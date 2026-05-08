@@ -265,7 +265,7 @@ unsafe fn collect_side_data(frame: &AVFrame) -> std::vec::Vec<SideDataEntry> {
     }
     let sd_ref = unsafe { &*sd };
     let kind = sd_ref.type_ as i32;
-    let size = sd_ref.size as usize;
+    let size = sd_ref.size;
     let data_slice = if size == 0 || sd_ref.data.is_null() {
       Vec::new()
     } else {
@@ -292,7 +292,7 @@ fn find_backing_buffer(
       continue;
     }
     let buf_data = unsafe { (*buf).data as *const u8 };
-    let buf_size = unsafe { (*buf).size as usize };
+    let buf_size = unsafe { (*buf).size };
     if buf_data.is_null() {
       continue;
     }

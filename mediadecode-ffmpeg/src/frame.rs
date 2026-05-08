@@ -313,6 +313,7 @@ struct PlaneInfo {
 pub(crate) fn is_supported_cpu_pix_fmt(pix_fmt: PixelFormat) -> bool {
   matches!(
     pix_fmt,
+    // --- HW download outputs (NV* + P0xx/P2xx/P4xx) ---
     PixelFormat::Nv12
       | PixelFormat::Nv21
       | PixelFormat::Nv16
@@ -326,6 +327,29 @@ pub(crate) fn is_supported_cpu_pix_fmt(pix_fmt: PixelFormat) -> bool {
       | PixelFormat::P410Le
       | PixelFormat::P412Le
       | PixelFormat::P416Le
+      // --- SW decoder outputs: planar YUV ---
+      | PixelFormat::Yuv420p
+      | PixelFormat::Yuv422p
+      | PixelFormat::Yuv444p
+      | PixelFormat::Yuv420p10Le
+      | PixelFormat::Yuv420p12Le
+      | PixelFormat::Yuv420p16Le
+      | PixelFormat::Yuv422p10Le
+      | PixelFormat::Yuv422p12Le
+      | PixelFormat::Yuv422p16Le
+      | PixelFormat::Yuv444p10Le
+      | PixelFormat::Yuv444p12Le
+      | PixelFormat::Yuv444p16Le
+      // --- SW decoder outputs: packed RGB ---
+      | PixelFormat::Rgb24
+      | PixelFormat::Bgr24
+      | PixelFormat::Rgba
+      | PixelFormat::Bgra
+      | PixelFormat::Argb
+      | PixelFormat::Abgr
+      // --- SW decoder outputs: greyscale ---
+      | PixelFormat::Gray8
+      | PixelFormat::Gray16Le
   )
 }
 
@@ -380,6 +404,65 @@ fn plane_row_bytes_for(pix_fmt: PixelFormat, plane: usize, frame_width: usize) -
       1 => Some(frame_width.checked_mul(4)?),
       _ => None,
     },
+    // --- SW planar YUV 4:2:0 8-bit ---
+    PixelFormat::Yuv420p => match plane {
+      0 => Some(frame_width),
+      1 | 2 => Some(frame_width.div_ceil(2)),
+      _ => None,
+    },
+    // --- SW planar YUV 4:2:2 8-bit ---
+    PixelFormat::Yuv422p => match plane {
+      0 => Some(frame_width),
+      1 | 2 => Some(frame_width.div_ceil(2)),
+      _ => None,
+    },
+    // --- SW planar YUV 4:4:4 8-bit ---
+    PixelFormat::Yuv444p => match plane {
+      0 | 1 | 2 => Some(frame_width),
+      _ => None,
+    },
+    // --- SW planar YUV 4:2:0 10/12/16-bit (low-packed in u16) ---
+    PixelFormat::Yuv420p10Le | PixelFormat::Yuv420p12Le | PixelFormat::Yuv420p16Le => {
+      match plane {
+        0 => Some(frame_width.checked_mul(2)?),
+        1 | 2 => Some(frame_width.div_ceil(2).checked_mul(2)?),
+        _ => None,
+      }
+    }
+    // --- SW planar YUV 4:2:2 10/12/16-bit ---
+    PixelFormat::Yuv422p10Le | PixelFormat::Yuv422p12Le | PixelFormat::Yuv422p16Le => {
+      match plane {
+        0 => Some(frame_width.checked_mul(2)?),
+        1 | 2 => Some(frame_width.div_ceil(2).checked_mul(2)?),
+        _ => None,
+      }
+    }
+    // --- SW planar YUV 4:4:4 10/12/16-bit ---
+    PixelFormat::Yuv444p10Le | PixelFormat::Yuv444p12Le | PixelFormat::Yuv444p16Le => {
+      match plane {
+        0 | 1 | 2 => Some(frame_width.checked_mul(2)?),
+        _ => None,
+      }
+    }
+    // --- SW packed RGB 8-bit (3 bytes/pixel for RGB24/BGR24,
+    //     4 bytes/pixel for RGBA/BGRA/ARGB/ABGR). Single plane. ---
+    PixelFormat::Rgb24 | PixelFormat::Bgr24 => match plane {
+      0 => Some(frame_width.checked_mul(3)?),
+      _ => None,
+    },
+    PixelFormat::Rgba | PixelFormat::Bgra | PixelFormat::Argb | PixelFormat::Abgr => match plane {
+      0 => Some(frame_width.checked_mul(4)?),
+      _ => None,
+    },
+    // --- SW greyscale ---
+    PixelFormat::Gray8 => match plane {
+      0 => Some(frame_width),
+      _ => None,
+    },
+    PixelFormat::Gray16Le => match plane {
+      0 => Some(frame_width.checked_mul(2)?),
+      _ => None,
+    },
     _ => None,
   }
 }
@@ -416,6 +499,39 @@ pub(crate) fn plane_height_for(
     | PixelFormat::P412Le
     | PixelFormat::P416Le => match plane {
       0 | 1 => Some(frame_height),
+      _ => None,
+    },
+    // --- SW planar YUV 4:2:0: Y full, U/V half-height ---
+    PixelFormat::Yuv420p
+    | PixelFormat::Yuv420p10Le
+    | PixelFormat::Yuv420p12Le
+    | PixelFormat::Yuv420p16Le => match plane {
+      0 => Some(frame_height),
+      1 | 2 => Some(frame_height.div_ceil(2)),
+      _ => None,
+    },
+    // --- SW planar YUV 4:2:2 / 4:4:4: all planes full height ---
+    PixelFormat::Yuv422p
+    | PixelFormat::Yuv422p10Le
+    | PixelFormat::Yuv422p12Le
+    | PixelFormat::Yuv422p16Le
+    | PixelFormat::Yuv444p
+    | PixelFormat::Yuv444p10Le
+    | PixelFormat::Yuv444p12Le
+    | PixelFormat::Yuv444p16Le => match plane {
+      0 | 1 | 2 => Some(frame_height),
+      _ => None,
+    },
+    // --- SW packed RGB / greyscale: single plane, full height ---
+    PixelFormat::Rgb24
+    | PixelFormat::Bgr24
+    | PixelFormat::Rgba
+    | PixelFormat::Bgra
+    | PixelFormat::Argb
+    | PixelFormat::Abgr
+    | PixelFormat::Gray8
+    | PixelFormat::Gray16Le => match plane {
+      0 => Some(frame_height),
       _ => None,
     },
     _ => None,
@@ -779,26 +895,17 @@ mod tests {
       AVPixelFormat::AV_PIX_FMT_D3D11 as i32
     )));
 
-    // Common CPU formats software decoders produce that we don't
-    // surface — drivers occasionally pick these for HW transfer too.
-    assert!(!is_supported_cpu_pix_fmt(boundary::from_av_pixel_format(
-      AVPixelFormat::AV_PIX_FMT_YUV420P as i32
-    )));
-    assert!(!is_supported_cpu_pix_fmt(boundary::from_av_pixel_format(
-      AVPixelFormat::AV_PIX_FMT_YUV422P as i32
-    )));
-    assert!(!is_supported_cpu_pix_fmt(boundary::from_av_pixel_format(
-      AVPixelFormat::AV_PIX_FMT_YUV444P as i32
-    )));
+    // YUVJ420P (deprecated full-range marker) maps to PixelFormat::Unknown
+    // — we don't surface the J variants since the range info now lives
+    // on `ColorInfo::range`.
     assert!(!is_supported_cpu_pix_fmt(boundary::from_av_pixel_format(
       AVPixelFormat::AV_PIX_FMT_YUVJ420P as i32
     )));
-    assert!(!is_supported_cpu_pix_fmt(boundary::from_av_pixel_format(
-      AVPixelFormat::AV_PIX_FMT_RGB24 as i32
-    )));
-    assert!(!is_supported_cpu_pix_fmt(boundary::from_av_pixel_format(
-      AVPixelFormat::AV_PIX_FMT_BGR24 as i32
-    )));
+
+    // Note: YUV420P / YUV422P / YUV444P / RGB24 / BGR24 / RGBA / BGRA
+    // are now intentionally **supported** (added when SW fallback
+    // landed in the FfmpegVideoStreamDecoder). They previously appeared
+    // here as "unsupported" when this crate was HW-only.
 
     // A future / unknown format value FFmpeg might invent — the helper
     // is closed-set so unknown integers are always rejected without

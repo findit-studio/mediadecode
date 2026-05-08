@@ -6,8 +6,12 @@
 //! the bindgen enum (UB hazard when the value isn't in the enum's
 //! discriminant set).
 
+use ffmpeg_next::Packet;
 use ffmpeg_next::ffi::AVPixelFormat;
-use mediadecode::PixelFormat;
+use mediadecode::{PixelFormat, packet::PacketFlags as MdPacketFlags};
+
+use crate::FfmpegBuffer;
+use crate::extras::VideoPacketExtra;
 
 /// Maps a raw `AVFrame.format` integer (i.e. the value of an
 /// `AVPixelFormat` enum variant) onto [`mediadecode::PixelFormat`].
@@ -120,6 +124,50 @@ pub const fn is_hardware_pix_fmt(raw: i32) -> bool {
       || x == AVPixelFormat::AV_PIX_FMT_MEDIACODEC as i32
       || x == AVPixelFormat::AV_PIX_FMT_VULKAN as i32
   )
+}
+
+/// Builds an `ffmpeg::Packet` from a [`mediadecode::VideoPacket`]
+/// parameterized by [`crate::extras::VideoPacketExtra`] and
+/// [`crate::FfmpegBuffer`].
+///
+/// The compressed bytes are **copied** into a new packet allocation —
+/// zero-copy passthrough of the FfmpegBuffer's underlying AVBufferRef
+/// is a future optimization (would need to wire an `AVBufferRef` into
+/// `AVPacket.buf` directly via `av_packet_alloc` + manual buffer set).
+/// PTS / DTS / duration / flags / stream_index are propagated.
+pub fn ffmpeg_packet_from_video_packet(
+  packet: &mediadecode::packet::VideoPacket<VideoPacketExtra, FfmpegBuffer>,
+) -> Packet {
+  let data = packet.data().as_ref();
+  let mut out = Packet::copy(data);
+  if let Some(ts) = packet.pts() {
+    out.set_pts(Some(ts.pts()));
+  }
+  if let Some(ts) = packet.dts() {
+    out.set_dts(Some(ts.pts()));
+  }
+  if let Some(d) = packet.duration() {
+    out.set_duration(d.pts());
+  }
+  // Map flags. `ffmpeg_next::packet::Flags` is a bitflags wrapper around
+  // AV_PKT_FLAG_*; the bit values match.
+  let flags = packet.flags();
+  let mut av_flags = ffmpeg_next::packet::Flags::empty();
+  if flags.contains(MdPacketFlags::KEY) {
+    av_flags |= ffmpeg_next::packet::Flags::KEY;
+  }
+  if flags.contains(MdPacketFlags::CORRUPT) {
+    av_flags |= ffmpeg_next::packet::Flags::CORRUPT;
+  }
+  // ffmpeg-next 8.x doesn't expose a DISCARD flag constant on
+  // `packet::Flags`; the upstream `AV_PKT_FLAG_DISCARD` bit is
+  // documented as a demuxer hint and rarely set on packets passed
+  // to a decoder. We forward KEY and CORRUPT (the meaningful subset)
+  // and silently drop DISCARD until ffmpeg-next adds it.
+  out.set_flags(av_flags);
+  // Stream index from the extras (stays 0 if the caller didn't set it).
+  out.set_stream(packet.extra().stream_index as usize);
+  out
 }
 
 #[cfg(test)]

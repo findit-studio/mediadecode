@@ -88,7 +88,7 @@ impl FfmpegBuffer {
     if buf.is_null() {
       return None;
     }
-    let buf_size = unsafe { (*buf).size as usize };
+    let buf_size = unsafe { (*buf).size };
     let end = offset.checked_add(len)?;
     if end > buf_size {
       return None;
@@ -121,7 +121,7 @@ impl FfmpegBuffer {
     if buf.is_null() {
       return None;
     }
-    let len = unsafe { (*buf).size as usize };
+    let len = unsafe { (*buf).size };
     Some(Self {
       inner: buf,
       offset: 0,
