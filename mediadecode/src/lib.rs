@@ -19,15 +19,23 @@
 
 // Workspace pattern (mirrors mediatime / colconv / scenesdetect) — alias
 // `alloc` as `std` so `std::vec::Vec` etc. resolves in alloc-only builds.
-// The `allow` is needed because `mediadecode`'s public API currently uses
-// only `core::` paths, leaving the alias technically unused at this layer.
-// `#[macro_use]` brings `vec!` / `format!` / `write!` etc. into scope so
-// `#[cfg(test)]` modules under `--no-default-features --features alloc`
-// still compile (the std prelude that normally provides them is gone).
+// `unused_extern_crates` is suppressed because the public API currently
+// uses only `core::` paths.
 #[cfg(all(not(feature = "std"), feature = "alloc"))]
 #[allow(unused_extern_crates)]
-#[macro_use]
 extern crate alloc as std;
+
+// Test-only re-extern with `#[macro_use]` so `#[cfg(test)]` modules
+// can use `vec!` / `format!` / `write!` under
+// `--no-default-features --features alloc` (the std prelude that
+// normally provides those macros is gone). `#[macro_use]` on the
+// non-test alias would be flagged as `unused_imports` by `-Dwarnings`
+// because the lib code itself doesn't use the macros — keeping it
+// `cfg(test)`-scoped sidesteps that lint.
+#[cfg(all(test, not(feature = "std"), feature = "alloc"))]
+#[allow(unused_extern_crates)]
+#[macro_use]
+extern crate alloc as alloc_test_macros;
 
 #[cfg(feature = "std")]
 extern crate std;
