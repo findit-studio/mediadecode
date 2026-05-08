@@ -50,6 +50,7 @@ mod tests {
         assert!(!BayerPattern::Bggr.is_rggb());
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn copy_and_hash() {
         use std::collections::hash_map::DefaultHasher;
