@@ -186,7 +186,7 @@ pub fn ffmpeg_packet_from_video_packet(
   // and silently drop DISCARD until ffmpeg-next adds it.
   out.set_flags(av_flags);
   // Stream index from the extras (stays 0 if the caller didn't set it).
-  out.set_stream(packet.extra().stream_index as usize);
+  out.set_stream(packet.extra().stream_index() as usize);
   out
 }
 
@@ -216,7 +216,7 @@ pub fn ffmpeg_packet_from_audio_packet(
     av_flags |= ffmpeg_next::packet::Flags::CORRUPT;
   }
   out.set_flags(av_flags);
-  out.set_stream(packet.extra().stream_index as usize);
+  out.set_stream(packet.extra().stream_index() as usize);
   out
 }
 
@@ -243,7 +243,7 @@ pub fn ffmpeg_packet_from_subtitle_packet(
     av_flags |= ffmpeg_next::packet::Flags::CORRUPT;
   }
   out.set_flags(av_flags);
-  out.set_stream(packet.extra().stream_index as usize);
+  out.set_stream(packet.extra().stream_index() as usize);
   out
 }
 
@@ -265,15 +265,8 @@ pub fn video_packet_from_ffmpeg(
   packet: &Packet,
 ) -> Option<VideoPacket<VideoPacketExtra, FfmpegBuffer>> {
   let buf = FfmpegBuffer::from_packet(packet)?;
-  let mut out = VideoPacket::new(
-    buf,
-    VideoPacketExtra {
-      stream_index: packet.stream() as i32,
-      byte_pos: None,
-      side_data: std::vec::Vec::new(),
-    },
-  )
-  .with_flags(md_flags_from_av(packet.flags()));
+  let mut out = VideoPacket::new(buf, VideoPacketExtra::new(packet.stream() as i32))
+    .with_flags(md_flags_from_av(packet.flags()));
   if let Some(p) = packet.pts() {
     out = out.with_pts(Some(Timestamp::new(p, mediadecode::Timebase::default())));
   }
@@ -295,15 +288,8 @@ pub fn audio_packet_from_ffmpeg(
   packet: &Packet,
 ) -> Option<AudioPacket<AudioPacketExtra, FfmpegBuffer>> {
   let buf = FfmpegBuffer::from_packet(packet)?;
-  let mut out = AudioPacket::new(
-    buf,
-    AudioPacketExtra {
-      stream_index: packet.stream() as i32,
-      byte_pos: None,
-      side_data: std::vec::Vec::new(),
-    },
-  )
-  .with_flags(md_flags_from_av(packet.flags()));
+  let mut out = AudioPacket::new(buf, AudioPacketExtra::new(packet.stream() as i32))
+    .with_flags(md_flags_from_av(packet.flags()));
   if let Some(p) = packet.pts() {
     out = out.with_pts(Some(Timestamp::new(p, mediadecode::Timebase::default())));
   }
@@ -325,15 +311,8 @@ pub fn subtitle_packet_from_ffmpeg(
   packet: &Packet,
 ) -> Option<SubtitlePacket<SubtitlePacketExtra, FfmpegBuffer>> {
   let buf = FfmpegBuffer::from_packet(packet)?;
-  let mut out = SubtitlePacket::new(
-    buf,
-    SubtitlePacketExtra {
-      stream_index: packet.stream() as i32,
-      language: None,
-      forced: false,
-    },
-  )
-  .with_flags(md_flags_from_av(packet.flags()));
+  let mut out = SubtitlePacket::new(buf, SubtitlePacketExtra::new(packet.stream() as i32))
+    .with_flags(md_flags_from_av(packet.flags()));
   if let Some(p) = packet.pts() {
     out = out.with_pts(Some(Timestamp::new(p, mediadecode::Timebase::default())));
   }

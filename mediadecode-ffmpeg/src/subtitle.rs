@@ -90,12 +90,14 @@ impl FfmpegSubtitleStreamDecoder {
   }
 
   /// Returns the time base associated with the source stream.
-  pub fn time_base(&self) -> Timebase {
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn time_base(&self) -> Timebase {
     self.time_base
   }
 
   /// Borrow the wrapped `ffmpeg::decoder::Subtitle`.
-  pub fn inner(&self) -> &ffmpeg_next::decoder::Subtitle {
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn inner(&self) -> &ffmpeg_next::decoder::Subtitle {
     &self.decoder
   }
 }

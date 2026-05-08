@@ -350,7 +350,7 @@ unsafe fn build_video_frame_extra(av_frame: *const AVFrame) -> VideoFrameExtra {
   let sar_num = unsafe { (*av_frame).sample_aspect_ratio.num };
   let sar_den = unsafe { (*av_frame).sample_aspect_ratio.den };
   if sar_num > 0 && sar_den > 0 && (sar_num != 1 || sar_den != 1) {
-    out.sample_aspect_ratio = Some((sar_num as u32, sar_den as u32));
+    out.set_sample_aspect_ratio(Some((sar_num as u32, sar_den as u32)));
   }
   // Picture type — read raw to avoid bindgen-enum UB if FFmpeg writes
   // an out-of-range value (version skew / hostile decoder).
@@ -358,21 +358,21 @@ unsafe fn build_video_frame_extra(av_frame: *const AVFrame) -> VideoFrameExtra {
   // SAFETY: `av_frame` is live; reading `pict_type` as `i32` matches
   // the bindgen enum's underlying `c_int` storage.
   let pict_type_raw = unsafe { read_unaligned(addr_of!((*av_frame).pict_type) as *const i32) };
-  out.picture_type = map_picture_type_raw(pict_type_raw);
+  out.set_picture_type(map_picture_type_raw(pict_type_raw));
   // Key frame and interlace flags. AVFrame.flags has dedicated bits
   // for these in recent FFmpeg; the deprecated fields (key_frame,
   // interlaced_frame, top_field_first) still mirror them.
   let flags = unsafe { (*av_frame).flags };
-  out.key_frame = flags & ffmpeg_next::ffi::AV_FRAME_FLAG_KEY != 0;
-  out.interlaced = flags & ffmpeg_next::ffi::AV_FRAME_FLAG_INTERLACED != 0;
-  out.top_field_first = flags & ffmpeg_next::ffi::AV_FRAME_FLAG_TOP_FIELD_FIRST != 0;
+  out.set_key_frame(flags & ffmpeg_next::ffi::AV_FRAME_FLAG_KEY != 0);
+  out.set_interlaced(flags & ffmpeg_next::ffi::AV_FRAME_FLAG_INTERLACED != 0);
+  out.set_top_field_first(flags & ffmpeg_next::ffi::AV_FRAME_FLAG_TOP_FIELD_FIRST != 0);
   // Best-effort timestamp.
   let bet = unsafe { (*av_frame).best_effort_timestamp };
   if bet != AV_NOPTS_VALUE {
-    out.best_effort_timestamp = Some(bet);
+    out.set_best_effort_timestamp(Some(bet));
   }
   // Side data — passthrough as raw bytes.
-  out.side_data = unsafe { collect_side_data(av_frame) };
+  out.set_side_data(unsafe { collect_side_data(av_frame) });
   out
 }
 
@@ -407,10 +407,7 @@ unsafe fn collect_side_data(av_frame: *const AVFrame) -> std::vec::Vec<SideDataE
       // per FFmpeg's AVFrameSideData contract.
       unsafe { core::slice::from_raw_parts(data_ptr, size).to_vec() }
     };
-    out.push(SideDataEntry {
-      kind,
-      data: data_slice,
-    });
+    out.push(SideDataEntry::new(kind, data_slice));
   }
   out
 }
@@ -686,12 +683,12 @@ pub unsafe fn av_frame_to_audio_frame(
 
   let mut extra = AudioFrameExtra::default();
   if bet_raw != AV_NOPTS_VALUE {
-    extra.best_effort_timestamp = Some(bet_raw);
+    extra.set_best_effort_timestamp(Some(bet_raw));
   }
   // SAFETY: caller upholds liveness for the duration of the call;
   // collect_side_data reads enum-typed `type_` raw and bounds-checks
   // each entry's data slice.
-  extra.side_data = unsafe { collect_side_data(av_frame) };
+  extra.set_side_data(unsafe { collect_side_data(av_frame) });
 
   Ok(
     AudioFrame::new(
@@ -924,10 +921,9 @@ pub unsafe fn av_subtitle_to_subtitle_frame(
     None
   };
 
-  let extra = SubtitleFrameExtra {
-    start_display_time: unsafe { (*av_subtitle).start_display_time },
-    end_display_time: unsafe { (*av_subtitle).end_display_time },
-  };
+  let extra = SubtitleFrameExtra::new(unsafe { (*av_subtitle).start_display_time }, unsafe {
+    (*av_subtitle).end_display_time
+  });
 
   Ok(SubtitleFrame::new(payload, extra).with_pts(pts))
 }
