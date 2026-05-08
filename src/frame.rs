@@ -129,7 +129,7 @@ impl<B> Plane<B> {
 }
 
 use crate::Timestamp;
-use crate::adapter::VideoAdapter;
+use crate::adapter::{AudioAdapter, VideoAdapter};
 use crate::color::ColorInfo;
 
 /// A decoded video frame.
@@ -252,6 +252,105 @@ impl<A: VideoAdapter, B: AsRef<[u8]>> VideoFrame<A, B> {
     pub const fn set_color(&mut self, v: ColorInfo) -> &mut Self { self.color = v; self }
 }
 
+/// A decoded audio frame.
+///
+/// `nb_samples` is **per channel**. `plane_count` is `1` for packed
+/// (interleaved) formats and `channel_count` for planar; the
+/// `[Plane; 8]` cap mirrors FFmpeg's `AV_NUM_DATA_POINTERS`.
+/// Channel counts above 8 surface their extra channels through
+/// `A::FrameExtra` (rare in practice).
+pub struct AudioFrame<A: AudioAdapter, B: AsRef<[u8]>> {
+    pts:            Option<Timestamp>,
+    duration:       Option<Timestamp>,
+    sample_rate:    u32,
+    nb_samples:     u32,
+    channel_count:  u8,
+    sample_format:  A::SampleFormat,
+    channel_layout: A::ChannelLayout,
+    plane_count:    u8,
+    planes:         [Plane<B>; 8],
+    extra:          A::FrameExtra,
+}
+
+impl<A: AudioAdapter, B: AsRef<[u8]>> AudioFrame<A, B> {
+    /// Constructs an `AudioFrame`.
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    pub fn new(
+        sample_rate: u32,
+        nb_samples: u32,
+        channel_count: u8,
+        sample_format: A::SampleFormat,
+        channel_layout: A::ChannelLayout,
+        planes: [Plane<B>; 8],
+        plane_count: u8,
+        extra: A::FrameExtra,
+    ) -> Self {
+        Self {
+            pts: None,
+            duration: None,
+            sample_rate,
+            nb_samples,
+            channel_count,
+            sample_format,
+            channel_layout,
+            plane_count,
+            planes,
+            extra,
+        }
+    }
+
+    /// Returns the presentation timestamp.
+    #[inline]
+    pub const fn pts(&self) -> Option<Timestamp> { self.pts }
+    /// Returns the duration.
+    #[inline]
+    pub const fn duration(&self) -> Option<Timestamp> { self.duration }
+    /// Returns the sample rate (Hz).
+    #[inline]
+    pub const fn sample_rate(&self) -> u32 { self.sample_rate }
+    /// Returns the per-channel sample count.
+    #[inline]
+    pub const fn nb_samples(&self) -> u32 { self.nb_samples }
+    /// Returns the channel count.
+    #[inline]
+    pub const fn channel_count(&self) -> u8 { self.channel_count }
+    /// Returns the sample format identifier.
+    #[inline]
+    pub fn sample_format(&self) -> A::SampleFormat { self.sample_format }
+    /// Returns the channel layout identifier.
+    #[inline]
+    pub fn channel_layout(&self) -> &A::ChannelLayout { &self.channel_layout }
+    /// Returns the populated plane count.
+    #[inline]
+    pub const fn plane_count(&self) -> u8 { self.plane_count }
+    /// Returns the populated planes as a slice.
+    #[inline]
+    pub fn planes(&self) -> &[Plane<B>] {
+        &self.planes[..self.plane_count as usize]
+    }
+    /// Returns the backend extras.
+    #[inline]
+    pub const fn extra(&self) -> &A::FrameExtra { &self.extra }
+    /// Returns a mutable reference to the backend extras.
+    #[inline]
+    pub fn extra_mut(&mut self) -> &mut A::FrameExtra { &mut self.extra }
+
+    /// Sets the PTS (consuming builder).
+    #[inline]
+    pub const fn with_pts(mut self, v: Option<Timestamp>) -> Self { self.pts = v; self }
+    /// Sets the duration (consuming builder).
+    #[inline]
+    pub const fn with_duration(mut self, v: Option<Timestamp>) -> Self { self.duration = v; self }
+
+    /// Sets the PTS in place.
+    #[inline]
+    pub const fn set_pts(&mut self, v: Option<Timestamp>) -> &mut Self { self.pts = v; self }
+    /// Sets the duration in place.
+    #[inline]
+    pub const fn set_duration(&mut self, v: Option<Timestamp>) -> &mut Self { self.duration = v; self }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,5 +469,40 @@ mod tests {
                 .with_visible_rect(Some(Rect::new(0, 0, 64, 64)));
         assert!(f.color().matrix().is_bt_2020_ncl());
         assert!(f.visible_rect().is_some());
+    }
+
+    struct ALoop;
+    impl AudioAdapter for ALoop {
+        type CodecId = u32;
+        type SampleFormat = u32;
+        type ChannelLayout = u32;
+        type PacketExtra = ();
+        type FrameExtra = ();
+    }
+
+    fn audio_planes() -> [Plane<&'static [u8]>; 8] {
+        [
+            Plane::new(&[][..], 0),
+            Plane::new(&[][..], 0),
+            Plane::new(&[][..], 0),
+            Plane::new(&[][..], 0),
+            Plane::new(&[][..], 0),
+            Plane::new(&[][..], 0),
+            Plane::new(&[][..], 0),
+            Plane::new(&[][..], 0),
+        ]
+    }
+
+    #[test]
+    fn audio_frame_construct_and_access() {
+        let f: AudioFrame<ALoop, &[u8]> = AudioFrame::new(
+            48_000, 1024, 2, /*sf=*/ 0u32, /*layout=*/ 0u32,
+            audio_planes(), 2, (),
+        );
+        assert_eq!(f.sample_rate(), 48_000);
+        assert_eq!(f.nb_samples(), 1024);
+        assert_eq!(f.channel_count(), 2);
+        assert_eq!(f.plane_count(), 2);
+        assert_eq!(f.planes().len(), 2);
     }
 }
