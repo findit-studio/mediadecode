@@ -36,7 +36,10 @@ pub mod color;
 pub mod decoder;
 pub mod frame;
 pub mod packet;
+pub mod pixel_format;
 pub mod subtitle;
+
+pub use pixel_format::PixelFormat;
 
 // Re-export the time primitives so consumers don't have to add a
 // separate `mediatime` dependency.
