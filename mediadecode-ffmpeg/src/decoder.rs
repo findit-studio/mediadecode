@@ -1687,11 +1687,7 @@ fn drain_into_pending(
         // during side-data alloc) we propagate so the probe candidate
         // is treated as failed rather than queueing a frame whose
         // metadata silently disappeared.
-        if let Err(e) = unsafe { copy_frame_props_minimal(cpu.as_mut_ptr(), hw_buf.as_ptr()) } {
-          // `cpu` drops here, releasing its plane refcounts; the
-          // partial copy is not enqueued.
-          return Err(e);
-        }
+        unsafe { copy_frame_props_minimal(cpu.as_mut_ptr(), hw_buf.as_ptr()) }?;
         *pending_bytes = new_total;
         pending.push_back(cpu);
       }

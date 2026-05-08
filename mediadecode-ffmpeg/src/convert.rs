@@ -587,8 +587,7 @@ pub unsafe fn av_frame_to_audio_frame(
   // address of the embedded ch_layout as `*const AVChannelLayout`
   // is sound because `addr_of!` doesn't form a reference.
   use core::ptr::addr_of;
-  let ch_layout_ptr =
-    unsafe { addr_of!((*av_frame).ch_layout) } as *const ffmpeg_next::ffi::AVChannelLayout;
+  let ch_layout_ptr = unsafe { addr_of!((*av_frame).ch_layout) };
   let channel_layout =
     unsafe { crate::channel_layout::audio_channel_layout_from_raw_ptr(ch_layout_ptr) };
   let channel_count_full = channel_layout.channels();

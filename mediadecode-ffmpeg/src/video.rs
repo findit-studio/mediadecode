@@ -213,10 +213,7 @@ impl FfmpegVideoStreamDecoder {
       local_replay: &mut VecDeque<frame::Video>,
     ) -> std::result::Result<(), Error> {
       loop {
-        let mut tmp = match alloc_av_video_frame() {
-          Ok(f) => f,
-          Err(e) => return Err(e),
-        };
+        let mut tmp = alloc_av_video_frame()?;
         match sw.receive_frame(&mut tmp) {
           Ok(()) => {
             if local_replay.len() >= SW_REPLAY_FRAME_CAP {

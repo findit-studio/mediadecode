@@ -452,7 +452,7 @@ pub(crate) fn plane_row_bytes_for(
     },
     // --- SW planar YUV 4:4:4 8-bit ---
     PixelFormat::Yuv444p => match plane {
-      0 | 1 | 2 => Some(frame_width),
+      0..=2 => Some(frame_width),
       _ => None,
     },
     // --- SW planar YUV 4:2:0 10/12/16-bit (low-packed in u16) ---
@@ -469,7 +469,7 @@ pub(crate) fn plane_row_bytes_for(
     },
     // --- SW planar YUV 4:4:4 10/12/16-bit ---
     PixelFormat::Yuv444p10Le | PixelFormat::Yuv444p12Le | PixelFormat::Yuv444p16Le => match plane {
-      0 | 1 | 2 => Some(frame_width.checked_mul(2)?),
+      0..=2 => Some(frame_width.checked_mul(2)?),
       _ => None,
     },
     // --- SW packed RGB 8-bit (3 bytes/pixel for RGB24/BGR24,
@@ -547,7 +547,7 @@ pub(crate) fn plane_height_for(
     | PixelFormat::Yuv444p10Le
     | PixelFormat::Yuv444p12Le
     | PixelFormat::Yuv444p16Le => match plane {
-      0 | 1 | 2 => Some(frame_height),
+      0..=2 => Some(frame_height),
       _ => None,
     },
     // --- SW packed RGB / greyscale: single plane, full height ---
