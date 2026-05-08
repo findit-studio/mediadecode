@@ -1,62 +1,53 @@
-[package]
-name = "mediadecode"
-version = "0.0.0"
-edition = "2024"
-repository = "https://github.com/findit-ai/mediadecode"
-homepage = "https://github.com/findit-ai/mediadecode"
-documentation = "https://docs.rs/mediadecode"
-description = "Generic, no_std-friendly type-and-trait spine for media decoders (FFmpeg, WebCodecs, R3D, BRAW, ARRIRAW, X-OCN, ProRes RAW, Canon Cinema RAW Light)."
-license = "MIT OR Apache-2.0"
+[workspace]
+resolver = "3"
+members = [
+  "mediadecode",
+  "mediadecode-ffmpeg",
+]
+
+[workspace.package]
+edition      = "2024"
 rust-version = "1.95.0"
-keywords = ["media", "decoder", "video", "audio", "no-std"]
-categories = ["multimedia", "multimedia::video", "multimedia::audio", "no-std", "no-std::no-alloc"]
+license      = "MIT OR Apache-2.0"
+repository   = "https://github.com/findit-ai/mediadecode"
+homepage     = "https://github.com/findit-ai/mediadecode"
 
-[features]
-default = ["std"]
-alloc   = []
-std     = ["alloc", "mediatime/std"]
+[workspace.dependencies]
+# Workspace-internal crates — referenced by sibling members via workspace inheritance.
+mediadecode = { version = "0.0.0", path = "mediadecode", default-features = false }
 
-serde      = ["dep:serde", "mediatime/serde", "bitflags/serde"]
-arbitrary  = ["dep:arbitrary", "mediatime/arbitrary"]
-quickcheck = ["dep:quickcheck", "mediatime/quickcheck"]
-
-[dependencies]
+# External deps used by more than one member, pinned at the workspace level.
 mediatime   = { version = "0.1", default-features = false }
 bitflags    = { version = "2", default-features = false }
-derive_more = { version = "2", default-features = false, features = ["is_variant"] }
+derive_more = { version = "2", default-features = false }
 thiserror   = { version = "2", default-features = false }
+ffmpeg-next = { version = "8.1", default-features = false, features = ["codec", "format"] }
+tracing     = { version = "0.1", default-features = false }
+libc        = "0.2"
 
-serde      = { version = "1", default-features = false, features = ["derive"], optional = true }
-arbitrary  = { version = "1", default-features = false, optional = true }
-quickcheck = { version = "1", default-features = false, optional = true }
+# Optional / fuzzing / serialization
+serde       = { version = "1", default-features = false, features = ["derive"] }
+arbitrary   = { version = "1", default-features = false }
+quickcheck  = { version = "1", default-features = false }
 
-[dev-dependencies]
+# Dev / bench
 criterion = "0.8"
 tempfile  = "3"
 
-[[bench]]
-path = "benches/foo.rs"
-name = "foo"
-harness = false
-
-[profile.bench]
-opt-level = 3
-debug = false
-codegen-units = 1
-lto = 'thin'
-incremental = false
-debug-assertions = false
-overflow-checks = false
-rpath = false
-
-[package.metadata.docs.rs]
-all-features = true
-rustdoc-args = ["--cfg", "docsrs"]
-
-[lints.rust]
-rust_2018_idioms = "warn"
-single_use_lifetimes = "warn"
-unexpected_cfgs = { level = "warn", check-cfg = [
+[workspace.lints.rust]
+rust_2018_idioms        = "warn"
+single_use_lifetimes    = "warn"
+unexpected_cfgs         = { level = "warn", check-cfg = [
   'cfg(all_tests)',
   'cfg(tarpaulin)',
 ] }
+
+[profile.bench]
+opt-level         = 3
+debug             = false
+codegen-units     = 1
+lto               = 'thin'
+incremental       = false
+debug-assertions  = false
+overflow-checks   = false
+rpath             = false
