@@ -298,18 +298,24 @@ variant in v1; if needed later, it will be feature-gated.
 [features]
 default = ["std"]
 alloc   = []
-std     = ["alloc", "thiserror/default", "mediatime/std"]
+std     = ["alloc", "mediatime/std"]
 serde       = ["dep:serde", "mediatime/serde", "bitflags/serde"]
 arbitrary   = ["dep:arbitrary", "mediatime/arbitrary"]
 quickcheck  = ["dep:quickcheck", "mediatime/quickcheck"]
 ```
 
+`thiserror = { version = "2", default-features = false }` is unconditional —
+since Rust 1.81 stabilized `core::error::Error`, `thiserror`'s default-off
+mode emits `core::error::Error` impls that compile in `core`-only builds.
+There is no need to gate it behind `std`.
+
 | Item | `core` | `+alloc` | `+std` |
 |---|---|---|---|
 | All non-bitmap-subtitle types and traits | ✅ | ✅ | ✅ |
 | `Timebase`/`Timestamp`/`TimeRange` (re-exports) | ✅ | ✅ | ✅ |
+| `core::error::Error` impls (via thiserror) | ✅ | ✅ | ✅ |
 | `SubtitlePayload::Bitmap` (alloc-gated) | ❌ | ✅ | ✅ |
-| `std::error::Error` impls (via thiserror) | ❌ | ❌ | ✅ |
+| `std`-only conveniences (currently none required) | ❌ | ❌ | ✅ |
 
 ### no_std story
 
