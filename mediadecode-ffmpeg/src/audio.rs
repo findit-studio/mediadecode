@@ -19,7 +19,8 @@ use mediadecode::{
 };
 
 use crate::{
-  Error, Ffmpeg, FfmpegBuffer, boundary, convert,
+  Error, Ffmpeg, FfmpegBuffer, boundary,
+  convert::{self, ConvertError},
   decoder::build_codec_context,
   extras::{AudioFrameExtra, AudioPacketExtra},
   frame::alloc_av_audio_frame,
@@ -114,10 +115,10 @@ impl AudioStreamDecoder for FfmpegAudioStreamDecoder {
 #[derive(thiserror::Error, Debug)]
 pub enum AudioDecodeError {
   /// The wrapped `ffmpeg::decoder::Audio` reported an error.
-  #[error("{0}")]
+  #[error(transparent)]
   Decode(#[from] Error),
   /// Conversion from FFmpeg's `AVFrame` to mediadecode's `AudioFrame`
   /// failed.
-  #[error("audio frame conversion failed: {0}")]
-  Convert(crate::convert::ConvertError),
+  #[error(transparent)]
+  Convert(#[from] ConvertError),
 }

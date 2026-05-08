@@ -18,7 +18,8 @@ use mediadecode::{
 };
 
 use crate::{
-  Error, Ffmpeg, FfmpegBuffer, boundary, convert,
+  Error, Ffmpeg, FfmpegBuffer, boundary,
+  convert::{self, ConvertError},
   decoder::build_codec_context,
   extras::{SubtitleFrameExtra, SubtitlePacketExtra},
 };
@@ -178,12 +179,12 @@ impl SubtitleDecoder for FfmpegSubtitleStreamDecoder {
 #[derive(thiserror::Error, Debug)]
 pub enum SubtitleDecodeError {
   /// The wrapped `ffmpeg::decoder::Subtitle` reported an error.
-  #[error("{0}")]
+  #[error(transparent)]
   Decode(#[from] Error),
   /// Conversion from FFmpeg's `AVSubtitle` to mediadecode's
   /// `SubtitleFrame` failed.
-  #[error("subtitle conversion failed: {0}")]
-  Convert(crate::convert::ConvertError),
+  #[error(transparent)]
+  Convert(#[from] ConvertError),
   /// `receive_frame` was called with no buffered frame ready — caller
   /// should send another packet.
   #[error("no subtitle frame ready; send another packet first")]

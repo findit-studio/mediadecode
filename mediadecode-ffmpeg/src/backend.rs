@@ -51,12 +51,7 @@ impl Backend {
 /// backends only, in preference order. Empty for platforms with no known
 /// HW backend; on those `open()` returns `AllBackendsFailed` immediately.
 pub(crate) fn probe_order() -> &'static [Backend] {
-  #[cfg(any(
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "tvos",
-    target_os = "visionos",
-  ))]
+  #[cfg(target_vendor = "apple")]
   {
     &[Backend::VideoToolbox]
   }
@@ -68,14 +63,7 @@ pub(crate) fn probe_order() -> &'static [Backend] {
   {
     &[Backend::D3d11va, Backend::Cuda]
   }
-  #[cfg(not(any(
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "tvos",
-    target_os = "visionos",
-    target_os = "linux",
-    target_os = "windows",
-  )))]
+  #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "windows",)))]
   {
     &[]
   }

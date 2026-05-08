@@ -37,7 +37,8 @@ use ffmpeg_next::{codec::Parameters, frame};
 use mediadecode::{Timebase, decoder::VideoStreamDecoder, frame::VideoFrame, packet::VideoPacket};
 
 use crate::{
-  Error, Ffmpeg, FfmpegBuffer, Frame, VideoDecoder, boundary, convert,
+  Error, Ffmpeg, FfmpegBuffer, Frame, VideoDecoder, boundary,
+  convert::{self, ConvertError},
   decoder::{build_codec_context, try_clone_parameters},
   extras::{VideoFrameExtra, VideoPacketExtra},
   frame::alloc_av_video_frame,
@@ -131,18 +132,21 @@ impl FfmpegVideoStreamDecoder {
 
   /// Returns `true` when this decoder has fallen back to the software
   /// path. `false` while still on the HW probe (the initial state).
-  pub fn is_software(&self) -> bool {
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn is_software(&self) -> bool {
     matches!(self.state, DecodeState::Sw(_))
   }
 
   /// Returns `true` while the HW probe is still active.
-  pub fn is_hardware(&self) -> bool {
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn is_hardware(&self) -> bool {
     matches!(self.state, DecodeState::Hw(_))
   }
 
   /// Borrow the inner [`VideoDecoder`] when this decoder is still on
   /// the HW path. Returns `None` after the SW fallback has fired.
-  pub fn hardware_inner(&self) -> Option<&VideoDecoder> {
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn hardware_inner(&self) -> Option<&VideoDecoder> {
     match &self.state {
       DecodeState::Hw(hw) => Some(hw),
       DecodeState::Sw(_) => None,
@@ -150,7 +154,8 @@ impl FfmpegVideoStreamDecoder {
   }
 
   /// Returns the time base associated with the source stream.
-  pub fn time_base(&self) -> Timebase {
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn time_base(&self) -> Timebase {
     self.time_base
   }
 
@@ -433,15 +438,10 @@ impl VideoStreamDecoder for FfmpegVideoStreamDecoder {
     // after this, so reset EOF tracking.
     self.eof_sent = false;
     match &mut self.state {
-      DecodeState::Hw(hw) => {
-        hw.flush();
-        Ok(())
-      }
-      DecodeState::Sw(sw) => {
-        sw.flush();
-        Ok(())
-      }
+      DecodeState::Hw(hw) => hw.flush(),
+      DecodeState::Sw(sw) => sw.flush(),
     }
+    Ok(())
   }
 }
 
@@ -460,10 +460,10 @@ fn open_sw_decoder(parameters: &Parameters) -> Result<ffmpeg_next::decoder::Vide
 #[derive(thiserror::Error, Debug)]
 pub enum VideoDecodeError {
   /// The wrapped decoder (HW or SW) reported an error.
-  #[error("{0}")]
+  #[error(transparent)]
   Decode(#[from] Error),
   /// Frame conversion from FFmpeg's native types to mediadecode's
   /// types failed.
-  #[error("frame conversion failed: {0}")]
-  Convert(crate::convert::ConvertError),
+  #[error(transparent)]
+  Convert(#[from] ConvertError),
 }
