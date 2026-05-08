@@ -13,7 +13,7 @@ categories = ["multimedia", "multimedia::video", "multimedia::audio", "no-std", 
 
 [features]
 default = ["std"]
-alloc   = []
+alloc   = ["dep:smol_str"]
 std     = ["alloc", "mediatime/std"]
 
 serde      = ["dep:serde", "mediatime/serde", "bitflags/serde"]
@@ -23,8 +23,9 @@ quickcheck = ["dep:quickcheck", "mediatime/quickcheck"]
 [dependencies]
 mediatime   = { workspace = true }
 bitflags    = { workspace = true }
-derive_more = { workspace = true, features = ["is_variant"] }
+derive_more = { workspace = true, features = ["display", "is_variant"] }
 thiserror   = { workspace = true }
+smol_str    = { workspace = true, optional = true }
 
 serde      = { workspace = true, optional = true }
 arbitrary  = { workspace = true, optional = true }

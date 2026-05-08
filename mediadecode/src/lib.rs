@@ -31,6 +31,7 @@ extern crate std;
 
 pub mod adapter;
 pub mod cfa;
+pub mod channel;
 pub mod color;
 pub mod decoder;
 pub mod frame;
