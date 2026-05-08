@@ -118,6 +118,87 @@ impl<A: VideoAdapter, B: AsRef<[u8]>> VideoPacket<A, B> {
     pub const fn set_flags(&mut self, v: PacketFlags) -> &mut Self { self.flags = v; self }
 }
 
+use crate::adapter::AudioAdapter;
+
+/// A compressed audio packet.
+pub struct AudioPacket<A: AudioAdapter, B: AsRef<[u8]>> {
+    pts:      Option<Timestamp>,
+    dts:      Option<Timestamp>,
+    duration: Option<Timestamp>,
+    flags:    PacketFlags,
+    data:     B,
+    extra:    A::PacketExtra,
+}
+
+impl<A: AudioAdapter, B: AsRef<[u8]>> AudioPacket<A, B> {
+    /// Constructs an `AudioPacket` from `data` and `extra`.
+    #[inline]
+    pub fn new(data: B, extra: A::PacketExtra) -> Self {
+        Self {
+            pts: None,
+            dts: None,
+            duration: None,
+            flags: PacketFlags::empty(),
+            data,
+            extra,
+        }
+    }
+
+    /// Returns the presentation timestamp.
+    #[inline]
+    pub const fn pts(&self) -> Option<Timestamp> { self.pts }
+    /// Returns the decompression timestamp.
+    #[inline]
+    pub const fn dts(&self) -> Option<Timestamp> { self.dts }
+    /// Returns the duration.
+    #[inline]
+    pub const fn duration(&self) -> Option<Timestamp> { self.duration }
+    /// Returns the flags.
+    #[inline]
+    pub const fn flags(&self) -> PacketFlags { self.flags }
+    /// Returns the compressed audio data.
+    #[inline]
+    pub const fn data(&self) -> &B { &self.data }
+    /// Returns the backend extras.
+    #[inline]
+    pub const fn extra(&self) -> &A::PacketExtra { &self.extra }
+    /// Returns a mutable reference to the backend extras.
+    #[inline]
+    pub fn extra_mut(&mut self) -> &mut A::PacketExtra { &mut self.extra }
+    /// Consumes the packet and returns the buffer.
+    #[inline]
+    pub fn into_data(self) -> B { self.data }
+    /// Consumes the packet and returns `(buffer, extras)`.
+    #[inline]
+    pub fn into_parts(self) -> (B, A::PacketExtra) { (self.data, self.extra) }
+
+    /// Sets the PTS (consuming builder).
+    #[inline]
+    pub const fn with_pts(mut self, v: Option<Timestamp>) -> Self { self.pts = v; self }
+    /// Sets the DTS (consuming builder).
+    #[inline]
+    pub const fn with_dts(mut self, v: Option<Timestamp>) -> Self { self.dts = v; self }
+    /// Sets the duration (consuming builder).
+    #[inline]
+    pub const fn with_duration(mut self, v: Option<Timestamp>) -> Self { self.duration = v; self }
+    /// Sets the flags (consuming builder).
+    #[inline]
+    pub const fn with_flags(mut self, v: PacketFlags) -> Self { self.flags = v; self }
+
+    /// Sets the PTS in place.
+    #[inline]
+    pub const fn set_pts(&mut self, v: Option<Timestamp>) -> &mut Self { self.pts = v; self }
+    /// Sets the DTS in place.
+    #[inline]
+    pub const fn set_dts(&mut self, v: Option<Timestamp>) -> &mut Self { self.dts = v; self }
+    /// Sets the duration in place.
+    #[inline]
+    pub const fn set_duration(&mut self, v: Option<Timestamp>) -> &mut Self { self.duration = v; self }
+    /// Sets the flags in place.
+    #[inline]
+    pub const fn set_flags(&mut self, v: PacketFlags) -> &mut Self { self.flags = v; self }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,5 +262,25 @@ mod tests {
         let p: VideoPacket<VLoop, &[u8]> = VideoPacket::new(&[1u8, 2][..], ());
         let (data, _extra) = p.into_parts();
         assert_eq!(data, &[1, 2]);
+    }
+
+    struct ALoop;
+    impl crate::adapter::AudioAdapter for ALoop {
+        type CodecId = u32;
+        type SampleFormat = u32;
+        type ChannelLayout = u32;
+        type PacketExtra = ();
+        type FrameExtra = ();
+    }
+
+    #[test]
+    fn audio_packet_round_trip() {
+        let data: &[u8] = &[7, 8, 9];
+        let p: AudioPacket<ALoop, &[u8]> = AudioPacket::new(data, ())
+            .with_flags(PacketFlags::KEY);
+        assert_eq!(*p.data(), data);
+        assert!(p.flags().contains(PacketFlags::KEY));
+        let (recovered, _) = p.into_parts();
+        assert_eq!(recovered, data);
     }
 }
