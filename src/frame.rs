@@ -66,6 +66,68 @@ impl Rect {
     pub const fn set_height(&mut self, h: u32) -> &mut Self { self.height = h; self }
 }
 
+/// One plane of pixel or audio data.
+///
+/// Generic over the buffer type `B` so the same `Plane` shape works
+/// for owned (`Vec<u8>`, `bytes::Bytes`), borrowed (`&'a [u8]`), or
+/// custom backend-supplied buffers. The bound `B: AsRef<[u8]>` lives
+/// at the use site (`Frame<A, B: AsRef<[u8]>>`); `Plane` itself is
+/// unbounded so it can be used in const contexts.
+///
+/// `stride` is bytes per row for video planes, total plane size in
+/// bytes for audio planar formats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Plane<B> {
+    data:   B,
+    stride: u32,
+}
+
+impl<B> Plane<B> {
+    /// Constructs a `Plane` from a buffer and a stride.
+    #[inline]
+    pub const fn new(data: B, stride: u32) -> Self {
+        Self { data, stride }
+    }
+
+    /// Returns the stride in bytes.
+    #[inline]
+    pub const fn stride(&self) -> u32 {
+        self.stride
+    }
+
+    /// Borrows the underlying buffer.
+    #[inline]
+    pub const fn data(&self) -> &B {
+        &self.data
+    }
+
+    /// Mutably borrows the underlying buffer.
+    #[inline]
+    pub fn data_mut(&mut self) -> &mut B {
+        &mut self.data
+    }
+
+    /// Consumes the plane and returns the underlying buffer.
+    #[inline]
+    pub fn into_data(self) -> B {
+        self.data
+    }
+
+    /// Sets the stride (consuming builder).
+    #[inline]
+    pub const fn with_stride(mut self, stride: u32) -> Self {
+        self.stride = stride;
+        self
+    }
+
+    /// Sets the stride in place.
+    #[inline]
+    pub const fn set_stride(&mut self, stride: u32) -> &mut Self {
+        self.stride = stride;
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,5 +168,31 @@ mod tests {
     fn rect_const_construction() {
         const R: Rect = Rect::new(0, 0, 1920, 1080);
         assert_eq!(R.width(), 1920);
+    }
+
+    #[test]
+    fn plane_construct_and_access_borrowed() {
+        let buf: [u8; 4] = [1, 2, 3, 4];
+        let p: Plane<&[u8]> = Plane::new(&buf, 4);
+        assert_eq!(p.stride(), 4);
+        assert_eq!(p.data(), &&buf[..]);
+    }
+
+    #[test]
+    fn plane_with_and_set_stride() {
+        let buf: [u8; 0] = [];
+        let p = Plane::new(&buf[..], 16).with_stride(32);
+        assert_eq!(p.stride(), 32);
+        let mut p2 = p;
+        p2.set_stride(64);
+        assert_eq!(p2.stride(), 64);
+    }
+
+    #[test]
+    fn plane_into_data() {
+        let buf: [u8; 4] = [1, 2, 3, 4];
+        let p: Plane<&[u8]> = Plane::new(&buf, 4);
+        let recovered = p.into_data();
+        assert_eq!(recovered, &buf[..]);
     }
 }
