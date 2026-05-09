@@ -1,4 +1,4 @@
-name: loc 
+name: loc
 
 on:
   push:
@@ -24,35 +24,40 @@ on:
 jobs:
   loc:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - { dir: mediadecode,        gist_file: mediadecode }
+          - { dir: mediadecode-ffmpeg, gist_file: mediadecode-ffmpeg }
+          - { dir: .,                  gist_file: mediadecode-root }
+    name: loc (${{ matrix.target.gist_file }})
     steps:
       - uses: actions/checkout@v6
 
       - name: Install Rust
-        run: |
-          rustup update stable && rustup default stable
-          rustup component add clippy
-          rustup component add rustfmt
-      
+        run: rustup update stable && rustup default stable
+
       - name: Install tokeit
-        run: |
-          cargo install tokeit --force
-      
+        run: cargo install tokeit --force
+
       - name: Count total lines of code
-        run: |
-          tokeit --lang rust
+        run: tokeit --lang rust
+        working-directory: ${{ matrix.target.dir }}
+
       - name: Upload total loc to GitHub Gist
         uses: actions/github-script@v9
+        env:
+          TOKEIT_FILE: ${{ matrix.target.dir }}/tokeit.json
+          GIST_FILE:   ${{ matrix.target.gist_file }}
         with:
           github-token: ${{ secrets.GIST_PAT }}
           script: |
             const fs = require('fs');
-            const output = fs.readFileSync('tokeit.json', 'utf8');
-            const gistId = '327b2a8aef9003246e45c6e47fe63937';
+            const output = fs.readFileSync(process.env.TOKEIT_FILE, 'utf8');
             await github.rest.gists.update({
-              gist_id: gistId,
+              gist_id: '327b2a8aef9003246e45c6e47fe63937',
               files: {
-                "template-rs": {
-                  content: output
-                }
+                [process.env.GIST_FILE]: { content: output }
               }
             });

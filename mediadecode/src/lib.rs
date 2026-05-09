@@ -1,15 +1,4 @@
-//! Generic, no_std-friendly type-and-trait spine for media decoders.
-//!
-//! This crate provides a unified vocabulary of `Packet` / `Frame` types
-//! and `Adapter` / `Decoder` traits that concrete decoder backends
-//! (FFmpeg, WebCodecs, RED R3D, Blackmagic BRAW, ARRIRAW, Sony X-OCN,
-//! Apple ProRes RAW, Canon Cinema RAW Light, …) implement. No decoder
-//! implementation lives here; backend crates depend on this crate and
-//! emit the unified types.
-//!
-//! See `docs/superpowers/specs/2026-05-08-mediadecode-design.md` for
-//! the full design.
-
+#![doc = include_str!("../README.md")]
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(docsrs, allow(unused_attributes))]
