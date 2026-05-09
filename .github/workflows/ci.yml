@@ -37,7 +37,16 @@ jobs:
     - name: Check formatting
       run: cargo fmt --all -- --check
 
-  # Apply clippy lints
+  # Apply clippy lints. Only macOS runs against the whole workspace —
+  # Homebrew ships FFmpeg ≥ 7 with `pkg-config` files included, which
+  # ffmpeg-next 8.1 needs to enable its `ffmpeg_7_0` code path (the
+  # one our `channel_layout::audio_channel_layout_from_raw_ptr` is
+  # written against). Linux apt ships FFmpeg 6.1.1 in the Ubuntu
+  # 24.04 archive — the available 7+ PPAs are either private/donor
+  # (savoury1/ffmpeg7) or out of date — and Windows would need a
+  # vcpkg build. So we run Linux + Windows clippy on `mediadecode`
+  # only and rely on macOS for full-workspace coverage of the
+  # FFmpeg adapter.
   clippy:
     name: clippy
     strategy:
@@ -49,15 +58,25 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
     - uses: actions/checkout@v6
+    - name: Install FFmpeg (macOS)
+      if: runner.os == 'macOS'
+      run: brew install ffmpeg pkg-config
     - name: Install Rust
       # --no-self-update is necessary because the windows environment cannot self-update rustup.exe.
       run: rustup update stable --no-self-update && rustup default stable && rustup component add clippy
     - name: Install cargo-hack
       run: cargo install cargo-hack
-    - name: Apply clippy lints
+    - name: Apply clippy lints (macOS, full workspace)
+      if: runner.os == 'macOS'
       run: cargo hack clippy --each-feature --exclude-no-default-features
+    - name: Apply clippy lints (Linux / Windows, mediadecode only)
+      if: runner.os != 'macOS'
+      run: cargo hack clippy -p mediadecode --each-feature --exclude-no-default-features
 
-  # Run tests on some extra platforms
+  # Run tests on some extra platforms. Only the pure-Rust `mediadecode`
+  # crate is built here — `mediadecode-ffmpeg` requires linkable
+  # FFmpeg system libraries that aren't easy to cross-compile to
+  # WASM / Android / non-host Linux targets.
   cross:
     name: cross
     strategy:
@@ -93,10 +112,10 @@ jobs:
             ${{ runner.os }}-cross-
       - name: Install Rust
         run: rustup update stable && rustup default stable
-      - name: cargo build --target ${{ matrix.target }}
+      - name: cargo build -p mediadecode --target ${{ matrix.target }}
         run: |
           rustup target add ${{ matrix.target }}
-          cargo build --target ${{ matrix.target }}
+          cargo build -p mediadecode --target ${{ matrix.target }}
 
   build:
     name: build
@@ -119,13 +138,20 @@ jobs:
         key: ${{ runner.os }}-build-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: |
           ${{ runner.os }}-build-
+    - name: Install FFmpeg (macOS)
+      if: runner.os == 'macOS'
+      run: brew install ffmpeg pkg-config
     - name: Install Rust
       # --no-self-update is necessary because the windows environment cannot self-update rustup.exe.
       run: rustup update stable --no-self-update && rustup default stable
     - name: Install cargo-hack
       run: cargo install cargo-hack
-    - name: Run build
+    - name: Run build (macOS, full workspace)
+      if: runner.os == 'macOS'
       run: cargo hack build --feature-powerset --exclude-no-default-features
+    - name: Run build (Linux / Windows, mediadecode only)
+      if: runner.os != 'macOS'
+      run: cargo hack build -p mediadecode --feature-powerset --exclude-no-default-features
 
   test:
     name: test
@@ -148,14 +174,24 @@ jobs:
         key: ${{ runner.os }}-test-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: |
           ${{ runner.os }}-test-
+    - name: Install FFmpeg (macOS)
+      if: runner.os == 'macOS'
+      run: brew install ffmpeg pkg-config
     - name: Install Rust
       # --no-self-update is necessary because the windows environment cannot self-update rustup.exe.
       run: rustup update stable --no-self-update && rustup default stable
     - name: Install cargo-hack
       run: cargo install cargo-hack
-    - name: Run test
-      run: cargo hack test --feature-powerset --exclude-no-default-features --exclude-features loom
+    - name: Run test (macOS, full workspace)
+      if: runner.os == 'macOS'
+      run: cargo hack test --feature-powerset --exclude-no-default-features
+    - name: Run test (Linux / Windows, mediadecode only)
+      if: runner.os != 'macOS'
+      run: cargo hack test -p mediadecode --feature-powerset --exclude-no-default-features
 
+  # Sanitizers run against `mediadecode` only. The `mediadecode-ffmpeg`
+  # adapter pulls in FFmpeg's C libraries which aren't instrumented
+  # and would generate uninteresting noise (especially MSAN/TSAN).
   sanitizer:
     name: sanitizer
     runs-on: ubuntu-latest
@@ -178,6 +214,8 @@ jobs:
       - name: ASAN / LSAN / MSAN / TSAN
         run: bash ci/sanitizer.sh
 
+  # Miri runs against `mediadecode` only — `mediadecode-ffmpeg` calls
+  # FFmpeg's C library through FFI, which Miri cannot interpret.
   miri-tb:
     name: miri-tb-${{ matrix.target }}
     strategy:
@@ -250,32 +288,6 @@ jobs:
         run: |
           bash ci/miri_sb.sh "${{ matrix.target }}"
 
-  loom:
-    name: loom
-    strategy:
-      matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
-          - windows-latest
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v6
-      - name: Cache cargo build and registry
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-loom-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-loom-
-      - name: Install Rust
-        run: rustup update nightly --no-self-update && rustup default nightly
-      - name: Loom tests
-        run: cargo test --tests --features loom
-
   # valgrind:
   #   name: valgrind
   #   runs-on: ubuntu-latest
@@ -305,6 +317,10 @@ jobs:
   #     #   run: valgrind --error-exitcode=1 --leak-check=full --show-leak-kinds=all ./target/debug/foo
   #     #   working-directory: integration
 
+  # Coverage runs on Linux against `mediadecode` only. Same FFmpeg-on-Linux
+  # rationale as `clippy` / `build` / `test` — Ubuntu's archive
+  # FFmpeg is too old for ffmpeg-next 8.1's new-AVChannelLayout
+  # path; the FFmpeg adapter's coverage is taken from macOS test runs.
   coverage:
     name: coverage
     runs-on: ubuntu-latest
@@ -315,7 +331,6 @@ jobs:
       - cross
       - test
       - sanitizer
-      - loom
     steps:
       - uses: actions/checkout@v6
       - name: Install Rust
@@ -335,7 +350,7 @@ jobs:
       - name: Run tarpaulin
         env:
           RUSTFLAGS: "--cfg tarpaulin"
-        run: cargo tarpaulin --all-features --run-types tests --run-types doctests --workspace --out xml
+        run: cargo tarpaulin -p mediadecode --all-features --run-types tests --run-types doctests --out xml
       - name: Upload to codecov.io
         uses: codecov/codecov-action@v6
         with:

@@ -35,4 +35,7 @@ cargo miri setup
 
 export MIRIFLAGS="-Zmiri-strict-provenance -Zmiri-disable-isolation -Zmiri-symbolic-alignment-check"
 
-cargo miri test --all-targets --target "$TARGET"
+# `mediadecode-ffmpeg` calls FFmpeg's C library through FFI, which
+# Miri can't interpret. Run Miri only against the pure-Rust core
+# crate `mediadecode`.
+cargo miri test -p mediadecode --all-targets --target "$TARGET"
