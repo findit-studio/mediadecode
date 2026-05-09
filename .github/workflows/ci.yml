@@ -37,11 +37,16 @@ jobs:
     - name: Check formatting
       run: cargo fmt --all -- --check
 
-  # Apply clippy lints. Linux + macOS run against the whole workspace
-  # (FFmpeg dev libs are easy to install via apt / brew); Windows
-  # excludes `mediadecode-ffmpeg` because the FFmpeg dev-libs +
-  # pkg-config setup on Windows is invasive (vcpkg, half-hour build)
-  # and the FFmpeg adapter is best validated on Linux / macOS.
+  # Apply clippy lints. Only macOS runs against the whole workspace —
+  # Homebrew ships FFmpeg ≥ 7 with `pkg-config` files included, which
+  # ffmpeg-next 8.1 needs to enable its `ffmpeg_7_0` code path (the
+  # one our `channel_layout::audio_channel_layout_from_raw_ptr` is
+  # written against). Linux apt ships FFmpeg 6.1.1 in the Ubuntu
+  # 24.04 archive — the available 7+ PPAs are either private/donor
+  # (savoury1/ffmpeg7) or out of date — and Windows would need a
+  # vcpkg build. So we run Linux + Windows clippy on `mediadecode`
+  # only and rely on macOS for full-workspace coverage of the
+  # FFmpeg adapter.
   clippy:
     name: clippy
     strategy:
@@ -53,25 +58,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
     - uses: actions/checkout@v6
-    - name: Install FFmpeg 7 (Linux)
-      if: runner.os == 'Linux'
-      # Ubuntu 24.04's archive ships FFmpeg 6.1.1; ffmpeg-next 8.1
-      # selects its `legacy_channel_layout.rs` (a `bitflags!` `ChannelLayout`)
-      # for any FFmpeg < 7.0 via the `not(feature = "ffmpeg_7_0")`
-      # `cfg_attr(path = …)` switch, which omits the
-      # `_22POINT2` / `_7POINT2POINT3` / `_9POINT1POINT4_BACK` /
-      # `_7POINT1_TOP_BACK` constants this crate maps. Use the
-      # `savoury1/ffmpeg7` PPA to pull FFmpeg 7.x dev libs so
-      # `ffmpeg_7_0` gets auto-enabled by ffmpeg-next's build
-      # script. macOS Homebrew already ships FFmpeg ≥ 7.
-      run: |
-        sudo add-apt-repository -y ppa:savoury1/ffmpeg7
-        sudo apt-get update
-        sudo apt-get install -y --no-install-recommends \
-          pkg-config \
-          libavcodec-dev libavformat-dev libavutil-dev \
-          libavdevice-dev libavfilter-dev \
-          libswscale-dev libswresample-dev
     - name: Install FFmpeg (macOS)
       if: runner.os == 'macOS'
       run: brew install ffmpeg pkg-config
@@ -80,11 +66,11 @@ jobs:
       run: rustup update stable --no-self-update && rustup default stable && rustup component add clippy
     - name: Install cargo-hack
       run: cargo install cargo-hack
-    - name: Apply clippy lints (Linux / macOS)
-      if: runner.os != 'Windows'
+    - name: Apply clippy lints (macOS, full workspace)
+      if: runner.os == 'macOS'
       run: cargo hack clippy --each-feature --exclude-no-default-features
-    - name: Apply clippy lints (Windows, mediadecode only)
-      if: runner.os == 'Windows'
+    - name: Apply clippy lints (Linux / Windows, mediadecode only)
+      if: runner.os != 'macOS'
       run: cargo hack clippy -p mediadecode --each-feature --exclude-no-default-features
 
   # Run tests on some extra platforms. Only the pure-Rust `mediadecode`
@@ -152,25 +138,6 @@ jobs:
         key: ${{ runner.os }}-build-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: |
           ${{ runner.os }}-build-
-    - name: Install FFmpeg 7 (Linux)
-      if: runner.os == 'Linux'
-      # Ubuntu 24.04's archive ships FFmpeg 6.1.1; ffmpeg-next 8.1
-      # selects its `legacy_channel_layout.rs` (a `bitflags!` `ChannelLayout`)
-      # for any FFmpeg < 7.0 via the `not(feature = "ffmpeg_7_0")`
-      # `cfg_attr(path = …)` switch, which omits the
-      # `_22POINT2` / `_7POINT2POINT3` / `_9POINT1POINT4_BACK` /
-      # `_7POINT1_TOP_BACK` constants this crate maps. Use the
-      # `savoury1/ffmpeg7` PPA to pull FFmpeg 7.x dev libs so
-      # `ffmpeg_7_0` gets auto-enabled by ffmpeg-next's build
-      # script. macOS Homebrew already ships FFmpeg ≥ 7.
-      run: |
-        sudo add-apt-repository -y ppa:savoury1/ffmpeg7
-        sudo apt-get update
-        sudo apt-get install -y --no-install-recommends \
-          pkg-config \
-          libavcodec-dev libavformat-dev libavutil-dev \
-          libavdevice-dev libavfilter-dev \
-          libswscale-dev libswresample-dev
     - name: Install FFmpeg (macOS)
       if: runner.os == 'macOS'
       run: brew install ffmpeg pkg-config
@@ -179,11 +146,11 @@ jobs:
       run: rustup update stable --no-self-update && rustup default stable
     - name: Install cargo-hack
       run: cargo install cargo-hack
-    - name: Run build (Linux / macOS)
-      if: runner.os != 'Windows'
+    - name: Run build (macOS, full workspace)
+      if: runner.os == 'macOS'
       run: cargo hack build --feature-powerset --exclude-no-default-features
-    - name: Run build (Windows, mediadecode only)
-      if: runner.os == 'Windows'
+    - name: Run build (Linux / Windows, mediadecode only)
+      if: runner.os != 'macOS'
       run: cargo hack build -p mediadecode --feature-powerset --exclude-no-default-features
 
   test:
@@ -207,25 +174,6 @@ jobs:
         key: ${{ runner.os }}-test-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: |
           ${{ runner.os }}-test-
-    - name: Install FFmpeg 7 (Linux)
-      if: runner.os == 'Linux'
-      # Ubuntu 24.04's archive ships FFmpeg 6.1.1; ffmpeg-next 8.1
-      # selects its `legacy_channel_layout.rs` (a `bitflags!` `ChannelLayout`)
-      # for any FFmpeg < 7.0 via the `not(feature = "ffmpeg_7_0")`
-      # `cfg_attr(path = …)` switch, which omits the
-      # `_22POINT2` / `_7POINT2POINT3` / `_9POINT1POINT4_BACK` /
-      # `_7POINT1_TOP_BACK` constants this crate maps. Use the
-      # `savoury1/ffmpeg7` PPA to pull FFmpeg 7.x dev libs so
-      # `ffmpeg_7_0` gets auto-enabled by ffmpeg-next's build
-      # script. macOS Homebrew already ships FFmpeg ≥ 7.
-      run: |
-        sudo add-apt-repository -y ppa:savoury1/ffmpeg7
-        sudo apt-get update
-        sudo apt-get install -y --no-install-recommends \
-          pkg-config \
-          libavcodec-dev libavformat-dev libavutil-dev \
-          libavdevice-dev libavfilter-dev \
-          libswscale-dev libswresample-dev
     - name: Install FFmpeg (macOS)
       if: runner.os == 'macOS'
       run: brew install ffmpeg pkg-config
@@ -234,11 +182,11 @@ jobs:
       run: rustup update stable --no-self-update && rustup default stable
     - name: Install cargo-hack
       run: cargo install cargo-hack
-    - name: Run test (Linux / macOS)
-      if: runner.os != 'Windows'
+    - name: Run test (macOS, full workspace)
+      if: runner.os == 'macOS'
       run: cargo hack test --feature-powerset --exclude-no-default-features
-    - name: Run test (Windows, mediadecode only)
-      if: runner.os == 'Windows'
+    - name: Run test (Linux / Windows, mediadecode only)
+      if: runner.os != 'macOS'
       run: cargo hack test -p mediadecode --feature-powerset --exclude-no-default-features
 
   # Sanitizers run against `mediadecode` only. The `mediadecode-ffmpeg`
@@ -369,6 +317,10 @@ jobs:
   #     #   run: valgrind --error-exitcode=1 --leak-check=full --show-leak-kinds=all ./target/debug/foo
   #     #   working-directory: integration
 
+  # Coverage runs on Linux against `mediadecode` only. Same FFmpeg-on-Linux
+  # rationale as `clippy` / `build` / `test` — Ubuntu's archive
+  # FFmpeg is too old for ffmpeg-next 8.1's new-AVChannelLayout
+  # path; the FFmpeg adapter's coverage is taken from macOS test runs.
   coverage:
     name: coverage
     runs-on: ubuntu-latest
@@ -381,18 +333,6 @@ jobs:
       - sanitizer
     steps:
       - uses: actions/checkout@v6
-      - name: Install FFmpeg 7
-        # See `clippy.Install FFmpeg 7 (Linux)` for the rationale —
-        # the `savoury1/ffmpeg7` PPA gives us FFmpeg 7.x dev libs
-        # so ffmpeg-next 8.1 picks the new-AVChannelLayout path.
-        run: |
-          sudo add-apt-repository -y ppa:savoury1/ffmpeg7
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            pkg-config \
-            libavcodec-dev libavformat-dev libavutil-dev \
-            libavdevice-dev libavfilter-dev \
-            libswscale-dev libswresample-dev
       - name: Install Rust
         run: rustup update nightly && rustup default nightly
       - name: Install cargo-tarpaulin
@@ -410,7 +350,7 @@ jobs:
       - name: Run tarpaulin
         env:
           RUSTFLAGS: "--cfg tarpaulin"
-        run: cargo tarpaulin --all-features --run-types tests --run-types doctests --workspace --out xml
+        run: cargo tarpaulin -p mediadecode --all-features --run-types tests --run-types doctests --out xml
       - name: Upload to codecov.io
         uses: codecov/codecov-action@v6
         with:
