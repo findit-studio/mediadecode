@@ -17,7 +17,7 @@ use mediadecode::{
   decoder::{
     AudioFrameSource, AudioStreamDecoder, SubtitleDecoder, VideoFrameSource, VideoStreamDecoder,
   },
-  frame::{AudioFrame, Plane, Rect, SubtitleFrame, VideoFrame},
+  frame::{AudioFrame, Dimensions, Plane, Rect, SubtitleFrame, VideoFrame},
   packet::{AudioPacket, PacketFlags, SubtitlePacket, VideoPacket},
   subtitle::SubtitlePayload,
 };
@@ -190,7 +190,7 @@ fn video_stream_round_trip() {
   ];
   // VideoFrame<P, E, D>: P=u32 (Loop's PixelFormat), E=Loop, D=&[u8].
   let mut dst: VideoFrame<u32, (), &'static [u8]> =
-    VideoFrame::new(2, 2, /*pix_fmt=*/ 0u32, planes, 1, ())
+    VideoFrame::new(Dimensions::new(2, 2), /*pix_fmt=*/ 0u32, planes, 1, ())
       .with_visible_rect(Some(Rect::new(0, 0, 2, 2)))
       .with_color(
         ColorInfo::UNSPECIFIED
@@ -226,7 +226,8 @@ fn video_source_round_trip() {
     Plane::new(&b""[..], 0),
     Plane::new(&b""[..], 0),
   ];
-  let mut dst: VideoFrame<u32, (), &'static [u8]> = VideoFrame::new(64, 64, 0u32, planes, 1, ());
+  let mut dst: VideoFrame<u32, (), &'static [u8]> =
+    VideoFrame::new(Dimensions::new(64, 64), 0u32, planes, 1, ());
   assert!(src.decode_frame(0, &mut dst).is_err());
 }
 

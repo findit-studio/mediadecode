@@ -1,0 +1,85 @@
+[package]
+name        = "mediadecode-webcodecs"
+version     = "0.0.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+homepage.workspace     = true
+documentation = "https://docs.rs/mediadecode-webcodecs"
+description = "WebCodecs adapter for the `mediadecode` abstraction layer — implements its `VideoAdapter` / `AudioAdapter` traits on top of the browser's WebCodecs API via `web-sys`, for `wasm32` targets."
+keywords      = ["webcodecs", "decoder", "video", "wasm", "mediadecode"]
+categories    = ["multimedia", "multimedia::video", "multimedia::audio", "wasm"]
+
+[features]
+default = ["std"]
+# `mediadecode/alloc` is pinned via the dep features below
+# (the adapter uses `AudioChannelLayout` / alloc-gated types
+# unconditionally), so the `alloc` feature here is a
+# compatibility no-op. Same shape as `mediadecode-ffmpeg`.
+std     = ["mediadecode/default"]
+alloc   = []
+
+# Browser-only crate. The dependency tree only resolves on `wasm32` —
+# native builds get an empty crate so the workspace `cargo build`
+# still succeeds outside the browser. `mediadecode/future` is
+# always-on: WebCodecs is fundamentally async + `!Send` (every
+# future holds a `JsValue`), so the adapter implements only the
+# async (`mediadecode::future::local`) variants of the decoder
+# traits, not the sync ones.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+mediadecode    = { workspace = true, features = ["alloc", "future"] }
+wasm-bindgen   = { workspace = true }
+js-sys         = { workspace = true }
+web-sys        = { workspace = true, features = [
+  # Codec surface
+  "VideoDecoder",
+  "VideoDecoderInit",
+  "VideoDecoderConfig",
+  "VideoDecoderSupport",
+  "VideoFrame",
+  "VideoFrameInit",
+  "VideoFrameCopyToOptions",
+  "VideoPixelFormat",
+  "VideoColorSpace",
+  "VideoColorPrimaries",
+  "VideoTransferCharacteristics",
+  "VideoMatrixCoefficients",
+  "PlaneLayout",
+  "EncodedVideoChunk",
+  "EncodedVideoChunkInit",
+  "EncodedVideoChunkType",
+  "AudioDecoder",
+  "AudioDecoderInit",
+  "AudioDecoderConfig",
+  "AudioDecoderSupport",
+  "AudioData",
+  "AudioDataInit",
+  "AudioDataCopyToOptions",
+  "AudioSampleFormat",
+  "EncodedAudioChunk",
+  "EncodedAudioChunkInit",
+  "EncodedAudioChunkType",
+  # Misc browser plumbing
+  "DomException",
+  "DomRectInit",
+  "DomRectReadOnly",
+] }
+wasm-bindgen-futures = { workspace = true }
+futures-channel      = { workspace = true }
+thiserror            = { workspace = true }
+
+# Wasm-only because `cargo test --target wasm32` resolves these too;
+# native `cargo check` skips them via the `cfg(target_arch = "wasm32")`
+# gate above.
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+default-target = "wasm32-unknown-unknown"
+targets = ["wasm32-unknown-unknown"]
+rustdoc-args = ["--cfg", "docsrs"]

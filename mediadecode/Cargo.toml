@@ -16,6 +16,12 @@ default = ["std"]
 alloc   = ["smol_str"]
 std     = ["mediatime/default", "smol_str/default"]
 
+# Async-fn-in-trait variants of the decoder traits, exposed under
+# `mediadecode::future`. No runtime dependency — only a proc-macro
+# (`trait-variant`) used to generate the `Send`-bounded sibling of
+# each `!Send` trait. Callers pick their own executor.
+future = ["dep:trait-variant"]
+
 serde      = ["dep:serde", "mediatime/serde", "bitflags/serde"]
 arbitrary  = ["dep:arbitrary", "mediatime/arbitrary", "smol_str?/arbitrary"]
 quickcheck = ["dep:quickcheck", "mediatime/quickcheck"]
@@ -30,6 +36,8 @@ smol_str    = { workspace = true, optional = true }
 serde      = { workspace = true, optional = true }
 arbitrary  = { workspace = true, optional = true }
 quickcheck = { workspace = true, optional = true }
+
+trait-variant = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

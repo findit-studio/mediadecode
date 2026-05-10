@@ -51,7 +51,7 @@ Output frames are CPU-side, downloaded with `av_hwframe_transfer_data`
 
 If every HW backend opens but later fails at decode time and the
 software backend is also unavailable, the error surfaces as
-`VideoDecodeError::AllBackendsFailed { unconsumed_packets, .. }`
+`VideoDecodeError::Decode(Error::AllBackendsFailed { unconsumed_packets, .. })`
 carrying any packets the decoder had already accepted from the demuxer
 — so non-seekable callers (live streams, pipes, network sources) can
 replay them through their own software decoder without re-demuxing.
@@ -63,8 +63,8 @@ use ffmpeg_next as ffmpeg;
 use ffmpeg::{format, media};
 use mediadecode::{Timebase, decoder::VideoStreamDecoder};
 use mediadecode_ffmpeg::{
-  FfmpegVideoStreamDecoder, empty_video_frame, video_packet_from_ffmpeg,
-  VideoDecodeError,
+  Error as FfmpegError, FfmpegVideoStreamDecoder, VideoDecodeError,
+  empty_video_frame, video_packet_from_ffmpeg,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -76,13 +76,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   let stream_index = stream.index();
   let time_base = Timebase::new(
     stream.time_base().numerator() as u32,
-    stream.time_base().denominator() as u32,
+    std::num::NonZeroU32::new(stream.time_base().denominator() as u32).unwrap(),
   );
 
   // Probes HW backends in order, falls back to software.
   let mut decoder = match FfmpegVideoStreamDecoder::open(stream.parameters(), time_base) {
     Ok(d) => d,
-    Err(VideoDecodeError::AllBackendsFailed { unconsumed_packets, .. }) => {
+    Err(FfmpegError::AllBackendsFailed { unconsumed_packets, .. }) => {
       // No backend at all could open this stream — including software.
       // `unconsumed_packets` is empty at open-time. Caller decides.
       let _ = unconsumed_packets;
@@ -90,7 +90,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     Err(e) => return Err(e.into()),
   };
-  println!("backend = {:?}", decoder.backend());
 
   let mut frame = empty_video_frame();
   for (s, av_packet) in input.packets() {
@@ -99,7 +98,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match decoder.send_packet(&pkt) {
       Ok(()) => {}
-      Err(VideoDecodeError::AllBackendsFailed { unconsumed_packets, .. }) => {
+      Err(VideoDecodeError::Decode(FfmpegError::AllBackendsFailed {
+        unconsumed_packets, ..
+      })) => {
         // Runtime exhaustion: rescued packets are the bytes the decoder
         // already consumed from `input`. Replay them through your own
         // software decoder before the current packet so non-seekable
@@ -118,15 +119,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   while decoder.receive_frame(&mut frame).is_ok() { /* drain */ }
   Ok(())
 }
-```
-
-To pin a specific HW backend (no probe):
-
-```rust
-use mediadecode_ffmpeg::{Backend, FfmpegVideoStreamDecoder};
-let decoder = FfmpegVideoStreamDecoder::open_with(
-  parameters, time_base, Backend::VideoToolbox,
-)?;
 ```
 
 Audio and subtitle decoding share the shape — see

@@ -39,6 +39,10 @@ pub mod packet;
 pub mod pixel_format;
 pub mod subtitle;
 
+#[cfg(feature = "future")]
+#[cfg_attr(docsrs, doc(cfg(feature = "future")))]
+pub mod future;
+
 pub use pixel_format::PixelFormat;
 
 // Re-export the time primitives so consumers don't have to add a

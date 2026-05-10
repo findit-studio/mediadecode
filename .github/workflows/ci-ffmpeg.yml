@@ -1,0 +1,152 @@
+name: CI / mediadecode-ffmpeg
+
+# Triggered by changes to either the FFmpeg adapter, the core
+# crate it adapts (since core changes can break the adapter), or
+# shared workspace files. macOS-only — Homebrew ships FFmpeg ≥ 7
+# with `pkg-config` files included, which `ffmpeg-next` 8.1 needs
+# to enable its `ffmpeg_7_0` code path. Ubuntu's archive FFmpeg
+# is 6.1.1 and Windows would need a vcpkg build.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'mediadecode/**'
+      - 'mediadecode-ffmpeg/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'ci/**'
+      - '.github/workflows/ci-ffmpeg.yml'
+  pull_request:
+    paths:
+      - 'mediadecode/**'
+      - 'mediadecode-ffmpeg/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'ci/**'
+      - '.github/workflows/ci-ffmpeg.yml'
+  workflow_dispatch:
+  schedule:
+    - cron: "0 1 1 * *"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+  RUST_BACKTRACE: 1
+
+jobs:
+  rustfmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+    - name: Install Rust
+      run: rustup update stable && rustup default stable && rustup component add rustfmt
+    - name: Check formatting
+      run: cargo fmt -p mediadecode-ffmpeg -- --check
+
+  clippy:
+    name: clippy
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v6
+    - name: Install FFmpeg
+      run: brew install ffmpeg pkg-config
+    - name: Install Rust
+      run: rustup update stable && rustup default stable && rustup component add clippy
+    - name: Install cargo-hack
+      run: cargo install cargo-hack
+    - name: Apply clippy lints
+      run: cargo hack clippy -p mediadecode-ffmpeg --each-feature --exclude-no-default-features
+
+  build:
+    name: build
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v6
+    - name: Cache cargo build and registry
+      uses: actions/cache@v5
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-ffmpeg-build-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-ffmpeg-build-
+    - name: Install FFmpeg
+      run: brew install ffmpeg pkg-config
+    - name: Install Rust
+      run: rustup update stable && rustup default stable
+    - name: Install cargo-hack
+      run: cargo install cargo-hack
+    - name: Run build
+      run: cargo hack build -p mediadecode-ffmpeg --feature-powerset --exclude-no-default-features
+
+  test:
+    name: test
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        # Audio fixtures live at `tests/fixtures/audio/` as a
+        # submodule pointing at `findit-ai/audio-fixtures`.
+        submodules: recursive
+    - name: Cache cargo build and registry
+      uses: actions/cache@v5
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-ffmpeg-test-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-ffmpeg-test-
+    - name: Install FFmpeg
+      run: brew install ffmpeg pkg-config
+    - name: Install Rust
+      run: rustup update stable && rustup default stable
+    - name: Install cargo-hack
+      run: cargo install cargo-hack
+    - name: Run test
+      run: cargo hack test -p mediadecode-ffmpeg --feature-powerset --exclude-no-default-features
+
+  coverage:
+    name: coverage
+    runs-on: macos-latest
+    needs: [rustfmt, clippy, build, test]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # Audio fixtures live at `tests/fixtures/audio/` as a
+          # submodule pointing at `findit-ai/audio-fixtures`.
+          # `audio_pcm_fixtures` walks the tree and panics on
+          # missing files, so tarpaulin needs them too — the
+          # `test` job above already runs with submodules.
+          submodules: recursive
+      - name: Install FFmpeg
+        run: brew install ffmpeg pkg-config
+      - name: Install Rust
+        run: rustup update nightly && rustup default nightly
+      - name: Install cargo-tarpaulin
+        run: cargo install cargo-tarpaulin
+      - name: Cache cargo build and registry
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-ffmpeg-coverage-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-ffmpeg-coverage-
+      - name: Run tarpaulin
+        env:
+          RUSTFLAGS: "--cfg tarpaulin"
+        run: cargo tarpaulin -p mediadecode-ffmpeg --all-features --run-types tests --run-types doctests --out xml
+      - name: Upload to codecov.io
+        uses: codecov/codecov-action@v6
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          slug: ${{ github.repository }}
+          fail_ci_if_error: true
+          flags: mediadecode-ffmpeg

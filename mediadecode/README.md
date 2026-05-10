@@ -93,7 +93,6 @@ crates. A backend-agnostic consumer programs against the traits:
 
 ```rust,no_run
 use mediadecode::{
-  Timebase,
   decoder::VideoStreamDecoder,
   frame::VideoFrame,
   packet::VideoPacket,
@@ -101,8 +100,15 @@ use mediadecode::{
 
 fn decode_one<D: VideoStreamDecoder>(
   decoder: &mut D,
-  packet: &VideoPacket<<D::Adapter as mediadecode::adapter::VideoAdapter>::PacketExtra, D::Buffer>,
-  dst:    &mut VideoFrame<<D::Adapter as mediadecode::adapter::VideoAdapter>::FrameExtra, D::Buffer>,
+  packet: &VideoPacket<
+    <D::Adapter as mediadecode::adapter::VideoAdapter>::PacketExtra,
+    D::Buffer,
+  >,
+  dst: &mut VideoFrame<
+    <D::Adapter as mediadecode::adapter::VideoAdapter>::PixelFormat,
+    <D::Adapter as mediadecode::adapter::VideoAdapter>::FrameExtra,
+    D::Buffer,
+  >,
 ) -> Result<(), D::Error> {
   decoder.send_packet(packet)?;
   decoder.receive_frame(dst)

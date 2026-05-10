@@ -1,0 +1,15 @@
+# `web-sys` gates the WebCodecs APIs (`VideoDecoder`, `AudioDecoder`,
+# `VideoFrame`, `AudioData`, …) behind `--cfg web_sys_unstable_apis`
+# because the WebIDL is not yet stable across all browsers. Set the
+# flag for any wasm32 build so `mediadecode-webcodecs` compiles.
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg=web_sys_unstable_apis"]
+
+[target.wasm32-unknown-emscripten]
+rustflags = ["--cfg=web_sys_unstable_apis"]
+
+[target.wasm32-wasip1]
+rustflags = ["--cfg=web_sys_unstable_apis"]
+
+[target.wasm32-wasip2]
+rustflags = ["--cfg=web_sys_unstable_apis"]

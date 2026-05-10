@@ -6,6 +6,92 @@
 
 use crate::{Timestamp, color::ColorInfo, subtitle::SubtitlePayload};
 
+/// A `(width, height)` pair in pixels.
+///
+/// Lives alongside the rest of the frame primitives in this module
+/// because the same pair shows up everywhere a video stream is
+/// described — the coded dimensions of a [`VideoFrame`], the
+/// `coded_*` parameters a backend adapter takes when opening a
+/// decoder, the per-plane layout helpers in the WebCodecs
+/// adapter, etc. Passing it as a single struct rather than two
+/// separate `u32` arguments removes a long-running footgun
+/// (silent argument swap) and gives a natural place to hang
+/// helpers like [`Self::is_zero`] or [`Self::Display`].
+///
+/// `u32` width / height matches WebCodecs' `coded_width` /
+/// `coded_height` typing in `web_sys` and FFmpeg's
+/// `AVCodecContext::width` / `height`. 65535×65535 (the smaller
+/// `u16` packing some adjacent crates use) covers every realistic
+/// resolution; the `u32` choice here keeps the public API plug-
+/// compatible with both adapter typings.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Dimensions {
+  width: u32,
+  height: u32,
+}
+
+impl Dimensions {
+  /// Constructs a `Dimensions` with the specified width and height
+  /// in pixels.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(width: u32, height: u32) -> Self {
+    Self { width, height }
+  }
+
+  /// Returns the width in pixels.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn width(&self) -> u32 {
+    self.width
+  }
+
+  /// Returns the height in pixels.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn height(&self) -> u32 {
+    self.height
+  }
+
+  /// Sets the width (consuming builder).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn with_width(mut self, width: u32) -> Self {
+    self.width = width;
+    self
+  }
+
+  /// Sets the width in place.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn set_width(&mut self, width: u32) -> &mut Self {
+    self.width = width;
+    self
+  }
+
+  /// Sets the height (consuming builder).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn with_height(mut self, height: u32) -> Self {
+    self.height = height;
+    self
+  }
+
+  /// Sets the height in place.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn set_height(&mut self, height: u32) -> &mut Self {
+    self.height = height;
+    self
+  }
+
+  /// Returns `true` when both width and height are zero — typically
+  /// the default-constructed / unset state.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn is_zero(&self) -> bool {
+    self.width == 0 && self.height == 0
+  }
+}
+
+impl core::fmt::Display for Dimensions {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    write!(f, "{}x{}", self.width, self.height)
+  }
+}
+
 /// An axis-aligned integer rectangle.
 ///
 /// Used for `VideoFrame::visible_rect` (FFmpeg crop /
@@ -187,8 +273,7 @@ impl<B> Plane<B> {
 pub struct VideoFrame<P, E, D> {
   pts: Option<Timestamp>,
   duration: Option<Timestamp>,
-  width: u32,
-  height: u32,
+  dimensions: Dimensions,
   visible_rect: Option<Rect>,
   pixel_format: P,
   plane_count: u8,
@@ -200,10 +285,13 @@ pub struct VideoFrame<P, E, D> {
 impl<P, E, D> VideoFrame<P, E, D> {
   /// Constructs a `VideoFrame`. Timestamps default to `None`,
   /// `visible_rect` to `None`, color to `ColorInfo::UNSPECIFIED`.
+  ///
+  /// `dimensions` is the coded width/height pair (see
+  /// [`Dimensions`] and [`Self::dimensions`] for the visible-vs-
+  /// coded distinction).
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new(
-    width: u32,
-    height: u32,
+    dimensions: Dimensions,
     pixel_format: P,
     planes: [Plane<D>; 4],
     plane_count: u8,
@@ -212,8 +300,7 @@ impl<P, E, D> VideoFrame<P, E, D> {
     Self {
       pts: None,
       duration: None,
-      width,
-      height,
+      dimensions,
       visible_rect: None,
       pixel_format,
       plane_count,
@@ -233,15 +320,20 @@ impl<P, E, D> VideoFrame<P, E, D> {
   pub const fn duration(&self) -> Option<Timestamp> {
     self.duration
   }
+  /// Returns the coded dimensions.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn dimensions(&self) -> Dimensions {
+    self.dimensions
+  }
   /// Returns the coded width.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn width(&self) -> u32 {
-    self.width
+    self.dimensions.width()
   }
   /// Returns the coded height.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn height(&self) -> u32 {
-    self.height
+    self.dimensions.height()
   }
   /// Returns the visible / clean-aperture rectangle, if any.
   #[cfg_attr(not(tarpaulin), inline(always))]
@@ -639,10 +731,16 @@ mod tests {
   fn video_frame_construct_and_access() {
     // VideoFrame<P, E, D>: P=u32 (PixelFormat), E=VLoop (adapter ZST),
     // D=&[u8] (plane buffer).
-    let f: VideoFrame<u32, (), &[u8]> =
-      VideoFrame::new(1920, 1080, /*pix_fmt=*/ 0u32, empty_planes(), 1, ());
+    let f: VideoFrame<u32, (), &[u8]> = VideoFrame::new(
+      Dimensions::new(1920, 1080),
+      /*pix_fmt=*/ 0u32,
+      empty_planes(),
+      1,
+      (),
+    );
     assert_eq!(f.width(), 1920);
     assert_eq!(f.height(), 1080);
+    assert_eq!(f.dimensions(), Dimensions::new(1920, 1080));
     assert_eq!(f.plane_count(), 1);
     assert!(f.color().matrix().is_bt_709());
     assert_eq!(f.planes().len(), 1);
@@ -650,7 +748,8 @@ mod tests {
 
   #[test]
   fn video_frame_plane_index_clamped() {
-    let f: VideoFrame<u32, (), &[u8]> = VideoFrame::new(64, 64, 0u32, empty_planes(), 2, ());
+    let f: VideoFrame<u32, (), &[u8]> =
+      VideoFrame::new(Dimensions::new(64, 64), 0u32, empty_planes(), 2, ());
     assert!(f.plane(0).is_some());
     assert!(f.plane(1).is_some());
     assert!(f.plane(2).is_none());
@@ -660,9 +759,10 @@ mod tests {
   #[test]
   fn video_frame_builders_chain() {
     let ci = ColorInfo::UNSPECIFIED.with_matrix(ColorMatrix::Bt2020Ncl);
-    let f: VideoFrame<u32, (), &[u8]> = VideoFrame::new(64, 64, 0u32, empty_planes(), 1, ())
-      .with_color(ci)
-      .with_visible_rect(Some(Rect::new(0, 0, 64, 64)));
+    let f: VideoFrame<u32, (), &[u8]> =
+      VideoFrame::new(Dimensions::new(64, 64), 0u32, empty_planes(), 1, ())
+        .with_color(ci)
+        .with_visible_rect(Some(Rect::new(0, 0, 64, 64)));
     assert!(f.color().matrix().is_bt_2020_ncl());
     assert!(f.visible_rect().is_some());
   }
@@ -711,7 +811,7 @@ mod tests {
     let f: SubtitleFrame<(), &[u8]> = SubtitleFrame::new(payload, ());
     match f.payload() {
       SubtitlePayload::Text { text, .. } => assert_eq!(text, &&b"hi"[..]),
-      #[cfg(feature = "alloc")]
+      #[cfg(any(feature = "std", feature = "alloc"))]
       _ => panic!("unexpected variant"),
     }
   }

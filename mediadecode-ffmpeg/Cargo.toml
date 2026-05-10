@@ -11,8 +11,20 @@ documentation = "https://docs.rs/mediadecode-ffmpeg"
 keywords      = ["ffmpeg", "decoder", "video", "audio", "mediadecode"]
 categories    = ["multimedia", "multimedia::video", "multimedia::audio"]
 
+[features]
+default = ["std"]
+# `std` adds `mediadecode/default` (the core's `std` feature)
+# on top of `mediadecode/alloc` already pinned via dep
+# features below. The adapter unconditionally uses
+# alloc-gated types (`AudioChannelLayout`,
+# `SubtitlePayload::Bitmap`, etc.) so `alloc` cannot be
+# optional — pinning it via the dep features keeps
+# `--no-default-features` builds compiling.
+std     = ["mediadecode/default"]
+alloc   = []
+
 [dependencies]
-mediadecode = { workspace = true, features = ["std"] }
+mediadecode = { workspace = true, features = ["alloc"] }
 ffmpeg-next = { workspace = true }
 smol_str    = { workspace = true }
 thiserror   = { workspace = true }
