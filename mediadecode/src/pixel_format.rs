@@ -231,6 +231,16 @@ pub enum PixelFormat {
   /// Planar 4:4:4 YUVA, 16-bit little-endian.
   #[display("yuva444p16le")]
   Yuva444p16Le = 214,
+  /// Planar 4:2:0 YUVA, 12-bit little-endian
+  /// (`AV_PIX_FMT_YUVA420P12LE`). Discriminant placed after
+  /// the 16-bit block because the 12-bit slot in the original
+  /// 200-series numbering (between 10Le at 206 and the 4:2:2
+  /// 12Le at 209) was already taken by the 4:2:2 / 4:4:4
+  /// 12Le forms; adding a new tail slot keeps existing
+  /// discriminants stable. Surfaced by WebCodecs as the
+  /// `I420AP12` `VideoPixelFormat`.
+  #[display("yuva420p12le")]
+  Yuva420p12Le = 215,
 
   // ===================================================================
   // Semi-planar YUV (NV-family) — 8-bit
@@ -665,6 +675,7 @@ impl PixelFormat {
       212 => Self::Yuva420p16Le,
       213 => Self::Yuva422p16Le,
       214 => Self::Yuva444p16Le,
+      215 => Self::Yuva420p12Le,
       // Semi-planar YUV.
       300 => Self::Nv12,
       301 => Self::Nv21,

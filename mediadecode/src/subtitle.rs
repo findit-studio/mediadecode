@@ -5,7 +5,7 @@
 //! holds a `Vec<BitmapRegion>` (FFmpeg subtitles can carry many
 //! rectangles per frame, so a fixed-size array is impractical).
 
-#[cfg(feature = "alloc")]
+#[cfg(any(feature = "std", feature = "alloc"))]
 extern crate alloc;
 
 use core::fmt::Debug;
@@ -16,8 +16,8 @@ use core::fmt::Debug;
 /// `data` use the buffer type `B` so callers can pick the storage.
 /// Plane stride and palette length are stored as `u32` for parity
 /// with the rest of the crate's geometry conventions.
-#[cfg(feature = "alloc")]
-#[cfg_attr(docsrs, doc(cfg(feature = "alloc")))]
+#[cfg(any(feature = "std", feature = "alloc"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
 #[derive(Debug, Clone)]
 pub struct BitmapRegion<B> {
   x: u32,
@@ -32,7 +32,7 @@ pub struct BitmapRegion<B> {
   palette: B,
 }
 
-#[cfg(feature = "alloc")]
+#[cfg(any(feature = "std", feature = "alloc"))]
 impl<B> BitmapRegion<B> {
   /// Constructs a `BitmapRegion`.
   #[cfg_attr(not(tarpaulin), inline(always))]
@@ -104,8 +104,8 @@ pub enum SubtitlePayload<B> {
   },
   /// Bitmap subtitle — one or more rectangles of paletted pixels.
   /// Available only with the `alloc` feature.
-  #[cfg(feature = "alloc")]
-  #[cfg_attr(docsrs, doc(cfg(feature = "alloc")))]
+  #[cfg(any(feature = "std", feature = "alloc"))]
+  #[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
   Bitmap {
     /// One or more rectangles. FFmpeg subtitles often carry several.
     regions: alloc::vec::Vec<BitmapRegion<B>>,
@@ -120,7 +120,7 @@ impl<B: Debug> Debug for SubtitlePayload<B> {
         .field("text", text)
         .field("language", language)
         .finish(),
-      #[cfg(feature = "alloc")]
+      #[cfg(any(feature = "std", feature = "alloc"))]
       Self::Bitmap { regions } => f
         .debug_struct("SubtitlePayload::Bitmap")
         .field("regions", &regions.len())
@@ -144,12 +144,12 @@ mod tests {
         assert_eq!(text, b"hello");
         assert_eq!(language, Some(*b"eng"));
       }
-      #[cfg(feature = "alloc")]
+      #[cfg(any(feature = "std", feature = "alloc"))]
       _ => panic!("unexpected variant"),
     }
   }
 
-  #[cfg(feature = "alloc")]
+  #[cfg(any(feature = "std", feature = "alloc"))]
   #[test]
   fn bitmap_region_construction() {
     let data: &[u8] = &[0; 16];
@@ -160,7 +160,7 @@ mod tests {
     assert_eq!(*r.data(), data);
   }
 
-  #[cfg(feature = "alloc")]
+  #[cfg(any(feature = "std", feature = "alloc"))]
   #[test]
   fn bitmap_payload_constructs() {
     let data: &[u8] = &[0; 16];

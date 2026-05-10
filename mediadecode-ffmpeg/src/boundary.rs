@@ -12,7 +12,7 @@ use ffmpeg_next::{Packet, ffi::AVPixelFormat};
 use mediadecode::{
   PixelFormat, Timestamp,
   channel::AudioChannelLayout,
-  frame::{AudioFrame, Plane, SubtitleFrame, VideoFrame},
+  frame::{AudioFrame, Dimensions, Plane, SubtitleFrame, VideoFrame},
   packet::{AudioPacket, PacketFlags as MdPacketFlags, SubtitlePacket, VideoPacket},
   subtitle::SubtitlePayload,
 };
@@ -409,8 +409,7 @@ pub fn try_empty_video_frame() -> Option<VideoFrame<PixelFormat, VideoFrameExtra
     Plane::new(FfmpegBuffer::try_empty()?, 0),
   ];
   Some(VideoFrame::new(
-    0,
-    0,
+    Dimensions::new(0, 0),
     PixelFormat::Unknown,
     planes,
     0,

@@ -17,7 +17,7 @@ use mediadecode::{
   PixelFormat, Timebase, Timestamp,
   channel::AudioChannelLayout,
   color::{ChromaLocation, ColorInfo, ColorMatrix, ColorPrimaries, ColorRange, ColorTransfer},
-  frame::{AudioFrame, Plane, Rect, SubtitleFrame, VideoFrame},
+  frame::{AudioFrame, Dimensions, Plane, Rect, SubtitleFrame, VideoFrame},
   subtitle::SubtitlePayload,
 };
 
@@ -320,10 +320,16 @@ pub unsafe fn av_frame_to_video_frame(
 
   // pix_fmt is already mediadecode::PixelFormat thanks to the boundary
   // function above, so we just pass it through.
-  let mut out = VideoFrame::new(width, height, pix_fmt, planes_out, plane_count, extra)
-    .with_pts(pts)
-    .with_duration(duration)
-    .with_color(color);
+  let mut out = VideoFrame::new(
+    Dimensions::new(width, height),
+    pix_fmt,
+    planes_out,
+    plane_count,
+    extra,
+  )
+  .with_pts(pts)
+  .with_duration(duration)
+  .with_color(color);
   if let Some(r) = visible_rect {
     out = out.with_visible_rect(Some(r));
   }

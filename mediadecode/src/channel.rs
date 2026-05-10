@@ -406,7 +406,7 @@ mod alloc_only {
   ///   per channel.
   /// - [`description`](Self::description) — free-form human-readable
   ///   description (e.g. FFmpeg's `av_channel_layout_describe` output).
-  #[cfg_attr(docsrs, doc(cfg(feature = "alloc")))]
+  #[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
   #[derive(Debug, Clone, PartialEq, Eq, Default)]
   pub struct AudioChannelLayout {
     order: AudioChannelOrderKind,
@@ -723,7 +723,7 @@ mod tests {
   //  AudioChannelSpec  /  AudioChannelLayout (alloc-gated)
   // -----------------------------------------------------------------
 
-  #[cfg(feature = "alloc")]
+  #[cfg(any(feature = "std", feature = "alloc"))]
   mod alloc_tests {
     use super::*;
 

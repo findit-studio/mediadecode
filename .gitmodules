@@ -1,0 +1,3 @@
+[submodule "tests/fixtures/audio"]
+	path = tests/fixtures/audio
+	url = https://github.com/Findit-AI/audio-fixtures.git

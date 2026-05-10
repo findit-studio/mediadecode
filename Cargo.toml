@@ -3,6 +3,7 @@ resolver = "3"
 members = [
   "mediadecode",
   "mediadecode-ffmpeg",
+  "mediadecode-webcodecs",
 ]
 
 [workspace.package]
@@ -26,10 +27,24 @@ ffmpeg-next = { version = "8.1", default-features = false, features = ["codec", 
 tracing     = { version = "0.1", default-features = false }
 libc        = "0.2"
 
+# Browser-only — used by `mediadecode-webcodecs`. Pinned here so the
+# whole workspace agrees on a single set of bindings versions.
+wasm-bindgen         = { version = "0.2", default-features = false }
+wasm-bindgen-futures = { version = "0.4", default-features = false }
+js-sys               = { version = "0.3", default-features = false }
+web-sys              = { version = "0.3", default-features = false }
+futures-channel      = { version = "0.3", default-features = false, features = ["alloc"] }
+
 # Optional / fuzzing / serialization
 serde       = { version = "1", default-features = false, features = ["derive"] }
 arbitrary   = { version = "1", default-features = false }
 quickcheck  = { version = "1", default-features = false }
+
+# Generates `Send`-bounded variants of `async fn`-in-trait
+# definitions; used by `mediadecode::future` to expose both
+# `local::*` (`!Send`) and `send::*` (`+ Send`) trait variants
+# from a single source. Proc-macro only — zero runtime cost.
+trait-variant = "0.1"
 
 # Dev / bench
 criterion = "0.8"
@@ -41,6 +56,9 @@ single_use_lifetimes    = "warn"
 unexpected_cfgs         = { level = "warn", check-cfg = [
   'cfg(all_tests)',
   'cfg(tarpaulin)',
+  # Set by `.cargo/config.toml` for `wasm32-*` targets and by
+  # CI's `RUSTFLAGS`. `web-sys` gates WebCodecs APIs behind it.
+  'cfg(web_sys_unstable_apis)',
 ] }
 
 [profile.bench]
