@@ -289,6 +289,14 @@ impl<P, E, D> VideoFrame<P, E, D> {
   /// `dimensions` is the coded width/height pair (see
   /// [`Dimensions`] and [`Self::dimensions`] for the visible-vs-
   /// coded distinction).
+  ///
+  /// # Panics
+  ///
+  /// Panics if `plane_count > 4`. The fixed-size `planes` array
+  /// has four slots; passing a larger `plane_count` would later
+  /// trip the slice indexing inside [`Self::planes`] far from
+  /// the construction site. Asserting here fails fast with a
+  /// clear message instead.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new(
     dimensions: Dimensions,
@@ -297,6 +305,10 @@ impl<P, E, D> VideoFrame<P, E, D> {
     plane_count: u8,
     extra: E,
   ) -> Self {
+    assert!(
+      plane_count as usize <= 4,
+      "VideoFrame::new: plane_count exceeds the fixed 4-plane array",
+    );
     Self {
       pts: None,
       duration: None,
@@ -459,6 +471,13 @@ pub struct AudioFrame<S, C, E, D> {
 
 impl<S, C, E, D> AudioFrame<S, C, E, D> {
   /// Constructs an `AudioFrame`.
+  ///
+  /// # Panics
+  ///
+  /// Panics if `plane_count > 8`. The fixed-size `planes` array
+  /// has eight slots; passing a larger `plane_count` would
+  /// later trip the slice indexing inside [`Self::planes`] far
+  /// from the construction site.
   #[allow(clippy::too_many_arguments)]
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new(
@@ -471,6 +490,10 @@ impl<S, C, E, D> AudioFrame<S, C, E, D> {
     plane_count: u8,
     extra: E,
   ) -> Self {
+    assert!(
+      plane_count as usize <= 8,
+      "AudioFrame::new: plane_count exceeds the fixed 8-plane array",
+    );
     Self {
       pts: None,
       duration: None,
@@ -778,6 +801,28 @@ mod tests {
       Plane::new(&[][..], 0),
       Plane::new(&[][..], 0),
     ]
+  }
+
+  #[test]
+  #[should_panic(expected = "plane_count exceeds the fixed 4-plane array")]
+  fn video_frame_rejects_plane_count_above_array_size() {
+    let _f: VideoFrame<u32, (), &[u8]> =
+      VideoFrame::new(Dimensions::new(64, 64), 0u32, empty_planes(), 5, ());
+  }
+
+  #[test]
+  #[should_panic(expected = "plane_count exceeds the fixed 8-plane array")]
+  fn audio_frame_rejects_plane_count_above_array_size() {
+    let _f: AudioFrame<u32, u32, (), &[u8]> = AudioFrame::new(
+      48_000,
+      1024,
+      2,
+      0u32,
+      0u32,
+      audio_planes(),
+      9,
+      (),
+    );
   }
 
   #[test]

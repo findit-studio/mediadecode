@@ -75,6 +75,23 @@ pub struct Frame {
   inner: frame::Video,
 }
 
+impl core::fmt::Debug for Frame {
+  /// `frame::Video` (from `ffmpeg_next`) doesn't itself implement
+  /// `Debug`, so route through the public accessors. Shows the
+  /// dimensions, pixel format, plane count, and PTS — enough to
+  /// distinguish frames at debug-print sites without surfacing
+  /// raw FFI internals.
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.debug_struct("Frame")
+      .field("width", &self.width())
+      .field("height", &self.height())
+      .field("pix_fmt", &self.pix_fmt())
+      .field("planes", &self.planes())
+      .field("pts", &self.pts())
+      .finish()
+  }
+}
+
 impl Frame {
   /// Construct an empty frame, suitable as the destination passed to
   /// [`crate::VideoDecoder::receive_frame`].
