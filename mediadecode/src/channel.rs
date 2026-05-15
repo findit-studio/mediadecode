@@ -347,6 +347,7 @@ mod alloc_only {
 
     /// Sets the channel index (consuming builder).
     #[cfg_attr(not(tarpaulin), inline(always))]
+    #[must_use]
     pub const fn with_index(mut self, value: u32) -> Self {
       self.set_index(value);
       self
@@ -361,6 +362,7 @@ mod alloc_only {
 
     /// Sets the raw id (consuming builder).
     #[cfg_attr(not(tarpaulin), inline(always))]
+    #[must_use]
     pub const fn with_raw_id(mut self, value: u32) -> Self {
       self.set_raw_id(value);
       self
@@ -375,6 +377,7 @@ mod alloc_only {
 
     /// Sets the label (consuming builder).
     #[cfg_attr(not(tarpaulin), inline(always))]
+    #[must_use]
     pub fn with_label(mut self, value: impl Into<SmolStr>) -> Self {
       self.set_label(value);
       self
@@ -490,6 +493,7 @@ mod alloc_only {
 
     /// Sets the order (consuming builder).
     #[cfg_attr(not(tarpaulin), inline(always))]
+    #[must_use]
     pub const fn with_order(mut self, value: AudioChannelOrderKind) -> Self {
       self.set_order(value);
       self
@@ -504,6 +508,7 @@ mod alloc_only {
 
     /// Sets the channel count (consuming builder).
     #[cfg_attr(not(tarpaulin), inline(always))]
+    #[must_use]
     pub const fn with_channels(mut self, value: u32) -> Self {
       self.set_channels(value);
       self
@@ -518,6 +523,7 @@ mod alloc_only {
 
     /// Sets the high-level layout tag (consuming builder).
     #[cfg_attr(not(tarpaulin), inline(always))]
+    #[must_use]
     pub const fn with_known_kind(mut self, value: ChannelLayoutKind) -> Self {
       self.set_known_kind(value);
       self
@@ -532,6 +538,7 @@ mod alloc_only {
 
     /// Sets the native-order bitmask (consuming builder).
     #[cfg_attr(not(tarpaulin), inline(always))]
+    #[must_use]
     pub const fn with_native_mask(mut self, value: Option<u64>) -> Self {
       self.set_native_mask(value);
       self
@@ -546,6 +553,7 @@ mod alloc_only {
 
     /// Sets the custom-order channel list (consuming builder).
     #[cfg_attr(not(tarpaulin), inline(always))]
+    #[must_use]
     pub fn with_custom_channels(mut self, value: Vec<AudioChannelSpec>) -> Self {
       self.set_custom_channels(value);
       self
@@ -560,6 +568,7 @@ mod alloc_only {
 
     /// Sets the human-readable description (consuming builder).
     #[cfg_attr(not(tarpaulin), inline(always))]
+    #[must_use]
     pub fn with_description(mut self, value: impl Into<SmolStr>) -> Self {
       self.set_description(value);
       self

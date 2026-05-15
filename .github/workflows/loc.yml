@@ -30,6 +30,7 @@ jobs:
         target:
           - { dir: mediadecode,        gist_file: mediadecode }
           - { dir: mediadecode-ffmpeg, gist_file: mediadecode-ffmpeg }
+          - { dir: mediadecode-webcodecs, gist_file: mediadecode-webcodecs }
           - { dir: .,                  gist_file: mediadecode-root }
     name: loc (${{ matrix.target.gist_file }})
     steps:

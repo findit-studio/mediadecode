@@ -115,7 +115,10 @@ fn decode_one_frame_through_trait() {
         );
         assert!(dst.width() > 0);
         assert!(dst.height() > 0);
-        assert_ne!(*dst.pixel_format(), mediadecode::PixelFormat::Unknown);
+        assert!(!matches!(
+          *dst.pixel_format(),
+          mediadecode::PixelFormat::Unknown(_)
+        ));
         got_frame = true;
         break;
       }

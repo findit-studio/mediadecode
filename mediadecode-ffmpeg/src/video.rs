@@ -40,6 +40,7 @@ use crate::{
   Error, Ffmpeg, FfmpegBuffer, Frame, VideoDecoder, boundary,
   convert::{self, ConvertError},
   decoder::{build_codec_context, try_clone_parameters},
+  error::FallbackFailed,
   extras::{VideoFrameExtra, VideoPacketExtra},
   frame::alloc_av_video_frame,
 };
@@ -111,7 +112,7 @@ impl FfmpegVideoStreamDecoder {
     let state =
       match VideoDecoder::open(try_clone_parameters(&owned_parameters).map_err(Error::Ffmpeg)?) {
         Ok(hw) => DecodeState::Hw(hw),
-        Err(Error::AllBackendsFailed { .. }) => {
+        Err(Error::AllBackendsFailed(_)) => {
           // Open-time HW exhaustion: no rescued packets (open didn't
           // see any). Just open SW directly from our owned copy.
           let sw = open_sw_decoder(&owned_parameters)?;
@@ -193,10 +194,10 @@ impl FfmpegVideoStreamDecoder {
     // fallback transition fails partway.
     match self.fall_back_to_sw_inner(&unconsumed_packets) {
       Ok(()) => Ok(()),
-      Err(source) => Err(Error::FallbackFailed {
-        source: Box::new(source),
+      Err(source) => Err(Error::FallbackFailed(FallbackFailed::new(
+        Box::new(source),
         unconsumed_packets,
-      }),
+      ))),
     }
   }
 
@@ -322,9 +323,8 @@ impl VideoStreamDecoder for FfmpegVideoStreamDecoder {
     match &mut self.state {
       DecodeState::Hw(hw) => match hw.send_packet(&av_pkt) {
         Ok(()) => Ok(()),
-        Err(Error::AllBackendsFailed {
-          unconsumed_packets, ..
-        }) => {
+        Err(Error::AllBackendsFailed(p)) => {
+          let unconsumed_packets = p.into_unconsumed_packets();
           self
             .fall_back_to_sw(unconsumed_packets)
             .map_err(VideoDecodeError::Decode)?;
@@ -365,9 +365,8 @@ impl VideoStreamDecoder for FfmpegVideoStreamDecoder {
       match &mut self.state {
         DecodeState::Hw(hw) => match hw.receive_frame(&mut self.hw_scratch) {
           Ok(()) => return self.deliver_frame(dst),
-          Err(Error::AllBackendsFailed {
-            unconsumed_packets, ..
-          }) => {
+          Err(Error::AllBackendsFailed(p)) => {
+            let unconsumed_packets = p.into_unconsumed_packets();
             // Probe exhausted at frame-time. Open SW, replay packets,
             // loop back so the SW path tries to receive_frame.
             self
@@ -402,9 +401,8 @@ impl VideoStreamDecoder for FfmpegVideoStreamDecoder {
     let outcome = match &mut self.state {
       DecodeState::Hw(hw) => match hw.send_eof() {
         Ok(()) => Ok(()),
-        Err(Error::AllBackendsFailed {
-          unconsumed_packets, ..
-        }) => {
+        Err(Error::AllBackendsFailed(p)) => {
+          let unconsumed_packets = p.into_unconsumed_packets();
           // Mark EOF as already accepted *before* fallback so that
           // `fall_back_to_sw` forwards it to the new SW decoder
           // transactionally — packet replay, EOF replay, and the

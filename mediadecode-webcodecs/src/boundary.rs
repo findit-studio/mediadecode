@@ -37,7 +37,7 @@ pub fn empty_video_frame() -> VideoFrame<PixelFormat, VideoFrameExtra, WebCodecs
   ];
   VideoFrame::new(
     Dimensions::new(0, 0),
-    PixelFormat::Unknown,
+    PixelFormat::Unknown(0),
     planes,
     0,
     VideoFrameExtra::new(false),

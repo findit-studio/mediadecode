@@ -11,6 +11,71 @@ The backend-agnostic core it adapts has its own log at
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-05-15
+
+Tracks `mediadecode` 0.2.0. The pixel-vocabulary types
+(`PixelFormat`, color enums, frame primitives) now live in the
+`videoframe` crate and are re-exported through `mediadecode`; this
+release adapts the FFmpeg boundary to the new `PixelFormat::Unknown(u32)`
+shape and updates the type aliases the crate re-exports.
+
+### Changed (BREAKING)
+
+- **`PixelFormat::Unknown` shape**: re-exported `PixelFormat` is now
+  `Unknown(u32)` (tuple variant) instead of the prior unit variant
+  — see [`mediadecode` 0.2.0](../mediadecode/CHANGELOG.md#020---2026-05-15).
+- **FFmpeg boundary fallback** now preserves the raw `AVPixelFormat`
+  identifier through `PixelFormat::Unknown(raw as u32)` instead of
+  collapsing to a bare `Unknown`. Round-trips losslessly via
+  `PixelFormat::{from_u32, to_u32}`.
+- **Type aliases reshape**: `VideoFrame`, `AudioFrame`,
+  `SubtitleFrame`, `VideoPacket`, `AudioPacket`, `SubtitlePacket`
+  inherit the upstream `PixelFormat` shape change. Downstream
+  callers matching on `Unknown` in destination frames need to
+  switch to `Unknown(_)`.
+- **`Error` enum variants** are now newtype-tuple form wrapping
+  payload structs (matches the convention in
+  [`videoframe`](https://crates.io/crates/videoframe)). Affected
+  variants: `HwDeviceInitFailed`, `AllBackendsFailed`,
+  `FallbackFailed`. Pure tuple variants (`Ffmpeg`, `NoCodec`,
+  `BackendUnsupportedByCodec`) unchanged. Callers destructuring
+  `Err(Error::AllBackendsFailed { attempts, .. })` must switch to
+  `Err(Error::AllBackendsFailed(p))` and call `p.attempts()` /
+  `p.unconsumed_packets()`. Owning-move paths for the rescued
+  packets are preserved via `p.into_unconsumed_packets()` /
+  `p.into_parts()`, so non-seekable callers can still relinquish
+  the `Vec<Packet>` without cloning. The hand-written `Debug` that
+  printed `[N packets]` (because `ffmpeg_next::Packet` has no
+  `Debug`) now lives on the payload structs.
+  All three new variants also carry `#[from]`, joining `Ffmpeg`
+  which already had it — so `impl From<HwDeviceInitFailed> for Error`,
+  `impl From<AllBackendsFailed> for Error`, and
+  `impl From<FallbackFailed> for Error` are auto-generated, and
+  helpers returning `Result<_, HwDeviceInitFailed>` etc. can be
+  `?`-propagated into `Result<_, Error>` directly.
+
+### Changed
+
+- **`mediadecode` dep**: bumped to `0.2`.
+- Boundary mapping in `pixel_format_from_ffmpeg` and the
+  side-data conversion paths updated to the new
+  `PixelFormat::Unknown(u32)` shape (17 fallback / assertion /
+  default-frame sites across `mediadecode-ffmpeg` and
+  `mediadecode-webcodecs`).
+
+### Added
+
+- **`Debug` impl for `Frame`** — manual `core::fmt::Debug` impl
+  showing dimensions / format so the only public type previously
+  without `Debug` is now printable.
+  Closes [issue #4 — finding 2](https://github.com/Findit-AI/mediadecode/issues/4).
+- **`#[must_use]`** on every consuming `with_*` builder method
+  across the crate's public surface.
+  Closes [issue #4 — finding 3](https://github.com/Findit-AI/mediadecode/issues/4).
+
+[0.1.0]: https://github.com/findit-ai/mediadecode/releases/tag/mediadecode-ffmpeg-v0.1.0
+[0.2.0]: https://github.com/findit-ai/mediadecode/releases/tag/mediadecode-ffmpeg-v0.2.0
+
 ## [0.1.0] - 2026-05-09
 
 Initial public release.
@@ -74,5 +139,3 @@ version-skewed decoder output:
   rather than `linesize × plane_height_for(AVFrame.height)`, so
   cropped or heavily aligned streams report correct byte counts.
 
-[Unreleased]: https://github.com/findit-ai/mediadecode/compare/mediadecode-ffmpeg-v0.1.0...HEAD
-[0.1.0]: https://github.com/findit-ai/mediadecode/releases/tag/mediadecode-ffmpeg-v0.1.0

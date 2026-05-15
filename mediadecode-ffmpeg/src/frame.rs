@@ -616,7 +616,7 @@ mod tests {
     assert_eq!(f.height(), 0);
     assert_eq!(f.pts(), None);
     // AVFrame.format defaults to -1 (AV_PIX_FMT_NONE) for an empty frame.
-    assert_eq!(f.pix_fmt(), PixelFormat::Unknown);
+    assert!(matches!(f.pix_fmt(), PixelFormat::Unknown(_)));
     // No active planes for an empty frame (all linesize entries are 0).
     assert_eq!(f.planes(), 0);
   }
@@ -787,7 +787,7 @@ mod tests {
     assert_eq!(plane_height_for(PixelFormat::Nv16, 1, 1080), Some(1080));
     assert_eq!(plane_height_for(PixelFormat::Nv24, 1, 1080), Some(1080));
     assert_eq!(plane_height_for(PixelFormat::P416Le, 1, 1080), Some(1080));
-    assert_eq!(plane_height_for(PixelFormat::Unknown, 0, 1080), None);
+    assert_eq!(plane_height_for(PixelFormat::Unknown(0), 0, 1080), None);
     assert_eq!(plane_height_for(PixelFormat::Nv12, 2, 1080), None);
   }
 
@@ -891,7 +891,7 @@ mod tests {
       Some(7680)
     );
     // Unsupported / out-of-range.
-    assert_eq!(plane_row_bytes_for(PixelFormat::Unknown, 0, 1920), None);
+    assert_eq!(plane_row_bytes_for(PixelFormat::Unknown(0), 0, 1920), None);
     assert_eq!(plane_row_bytes_for(PixelFormat::Nv12, 2, 1920), None);
   }
 
@@ -947,7 +947,7 @@ mod tests {
 
     // AV_PIX_FMT_NONE sentinel and HW pix_fmts (those should never
     // surface post-transfer).
-    assert!(!is_supported_cpu_pix_fmt(PixelFormat::Unknown));
+    assert!(!is_supported_cpu_pix_fmt(PixelFormat::Unknown(0)));
     assert!(!is_supported_cpu_pix_fmt(boundary::from_av_pixel_format(
       AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX as i32
     )));

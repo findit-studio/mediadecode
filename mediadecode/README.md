@@ -7,7 +7,7 @@ Generic, `no_std`-friendly type-and-trait spine for media decoders.
 
 [<img alt="github" src="https://img.shields.io/badge/github-findit--ai/mediadecode-8da0cb?style=for-the-badge&logo=Github" height="22">][Github-url]
 <img alt="LoC" src="https://img.shields.io/endpoint?url=https%3A%2F%2Fgist.githubusercontent.com%2Fal8n%2F327b2a8aef9003246e45c6e47fe63937%2Fraw%2Fmediadecode" height="22">
-[<img alt="Build" src="https://img.shields.io/github/actions/workflow/status/findit-ai/mediadecode/ci.yml?logo=Github-Actions&style=for-the-badge" height="22">][CI-url]
+[<img alt="Build" src="https://img.shields.io/github/actions/workflow/status/findit-ai/mediadecode/ci-core.yml?logo=Github-Actions&style=for-the-badge" height="22">][CI-url]
 [<img alt="codecov" src="https://img.shields.io/codecov/c/gh/findit-ai/mediadecode?style=for-the-badge&logo=codecov" height="22">][codecov-url]
 
 [<img alt="docs.rs" src="https://img.shields.io/badge/docs.rs-mediadecode-66c2a5?style=for-the-badge&labelColor=555555&logo=data:image/svg+xml;base64,PHN2ZyByb2xlPSJpbWciIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyIgdmlld0JveD0iMCAwIDUxMiA1MTIiPjxwYXRoIGZpbGw9IiNmNWY1ZjUiIGQ9Ik00ODguNiAyNTAuMkwzOTIgMjE0VjEwNS41YzAtMTUtOS4zLTI4LjQtMjMuNC0zMy43bC0xMDAtMzcuNWMtOC4xLTMuMS0xNy4xLTMuMS0yNS4zIDBsLTEwMCAzNy41Yy0xNC4xIDUuMy0yMy40IDE4LjctMjMuNCAzMy43VjIxNGwtOTYuNiAzNi4yQzkuMyAyNTUuNSAwIDI2OC45IDAgMjgzLjlWMzk0YzAgMTMuNiA3LjcgMjYuMSAxOS45IDMyLjJsMTAwIDUwYzEwLjEgNS4xIDIyLjEgNS4xIDMyLjIgMGwxMDMuOS01MiAxMDMuOSA1MmMxMC4xIDUuMSAyMi4xIDUuMSAzMi4yIDBsMTAwLTUwYzEyLjItNi4xIDE5LjktMTguNiAxOS45LTMyLjJWMjgzLjljMC0xNS05LjMtMjguNC0yMy40LTMzLjd6TTM1OCAyMTQuOGwtODUgMzEuOXYtNjguMmw4NS0zN3Y3My4zek0xNTQgMTA0LjFsMTAyLTM4LjIgMTAyIDM4LjJ2LjZsLTEwMiA0MS40LTEwMi00MS40di0uNnptODQgMjkxLjFsLTg1IDQyLjV2LTc5LjFsODUtMzguOHY3NS40em0wLTExMmwtMTAyIDQxLjQtMTAyLTQxLjR2LS42bDEwMi0zOC4yIDEwMiAzOC4ydi42em0yNDAgMTEybC04NSA0Mi41di03OS4xbDg1LTM4Ljh2NzUuNHptMC0xMTJsLTEwMiA0MS40LTEwMi00MS40di0uNmwxMDItMzguMiAxMDIgMzguMnYuNnoiPjwvcGF0aD48L3N2Zz4K" height="20">][doc-url]
@@ -32,11 +32,16 @@ bytes. Adapter implementations live in sibling crates such as
 
 ## What's in the box
 
-- **Pixel and sample formats** — `PixelFormat` (closed enum covering
-  CPU and HW-tile formats: NV12, P010/P012/P016, P210/P212/P216,
-  P410/P412/P416, YUV420P, RGB24, …) and the H.273-aligned color
-  enums `ColorMatrix`, `ColorPrimaries`, `ColorTransfer`,
-  `ColorRange`, `ChromaLocation`, plus `BayerPattern` for RAW.
+- **Pixel and sample formats** — `PixelFormat` (~270 variants
+  covering every FFmpeg `n8.1` `AVPixelFormat` slug plus cinema-RAW
+  additions; sourced from
+  [`videoframe`](https://crates.io/crates/videoframe) and re-exported
+  here so consumers keep their `mediadecode::PixelFormat` import).
+  `Unknown(u32)` preserves the raw wire identifier for lossless
+  round-trip via `from_u32` / `to_u32`. H.273-aligned color enums
+  (`ColorMatrix`, `ColorPrimaries`, `ColorTransfer`, `ColorRange`,
+  `ChromaLocation`) and `BayerPattern` for RAW are similarly
+  re-exported from `videoframe`.
 - **Generic packet / frame types** — `VideoPacket<A, B>`,
   `AudioPacket<A, B>`, `SubtitlePacket<A, B>`, `VideoFrame<A, B>`,
   `AudioFrame<A, B>`, `SubtitleFrame<A, B>` parameterized over an
@@ -83,7 +88,7 @@ the rest of the findit-studio workspace uses:
 
 ```toml
 [dependencies]
-mediadecode = { version = "0.0.0", default-features = false, features = ["alloc"] }
+mediadecode = { version = "0.2", default-features = false, features = ["alloc"] }
 ```
 
 ## Usage
