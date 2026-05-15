@@ -71,6 +71,19 @@ re-exports.
 - **`#[must_use]`** on every consuming `with_*` builder method
   across frame / packet / subtitle types. Catches accidental
   discards of the returned value at compile time.
+- **`VideoFrame::try_new`** / **`AudioFrame::try_new`** —
+  panic-free constructors returning `Result<Self, FrameError>`.
+  The existing `new` constructors keep their panicking behavior
+  for `const fn` / statically-known call sites; `try_new` is for
+  runtime-checked callers (e.g. backend adapters validating
+  decoder output). Pairs the `new` / `try_new` convention the
+  rest of the crate already follows
+  (`Plane::new` / `Plane::try_new`, `*_empty` / `try_*_empty`,
+  …).
+- **`mediadecode::frame::FrameError`** — enum capturing the
+  validation failures the `try_new` constructors can surface
+  (`TooManyVideoPlanes` / `TooManyAudioPlanes`). `non_exhaustive`,
+  `IsVariant`, `thiserror::Error`.
 
 ### Fixed
 

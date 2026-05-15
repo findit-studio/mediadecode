@@ -12,7 +12,34 @@
 
 pub use videoframe::frame::{Dimensions, Plane, Rect};
 
+use derive_more::IsVariant;
+use thiserror::Error;
+
 use crate::{Timestamp, color::ColorInfo, subtitle::SubtitlePayload};
+
+/// Errors returned by the `try_new` constructors on the frame types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, IsVariant, Error)]
+#[non_exhaustive]
+pub enum FrameError {
+  /// `VideoFrame::try_new` was called with `plane_count > 4`. The
+  /// fixed plane array has exactly 4 slots; `plane_count` values
+  /// up to and including 4 are accepted, larger values would
+  /// later panic inside [`VideoFrame::planes`] far from the
+  /// construction site.
+  #[error("VideoFrame: plane_count {plane_count} exceeds the fixed 4-plane array")]
+  TooManyVideoPlanes {
+    /// The out-of-range `plane_count` value the caller supplied.
+    plane_count: u8,
+  },
+  /// `AudioFrame::try_new` was called with `plane_count > 8`. The
+  /// fixed plane array has exactly 8 slots (matches FFmpeg's
+  /// `AV_NUM_DATA_POINTERS`).
+  #[error("AudioFrame: plane_count {plane_count} exceeds the fixed 8-plane array")]
+  TooManyAudioPlanes {
+    /// The out-of-range `plane_count` value the caller supplied.
+    plane_count: u8,
+  },
+}
 
 /// A decoded video frame.
 ///
@@ -57,7 +84,8 @@ impl<P, E, D> VideoFrame<P, E, D> {
   /// has four slots; passing a larger `plane_count` would later
   /// trip the slice indexing inside [`Self::planes`] far from
   /// the construction site. Asserting here fails fast with a
-  /// clear message instead.
+  /// clear message instead. Prefer [`Self::try_new`] when
+  /// `plane_count` can't be statically proven `<= 4`.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new(
     dimensions: Dimensions,
@@ -81,6 +109,38 @@ impl<P, E, D> VideoFrame<P, E, D> {
       color: ColorInfo::UNSPECIFIED,
       extra,
     }
+  }
+
+  /// Fallible counterpart to [`Self::new`]. Returns
+  /// [`FrameError::TooManyVideoPlanes`] when `plane_count > 4`
+  /// (the fixed plane array's capacity) rather than panicking.
+  ///
+  /// Not `const fn` — returning `Result<Self, _>` would require
+  /// dropping the moved generic-typed `planes` / `pixel_format` /
+  /// `extra` on the error branch, which the const evaluator
+  /// can't prove safe for arbitrary `P` / `E` / `D`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn try_new(
+    dimensions: Dimensions,
+    pixel_format: P,
+    planes: [Plane<D>; 4],
+    plane_count: u8,
+    extra: E,
+  ) -> Result<Self, FrameError> {
+    if plane_count as usize > 4 {
+      return Err(FrameError::TooManyVideoPlanes { plane_count });
+    }
+    Ok(Self {
+      pts: None,
+      duration: None,
+      dimensions,
+      visible_rect: None,
+      pixel_format,
+      plane_count,
+      planes,
+      color: ColorInfo::UNSPECIFIED,
+      extra,
+    })
   }
 
   /// Returns the presentation timestamp.
@@ -243,6 +303,9 @@ impl<S, C, E, D> AudioFrame<S, C, E, D> {
   /// has eight slots; passing a larger `plane_count` would
   /// later trip the slice indexing inside [`Self::planes`] far
   /// from the construction site.
+  ///
+  /// Prefer [`Self::try_new`] when `plane_count` can't be
+  /// statically proven `<= 8`.
   #[allow(clippy::too_many_arguments)]
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new(
@@ -271,6 +334,41 @@ impl<S, C, E, D> AudioFrame<S, C, E, D> {
       planes,
       extra,
     }
+  }
+
+  /// Fallible counterpart to [`Self::new`]. Returns
+  /// [`FrameError::TooManyAudioPlanes`] when `plane_count > 8`
+  /// (the fixed plane array's capacity) rather than panicking.
+  ///
+  /// Not `const fn` — see the rationale on
+  /// [`VideoFrame::try_new`].
+  #[allow(clippy::too_many_arguments)]
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn try_new(
+    sample_rate: u32,
+    nb_samples: u32,
+    channel_count: u8,
+    sample_format: S,
+    channel_layout: C,
+    planes: [Plane<D>; 8],
+    plane_count: u8,
+    extra: E,
+  ) -> Result<Self, FrameError> {
+    if plane_count as usize > 8 {
+      return Err(FrameError::TooManyAudioPlanes { plane_count });
+    }
+    Ok(Self {
+      pts: None,
+      duration: None,
+      sample_rate,
+      nb_samples,
+      channel_count,
+      sample_format,
+      channel_layout,
+      plane_count,
+      planes,
+      extra,
+    })
   }
 
   /// Returns the presentation timestamp.
@@ -580,10 +678,46 @@ mod tests {
   }
 
   #[test]
+  fn video_frame_try_new_returns_err_for_too_many_planes() {
+    let res: Result<VideoFrame<u32, (), &[u8]>, FrameError> =
+      VideoFrame::try_new(Dimensions::new(64, 64), 0u32, empty_planes(), 5, ());
+    assert!(matches!(
+      res,
+      Err(FrameError::TooManyVideoPlanes { plane_count: 5 })
+    ));
+  }
+
+  #[test]
+  fn video_frame_try_new_accepts_valid_plane_count() {
+    let f: VideoFrame<u32, (), &[u8]> =
+      VideoFrame::try_new(Dimensions::new(64, 64), 0u32, empty_planes(), 2, ())
+        .expect("plane_count = 2 is within the 4-slot capacity");
+    assert_eq!(f.plane_count(), 2);
+  }
+
+  #[test]
   #[should_panic(expected = "plane_count exceeds the fixed 8-plane array")]
   fn audio_frame_rejects_plane_count_above_array_size() {
     let _f: AudioFrame<u32, u32, (), &[u8]> =
       AudioFrame::new(48_000, 1024, 2, 0u32, 0u32, audio_planes(), 9, ());
+  }
+
+  #[test]
+  fn audio_frame_try_new_returns_err_for_too_many_planes() {
+    let res: Result<AudioFrame<u32, u32, (), &[u8]>, FrameError> =
+      AudioFrame::try_new(48_000, 1024, 2, 0u32, 0u32, audio_planes(), 9, ());
+    assert!(matches!(
+      res,
+      Err(FrameError::TooManyAudioPlanes { plane_count: 9 })
+    ));
+  }
+
+  #[test]
+  fn audio_frame_try_new_accepts_valid_plane_count() {
+    let f: AudioFrame<u32, u32, (), &[u8]> =
+      AudioFrame::try_new(48_000, 1024, 2, 0u32, 0u32, audio_planes(), 8, ())
+        .expect("plane_count = 8 is the 8-slot capacity boundary");
+    assert_eq!(f.plane_count(), 8);
   }
 
   #[test]
