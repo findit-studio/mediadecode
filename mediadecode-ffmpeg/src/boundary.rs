@@ -126,7 +126,7 @@ pub const fn from_av_pixel_format(raw: i32) -> PixelFormat {
     x if x == AVPixelFormat::AV_PIX_FMT_BAYER_RGGB16LE as i32 => PixelFormat::BayerRggb16Le,
     x if x == AVPixelFormat::AV_PIX_FMT_BAYER_GBRG16LE as i32 => PixelFormat::BayerGbrg16Le,
     x if x == AVPixelFormat::AV_PIX_FMT_BAYER_GRBG16LE as i32 => PixelFormat::BayerGrbg16Le,
-    _ => PixelFormat::Unknown,
+    _ => PixelFormat::Unknown(raw as u32),
   }
 }
 
@@ -410,7 +410,7 @@ pub fn try_empty_video_frame() -> Option<VideoFrame<PixelFormat, VideoFrameExtra
   ];
   Some(VideoFrame::new(
     Dimensions::new(0, 0),
-    PixelFormat::Unknown,
+    PixelFormat::Unknown(0),
     planes,
     0,
     VideoFrameExtra::default(),
@@ -511,7 +511,10 @@ mod tests {
 
   #[test]
   fn unknown_for_garbage_value() {
-    assert_eq!(from_av_pixel_format(-99_999), PixelFormat::Unknown);
+    assert!(matches!(
+      from_av_pixel_format(-99_999),
+      PixelFormat::Unknown(_)
+    ));
   }
 
   #[test]
@@ -537,13 +540,13 @@ mod tests {
   fn hw_formats_map_to_unknown_in_pixel_format() {
     // HW sentinels intentionally don't have a mediadecode::PixelFormat
     // representation — they're not CPU pixel data.
-    assert_eq!(
+    assert!(matches!(
       from_av_pixel_format(AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX as i32),
-      PixelFormat::Unknown,
-    );
-    assert_eq!(
+      PixelFormat::Unknown(_)
+    ));
+    assert!(matches!(
       from_av_pixel_format(AVPixelFormat::AV_PIX_FMT_VAAPI as i32),
-      PixelFormat::Unknown,
-    );
+      PixelFormat::Unknown(_)
+    ));
   }
 }

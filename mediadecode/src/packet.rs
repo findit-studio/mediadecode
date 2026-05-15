@@ -110,24 +110,28 @@ impl<E, D> VideoPacket<E, D> {
 
   /// Sets the PTS (consuming builder).
   #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
   pub const fn with_pts(mut self, v: Option<Timestamp>) -> Self {
     self.pts = v;
     self
   }
   /// Sets the DTS (consuming builder).
   #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
   pub const fn with_dts(mut self, v: Option<Timestamp>) -> Self {
     self.dts = v;
     self
   }
   /// Sets the duration (consuming builder).
   #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
   pub const fn with_duration(mut self, v: Option<Timestamp>) -> Self {
     self.duration = v;
     self
   }
   /// Sets the flags (consuming builder).
   #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
   pub const fn with_flags(mut self, v: PacketFlags) -> Self {
     self.flags = v;
     self
@@ -231,24 +235,28 @@ impl<E, D> AudioPacket<E, D> {
 
   /// Sets the PTS (consuming builder).
   #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
   pub const fn with_pts(mut self, v: Option<Timestamp>) -> Self {
     self.pts = v;
     self
   }
   /// Sets the DTS (consuming builder).
   #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
   pub const fn with_dts(mut self, v: Option<Timestamp>) -> Self {
     self.dts = v;
     self
   }
   /// Sets the duration (consuming builder).
   #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
   pub const fn with_duration(mut self, v: Option<Timestamp>) -> Self {
     self.duration = v;
     self
   }
   /// Sets the flags (consuming builder).
   #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
   pub const fn with_flags(mut self, v: PacketFlags) -> Self {
     self.flags = v;
     self
@@ -345,18 +353,21 @@ impl<E, D> SubtitlePacket<E, D> {
 
   /// Sets the PTS (consuming builder).
   #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
   pub const fn with_pts(mut self, v: Option<Timestamp>) -> Self {
     self.pts = v;
     self
   }
   /// Sets the duration (consuming builder).
   #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
   pub const fn with_duration(mut self, v: Option<Timestamp>) -> Self {
     self.duration = v;
     self
   }
   /// Sets the flags (consuming builder).
   #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
   pub const fn with_flags(mut self, v: PacketFlags) -> Self {
     self.flags = v;
     self

@@ -49,18 +49,21 @@ impl VideoPacketExtra {
 
   /// Sets the stream index (consuming builder).
   #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
   pub const fn with_stream_index(mut self, value: i32) -> Self {
     self.stream_index = value;
     self
   }
   /// Sets the byte position (consuming builder).
   #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
   pub const fn with_byte_pos(mut self, value: Option<i64>) -> Self {
     self.byte_pos = value;
     self
   }
   /// Sets the side-data list (consuming builder).
   #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
   pub fn with_side_data(mut self, value: Vec<SideDataEntry>) -> Self {
     self.side_data = value;
     self
@@ -180,54 +183,63 @@ impl VideoFrameExtra {
   }
   /// Sets the picture type (consuming builder).
   #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
   pub const fn with_picture_type(mut self, value: PictureType) -> Self {
     self.picture_type = value;
     self
   }
   /// Sets the key-frame flag (consuming builder).
   #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
   pub const fn with_key_frame(mut self, value: bool) -> Self {
     self.key_frame = value;
     self
   }
   /// Sets the interlaced flag (consuming builder).
   #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
   pub const fn with_interlaced(mut self, value: bool) -> Self {
     self.interlaced = value;
     self
   }
   /// Sets the top-field-first flag (consuming builder).
   #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
   pub const fn with_top_field_first(mut self, value: bool) -> Self {
     self.top_field_first = value;
     self
   }
   /// Sets the best-effort timestamp (consuming builder).
   #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
   pub const fn with_best_effort_timestamp(mut self, value: Option<i64>) -> Self {
     self.best_effort_timestamp = value;
     self
   }
   /// Sets the mastering-display metadata (consuming builder).
   #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
   pub const fn with_mastering_display(mut self, value: Option<MasteringDisplay>) -> Self {
     self.mastering_display = value;
     self
   }
   /// Sets the content-light-level metadata (consuming builder).
   #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
   pub const fn with_content_light_level(mut self, value: Option<ContentLightLevel>) -> Self {
     self.content_light_level = value;
     self
   }
   /// Sets the SMPTE timecode list (consuming builder).
   #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
   pub fn with_smpte_timecode(mut self, value: Vec<u32>) -> Self {
     self.smpte_timecode = value;
     self
   }
   /// Sets the side-data list (consuming builder).
   #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
   pub fn with_side_data(mut self, value: Vec<SideDataEntry>) -> Self {
     self.side_data = value;
     self
@@ -332,18 +344,21 @@ impl AudioPacketExtra {
 
   /// Sets the stream index (consuming builder).
   #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
   pub const fn with_stream_index(mut self, value: i32) -> Self {
     self.stream_index = value;
     self
   }
   /// Sets the byte position (consuming builder).
   #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
   pub const fn with_byte_pos(mut self, value: Option<i64>) -> Self {
     self.byte_pos = value;
     self
   }
   /// Sets the side-data list (consuming builder).
   #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
   pub fn with_side_data(mut self, value: Vec<SideDataEntry>) -> Self {
     self.side_data = value;
     self
@@ -399,12 +414,14 @@ impl AudioFrameExtra {
 
   /// Sets the best-effort timestamp (consuming builder).
   #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
   pub const fn with_best_effort_timestamp(mut self, value: Option<i64>) -> Self {
     self.best_effort_timestamp = value;
     self
   }
   /// Sets the side-data list (consuming builder).
   #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
   pub fn with_side_data(mut self, value: Vec<SideDataEntry>) -> Self {
     self.side_data = value;
     self
@@ -461,18 +478,21 @@ impl SubtitlePacketExtra {
 
   /// Sets the stream index (consuming builder).
   #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
   pub const fn with_stream_index(mut self, value: i32) -> Self {
     self.stream_index = value;
     self
   }
   /// Sets the language tag (consuming builder).
   #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
   pub const fn with_language(mut self, value: Option<[u8; 3]>) -> Self {
     self.language = value;
     self
   }
   /// Sets the forced flag (consuming builder).
   #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
   pub const fn with_forced(mut self, value: bool) -> Self {
     self.forced = value;
     self
@@ -528,12 +548,14 @@ impl SubtitleFrameExtra {
 
   /// Sets the start display time (consuming builder).
   #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
   pub const fn with_start_display_time(mut self, value: u32) -> Self {
     self.start_display_time = value;
     self
   }
   /// Sets the end display time (consuming builder).
   #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
   pub const fn with_end_display_time(mut self, value: u32) -> Self {
     self.end_display_time = value;
     self
@@ -606,12 +628,14 @@ impl SideDataEntry {
 
   /// Sets the type id (consuming builder).
   #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
   pub const fn with_kind(mut self, value: i32) -> Self {
     self.kind = value;
     self
   }
   /// Sets the payload (consuming builder).
   #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
   pub fn with_data(mut self, value: Vec<u8>) -> Self {
     self.data = value;
     self
@@ -757,12 +781,14 @@ impl ContentLightLevel {
 
   /// Sets `max_cll` (consuming builder).
   #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
   pub const fn with_max_cll(mut self, value: u32) -> Self {
     self.max_cll = value;
     self
   }
   /// Sets `max_fall` (consuming builder).
   #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
   pub const fn with_max_fall(mut self, value: u32) -> Self {
     self.max_fall = value;
     self

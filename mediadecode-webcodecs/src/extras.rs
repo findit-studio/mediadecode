@@ -38,6 +38,7 @@ impl VideoPacketExtra {
   }
 
   /// Builder-style setter — consumes and returns `self`.
+  #[must_use]
   pub const fn with_key(mut self, key: bool) -> Self {
     self.key = key;
     self
@@ -71,6 +72,7 @@ impl VideoFrameExtra {
   }
 
   /// Builder-style setter.
+  #[must_use]
   pub const fn with_key(mut self, key: bool) -> Self {
     self.key = key;
     self
@@ -102,6 +104,7 @@ impl AudioPacketExtra {
   }
 
   /// Builder-style setter.
+  #[must_use]
   pub const fn with_key(mut self, key: bool) -> Self {
     self.key = key;
     self
@@ -133,6 +136,7 @@ impl AudioFrameExtra {
   }
 
   /// Builder-style setter.
+  #[must_use]
   pub const fn with_key(mut self, key: bool) -> Self {
     self.key = key;
     self

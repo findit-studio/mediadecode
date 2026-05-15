@@ -9,7 +9,7 @@ layer, built on top of
 
 [<img alt="github" src="https://img.shields.io/badge/github-findit--ai/mediadecode-8da0cb?style=for-the-badge&logo=Github" height="22">][Github-url]
 <img alt="LoC" src="https://img.shields.io/endpoint?url=https%3A%2F%2Fgist.githubusercontent.com%2Fal8n%2F327b2a8aef9003246e45c6e47fe63937%2Fraw%2Fmediadecode-ffmpeg" height="22">
-[<img alt="Build" src="https://img.shields.io/github/actions/workflow/status/findit-ai/mediadecode/ci.yml?logo=Github-Actions&style=for-the-badge" height="22">][CI-url]
+[<img alt="Build" src="https://img.shields.io/github/actions/workflow/status/findit-ai/mediadecode/ci-ffmpeg.yml?logo=Github-Actions&style=for-the-badge" height="22">][CI-url]
 [<img alt="codecov" src="https://img.shields.io/codecov/c/gh/findit-ai/mediadecode?style=for-the-badge&logo=codecov" height="22">][codecov-url]
 
 [<img alt="docs.rs" src="https://img.shields.io/badge/docs.rs-mediadecode--ffmpeg-66c2a5?style=for-the-badge&labelColor=555555&logo=data:image/svg+xml;base64,PHN2ZyByb2xlPSJpbWciIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyIgdmlld0JveD0iMCAwIDUxMiA1MTIiPjxwYXRoIGZpbGw9IiNmNWY1ZjUiIGQ9Ik00ODguNiAyNTAuMkwzOTIgMjE0VjEwNS41YzAtMTUtOS4zLTI4LjQtMjMuNC0zMy43bC0xMDAtMzcuNWMtOC4xLTMuMS0xNy4xLTMuMS0yNS4zIDBsLTEwMCAzNy41Yy0xNC4xIDUuMy0yMy40IDE4LjctMjMuNCAzMy43VjIxNGwtOTYuNiAzNi4yQzkuMyAyNTUuNSAwIDI2OC45IDAgMjgzLjlWMzk0YzAgMTMuNiA3LjcgMjYuMSAxOS45IDMyLjJsMTAwIDUwYzEwLjEgNS4xIDIyLjEgNS4xIDMyLjIgMGwxMDMuOS01MiAxMDMuOSA1MmMxMC4xIDUuMSAyMi4xIDUuMSAzMi4yIDBsMTAwLTUwYzEyLjItNi4xIDE5LjktMTguNiAxOS45LTMyLjJWMjgzLjljMC0xNS05LjMtMjguNC0yMy40LTMzLjd6TTM1OCAyMTQuOGwtODUgMzEuOXYtNjguMmw4NS0zN3Y3My4zek0xNTQgMTA0LjFsMTAyLTM4LjIgMTAyIDM4LjJ2LjZsLTEwMiA0MS40LTEwMi00MS40di0uNnptODQgMjkxLjFsLTg1IDQyLjV2LTc5LjFsODUtMzguOHY3NS40em0wLTExMmwtMTAyIDQxLjQtMTAyLTQxLjR2LS42bDEwMi0zOC4yIDEwMiAzOC4ydi42em0yNDAgMTEybC04NSA0Mi41di03OS4xbDg1LTM4Ljh2NzUuNHptMC0xMTJsLTEwMiA0MS40LTEwMi00MS40di0uNmwxMDItMzguMiAxMDIgMzguMnYuNnoiPjwvcGF0aD48L3N2Zz4K" height="20">][doc-url]
@@ -51,10 +51,11 @@ Output frames are CPU-side, downloaded with `av_hwframe_transfer_data`
 
 If every HW backend opens but later fails at decode time and the
 software backend is also unavailable, the error surfaces as
-`VideoDecodeError::Decode(Error::AllBackendsFailed { unconsumed_packets, .. })`
-carrying any packets the decoder had already accepted from the demuxer
-— so non-seekable callers (live streams, pipes, network sources) can
-replay them through their own software decoder without re-demuxing.
+`VideoDecodeError::Decode(Error::AllBackendsFailed(p))` carrying any
+packets the decoder had already accepted from the demuxer (accessible
+via `p.unconsumed_packets()` / `p.into_unconsumed_packets()`) — so
+non-seekable callers (live streams, pipes, network sources) can replay
+them through their own software decoder without re-demuxing.
 
 ## Usage
 
@@ -82,10 +83,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   // Probes HW backends in order, falls back to software.
   let mut decoder = match FfmpegVideoStreamDecoder::open(stream.parameters(), time_base) {
     Ok(d) => d,
-    Err(FfmpegError::AllBackendsFailed { unconsumed_packets, .. }) => {
+    Err(FfmpegError::AllBackendsFailed(p)) => {
       // No backend at all could open this stream — including software.
       // `unconsumed_packets` is empty at open-time. Caller decides.
-      let _ = unconsumed_packets;
+      let _unconsumed_packets = p.into_unconsumed_packets();
       return Ok(());
     }
     Err(e) => return Err(e.into()),
@@ -98,14 +99,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match decoder.send_packet(&pkt) {
       Ok(()) => {}
-      Err(VideoDecodeError::Decode(FfmpegError::AllBackendsFailed {
-        unconsumed_packets, ..
-      })) => {
+      Err(VideoDecodeError::Decode(FfmpegError::AllBackendsFailed(p))) => {
         // Runtime exhaustion: rescued packets are the bytes the decoder
         // already consumed from `input`. Replay them through your own
         // software decoder before the current packet so non-seekable
         // sources recover cleanly.
-        let _ = unconsumed_packets;
+        let _unconsumed_packets = p.into_unconsumed_packets();
         return Ok(());
       }
       Err(e) => return Err(e.into()),

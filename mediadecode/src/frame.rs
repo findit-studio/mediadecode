@@ -1,255 +1,85 @@
 //! Frame types and supporting building blocks.
 //!
-//! `Rect` and `Plane<B>` are the shared building blocks. The full
-//! `VideoFrame` / `AudioFrame` / `SubtitleFrame` types land in later
-//! tasks.
+//! The frame structural primitives `Dimensions`, `Rect`, and `Plane<B>`
+//! are re-exported from `videoframe::frame` — they live in the lowest-
+//! layer crate so colconv, mediadecode, and scenesdetect share a single
+//! canonical definition.
+//!
+//! `VideoFrame<P, E, D>`, `AudioFrame<S, C, E, D>`, and
+//! `SubtitleFrame<E, D>` remain in mediadecode because they carry
+//! timestamp + backend-extras layers that are mediadecode's domain
+//! (`videoframe` stays the pure pixel-data layer).
+
+pub use videoframe::frame::{Dimensions, Plane, Rect};
+
+use derive_more::IsVariant;
+use thiserror::Error;
 
 use crate::{Timestamp, color::ColorInfo, subtitle::SubtitlePayload};
 
-/// A `(width, height)` pair in pixels.
-///
-/// Lives alongside the rest of the frame primitives in this module
-/// because the same pair shows up everywhere a video stream is
-/// described — the coded dimensions of a [`VideoFrame`], the
-/// `coded_*` parameters a backend adapter takes when opening a
-/// decoder, the per-plane layout helpers in the WebCodecs
-/// adapter, etc. Passing it as a single struct rather than two
-/// separate `u32` arguments removes a long-running footgun
-/// (silent argument swap) and gives a natural place to hang
-/// helpers like [`Self::is_zero`] or [`Self::Display`].
-///
-/// `u32` width / height matches WebCodecs' `coded_width` /
-/// `coded_height` typing in `web_sys` and FFmpeg's
-/// `AVCodecContext::width` / `height`. 65535×65535 (the smaller
-/// `u16` packing some adjacent crates use) covers every realistic
-/// resolution; the `u32` choice here keeps the public API plug-
-/// compatible with both adapter typings.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Dimensions {
-  width: u32,
-  height: u32,
+/// Errors returned by the `try_new` constructors on the frame types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, IsVariant, Error)]
+#[non_exhaustive]
+pub enum FrameError {
+  /// `VideoFrame::try_new` was called with `plane_count > 4`. The
+  /// fixed plane array has exactly 4 slots; `plane_count` values
+  /// up to and including 4 are accepted, larger values would
+  /// later panic inside [`VideoFrame::planes`] far from the
+  /// construction site. See [`TooManyVideoPlanes`] for the
+  /// payload details. `#[from]` gives a free
+  /// `impl From<TooManyVideoPlanes> for FrameError`, so inner
+  /// helpers that return `Result<_, TooManyVideoPlanes>` can be
+  /// `?`-propagated into `FrameError` directly.
+  #[error(transparent)]
+  TooManyVideoPlanes(#[from] TooManyVideoPlanes),
+  /// `AudioFrame::try_new` was called with `plane_count > 8`. The
+  /// fixed plane array has exactly 8 slots (matches FFmpeg's
+  /// `AV_NUM_DATA_POINTERS`). See [`TooManyAudioPlanes`] for the
+  /// payload details. `#[from]` gives a free
+  /// `impl From<TooManyAudioPlanes> for FrameError`.
+  #[error(transparent)]
+  TooManyAudioPlanes(#[from] TooManyAudioPlanes),
 }
 
-impl Dimensions {
-  /// Constructs a `Dimensions` with the specified width and height
-  /// in pixels.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn new(width: u32, height: u32) -> Self {
-    Self { width, height }
-  }
+/// Payload for [`FrameError::TooManyVideoPlanes`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Error)]
+#[error("VideoFrame: plane_count {plane_count} exceeds the fixed 4-plane array")]
+pub struct TooManyVideoPlanes {
+  /// The out-of-range `plane_count` value the caller supplied.
+  plane_count: u8,
+}
 
-  /// Returns the width in pixels.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn width(&self) -> u32 {
-    self.width
+impl TooManyVideoPlanes {
+  /// Constructs a new [`TooManyVideoPlanes`] payload.
+  #[inline]
+  pub const fn new(plane_count: u8) -> Self {
+    Self { plane_count }
   }
-
-  /// Returns the height in pixels.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn height(&self) -> u32 {
-    self.height
-  }
-
-  /// Sets the width (consuming builder).
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn with_width(mut self, width: u32) -> Self {
-    self.width = width;
-    self
-  }
-
-  /// Sets the width in place.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn set_width(&mut self, width: u32) -> &mut Self {
-    self.width = width;
-    self
-  }
-
-  /// Sets the height (consuming builder).
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn with_height(mut self, height: u32) -> Self {
-    self.height = height;
-    self
-  }
-
-  /// Sets the height in place.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn set_height(&mut self, height: u32) -> &mut Self {
-    self.height = height;
-    self
-  }
-
-  /// Returns `true` when both width and height are zero — typically
-  /// the default-constructed / unset state.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn is_zero(&self) -> bool {
-    self.width == 0 && self.height == 0
+  /// The out-of-range `plane_count` value the caller supplied.
+  #[inline]
+  pub const fn plane_count(&self) -> u8 {
+    self.plane_count
   }
 }
 
-impl core::fmt::Display for Dimensions {
-  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-    write!(f, "{}x{}", self.width, self.height)
-  }
+/// Payload for [`FrameError::TooManyAudioPlanes`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Error)]
+#[error("AudioFrame: plane_count {plane_count} exceeds the fixed 8-plane array")]
+pub struct TooManyAudioPlanes {
+  /// The out-of-range `plane_count` value the caller supplied.
+  plane_count: u8,
 }
 
-/// An axis-aligned integer rectangle.
-///
-/// Used for `VideoFrame::visible_rect` (FFmpeg crop /
-/// WebCodecs `visibleRect` / ProRes RAW `CleanAperture`).
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Rect {
-  x: u32,
-  y: u32,
-  width: u32,
-  height: u32,
-}
-
-impl Rect {
-  /// Constructs a `Rect` at `(x, y)` with the given size.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn new(x: u32, y: u32, width: u32, height: u32) -> Self {
-    Self {
-      x,
-      y,
-      width,
-      height,
-    }
+impl TooManyAudioPlanes {
+  /// Constructs a new [`TooManyAudioPlanes`] payload.
+  #[inline]
+  pub const fn new(plane_count: u8) -> Self {
+    Self { plane_count }
   }
-
-  /// Returns the X coordinate of the top-left corner.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn x(&self) -> u32 {
-    self.x
-  }
-
-  /// Returns the Y coordinate of the top-left corner.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn y(&self) -> u32 {
-    self.y
-  }
-
-  /// Returns the width.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn width(&self) -> u32 {
-    self.width
-  }
-
-  /// Returns the height.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn height(&self) -> u32 {
-    self.height
-  }
-
-  /// Sets the X coordinate (consuming builder).
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn with_x(mut self, x: u32) -> Self {
-    self.x = x;
-    self
-  }
-  /// Sets the Y coordinate (consuming builder).
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn with_y(mut self, y: u32) -> Self {
-    self.y = y;
-    self
-  }
-  /// Sets the width (consuming builder).
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn with_width(mut self, w: u32) -> Self {
-    self.width = w;
-    self
-  }
-  /// Sets the height (consuming builder).
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn with_height(mut self, h: u32) -> Self {
-    self.height = h;
-    self
-  }
-
-  /// Sets the X coordinate in place.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn set_x(&mut self, x: u32) -> &mut Self {
-    self.x = x;
-    self
-  }
-  /// Sets the Y coordinate in place.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn set_y(&mut self, y: u32) -> &mut Self {
-    self.y = y;
-    self
-  }
-  /// Sets the width in place.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn set_width(&mut self, w: u32) -> &mut Self {
-    self.width = w;
-    self
-  }
-  /// Sets the height in place.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn set_height(&mut self, h: u32) -> &mut Self {
-    self.height = h;
-    self
-  }
-}
-
-/// One plane of pixel or audio data.
-///
-/// Generic over the buffer type `B` so the same `Plane` shape works
-/// for owned (`Vec<u8>`, `bytes::Bytes`), borrowed (`&'a [u8]`), or
-/// custom backend-supplied buffers. The bound `B: AsRef<[u8]>` lives
-/// at the use site (`Frame<A, B: AsRef<[u8]>>`); `Plane` itself is
-/// unbounded so it can be used in const contexts.
-///
-/// `stride` is bytes per row for video planes, total plane size in
-/// bytes for audio planar formats.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Plane<B> {
-  data: B,
-  stride: u32,
-}
-
-impl<B> Plane<B> {
-  /// Constructs a `Plane` from a buffer and a stride.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn new(data: B, stride: u32) -> Self {
-    Self { data, stride }
-  }
-
-  /// Returns the stride in bytes.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn stride(&self) -> u32 {
-    self.stride
-  }
-
-  /// Borrows the underlying buffer.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn data(&self) -> &B {
-    &self.data
-  }
-
-  /// Mutably borrows the underlying buffer.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn data_mut(&mut self) -> &mut B {
-    &mut self.data
-  }
-
-  /// Consumes the plane and returns the underlying buffer.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn into_data(self) -> B {
-    self.data
-  }
-
-  /// Sets the stride (consuming builder).
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn with_stride(mut self, stride: u32) -> Self {
-    self.stride = stride;
-    self
-  }
-
-  /// Sets the stride in place.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn set_stride(&mut self, stride: u32) -> &mut Self {
-    self.stride = stride;
-    self
+  /// The out-of-range `plane_count` value the caller supplied.
+  #[inline]
+  pub const fn plane_count(&self) -> u8 {
+    self.plane_count
   }
 }
 
@@ -296,7 +126,8 @@ impl<P, E, D> VideoFrame<P, E, D> {
   /// has four slots; passing a larger `plane_count` would later
   /// trip the slice indexing inside [`Self::planes`] far from
   /// the construction site. Asserting here fails fast with a
-  /// clear message instead.
+  /// clear message instead. Prefer [`Self::try_new`] when
+  /// `plane_count` can't be statically proven `<= 4`.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new(
     dimensions: Dimensions,
@@ -320,6 +151,40 @@ impl<P, E, D> VideoFrame<P, E, D> {
       color: ColorInfo::UNSPECIFIED,
       extra,
     }
+  }
+
+  /// Fallible counterpart to [`Self::new`]. Returns
+  /// [`FrameError::TooManyVideoPlanes`] when `plane_count > 4`
+  /// (the fixed plane array's capacity) rather than panicking.
+  ///
+  /// Not `const fn` — returning `Result<Self, _>` would require
+  /// dropping the moved generic-typed `planes` / `pixel_format` /
+  /// `extra` on the error branch, which the const evaluator
+  /// can't prove safe for arbitrary `P` / `E` / `D`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn try_new(
+    dimensions: Dimensions,
+    pixel_format: P,
+    planes: [Plane<D>; 4],
+    plane_count: u8,
+    extra: E,
+  ) -> Result<Self, FrameError> {
+    if plane_count as usize > 4 {
+      return Err(FrameError::TooManyVideoPlanes(TooManyVideoPlanes::new(
+        plane_count,
+      )));
+    }
+    Ok(Self {
+      pts: None,
+      duration: None,
+      dimensions,
+      visible_rect: None,
+      pixel_format,
+      plane_count,
+      planes,
+      color: ColorInfo::UNSPECIFIED,
+      extra,
+    })
   }
 
   /// Returns the presentation timestamp.
@@ -394,24 +259,28 @@ impl<P, E, D> VideoFrame<P, E, D> {
 
   /// Sets the PTS (consuming builder).
   #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
   pub const fn with_pts(mut self, v: Option<Timestamp>) -> Self {
     self.pts = v;
     self
   }
   /// Sets the duration (consuming builder).
   #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
   pub const fn with_duration(mut self, v: Option<Timestamp>) -> Self {
     self.duration = v;
     self
   }
   /// Sets the visible rect (consuming builder).
   #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
   pub const fn with_visible_rect(mut self, v: Option<Rect>) -> Self {
     self.visible_rect = v;
     self
   }
   /// Sets the color metadata (consuming builder).
   #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
   pub const fn with_color(mut self, v: ColorInfo) -> Self {
     self.color = v;
     self
@@ -478,6 +347,9 @@ impl<S, C, E, D> AudioFrame<S, C, E, D> {
   /// has eight slots; passing a larger `plane_count` would
   /// later trip the slice indexing inside [`Self::planes`] far
   /// from the construction site.
+  ///
+  /// Prefer [`Self::try_new`] when `plane_count` can't be
+  /// statically proven `<= 8`.
   #[allow(clippy::too_many_arguments)]
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new(
@@ -506,6 +378,43 @@ impl<S, C, E, D> AudioFrame<S, C, E, D> {
       planes,
       extra,
     }
+  }
+
+  /// Fallible counterpart to [`Self::new`]. Returns
+  /// [`FrameError::TooManyAudioPlanes`] when `plane_count > 8`
+  /// (the fixed plane array's capacity) rather than panicking.
+  ///
+  /// Not `const fn` — see the rationale on
+  /// [`VideoFrame::try_new`].
+  #[allow(clippy::too_many_arguments)]
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn try_new(
+    sample_rate: u32,
+    nb_samples: u32,
+    channel_count: u8,
+    sample_format: S,
+    channel_layout: C,
+    planes: [Plane<D>; 8],
+    plane_count: u8,
+    extra: E,
+  ) -> Result<Self, FrameError> {
+    if plane_count as usize > 8 {
+      return Err(FrameError::TooManyAudioPlanes(TooManyAudioPlanes::new(
+        plane_count,
+      )));
+    }
+    Ok(Self {
+      pts: None,
+      duration: None,
+      sample_rate,
+      nb_samples,
+      channel_count,
+      sample_format,
+      channel_layout,
+      plane_count,
+      planes,
+      extra,
+    })
   }
 
   /// Returns the presentation timestamp.
@@ -566,12 +475,14 @@ impl<S, C, E, D> AudioFrame<S, C, E, D> {
 
   /// Sets the PTS (consuming builder).
   #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
   pub const fn with_pts(mut self, v: Option<Timestamp>) -> Self {
     self.pts = v;
     self
   }
   /// Sets the duration (consuming builder).
   #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
   pub const fn with_duration(mut self, v: Option<Timestamp>) -> Self {
     self.duration = v;
     self
@@ -643,12 +554,14 @@ impl<E, D> SubtitleFrame<E, D> {
 
   /// Sets the PTS (consuming builder).
   #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
   pub const fn with_pts(mut self, v: Option<Timestamp>) -> Self {
     self.pts = v;
     self
   }
   /// Sets the duration (consuming builder).
   #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
   pub const fn with_duration(mut self, v: Option<Timestamp>) -> Self {
     self.duration = v;
     self
@@ -671,6 +584,20 @@ impl<E, D> SubtitleFrame<E, D> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  use crate::{
+    color::{ColorInfo, ColorMatrix},
+    subtitle::SubtitlePayload,
+  };
+
+  fn empty_planes() -> [Plane<&'static [u8]>; 4] {
+    [
+      Plane::new(&[][..], 0),
+      Plane::new(&[][..], 0),
+      Plane::new(&[][..], 0),
+      Plane::new(&[][..], 0),
+    ]
+  }
 
   #[test]
   fn rect_construct_and_access() {
@@ -736,20 +663,6 @@ mod tests {
     assert_eq!(recovered, &buf[..]);
   }
 
-  use crate::{
-    color::{ColorInfo, ColorMatrix},
-    subtitle::SubtitlePayload,
-  };
-
-  fn empty_planes() -> [Plane<&'static [u8]>; 4] {
-    [
-      Plane::new(&[][..], 0),
-      Plane::new(&[][..], 0),
-      Plane::new(&[][..], 0),
-      Plane::new(&[][..], 0),
-    ]
-  }
-
   #[test]
   fn video_frame_construct_and_access() {
     // VideoFrame<P, E, D>: P=u32 (PixelFormat), E=VLoop (adapter ZST),
@@ -811,18 +724,46 @@ mod tests {
   }
 
   #[test]
+  fn video_frame_try_new_returns_err_for_too_many_planes() {
+    let res: Result<VideoFrame<u32, (), &[u8]>, FrameError> =
+      VideoFrame::try_new(Dimensions::new(64, 64), 0u32, empty_planes(), 5, ());
+    assert!(matches!(
+      res,
+      Err(FrameError::TooManyVideoPlanes(p)) if p.plane_count() == 5,
+    ));
+  }
+
+  #[test]
+  fn video_frame_try_new_accepts_valid_plane_count() {
+    let f: VideoFrame<u32, (), &[u8]> =
+      VideoFrame::try_new(Dimensions::new(64, 64), 0u32, empty_planes(), 2, ())
+        .expect("plane_count = 2 is within the 4-slot capacity");
+    assert_eq!(f.plane_count(), 2);
+  }
+
+  #[test]
   #[should_panic(expected = "plane_count exceeds the fixed 8-plane array")]
   fn audio_frame_rejects_plane_count_above_array_size() {
-    let _f: AudioFrame<u32, u32, (), &[u8]> = AudioFrame::new(
-      48_000,
-      1024,
-      2,
-      0u32,
-      0u32,
-      audio_planes(),
-      9,
-      (),
-    );
+    let _f: AudioFrame<u32, u32, (), &[u8]> =
+      AudioFrame::new(48_000, 1024, 2, 0u32, 0u32, audio_planes(), 9, ());
+  }
+
+  #[test]
+  fn audio_frame_try_new_returns_err_for_too_many_planes() {
+    let res: Result<AudioFrame<u32, u32, (), &[u8]>, FrameError> =
+      AudioFrame::try_new(48_000, 1024, 2, 0u32, 0u32, audio_planes(), 9, ());
+    assert!(matches!(
+      res,
+      Err(FrameError::TooManyAudioPlanes(p)) if p.plane_count() == 9,
+    ));
+  }
+
+  #[test]
+  fn audio_frame_try_new_accepts_valid_plane_count() {
+    let f: AudioFrame<u32, u32, (), &[u8]> =
+      AudioFrame::try_new(48_000, 1024, 2, 0u32, 0u32, audio_planes(), 8, ())
+        .expect("plane_count = 8 is the 8-slot capacity boundary");
+    assert_eq!(f.plane_count(), 8);
   }
 
   #[test]

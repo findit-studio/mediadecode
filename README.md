@@ -14,10 +14,16 @@ Generic, `no_std`-friendly type-and-trait spine for media decoders.
 
 ## Crates
 
-| Crate                                                | Role                                                          |
-| ---------------------------------------------------- | ------------------------------------------------------------- |
-| [`mediadecode`](mediadecode/README.md)               | Backend-agnostic core — `no_std`, no FFmpeg.                  |
-| [`mediadecode-ffmpeg`](mediadecode-ffmpeg/README.md) | FFmpeg adapter with HW-acceleration auto-probe.               |
+| Crate                                                      | Role                                                          |
+| ---------------------------------------------------------- | ------------------------------------------------------------- |
+| [`mediadecode`](mediadecode/README.md)                     | Backend-agnostic core — `no_std`, no FFmpeg.                  |
+| [`mediadecode-ffmpeg`](mediadecode-ffmpeg/README.md)       | FFmpeg adapter with HW-acceleration auto-probe.               |
+| [`mediadecode-webcodecs`](mediadecode-webcodecs/README.md) | WebCodecs adapter for `wasm32` targets (scaffolded).          |
+
+The pixel-format and color-metadata vocabulary (`PixelFormat`,
+`ColorMatrix`, `BayerPattern`, frame primitives) is sourced from
+[`videoframe`](https://crates.io/crates/videoframe) so colconv,
+mediadecode, and scenesdetect share one canonical definition.
 
 See each crate's README for its API surface, usage, and build
 requirements.

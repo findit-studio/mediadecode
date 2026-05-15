@@ -9,7 +9,7 @@ layer, built on top of
 
 [<img alt="github" src="https://img.shields.io/badge/github-findit--ai/mediadecode-8da0cb?style=for-the-badge&logo=Github" height="22">][Github-url]
 <img alt="LoC" src="https://img.shields.io/endpoint?url=https%3A%2F%2Fgist.githubusercontent.com%2Fal8n%2F327b2a8aef9003246e45c6e47fe63937%2Fraw%2Fmediadecode-webcodecs" height="22">
-[<img alt="Build" src="https://img.shields.io/github/actions/workflow/status/findit-ai/mediadecode/ci.yml?logo=Github-Actions&style=for-the-badge" height="22">][CI-url]
+[<img alt="Build" src="https://img.shields.io/github/actions/workflow/status/findit-ai/mediadecode/ci-webcodecs.yml?logo=Github-Actions&style=for-the-badge" height="22">][CI-url]
 [<img alt="codecov" src="https://img.shields.io/codecov/c/gh/findit-ai/mediadecode?style=for-the-badge&logo=codecov" height="22">][codecov-url]
 
 [<img alt="docs.rs" src="https://img.shields.io/badge/docs.rs-mediadecode--webcodecs-66c2a5?style=for-the-badge&labelColor=555555" height="22">][doc-url]
@@ -30,9 +30,13 @@ This crate is **`wasm32`-only**. On non-`wasm32` targets it compiles
 to an empty stub so the workspace `cargo build` / `cargo check`
 continue to work in native dev loops.
 
+> **Status:** scaffolded, public API not yet released. Track
+> the [CHANGELOG](CHANGELOG.md) for the first published version.
+
 ```toml
+# Once published. Until then consume via git or path dep.
 [dependencies]
-mediadecode-webcodecs = "0.1"
+mediadecode-webcodecs = "0.0"
 ```
 
 Built and run via [`wasm-bindgen`](https://crates.io/crates/wasm-bindgen)

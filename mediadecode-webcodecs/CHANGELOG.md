@@ -15,5 +15,13 @@ The backend-agnostic core it adapts has its own log at
   dependency surface, design spec captured in
   `docs/superpowers/specs/2026-05-09-webcodecs-design.md`.
   Public API lands in a subsequent release.
-
-[Unreleased]: https://github.com/findit-ai/mediadecode/compare/mediadecode-webcodecs-v0.1.0...HEAD
+- Tracks the `mediadecode` 0.2.0 / `videoframe` 0.2 cutover: the
+  `PixelFormat::Unknown` boundary fallback in
+  `webcodecs_pixel_format_to_mediadecode` preserves the raw
+  WebCodecs identifier via `PixelFormat::Unknown(raw as u32)`
+  instead of collapsing to a unit variant.
+- `#[must_use]` added to every `with_*` consuming builder method.
+- New `tests/native_stub.rs` — verifies the crate compiles to an
+  empty stub on non-wasm32 targets and that no wasm-only names
+  leak through. Closes
+  [issue #4 — finding 4](https://github.com/Findit-AI/mediadecode/issues/4).

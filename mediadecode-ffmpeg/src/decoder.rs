@@ -37,7 +37,7 @@ mod c_shims {
 
 use crate::{
   backend::{self, Backend},
-  error::{Error, Result},
+  error::{AllBackendsFailed, Error, HwDeviceInitFailed, Result},
   ffi::{CallbackState, codec_supports_hwaccel, get_hw_format},
   frame::Frame,
 };
@@ -377,11 +377,11 @@ impl VideoDecoder {
         }
       }
     }
-    Err(Error::AllBackendsFailed {
+    // No packets have been consumed at open time.
+    Err(Error::AllBackendsFailed(AllBackendsFailed::new(
       attempts,
-      // No packets have been consumed at open time.
-      unconsumed_packets: Vec::new(),
-    })
+      Vec::new(),
+    )))
   }
 
   /// Open the decoder with a specific backend. No probe, no fallback.
@@ -418,6 +418,7 @@ impl VideoDecoder {
   /// let decoder = VideoDecoder::open(params)?
   ///     .with_max_probe_pending_bytes(1024 * 1024 * 1024); // 1 GiB
   /// ```
+  #[must_use]
   pub fn with_max_probe_pending_bytes(mut self, bytes: usize) -> Self {
     self.max_probe_pending_bytes = bytes;
     self
@@ -502,10 +503,10 @@ impl VideoDecoder {
             "hwdecode: probe rescue exhausted before consuming packet; \
              returning AllBackendsFailed without invoking decoder"
           );
-          return Err(Error::AllBackendsFailed {
-            attempts: probe.attempts,
-            unconsumed_packets: probe.buffered_packets,
-          });
+          return Err(Error::AllBackendsFailed(AllBackendsFailed::new(
+            probe.attempts,
+            probe.buffered_packets,
+          )));
         }
         // Step 2: byte / packet count cap. `packet_side_data_bytes`
         // clamps its walk to MAX_PROBE_PACKET_SIDE_DATA_ENTRIES as
@@ -529,10 +530,10 @@ impl VideoDecoder {
             "hwdecode: probe rescue exhausted before consuming packet; \
              returning AllBackendsFailed without invoking decoder"
           );
-          return Err(Error::AllBackendsFailed {
-            attempts: probe.attempts,
-            unconsumed_packets: probe.buffered_packets,
-          });
+          return Err(Error::AllBackendsFailed(AllBackendsFailed::new(
+            probe.attempts,
+            probe.buffered_packets,
+          )));
         }
         // Step 3: pre-clone before consuming. `av_packet_ref` is a
         // refcounted shallow clone (no payload deep-copy) but can still
@@ -547,10 +548,10 @@ impl VideoDecoder {
               "hwdecode: packet clone failed before consuming; \
                returning AllBackendsFailed without invoking decoder"
             );
-            return Err(Error::AllBackendsFailed {
-              attempts: probe.attempts,
-              unconsumed_packets: probe.buffered_packets,
-            });
+            return Err(Error::AllBackendsFailed(AllBackendsFailed::new(
+              probe.attempts,
+              probe.buffered_packets,
+            )));
           }
         }
       } else {
@@ -764,8 +765,9 @@ impl VideoDecoder {
   /// Returns:
   /// - `Ok(())` when a candidate is installed and replay completed —
   ///   caller should retry the operation.
-  /// - `Err(Error::AllBackendsFailed { attempts })` when every remaining
+  /// - `Err(Error::AllBackendsFailed(p))` when every remaining
   ///   backend has been exhausted (including the just-failed active one).
+  ///   `p.attempts()` carries the per-backend failure log.
   ///   This is what the documented `open` contract promises, surfaced at
   ///   runtime so the caller can branch into a software fallback. On a
   ///   single-backend platform (e.g. macOS), this fires after the only
@@ -841,10 +843,10 @@ impl VideoDecoder {
             .take()
             .map(|p| (p.attempts, p.buffered_packets))
             .unwrap_or_default();
-          return Err(Error::AllBackendsFailed {
+          return Err(Error::AllBackendsFailed(AllBackendsFailed::new(
             attempts,
             unconsumed_packets,
-          });
+          )));
         }
       };
 
@@ -1021,10 +1023,10 @@ impl VideoDecoder {
       av_hwdevice_ctx_create(&mut hw_device_ref, av_type, ptr::null(), ptr::null_mut(), 0)
     };
     if ret < 0 {
-      return Err(Error::HwDeviceInitFailed {
+      return Err(Error::HwDeviceInitFailed(HwDeviceInitFailed::new(
         backend,
-        source: ffmpeg_next::Error::from(ret),
-      });
+        ffmpeg_next::Error::from(ret),
+      )));
     }
 
     let callback_state = Box::into_raw(Box::new(CallbackState {
@@ -2603,10 +2605,9 @@ mod tests {
         continue;
       }
       match decoder.send_packet(&packet) {
-        Err(Error::AllBackendsFailed {
-          attempts,
-          unconsumed_packets,
-        }) => {
+        Err(Error::AllBackendsFailed(p)) => {
+          let attempts = p.attempts();
+          let unconsumed_packets = p.unconsumed_packets();
           assert_eq!(
             unconsumed_packets.len(),
             1,
@@ -2697,10 +2698,9 @@ mod tests {
     // buffered packets and surface them via `unconsumed_packets`.
     let result = decoder.advance_probe(Error::Ffmpeg(ffmpeg_next::Error::InvalidData));
     match result {
-      Err(Error::AllBackendsFailed {
-        attempts,
-        unconsumed_packets,
-      }) => {
+      Err(Error::AllBackendsFailed(p)) => {
+        let attempts = p.attempts();
+        let unconsumed_packets = p.unconsumed_packets();
         assert_eq!(
           unconsumed_packets.len(),
           2,
@@ -2785,7 +2785,8 @@ mod tests {
 
     let result = decoder.advance_probe(Error::Ffmpeg(ffmpeg_next::Error::InvalidData));
     match result {
-      Err(Error::AllBackendsFailed { attempts, .. }) => {
+      Err(Error::AllBackendsFailed(p)) => {
+        let attempts = p.attempts();
         assert_eq!(
           attempts.len(),
           2,

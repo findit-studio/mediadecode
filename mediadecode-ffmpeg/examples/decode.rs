@@ -24,12 +24,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
   let mut decoder = match VideoDecoder::open(stream.parameters()) {
     Ok(d) => d,
-    Err(mediadecode_ffmpeg::Error::AllBackendsFailed { attempts, .. }) => {
+    Err(mediadecode_ffmpeg::Error::AllBackendsFailed(p)) => {
+      let attempts = p.attempts();
       eprintln!(
         "no hardware backend available; tried {} backend(s):",
         attempts.len()
       );
-      for (b, e) in &attempts {
+      for (b, e) in attempts {
         eprintln!("  {b:?}: {e}");
       }
       eprintln!("(callers handle software fallback themselves — see ffmpeg::decoder::Video)");

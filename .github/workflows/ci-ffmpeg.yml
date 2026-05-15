@@ -70,9 +70,10 @@ jobs:
           ~/.cargo/registry
           ~/.cargo/git
           target
-        key: ${{ runner.os }}-ffmpeg-build-${{ hashFiles('**/Cargo.lock') }}
+        # See the `test` job below for the `-v2-` prefix rationale.
+        key: ${{ runner.os }}-ffmpeg-build-v2-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: |
-          ${{ runner.os }}-ffmpeg-build-
+          ${{ runner.os }}-ffmpeg-build-v2-
     - name: Install FFmpeg
       run: brew install ffmpeg pkg-config
     - name: Install Rust
@@ -98,15 +99,32 @@ jobs:
           ~/.cargo/registry
           ~/.cargo/git
           target
-        key: ${{ runner.os }}-ffmpeg-test-${{ hashFiles('**/Cargo.lock') }}
+        # `-v2-` prefix bump is a one-shot cache invalidation —
+        # earlier runs cached `ffmpeg-sys-next` artifacts that
+        # had baked in a stale brew FFmpeg path
+        # (`/opt/homebrew/Cellar/ffmpeg/<old version>/lib`).
+        # The runner now has a different patch version, so the
+        # linker fails with `library 'avutil' not found`. Once
+        # the new cache populates, the explicit clean step
+        # below keeps it fresh on every run.
+        key: ${{ runner.os }}-ffmpeg-test-v2-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: |
-          ${{ runner.os }}-ffmpeg-test-
+          ${{ runner.os }}-ffmpeg-test-v2-
     - name: Install FFmpeg
       run: brew install ffmpeg pkg-config
     - name: Install Rust
       run: rustup update stable && rustup default stable
     - name: Install cargo-hack
       run: cargo install cargo-hack
+    - name: Refresh ffmpeg-sys-next build artifacts
+      # `ffmpeg-sys-next`'s `build.rs` bakes the brew-installed
+      # `/opt/homebrew/Cellar/ffmpeg/<version>/lib` path into its
+      # linker hints. When brew bumps FFmpeg between runs the
+      # cached output points at a path that no longer exists and
+      # the linker fails. Force a rebuild of the sys crate (and
+      # its downstream binding) so the build script re-reads
+      # `pkg-config` against the currently-installed FFmpeg.
+      run: cargo clean -p ffmpeg-sys-next -p ffmpeg-next -p mediadecode-ffmpeg
     - name: Run test
       run: cargo hack test -p mediadecode-ffmpeg --feature-powerset --exclude-no-default-features
 
@@ -136,9 +154,13 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-ffmpeg-coverage-${{ hashFiles('**/Cargo.lock') }}
+          # See the `test` job above for the `-v2-` prefix + clean
+          # step rationale. Same brew-ffmpeg-path drift bites here.
+          key: ${{ runner.os }}-ffmpeg-coverage-v2-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-ffmpeg-coverage-
+            ${{ runner.os }}-ffmpeg-coverage-v2-
+      - name: Refresh ffmpeg-sys-next build artifacts
+        run: cargo clean -p ffmpeg-sys-next -p ffmpeg-next -p mediadecode-ffmpeg
       - name: Run tarpaulin
         env:
           RUSTFLAGS: "--cfg tarpaulin"
