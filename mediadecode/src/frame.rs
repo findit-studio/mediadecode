@@ -1,16 +1,16 @@
 //! Frame types and supporting building blocks.
 //!
 //! The frame structural primitives `Dimensions`, `Rect`, and `Plane<B>`
-//! are re-exported from `videoframe::frame` — they live in the lowest-
+//! are re-exported from `mediaframe::frame` — they live in the lowest-
 //! layer crate so colconv, mediadecode, and scenesdetect share a single
 //! canonical definition.
 //!
 //! `VideoFrame<P, E, D>`, `AudioFrame<S, C, E, D>`, and
 //! `SubtitleFrame<E, D>` remain in mediadecode because they carry
 //! timestamp + backend-extras layers that are mediadecode's domain
-//! (`videoframe` stays the pure pixel-data layer).
+//! (`mediaframe` stays the pure pixel-data layer).
 
-pub use videoframe::frame::{Dimensions, Plane, Rect};
+pub use mediaframe::frame::{Dimensions, Plane, Rect};
 
 use derive_more::IsVariant;
 use thiserror::Error;
@@ -642,7 +642,7 @@ mod tests {
     let buf: [u8; 4] = [1, 2, 3, 4];
     let p: Plane<&[u8]> = Plane::new(&buf, 4);
     assert_eq!(p.stride(), 4);
-    assert_eq!(p.data(), &&buf[..]);
+    assert_eq!(p.data_ref(), &&buf[..]);
   }
 
   #[test]
@@ -678,7 +678,8 @@ mod tests {
     assert_eq!(f.height(), 1080);
     assert_eq!(f.dimensions(), Dimensions::new(1920, 1080));
     assert_eq!(f.plane_count(), 1);
-    assert!(f.color().matrix().is_bt_709());
+    // mediaframe rename: `Matrix::default()` is now `Unspecified` (was `Bt709`).
+    assert_eq!(f.color().matrix(), crate::color::ColorMatrix::Unspecified);
     assert_eq!(f.planes().len(), 1);
   }
 

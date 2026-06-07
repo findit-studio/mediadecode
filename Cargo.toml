@@ -16,7 +16,7 @@ homepage     = "https://github.com/findit-ai/mediadecode"
 [workspace.dependencies]
 # Workspace-internal crates — referenced by sibling members via workspace inheritance.
 mediadecode = { version = "0.2", path = "mediadecode", default-features = false }
-videoframe  = { version = "0.2", default-features = false, features = ["frame"] }
+mediaframe  = { version = "0.1", default-features = false, features = ["frame"] }
 
 # External deps used by more than one member, pinned at the workspace level.
 mediatime   = { version = "0.1", default-features = false }
