@@ -29,7 +29,7 @@ use crate::{
 };
 
 /// Errors from [`av_frame_to_video_frame`].
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum ConvertError {
   /// `av_frame` was null.

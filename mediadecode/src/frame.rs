@@ -325,6 +325,7 @@ impl<P, E, D> VideoFrame<P, E, D> {
 /// `[Plane; 8]` cap mirrors FFmpeg's `AV_NUM_DATA_POINTERS`. Channel
 /// counts above 8 surface their extra channels through `E` (rare in
 /// practice).
+#[derive(Clone)]
 pub struct AudioFrame<S, C, E, D> {
   pts: Option<Timestamp>,
   duration: Option<Timestamp>,

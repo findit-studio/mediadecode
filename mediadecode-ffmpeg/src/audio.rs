@@ -115,7 +115,7 @@ impl AudioStreamDecoder for FfmpegAudioStreamDecoder {
 }
 
 /// Errors from [`FfmpegAudioStreamDecoder`].
-#[derive(thiserror::Error, Debug)]
+#[derive(thiserror::Error, Debug, Clone)]
 pub enum AudioDecodeError {
   /// The wrapped `ffmpeg::decoder::Audio` reported an error.
   #[error(transparent)]
