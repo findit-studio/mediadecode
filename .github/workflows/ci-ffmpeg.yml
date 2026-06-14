@@ -166,7 +166,7 @@ jobs:
           RUSTFLAGS: "--cfg tarpaulin"
         run: cargo tarpaulin -p mediadecode-ffmpeg --all-features --run-types tests --run-types doctests --out xml
       - name: Upload to codecov.io
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           slug: ${{ github.repository }}
