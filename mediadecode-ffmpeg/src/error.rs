@@ -16,7 +16,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// `Debug`. Those payloads summarize the packet count rather
 /// than dumping each packet's fields, which would be both noisy
 /// and useless for triage.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum Error {
   /// An underlying FFmpeg error.
   #[error("ffmpeg error: {0}")]
@@ -116,7 +116,7 @@ impl HwDeviceInitFailed {
 /// `Debug` is hand-written: [`ffmpeg_next::Packet`] does not derive
 /// `Debug`, so we print `[N packets]` instead of dumping per-packet
 /// bytes, which would be both noisy and useless for triage.
-#[derive(thiserror::Error)]
+#[derive(Clone, thiserror::Error)]
 #[error("all hardware backends failed; attempts: {attempts:?}")]
 pub struct AllBackendsFailed {
   /// Per-backend errors collected during probing, in the order tried.
@@ -192,7 +192,7 @@ impl std::fmt::Debug for AllBackendsFailed {
 /// `Debug` is hand-written for the same reason as
 /// [`AllBackendsFailed`]: [`ffmpeg_next::Packet`] does not derive
 /// `Debug`.
-#[derive(thiserror::Error)]
+#[derive(Clone, thiserror::Error)]
 #[error("HW->SW fallback failed: {source}")]
 pub struct FallbackFailed {
   /// Underlying error that aborted the fallback transition.
