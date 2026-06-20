@@ -39,7 +39,17 @@ impl FfmpegAudioStreamDecoder {
   pub fn open(parameters: Parameters, time_base: Timebase) -> Result<Self, AudioDecodeError> {
     // Use the checked codec-context builder — `Context::from_parameters`
     // is OOM-UB-prone (see `crate::decoder::build_codec_context`).
-    let ctx = build_codec_context(&parameters).map_err(AudioDecodeError::Decode)?;
+    let mut ctx = build_codec_context(&parameters).map_err(AudioDecodeError::Decode)?;
+    // Frame threading for audio: count=0 → ffmpeg auto-picks; the env
+    // var overrides (shared with the video path so one knob tunes both).
+    let thread_count: usize = std::env::var("MEDIADECODE_DECODE_THREADS")
+      .ok()
+      .and_then(|v| v.parse().ok())
+      .unwrap_or(4);
+    ctx.set_threading(ffmpeg_next::codec::threading::Config {
+      kind: ffmpeg_next::codec::threading::Type::Frame,
+      count: thread_count,
+    });
     let decoder = ctx
       .decoder()
       .audio()

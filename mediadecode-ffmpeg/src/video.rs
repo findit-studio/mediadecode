@@ -451,7 +451,21 @@ fn open_sw_decoder(parameters: &Parameters) -> Result<ffmpeg_next::decoder::Vide
   // running `avcodec_parameters_to_context` against it. Under
   // memory pressure that's C-level UB; `build_codec_context`
   // surfaces the OOM as an error instead.
-  let ctx = build_codec_context(parameters)?;
+  let mut ctx = build_codec_context(parameters)?;
+  // Frame threading: each decoded frame runs on its own OS thread.
+  // `Type::Frame` degrades gracefully to slice threading for codecs
+  // (e.g. some older MPEG variants) that don't support frame threading.
+  // count=0 means "let ffmpeg choose"; the env var lets the caller
+  // override (e.g. MEDIADECODE_DECODE_THREADS=1 to disable, or a
+  // larger value for heavy 4K/8K workloads).
+  let thread_count: usize = std::env::var("MEDIADECODE_DECODE_THREADS")
+    .ok()
+    .and_then(|v| v.parse().ok())
+    .unwrap_or(4);
+  ctx.set_threading(ffmpeg_next::codec::threading::Config {
+    kind: ffmpeg_next::codec::threading::Type::Frame,
+    count: thread_count,
+  });
   ctx.decoder().video().map_err(Error::Ffmpeg)
 }
 
