@@ -96,6 +96,43 @@ impl HwDeviceInitFailed {
   }
 }
 
+/// Where in the decoder's life a [`AllBackendsFailed`] was raised.
+///
+/// The [`crate::FfmpegVideoStreamDecoder`] wrapper routes its software-fallback
+/// replay on **this explicit signal** rather than inferring origin from whether
+/// `unconsumed_packets` is empty. Both origins can carry an empty
+/// `unconsumed_packets` — a probe-era failure on the *first* packet (a
+/// side-data / byte / packet cap trip, or an `av_packet_ref` ENOMEM) has no
+/// prior history to surface, exactly like every post-commit failure — so
+/// emptiness cannot disambiguate them. Conflating the two made the wrapper
+/// treat a probe-era first-packet cap trip as post-commit: it would append a
+/// clone of the borrowed current packet to an empty replay set and skip the
+/// post-fallback `send_packet`, silently dropping that packet if the clone
+/// failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FallbackOrigin {
+  /// Raised while the inner decoder's probe was still active (before the first
+  /// frame). `unconsumed_packets` is the probe's buffered history (possibly
+  /// empty when the failure landed on the very first packet). The wrapper
+  /// replays that history and then routes the still-unconsumed current packet
+  /// to the new software decoder itself.
+  Probe,
+  /// Raised after the probe collapsed (the committed backend failed at
+  /// runtime). `unconsumed_packets` is always empty — the probe buffer is gone
+  /// — so the wrapper does not replay: it opens a software decoder cold,
+  /// forwards only the failing call's current packet (or EOF), and resyncs at
+  /// the next keyframe, accepting a bounded, logged gap (degrade-and-continue).
+  PostCommit,
+}
+
+impl FallbackOrigin {
+  /// `true` for [`FallbackOrigin::PostCommit`].
+  #[inline]
+  pub const fn is_post_commit(self) -> bool {
+    matches!(self, FallbackOrigin::PostCommit)
+  }
+}
+
 /// Payload for [`Error::AllBackendsFailed`].
 ///
 /// Auto-probe exhausted every backend in the platform's order. Empty
@@ -113,6 +150,11 @@ impl HwDeviceInitFailed {
 /// from [`crate::VideoDecoder::open`] (no packets were ever sent),
 /// this vec is empty.
 ///
+/// `origin` records whether the failure happened during the probe or after the
+/// committed backend collapsed at runtime — the explicit signal the wrapper
+/// routes on (see [`FallbackOrigin`]). It is never inferred from
+/// `unconsumed_packets.is_empty()`, which both origins can satisfy.
+///
 /// `Debug` is hand-written: [`ffmpeg_next::Packet`] does not derive
 /// `Debug`, so we print `[N packets]` instead of dumping per-packet
 /// bytes, which would be both noisy and useless for triage.
@@ -124,10 +166,16 @@ pub struct AllBackendsFailed {
   /// Packets the decoder consumed from the caller before exhaustion.
   /// Replay them through a software decoder for non-seekable inputs.
   unconsumed_packets: Vec<Packet>,
+  /// Whether this was raised during the probe or post-commit. The wrapper's
+  /// fallback replay routes on this, never on `unconsumed_packets` emptiness.
+  origin: FallbackOrigin,
 }
 
 impl AllBackendsFailed {
-  /// Constructs a new [`AllBackendsFailed`] payload.
+  /// Constructs a probe-era [`AllBackendsFailed`] payload — raised while the
+  /// inner decoder's probe is still active. `unconsumed_packets` is the probe's
+  /// buffered history (possibly empty if the failure landed on the first
+  /// packet). See [`FallbackOrigin::Probe`].
   ///
   /// Not `const fn`: the `Vec` arguments may carry destructors and
   /// the const evaluator can't prove their drop safe for arbitrary
@@ -137,12 +185,32 @@ impl AllBackendsFailed {
     Self {
       attempts,
       unconsumed_packets,
+      origin: FallbackOrigin::Probe,
+    }
+  }
+  /// Constructs a post-commit [`AllBackendsFailed`] payload — raised after the
+  /// probe collapsed, when the committed backend failed at runtime.
+  /// `unconsumed_packets` is always empty (the probe buffer is gone); the
+  /// wrapper's retained GOP window supplies the replay set. See
+  /// [`FallbackOrigin::PostCommit`].
+  #[inline]
+  pub fn new_post_commit(attempts: Vec<(Backend, Box<Error>)>) -> Self {
+    Self {
+      attempts,
+      unconsumed_packets: Vec::new(),
+      origin: FallbackOrigin::PostCommit,
     }
   }
   /// Per-backend errors collected during probing, in the order tried.
   #[inline]
   pub fn attempts(&self) -> &[(Backend, Box<Error>)] {
     &self.attempts
+  }
+  /// Where this failure was raised — the explicit probe-vs-post-commit signal
+  /// the wrapper routes its fallback replay on.
+  #[inline]
+  pub const fn origin(&self) -> FallbackOrigin {
+    self.origin
   }
   /// Packets the decoder consumed from the caller before exhaustion.
   /// Replay them through a software decoder for non-seekable inputs.
@@ -175,6 +243,7 @@ impl std::fmt::Debug for AllBackendsFailed {
         "unconsumed_packets",
         &format_args!("[{} packets]", self.unconsumed_packets.len()),
       )
+      .field("origin", &self.origin)
       .finish()
   }
 }
