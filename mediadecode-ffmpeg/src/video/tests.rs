@@ -1422,17 +1422,333 @@ fn inert_seam_builds_on_hardware() {
 //  Deferred real-fixture integration test
 // ---------------------------------------------------------------------------
 
-// TODO: user provides FX3 H.264 High 4:2:2 10-bit fixture; assert HW→SW
-// fallback decodes from the next keyframe after the runtime HW failure. This is
-// the real-hardware counterpart to
-// `post_commit_failure_degrades_and_resyncs_at_next_keyframe`: open
-// `FfmpegVideoStreamDecoder` on the actual VideoToolbox path, drive the FX3
-// clip, and assert (a) it transparently falls back to SW mid-stream and (b) it
-// resyncs at the next keyframe and decodes the remainder (the bounded gap at
-// the failure boundary is the accepted, logged loss).
+/// Real-hardware counterpart to
+/// [`post_commit_failure_degrades_and_resyncs_at_next_keyframe`]: drive an
+/// actual Sony FX3 H.264 **High 4:2:2 10-bit** clip through the real
+/// VideoToolbox path and observe whether the post-commit degrade-and-continue
+/// fallback survives a *real* H.264 codec (the synthetic tests use a lenient
+/// mpeg4 SW decoder; this resolves whether that leniency masks a real defect —
+/// see findit-studio/mediadecode#12).
+///
+/// This is an **instrumented experiment**, not a green-checkmark assertion. It
+/// captures (a) the starting backend, (b) the HW→SW transition point, (c) the
+/// per-frame PTS delivered and the gap at the fallback boundary, and (d)
+/// whether the cold SW decoder resynced at the next keyframe and decoded the
+/// remainder — or aborted on a pre-keyframe P-frame / never saw the keyframe.
+/// All of it is printed under `--nocapture`. The hard assertions at the end
+/// encode the **observed** real-codec behaviour on this fixture.
+///
+/// Gated on `MEDIADECODE_FX3_SAMPLE` (absolute path to the fixture); skips
+/// cleanly when unset so `cargo test` stays green without it. Run with:
+///
+/// ```sh
+/// MEDIADECODE_FX3_SAMPLE=/path/to/12_sony_fx3_xavc.mp4 \
+///   cargo test -p mediadecode-ffmpeg --all-features \
+///   fx3_high_422_10bit -- --ignored --nocapture
+/// ```
 #[test]
 #[ignore = "requires a Sony FX3 H.264 High 4:2:2 10-bit fixture (user-provided); \
             set MEDIADECODE_FX3_SAMPLE to its path"]
 fn fx3_high_422_10bit_falls_back_to_software_and_decodes_whole_stream() {
-  // Intentionally empty until the fixture is available — see TODO above.
+  use ffmpeg_next::{format, media};
+
+  let Some(path) = std::env::var_os("MEDIADECODE_FX3_SAMPLE") else {
+    eprintln!(
+      "skipping: set MEDIADECODE_FX3_SAMPLE to the Sony FX3 H.264 422-10bit fixture path to run \
+       this experiment"
+    );
+    return;
+  };
+
+  ffmpeg_next::init().expect("ffmpeg init");
+
+  let mut input = format::input(&path).expect("open FX3 input");
+  let stream = input
+    .streams()
+    .best(media::Type::Video)
+    .expect("video stream");
+  let stream_index = stream.index();
+  // SAFETY: `stream.parameters()` exposes a live `*const AVCodecParameters`
+  // for the duration of the borrow; reading the geometry fields is sound.
+  let (expected_w, expected_h) = unsafe {
+    let p = stream.parameters();
+    ((*p.as_ptr()).width as u32, (*p.as_ptr()).height as u32)
+  };
+  // A nominal time base for frame labelling — the experiment only inspects the
+  // coverage/ordering of the resulting PTS, not its real-time scale.
+  let tb = Timebase::new(1, NonZeroU32::new(24).expect("nonzero"));
+
+  let mut dec = match FfmpegVideoStreamDecoder::open(stream.parameters(), tb) {
+    Ok(d) => d,
+    Err(Error::AllBackendsFailed(p)) => {
+      // No HW backend opened at all → the wrapper went straight to SW at
+      // open-time (probe-era), never exercising the post-commit path. Nothing
+      // to observe; record and skip rather than false-fail.
+      eprintln!(
+        "skipping: no hardware backend available at open ({} attempts) — the post-commit \
+         degrade path needs a HW backend that COMMITS then fails at runtime",
+        p.attempts().len()
+      );
+      return;
+    }
+    Err(e) => panic!("open FX3 decoder: {e:?}"),
+  };
+
+  let mut obs = Fx3Observation::new(dec.is_hardware());
+  eprintln!(
+    "FX3 experiment: {expected_w}x{expected_h}; started_on_hw={} (is_software={})",
+    obs.started_on_hw,
+    dec.is_software()
+  );
+
+  let mut dst = crate::empty_video_frame();
+
+  'feed: for (s, packet) in input.packets() {
+    if s.index() != stream_index {
+      continue;
+    }
+    let is_key = packet.is_key();
+    let pkt_pts = packet.pts();
+    let Some(vpkt) = boundary::video_packet_from_ffmpeg(&packet) else {
+      continue; // empty packet (no buffer) — skip
+    };
+
+    // send_packet, draining on EAGAIN.
+    let mut attempts = 0u32;
+    loop {
+      match dec.send_packet(&vpkt) {
+        Ok(()) => break,
+        Err(VideoDecodeError::Decode(Error::Ffmpeg(ffmpeg_next::Error::Other { errno })))
+          if errno == ffmpeg_next::error::EAGAIN =>
+        {
+          if let Err(err) = obs.drain(&mut dec, &mut dst) {
+            obs.abort = Some(format!("during send #{} EAGAIN-drain: {err}", obs.send_idx));
+            break 'feed;
+          }
+          attempts += 1;
+          assert!(
+            attempts <= 64,
+            "send_packet stuck on EAGAIN at send #{}",
+            obs.send_idx
+          );
+        }
+        Err(e) => {
+          // A non-transient error surfacing from `send_packet` itself — capture
+          // the variant. This is where a forwarded current packet that the cold
+          // SW rejects would land (Codex finding 1's send-arm shape).
+          obs.abort = Some(format!(
+            "send_packet #{} (key={is_key}, pts={pkt_pts:?}) errored: {e:?}",
+            obs.send_idx
+          ));
+          break 'feed;
+        }
+      }
+    }
+    if let Err(err) = obs.drain(&mut dec, &mut dst) {
+      obs.abort = Some(format!(
+        "after send #{} (key={is_key}): {err}",
+        obs.send_idx
+      ));
+      break 'feed;
+    }
+    obs.send_idx += 1;
+  }
+
+  // EOF + final drain (only if we did not already abort mid-feed).
+  if obs.abort.is_none() {
+    match dec.send_eof() {
+      Ok(()) => {
+        if let Err(err) = obs.drain(&mut dec, &mut dst) {
+          obs.abort = Some(format!("during post-EOF drain: {err}"));
+        }
+      }
+      Err(VideoDecodeError::PostCommitNeverResynced { packets_lost }) => {
+        obs.escalated_never_resynced = Some(packets_lost);
+      }
+      Err(e) => obs.abort = Some(format!("send_eof errored: {e:?}")),
+    }
+  }
+
+  // ----- Report -----------------------------------------------------------
+  let ended_on_sw = dec.is_software();
+  let unique: std::collections::HashSet<i64> = obs.pts_out.iter().copied().collect();
+  eprintln!("FX3 experiment RESULT:");
+  eprintln!("  started_on_hw        = {}", obs.started_on_hw);
+  eprintln!(
+    "  transitioned_to_sw   = {} (at send #{:?})",
+    obs.transitioned_to_sw, obs.transition_send_idx
+  );
+  eprintln!("  ended_on_sw          = {ended_on_sw}");
+  eprintln!(
+    "  frames_delivered     = {} (unique pts = {})",
+    obs.pts_out.len(),
+    unique.len()
+  );
+  eprintln!("  delivered_pts        = {:?}", obs.pts_out);
+  eprintln!(
+    "  resync_pending@end   = {}",
+    dec.degraded_resync_pending_for_test()
+  );
+  eprintln!(
+    "  never_resynced_esc   = {:?}",
+    obs.escalated_never_resynced
+  );
+  eprintln!("  abort                = {:?}", obs.abort);
+
+  // ----- Assertions on the OBSERVED behaviour -----------------------------
+  // (1) The fixture must commit on HW first — otherwise this is not the
+  //     post-commit path and the experiment is inconclusive (skip-shaped).
+  assert!(
+    obs.started_on_hw,
+    "expected to start on the VideoToolbox HW path; if it opened straight to SW the post-commit \
+     path was never exercised on this run"
+  );
+
+  // (2) A real HW runtime failure must have driven a transparent mid-stream
+  //     HW->SW transition (the core #12 fix behaviour).
+  assert!(
+    obs.transitioned_to_sw && ended_on_sw,
+    "expected a transparent mid-stream HW->SW fallback on the real FX3 clip (VideoToolbox cannot \
+     decode H.264 High 4:2:2 10-bit at runtime); observed transition={}, ended_on_sw={ended_on_sw}, \
+     abort={:?}",
+    obs.transitioned_to_sw,
+    obs.abort
+  );
+
+  // (3) The drive must not have ABORTED on a hard error before EOF. A
+  //     pre-keyframe P-frame InvalidData (Codex finding 1) or a missed
+  //     keyframe surfacing as a hard error would land here.
+  assert!(
+    obs.abort.is_none(),
+    "the degrade-and-continue path aborted before EOF on the real H.264 codec: {:?} — this would \
+     be Codex R7's finding reproducing on a real (non-lenient) codec",
+    obs.abort
+  );
+
+  // (4) The fallback must have RESYNCED at the next keyframe and decoded the
+  //     remainder — i.e. it did NOT escalate `PostCommitNeverResynced`, and
+  //     the resync guard is clear at EOF. A bounded gap at the failure
+  //     boundary is acceptable; never reaching a keyframe is the failure.
+  assert!(
+    obs.escalated_never_resynced.is_none(),
+    "the cold SW decoder never resynced at a keyframe before EOF (PostCommitNeverResynced, {:?} \
+     packets lost) — the whole tail was dropped; Codex R7's finding 2 (HW swallowed the keyframe / \
+     cold SW never saw it) reproduces on real H.264",
+    obs.escalated_never_resynced
+  );
+  assert!(
+    !dec.degraded_resync_pending_for_test(),
+    "a post-commit resync was still pending at EOF — SW never proved a keyframe-anchored resync"
+  );
+
+  // (5) Having resynced, SW must have delivered a non-trivial set of frames
+  //     from the remainder, every one a real PTS, no duplicates.
+  assert!(
+    !obs.pts_out.is_empty(),
+    "no frames were delivered at all — neither HW prefix nor SW remainder"
+  );
+  assert!(
+    !obs.pts_out.contains(&i64::MIN),
+    "every delivered frame must carry a real PTS: {:?}",
+    obs.pts_out
+  );
+  assert_eq!(
+    unique.len(),
+    obs.pts_out.len(),
+    "the degrade path must not re-emit a frame (no duplicate PTS): {:?}",
+    obs.pts_out
+  );
+}
+
+/// Instrumentation accumulator for the FX3 experiment: the observed backend
+/// trajectory (HW start, the HW→SW transition point), the delivered PTS, and
+/// any terminal error / escalation. Bundled into one value so the drive loop's
+/// drain step is a single method call instead of threading seven `&mut`s.
+struct Fx3Observation {
+  /// Whether the decoder opened on the HW path (the precondition for
+  /// exercising the post-commit degrade path at all).
+  started_on_hw: bool,
+  /// Set once the SW path is first observed active mid-drive.
+  transitioned_to_sw: bool,
+  /// `send_packet` index at which the HW→SW transition was first observed.
+  transition_send_idx: Option<usize>,
+  /// 0-based index of the current `send_packet`, advanced by the drive loop.
+  send_idx: usize,
+  /// PTS of every delivered frame, in delivery order (`i64::MIN` marks a hole).
+  pts_out: Vec<i64>,
+  /// `Debug` of the terminal error if the drive aborted before EOF.
+  abort: Option<String>,
+  /// `packets_lost` if the fallback escalated `PostCommitNeverResynced`.
+  escalated_never_resynced: Option<u64>,
+}
+
+impl Fx3Observation {
+  fn new(started_on_hw: bool) -> Self {
+    Self {
+      started_on_hw,
+      transitioned_to_sw: false,
+      transition_send_idx: None,
+      send_idx: 0,
+      pts_out: Vec::new(),
+      abort: None,
+      escalated_never_resynced: None,
+    }
+  }
+
+  /// Note the HW→SW transition the first time the SW path is observed active
+  /// (which can be before the cold SW produces any frame — it withholds output
+  /// until the resync keyframe).
+  fn note_transition(&mut self, dec: &FfmpegVideoStreamDecoder, frame_pending: bool) {
+    if !self.transitioned_to_sw && dec.is_software() {
+      self.transitioned_to_sw = true;
+      self.transition_send_idx = Some(self.send_idx);
+      let detail = if frame_pending {
+        format!("frames delivered so far: {}", self.pts_out.len())
+      } else {
+        "no frame yet — cold SW awaiting resync keyframe".to_string()
+      };
+      eprintln!(
+        "  -> HW->SW transition observed at/after send #{} ({detail})",
+        self.send_idx
+      );
+    }
+  }
+
+  /// Drain every ready frame, recording delivered PTS and any escalation.
+  /// Returns `Err(Debug)` on a non-transient decode error — the decisive
+  /// observation, since the most-feared shape (Codex finding 1) is the cold SW
+  /// decoder returning `InvalidData` / missing-reference on a pre-keyframe
+  /// P-frame.
+  fn drain(
+    &mut self,
+    dec: &mut FfmpegVideoStreamDecoder,
+    dst: &mut VideoFrame<mediadecode::PixelFormat, VideoFrameExtra, FfmpegBuffer>,
+  ) -> Result<(), String> {
+    loop {
+      match dec.receive_frame(dst) {
+        Ok(()) => {
+          self.note_transition(dec, true);
+          let pts = VideoFrame::pts(dst).map(|t| t.pts()).unwrap_or(i64::MIN);
+          self.pts_out.push(pts);
+        }
+        Err(VideoDecodeError::Decode(Error::Ffmpeg(ffmpeg_next::Error::Other { errno })))
+          if errno == ffmpeg_next::error::EAGAIN =>
+        {
+          self.note_transition(dec, false);
+          break;
+        }
+        Err(VideoDecodeError::Decode(Error::Ffmpeg(ffmpeg_next::Error::Eof))) => break,
+        Err(VideoDecodeError::PostCommitNeverResynced { packets_lost }) => {
+          self.escalated_never_resynced = Some(packets_lost);
+          eprintln!(
+            "  -> PostCommitNeverResynced at EOF: {packets_lost} packets fed to SW produced no \
+             frame (no keyframe crossed the gap)"
+          );
+          break;
+        }
+        Err(e) => return Err(format!("{e:?}")),
+      }
+    }
+    Ok(())
+  }
 }
