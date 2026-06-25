@@ -16,6 +16,7 @@ mod error;
 pub mod extras;
 mod ffi;
 mod frame;
+mod pixdesc;
 mod sample_format;
 mod subtitle;
 mod video;
