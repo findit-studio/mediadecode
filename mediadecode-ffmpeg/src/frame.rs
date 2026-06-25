@@ -961,9 +961,12 @@ mod tests {
       AVPixelFormat::AV_PIX_FMT_D3D11 as i32
     )));
 
-    // YUVJ420P (deprecated full-range marker) maps to PixelFormat::Unknown
-    // — we don't surface the J variants since the range info now lives
-    // on `ColorInfo::range`.
+    // YUVJ420P (deprecated full-range marker) maps to its own
+    // `PixelFormat::Yuvj420p`, which is outside this narrow HW-output
+    // gate (the range itself is carried on `ColorInfo::range`). The
+    // descriptor-driven convert path still handles it; this gate just
+    // doesn't list the J family among the formats the safe `Frame::row`
+    // accessors support.
     assert!(!is_supported_cpu_pix_fmt(boundary::from_av_pixel_format(
       AVPixelFormat::AV_PIX_FMT_YUVJ420P as i32
     )));

@@ -24,7 +24,7 @@ use mediadecode::{
 use crate::{
   FfmpegBuffer, boundary,
   extras::{AudioFrameExtra, PictureType, SideDataEntry, SubtitleFrameExtra, VideoFrameExtra},
-  frame::{is_supported_cpu_pix_fmt, plane_height_for, plane_row_bytes_for},
+  pixdesc,
   sample_format::SampleFormat,
 };
 
@@ -149,12 +149,25 @@ pub unsafe fn av_frame_to_video_frame(
   let width = width_raw.max(0) as u32;
   let height = height_raw.max(0) as u32;
 
-  // Build planes. We support the closed CPU-format set for which we
-  // know the per-plane height (NV*, P0xx/P2xx/P4xx). Unknown formats
-  // would let us read garbage `linesize * height` bytes — refuse.
-  if !is_supported_cpu_pix_fmt(pix_fmt) {
+  // Build planes. Reject any format whose planes we can't safely
+  // extract — HWACCEL surfaces, Bayer mosaics, paletted, and sub-byte
+  // bitstream packings — before touching plane memory. Without a
+  // deliverable layout we'd be reading garbage `linesize * height`
+  // bytes.
+  if !pixdesc::is_deliverable(pix_fmt) {
     return Err(ConvertError::UnsupportedPixelFormat(pix_fmt));
   }
+  // The per-plane row count and visible (tight) byte width come from
+  // `pixdesc::plane_geometry`, which derives them from libavutil's own
+  // `av_image_fill_linesizes` / `av_image_fill_plane_sizes` for this
+  // exact `(format, width, height)` — correct by construction for every
+  // deliverable CPU format. For a deliverable format `plane_geometry`
+  // only returns `None` on out-of-range dimensions; treat that as an
+  // unsupported frame rather than guessing a layout.
+  let geom = match pixdesc::plane_geometry(pix_fmt, width as usize, height as usize) {
+    Some(g) => g,
+    None => return Err(ConvertError::UnsupportedPixelFormat(pix_fmt)),
+  };
 
   let mut planes_out: [Plane<FfmpegBuffer>; 4] = [
     plane_placeholder()?,
@@ -169,29 +182,28 @@ pub unsafe fn av_frame_to_video_frame(
   // can iterate via `iter_mut().enumerate()` — `linesize` / `data` are
   // raw `[T; 8]` fields read through `(*av_frame).field[plane_idx]`,
   // and `planes_out` is also indexed by the same key for symmetry —
-  // so the index-based loop is the natural shape.
+  // so the index-based loop is the natural shape. The descriptor's
+  // `count` (`1..=4`) bounds the loop to exactly the planes this format
+  // populates.
   #[allow(clippy::needless_range_loop)]
-  for plane_idx in 0..4 {
+  for plane_idx in 0..geom.count {
     // Read per-plane fields through the raw pointer (no `&AVFrame`
     // formed). `linesize` is `[c_int; 8]` and `data` is `[*mut u8; 8]`.
     let linesize = unsafe { (*av_frame).linesize[plane_idx] };
     if linesize <= 0 {
-      // Either we ran past the active plane count (linesize == 0) or
-      // the frame uses negative-stride vertical-flip (which our safe
-      // accessors refuse).
-      if linesize == 0 {
-        break;
-      }
+      // `plane_idx < geom.count`, so this plane must be populated; a
+      // zero linesize means the decoder left an expected plane unset,
+      // and a negative linesize is FFmpeg's vertical-flip convention
+      // (which our safe accessors refuse). Either way the layout is
+      // unusable.
       return Err(ConvertError::InvalidPlaneLayout { plane: plane_idx });
     }
     let data_ptr = unsafe { (*av_frame).data[plane_idx] };
     if data_ptr.is_null() {
       return Err(ConvertError::InvalidPlaneLayout { plane: plane_idx });
     }
-    let plane_h = plane_height_for(pix_fmt, plane_idx, height as usize)
-      .ok_or(ConvertError::InvalidPlaneLayout { plane: plane_idx })?;
-    let row_bytes = plane_row_bytes_for(pix_fmt, plane_idx, width as usize)
-      .ok_or(ConvertError::InvalidPlaneLayout { plane: plane_idx })?;
+    let plane_h = geom.height[plane_idx];
+    let row_bytes = geom.row_bytes[plane_idx];
     if row_bytes > linesize as usize {
       return Err(ConvertError::InvalidPlaneLayout { plane: plane_idx });
     }
@@ -312,7 +324,7 @@ pub unsafe fn av_frame_to_video_frame(
     .with_primaries(map_primaries(color_primaries_raw))
     .with_transfer(map_transfer(color_trc_raw))
     .with_matrix(map_matrix(colorspace_raw))
-    .with_range(map_range(color_range_raw))
+    .with_range(map_range_for(pix_fmt, color_range_raw))
     .with_chroma_location(map_chroma_loc(chroma_location_raw));
 
   // Backend-specific extras.
@@ -680,6 +692,40 @@ fn map_range(raw: i32) -> ColorRange {
     x if x == AVColorRange::AVCOL_RANGE_MPEG as i32 => ColorRange::Limited,
     _ => ColorRange::Unspecified,
   }
+}
+
+/// `true` for the JPEG-range planar YUV (`yuvj*`) formats. These are
+/// **full-range by definition** — the `j` is FFmpeg's marker for an
+/// MJPEG/JPEG-family full-swing signal — so their color range is a
+/// property of the format itself, not something the frame's
+/// `color_range` field needs to (or reliably does) carry.
+fn is_yuvj(pix_fmt: PixelFormat) -> bool {
+  matches!(
+    pix_fmt,
+    PixelFormat::Yuvj411p
+      | PixelFormat::Yuvj420p
+      | PixelFormat::Yuvj422p
+      | PixelFormat::Yuvj440p
+      | PixelFormat::Yuvj444p
+  )
+}
+
+/// Derives the delivered [`ColorRange`] from the frame's `color_range`
+/// field, honoring the range a pixel format *implies*.
+///
+/// A `yuvj*` frame is JPEG full-range by definition, but its
+/// `AVFrame.color_range` is frequently `AVCOL_RANGE_UNSPECIFIED` (the
+/// MJPEG/JPEG decode paths don't always stamp it). Deriving the range
+/// purely from that field would mislabel a full-range frame as
+/// `Unspecified` (which downstream YUV→RGB conversion reads as the
+/// Limited-swing default) — a silent decode-correctness regression. So
+/// for the `yuvj*` family we force [`ColorRange::Full`] regardless of
+/// the field. Every other format defers entirely to `color_range`.
+fn map_range_for(pix_fmt: PixelFormat, color_range_raw: i32) -> ColorRange {
+  if is_yuvj(pix_fmt) {
+    return ColorRange::Full;
+  }
+  map_range(color_range_raw)
 }
 
 fn map_chroma_loc(raw: i32) -> ChromaLocation {
@@ -1158,3 +1204,6 @@ fn map_picture_type_raw(raw: i32) -> PictureType {
     _ => PictureType::Unspecified,
   }
 }
+
+#[cfg(test)]
+mod tests;
