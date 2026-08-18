@@ -2,9 +2,9 @@ name: CI / mediadecode-ffmpeg
 
 # Triggered by changes to either the FFmpeg adapter, the core
 # crate it adapts (since core changes can break the adapter), or
-# shared workspace files. macOS-only — Homebrew ships FFmpeg ≥ 7
-# with `pkg-config` files included, which `ffmpeg-next` 8.1 needs
-# to enable its `ffmpeg_7_0` code path. Ubuntu's archive FFmpeg
+# shared workspace files. macOS-only — Homebrew ships FFmpeg 9
+# with `pkg-config` files included, which `ffmpeg-next` 9 needs to
+# enable its `ffmpeg_9_0` code path. Ubuntu's archive FFmpeg
 # is 6.1.1 and Windows would need a vcpkg build.
 on:
   push:

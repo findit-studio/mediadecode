@@ -17,13 +17,33 @@ Tracks `mediadecode` 0.4.0, which crosses `mediatime` 0.1 → 0.3 and
 `mediaframe` 0.1 → 0.3 — two breaking minors each. Both are public
 dependencies of the core crate, so this adapter's re-exported
 signatures move with them. See
-[`mediadecode` 0.4.0](../mediadecode/CHANGELOG.md#040). Nothing about
-the FFmpeg boundary's *behaviour* changes: the same raw integers are
-accepted, the same formats are deliverable, and the same frames are
-rejected.
+[`mediadecode` 0.4.0](../mediadecode/CHANGELOG.md#040). This release
+also crosses `ffmpeg-next` 8.1 → 9. Nothing about the FFmpeg
+boundary's *behaviour* changes: the same raw integers are accepted,
+the same formats are deliverable, and the same frames are rejected.
 
 ### Changed (BREAKING)
 
+- **`ffmpeg-next` 8.1 → 9**, tracking FFmpeg 9. `ffmpeg_next::Packet`,
+  `Frame`, `Error`, `decoder::Audio` and `decoder::Subtitle` appear in
+  this crate's public signatures, so `ffmpeg-next` is a public
+  dependency and downstream crates must move to the same major.
+  No adapter source changed: the bump is spelling-clean, and the
+  boundary's behaviour is unaffected. What it buys is the
+  `ffmpeg_9_0` code path — `ffmpeg-sys-next` 8.1's version table
+  topped out at `ffmpeg_8_1` and gated 9.0 off even when linked
+  against a 9.x system library. Two surfaces moved in FFmpeg 9 but do
+  not reach this crate: capability queries (`Audio`/`Video`'s
+  `rates` / `formats` / `channel_layouts`) now read
+  `avcodec_get_supported_config` instead of the codec struct's
+  fields, and none of them are called here; and the codec-id
+  vocabulary dropped `V308` / `V408` / `V410` while adding
+  `WEBP_ANIM` / `APPLE_APAC`, which `CodecId` absorbs as a
+  `#[repr(transparent)]` `i32` with a fall-through `Debug` arm. The
+  pixel formats this crate already mapped to `None` for want of an
+  `AV_PIX_FMT_*` constant (`V210`, `V410Le`, `Yuva420p12Le`,
+  `Yuva444p14Le`) are still absent in 9, so their fall-through
+  stands.
 - **The pixel-format fall-through is now `PixelFormat::None`.**
   `boundary::from_av_pixel_format` returned
   `PixelFormat::Unknown(raw as u32)` for a raw `AVFrame.format`

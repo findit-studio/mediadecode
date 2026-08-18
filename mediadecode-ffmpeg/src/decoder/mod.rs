@@ -146,7 +146,7 @@ pub(crate) const MAX_PROBE_PACKET_SIDE_DATA_ENTRIES: usize = 64;
 /// Conservative per-side-data-entry overhead estimate used by both
 /// [`packet_side_data_bytes`] and the budget accounting in
 /// [`VideoDecoder::send_packet`]. Counts the `AVPacketSideData`
-/// descriptor (24 bytes per the FFmpeg 8.x bindings), the `AVBufferRef`
+/// descriptor (24 bytes per the FFmpeg 9.x bindings), the `AVBufferRef`
 /// FFmpeg allocates per entry, and a margin for malloc bookkeeping
 /// (header bytes, alignment slack). Setting it on the high side keeps
 /// the byte cap a true upper bound on retained memory; under-charging
