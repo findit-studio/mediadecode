@@ -771,6 +771,121 @@ mod alloc_only {
   }
 }
 
+// ---------------------------------------------------------------------------
+//  Optional trait matrices (`serde` / `arbitrary` / `quickcheck`).
+//  All three cover the same two types — a vocabulary that can be written
+//  to a wire is one a fuzzer and a property test must be able to produce.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "serde")]
+#[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
+mod serde_impls {
+  //! Both vocabularies travel as their canonical slug, not as their `u32`
+  //! code.
+  //!
+  //! The code is the compact form, and a caller who wants it asks for it
+  //! by name ([`ChannelLayoutKind::to_u32`] /
+  //! [`AudioChannelOrderKind::as_u32`]). The name is the form a
+  //! self-describing document should carry, and it is also the only one
+  //! that round-trips exactly: `from_u32` absorbs an unrecognised code
+  //! into `Unknown` / `Unspecified`, while an unrecognised slug is a
+  //! deserialization error rather than a silently invented value.
+
+  use core::fmt;
+
+  use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Visitor};
+
+  use super::{AudioChannelOrderKind, ChannelLayoutKind};
+
+  macro_rules! serde_via_slug {
+    ($ty:ty, $expecting:literal) => {
+      impl Serialize for $ty {
+        #[cfg_attr(not(tarpaulin), inline(always))]
+        fn serialize<S: Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+          ser.serialize_str(self.as_str())
+        }
+      }
+
+      impl<'de> Deserialize<'de> for $ty {
+        fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+          struct SlugVisitor;
+
+          impl Visitor<'_> for SlugVisitor {
+            type Value = $ty;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+              f.write_str($expecting)
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+              v.parse::<$ty>().map_err(E::custom)
+            }
+          }
+
+          de.deserialize_str(SlugVisitor)
+        }
+      }
+    };
+  }
+
+  serde_via_slug!(ChannelLayoutKind, "a channel-layout-kind slug");
+  serde_via_slug!(AudioChannelOrderKind, "an audio-channel-order slug");
+}
+
+#[cfg(feature = "arbitrary")]
+#[cfg_attr(docsrs, doc(cfg(feature = "arbitrary")))]
+mod arbitrary_impls {
+  //! Both vocabularies generate by choosing uniformly from their roster.
+  //!
+  //! Decoding an arbitrary `u32` through `from_u32` is the obvious
+  //! alternative and the wrong one: every code outside the enumerated set
+  //! collapses to `Unknown` / `Unspecified`, so the 38 named layouts would
+  //! share about one draw in 10^8 between them and a fuzzer would spend
+  //! its whole budget on the fallback variant.
+
+  use arbitrary::{Arbitrary, Result, Unstructured};
+
+  use super::{AudioChannelOrderKind, ChannelLayoutKind};
+
+  macro_rules! arbitrary_via_roster {
+    ($ty:ty) => {
+      impl<'a> Arbitrary<'a> for $ty {
+        fn arbitrary(u: &mut Unstructured<'a>) -> Result<Self> {
+          Ok(*u.choose(<$ty>::ALL)?)
+        }
+      }
+    };
+  }
+
+  arbitrary_via_roster!(ChannelLayoutKind);
+  arbitrary_via_roster!(AudioChannelOrderKind);
+}
+
+#[cfg(feature = "quickcheck")]
+#[cfg_attr(docsrs, doc(cfg(feature = "quickcheck")))]
+mod quickcheck_impls {
+  //! The `quickcheck` half of the coverage `arbitrary_impls` gives, drawn
+  //! the same way and for the same reason: uniform over the roster, never
+  //! uniform over `u32`.
+
+  use quickcheck::{Arbitrary, Gen};
+
+  use super::{AudioChannelOrderKind, ChannelLayoutKind};
+
+  macro_rules! quickcheck_via_roster {
+    ($ty:ty) => {
+      impl Arbitrary for $ty {
+        fn arbitrary(g: &mut Gen) -> Self {
+          *g.choose(<$ty>::ALL).expect("the roster is never empty")
+        }
+      }
+    };
+  }
+
+  quickcheck_via_roster!(ChannelLayoutKind);
+  quickcheck_via_roster!(AudioChannelOrderKind);
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -1190,6 +1305,311 @@ mod tests {
         .set_native_mask(Some(0x63F));
       assert_eq!(l.channels(), 8);
       assert!(matches!(l.known_kind(), ChannelLayoutKind::Ch7_1));
+    }
+  }
+
+  // -----------------------------------------------------------------
+  //  Optional matrices (`serde` / `arbitrary` / `quickcheck`)
+  // -----------------------------------------------------------------
+
+  #[cfg(feature = "serde")]
+  mod serde_tests {
+    use serde::{
+      Deserialize, Serialize,
+      de::{
+        IntoDeserializer,
+        value::{Error as ValueError, StrDeserializer, U32Deserializer},
+      },
+      ser::{Impossible, Serializer},
+    };
+
+    use super::*;
+
+    /// A serializer that accepts exactly one call — `serialize_str` — and
+    /// checks what it was handed. Every other entry point panics, and
+    /// that is the assertion: these vocabularies reach the wire as their
+    /// slug, never as a number or a struct.
+    ///
+    /// Hand-written because the crate takes no format dependency, and
+    /// because these types are available at the no-`alloc` tier where a
+    /// JSON round-trip could not run in the first place.
+    struct SlugOnly<'a> {
+      expected: &'a str,
+    }
+
+    /// The error `SlugOnly` never produces. `serialize_str` cannot fail
+    /// and every other method panics before it could return one.
+    #[derive(Debug)]
+    struct Unreachable;
+
+    impl core::fmt::Display for Unreachable {
+      fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("the slug serializer cannot fail")
+      }
+    }
+
+    impl core::error::Error for Unreachable {}
+
+    impl serde::ser::Error for Unreachable {
+      fn custom<T: core::fmt::Display>(_: T) -> Self {
+        Self
+      }
+    }
+
+    macro_rules! not_a_slug {
+      ($($method:ident($($arg:ty),*);)*) => {
+        $(
+          fn $method(self, $(_: $arg),*) -> Result<Self::Ok, Self::Error> {
+            panic!("a channel vocabulary must reach the wire as its slug")
+          }
+        )*
+      };
+    }
+
+    impl Serializer for SlugOnly<'_> {
+      type Ok = ();
+      type Error = Unreachable;
+      type SerializeSeq = Impossible<(), Unreachable>;
+      type SerializeTuple = Impossible<(), Unreachable>;
+      type SerializeTupleStruct = Impossible<(), Unreachable>;
+      type SerializeTupleVariant = Impossible<(), Unreachable>;
+      type SerializeMap = Impossible<(), Unreachable>;
+      type SerializeStruct = Impossible<(), Unreachable>;
+      type SerializeStructVariant = Impossible<(), Unreachable>;
+
+      fn serialize_str(self, v: &str) -> Result<Self::Ok, Self::Error> {
+        assert_eq!(v, self.expected, "wrong slug on the wire");
+        Ok(())
+      }
+
+      not_a_slug! {
+        serialize_bool(bool);
+        serialize_i8(i8);
+        serialize_i16(i16);
+        serialize_i32(i32);
+        serialize_i64(i64);
+        serialize_u8(u8);
+        serialize_u16(u16);
+        serialize_u32(u32);
+        serialize_u64(u64);
+        serialize_f32(f32);
+        serialize_f64(f64);
+        serialize_char(char);
+        serialize_bytes(&[u8]);
+        serialize_none();
+        serialize_unit();
+        serialize_unit_struct(&'static str);
+        serialize_unit_variant(&'static str, u32, &'static str);
+      }
+
+      fn serialize_some<T>(self, _: &T) -> Result<Self::Ok, Self::Error>
+      where
+        T: ?Sized + Serialize,
+      {
+        panic!("a channel vocabulary must reach the wire as its slug")
+      }
+
+      fn serialize_newtype_struct<T>(self, _: &'static str, _: &T) -> Result<Self::Ok, Self::Error>
+      where
+        T: ?Sized + Serialize,
+      {
+        panic!("a channel vocabulary must reach the wire as its slug")
+      }
+
+      fn serialize_newtype_variant<T>(
+        self,
+        _: &'static str,
+        _: u32,
+        _: &'static str,
+        _: &T,
+      ) -> Result<Self::Ok, Self::Error>
+      where
+        T: ?Sized + Serialize,
+      {
+        panic!("a channel vocabulary must reach the wire as its slug")
+      }
+
+      fn serialize_seq(self, _: Option<usize>) -> Result<Self::SerializeSeq, Self::Error> {
+        panic!("a channel vocabulary must reach the wire as its slug")
+      }
+
+      fn serialize_tuple(self, _: usize) -> Result<Self::SerializeTuple, Self::Error> {
+        panic!("a channel vocabulary must reach the wire as its slug")
+      }
+
+      fn serialize_tuple_struct(
+        self,
+        _: &'static str,
+        _: usize,
+      ) -> Result<Self::SerializeTupleStruct, Self::Error> {
+        panic!("a channel vocabulary must reach the wire as its slug")
+      }
+
+      fn serialize_tuple_variant(
+        self,
+        _: &'static str,
+        _: u32,
+        _: &'static str,
+        _: usize,
+      ) -> Result<Self::SerializeTupleVariant, Self::Error> {
+        panic!("a channel vocabulary must reach the wire as its slug")
+      }
+
+      fn serialize_map(self, _: Option<usize>) -> Result<Self::SerializeMap, Self::Error> {
+        panic!("a channel vocabulary must reach the wire as its slug")
+      }
+
+      fn serialize_struct(
+        self,
+        _: &'static str,
+        _: usize,
+      ) -> Result<Self::SerializeStruct, Self::Error> {
+        panic!("a channel vocabulary must reach the wire as its slug")
+      }
+
+      fn serialize_struct_variant(
+        self,
+        _: &'static str,
+        _: u32,
+        _: &'static str,
+        _: usize,
+      ) -> Result<Self::SerializeStructVariant, Self::Error> {
+        panic!("a channel vocabulary must reach the wire as its slug")
+      }
+    }
+
+    fn assert_wire_slug<T: Serialize>(value: &T, expected: &str) {
+      value
+        .serialize(SlugOnly { expected })
+        .expect("the slug serializer cannot fail");
+    }
+
+    #[test]
+    fn every_variant_serializes_as_its_slug() {
+      for &kind in ChannelLayoutKind::ALL {
+        assert_wire_slug(&kind, kind.as_str());
+      }
+      for &order in AudioChannelOrderKind::ALL {
+        assert_wire_slug(&order, order.as_str());
+      }
+    }
+
+    #[test]
+    fn every_variant_deserializes_from_its_slug() {
+      for &kind in ChannelLayoutKind::ALL {
+        let de: StrDeserializer<'_, ValueError> = kind.as_str().into_deserializer();
+        assert_eq!(ChannelLayoutKind::deserialize(de).unwrap(), kind);
+      }
+      for &order in AudioChannelOrderKind::ALL {
+        let de: StrDeserializer<'_, ValueError> = order.as_str().into_deserializer();
+        assert_eq!(AudioChannelOrderKind::deserialize(de).unwrap(), order);
+      }
+    }
+
+    #[test]
+    fn deserialization_folds_case_like_the_door() {
+      let de: StrDeserializer<'_, ValueError> = "5.1-BACK".into_deserializer();
+      assert_eq!(
+        ChannelLayoutKind::deserialize(de).unwrap(),
+        ChannelLayoutKind::Ch5_1Back
+      );
+      let de: StrDeserializer<'_, ValueError> = "Ambisonic".into_deserializer();
+      assert_eq!(
+        AudioChannelOrderKind::deserialize(de).unwrap(),
+        AudioChannelOrderKind::Ambisonic
+      );
+    }
+
+    #[test]
+    fn an_unknown_slug_is_an_error_not_an_invented_value() {
+      let de: StrDeserializer<'_, ValueError> = "atmos".into_deserializer();
+      assert!(ChannelLayoutKind::deserialize(de).is_err());
+      let de: StrDeserializer<'_, ValueError> = "interleaved".into_deserializer();
+      assert!(AudioChannelOrderKind::deserialize(de).is_err());
+    }
+
+    #[test]
+    fn a_number_is_not_a_name() {
+      // 19 is `Ch5_1`'s wire code, and the read side still refuses it:
+      // the numeric door is `from_u32`, not this one.
+      let de: U32Deserializer<ValueError> = 19u32.into_deserializer();
+      assert!(ChannelLayoutKind::deserialize(de).is_err());
+      let de: U32Deserializer<ValueError> = 1u32.into_deserializer();
+      assert!(AudioChannelOrderKind::deserialize(de).is_err());
+    }
+  }
+
+  #[cfg(feature = "arbitrary")]
+  mod arbitrary_tests {
+    use arbitrary::{Arbitrary, Unstructured};
+
+    use super::*;
+
+    #[test]
+    fn every_variant_is_reachable() {
+      // Coverage bitmap indexed by wire code, so the test allocates
+      // nothing and survives the no-`alloc` tier.
+      let mut layout_seen = [false; 64];
+      let mut order_seen = [false; 64];
+      for byte in 0..=u8::MAX {
+        let data = [byte];
+
+        let mut u = Unstructured::new(&data);
+        let kind = ChannelLayoutKind::arbitrary(&mut u).unwrap();
+        assert!(ChannelLayoutKind::ALL.contains(&kind));
+        layout_seen[kind.to_u32() as usize] = true;
+
+        let mut u = Unstructured::new(&data);
+        let order = AudioChannelOrderKind::arbitrary(&mut u).unwrap();
+        assert!(AudioChannelOrderKind::ALL.contains(&order));
+        order_seen[order.as_u32() as usize] = true;
+      }
+      assert_eq!(
+        layout_seen.iter().filter(|&&seen| seen).count(),
+        ChannelLayoutKind::ALL.len(),
+        "a layout kind the generator never produces"
+      );
+      assert_eq!(
+        order_seen.iter().filter(|&&seen| seen).count(),
+        AudioChannelOrderKind::ALL.len(),
+        "an order kind the generator never produces"
+      );
+    }
+  }
+
+  #[cfg(feature = "quickcheck")]
+  mod quickcheck_tests {
+    use quickcheck::{Arbitrary, Gen};
+
+    use super::*;
+
+    #[test]
+    fn every_variant_is_reachable() {
+      // 2000 draws over 39 variants: the chance of missing one is around
+      // 1e-21, so a failure here means the generator is skewed, not
+      // unlucky.
+      let mut g = Gen::new(16);
+      let mut layout_seen = [false; 64];
+      let mut order_seen = [false; 64];
+      for _ in 0..2000 {
+        let kind = ChannelLayoutKind::arbitrary(&mut g);
+        assert!(ChannelLayoutKind::ALL.contains(&kind));
+        layout_seen[kind.to_u32() as usize] = true;
+
+        let order = AudioChannelOrderKind::arbitrary(&mut g);
+        assert!(AudioChannelOrderKind::ALL.contains(&order));
+        order_seen[order.as_u32() as usize] = true;
+      }
+      assert_eq!(
+        layout_seen.iter().filter(|&&seen| seen).count(),
+        ChannelLayoutKind::ALL.len(),
+        "a layout kind the generator never produces"
+      );
+      assert_eq!(
+        order_seen.iter().filter(|&&seen| seen).count(),
+        AudioChannelOrderKind::ALL.len(),
+        "an order kind the generator never produces"
+      );
     }
   }
 }
