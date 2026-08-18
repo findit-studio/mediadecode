@@ -11,6 +11,37 @@ The backend-agnostic core it adapts has its own log at
 
 ## [Unreleased]
 
+### Changed (BREAKING)
+
+- **`convert::ConvertError::UnsupportedPixelFormat` names the format
+  again.** It was `UnsupportedPixelFormat(PixelFormat)`; it is now a
+  struct variant carrying `format`, `raw` and `name`. The `format`
+  field is the old payload unchanged — still `PixelFormat::None` for
+  the fall-through, because this restores the *diagnostic*, not the
+  `Unknown(u32)` variant mediaframe 0.3 struck. What is restored is
+  everything the message lost with it:
+  - `raw: i32` — the `AVFrame.format` integer exactly as FFmpeg wrote
+    it, present unconditionally.
+  - `name: Option<SmolStr>` — FFmpeg's own name for that integer, from
+    `av_get_pix_fmt_name`, or `None` when libavutil has no descriptor
+    for it.
+
+  The rendered message goes from `unsupported pixel format None` back
+  to `unsupported pixel format None (AVPixelFormat <n> =
+  "videotoolbox_vld")`, and to `… (AVPixelFormat 99999, unnamed by
+  libavutil)` where there is no name. This supersedes the note under
+  0.4.0 below, which recorded the message losing the raw integer.
+
+  Callers matching `ConvertError::UnsupportedPixelFormat(pf)` move to
+  `ConvertError::UnsupportedPixelFormat { format, .. }`.
+
+  The lookup does not weaken the crate's FFI stance. `av_get_pix_fmt_name`
+  is redeclared with a plain `c_int` parameter rather than the bindgen
+  enum, so an integer outside our build's discriminant set is never
+  turned into an `AVPixelFormat` — which is the whole reason the
+  fall-through exists in the first place. Two tests pin that libavutil
+  answers such integers with null rather than misbehaving.
+
 ## [0.4.0]
 
 Tracks `mediadecode` 0.4.0, which crosses `mediatime` 0.1 → 0.3 and
