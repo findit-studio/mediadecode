@@ -21,7 +21,7 @@ use mediadecode_ffmpeg::{
   Ffmpeg, FfmpegBuffer, FfmpegVideoStreamDecoder, VideoFrame, VideoPacket, empty_video_frame,
   video_packet_from_ffmpeg,
 };
-use std::num::NonZeroU32;
+use std::num::NonZeroI32;
 
 /// Generic helper bounded purely on the `mediadecode` trait — proves
 /// `FfmpegVideoStreamDecoder` is reachable through the abstraction.
@@ -73,8 +73,8 @@ fn decode_one_frame_through_trait() {
   let stream_index = stream.index();
   let stream_tb = stream.time_base();
   let time_base = Timebase::new(
-    stream_tb.numerator() as u32,
-    NonZeroU32::new(stream_tb.denominator().max(1) as u32).expect("non-zero den"),
+    stream_tb.numerator(),
+    NonZeroI32::new(stream_tb.denominator().max(1)).expect("non-zero den"),
   );
 
   let mut decoder =
@@ -115,10 +115,7 @@ fn decode_one_frame_through_trait() {
         );
         assert!(dst.width() > 0);
         assert!(dst.height() > 0);
-        assert!(!matches!(
-          *dst.pixel_format(),
-          mediadecode::PixelFormat::Unknown(_)
-        ));
+        assert_ne!(*dst.pixel_format(), mediadecode::PixelFormat::None);
         got_frame = true;
         break;
       }

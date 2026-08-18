@@ -1267,7 +1267,7 @@ unsafe fn transfer_hw_frame(
     // software fallback.
     let dst_raw_fmt: i32 = (*dst.as_inner_mut().as_ptr()).format;
     let dst_pix_fmt = crate::boundary::from_av_pixel_format(dst_raw_fmt);
-    if !crate::frame::is_supported_cpu_pix_fmt(dst_pix_fmt) {
+    if !crate::frame::is_supported_cpu_pix_fmt(&dst_pix_fmt) {
       tracing::warn!(
         pix_fmt = dst_raw_fmt,
         "hwdecode: hw->cpu transfer produced unsupported pix_fmt; \
@@ -1948,7 +1948,7 @@ fn drain_into_pending(
         // backend instead.
         let cpu_raw_fmt: i32 = unsafe { (*cpu.as_ptr()).format };
         let cpu_pix_fmt = crate::boundary::from_av_pixel_format(cpu_raw_fmt);
-        if !crate::frame::is_supported_cpu_pix_fmt(cpu_pix_fmt) {
+        if !crate::frame::is_supported_cpu_pix_fmt(&cpu_pix_fmt) {
           tracing::warn!(
             pix_fmt = cpu_raw_fmt,
             "hwdecode: candidate produced unsupported CPU pix_fmt during \

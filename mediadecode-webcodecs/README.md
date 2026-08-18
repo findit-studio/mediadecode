@@ -30,13 +30,12 @@ This crate is **`wasm32`-only**. On non-`wasm32` targets it compiles
 to an empty stub so the workspace `cargo build` / `cargo check`
 continue to work in native dev loops.
 
-> **Status:** scaffolded, public API not yet released. Track
-> the [CHANGELOG](CHANGELOG.md) for the first published version.
+> **Status:** published; the public API is still pre-1.0 and moves
+> with `mediadecode`. Track the [CHANGELOG](CHANGELOG.md).
 
 ```toml
-# Once published. Until then consume via git or path dep.
 [dependencies]
-mediadecode-webcodecs = "0.0"
+mediadecode-webcodecs = "0.4"
 ```
 
 Built and run via [`wasm-bindgen`](https://crates.io/crates/wasm-bindgen)

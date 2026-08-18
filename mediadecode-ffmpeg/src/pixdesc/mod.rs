@@ -92,7 +92,7 @@ pub(crate) struct PlaneGeometry {
 /// descriptor describes a plain CPU memory layout.
 ///
 /// Rejected (returns `false`):
-/// * `PixelFormat::Unknown(_)` — no recognised format, no descriptor.
+/// * [`PixelFormat::None`] — no format, so no descriptor.
 /// * Hardware-surface formats (`AV_PIX_FMT_FLAG_HWACCEL`) — these never
 ///   describe CPU-side pixel bytes; the HW path transfers to a CPU format
 ///   before delivery.
@@ -108,14 +108,14 @@ pub(crate) struct PlaneGeometry {
 /// Everything else FFmpeg can describe (planar/semi-planar/packed YUV, RGB,
 /// GBR, greyscale, alpha, float, XYZ, at every endianness/bit-depth) is
 /// accepted: its geometry is fully determined by the descriptor.
-pub(crate) fn is_deliverable(pix_fmt: PixelFormat) -> bool {
+pub(crate) fn is_deliverable(pix_fmt: &PixelFormat) -> bool {
   geometry_descriptor(pix_fmt).is_some()
 }
 
 /// Resolve the format to a known `AVPixelFormat` constant and confirm its
 /// descriptor describes a plain CPU layout; returns the constant on
 /// success so callers don't repeat the mapping.
-fn geometry_descriptor(pix_fmt: PixelFormat) -> Option<AVPixelFormat> {
+fn geometry_descriptor(pix_fmt: &PixelFormat) -> Option<AVPixelFormat> {
   let av = to_av_pixel_format(pix_fmt)?;
   // SAFETY: `av` is a known `AV_PIX_FMT_*` constant (never an integer cast
   // into the enum). `av_pix_fmt_desc_get` returns a pointer to a static
@@ -157,7 +157,7 @@ fn geometry_descriptor(pix_fmt: PixelFormat) -> Option<AVPixelFormat> {
 /// `width` and `height` are the frame's coded dimensions
 /// (`AVFrame.width`/`.height`).
 pub(crate) fn plane_geometry(
-  pix_fmt: PixelFormat,
+  pix_fmt: &PixelFormat,
   width: usize,
   height: usize,
 ) -> Option<PlaneGeometry> {
@@ -242,7 +242,7 @@ pub(crate) fn plane_geometry(
 /// Maps a recognised [`PixelFormat`] onto the matching compile-time
 /// `AVPixelFormat::AV_PIX_FMT_*` constant.
 ///
-/// Returns `None` for [`PixelFormat::Unknown`] and for any variant with no
+/// Returns `None` for [`PixelFormat::None`] and for any variant with no
 /// corresponding FFmpeg pixel format in the linked build. **Only literal
 /// constants are produced** — never an integer cast into the enum — so this
 /// is sound regardless of which discriminant set the linked FFmpeg exposes
@@ -250,7 +250,7 @@ pub(crate) fn plane_geometry(
 ///
 /// This is the inverse of [`crate::boundary::from_av_pixel_format`] for the
 /// formats that crate maps; the round-trip is asserted in tests.
-pub(crate) const fn to_av_pixel_format(pix_fmt: PixelFormat) -> Option<AVPixelFormat> {
+pub(crate) const fn to_av_pixel_format(pix_fmt: &PixelFormat) -> Option<AVPixelFormat> {
   use AVPixelFormat as F;
   Some(match pix_fmt {
     // --- Planar YUV 8-bit ---
@@ -542,7 +542,7 @@ pub(crate) const fn to_av_pixel_format(pix_fmt: PixelFormat) -> Option<AVPixelFo
     PixelFormat::BayerGrbg16Be => F::AV_PIX_FMT_BAYER_GRBG16BE,
     // No FFmpeg pixel-format constant for these mediaframe variants in the
     // linked build (10/12/14-bit Bayer have no stable FFmpeg enum), or the
-    // variant is the `Unknown` catch-all. Return `None`.
+    // variant is `None` / an unnamed `Other`. Return `None`.
     _ => return None,
   })
 }

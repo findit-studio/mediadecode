@@ -20,7 +20,7 @@ fn map_range_for_forces_full_for_every_yuvj_variant() {
   let unspecified = AVColorRange::AVCOL_RANGE_UNSPECIFIED as i32;
   let mpeg = AVColorRange::AVCOL_RANGE_MPEG as i32;
   let jpeg = AVColorRange::AVCOL_RANGE_JPEG as i32;
-  for pf in yuvj {
+  for pf in &yuvj {
     // Unspecified field — the regression scenario.
     assert_eq!(
       map_range_for(pf, unspecified),
@@ -54,23 +54,23 @@ fn map_range_for_defers_for_non_yuvj() {
   // Plain limited-range YUV: unspecified stays unspecified, explicit tags
   // pass through untouched.
   assert_eq!(
-    map_range_for(PixelFormat::Yuv420p, unspecified),
+    map_range_for(&PixelFormat::Yuv420p, unspecified),
     ColorRange::Unspecified
   );
-  assert_eq!(map_range_for(PixelFormat::Yuv420p, jpeg), ColorRange::Full);
+  assert_eq!(map_range_for(&PixelFormat::Yuv420p, jpeg), ColorRange::Full);
   assert_eq!(
-    map_range_for(PixelFormat::Yuv420p, mpeg),
+    map_range_for(&PixelFormat::Yuv420p, mpeg),
     ColorRange::Limited
   );
 
   // RGB is deliberately NOT forced to Full: range is a YUV property, and
   // mediaframe makes no full-range claim about RGB formats.
   assert_eq!(
-    map_range_for(PixelFormat::Rgb24, unspecified),
+    map_range_for(&PixelFormat::Rgb24, unspecified),
     ColorRange::Unspecified
   );
   assert_eq!(
-    map_range_for(PixelFormat::Rgba, unspecified),
+    map_range_for(&PixelFormat::Rgba, unspecified),
     ColorRange::Unspecified
   );
 }
@@ -80,7 +80,7 @@ fn map_range_for_defers_for_non_yuvj() {
 /// accidental inclusion of a non-`yuvj` format) is caught here.
 #[test]
 fn is_yuvj_covers_exactly_the_five_variants() {
-  for pf in [
+  for pf in &[
     PixelFormat::Yuvj411p,
     PixelFormat::Yuvj420p,
     PixelFormat::Yuvj422p,
@@ -90,7 +90,7 @@ fn is_yuvj_covers_exactly_the_five_variants() {
     assert!(is_yuvj(pf), "{pf:?} should be recognized as yuvj");
   }
   // Their non-JPEG siblings and unrelated families are not yuvj.
-  for pf in [
+  for pf in &[
     PixelFormat::Yuv411p,
     PixelFormat::Yuv420p,
     PixelFormat::Yuv422p,

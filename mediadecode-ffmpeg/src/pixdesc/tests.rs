@@ -6,7 +6,7 @@ use ffmpeg_next::ffi::{
 
 use crate::boundary::from_av_pixel_format;
 
-/// Every non-`Unknown` `mediaframe::PixelFormat` variant. Drives the
+/// Every named `mediaframe::PixelFormat` variant except `None`. Drives the
 /// round-trip and deliverability sweeps so a newly-added variant can't
 /// silently escape coverage.
 const ALL_PIXEL_FORMATS: &[PixelFormat] = &[
@@ -298,8 +298,8 @@ const ALIAS_VARIANTS: &[(PixelFormat, PixelFormat)] = &[
   (PixelFormat::Y400a, PixelFormat::Ya8),
 ];
 
-fn is_alias(pf: PixelFormat) -> bool {
-  ALIAS_VARIANTS.iter().any(|&(a, _)| a == pf)
+fn is_alias(pf: &PixelFormat) -> bool {
+  ALIAS_VARIANTS.iter().any(|(a, _)| a == pf)
 }
 
 /// Independent geometry oracle: derives per-plane row-bytes and row
@@ -310,7 +310,7 @@ fn is_alias(pf: PixelFormat) -> bool {
 /// asserted against themselves. Returns `None` exactly when the format
 /// is not deliverable (no descriptor / rejected flag) or the dimensions
 /// are out of range — matching `plane_geometry`'s contract.
-fn oracle_geometry(pf: PixelFormat, w: usize, h: usize) -> Option<PlaneGeometry> {
+fn oracle_geometry(pf: &PixelFormat, w: usize, h: usize) -> Option<PlaneGeometry> {
   let av = to_av_pixel_format(pf)?;
   // SAFETY: `av` is a known `AV_PIX_FMT_*` constant.
   let desc = unsafe { ffmpeg_next::ffi::av_pix_fmt_desc_get(av) };
@@ -439,7 +439,7 @@ const ORACLE_DIMS: &[(usize, usize)] =
 
 #[test]
 fn plane_geometry_matches_libavutil_oracle() {
-  for &pf in ORACLE_FORMATS {
+  for pf in ORACLE_FORMATS {
     for &(w, h) in ORACLE_DIMS {
       let got = plane_geometry(pf, w, h);
       let want = oracle_geometry(pf, w, h);
@@ -501,7 +501,7 @@ fn plane_geometry_agrees_with_frame_hand_tables() {
     PixelFormat::Gray8,
     PixelFormat::Gray16Le,
   ];
-  for pf in hand_formats {
+  for pf in &hand_formats {
     for &(w, h) in ORACLE_DIMS {
       let geom = plane_geometry(pf, w, h)
         .unwrap_or_else(|| panic!("plane_geometry returned None for hand-table format {pf:?}"));
@@ -539,7 +539,7 @@ fn plane_geometry_agrees_with_frame_hand_tables() {
 #[test]
 fn plane_geometry_known_values() {
   // NV12: Y full, interleaved UV at half height, 2 bytes per chroma pair.
-  let nv12 = plane_geometry(PixelFormat::Nv12, 1920, 1080).unwrap();
+  let nv12 = plane_geometry(&PixelFormat::Nv12, 1920, 1080).unwrap();
   assert_eq!(nv12.count, 2);
   assert_eq!(nv12.row_bytes[0], 1920);
   assert_eq!(nv12.height[0], 1080);
@@ -547,12 +547,12 @@ fn plane_geometry_known_values() {
   assert_eq!(nv12.height[1], 540);
 
   // NV12 odd width rounds the chroma row up.
-  let nv12_odd = plane_geometry(PixelFormat::Nv12, 1921, 1080).unwrap();
+  let nv12_odd = plane_geometry(&PixelFormat::Nv12, 1921, 1080).unwrap();
   assert_eq!(nv12_odd.row_bytes[0], 1921);
   assert_eq!(nv12_odd.row_bytes[1], 1922);
 
   // P010: 2 bytes/sample. Y row = 2*W, chroma row = ceil(W/2)*4.
-  let p010 = plane_geometry(PixelFormat::P010Le, 1920, 1080).unwrap();
+  let p010 = plane_geometry(&PixelFormat::P010Le, 1920, 1080).unwrap();
   assert_eq!(p010.count, 2);
   assert_eq!(p010.row_bytes[0], 3840);
   assert_eq!(p010.height[0], 1080);
@@ -560,7 +560,7 @@ fn plane_geometry_known_values() {
   assert_eq!(p010.height[1], 540);
 
   // Planar YUV 4:2:0 has three planes; chroma at half resolution.
-  let yuv420 = plane_geometry(PixelFormat::Yuv420p, 1920, 1080).unwrap();
+  let yuv420 = plane_geometry(&PixelFormat::Yuv420p, 1920, 1080).unwrap();
   assert_eq!(yuv420.count, 3);
   assert_eq!(yuv420.row_bytes[0], 1920);
   assert_eq!(yuv420.height[0], 1080);
@@ -570,13 +570,13 @@ fn plane_geometry_known_values() {
   assert_eq!(yuv420.height[2], 540);
 
   // Packed RGB24: single plane, 3 bytes/pixel.
-  let rgb24 = plane_geometry(PixelFormat::Rgb24, 640, 480).unwrap();
+  let rgb24 = plane_geometry(&PixelFormat::Rgb24, 640, 480).unwrap();
   assert_eq!(rgb24.count, 1);
   assert_eq!(rgb24.row_bytes[0], 640 * 3);
   assert_eq!(rgb24.height[0], 480);
 
   // GBR planar: three full-resolution planes.
-  let gbrp = plane_geometry(PixelFormat::Gbrp, 640, 480).unwrap();
+  let gbrp = plane_geometry(&PixelFormat::Gbrp, 640, 480).unwrap();
   assert_eq!(gbrp.count, 3);
   for p in 0..3 {
     assert_eq!(gbrp.row_bytes[p], 640);
@@ -588,10 +588,10 @@ fn plane_geometry_known_values() {
 /// degenerate geometry the unsafe convert path would trust.
 #[test]
 fn plane_geometry_rejects_bad_dimensions() {
-  assert!(plane_geometry(PixelFormat::Nv12, 0, 1080).is_none());
-  assert!(plane_geometry(PixelFormat::Nv12, 1920, 0).is_none());
+  assert!(plane_geometry(&PixelFormat::Nv12, 0, 1080).is_none());
+  assert!(plane_geometry(&PixelFormat::Nv12, 1920, 0).is_none());
   // Beyond c_int::MAX — libavutil's params are `int`.
-  assert!(plane_geometry(PixelFormat::Nv12, usize::MAX, 1080).is_none());
+  assert!(plane_geometry(&PixelFormat::Nv12, usize::MAX, 1080).is_none());
 }
 
 /// For every deliverable format the boundary round trip is
@@ -603,7 +603,7 @@ fn plane_geometry_rejects_bad_dimensions() {
 #[test]
 fn round_trip_deliverable_formats() {
   let mut deliverable = 0usize;
-  for &pf in ALL_PIXEL_FORMATS {
+  for pf in ALL_PIXEL_FORMATS {
     if !is_deliverable(pf) {
       continue;
     }
@@ -611,20 +611,20 @@ fn round_trip_deliverable_formats() {
     let av = to_av_pixel_format(pf).expect("deliverable format must map to a constant");
     let back = from_av_pixel_format(av as i32);
     if is_alias(pf) {
-      let &(_, canonical) = ALIAS_VARIANTS.iter().find(|&&(a, _)| a == pf).unwrap();
+      let (_, canonical) = ALIAS_VARIANTS.iter().find(|(a, _)| a == pf).unwrap();
       assert_eq!(
-        back, canonical,
+        &back, canonical,
         "{pf:?} should collapse to its canonical sibling {canonical:?} on round trip"
       );
     } else {
       assert_eq!(
-        back, pf,
+        &back, pf,
         "exact round trip failed: from_av(to_av({pf:?})) == {back:?}"
       );
     }
     // Discriminant-stable for all (including aliases): re-encoding the
     // decoded variant reproduces the original wire value.
-    let reencoded = to_av_pixel_format(back).expect("decoded format must re-encode");
+    let reencoded = to_av_pixel_format(&back).expect("decoded format must re-encode");
     assert_eq!(
       reencoded as i32, av as i32,
       "round trip not discriminant-stable for {pf:?}"
@@ -643,7 +643,7 @@ fn round_trip_deliverable_formats() {
 #[test]
 fn excludes_hwaccel_bayer_pal_mono() {
   // Hardware-surface formats: not deliverable, and the boundary maps
-  // their wire value to `Unknown` (they're not CPU pixel data).
+  // their wire value to `None` (they're not CPU pixel data).
   for hw in [
     ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX,
     ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_VAAPI,
@@ -651,19 +651,20 @@ fn excludes_hwaccel_bayer_pal_mono() {
     ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_D3D11,
   ] {
     let mapped = from_av_pixel_format(hw as i32);
-    assert!(
-      matches!(mapped, PixelFormat::Unknown(_)),
-      "GPU surface {hw:?} should map to Unknown, got {mapped:?}"
+    assert_eq!(
+      mapped,
+      PixelFormat::None,
+      "GPU surface {hw:?} should map to None, got {mapped:?}"
     );
     assert!(
-      !is_deliverable(mapped),
+      !is_deliverable(&mapped),
       "GPU surface {hw:?} must not be deliverable"
     );
   }
 
   // Bayer: maps to a Bayer `PixelFormat` variant but is rejected by the
   // BAYER flag (deferred to colconv demosaic).
-  for bayer in [
+  for bayer in &[
     PixelFormat::BayerBggr8,
     PixelFormat::BayerRggb8,
     PixelFormat::BayerGbrg16Le,
@@ -677,21 +678,21 @@ fn excludes_hwaccel_bayer_pal_mono() {
   }
 
   // Paletted: rejected by the PAL flag.
-  assert!(!is_deliverable(PixelFormat::Pal8));
-  assert!(plane_geometry(PixelFormat::Pal8, 1920, 1080).is_none());
+  assert!(!is_deliverable(&PixelFormat::Pal8));
+  assert!(plane_geometry(&PixelFormat::Pal8, 1920, 1080).is_none());
 
   // Monochrome (sub-byte bitstream): rejected by the BITSTREAM flag.
-  assert!(!is_deliverable(PixelFormat::Monowhite));
-  assert!(!is_deliverable(PixelFormat::Monoblack));
-  assert!(plane_geometry(PixelFormat::Monowhite, 1920, 1080).is_none());
+  assert!(!is_deliverable(&PixelFormat::Monowhite));
+  assert!(!is_deliverable(&PixelFormat::Monoblack));
+  assert!(plane_geometry(&PixelFormat::Monowhite, 1920, 1080).is_none());
 
   // Sub-byte packed RGB (also BITSTREAM): rejected.
-  assert!(!is_deliverable(PixelFormat::Rgb4));
-  assert!(!is_deliverable(PixelFormat::Bgr4));
+  assert!(!is_deliverable(&PixelFormat::Rgb4));
+  assert!(!is_deliverable(&PixelFormat::Bgr4));
 
-  // Unknown is never deliverable and never maps to a constant.
-  assert!(!is_deliverable(PixelFormat::Unknown(0)));
-  assert!(to_av_pixel_format(PixelFormat::Unknown(123)).is_none());
+  // `None` is never deliverable and never maps to a constant.
+  assert!(!is_deliverable(&PixelFormat::None));
+  assert!(to_av_pixel_format(&PixelFormat::None).is_none());
 }
 
 /// The four mediaframe variants whose FFmpeg constant is absent from
@@ -700,7 +701,7 @@ fn excludes_hwaccel_bayer_pal_mono() {
 /// the format is consequently not deliverable.
 #[test]
 fn formats_without_linked_constant_are_unmapped() {
-  for pf in [
+  for pf in &[
     PixelFormat::V210,
     PixelFormat::V410Le,
     PixelFormat::Yuva420p12Le,

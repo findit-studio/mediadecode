@@ -418,10 +418,10 @@ mod tests {
   }
 
   use crate::Timebase;
-  use core::num::NonZeroU32;
+  use core::num::NonZeroI32;
 
   fn ms_tb() -> Timebase {
-    Timebase::new(1, NonZeroU32::new(1000).unwrap())
+    Timebase::new(1, NonZeroI32::new(1000).unwrap())
   }
 
   #[test]

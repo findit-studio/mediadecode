@@ -94,7 +94,7 @@ an unrecognised code would decode to `Unknown` / `Unspecified`.
 
 ```toml
 [dependencies]
-mediadecode = { version = "0.2", default-features = false, features = ["alloc"] }
+mediadecode = { version = "0.4", default-features = false, features = ["alloc"] }
 ```
 
 ## Usage
