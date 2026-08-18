@@ -88,6 +88,124 @@ the same formats are deliverable, and the same frames are rejected.
 
 [0.4.0]: https://github.com/findit-ai/mediadecode/releases/tag/mediadecode-ffmpeg-v0.4.0
 
+## [0.3.3] - 2026-06-25
+
+Every byte-addressable CPU pixel format FFmpeg can produce now decodes
+and delivers ([#15](https://github.com/Findit-AI/mediadecode/pull/15)).
+The hand-maintained per-format geometry table is gone from the decode
+path; libavutil's own descriptor is the authority.
+
+### Added
+
+- **`pixdesc` module.** Per-plane geometry — visible row bytes and row
+  count — is derived from `av_image_fill_linesizes` and
+  `av_image_fill_plane_sizes` for the exact `(format, width, height)`,
+  so it is correct by construction for any format FFmpeg can describe
+  rather than for the formats someone remembered to tabulate. The
+  safety stance is unchanged: an `AVPixelFormat` is never constructed
+  from a runtime integer, only mapped from a recognised `PixelFormat`
+  to a compile-time `AV_PIX_FMT_*` constant.
+
+### Fixed
+
+- **The YUVJ family decodes.** `yuvj420p` / `yuvj422p` / `yuvj440p` /
+  `yuvj444p` / `yuvj411p` previously fell through to `Unknown` and were
+  rejected at convert; they now map, deliver, and carry their JPEG
+  range on `ColorInfo::range`. This is the real-world fix for MJPEG and
+  JPEG-range footage.
+- **`boundary::from_av_pixel_format` covers 251 formats**, up from 63.
+
+### Changed
+
+- **Deliberate exclusions**, by descriptor flag rather than by omission:
+  Bayer mosaics (a demosaic question, not a geometry one), GPU surface
+  formats (the hardware path transfers to a CPU format first), paletted,
+  monochrome and sub-byte-packed RGB. All are rejected up front by
+  `pixdesc::is_deliverable` with a layout the crate can state, instead
+  of being read as `linesize × height` bytes of guesswork.
+- Four formats have no constant in the linked `ffmpeg-sys-next` 8.1 and
+  so still fall through: `V210`, `V410LE`, `YUVA420P12LE`,
+  `YUVA444P14LE`.
+
+> Downstream note carried from the PR: this crate now delivers formats
+> the colconv resample layer did not yet handle at the time, which
+> decode and then fail at resample. That is not a regression — they
+> failed earlier, at decode, before this release — and closing the gap
+> is colconv-side work.
+
+[0.3.3]: https://github.com/findit-ai/mediadecode/releases/tag/mediadecode-ffmpeg-v0.3.3
+
+## [0.3.2] - 2026-06-24
+
+Hardware decode that collapses **after** the probe has committed now
+falls back to software instead of failing the stream
+([#13](https://github.com/Findit-AI/mediadecode/pull/13)).
+
+### Added
+
+- **`FallbackOrigin`** (`Probe` / `PostCommit`) on the
+  `AllBackendsFailed` payload, with `AllBackendsFailed::origin()` and
+  `AllBackendsFailed::new_post_commit()`. The wrapper routes its
+  software-fallback replay on this explicit signal rather than inferring
+  the origin from whether `unconsumed_packets` is empty — both origins
+  can be empty (a probe-era failure on the very first packet has no
+  history to surface either), so emptiness cannot tell them apart.
+  Conflating the two made a probe-era first-packet cap trip look
+  post-commit, and the packet could be dropped in silence.
+
+### Fixed
+
+- **Runtime HW failure no longer ends the stream.** When the committed
+  backend fails after the probe has collapsed, the decoder opens a
+  software decoder cold, forwards the failing call's packet (or EOF),
+  and resyncs at the next keyframe — a bounded, logged gap rather than
+  a dead stream. Probe-era failures keep the previous behaviour: the
+  buffered history is replayed and the current packet routed on.
+
+[0.3.2]: https://github.com/findit-ai/mediadecode/releases/tag/mediadecode-ffmpeg-v0.3.2
+
+## [0.3.1] - 2026-06-14
+
+Additive release ([#10](https://github.com/Findit-AI/mediadecode/pull/10)).
+
+### Added
+
+- **`Clone` on the decode-path error types** — `Error`,
+  `AllBackendsFailed`, `FallbackFailed`, `AudioDecodeError` and
+  `ConvertError` — so a consumer can forward one error event to several
+  per-stream subscribers. Every payload was already cheaply clonable:
+  `ffmpeg_next::Error` is `Copy`, `ffmpeg_next::Packet` is `Clone`, and
+  `Backend` is `Copy`. `mediadecode::AudioFrame` gains `Clone` in the
+  same release — see
+  [`mediadecode` 0.3.1](../mediadecode/CHANGELOG.md#031---2026-06-14).
+
+[0.3.1]: https://github.com/findit-ai/mediadecode/releases/tag/mediadecode-ffmpeg-v0.3.1
+
+## [0.3.0] - 2026-06-07
+
+Tracks `mediadecode` 0.3.0, which flips the shared vocabulary crate from
+`videoframe` 0.2 to `mediaframe` 0.1
+([#7](https://github.com/Findit-AI/mediadecode/pull/7),
+[#8](https://github.com/Findit-AI/mediadecode/pull/8)). See
+[`mediadecode` 0.3.0](../mediadecode/CHANGELOG.md#030---2026-06-07) for
+what moved in the vocabulary itself.
+
+### Changed (BREAKING)
+
+- **`mediadecode` dep**: bumped to `0.3`. The re-exported vocabulary
+  types are `mediaframe`'s now, so this adapter's type aliases and
+  signatures carry the new identity.
+- **Two colour-transfer mappings are renamed**, tracking upstream:
+  `ColorTransfer::Bt470M` → `Gamma22` and `Bt470Bg` → `Gamma28`. The
+  FFmpeg wire mapping is untouched — the same `AVCOL_TRC_GAMMA22` /
+  `AVCOL_TRC_GAMMA28` land on the same values under their new spelling.
+
+### Changed
+
+- Version bumped to 0.3.0 with the rest of the workspace.
+
+[0.3.0]: https://github.com/findit-ai/mediadecode/releases/tag/mediadecode-ffmpeg-v0.3.0
+
 ## [0.2.0] - 2026-05-15
 
 Tracks `mediadecode` 0.2.0. The pixel-vocabulary types

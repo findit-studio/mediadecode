@@ -11,6 +11,31 @@ The sibling FFmpeg adapter has its own log at
 
 ## [Unreleased]
 
+### Added
+
+- **The three optional matrices reach every type that owns a wire
+  shape.** `channel::AudioChannelSpec`, `channel::AudioChannelLayout`
+  and `packet::PacketFlags` gain `serde`, `arbitrary` and `quickcheck`
+  impls; the matrices had covered only the two `channel` vocabularies.
+  The two records travel as a map of their accessor names (with the
+  vocabularies inside them still as slugs); `PacketFlags` travels as
+  its raw bits, because a bit set has no name to spell and
+  `from_bits_retain` has to carry bits this build has no constant for
+  (FFmpeg's `AV_PKT_FLAG_TRUSTED` / `_DISPOSABLE`). Same reasoning, and
+  the same wire, as `mediaframe::TrackDisposition`.
+- **Feature wiring**: `serde` now enables `smol_str?/serde`, `alloc`
+  enables `serde?/alloc` and `std` enables `serde?/std` — the records'
+  `Vec` and `SmolStr` fields need them. `arbitrary`'s existing
+  `smol_str?/arbitrary` is live for the first time.
+
+### Removed
+
+- **`serde` no longer enables `bitflags/serde`.** It was inert
+  (bitflags 2 routes serde through a derive placed inside the
+  `bitflags!` body, which `PacketFlags` does not carry), and its wire
+  shape is a flag grammar — `"KEY | CORRUPT"` — in any human-readable
+  format, which is not the shape `PacketFlags` takes.
+
 ## [0.4.0]
 
 Both public dependencies cross **two** breaking minors at once:
@@ -77,15 +102,43 @@ what follows is only what changes **here**.
 ### Changed
 
 - Version bumped to 0.4.0. The sibling adapters move to 0.4.0 with it.
+- **Fifteen `channel::ChannelLayoutKind` renderings move**
+  ([#19](https://github.com/Findit-AI/mediadecode/pull/19)). The
+  multi-word names are hyphenated rather than spaced, so `Display` (and
+  the new `as_str`) now print `"stereo-downmix"`, `"5.1-back"`,
+  `"7.1-wide-back"` where they printed `"stereo downmix"`, `"5.1 back"`,
+  `"7.1 wide back"`. Affected: `StereoDownmix`, `Ch2_1Alt`, `Ch5_0Back`,
+  `Ch5_1Back`, `Ch5_1_2Back`, `Ch5_1_4Back`, `Ch6_0Front`, `Ch6_1Back`,
+  `Ch6_1Front`, `Ch7_0Front`, `Ch7_1Wide`, `Ch7_1WideBack`,
+  `Ch7_1TopBack`, `Ch7_1_4Back`, `Ch9_1_4Back`. The other 24 slugs are
+  unchanged. A slug has to survive a CLI argument, a filename and an
+  environment variable without quoting, and the sibling crates spell
+  every multi-word slug this way. **No alias was kept**: the old spaced
+  spelling is now a parse error, because one value has one name.
 
-> **Log completeness.** This file jumps from 0.2.0 to 0.4.0: the
-> published 0.3.0 / 0.3.1 releases and the channel-vocabulary text-form
-> work merged as [#19](https://github.com/Findit-AI/mediadecode/pull/19)
-> (lowercase-slug `as_str` / `Display` / `FromStr` on
-> `channel::ChannelLayoutKind` and `channel::AudioChannelOrderKind`,
-> plus their serde / arbitrary / quickcheck impls) also ship in 0.4.0
-> but were never written up here. Backfilling that history is a
-> separate job.
+### Added
+
+- **A text form for the two `channel` vocabularies**
+  ([#19](https://github.com/Findit-AI/mediadecode/pull/19)).
+  `ChannelLayoutKind` and `AudioChannelOrderKind` gain a `const fn
+  as_str` returning a canonical lowercase slug, `FromStr` reading it
+  back, and one error type each — `ParseChannelLayoutKindError` /
+  `ParseAudioChannelOrderKindError`, both `#[non_exhaustive]` unit
+  structs that deliberately do not retain the rejected input.
+  `AudioChannelOrderKind` also gains `Display`, which it did not have.
+  The door folds ASCII case and nothing else (`"5.1-BACK"` parses,
+  `"5.1-back "` does not) and allocates nothing, so it works at the
+  no-`alloc` tier where both enums live. The numeric doors (`to_u32` /
+  `as_u32` / `from_u32`) are unchanged and stay the compact form.
+- **`serde` / `arbitrary` / `quickcheck` for those two vocabularies**
+  ([#19](https://github.com/Findit-AI/mediadecode/pull/19)). Before
+  this, all three features compiled and no type in the crate
+  implemented anything. serde carries them as their slug rather than
+  their `u32` code: an unrecognised name is a deserialization error,
+  where an unrecognised code would decode to `Unknown` / `Unspecified`
+  and invent a value. Both generators choose uniformly from the
+  variant roster rather than decoding an arbitrary `u32`, which would
+  have spent the whole budget on the fall-through variant.
 
 ### Not affected
 
@@ -100,6 +153,66 @@ what follows is only what changes **here**.
   kernel, and its `serde` feature does not reach mediaframe.
 
 [0.4.0]: https://github.com/findit-ai/mediadecode/releases/tag/mediadecode-v0.4.0
+
+## [0.3.1] - 2026-06-14
+
+Additive release ([#10](https://github.com/Findit-AI/mediadecode/pull/10)).
+
+### Added
+
+- **`Clone` on `AudioFrame`.** The decode → resample pipelines that
+  consume this crate fan one decoded audio frame out to several
+  renditions (a 16 kHz and a 48 kHz resampler, say), which needs the
+  frame itself to be clonable. Nothing about the clone is expensive by
+  construction: an `AudioFrame`'s planes are the adapter's buffer type,
+  and for the FFmpeg adapter that clone is an `av_buffer_ref` refcount
+  bump. The sibling adapter's error types gain `Clone` in the same
+  release — see
+  [`mediadecode-ffmpeg` 0.3.1](../mediadecode-ffmpeg/CHANGELOG.md#031---2026-06-14).
+
+[0.3.1]: https://github.com/findit-ai/mediadecode/releases/tag/mediadecode-v0.3.1
+
+## [0.3.0] - 2026-06-07
+
+The shared vocabulary crate is renamed: `videoframe` 0.2 became
+`mediaframe` 0.1 when its charter broadened from pixel/frame to all
+media-stream vocabulary, and the old `videoframe` 0.x line is yanked.
+mediadecode flips in lockstep
+([#7](https://github.com/Findit-AI/mediadecode/pull/7),
+[#8](https://github.com/Findit-AI/mediadecode/pull/8)). Because the
+re-exported types *are* mediadecode's public surface, a rename upstream
+is a break here even where this crate's own spellings do not move.
+
+### Changed (BREAKING)
+
+- **`videoframe` 0.2 → `mediaframe` 0.1.** Every re-export in
+  `color`, `cfa`, `pixel_format` and `frame` now resolves to a
+  `mediaframe` type. The import paths callers write are unchanged
+  (`mediadecode::color::ColorMatrix`, `mediadecode::PixelFormat`, …),
+  but the **type identity** behind them is a different crate, so a
+  value obtained from `videoframe` 0.2 no longer type-checks here.
+- **`frame::Plane::data()` is renamed `data_ref()`**, tracking
+  mediaframe's `_ref` getter-suffix convention.
+- **The `Color*` names are now aliases.** Upstream renamed
+  `Color{Matrix,Primaries,Transfer,Range,Info}` to
+  `{Matrix,Primaries,Transfer,DynamicRange,Info}`; mediadecode keeps
+  the disambiguated spellings as re-export aliases
+  (`DynamicRange as ColorRange`, `Info as ColorInfo`, …) so its own
+  surface and its consumers stay source-compatible. Callers naming the
+  upstream types directly see the new names.
+- **`ColorMatrix::default()` is `Unspecified`**, was `Bt709` — an
+  upstream default that this crate re-exports rather than defines.
+- **`ColorTransfer::Bt470M` / `Bt470Bg` are renamed `Gamma22` /
+  `Gamma28`**, again upstream. The wire mapping is untouched: the same
+  H.273 codes, and the FFmpeg adapter still maps `AVCOL_TRC_GAMMA22` /
+  `AVCOL_TRC_GAMMA28` to them.
+
+### Changed
+
+- Version bumped to 0.3.0 — pre-1.0 SemVer puts a breaking change in
+  the minor. All three workspace members move together.
+
+[0.3.0]: https://github.com/findit-ai/mediadecode/releases/tag/mediadecode-v0.3.0
 
 ## [0.2.0] - 2026-05-15
 
