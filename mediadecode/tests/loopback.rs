@@ -8,7 +8,7 @@
 //!
 //! No external SDK is required.
 
-use core::num::NonZeroU32;
+use core::num::NonZeroI32;
 
 use mediadecode::{
   Timebase, Timestamp,
@@ -177,7 +177,7 @@ fn video_stream_round_trip() {
   let pkt: VideoPacket<(), &'static [u8]> = VideoPacket::new(b"compressed" as &[u8], ())
     .with_pts(Some(Timestamp::new(
       0,
-      Timebase::new(1, NonZeroU32::new(1000).unwrap()),
+      Timebase::new(1, NonZeroI32::new(1000).unwrap()),
     )))
     .with_flags(PacketFlags::KEY);
   assert!(s.send_packet(&pkt).is_ok());
@@ -210,7 +210,7 @@ fn video_stream_round_trip() {
 
 #[test]
 fn video_source_round_trip() {
-  let fps = Timebase::new(30, NonZeroU32::new(1).unwrap());
+  let fps = Timebase::new(30, NonZeroI32::new(1).unwrap());
   let mut src = VideoSource {
     fps,
     duration_pts: 0,

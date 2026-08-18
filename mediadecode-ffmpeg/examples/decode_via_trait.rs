@@ -26,7 +26,7 @@ use mediadecode_ffmpeg::{
   Ffmpeg, FfmpegBuffer, FfmpegVideoStreamDecoder, VideoFrame, empty_video_frame,
   video_packet_from_ffmpeg,
 };
-use std::num::NonZeroU32;
+use std::num::NonZeroI32;
 
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
   let path = std::env::args()
@@ -43,8 +43,8 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
   let stream_index = stream.index();
   let stream_tb = stream.time_base();
   let time_base = Timebase::new(
-    stream_tb.numerator() as u32,
-    NonZeroU32::new(stream_tb.denominator().max(1) as u32).ok_or("bad time base")?,
+    stream_tb.numerator(),
+    NonZeroI32::new(stream_tb.denominator().max(1)).ok_or("bad time base")?,
   );
 
   let mut decoder = FfmpegVideoStreamDecoder::open(stream.parameters(), time_base)?;

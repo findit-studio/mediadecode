@@ -13,7 +13,7 @@ use mediadecode_ffmpeg::{
   AudioFrame, Ffmpeg, FfmpegAudioStreamDecoder, FfmpegBuffer, FfmpegSubtitleStreamDecoder,
   audio_packet_from_ffmpeg, empty_audio_frame, empty_subtitle_frame, subtitle_packet_from_ffmpeg,
 };
-use std::num::NonZeroU32;
+use std::num::NonZeroI32;
 
 #[test]
 fn ffmpeg_audio_decoder_implements_trait() {
@@ -64,8 +64,8 @@ fn decode_one_audio_frame_through_trait() {
   let stream_index = stream.index();
   let stream_tb = stream.time_base();
   let time_base = Timebase::new(
-    stream_tb.numerator() as u32,
-    NonZeroU32::new(stream_tb.denominator().max(1) as u32).expect("non-zero den"),
+    stream_tb.numerator(),
+    NonZeroI32::new(stream_tb.denominator().max(1)).expect("non-zero den"),
   );
 
   let mut decoder =
@@ -124,8 +124,8 @@ fn decode_one_subtitle_through_trait() {
   let stream_index = stream.index();
   let stream_tb = stream.time_base();
   let time_base = Timebase::new(
-    stream_tb.numerator() as u32,
-    NonZeroU32::new(stream_tb.denominator().max(1) as u32).expect("non-zero den"),
+    stream_tb.numerator(),
+    NonZeroI32::new(stream_tb.denominator().max(1)).expect("non-zero den"),
   );
 
   let mut decoder = FfmpegSubtitleStreamDecoder::open(stream.parameters(), time_base)

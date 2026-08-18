@@ -76,8 +76,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   let stream = input.streams().best(media::Type::Video).unwrap();
   let stream_index = stream.index();
   let time_base = Timebase::new(
-    stream.time_base().numerator() as u32,
-    std::num::NonZeroU32::new(stream.time_base().denominator() as u32).unwrap(),
+    stream.time_base().numerator(),
+    std::num::NonZeroI32::new(stream.time_base().denominator()).unwrap(),
   );
 
   // Probes HW backends in order, falls back to software.

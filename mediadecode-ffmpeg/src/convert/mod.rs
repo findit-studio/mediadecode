@@ -154,7 +154,7 @@ pub unsafe fn av_frame_to_video_frame(
   // bitstream packings — before touching plane memory. Without a
   // deliverable layout we'd be reading garbage `linesize * height`
   // bytes.
-  if !pixdesc::is_deliverable(pix_fmt) {
+  if !pixdesc::is_deliverable(&pix_fmt) {
     return Err(ConvertError::UnsupportedPixelFormat(pix_fmt));
   }
   // The per-plane row count and visible (tight) byte width come from
@@ -164,7 +164,7 @@ pub unsafe fn av_frame_to_video_frame(
   // deliverable CPU format. For a deliverable format `plane_geometry`
   // only returns `None` on out-of-range dimensions; treat that as an
   // unsupported frame rather than guessing a layout.
-  let geom = match pixdesc::plane_geometry(pix_fmt, width as usize, height as usize) {
+  let geom = match pixdesc::plane_geometry(&pix_fmt, width as usize, height as usize) {
     Some(g) => g,
     None => return Err(ConvertError::UnsupportedPixelFormat(pix_fmt)),
   };
@@ -324,7 +324,7 @@ pub unsafe fn av_frame_to_video_frame(
     .with_primaries(map_primaries(color_primaries_raw))
     .with_transfer(map_transfer(color_trc_raw))
     .with_matrix(map_matrix(colorspace_raw))
-    .with_range(map_range_for(pix_fmt, color_range_raw))
+    .with_range(map_range_for(&pix_fmt, color_range_raw))
     .with_chroma_location(map_chroma_loc(chroma_location_raw));
 
   // Backend-specific extras.
@@ -699,7 +699,7 @@ fn map_range(raw: i32) -> ColorRange {
 /// MJPEG/JPEG-family full-swing signal — so their color range is a
 /// property of the format itself, not something the frame's
 /// `color_range` field needs to (or reliably does) carry.
-fn is_yuvj(pix_fmt: PixelFormat) -> bool {
+fn is_yuvj(pix_fmt: &PixelFormat) -> bool {
   matches!(
     pix_fmt,
     PixelFormat::Yuvj411p
@@ -721,7 +721,7 @@ fn is_yuvj(pix_fmt: PixelFormat) -> bool {
 /// Limited-swing default) — a silent decode-correctness regression. So
 /// for the `yuvj*` family we force [`ColorRange::Full`] regardless of
 /// the field. Every other format defers entirely to `color_range`.
-fn map_range_for(pix_fmt: PixelFormat, color_range_raw: i32) -> ColorRange {
+fn map_range_for(pix_fmt: &PixelFormat, color_range_raw: i32) -> ColorRange {
   if is_yuvj(pix_fmt) {
     return ColorRange::Full;
   }

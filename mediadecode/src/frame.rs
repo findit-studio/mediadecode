@@ -242,9 +242,14 @@ impl<P, E, D> VideoFrame<P, E, D> {
     }
   }
   /// Returns the color metadata.
+  ///
+  /// Not `const`: mediaframe 0.3 dropped `Copy` from [`ColorInfo`]
+  /// (its member vocabularies carry an owned `Other` arm at the
+  /// `alloc` tier), so the by-value accessor clones — the shape
+  /// mediaframe's own `Info` accessors use.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn color(&self) -> ColorInfo {
-    self.color
+  pub fn color(&self) -> ColorInfo {
+    self.color.clone()
   }
   /// Returns the backend extras.
   #[cfg_attr(not(tarpaulin), inline(always))]
@@ -279,9 +284,17 @@ impl<P, E, D> VideoFrame<P, E, D> {
     self
   }
   /// Sets the color metadata (consuming builder).
+  ///
+  /// Not `const`: assigning the field drops the previous
+  /// [`ColorInfo`], and mediaframe 0.3's `Info` has a destructor
+  /// whenever mediaframe's `alloc` feature is on (its member
+  /// vocabularies then carry an owned `Other` arm). A const
+  /// destructor is not evaluable, and feature unification can turn
+  /// that feature on from anywhere in the dependency graph, so the
+  /// `const` cannot be kept at either tier.
   #[cfg_attr(not(tarpaulin), inline(always))]
   #[must_use]
-  pub const fn with_color(mut self, v: ColorInfo) -> Self {
+  pub fn with_color(mut self, v: ColorInfo) -> Self {
     self.color = v;
     self
   }
@@ -305,8 +318,10 @@ impl<P, E, D> VideoFrame<P, E, D> {
     self
   }
   /// Sets the color metadata in place.
+  ///
+  /// Not `const`, for the same reason as [`Self::with_color`].
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn set_color(&mut self, v: ColorInfo) -> &mut Self {
+  pub fn set_color(&mut self, v: ColorInfo) -> &mut Self {
     self.color = v;
     self
   }

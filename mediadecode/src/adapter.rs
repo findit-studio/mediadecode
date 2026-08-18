@@ -17,7 +17,13 @@ pub trait VideoAdapter {
   /// Pixel format identifier (e.g. backend-specific newtype around
   /// FFmpeg `AVPixelFormat`, WebCodecs `VideoPixelFormat`, RAW
   /// `VideoPixelType`, BRAW `BlackmagicRawResourceFormat`).
-  type PixelFormat: Copy + Eq + Debug;
+  ///
+  /// `Clone`, not `Copy`, for the same reason
+  /// [`AudioAdapter::ChannelLayout`] is: mediaframe 0.3's
+  /// `PixelFormat` carries an owned `Other(SmolStr)` arm at the
+  /// `alloc` tier, and that is the identifier the FFmpeg and
+  /// WebCodecs adapters bind here.
+  type PixelFormat: Clone + Eq + Debug;
   /// Backend-specific extras carried on every `VideoPacket` (e.g.
   /// FFmpeg side-data, WebCodecs metadata).
   type PacketExtra;

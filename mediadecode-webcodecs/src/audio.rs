@@ -13,7 +13,7 @@
 //! while `AudioDecoder.decodeQueueSize >= [`MAX_DECODE_QUEUE`]
 //! and resumes when the WebCodecs `dequeue` event fires.
 
-use std::num::NonZeroU32;
+use std::num::NonZeroI32;
 
 use mediadecode::{
   Timebase, Timestamp,
@@ -165,7 +165,7 @@ impl DecodedAudioFrame {
   }
 }
 
-const MICROS: Timebase = match NonZeroU32::new(1_000_000) {
+const MICROS: Timebase = match NonZeroI32::new(1_000_000) {
   Some(d) => Timebase::new(1, d),
   None => unreachable!(),
 };
