@@ -16,6 +16,20 @@ bitflags! {
   ///   `AV_PKT_FLAG_CORRUPT`).
   /// - `DISCARD = 0b100` — packet should be skipped during reconstruction
   ///   (FFmpeg `AV_PKT_FLAG_DISCARD`).
+  ///
+  /// # Text form
+  ///
+  /// This type deliberately has **no** `Display` / `FromStr`, and its
+  /// serde shape is the raw [`bits`](Self::bits) as a number. A
+  /// vocabulary of *names* takes a text form; a bit *set* takes a
+  /// number. A flag-set grammar (`"key|discard"`) would need two shapes
+  /// rather than one, because a bit this build has no constant for can
+  /// only be printed as a bare literal — and there are such bits today:
+  /// FFmpeg carries `AV_PKT_FLAG_TRUSTED` (`0b0_1000`) and
+  /// `AV_PKT_FLAG_DISPOSABLE` (`0b1_0000`), which this set does not
+  /// name. Human-readable names live in `Debug` and in whatever
+  /// consumer surface wants them. This is `mediaframe::TrackDisposition`'s
+  /// stance, for the same reason.
   #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
   pub struct PacketFlags: u8 {
     /// Keyframe / sync sample.
@@ -393,6 +407,90 @@ impl<E, D> SubtitlePacket<E, D> {
   }
 }
 
+// ---------------------------------------------------------------------------
+//  Optional trait matrices (`serde` / `arbitrary` / `quickcheck`) for
+//  `PacketFlags`. The packet types themselves are generic over a caller's
+//  buffer and extras and are not a wire vocabulary; the flag set is.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "serde")]
+#[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
+mod serde_impls {
+  //! The bit set travels as its number.
+  //!
+  //! This is the opposite of the choice `channel`'s two vocabularies
+  //! make, and for the opposite reason. There, a `u32` wire would let an
+  //! unrecognised code decode to `Unknown` — inventing a value — so the
+  //! name is the only faithful shape. Here every bit pattern *is* a
+  //! value, including the ones this build has no constant for
+  //! (`AV_PKT_FLAG_TRUSTED`, `AV_PKT_FLAG_DISPOSABLE`), so the number is
+  //! the only shape that carries them all. `from_bits_retain` is what
+  //! keeps that round trip lossless; `from_bits` would reject the very
+  //! bits the wire exists to preserve.
+  //!
+  //! `mediaframe::TrackDisposition` sits on this same wire, so a
+  //! consumer that stores both sees one convention.
+
+  use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+  use super::PacketFlags;
+
+  impl Serialize for PacketFlags {
+    #[cfg_attr(not(tarpaulin), inline(always))]
+    fn serialize<S: Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+      ser.serialize_u8(self.bits())
+    }
+  }
+
+  impl<'de> Deserialize<'de> for PacketFlags {
+    #[cfg_attr(not(tarpaulin), inline(always))]
+    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+      u8::deserialize(de).map(Self::from_bits_retain)
+    }
+  }
+}
+
+#[cfg(feature = "arbitrary")]
+#[cfg_attr(docsrs, doc(cfg(feature = "arbitrary")))]
+mod arbitrary_impls {
+  //! Uniform over `u8`, decoded with `from_bits_retain`.
+  //!
+  //! Again the opposite of `channel`'s roster draw, and again because a
+  //! bit set has no fallback variant to collapse into: every one of the
+  //! 256 patterns is a distinct value, each named bit is set in half of
+  //! them, and the unnamed bits — the ones a real FFmpeg packet does
+  //! carry — appear at the same rate. Choosing from a roster of the
+  //! three named flags would generate exactly the inputs that cannot go
+  //! wrong.
+
+  use arbitrary::{Arbitrary, Result, Unstructured};
+
+  use super::PacketFlags;
+
+  impl<'a> Arbitrary<'a> for PacketFlags {
+    fn arbitrary(u: &mut Unstructured<'a>) -> Result<Self> {
+      Ok(Self::from_bits_retain(u8::arbitrary(u)?))
+    }
+  }
+}
+
+#[cfg(feature = "quickcheck")]
+#[cfg_attr(docsrs, doc(cfg(feature = "quickcheck")))]
+mod quickcheck_impls {
+  //! The `quickcheck` half of what `arbitrary_impls` gives, drawn the
+  //! same way and for the same reason.
+
+  use quickcheck::{Arbitrary, Gen};
+
+  use super::PacketFlags;
+
+  impl Arbitrary for PacketFlags {
+    fn arbitrary(g: &mut Gen) -> Self {
+      Self::from_bits_retain(u8::arbitrary(g))
+    }
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -465,5 +563,111 @@ mod tests {
     let data: &[u8] = b"hi";
     let p: SubtitlePacket<_, &[u8]> = SubtitlePacket::new(data, ());
     assert_eq!(*p.data(), data);
+  }
+
+  // -------------------------------------------------------------------
+  //  Optional matrices (`serde` / `arbitrary` / `quickcheck`)
+  // -------------------------------------------------------------------
+
+  // The wire assertions need a real self-describing format, which needs
+  // an allocator; the impls themselves compile at every tier.
+  #[cfg(all(feature = "serde", any(feature = "alloc", feature = "std")))]
+  mod serde_tests {
+    use super::*;
+
+    #[test]
+    fn the_wire_is_a_number_not_a_flag_grammar() {
+      // The ruling this pins: a bit set reaches the wire as its bits.
+      // `bitflags`' own serde would have written `"KEY | CORRUPT"` here
+      // for a human-readable format, which is why that sub-feature is
+      // not the mechanism.
+      let flags = PacketFlags::KEY | PacketFlags::CORRUPT;
+      assert_eq!(
+        serde_json::to_string(&flags).expect("flags always serialize"),
+        "3"
+      );
+      assert_eq!(
+        serde_json::to_string(&PacketFlags::empty()).expect("flags always serialize"),
+        "0"
+      );
+    }
+
+    #[test]
+    fn a_name_is_not_a_number() {
+      assert!(serde_json::from_str::<PacketFlags>(r#""KEY""#).is_err());
+      assert!(serde_json::from_str::<PacketFlags>(r#""key|corrupt""#).is_err());
+    }
+
+    #[test]
+    fn every_bit_pattern_round_trips_including_the_unnamed_ones() {
+      // 0b0000_1000 and 0b0001_0000 are FFmpeg's TRUSTED / DISPOSABLE,
+      // which this set does not name. They still have to survive, which
+      // is what `from_bits_retain` buys and what `from_bits` would lose.
+      for bits in 0..=u8::MAX {
+        let flags = PacketFlags::from_bits_retain(bits);
+        let json = serde_json::to_string(&flags).expect("flags always serialize");
+        assert_eq!(json, bits.to_string());
+        assert_eq!(
+          serde_json::from_str::<PacketFlags>(&json).expect("its own output parses"),
+          flags,
+          "round-trip failed for {bits:#010b}"
+        );
+      }
+    }
+
+    #[test]
+    fn a_value_no_u8_can_hold_is_refused() {
+      assert!(serde_json::from_str::<PacketFlags>("256").is_err());
+      assert!(serde_json::from_str::<PacketFlags>("-1").is_err());
+    }
+  }
+
+  #[cfg(feature = "arbitrary")]
+  mod arbitrary_tests {
+    use arbitrary::{Arbitrary, Unstructured};
+
+    use super::*;
+
+    #[test]
+    fn every_bit_pattern_is_reachable() {
+      let mut seen = [false; 256];
+      for byte in 0..=u8::MAX {
+        let data = [byte];
+        let mut u = Unstructured::new(&data);
+        let flags = PacketFlags::arbitrary(&mut u).expect("the generator is total");
+        seen[flags.bits() as usize] = true;
+      }
+      assert!(
+        seen.iter().all(|&s| s),
+        "a bit pattern the generator never produces"
+      );
+    }
+  }
+
+  #[cfg(feature = "quickcheck")]
+  mod quickcheck_tests {
+    use quickcheck::{Arbitrary, Gen};
+
+    use super::*;
+
+    #[test]
+    fn the_named_flags_and_the_unnamed_bits_are_both_reachable() {
+      // 4000 draws over 256 patterns: missing a named flag here means
+      // the generator is skewed, not unlucky.
+      let mut g = Gen::new(16);
+      let mut union = PacketFlags::empty();
+      let mut saw_unnamed = false;
+      for _ in 0..4000 {
+        let flags = PacketFlags::arbitrary(&mut g);
+        union |= flags;
+        saw_unnamed |= !PacketFlags::all().contains(flags);
+      }
+      assert_eq!(
+        union,
+        PacketFlags::from_bits_retain(u8::MAX),
+        "a bit the generator never sets"
+      );
+      assert!(saw_unnamed, "an unnamed bit is never produced");
+    }
   }
 }

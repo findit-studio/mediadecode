@@ -79,15 +79,27 @@ the rest of the findit-studio workspace uses:
 | ------------ | :-----: | ------------------------------------------------------------- |
 | `std`        |   yes   | Enable the standard library and `mediatime/default`.          |
 | `alloc`      |    —    | Enable owning collections (`Vec`, `String`) without `std`.    |
-| `serde`      |    —    | The channel vocabularies as their slug, plus `mediatime`.     |
-| `arbitrary`  |    —    | `Arbitrary` impls for fuzzing (the channel vocabularies).     |
-| `quickcheck` |    —    | The same coverage for `quickcheck`.                           |
+| `serde`      |    —    | Every type below on the wire, plus `mediatime`.               |
+| `arbitrary`  |    —    | `Arbitrary` impls for fuzzing, same coverage.                 |
+| `quickcheck` |    —    | The same coverage again, for `quickcheck`.                    |
 
-The three optional matrices cover the same types — today
-`channel::ChannelLayoutKind` and `channel::AudioChannelOrderKind`, which
-serde carries as their canonical slug (`"5.1"`, `"native"`) rather than
-their `u32` code: an unrecognised name is a deserialization error, where
-an unrecognised code would decode to `Unknown` / `Unspecified`.
+The three optional matrices cover the same types, and each type's wire
+shape follows what it *is*:
+
+| Type | Tier | serde wire shape |
+| ---- | ---- | ---------------- |
+| `channel::ChannelLayoutKind`     | any     | canonical slug — `"5.1"`, `"7.1-wide-back"` |
+| `channel::AudioChannelOrderKind` | any     | canonical slug — `"native"`, `"ambisonic"`  |
+| `channel::AudioChannelSpec`      | `alloc` | map of its accessor names                   |
+| `channel::AudioChannelLayout`    | `alloc` | map of its accessor names                   |
+| `packet::PacketFlags`            | any     | the raw bits, as a number                   |
+
+A **name vocabulary** travels as its name: an unrecognised slug is a
+deserialization error, where an unrecognised `u32` code would decode to
+`Unknown` / `Unspecified` and invent a value. A **bit set** travels as a
+number, because every bit pattern is meaningful and bits this build has
+no constant for still have to survive the round trip. A **record**
+travels as its fields, each in its own shape.
 
 `no_std` builds: disable defaults and pick `alloc` if you need
 `Vec`-backed payloads:
