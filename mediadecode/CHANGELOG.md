@@ -11,6 +11,96 @@ The sibling FFmpeg adapter has its own log at
 
 ## [Unreleased]
 
+## [0.4.0]
+
+Both public dependencies cross **two** breaking minors at once:
+`mediatime` 0.1 → 0.3 and `mediaframe` 0.1 → 0.3. Neither is an
+internal detail — `mediatime::{Timebase, Timestamp, TimeRange}` and
+eleven `mediaframe` types are re-exported as mediadecode's own public
+surface and appear in its signatures — so a consumer holding a
+`mediatime 0.1` / `mediaframe 0.1` value no longer type-checks against
+this release. The upstream notes are the authority
+([mediatime](https://github.com/findit-studio/mediatime/blob/main/CHANGELOG.md),
+[mediaframe](https://github.com/findit-studio/mediaframe/blob/main/CHANGELOG.md));
+what follows is only what changes **here**.
+
+### Changed (BREAKING)
+
+- **`mediatime` 0.1 → 0.3.** `Timebase`'s numerator and denominator
+  are now signed (`u32 → i32`, `NonZeroU32 → NonZeroI32`), matching
+  FFmpeg's `AVRational`; `Timebase::new` panics on a negative
+  numerator or denominator, with `try_new` as the fallible form.
+  Every `Timebase::new(n, NonZeroU32::new(d).unwrap())` call site
+  becomes `Timebase::new(n, NonZeroI32::new(d).unwrap())`. mediatime
+  0.2 → 0.3 additionally deleted the bare rescale ladder
+  (`rescale_pts` / `rescale` / `duration_to_pts` → `checked_*` /
+  `saturating_*`), corrected the rounding to `AV_ROUND_NEAR_INF` and
+  moved `frames_to_duration` onto the new `Rate` type — **mediadecode
+  calls none of those**, so nothing here moves for them; consumers
+  that call them through mediadecode's re-export do.
+- **`mediaframe` 0.1 → 0.3.** `PixelFormat::Unknown(u32)` is struck —
+  the same numeric escape goes from eleven coded vocabularies in all.
+  `PixelFormat::None` — a **named** member (FFmpeg's own
+  `AV_PIX_FMT_NONE`, and the `Default`) — is what the adapter crates
+  now produce where they used to produce `Unknown(raw as u32)`; the
+  raw integer no longer rides along. `from_u32` returns
+  `Option<Self>` and `to_u32` returns `Option<u32>`. The open
+  extension arm mediaframe offers instead is `Other(SmolStr)`, which
+  lives behind mediaframe's `alloc` feature; mediadecode pins
+  mediaframe at the no-alloc tier (`default-features = false`,
+  `features = ["frame"]` — unchanged from 0.1), so the re-exported
+  vocabularies are **closed** here.
+- **`VideoAdapter::PixelFormat` is now `Clone + Eq + Debug`**, was
+  `Copy + Eq + Debug`. mediaframe 0.3 dropped `Copy` from the ten
+  coded enums (the `Other` arm is heap-capable), so a backend binding
+  `mediaframe::PixelFormat` could not satisfy the old bound. Relaxing
+  a bound is free for implementors; consumers that relied on
+  `A::PixelFormat: Copy` need a `.clone()` or a borrow.
+  `AudioAdapter::ChannelLayout` was already `Clone` for the same
+  reason (`AudioChannelLayout` carries an owned description) — this
+  brings the two into line.
+- **`VideoFrame::color` is no longer `const`** and returns a clone.
+  `mediaframe::color::Info` lost `Copy` in 0.3. The signature is
+  unchanged (`fn color(&self) -> ColorInfo`), matching what
+  mediaframe's own `Info` accessors did with the same problem.
+- **`VideoFrame::with_color` and `VideoFrame::set_color` are no longer
+  `const`.** Assigning the field drops the previous `ColorInfo`, and
+  mediaframe 0.3's `Info` acquires a destructor as soon as
+  mediaframe's `alloc` feature is on — a const destructor is not
+  evaluable (`E0493`). This is **not** conditional on how mediadecode
+  pins mediaframe: Cargo unifies features across the whole graph, so
+  any other crate depending on `mediaframe` with its defaults turns
+  `alloc` on for this build too. The `const` therefore cannot be kept
+  at either tier. Signatures are otherwise unchanged; only `const`
+  evaluation of these two setters is lost.
+
+### Changed
+
+- Version bumped to 0.4.0. The sibling adapters move to 0.4.0 with it.
+
+> **Log completeness.** This file jumps from 0.2.0 to 0.4.0: the
+> published 0.3.0 / 0.3.1 releases and the channel-vocabulary text-form
+> work merged as [#19](https://github.com/Findit-AI/mediadecode/pull/19)
+> (lowercase-slug `as_str` / `Display` / `FromStr` on
+> `channel::ChannelLayoutKind` and `channel::AudioChannelOrderKind`,
+> plus their serde / arbitrary / quickcheck impls) also ship in 0.4.0
+> but were never written up here. Backfilling that history is a
+> separate job.
+
+### Not affected
+
+- `mediaframe::frame::Rational` widening to `i64` / `NonZeroI64`
+  (mediaframe 0.2) has **no** site here: mediadecode names no
+  `Rational`, `SampleAspectRatio` or `FrameRate`, and
+  `mediadecode-ffmpeg`'s `Rational` is `ffmpeg_next::Rational`.
+- The retired shared `mediaframe::parse::ParseError`, the new
+  `KernelMatrix` / `KernelGamut` kernel selectors, and mediaframe's
+  serde/buffa number → slug wire move have no site here either:
+  mediadecode parses none of those vocabularies, calls no conversion
+  kernel, and its `serde` feature does not reach mediaframe.
+
+[0.4.0]: https://github.com/findit-ai/mediadecode/releases/tag/mediadecode-v0.4.0
+
 ## [0.2.0] - 2026-05-15
 
 The shared pixel-vocabulary layer (`color`, `cfa`, `pixel_format`,
