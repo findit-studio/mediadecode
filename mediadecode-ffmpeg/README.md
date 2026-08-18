@@ -147,17 +147,35 @@ for end-to-end demuxer-driven runs that cover all three streams.
 
 ## Running tests and benches
 
-The integration test and benchmark expect a real video file. Set
-`MEDIADECODE_SAMPLE_VIDEO` to enable them:
+The fixture-gated tests and the benchmark expect real media files,
+named by five environment variables. The unit tests run
+unconditionally; the gated ones are `#[ignore]`d, so `--ignored`
+is what opts into them.
+
+| Variable | Feeds |
+| --- | --- |
+| `HWDECODE_SAMPLE_VIDEO` | `tests/decode.rs`, `tests/hw_smoke.rs`, `benches/decode.rs`, and the three `decoder::tests` backend cases |
+| `MEDIADECODE_SAMPLE_VIDEO` | `tests/decode_via_trait.rs` |
+| `MEDIADECODE_SAMPLE_AUDIO` | the audio-through-trait case (any container with an audio track) |
+| `MEDIADECODE_SAMPLE_SUBTITLE` | the subtitle-through-trait case (needs a container that really carries a subtitle track) |
+| `MEDIADECODE_FX3_SAMPLE` | the Sony FX3 H.264 High 4:2:2 10-bit mid-stream HW→SW fallback case |
 
 ```sh
-MEDIADECODE_SAMPLE_VIDEO=/path/to/clip.mp4 cargo test
-MEDIADECODE_SAMPLE_VIDEO=/path/to/clip.mp4 cargo test --test hw_smoke -- --ignored
-MEDIADECODE_SAMPLE_VIDEO=/path/to/clip.mp4 cargo bench
+HWDECODE_SAMPLE_VIDEO=/path/to/clip.mp4 cargo test --test hw_smoke -- --ignored
+HWDECODE_SAMPLE_VIDEO=/path/to/clip.mp4 cargo bench
+
+# The whole fixture-gated set at once.
+HWDECODE_SAMPLE_VIDEO=/path/to/clip.mp4 \
+MEDIADECODE_SAMPLE_VIDEO=/path/to/clip.mp4 \
+MEDIADECODE_SAMPLE_AUDIO=/path/to/clip.mp4 \
+MEDIADECODE_SAMPLE_SUBTITLE=/path/to/subtitled.mkv \
+MEDIADECODE_FX3_SAMPLE=/path/to/12_sony_fx3_xavc.mp4 \
+  cargo test --all-features -- --ignored
 ```
 
-Without the env var the integration tests skip with a notice; unit
-tests run unconditionally.
+A variable left unset is not always a quiet skip: the FX3 case prints
+a notice and returns, but the trait cases panic on a missing path
+once `--ignored` has opted into them.
 
 ## Build requirements
 
