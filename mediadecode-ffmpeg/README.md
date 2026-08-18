@@ -163,7 +163,7 @@ tests run unconditionally.
 
 - A system FFmpeg ≥ **5.1** linkable via `pkg-config` (we reference
   `AV_PIX_FMT_P212LE` / `AV_PIX_FMT_P412LE`, which were added in 5.1).
-  Tested against 8.1. Verify with `ffmpeg -hwaccels` that your build
+  Tested against 9.0. Verify with `ffmpeg -hwaccels` that your build
   has the backends you expect compiled in
   (e.g. `videotoolbox` on macOS, `vaapi` / `cuda` on Linux,
   `d3d11va` / `cuda` on Windows).
