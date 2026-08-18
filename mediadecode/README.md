@@ -33,7 +33,7 @@ bytes. Adapter implementations live in sibling crates such as
 ## What's in the box
 
 - **Pixel and sample formats** — `PixelFormat` (~270 variants
-  covering every FFmpeg `n8.1` `AVPixelFormat` slug plus cinema-RAW
+  covering every FFmpeg `n9.0` `AVPixelFormat` slug plus cinema-RAW
   additions; sourced from
   [`videoframe`](https://crates.io/crates/videoframe) and re-exported
   here so consumers keep their `mediadecode::PixelFormat` import).
