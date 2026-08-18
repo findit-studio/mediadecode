@@ -326,7 +326,7 @@ pub(crate) const fn to_av_pixel_format(pix_fmt: &PixelFormat) -> Option<AVPixelF
     PixelFormat::Yuva444p10Le => F::AV_PIX_FMT_YUVA444P10LE,
     PixelFormat::Yuva444p10Be => F::AV_PIX_FMT_YUVA444P10BE,
     // `Yuva420p12Le` / `Yuva444p14Le` have no `AV_PIX_FMT_*` constant in
-    // the linked FFmpeg build (ffmpeg-sys-next 8.1) — they fall through
+    // the linked FFmpeg build (ffmpeg-sys-next 9.0) — they fall through
     // to `None` below.
     PixelFormat::Yuva422p12Le => F::AV_PIX_FMT_YUVA422P12LE,
     PixelFormat::Yuva422p12Be => F::AV_PIX_FMT_YUVA422P12BE,
@@ -378,7 +378,7 @@ pub(crate) const fn to_av_pixel_format(pix_fmt: &PixelFormat) -> Option<AVPixelF
     PixelFormat::Y216Le => F::AV_PIX_FMT_Y216LE,
     PixelFormat::Y216Be => F::AV_PIX_FMT_Y216BE,
     // `V210` / `V410Le` have no `AV_PIX_FMT_*` constant in the linked
-    // FFmpeg build (ffmpeg-sys-next 8.1) — they fall through to `None`.
+    // FFmpeg build (ffmpeg-sys-next 9.0) — they fall through to `None`.
     PixelFormat::Xv30Le => F::AV_PIX_FMT_XV30LE,
     PixelFormat::Xv30Be => F::AV_PIX_FMT_XV30BE,
     PixelFormat::V30xLe => F::AV_PIX_FMT_V30XLE,
