@@ -21,7 +21,7 @@
 //!
 //! [1]: https://github.com/findit-ai/audio-fixtures
 
-use std::{num::NonZeroU32, path::PathBuf};
+use std::{num::NonZeroI32, path::PathBuf};
 
 use ffmpeg_next as ffmpeg;
 use mediadecode::{Timebase, decoder::AudioStreamDecoder};
@@ -111,8 +111,8 @@ fn decode_clip(path: &std::path::Path, expected: (u32, u8, u64)) {
   let stream_index = stream.index();
   let stream_tb = stream.time_base();
   let time_base = Timebase::new(
-    stream_tb.numerator() as u32,
-    NonZeroU32::new(stream_tb.denominator().max(1) as u32).expect("non-zero den"),
+    stream_tb.numerator(),
+    NonZeroI32::new(stream_tb.denominator().max(1)).expect("non-zero den"),
   );
 
   let mut decoder =

@@ -27,7 +27,7 @@
 //! chunk leaves the WebCodecs internal queue; we hook it to wake
 //! the producer's waker when there's room again.
 
-use std::{num::NonZeroU32, sync::Arc};
+use std::{num::NonZeroI32, sync::Arc};
 
 use mediadecode::{
   Timebase, Timestamp,
@@ -206,8 +206,12 @@ impl DecodedVideoFrame {
     self.visible_rect
   }
   /// Pixel format mapped from `VideoFrame.format`.
-  pub const fn format(&self) -> PixelFormat {
-    self.format
+  ///
+  /// Not `const`: mediaframe 0.3 dropped `Copy` from `PixelFormat`
+  /// (it carries an owned `Other` arm at the `alloc` tier), so the
+  /// by-value accessor clones.
+  pub fn format(&self) -> PixelFormat {
+    self.format.clone()
   }
   /// Consume `self` and return the planes by value (so the
   /// caller can destructure them without cloning the
@@ -230,12 +234,14 @@ impl DecodedVideoFrame {
     self.byte_size
   }
   /// Color metadata mapped from `VideoFrame.colorSpace`.
-  pub const fn color(&self) -> ColorInfo {
-    self.color
+  ///
+  /// Not `const`: mediaframe 0.3 dropped `Copy` from `ColorInfo`.
+  pub fn color(&self) -> ColorInfo {
+    self.color.clone()
   }
 }
 
-const MICROS: Timebase = match NonZeroU32::new(1_000_000) {
+const MICROS: Timebase = match NonZeroI32::new(1_000_000) {
   Some(d) => Timebase::new(1, d),
   None => unreachable!(),
 };
@@ -1668,7 +1674,7 @@ async fn copy_video_frame(
   // accepted unexpected layout-array sizes silently. Compare
   // against the expected per-format plane count instead, and
   // reject mismatches before constructing planes.
-  let expected = expected_plane_layout(format, width, height);
+  let expected = expected_plane_layout(&format, width, height);
   if let Some(layout) = expected
     && raw_layout_count != layout.count
   {
@@ -1959,7 +1965,7 @@ struct PlaneLayout {
 /// `u32::MAX` rather than overflowing — the validation
 /// caller compares against `plane_len_u32` so a saturated
 /// row_bytes naturally fails closed.
-fn expected_plane_layout(format: PixelFormat, width: u32, height: u32) -> Option<PlaneLayout> {
+fn expected_plane_layout(format: &PixelFormat, width: u32, height: u32) -> Option<PlaneLayout> {
   use PixelFormat as P;
   let halfw = width.div_ceil(2);
   let halfh = height.div_ceil(2);

@@ -190,7 +190,7 @@ pub trait SubtitleDecoder {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use core::num::NonZeroU32;
+  use core::num::NonZeroI32;
 
   struct VLoop;
   impl VideoAdapter for VLoop {
@@ -253,7 +253,7 @@ mod tests {
       0
     }
     fn frame_rate(&self) -> Timebase {
-      Timebase::new(30, NonZeroU32::new(1).unwrap())
+      Timebase::new(30, NonZeroI32::new(1).unwrap())
     }
     fn duration(&self) -> Timestamp {
       Timestamp::new(0, self.frame_rate())

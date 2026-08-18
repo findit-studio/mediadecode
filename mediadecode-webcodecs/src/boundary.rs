@@ -26,8 +26,8 @@ use crate::{
 /// Construct an empty [`mediadecode::frame::VideoFrame`] suitable as
 /// the destination argument to
 /// [`mediadecode::future::local::VideoStreamDecoder::receive_frame`].
-/// All fields are zero / [`WebCodecsBuffer::empty`] / `Unknown` —
-/// the adapter overwrites every one of them on a successful decode.
+/// All fields are zero / [`WebCodecsBuffer::empty`] / [`PixelFormat::None`]
+/// — the adapter overwrites every one of them on a successful decode.
 pub fn empty_video_frame() -> VideoFrame<PixelFormat, VideoFrameExtra, WebCodecsBuffer> {
   let planes = [
     Plane::new(WebCodecsBuffer::empty(), 0),
@@ -37,7 +37,8 @@ pub fn empty_video_frame() -> VideoFrame<PixelFormat, VideoFrameExtra, WebCodecs
   ];
   VideoFrame::new(
     Dimensions::new(0, 0),
-    PixelFormat::Unknown(0),
+    // mediaframe 0.3's named "no format yet" member, and its `Default`.
+    PixelFormat::None,
     planes,
     0,
     VideoFrameExtra::new(false),

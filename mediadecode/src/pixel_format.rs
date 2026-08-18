@@ -8,10 +8,13 @@
 //! `mediadecode::PixelFormat` or `mediadecode::pixel_format::PixelFormat`
 //! exactly as before.
 //!
-//! Note: the mediaframe variant for unrecognized wire values is
-//! `Unknown(u32)` (preserves the raw integer for lossless round-trip),
-//! not the prior unit-variant `Unknown`. Mediadecode backends fall
-//! through to `PixelFormat::Unknown(raw as u32)` when an FFmpeg /
-//! WebCodecs identifier doesn't map to a known format.
+//! Note: mediaframe 0.3 struck the numeric escape `Unknown(u32)`.
+//! `PixelFormat::None` is a **named** member — FFmpeg's own
+//! `AV_PIX_FMT_NONE`, and the [`Default`] — and it is what mediadecode
+//! backends produce when an FFmpeg / WebCodecs identifier doesn't map
+//! to a known format. The open extension arm mediaframe offers instead
+//! is `Other(SmolStr)`, which lives behind mediaframe's `alloc` feature;
+//! mediadecode pins mediaframe at the no-alloc tier, so this re-export
+//! is a closed vocabulary here.
 
 pub use mediaframe::pixel_format::PixelFormat;

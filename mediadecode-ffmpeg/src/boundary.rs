@@ -29,12 +29,20 @@ use crate::{
 /// Maps a raw `AVFrame.format` integer (i.e. the value of an
 /// `AVPixelFormat` enum variant) onto [`mediadecode::PixelFormat`].
 ///
-/// Returns [`PixelFormat::Unknown`] for raw integers we don't have a
-/// mapping for — including hardware-frame markers
-/// (`AV_PIX_FMT_VIDEOTOOLBOX` / `_VAAPI` / `_CUDA` / `_D3D11` / …)
-/// since those never describe CPU-side pixel data and the unified
-/// enum intentionally doesn't carry them. Use [`is_hardware_pix_fmt`]
-/// to identify HW frames before transferring to a CPU format.
+/// Returns [`PixelFormat::None`] for raw integers we don't have a
+/// mapping for — including `AV_PIX_FMT_NONE` itself and the
+/// hardware-frame markers (`AV_PIX_FMT_VIDEOTOOLBOX` / `_VAAPI` /
+/// `_CUDA` / `_D3D11` / …), since those never describe CPU-side pixel
+/// data and the unified enum intentionally doesn't carry them. Use
+/// [`is_hardware_pix_fmt`] to identify HW frames before transferring
+/// to a CPU format.
+///
+/// mediaframe 0.3 struck `PixelFormat::Unknown(u32)`, so the raw
+/// integer no longer rides along in the returned value; the caller's
+/// own `raw` is the place it survives. Every consumer in this crate
+/// already treats the fall-through as "not a deliverable CPU format"
+/// (`pixdesc::to_av_pixel_format`, `is_supported_cpu_pix_fmt` and the
+/// geometry tables all reject it), so the rejection is unchanged.
 ///
 /// The match never constructs an `AVPixelFormat` from a runtime
 /// value; it compares the input against `AVPixelFormat::AV_PIX_FMT_X
@@ -336,7 +344,7 @@ pub const fn from_av_pixel_format(raw: i32) -> PixelFormat {
     x if x == AVPixelFormat::AV_PIX_FMT_BAYER_GBRG16BE as i32 => PixelFormat::BayerGbrg16Be,
     x if x == AVPixelFormat::AV_PIX_FMT_BAYER_GRBG16LE as i32 => PixelFormat::BayerGrbg16Le,
     x if x == AVPixelFormat::AV_PIX_FMT_BAYER_GRBG16BE as i32 => PixelFormat::BayerGrbg16Be,
-    _ => PixelFormat::Unknown(raw as u32),
+    _ => PixelFormat::None,
   }
 }
 
@@ -620,7 +628,10 @@ pub fn try_empty_video_frame() -> Option<VideoFrame<PixelFormat, VideoFrameExtra
   ];
   Some(VideoFrame::new(
     Dimensions::new(0, 0),
-    PixelFormat::Unknown(0),
+    // mediaframe 0.3's named "no format yet" member, and its
+    // `Default` — the state a descriptor is in before a decoder has
+    // said what it produces, which is exactly this placeholder.
+    PixelFormat::None,
     planes,
     0,
     VideoFrameExtra::default(),
@@ -720,11 +731,16 @@ mod tests {
   }
 
   #[test]
-  fn unknown_for_garbage_value() {
-    assert!(matches!(
-      from_av_pixel_format(-99_999),
-      PixelFormat::Unknown(_)
-    ));
+  fn unnamed_raw_maps_to_none() {
+    assert_eq!(from_av_pixel_format(-99_999), PixelFormat::None);
+  }
+
+  #[test]
+  fn av_pix_fmt_none_maps_to_none() {
+    assert_eq!(
+      from_av_pixel_format(AVPixelFormat::AV_PIX_FMT_NONE as i32),
+      PixelFormat::None,
+    );
   }
 
   #[test]
@@ -747,16 +763,16 @@ mod tests {
   }
 
   #[test]
-  fn hw_formats_map_to_unknown_in_pixel_format() {
+  fn hw_formats_map_to_none_in_pixel_format() {
     // HW sentinels intentionally don't have a mediadecode::PixelFormat
     // representation — they're not CPU pixel data.
-    assert!(matches!(
+    assert_eq!(
       from_av_pixel_format(AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX as i32),
-      PixelFormat::Unknown(_)
-    ));
-    assert!(matches!(
+      PixelFormat::None,
+    );
+    assert_eq!(
       from_av_pixel_format(AVPixelFormat::AV_PIX_FMT_VAAPI as i32),
-      PixelFormat::Unknown(_)
-    ));
+      PixelFormat::None,
+    );
   }
 }

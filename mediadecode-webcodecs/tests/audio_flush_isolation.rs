@@ -65,7 +65,7 @@ fn silent_pcm_s16_packet(
 async fn flush_isolates_pre_and_post_flush_streams() {
   let time_base = Timebase::new(
     1,
-    core::num::NonZeroU32::new(SAMPLE_RATE).expect("non-zero rate"),
+    core::num::NonZeroI32::new(SAMPLE_RATE as i32).expect("non-zero rate"),
   );
 
   let mut decoder = WebCodecsAudioStreamDecoder::open_with_codec_string(

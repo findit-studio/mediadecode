@@ -215,7 +215,7 @@ async fn decode_fixture(fix: &Fixture) {
 
   let time_base = Timebase::new(
     1,
-    core::num::NonZeroU32::new(sample_rate).expect("non-zero rate"),
+    core::num::NonZeroI32::new(sample_rate as i32).expect("non-zero rate"),
   );
   let mut decoder = WebCodecsAudioStreamDecoder::open_with_codec_string(
     fix.codec_string,

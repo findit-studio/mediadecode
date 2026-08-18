@@ -1,7 +1,7 @@
 use super::*;
 
 use mediadecode::decoder::VideoStreamDecoder;
-use std::num::NonZeroU32;
+use std::num::NonZeroI32;
 
 // ---------------------------------------------------------------------------
 //  Fake-HW fallback seam: synthetic clip + driver
@@ -368,7 +368,7 @@ fn post_commit_failure_degrades_and_resyncs_at_next_keyframe() {
     "fail target must be a mid-GOP P-frame before the next keyframe"
   );
 
-  let tb = Timebase::new(1, NonZeroU32::new(25).expect("nonzero"));
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
   let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test(
     // Deliver every frame up to the failure (doom == fail: HW keeps delivering
     // 1:1 right until it fails), then fail post-commit on `fail_at`.
@@ -518,7 +518,7 @@ fn fake_hw_without_failure_stays_on_hardware() {
   let (w, h) = (128u32, 96u32);
   let clip = encode_synthetic_clip(w, h, 12, 6);
 
-  let tb = Timebase::new(1, NonZeroU32::new(25).expect("nonzero"));
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
   let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test(
     Box::new(FakeHw::never_failing(w, h)),
     clip.parameters.clone(),
@@ -558,7 +558,7 @@ fn probe_era_failure_replays_history_losslessly() {
   let fail_at = 5;
   assert!(fail_at < clip.packets.len(), "fail target in range");
 
-  let tb = Timebase::new(1, NonZeroU32::new(25).expect("nonzero"));
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
   let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test(
     Box::new(FakeHw::failing(w, h, 0, fail_at, FailShape::ProbeEra)),
     clip.parameters.clone(),
@@ -600,7 +600,7 @@ fn probe_era_failure_replays_history_losslessly() {
 fn unopenable_sw_decoder(hw: Box<dyn HwInner>) -> FfmpegVideoStreamDecoder {
   ffmpeg_next::init().expect("ffmpeg init");
   let params = ffmpeg_next::codec::Parameters::new();
-  let tb = Timebase::new(1, NonZeroU32::new(25).expect("nonzero"));
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
   FfmpegVideoStreamDecoder::from_hw_inner_for_test(hw, params, tb).expect("build test decoder")
 }
 
@@ -681,7 +681,7 @@ fn sw_replay_drain_surfaces_non_transient_decode_error() {
   // The buffered history the SW decoder replays is {keyframe, corrupt_P, P, ...}
   // → the drain surfaces InvalidData.
   let fail_at = p1 + 3;
-  let tb = Timebase::new(1, NonZeroU32::new(25).expect("nonzero"));
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
   let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test(
     Box::new(FakeHw::failing(w, h, 0, fail_at, FailShape::ProbeEra)),
     clip.parameters.clone(),
@@ -782,7 +782,7 @@ fn sw_replay_deferred_error_surfaces_fallback_failed_at_commit() {
   // buffered as history; fail probe-era at `fail_at`. History replayed through
   // SW is {keyframe, clean P.., corrupt_P} — the sends accept it all, and the
   // final drain decodes corrupt_P and surfaces InvalidData.
-  let tb = Timebase::new(1, NonZeroU32::new(25).expect("nonzero"));
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
   let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test(
     Box::new(FakeHw::failing(w, h, 0, fail_at, FailShape::ProbeEra)),
     clip.parameters.clone(),
@@ -940,7 +940,7 @@ fn post_commit_fallback_never_resyncing_escalates_at_eof() {
   // failure then strands the tail and SW cannot resync from a cold EOF.
   let clip = encode_synthetic_clip(w, h, 12, 6);
 
-  let tb = Timebase::new(1, NonZeroU32::new(25).expect("nonzero"));
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
   let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test(
     Box::new(FakeHwEofFails::new(w, h)),
     clip.parameters.clone(),
@@ -1053,7 +1053,7 @@ fn post_commit_gap_counter_tallies_then_clears_on_resync() {
     "fail target must be a mid-GOP P-frame before the next keyframe"
   );
 
-  let tb = Timebase::new(1, NonZeroU32::new(25).expect("nonzero"));
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
   let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test(
     Box::new(FakeHw::failing(
       w,
@@ -1217,7 +1217,7 @@ fn post_commit_concealed_p_frame_does_not_clear_resync_escalates_at_eof() {
     "fail target must be a mid-GOP P-frame before the next keyframe"
   );
 
-  let tb = Timebase::new(1, NonZeroU32::new(25).expect("nonzero"));
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
   let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test(
     Box::new(FakeHw::failing(
       w,
@@ -1337,7 +1337,7 @@ fn post_commit_retains_no_replay_frames() {
     "fail target must be a mid-GOP P-frame before the next keyframe"
   );
 
-  let tb = Timebase::new(1, NonZeroU32::new(25).expect("nonzero"));
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
   let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test(
     Box::new(FakeHw::failing(
       w,
@@ -1411,7 +1411,7 @@ fn post_commit_retains_no_replay_frames() {
 fn inert_seam_builds_on_hardware() {
   ffmpeg_next::init().expect("ffmpeg init");
   let params = ffmpeg_next::codec::Parameters::new();
-  let tb = Timebase::new(1, NonZeroU32::new(25).expect("nonzero"));
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
   let dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test(Box::new(FakeHw::inert()), params, tb)
     .expect("build test decoder");
   assert!(dec.is_hardware(), "inert seam starts on the HW path");
@@ -1476,7 +1476,7 @@ fn fx3_high_422_10bit_falls_back_to_software_and_decodes_whole_stream() {
   };
   // A nominal time base for frame labelling — the experiment only inspects the
   // coverage/ordering of the resulting PTS, not its real-time scale.
-  let tb = Timebase::new(1, NonZeroU32::new(24).expect("nonzero"));
+  let tb = Timebase::new(1, NonZeroI32::new(24).expect("nonzero"));
 
   let mut dec = match FfmpegVideoStreamDecoder::open(stream.parameters(), tb) {
     Ok(d) => d,

@@ -11,6 +11,39 @@ The backend-agnostic core it adapts has its own log at
 
 ## [Unreleased]
 
+## [0.4.0]
+
+Tracks `mediadecode` 0.4.0, which crosses `mediatime` 0.1 → 0.3 and
+`mediaframe` 0.1 → 0.3 — two breaking minors each. See
+[`mediadecode` 0.4.0](../mediadecode/CHANGELOG.md#040). No adapter
+behaviour changes.
+
+### Changed (BREAKING)
+
+- **The empty destination frame's pixel format is now
+  `PixelFormat::None`.** `boundary::empty_video_frame` filled the
+  placeholder with `PixelFormat::Unknown(0)`; mediaframe 0.3 struck
+  that variant, and `None` is its named "no format yet" member (and
+  the `Default`) — which is what the placeholder always meant. The
+  adapter overwrites it on every successful decode, as before.
+- **`WebCodecsVideoFrame::format` and `::color` are no longer
+  `const`** and return clones. `mediaframe::PixelFormat` and
+  `mediaframe::color::Info` lost `Copy` in 0.3. Both signatures are
+  otherwise unchanged.
+- **`Timebase` construction is signed.** `mediatime` 0.2 made
+  `Timebase`'s numerator and denominator `i32` / `NonZeroI32`; the
+  crate's two `MICROS` constants and the wasm integration tests move
+  from `NonZeroU32` to `NonZeroI32`.
+
+### Changed
+
+- **`mediadecode` dep**: bumped to `0.4`.
+- `video::expected_plane_layout` (private) takes `&PixelFormat`.
+- README: the install snippet said the crate was unpublished and
+  pinned `"0.0"`; it has been on crates.io since 0.3.1. Now `"0.4"`.
+
+[0.4.0]: https://github.com/findit-ai/mediadecode/releases/tag/mediadecode-webcodecs-v0.4.0
+
 - Crate scaffolded: workspace member, `wasm32`-gated `web-sys`
   dependency surface, design spec captured in
   `docs/superpowers/specs/2026-05-09-webcodecs-design.md`.
