@@ -14,8 +14,20 @@
 //!
 //! The two enums work without `alloc`. The two structs require the
 //! `alloc` feature because they hold `Vec` / `SmolStr` payloads.
+//!
+//! Both enums carry a canonical **lowercase slug**: `as_str` renders it,
+//! [`Display`](core::fmt::Display) prints exactly that, and
+//! [`FromStr`](core::str::FromStr) reads it back folding ASCII case, so
+//! `"5.1-back"` and `"5.1-BACK"` are one value. Case is the whole of the
+//! folding — no alias, no trimming, no second spelling for one variant —
+//! and the fold allocates nothing, so the door is the same at the
+//! no-`alloc` tier. The slug is the text form; `to_u32` / `as_u32` stay
+//! the compact numeric one.
+
+use core::str::FromStr;
 
 use derive_more::{Display, IsVariant};
+use thiserror::Error;
 
 /// The kind of channel layout, abstracting the specific layout details
 /// into a more general category.
@@ -23,126 +35,97 @@ use derive_more::{Display, IsVariant};
 /// Roughly mirrors FFmpeg's named-layout set (`AV_CHANNEL_LAYOUT_*`)
 /// without committing to that namespace's exact integer values; use
 /// [`Self::to_u32`] / [`Self::from_u32`] when you need a stable wire
-/// representation.
+/// representation, [`Self::as_str`] / [`FromStr`] for the text one.
+///
+/// **Closed set.** A layout this tag cannot name is [`Self::Unknown`],
+/// not an owned `Other(…)` escape. The tag classifies an
+/// [`AudioChannelLayout`], and that record already keeps the
+/// unclassifiable case losslessly — `native_mask`, `custom_channels`
+/// and the free-form `description` (FFmpeg's own
+/// `av_channel_layout_describe` rendering) — so an escape arm here
+/// would duplicate a neighbouring field while costing the enum both
+/// `Copy` and its place at the no-`alloc` tier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Display, IsVariant)]
+#[display("{}", self.as_str())]
 #[non_exhaustive]
 pub enum ChannelLayoutKind {
   /// Mono channel layout, typically with a single audio channel.
-  #[display("mono")]
   Mono,
   /// Stereo channel layout, typically with two audio channels (left and right).
-  #[display("stereo")]
   Stereo,
   /// Stereo downmix channel layout, which is a stereo representation of a multi-channel audio layout.
-  #[display("stereo downmix")]
   StereoDownmix,
   /// Surround channel layout, typically with three audio channels (left, center, right) and sometimes additional channels for rear or height speakers.
-  #[display("surround")]
   Surround,
   /// Quad channel layout, typically with four audio channels (front left, front right, rear left, rear right).
-  #[display("quad")]
   Quad,
   /// Hexagonal channel layout, typically with six audio channels arranged in a hexagonal pattern.
-  #[display("hexagonal")]
   Hexagonal,
   /// Octagonal channel layout, typically with eight audio channels arranged in an octagonal pattern.
-  #[display("octagonal")]
   Octagonal,
   /// Hexadecagonal channel layout, typically with sixteen audio channels arranged in a hexadecagonal pattern.
-  #[display("hexadecagonal")]
   Hexadecagonal,
   /// Cube channel layout, typically with eight audio channels arranged in a cube pattern.
-  #[display("cube")]
   Cube,
   /// 2.1 channel layout, typically with three audio channels (left, right, and a subwoofer).
-  #[display("2.1")]
   Ch2_1,
   /// 2.1 alternative channel layout, which is an alternative representation of the 2.1 channel layout.
-  #[display("2.1 alternative")]
   Ch2_1Alt,
   /// 2.2 channel layout, typically with four audio channels (left, right, subwoofer, and an additional channel for height or rear speakers).
-  #[display("2.2")]
   Ch2_2,
   /// 3.1 channel layout, typically with four audio channels (left, center, right, and a subwoofer).
-  #[display("3.1")]
   Ch3_1,
   /// 3.1.2 channel layout, typically with six audio channels (left, center, right, subwoofer, and two additional channels for height or rear speakers).
-  #[display("3.1.2")]
   Ch3_1_2,
   /// 4.0 channel layout, typically with four audio channels (front left, front right, rear left, rear right) without a center channel or subwoofer.
-  #[display("4.0")]
   Ch4_0,
   /// 4.1 channel layout, typically with five audio channels (front left, front right, rear left, rear right, and a center channel) without a subwoofer.
-  #[display("4.1")]
   Ch4_1,
   /// 5.0 channel layout, typically with five audio channels (front left, front right, center, rear left, rear right) without a subwoofer.
-  #[display("5.0")]
   Ch5_0,
   /// 5.0 back channel layout, which is a variation of the 5.0 channel layout with the rear channels positioned behind the listener.
-  #[display("5.0 back")]
   Ch5_0Back,
   /// 5.1 channel layout, typically with six audio channels (front left, front right, center, rear left, rear right, and a subwoofer).
-  #[display("5.1")]
   Ch5_1,
   /// 5.1 back channel layout, which is a variation of the 5.1 channel layout with the rear channels positioned behind the listener.
-  #[display("5.1 back")]
   Ch5_1Back,
   /// 5.1.2 back channel layout, which is a variation of the 5.1 channel layout with two additional channels for height or rear speakers positioned behind the listener.
-  #[display("5.1.2 back")]
   Ch5_1_2Back,
   /// 5.1.4 back channel layout, which is a variation of the 5.1 channel layout with four additional channels for height or rear speakers positioned behind the listener.
-  #[display("5.1.4 back")]
   Ch5_1_4Back,
   /// 6.0 channel layout, typically with six audio channels (front left, front right, center, rear left, rear right, and an additional channel for height or rear speakers) without a subwoofer.
-  #[display("6.0")]
   Ch6_0,
   /// 6.0 front channel layout, which is a variation of the 6.0 channel layout with the additional channel for height or rear speakers positioned in front of the listener.
-  #[display("6.0 front")]
   Ch6_0Front,
   /// 6.1 channel layout, typically with seven audio channels (front left, front right, center, rear left, rear right, an additional channel for height or rear speakers, and a subwoofer).
-  #[display("6.1")]
   Ch6_1,
   /// 6.1 back channel layout, which is a variation of the 6.1 channel layout with the additional channel for height or rear speakers positioned behind the listener.
-  #[display("6.1 back")]
   Ch6_1Back,
   /// 6.1 front channel layout, which is a variation of the 6.1 channel layout with the additional channel for height or rear speakers positioned in front of the listener.
-  #[display("6.1 front")]
   Ch6_1Front,
   /// 7.0 channel layout, typically with seven audio channels (front left, front right, center, rear left, rear right, and two additional channels for height or rear speakers) without a subwoofer.
-  #[display("7.0")]
   Ch7_0,
   /// 7.0 front channel layout, which is a variation of the 7.0 channel layout with the two additional channels for height or rear speakers positioned in front of the listener.
-  #[display("7.0 front")]
   Ch7_0Front,
   /// 7.1 channel layout, typically with eight audio channels (front left, front right, center, rear left, rear right, two additional channels for height or rear speakers, and a subwoofer).
-  #[display("7.1")]
   Ch7_1,
   /// 7.1 wide channel layout, which is a variation of the 7.1 channel layout with the two additional channels for height or rear speakers positioned wider than the standard 7.1 layout.
-  #[display("7.1 wide")]
   Ch7_1Wide,
   /// 7.1 wide back channel layout, which is a variation of the 7.1 wide channel layout with the two additional channels for height or rear speakers positioned behind the listener.
-  #[display("7.1 wide back")]
   Ch7_1WideBack,
   /// 7.1 top back channel layout, which is a variation of the 7.1 channel layout with the two additional channels for height or rear speakers positioned above and behind the listener.
-  #[display("7.1 top back")]
   Ch7_1TopBack,
   /// 7.1.2 channel layout, which is a variation of the 7.1 channel layout with two additional channels for height or rear speakers.
-  #[display("7.1.2")]
   Ch7_1_2,
   /// 7.1.4 back channel layout, which is a variation of the 7.1 channel layout with four additional channels for height or rear speakers positioned behind the listener.
-  #[display("7.1.4 back")]
   Ch7_1_4Back,
   /// 7.2.3 channel layout, which is a variation of the 7.1 channel layout with two additional channels for height or rear speakers and three additional channels for height or rear speakers positioned behind the listener.
-  #[display("7.2.3")]
   Ch7_2_3,
   /// 9.1.4 back channel layout, which is a variation of the 7.1 channel layout with two additional channels for height or rear speakers and four additional channels for height or rear speakers positioned behind the listener.
-  #[display("9.1.4 back")]
   Ch9_1_4Back,
   /// 22.2 channel layout, typically with twenty-four audio channels arranged in a 22.2 configuration.
-  #[display("22.2")]
   Ch22_2,
   /// Unknown channel layout kind, represents any channel layout that does not fit into the predefined categories.
-  #[display("unknown")]
   Unknown,
 }
 
@@ -154,6 +137,107 @@ impl Default for ChannelLayoutKind {
 }
 
 impl ChannelLayoutKind {
+  /// Every variant, once — the roster [`FromStr`] walks and the
+  /// `arbitrary` / `quickcheck` generators sample.
+  ///
+  /// The slugs themselves live only in [`Self::as_str`]; this list walks
+  /// that one table, so a name can never be writable in one direction and
+  /// unreadable in the other. `channel_layout_kind_roster_is_complete`
+  /// pins that a variant reaching [`Self::to_u32`] reaches this list too.
+  const ALL: &'static [Self] = &[
+    Self::Mono,
+    Self::Stereo,
+    Self::StereoDownmix,
+    Self::Surround,
+    Self::Quad,
+    Self::Hexagonal,
+    Self::Octagonal,
+    Self::Hexadecagonal,
+    Self::Cube,
+    Self::Ch2_1,
+    Self::Ch2_1Alt,
+    Self::Ch2_2,
+    Self::Ch3_1,
+    Self::Ch3_1_2,
+    Self::Ch4_0,
+    Self::Ch4_1,
+    Self::Ch5_0,
+    Self::Ch5_0Back,
+    Self::Ch5_1,
+    Self::Ch5_1Back,
+    Self::Ch5_1_2Back,
+    Self::Ch5_1_4Back,
+    Self::Ch6_0,
+    Self::Ch6_0Front,
+    Self::Ch6_1,
+    Self::Ch6_1Back,
+    Self::Ch6_1Front,
+    Self::Ch7_0,
+    Self::Ch7_0Front,
+    Self::Ch7_1,
+    Self::Ch7_1Wide,
+    Self::Ch7_1WideBack,
+    Self::Ch7_1TopBack,
+    Self::Ch7_1_2,
+    Self::Ch7_1_4Back,
+    Self::Ch7_2_3,
+    Self::Ch9_1_4Back,
+    Self::Ch22_2,
+    Self::Unknown,
+  ];
+
+  /// Canonical lowercase slug — the text form [`Display`](core::fmt::Display)
+  /// prints and [`FromStr`] reads back (`"mono"`, `"5.1"`,
+  /// `"7.1-wide-back"`).
+  ///
+  /// Multi-word names are hyphenated rather than spaced: a slug is meant
+  /// to survive a CLI argument, a filename and an environment variable
+  /// without quoting.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::Mono => "mono",
+      Self::Stereo => "stereo",
+      Self::StereoDownmix => "stereo-downmix",
+      Self::Surround => "surround",
+      Self::Quad => "quad",
+      Self::Hexagonal => "hexagonal",
+      Self::Octagonal => "octagonal",
+      Self::Hexadecagonal => "hexadecagonal",
+      Self::Cube => "cube",
+      Self::Ch2_1 => "2.1",
+      Self::Ch2_1Alt => "2.1-alternative",
+      Self::Ch2_2 => "2.2",
+      Self::Ch3_1 => "3.1",
+      Self::Ch3_1_2 => "3.1.2",
+      Self::Ch4_0 => "4.0",
+      Self::Ch4_1 => "4.1",
+      Self::Ch5_0 => "5.0",
+      Self::Ch5_0Back => "5.0-back",
+      Self::Ch5_1 => "5.1",
+      Self::Ch5_1Back => "5.1-back",
+      Self::Ch5_1_2Back => "5.1.2-back",
+      Self::Ch5_1_4Back => "5.1.4-back",
+      Self::Ch6_0 => "6.0",
+      Self::Ch6_0Front => "6.0-front",
+      Self::Ch6_1 => "6.1",
+      Self::Ch6_1Back => "6.1-back",
+      Self::Ch6_1Front => "6.1-front",
+      Self::Ch7_0 => "7.0",
+      Self::Ch7_0Front => "7.0-front",
+      Self::Ch7_1 => "7.1",
+      Self::Ch7_1Wide => "7.1-wide",
+      Self::Ch7_1WideBack => "7.1-wide-back",
+      Self::Ch7_1TopBack => "7.1-top-back",
+      Self::Ch7_1_2 => "7.1.2",
+      Self::Ch7_1_4Back => "7.1.4-back",
+      Self::Ch7_2_3 => "7.2.3",
+      Self::Ch9_1_4Back => "9.1.4-back",
+      Self::Ch22_2 => "22.2",
+      Self::Unknown => "unknown",
+    }
+  }
+
   /// Decode from the stable `u32` representation produced by [`Self::to_u32`].
   /// Unrecognised values map to [`Self::Unknown`].
   #[cfg_attr(not(tarpaulin), inline(always))]
@@ -248,11 +332,57 @@ impl ChannelLayoutKind {
   }
 }
 
+/// The error [`ChannelLayoutKind`]'s [`FromStr`] returns.
+///
+/// Opaque and sealed: the rejected input is deliberately not retained.
+/// This vocabulary is available at the crate's no-`alloc` tier, where
+/// there is nowhere to put an owned copy, and the input is
+/// attacker-controlled on any deserialization path. `#[non_exhaustive]`
+/// keeps the error constructible here only, so it can grow structure
+/// later without breaking callers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Error)]
+#[error("not a channel-layout-kind name")]
+#[non_exhaustive]
+pub struct ParseChannelLayoutKindError;
+
+impl FromStr for ChannelLayoutKind {
+  type Err = ParseChannelLayoutKindError;
+
+  /// Reads the canonical slug [`Self::as_str`] renders — the exact
+  /// inverse of [`Display`](core::fmt::Display).
+  ///
+  /// The comparison is made against the roster's own slugs with
+  /// [`str::eq_ignore_ascii_case`], so nothing is allocated and nothing
+  /// is folded into a buffer: `"5.1-back"`, `"5.1-Back"` and
+  /// `"5.1-BACK"` are one value, and case is the whole of the folding —
+  /// no alias, no trimming.
+  ///
+  /// # Errors
+  ///
+  /// Returns [`ParseChannelLayoutKindError`] for any input outside this
+  /// closed vocabulary, the empty string included.
+  fn from_str(s: &str) -> Result<Self, Self::Err> {
+    Self::ALL
+      .iter()
+      .find(|kind| kind.as_str().eq_ignore_ascii_case(s))
+      .copied()
+      .ok_or(ParseChannelLayoutKindError)
+  }
+}
+
 /// How the channels in an [`AudioChannelLayout`] are ordered.
 ///
 /// Mirrors FFmpeg's `AVChannelOrder`. Stable wire integers are
-/// `repr(u32)` and match the `to_u32` / `from_u32` mapping.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+/// `repr(u32)` and match the [`Self::as_u32`] / [`Self::from_u32`]
+/// mapping; [`Self::as_str`] / [`FromStr`] are the text form.
+///
+/// **Closed set.** `AVChannelOrder` is itself a closed taxonomy — every
+/// layout FFmpeg can describe is unspecified, native, custom or
+/// ambisonic — so there is no vendor space for an escape arm to
+/// preserve. A raw discriminant outside the four is a corrupt read, not
+/// a value, and decodes to [`Self::Unspecified`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Display)]
+#[display("{}", self.as_str())]
 #[repr(u32)]
 pub enum AudioChannelOrderKind {
   /// Channel order is unknown / not communicated by the source.
@@ -271,6 +401,29 @@ pub enum AudioChannelOrderKind {
 }
 
 impl AudioChannelOrderKind {
+  /// Every variant, once — the roster [`FromStr`] walks and the
+  /// `arbitrary` / `quickcheck` generators sample. The slugs live only
+  /// in [`Self::as_str`]; `order_roster_is_complete` pins that a variant
+  /// reaching [`Self::from_u32`] reaches this list too.
+  const ALL: &'static [Self] = &[
+    Self::Unspecified,
+    Self::Native,
+    Self::Custom,
+    Self::Ambisonic,
+  ];
+
+  /// Canonical lowercase slug — the text form
+  /// [`Display`](core::fmt::Display) prints and [`FromStr`] reads back.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::Unspecified => "unspecified",
+      Self::Native => "native",
+      Self::Custom => "custom",
+      Self::Ambisonic => "ambisonic",
+    }
+  }
+
   /// Decode from the stable `u32` representation. Unrecognised values
   /// map to [`Self::Unspecified`].
   #[cfg_attr(not(tarpaulin), inline(always))]
@@ -287,6 +440,41 @@ impl AudioChannelOrderKind {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn as_u32(self) -> u32 {
     self as u32
+  }
+}
+
+/// The error [`AudioChannelOrderKind`]'s [`FromStr`] returns.
+///
+/// Its own type rather than a shared one: an input that names no channel
+/// *order* and an input that names no channel *layout* are different
+/// failures, and the type is what says which. Opaque and sealed for the
+/// same reasons as [`ParseChannelLayoutKindError`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Error)]
+#[error("not an audio-channel-order name")]
+#[non_exhaustive]
+pub struct ParseAudioChannelOrderKindError;
+
+impl FromStr for AudioChannelOrderKind {
+  type Err = ParseAudioChannelOrderKindError;
+
+  /// Reads the canonical slug [`Self::as_str`] renders — the exact
+  /// inverse of [`Display`](core::fmt::Display), folding ASCII case and
+  /// nothing else (`"native"`, `"Native"`, `"NATIVE"`).
+  ///
+  /// # Errors
+  ///
+  /// Returns [`ParseAudioChannelOrderKindError`] for any input outside
+  /// this closed vocabulary, the empty string included. Note that
+  /// [`Self::from_u32`] absorbs an unrecognised *code* into
+  /// [`Self::Unspecified`] while this door rejects an unrecognised
+  /// *name*: a corrupt discriminant read out of FFmpeg memory has no
+  /// spelling to fall back on, a misspelled configuration value does.
+  fn from_str(s: &str) -> Result<Self, Self::Err> {
+    Self::ALL
+      .iter()
+      .find(|order| order.as_str().eq_ignore_ascii_case(s))
+      .copied()
+      .ok_or(ParseAudioChannelOrderKindError)
   }
 }
 
@@ -583,6 +771,121 @@ mod alloc_only {
   }
 }
 
+// ---------------------------------------------------------------------------
+//  Optional trait matrices (`serde` / `arbitrary` / `quickcheck`).
+//  All three cover the same two types — a vocabulary that can be written
+//  to a wire is one a fuzzer and a property test must be able to produce.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "serde")]
+#[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
+mod serde_impls {
+  //! Both vocabularies travel as their canonical slug, not as their `u32`
+  //! code.
+  //!
+  //! The code is the compact form, and a caller who wants it asks for it
+  //! by name ([`ChannelLayoutKind::to_u32`] /
+  //! [`AudioChannelOrderKind::as_u32`]). The name is the form a
+  //! self-describing document should carry, and it is also the only one
+  //! that round-trips exactly: `from_u32` absorbs an unrecognised code
+  //! into `Unknown` / `Unspecified`, while an unrecognised slug is a
+  //! deserialization error rather than a silently invented value.
+
+  use core::fmt;
+
+  use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Visitor};
+
+  use super::{AudioChannelOrderKind, ChannelLayoutKind};
+
+  macro_rules! serde_via_slug {
+    ($ty:ty, $expecting:literal) => {
+      impl Serialize for $ty {
+        #[cfg_attr(not(tarpaulin), inline(always))]
+        fn serialize<S: Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+          ser.serialize_str(self.as_str())
+        }
+      }
+
+      impl<'de> Deserialize<'de> for $ty {
+        fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+          struct SlugVisitor;
+
+          impl Visitor<'_> for SlugVisitor {
+            type Value = $ty;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+              f.write_str($expecting)
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+              v.parse::<$ty>().map_err(E::custom)
+            }
+          }
+
+          de.deserialize_str(SlugVisitor)
+        }
+      }
+    };
+  }
+
+  serde_via_slug!(ChannelLayoutKind, "a channel-layout-kind slug");
+  serde_via_slug!(AudioChannelOrderKind, "an audio-channel-order slug");
+}
+
+#[cfg(feature = "arbitrary")]
+#[cfg_attr(docsrs, doc(cfg(feature = "arbitrary")))]
+mod arbitrary_impls {
+  //! Both vocabularies generate by choosing uniformly from their roster.
+  //!
+  //! Decoding an arbitrary `u32` through `from_u32` is the obvious
+  //! alternative and the wrong one: every code outside the enumerated set
+  //! collapses to `Unknown` / `Unspecified`, so the 38 named layouts would
+  //! share about one draw in 10^8 between them and a fuzzer would spend
+  //! its whole budget on the fallback variant.
+
+  use arbitrary::{Arbitrary, Result, Unstructured};
+
+  use super::{AudioChannelOrderKind, ChannelLayoutKind};
+
+  macro_rules! arbitrary_via_roster {
+    ($ty:ty) => {
+      impl<'a> Arbitrary<'a> for $ty {
+        fn arbitrary(u: &mut Unstructured<'a>) -> Result<Self> {
+          Ok(*u.choose(<$ty>::ALL)?)
+        }
+      }
+    };
+  }
+
+  arbitrary_via_roster!(ChannelLayoutKind);
+  arbitrary_via_roster!(AudioChannelOrderKind);
+}
+
+#[cfg(feature = "quickcheck")]
+#[cfg_attr(docsrs, doc(cfg(feature = "quickcheck")))]
+mod quickcheck_impls {
+  //! The `quickcheck` half of the coverage `arbitrary_impls` gives, drawn
+  //! the same way and for the same reason: uniform over the roster, never
+  //! uniform over `u32`.
+
+  use quickcheck::{Arbitrary, Gen};
+
+  use super::{AudioChannelOrderKind, ChannelLayoutKind};
+
+  macro_rules! quickcheck_via_roster {
+    ($ty:ty) => {
+      impl Arbitrary for $ty {
+        fn arbitrary(g: &mut Gen) -> Self {
+          *g.choose(<$ty>::ALL).expect("the roster is never empty")
+        }
+      }
+    };
+  }
+
+  quickcheck_via_roster!(ChannelLayoutKind);
+  quickcheck_via_roster!(AudioChannelOrderKind);
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -601,48 +904,7 @@ mod tests {
 
   #[test]
   fn channel_layout_kind_round_trip_u32() {
-    let all = [
-      ChannelLayoutKind::Unknown,
-      ChannelLayoutKind::Mono,
-      ChannelLayoutKind::Stereo,
-      ChannelLayoutKind::StereoDownmix,
-      ChannelLayoutKind::Surround,
-      ChannelLayoutKind::Quad,
-      ChannelLayoutKind::Hexagonal,
-      ChannelLayoutKind::Octagonal,
-      ChannelLayoutKind::Hexadecagonal,
-      ChannelLayoutKind::Cube,
-      ChannelLayoutKind::Ch2_1,
-      ChannelLayoutKind::Ch2_1Alt,
-      ChannelLayoutKind::Ch2_2,
-      ChannelLayoutKind::Ch3_1,
-      ChannelLayoutKind::Ch3_1_2,
-      ChannelLayoutKind::Ch4_0,
-      ChannelLayoutKind::Ch4_1,
-      ChannelLayoutKind::Ch5_0,
-      ChannelLayoutKind::Ch5_0Back,
-      ChannelLayoutKind::Ch5_1,
-      ChannelLayoutKind::Ch5_1Back,
-      ChannelLayoutKind::Ch5_1_2Back,
-      ChannelLayoutKind::Ch5_1_4Back,
-      ChannelLayoutKind::Ch6_0,
-      ChannelLayoutKind::Ch6_0Front,
-      ChannelLayoutKind::Ch6_1,
-      ChannelLayoutKind::Ch6_1Back,
-      ChannelLayoutKind::Ch6_1Front,
-      ChannelLayoutKind::Ch7_0,
-      ChannelLayoutKind::Ch7_0Front,
-      ChannelLayoutKind::Ch7_1,
-      ChannelLayoutKind::Ch7_1Wide,
-      ChannelLayoutKind::Ch7_1WideBack,
-      ChannelLayoutKind::Ch7_1TopBack,
-      ChannelLayoutKind::Ch7_1_2,
-      ChannelLayoutKind::Ch7_1_4Back,
-      ChannelLayoutKind::Ch7_2_3,
-      ChannelLayoutKind::Ch9_1_4Back,
-      ChannelLayoutKind::Ch22_2,
-    ];
-    for kind in all {
+    for &kind in ChannelLayoutKind::ALL {
       let n = kind.to_u32();
       assert_eq!(
         ChannelLayoutKind::from_u32(n),
@@ -669,9 +931,16 @@ mod tests {
     assert_eq!(format!("{}", ChannelLayoutKind::Ch5_1), "5.1");
     assert_eq!(
       format!("{}", ChannelLayoutKind::Ch7_1WideBack),
-      "7.1 wide back"
+      "7.1-wide-back"
     );
     assert_eq!(format!("{}", ChannelLayoutKind::Unknown), "unknown");
+    for &kind in ChannelLayoutKind::ALL {
+      assert_eq!(
+        format!("{kind}"),
+        kind.as_str(),
+        "display drifted from as_str"
+      );
+    }
   }
 
   #[test]
@@ -680,6 +949,133 @@ mod tests {
     assert!(!ChannelLayoutKind::Stereo.is_mono());
     assert!(ChannelLayoutKind::Ch5_1.is_ch_5_1());
     assert!(ChannelLayoutKind::Unknown.is_unknown());
+  }
+
+  #[test]
+  fn channel_layout_kind_slugs() {
+    // `FromStr` reads the very table `as_str` writes, so a typo there
+    // round-trips happily. This is the independent copy that catches it.
+    let table = [
+      (ChannelLayoutKind::Mono, "mono"),
+      (ChannelLayoutKind::Stereo, "stereo"),
+      (ChannelLayoutKind::StereoDownmix, "stereo-downmix"),
+      (ChannelLayoutKind::Surround, "surround"),
+      (ChannelLayoutKind::Quad, "quad"),
+      (ChannelLayoutKind::Hexagonal, "hexagonal"),
+      (ChannelLayoutKind::Octagonal, "octagonal"),
+      (ChannelLayoutKind::Hexadecagonal, "hexadecagonal"),
+      (ChannelLayoutKind::Cube, "cube"),
+      (ChannelLayoutKind::Ch2_1, "2.1"),
+      (ChannelLayoutKind::Ch2_1Alt, "2.1-alternative"),
+      (ChannelLayoutKind::Ch2_2, "2.2"),
+      (ChannelLayoutKind::Ch3_1, "3.1"),
+      (ChannelLayoutKind::Ch3_1_2, "3.1.2"),
+      (ChannelLayoutKind::Ch4_0, "4.0"),
+      (ChannelLayoutKind::Ch4_1, "4.1"),
+      (ChannelLayoutKind::Ch5_0, "5.0"),
+      (ChannelLayoutKind::Ch5_0Back, "5.0-back"),
+      (ChannelLayoutKind::Ch5_1, "5.1"),
+      (ChannelLayoutKind::Ch5_1Back, "5.1-back"),
+      (ChannelLayoutKind::Ch5_1_2Back, "5.1.2-back"),
+      (ChannelLayoutKind::Ch5_1_4Back, "5.1.4-back"),
+      (ChannelLayoutKind::Ch6_0, "6.0"),
+      (ChannelLayoutKind::Ch6_0Front, "6.0-front"),
+      (ChannelLayoutKind::Ch6_1, "6.1"),
+      (ChannelLayoutKind::Ch6_1Back, "6.1-back"),
+      (ChannelLayoutKind::Ch6_1Front, "6.1-front"),
+      (ChannelLayoutKind::Ch7_0, "7.0"),
+      (ChannelLayoutKind::Ch7_0Front, "7.0-front"),
+      (ChannelLayoutKind::Ch7_1, "7.1"),
+      (ChannelLayoutKind::Ch7_1Wide, "7.1-wide"),
+      (ChannelLayoutKind::Ch7_1WideBack, "7.1-wide-back"),
+      (ChannelLayoutKind::Ch7_1TopBack, "7.1-top-back"),
+      (ChannelLayoutKind::Ch7_1_2, "7.1.2"),
+      (ChannelLayoutKind::Ch7_1_4Back, "7.1.4-back"),
+      (ChannelLayoutKind::Ch7_2_3, "7.2.3"),
+      (ChannelLayoutKind::Ch9_1_4Back, "9.1.4-back"),
+      (ChannelLayoutKind::Ch22_2, "22.2"),
+      (ChannelLayoutKind::Unknown, "unknown"),
+    ];
+    assert_eq!(table.len(), ChannelLayoutKind::ALL.len());
+    for (kind, slug) in table {
+      assert_eq!(kind.as_str(), slug, "slug mismatch for {kind:?}");
+    }
+  }
+
+  #[test]
+  fn channel_layout_kind_round_trips_through_its_slug() {
+    for &kind in ChannelLayoutKind::ALL {
+      assert_eq!(
+        kind.as_str().parse::<ChannelLayoutKind>(),
+        Ok(kind),
+        "slug round-trip failed for {kind:?}"
+      );
+    }
+  }
+
+  #[test]
+  fn channel_layout_kind_folds_ascii_case() {
+    assert_eq!(
+      "MONO".parse::<ChannelLayoutKind>(),
+      Ok(ChannelLayoutKind::Mono)
+    );
+    assert_eq!(
+      "5.1-Back".parse::<ChannelLayoutKind>(),
+      Ok(ChannelLayoutKind::Ch5_1Back)
+    );
+    assert_eq!(
+      "Stereo-DOWNMIX".parse::<ChannelLayoutKind>(),
+      Ok(ChannelLayoutKind::StereoDownmix)
+    );
+  }
+
+  #[test]
+  fn channel_layout_kind_rejects_what_it_cannot_name() {
+    assert!("".parse::<ChannelLayoutKind>().is_err());
+    assert!("atmos".parse::<ChannelLayoutKind>().is_err());
+    // Case is the whole of the folding: neither whitespace nor a second
+    // spelling of a name is an alias for it.
+    assert!("5.1-back ".parse::<ChannelLayoutKind>().is_err());
+    assert!("5.1 back".parse::<ChannelLayoutKind>().is_err());
+  }
+
+  #[test]
+  fn channel_layout_kind_slugs_do_not_collide_under_ascii_folding() {
+    // The door folds case, so two slugs equal under folding would make it
+    // ambiguous and the earlier roster entry would win in silence. This
+    // also pins that no variant is listed twice.
+    for (i, a) in ChannelLayoutKind::ALL.iter().enumerate() {
+      for b in &ChannelLayoutKind::ALL[i + 1..] {
+        assert!(
+          !a.as_str().eq_ignore_ascii_case(b.as_str()),
+          "{a:?} and {b:?} answer to the same name"
+        );
+      }
+    }
+  }
+
+  #[test]
+  fn channel_layout_kind_roster_is_complete() {
+    // A code is live when it survives the `u32` round trip; every live
+    // code's variant has to be on the roster the text door walks, or the
+    // value would be writable and unreadable. The scan runs past the
+    // highest live code so a variant added tomorrow is covered too.
+    let mut live = 0;
+    for code in 0..=64u32 {
+      let kind = ChannelLayoutKind::from_u32(code);
+      if kind.to_u32() == code {
+        live += 1;
+        assert!(
+          ChannelLayoutKind::ALL.contains(&kind),
+          "{kind:?} (code {code}) is missing from the roster"
+        );
+      }
+    }
+    assert_eq!(
+      ChannelLayoutKind::ALL.len(),
+      live,
+      "the roster holds an entry no wire code decodes to"
+    );
   }
 
   // -----------------------------------------------------------------
@@ -696,12 +1092,7 @@ mod tests {
 
   #[test]
   fn order_round_trip_u32() {
-    for o in [
-      AudioChannelOrderKind::Unspecified,
-      AudioChannelOrderKind::Native,
-      AudioChannelOrderKind::Custom,
-      AudioChannelOrderKind::Ambisonic,
-    ] {
+    for &o in AudioChannelOrderKind::ALL {
       assert_eq!(AudioChannelOrderKind::from_u32(o.as_u32()), o);
     }
   }
@@ -726,6 +1117,100 @@ mod tests {
     assert_eq!(AudioChannelOrderKind::Custom as u32, 2);
     assert_eq!(AudioChannelOrderKind::Ambisonic as u32, 3);
     assert_eq!(AudioChannelOrderKind::Native.as_u32(), 1);
+  }
+
+  #[test]
+  fn order_slugs() {
+    let table = [
+      (AudioChannelOrderKind::Unspecified, "unspecified"),
+      (AudioChannelOrderKind::Native, "native"),
+      (AudioChannelOrderKind::Custom, "custom"),
+      (AudioChannelOrderKind::Ambisonic, "ambisonic"),
+    ];
+    assert_eq!(table.len(), AudioChannelOrderKind::ALL.len());
+    for (order, slug) in table {
+      assert_eq!(order.as_str(), slug, "slug mismatch for {order:?}");
+    }
+  }
+
+  #[cfg(any(feature = "alloc", feature = "std"))]
+  #[test]
+  fn order_display_is_the_slug() {
+    assert_eq!(format!("{}", AudioChannelOrderKind::Ambisonic), "ambisonic");
+    for &order in AudioChannelOrderKind::ALL {
+      assert_eq!(
+        format!("{order}"),
+        order.as_str(),
+        "display drifted from as_str"
+      );
+    }
+  }
+
+  #[test]
+  fn order_round_trips_through_its_slug() {
+    for &order in AudioChannelOrderKind::ALL {
+      assert_eq!(
+        order.as_str().parse::<AudioChannelOrderKind>(),
+        Ok(order),
+        "slug round-trip failed for {order:?}"
+      );
+    }
+  }
+
+  #[test]
+  fn order_folds_ascii_case() {
+    assert_eq!(
+      "Native".parse::<AudioChannelOrderKind>(),
+      Ok(AudioChannelOrderKind::Native)
+    );
+    assert_eq!(
+      "AMBISONIC".parse::<AudioChannelOrderKind>(),
+      Ok(AudioChannelOrderKind::Ambisonic)
+    );
+  }
+
+  #[test]
+  fn order_rejects_what_it_cannot_name() {
+    // The numeric door absorbs an unknown code into `Unspecified`; the
+    // text door refuses an unknown name rather than inventing one.
+    assert!("".parse::<AudioChannelOrderKind>().is_err());
+    assert!("interleaved".parse::<AudioChannelOrderKind>().is_err());
+    assert_eq!(
+      AudioChannelOrderKind::from_u32(42),
+      AudioChannelOrderKind::Unspecified
+    );
+  }
+
+  #[test]
+  fn order_slugs_do_not_collide_under_ascii_folding() {
+    for (i, a) in AudioChannelOrderKind::ALL.iter().enumerate() {
+      for b in &AudioChannelOrderKind::ALL[i + 1..] {
+        assert!(
+          !a.as_str().eq_ignore_ascii_case(b.as_str()),
+          "{a:?} and {b:?} answer to the same name"
+        );
+      }
+    }
+  }
+
+  #[test]
+  fn order_roster_is_complete() {
+    let mut live = 0;
+    for code in 0..=16u32 {
+      let order = AudioChannelOrderKind::from_u32(code);
+      if order.as_u32() == code {
+        live += 1;
+        assert!(
+          AudioChannelOrderKind::ALL.contains(&order),
+          "{order:?} (code {code}) is missing from the roster"
+        );
+      }
+    }
+    assert_eq!(
+      AudioChannelOrderKind::ALL.len(),
+      live,
+      "the roster holds an entry no wire code decodes to"
+    );
   }
 
   // -----------------------------------------------------------------
@@ -820,6 +1305,311 @@ mod tests {
         .set_native_mask(Some(0x63F));
       assert_eq!(l.channels(), 8);
       assert!(matches!(l.known_kind(), ChannelLayoutKind::Ch7_1));
+    }
+  }
+
+  // -----------------------------------------------------------------
+  //  Optional matrices (`serde` / `arbitrary` / `quickcheck`)
+  // -----------------------------------------------------------------
+
+  #[cfg(feature = "serde")]
+  mod serde_tests {
+    use serde::{
+      Deserialize, Serialize,
+      de::{
+        IntoDeserializer,
+        value::{Error as ValueError, StrDeserializer, U32Deserializer},
+      },
+      ser::{Impossible, Serializer},
+    };
+
+    use super::*;
+
+    /// A serializer that accepts exactly one call — `serialize_str` — and
+    /// checks what it was handed. Every other entry point panics, and
+    /// that is the assertion: these vocabularies reach the wire as their
+    /// slug, never as a number or a struct.
+    ///
+    /// Hand-written because the crate takes no format dependency, and
+    /// because these types are available at the no-`alloc` tier where a
+    /// JSON round-trip could not run in the first place.
+    struct SlugOnly<'a> {
+      expected: &'a str,
+    }
+
+    /// The error `SlugOnly` never produces. `serialize_str` cannot fail
+    /// and every other method panics before it could return one.
+    #[derive(Debug)]
+    struct Unreachable;
+
+    impl core::fmt::Display for Unreachable {
+      fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("the slug serializer cannot fail")
+      }
+    }
+
+    impl core::error::Error for Unreachable {}
+
+    impl serde::ser::Error for Unreachable {
+      fn custom<T: core::fmt::Display>(_: T) -> Self {
+        Self
+      }
+    }
+
+    macro_rules! not_a_slug {
+      ($($method:ident($($arg:ty),*);)*) => {
+        $(
+          fn $method(self, $(_: $arg),*) -> Result<Self::Ok, Self::Error> {
+            panic!("a channel vocabulary must reach the wire as its slug")
+          }
+        )*
+      };
+    }
+
+    impl Serializer for SlugOnly<'_> {
+      type Ok = ();
+      type Error = Unreachable;
+      type SerializeSeq = Impossible<(), Unreachable>;
+      type SerializeTuple = Impossible<(), Unreachable>;
+      type SerializeTupleStruct = Impossible<(), Unreachable>;
+      type SerializeTupleVariant = Impossible<(), Unreachable>;
+      type SerializeMap = Impossible<(), Unreachable>;
+      type SerializeStruct = Impossible<(), Unreachable>;
+      type SerializeStructVariant = Impossible<(), Unreachable>;
+
+      fn serialize_str(self, v: &str) -> Result<Self::Ok, Self::Error> {
+        assert_eq!(v, self.expected, "wrong slug on the wire");
+        Ok(())
+      }
+
+      not_a_slug! {
+        serialize_bool(bool);
+        serialize_i8(i8);
+        serialize_i16(i16);
+        serialize_i32(i32);
+        serialize_i64(i64);
+        serialize_u8(u8);
+        serialize_u16(u16);
+        serialize_u32(u32);
+        serialize_u64(u64);
+        serialize_f32(f32);
+        serialize_f64(f64);
+        serialize_char(char);
+        serialize_bytes(&[u8]);
+        serialize_none();
+        serialize_unit();
+        serialize_unit_struct(&'static str);
+        serialize_unit_variant(&'static str, u32, &'static str);
+      }
+
+      fn serialize_some<T>(self, _: &T) -> Result<Self::Ok, Self::Error>
+      where
+        T: ?Sized + Serialize,
+      {
+        panic!("a channel vocabulary must reach the wire as its slug")
+      }
+
+      fn serialize_newtype_struct<T>(self, _: &'static str, _: &T) -> Result<Self::Ok, Self::Error>
+      where
+        T: ?Sized + Serialize,
+      {
+        panic!("a channel vocabulary must reach the wire as its slug")
+      }
+
+      fn serialize_newtype_variant<T>(
+        self,
+        _: &'static str,
+        _: u32,
+        _: &'static str,
+        _: &T,
+      ) -> Result<Self::Ok, Self::Error>
+      where
+        T: ?Sized + Serialize,
+      {
+        panic!("a channel vocabulary must reach the wire as its slug")
+      }
+
+      fn serialize_seq(self, _: Option<usize>) -> Result<Self::SerializeSeq, Self::Error> {
+        panic!("a channel vocabulary must reach the wire as its slug")
+      }
+
+      fn serialize_tuple(self, _: usize) -> Result<Self::SerializeTuple, Self::Error> {
+        panic!("a channel vocabulary must reach the wire as its slug")
+      }
+
+      fn serialize_tuple_struct(
+        self,
+        _: &'static str,
+        _: usize,
+      ) -> Result<Self::SerializeTupleStruct, Self::Error> {
+        panic!("a channel vocabulary must reach the wire as its slug")
+      }
+
+      fn serialize_tuple_variant(
+        self,
+        _: &'static str,
+        _: u32,
+        _: &'static str,
+        _: usize,
+      ) -> Result<Self::SerializeTupleVariant, Self::Error> {
+        panic!("a channel vocabulary must reach the wire as its slug")
+      }
+
+      fn serialize_map(self, _: Option<usize>) -> Result<Self::SerializeMap, Self::Error> {
+        panic!("a channel vocabulary must reach the wire as its slug")
+      }
+
+      fn serialize_struct(
+        self,
+        _: &'static str,
+        _: usize,
+      ) -> Result<Self::SerializeStruct, Self::Error> {
+        panic!("a channel vocabulary must reach the wire as its slug")
+      }
+
+      fn serialize_struct_variant(
+        self,
+        _: &'static str,
+        _: u32,
+        _: &'static str,
+        _: usize,
+      ) -> Result<Self::SerializeStructVariant, Self::Error> {
+        panic!("a channel vocabulary must reach the wire as its slug")
+      }
+    }
+
+    fn assert_wire_slug<T: Serialize>(value: &T, expected: &str) {
+      value
+        .serialize(SlugOnly { expected })
+        .expect("the slug serializer cannot fail");
+    }
+
+    #[test]
+    fn every_variant_serializes_as_its_slug() {
+      for &kind in ChannelLayoutKind::ALL {
+        assert_wire_slug(&kind, kind.as_str());
+      }
+      for &order in AudioChannelOrderKind::ALL {
+        assert_wire_slug(&order, order.as_str());
+      }
+    }
+
+    #[test]
+    fn every_variant_deserializes_from_its_slug() {
+      for &kind in ChannelLayoutKind::ALL {
+        let de: StrDeserializer<'_, ValueError> = kind.as_str().into_deserializer();
+        assert_eq!(ChannelLayoutKind::deserialize(de).unwrap(), kind);
+      }
+      for &order in AudioChannelOrderKind::ALL {
+        let de: StrDeserializer<'_, ValueError> = order.as_str().into_deserializer();
+        assert_eq!(AudioChannelOrderKind::deserialize(de).unwrap(), order);
+      }
+    }
+
+    #[test]
+    fn deserialization_folds_case_like_the_door() {
+      let de: StrDeserializer<'_, ValueError> = "5.1-BACK".into_deserializer();
+      assert_eq!(
+        ChannelLayoutKind::deserialize(de).unwrap(),
+        ChannelLayoutKind::Ch5_1Back
+      );
+      let de: StrDeserializer<'_, ValueError> = "Ambisonic".into_deserializer();
+      assert_eq!(
+        AudioChannelOrderKind::deserialize(de).unwrap(),
+        AudioChannelOrderKind::Ambisonic
+      );
+    }
+
+    #[test]
+    fn an_unknown_slug_is_an_error_not_an_invented_value() {
+      let de: StrDeserializer<'_, ValueError> = "atmos".into_deserializer();
+      assert!(ChannelLayoutKind::deserialize(de).is_err());
+      let de: StrDeserializer<'_, ValueError> = "interleaved".into_deserializer();
+      assert!(AudioChannelOrderKind::deserialize(de).is_err());
+    }
+
+    #[test]
+    fn a_number_is_not_a_name() {
+      // 19 is `Ch5_1`'s wire code, and the read side still refuses it:
+      // the numeric door is `from_u32`, not this one.
+      let de: U32Deserializer<ValueError> = 19u32.into_deserializer();
+      assert!(ChannelLayoutKind::deserialize(de).is_err());
+      let de: U32Deserializer<ValueError> = 1u32.into_deserializer();
+      assert!(AudioChannelOrderKind::deserialize(de).is_err());
+    }
+  }
+
+  #[cfg(feature = "arbitrary")]
+  mod arbitrary_tests {
+    use arbitrary::{Arbitrary, Unstructured};
+
+    use super::*;
+
+    #[test]
+    fn every_variant_is_reachable() {
+      // Coverage bitmap indexed by wire code, so the test allocates
+      // nothing and survives the no-`alloc` tier.
+      let mut layout_seen = [false; 64];
+      let mut order_seen = [false; 64];
+      for byte in 0..=u8::MAX {
+        let data = [byte];
+
+        let mut u = Unstructured::new(&data);
+        let kind = ChannelLayoutKind::arbitrary(&mut u).unwrap();
+        assert!(ChannelLayoutKind::ALL.contains(&kind));
+        layout_seen[kind.to_u32() as usize] = true;
+
+        let mut u = Unstructured::new(&data);
+        let order = AudioChannelOrderKind::arbitrary(&mut u).unwrap();
+        assert!(AudioChannelOrderKind::ALL.contains(&order));
+        order_seen[order.as_u32() as usize] = true;
+      }
+      assert_eq!(
+        layout_seen.iter().filter(|&&seen| seen).count(),
+        ChannelLayoutKind::ALL.len(),
+        "a layout kind the generator never produces"
+      );
+      assert_eq!(
+        order_seen.iter().filter(|&&seen| seen).count(),
+        AudioChannelOrderKind::ALL.len(),
+        "an order kind the generator never produces"
+      );
+    }
+  }
+
+  #[cfg(feature = "quickcheck")]
+  mod quickcheck_tests {
+    use quickcheck::{Arbitrary, Gen};
+
+    use super::*;
+
+    #[test]
+    fn every_variant_is_reachable() {
+      // 2000 draws over 39 variants: the chance of missing one is around
+      // 1e-21, so a failure here means the generator is skewed, not
+      // unlucky.
+      let mut g = Gen::new(16);
+      let mut layout_seen = [false; 64];
+      let mut order_seen = [false; 64];
+      for _ in 0..2000 {
+        let kind = ChannelLayoutKind::arbitrary(&mut g);
+        assert!(ChannelLayoutKind::ALL.contains(&kind));
+        layout_seen[kind.to_u32() as usize] = true;
+
+        let order = AudioChannelOrderKind::arbitrary(&mut g);
+        assert!(AudioChannelOrderKind::ALL.contains(&order));
+        order_seen[order.as_u32() as usize] = true;
+      }
+      assert_eq!(
+        layout_seen.iter().filter(|&&seen| seen).count(),
+        ChannelLayoutKind::ALL.len(),
+        "a layout kind the generator never produces"
+      );
+      assert_eq!(
+        order_seen.iter().filter(|&&seen| seen).count(),
+        AudioChannelOrderKind::ALL.len(),
+        "an order kind the generator never produces"
+      );
     }
   }
 }
