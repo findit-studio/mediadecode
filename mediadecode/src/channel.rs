@@ -495,7 +495,14 @@ mod alloc_only {
 
   /// One entry in a [`AudioChannelLayout::custom_channels`] list — the
   /// per-channel description for a [`AudioChannelOrderKind::Custom`]
-  /// layout.  
+  /// layout.
+  ///
+  /// With the `serde` feature the wire form is a map of the three
+  /// accessors' names — `{"index": 0, "raw_id": 1, "label": "FL"}`. The
+  /// record carries no invariant (every field has a public unchecked
+  /// setter), so the derive is the whole story: there is nothing a
+  /// hand-written `Deserialize` would have to re-check.
+  #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
   #[derive(Debug, Clone, PartialEq, Eq, Default)]
   pub struct AudioChannelSpec {
     index: u32,
@@ -597,6 +604,16 @@ mod alloc_only {
   ///   per channel.
   /// - [`description`](Self::description) — free-form human-readable
   ///   description (e.g. FFmpeg's `av_channel_layout_describe` output).
+  ///
+  /// With the `serde` feature the wire form is a map of those six names,
+  /// each field in its own shape: the two vocabularies as their canonical
+  /// slug, `native_mask` as a nullable integer, `custom_channels` as an
+  /// array of [`AudioChannelSpec`] maps. Like `AudioChannelSpec` this
+  /// record holds no invariant across its fields — an incoherent
+  /// combination (`Custom` order with an empty channel list, say) is
+  /// exactly as constructible through the public setters — so the derive
+  /// rejects nothing the builders would have accepted.
+  #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
   #[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
   #[derive(Debug, Clone, PartialEq, Eq, Default)]
   pub struct AudioChannelLayout {
@@ -773,8 +790,16 @@ mod alloc_only {
 
 // ---------------------------------------------------------------------------
 //  Optional trait matrices (`serde` / `arbitrary` / `quickcheck`).
-//  All three cover the same two types — a vocabulary that can be written
-//  to a wire is one a fuzzer and a property test must be able to produce.
+//  All three cover the same four types — the two vocabularies at every
+//  capability tier, and the two records wherever the allocator is. A type
+//  that can be written to a wire is one a fuzzer and a property test must
+//  be able to produce.
+//
+//  `AudioChannelSpec` and `AudioChannelLayout` take their `serde` half as
+//  a derive at the definition site (they are plain records, and the field
+//  names are the wire), and their generator halves here. The two
+//  vocabularies take all three here, because each is a hand-written
+//  mapping rather than a field walk.
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "serde")]
@@ -859,6 +884,44 @@ mod arbitrary_impls {
 
   arbitrary_via_roster!(ChannelLayoutKind);
   arbitrary_via_roster!(AudioChannelOrderKind);
+
+  /// The two records, which exist only where the allocator does.
+  ///
+  /// Each field is drawn independently through its own `Arbitrary` —
+  /// including the combinations a well-formed FFmpeg layout never shows
+  /// (a `Custom` order with no channel list, a `Native` order with no
+  /// mask). That is deliberate: the type enforces no relation between
+  /// its fields, every one of them has a public unchecked setter, and a
+  /// generator that produced only coherent layouts would leave the
+  /// incoherent ones — the ones a consumer is most likely to mishandle —
+  /// unreachable by the fuzzer.
+  #[cfg(any(feature = "alloc", feature = "std"))]
+  mod alloc_only {
+    use arbitrary::{Arbitrary, Result, Unstructured};
+    use smol_str::SmolStr;
+    use std::vec::Vec;
+
+    use super::super::{AudioChannelLayout, AudioChannelSpec};
+
+    impl<'a> Arbitrary<'a> for AudioChannelSpec {
+      fn arbitrary(u: &mut Unstructured<'a>) -> Result<Self> {
+        Ok(Self::new(u32::arbitrary(u)?, u32::arbitrary(u)?).with_label(SmolStr::arbitrary(u)?))
+      }
+    }
+
+    impl<'a> Arbitrary<'a> for AudioChannelLayout {
+      fn arbitrary(u: &mut Unstructured<'a>) -> Result<Self> {
+        Ok(
+          Self::new(u32::arbitrary(u)?)
+            .with_order(Arbitrary::arbitrary(u)?)
+            .with_known_kind(Arbitrary::arbitrary(u)?)
+            .with_native_mask(Option::<u64>::arbitrary(u)?)
+            .with_custom_channels(Vec::<AudioChannelSpec>::arbitrary(u)?)
+            .with_description(SmolStr::arbitrary(u)?),
+        )
+      }
+    }
+  }
 }
 
 #[cfg(feature = "quickcheck")]
@@ -884,6 +947,45 @@ mod quickcheck_impls {
 
   quickcheck_via_roster!(ChannelLayoutKind);
   quickcheck_via_roster!(AudioChannelOrderKind);
+
+  /// The two records, mirroring `arbitrary_impls::alloc_only` field for
+  /// field — same independent draws, same reason.
+  ///
+  /// `SmolStr` has no `quickcheck::Arbitrary` of its own (smol_str
+  /// implements only the `arbitrary` crate's trait), so the string
+  /// fields go through `String` and are converted; every `SmolStr` is a
+  /// valid `String` and back, so nothing is lost in the transit.
+  ///
+  /// `shrink` is left at the trait default (no shrinking). The fields
+  /// are independent scalars and a string, so a failing case is already
+  /// readable as printed; the enum halves of this matrix made the same
+  /// choice.
+  #[cfg(any(feature = "alloc", feature = "std"))]
+  mod alloc_only {
+    use quickcheck::{Arbitrary, Gen};
+    use smol_str::SmolStr;
+    use std::{string::String, vec::Vec};
+
+    use super::super::{AudioChannelLayout, AudioChannelSpec};
+
+    impl Arbitrary for AudioChannelSpec {
+      fn arbitrary(g: &mut Gen) -> Self {
+        Self::new(u32::arbitrary(g), u32::arbitrary(g))
+          .with_label(SmolStr::new(String::arbitrary(g)))
+      }
+    }
+
+    impl Arbitrary for AudioChannelLayout {
+      fn arbitrary(g: &mut Gen) -> Self {
+        Self::new(u32::arbitrary(g))
+          .with_order(Arbitrary::arbitrary(g))
+          .with_known_kind(Arbitrary::arbitrary(g))
+          .with_native_mask(Option::<u64>::arbitrary(g))
+          .with_custom_channels(Vec::<AudioChannelSpec>::arbitrary(g))
+          .with_description(SmolStr::new(String::arbitrary(g)))
+      }
+    }
+  }
 }
 
 #[cfg(test)]
@@ -1537,6 +1639,75 @@ mod tests {
       let de: U32Deserializer<ValueError> = 1u32.into_deserializer();
       assert!(AudioChannelOrderKind::deserialize(de).is_err());
     }
+
+    /// The two records. Unlike the vocabularies these live only where the
+    /// allocator does, so a real self-describing format can carry them and
+    /// the byte-exact wire is worth asserting directly — `serde_json` is a
+    /// dev-dependency for exactly this.
+    #[cfg(any(feature = "alloc", feature = "std"))]
+    mod records {
+      use super::*;
+
+      #[test]
+      fn a_spec_is_a_map_of_its_accessor_names() {
+        let spec = AudioChannelSpec::new(2, 5).with_label("FL");
+        let json = serde_json::to_string(&spec).expect("a spec always serializes");
+        assert_eq!(json, r#"{"index":2,"raw_id":5,"label":"FL"}"#);
+        assert_eq!(
+          serde_json::from_str::<AudioChannelSpec>(&json).expect("its own output parses"),
+          spec
+        );
+      }
+
+      #[test]
+      fn a_layout_carries_its_vocabularies_as_slugs() {
+        // The pin that matters: `order` and `known_kind` reach the wire as
+        // the slugs their own `Serialize` writes, not as the `u32` codes
+        // `as_u32` / `to_u32` would give. A derive on the record inherits
+        // the field types' impls, and this is what proves it.
+        let layout = AudioChannelLayout::new(6)
+          .with_order(AudioChannelOrderKind::Native)
+          .with_known_kind(ChannelLayoutKind::Ch5_1)
+          .with_native_mask(Some(0x3F))
+          .with_description("5.1(side)");
+        let json = serde_json::to_string(&layout).expect("a layout always serializes");
+        assert_eq!(
+          json,
+          r#"{"order":"native","channels":6,"known_kind":"5.1","native_mask":63,"custom_channels":[],"description":"5.1(side)"}"#
+        );
+        assert_eq!(
+          serde_json::from_str::<AudioChannelLayout>(&json).expect("its own output parses"),
+          layout
+        );
+      }
+
+      #[test]
+      fn a_custom_layout_round_trips_its_channel_list() {
+        let layout = AudioChannelLayout::new(2)
+          .with_order(AudioChannelOrderKind::Custom)
+          .with_custom_channels(vec![
+            AudioChannelSpec::new(0, 1).with_label("FL"),
+            AudioChannelSpec::new(1, 2).with_label("FR"),
+          ]);
+        let json = serde_json::to_string(&layout).expect("a layout always serializes");
+        assert_eq!(
+          serde_json::from_str::<AudioChannelLayout>(&json).expect("its own output parses"),
+          layout
+        );
+      }
+
+      #[test]
+      fn a_record_inherits_the_vocabulary_doors_refusal() {
+        // `"interleaved"` is not an order name, and the record does not
+        // soften that into a default the way a numeric field would.
+        assert!(
+          serde_json::from_str::<AudioChannelLayout>(
+            r#"{"order":"interleaved","channels":2,"known_kind":"unknown","native_mask":null,"custom_channels":[],"description":""}"#
+          )
+          .is_err()
+        );
+      }
+    }
   }
 
   #[cfg(feature = "arbitrary")]
@@ -1575,6 +1746,76 @@ mod tests {
         "an order kind the generator never produces"
       );
     }
+
+    #[cfg(any(feature = "alloc", feature = "std"))]
+    mod records {
+      use super::*;
+
+      /// Deterministic fuzz input. `Unstructured` reads fields from the
+      /// front and length prefixes from the back, so a record needs a
+      /// buffer with spread in both — a repeated byte would pin most of
+      /// the fields to one value and hide exactly what these tests check.
+      fn seeded_bytes(seed: u32) -> [u8; 48] {
+        let mut out = [0u8; 48];
+        let mut state = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+        for byte in &mut out {
+          state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+          *byte = (state >> 24) as u8;
+        }
+        out
+      }
+
+      #[test]
+      fn a_spec_varies_across_every_field() {
+        // A generator that wired a field to a constant would still be
+        // total and still pass a smoke test; this is the pin that each of
+        // the three fields actually moves.
+        let mut indices = 0u32;
+        let mut raw_ids = 0u32;
+        let mut labelled = false;
+        for seed in 0..4096 {
+          let data = seeded_bytes(seed);
+          let mut u = Unstructured::new(&data);
+          let spec = AudioChannelSpec::arbitrary(&mut u).expect("the spec generator is total");
+          indices |= spec.index();
+          raw_ids |= spec.raw_id();
+          labelled |= !spec.label().is_empty();
+        }
+        assert_ne!(indices, 0, "index never left zero");
+        assert_ne!(raw_ids, 0, "raw_id never left zero");
+        assert!(labelled, "label was never populated");
+      }
+
+      #[test]
+      fn a_layout_reaches_its_incoherent_combinations() {
+        // The point of drawing each field independently: a `Custom` order
+        // with an empty channel list, and a `Native` order with no mask,
+        // are both constructible through the public setters, so both must
+        // be reachable by the fuzzer. Walk enough seeds to see one of each.
+        let mut custom_without_channels = false;
+        let mut native_without_mask = false;
+        for seed in 0..4096 {
+          let data = seeded_bytes(seed);
+          let mut u = Unstructured::new(&data);
+          let layout = AudioChannelLayout::arbitrary(&mut u).expect("the generator is total");
+          custom_without_channels |=
+            layout.order() == AudioChannelOrderKind::Custom && layout.custom_channels().is_empty();
+          native_without_mask |=
+            layout.order() == AudioChannelOrderKind::Native && layout.native_mask().is_none();
+          if custom_without_channels && native_without_mask {
+            break;
+          }
+        }
+        assert!(
+          custom_without_channels,
+          "a Custom order with no channel list is unreachable"
+        );
+        assert!(
+          native_without_mask,
+          "a Native order with no mask is unreachable"
+        );
+      }
+    }
   }
 
   #[cfg(feature = "quickcheck")]
@@ -1610,6 +1851,91 @@ mod tests {
         AudioChannelOrderKind::ALL.len(),
         "an order kind the generator never produces"
       );
+    }
+
+    #[cfg(any(feature = "alloc", feature = "std"))]
+    mod records {
+      use super::*;
+
+      #[test]
+      fn the_records_vary_across_every_field() {
+        let mut g = Gen::new(8);
+        let mut indices = 0u32;
+        let mut raw_ids = 0u32;
+        let mut spec_labelled = false;
+        let mut channels = 0u32;
+        let mut masked = false;
+        let mut populated = false;
+        let mut described = false;
+        for _ in 0..500 {
+          let spec = AudioChannelSpec::arbitrary(&mut g);
+          indices |= spec.index();
+          raw_ids |= spec.raw_id();
+          spec_labelled |= !spec.label().is_empty();
+
+          let layout = AudioChannelLayout::arbitrary(&mut g);
+          channels |= layout.channels();
+          masked |= layout.native_mask().is_some();
+          populated |= !layout.custom_channels().is_empty();
+          described |= !layout.description().is_empty();
+        }
+        assert_ne!(indices, 0, "spec index never left zero");
+        assert_ne!(raw_ids, 0, "spec raw_id never left zero");
+        assert!(spec_labelled, "spec label was never populated");
+        assert_ne!(channels, 0, "layout channels never left zero");
+        assert!(masked, "layout native_mask was never Some");
+        assert!(populated, "layout custom_channels was never non-empty");
+        assert!(described, "layout description was never populated");
+      }
+    }
+  }
+
+  /// The three matrices have to agree, not merely coexist: whatever the
+  /// generators can produce, the wire has to be able to carry back
+  /// unchanged. Runs only when both features are on, which is where the
+  /// disagreement would live.
+  #[cfg(all(
+    feature = "serde",
+    feature = "quickcheck",
+    any(feature = "alloc", feature = "std")
+  ))]
+  mod matrix_agreement_tests {
+    use quickcheck::{Arbitrary, Gen};
+
+    use super::*;
+
+    #[test]
+    fn every_generated_value_survives_the_wire() {
+      let mut g = Gen::new(8);
+      for _ in 0..200 {
+        let kind = ChannelLayoutKind::arbitrary(&mut g);
+        let json = serde_json::to_string(&kind).expect("a kind always serializes");
+        assert_eq!(
+          serde_json::from_str::<ChannelLayoutKind>(&json).expect("its own output parses"),
+          kind
+        );
+
+        let order = AudioChannelOrderKind::arbitrary(&mut g);
+        let json = serde_json::to_string(&order).expect("an order always serializes");
+        assert_eq!(
+          serde_json::from_str::<AudioChannelOrderKind>(&json).expect("its own output parses"),
+          order
+        );
+
+        let spec = AudioChannelSpec::arbitrary(&mut g);
+        let json = serde_json::to_string(&spec).expect("a spec always serializes");
+        assert_eq!(
+          serde_json::from_str::<AudioChannelSpec>(&json).expect("its own output parses"),
+          spec
+        );
+
+        let layout = AudioChannelLayout::arbitrary(&mut g);
+        let json = serde_json::to_string(&layout).expect("a layout always serializes");
+        assert_eq!(
+          serde_json::from_str::<AudioChannelLayout>(&json).expect("its own output parses"),
+          layout
+        );
+      }
     }
   }
 }

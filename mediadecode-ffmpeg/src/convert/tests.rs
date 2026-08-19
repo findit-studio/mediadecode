@@ -133,3 +133,102 @@ fn yuvj420p_unspecified_range_delivers_full() {
     "YUVJ420P with UNSPECIFIED color_range must be delivered as Full"
   );
 }
+
+/// Builds an unallocated `AVFrame` carrying `raw` in its `format` field.
+///
+/// The point is to reach the convert path with an integer no CPU layout
+/// can be derived from — including integers outside our bindgen's
+/// `AVPixelFormat` discriminant set, which is precisely the case the
+/// restored diagnostic exists for. `AVFrame.format` is a plain C `int`,
+/// so writing one is not a detour around the enum; there is no enum
+/// here to begin with, which is why a raw id was always available at
+/// this boundary and only the error had stopped carrying it.
+fn frame_with_raw_format(raw: i32) -> ffmpeg_next::frame::Video {
+  let mut frame = ffmpeg_next::frame::Video::empty();
+  // SAFETY: `frame` is a live, uniquely-owned AVFrame; these are three
+  // scalar field writes through the raw pointer.
+  unsafe {
+    let frame_ptr = frame.as_mut_ptr();
+    (*frame_ptr).format = raw;
+    (*frame_ptr).width = 64;
+    (*frame_ptr).height = 48;
+  }
+  frame
+}
+
+/// A hardware surface has no CPU pixel data, so the unified vocabulary's
+/// answer for it is `PixelFormat::None` — and before this the whole error
+/// message was that `None`, naming nothing. The raw id and FFmpeg's own
+/// name for it now ride along.
+#[test]
+fn an_unsupported_format_is_named_in_the_error() {
+  use ffmpeg_next::ffi::AVPixelFormat;
+
+  let raw = AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX as i32;
+  let frame = frame_with_raw_format(raw);
+
+  // `VideoFrame` has no `Debug`, so `expect_err` is unavailable.
+  let Err(err) = video_frame_from(&frame, Timebase::default()) else {
+    panic!("a hardware surface carries no deliverable CPU layout");
+  };
+
+  let ConvertError::UnsupportedPixelFormat {
+    format,
+    raw: got,
+    name,
+  } = &err
+  else {
+    panic!("expected UnsupportedPixelFormat, got {err:?}");
+  };
+  // The *value* is unchanged — this restores the diagnostic, not the
+  // struck `Unknown(u32)` variant.
+  assert_eq!(*format, PixelFormat::None);
+  assert_eq!(*got, raw);
+  assert_eq!(name.as_deref(), Some("videotoolbox_vld"));
+
+  let rendered = err.to_string();
+  assert!(
+    rendered.contains(&raw.to_string()),
+    "the raw id is missing from {rendered:?}"
+  );
+  assert!(
+    rendered.contains("videotoolbox_vld"),
+    "the FFmpeg name is missing from {rendered:?}"
+  );
+}
+
+/// An integer libavutil cannot describe — a corrupt read, or a format
+/// from a newer library than the one linked. The name is absent and the
+/// message says so, but the raw id is still there, which is the whole
+/// point of carrying it separately.
+#[test]
+fn an_unnameable_format_still_reports_its_raw_id() {
+  let raw = 99_999;
+  let frame = frame_with_raw_format(raw);
+
+  let Err(err) = video_frame_from(&frame, Timebase::default()) else {
+    panic!("an unmappable format integer has no deliverable layout");
+  };
+
+  let ConvertError::UnsupportedPixelFormat {
+    format,
+    raw: got,
+    name,
+  } = &err
+  else {
+    panic!("expected UnsupportedPixelFormat, got {err:?}");
+  };
+  assert_eq!(*format, PixelFormat::None);
+  assert_eq!(*got, raw);
+  assert_eq!(*name, None);
+
+  let rendered = err.to_string();
+  assert!(
+    rendered.contains("99999"),
+    "the raw id is missing from {rendered:?}"
+  );
+  assert!(
+    rendered.contains("unnamed by libavutil"),
+    "the absent-name case is not spelled out in {rendered:?}"
+  );
+}

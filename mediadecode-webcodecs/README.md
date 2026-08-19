@@ -9,8 +9,8 @@ layer, built on top of
 
 [<img alt="github" src="https://img.shields.io/badge/github-findit--ai/mediadecode-8da0cb?style=for-the-badge&logo=Github" height="22">][Github-url]
 <img alt="LoC" src="https://img.shields.io/endpoint?url=https%3A%2F%2Fgist.githubusercontent.com%2Fal8n%2F327b2a8aef9003246e45c6e47fe63937%2Fraw%2Fmediadecode-webcodecs" height="22">
-[<img alt="Build" src="https://img.shields.io/github/actions/workflow/status/findit-ai/mediadecode/ci-webcodecs.yml?logo=Github-Actions&style=for-the-badge" height="22">][CI-url]
-[<img alt="codecov" src="https://img.shields.io/codecov/c/gh/findit-ai/mediadecode?style=for-the-badge&logo=codecov" height="22">][codecov-url]
+[<img alt="Build" src="https://img.shields.io/github/actions/workflow/status/findit-studio/mediadecode/ci-webcodecs.yml?logo=Github-Actions&style=for-the-badge" height="22">][CI-url]
+[<img alt="codecov" src="https://img.shields.io/codecov/c/gh/findit-studio/mediadecode?style=for-the-badge&logo=codecov" height="22">][codecov-url]
 
 [<img alt="docs.rs" src="https://img.shields.io/badge/docs.rs-mediadecode--webcodecs-66c2a5?style=for-the-badge&labelColor=555555" height="22">][doc-url]
 [<img alt="crates.io" src="https://img.shields.io/crates/v/mediadecode-webcodecs?style=for-the-badge" height="22">][crates-url]
@@ -76,8 +76,8 @@ See [LICENSE-APACHE](LICENSE-APACHE), [LICENSE-MIT](LICENSE-MIT) for details.
 
 Copyright (c) 2026 FinDIT Studio authors.
 
-[Github-url]: https://github.com/findit-ai/mediadecode
-[CI-url]: https://github.com/findit-ai/mediadecode/actions/workflows/ci.yml
-[codecov-url]: https://app.codecov.io/gh/findit-ai/mediadecode/
+[Github-url]: https://github.com/findit-studio/mediadecode
+[CI-url]: https://github.com/findit-studio/mediadecode/actions/workflows/ci.yml
+[codecov-url]: https://app.codecov.io/gh/findit-studio/mediadecode/
 [doc-url]: https://docs.rs/mediadecode-webcodecs
 [crates-url]: https://crates.io/crates/mediadecode-webcodecs

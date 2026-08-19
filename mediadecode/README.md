@@ -7,8 +7,8 @@ Generic, `no_std`-friendly type-and-trait spine for media decoders.
 
 [<img alt="github" src="https://img.shields.io/badge/github-findit--ai/mediadecode-8da0cb?style=for-the-badge&logo=Github" height="22">][Github-url]
 <img alt="LoC" src="https://img.shields.io/endpoint?url=https%3A%2F%2Fgist.githubusercontent.com%2Fal8n%2F327b2a8aef9003246e45c6e47fe63937%2Fraw%2Fmediadecode" height="22">
-[<img alt="Build" src="https://img.shields.io/github/actions/workflow/status/findit-ai/mediadecode/ci-core.yml?logo=Github-Actions&style=for-the-badge" height="22">][CI-url]
-[<img alt="codecov" src="https://img.shields.io/codecov/c/gh/findit-ai/mediadecode?style=for-the-badge&logo=codecov" height="22">][codecov-url]
+[<img alt="Build" src="https://img.shields.io/github/actions/workflow/status/findit-studio/mediadecode/ci-core.yml?logo=Github-Actions&style=for-the-badge" height="22">][CI-url]
+[<img alt="codecov" src="https://img.shields.io/codecov/c/gh/findit-studio/mediadecode?style=for-the-badge&logo=codecov" height="22">][codecov-url]
 
 [<img alt="docs.rs" src="https://img.shields.io/badge/docs.rs-mediadecode-66c2a5?style=for-the-badge&labelColor=555555&logo=data:image/svg+xml;base64,PHN2ZyByb2xlPSJpbWciIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyIgdmlld0JveD0iMCAwIDUxMiA1MTIiPjxwYXRoIGZpbGw9IiNmNWY1ZjUiIGQ9Ik00ODguNiAyNTAuMkwzOTIgMjE0VjEwNS41YzAtMTUtOS4zLTI4LjQtMjMuNC0zMy43bC0xMDAtMzcuNWMtOC4xLTMuMS0xNy4xLTMuMS0yNS4zIDBsLTEwMCAzNy41Yy0xNC4xIDUuMy0yMy40IDE4LjctMjMuNCAzMy43VjIxNGwtOTYuNiAzNi4yQzkuMyAyNTUuNSAwIDI2OC45IDAgMjgzLjlWMzk0YzAgMTMuNiA3LjcgMjYuMSAxOS45IDMyLjJsMTAwIDUwYzEwLjEgNS4xIDIyLjEgNS4xIDMyLjIgMGwxMDMuOS01MiAxMDMuOSA1MmMxMC4xIDUuMSAyMi4xIDUuMSAzMi4yIDBsMTAwLTUwYzEyLjItNi4xIDE5LjktMTguNiAxOS45LTMyLjJWMjgzLjljMC0xNS05LjMtMjguNC0yMy40LTMzLjd6TTM1OCAyMTQuOGwtODUgMzEuOXYtNjguMmw4NS0zN3Y3My4zek0xNTQgMTA0LjFsMTAyLTM4LjIgMTAyIDM4LjJ2LjZsLTEwMiA0MS40LTEwMi00MS40di0uNnptODQgMjkxLjFsLTg1IDQyLjV2LTc5LjFsODUtMzguOHY3NS40em0wLTExMmwtMTAyIDQxLjQtMTAyLTQxLjR2LS42bDEwMi0zOC4yIDEwMiAzOC4ydi42em0yNDAgMTEybC04NSA0Mi41di03OS4xbDg1LTM4Ljh2NzUuNHptMC0xMTJsLTEwMiA0MS40LTEwMi00MS40di0uNmwxMDItMzguMiAxMDIgMzguMnYuNnoiPjwvcGF0aD48L3N2Zz4K" height="20">][doc-url]
 [<img alt="crates.io" src="https://img.shields.io/crates/v/mediadecode?style=for-the-badge&logo=data:image/svg+xml;base64,PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iaXNvLTg4NTktMSI/Pg0KPCEtLSBHZW5lcmF0b3I6IEFkb2JlIElsbHVzdHJhdG9yIDE5LjAuMCwgU1ZHIEV4cG9ydCBQbHVnLUluIC4gU1ZHIFZlcnNpb246IDYuMDAgQnVpbGQgMCkgIC0tPg0KPHN2ZyB2ZXJzaW9uPSIxLjEiIGlkPSJMYXllcl8xIiB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHhtbG5zOnhsaW5rPSJodHRwOi8vd3d3LnczLm9yZy8xOTk5L3hsaW5rIiB4PSIwcHgiIHk9IjBweCINCgkgdmlld0JveD0iMCAwIDUxMiA1MTIiIHhtbDpzcGFjZT0icHJlc2VydmUiPg0KPGc+DQoJPGc+DQoJCTxwYXRoIGQ9Ik0yNTYsMEwzMS41MjgsMTEyLjIzNnYyODcuNTI4TDI1Niw1MTJsMjI0LjQ3Mi0xMTIuMjM2VjExMi4yMzZMMjU2LDB6IE0yMzQuMjc3LDQ1Mi41NjRMNzQuOTc0LDM3Mi45MTNWMTYwLjgxDQoJCQlsMTU5LjMwMyw3OS42NTFWNDUyLjU2NHogTTEwMS44MjYsMTI1LjY2MkwyNTYsNDguNTc2bDE1NC4xNzQsNzcuMDg3TDI1NiwyMDIuNzQ5TDEwMS44MjYsMTI1LjY2MnogTTQzNy4wMjYsMzcyLjkxMw0KCQkJbC0xNTkuMzAzLDc5LjY1MVYyNDAuNDYxbDE1OS4zMDMtNzkuNjUxVjM3Mi45MTN6IiBmaWxsPSIjRkZGIi8+DQoJPC9nPg0KPC9nPg0KPGc+DQo8L2c+DQo8Zz4NCjwvZz4NCjxnPg0KPC9nPg0KPGc+DQo8L2c+DQo8Zz4NCjwvZz4NCjxnPg0KPC9nPg0KPGc+DQo8L2c+DQo8Zz4NCjwvZz4NCjxnPg0KPC9nPg0KPGc+DQo8L2c+DQo8Zz4NCjwvZz4NCjxnPg0KPC9nPg0KPGc+DQo8L2c+DQo8Zz4NCjwvZz4NCjxnPg0KPC9nPg0KPC9zdmc+DQo=" height="22">][crates-url]
@@ -17,7 +17,7 @@ Generic, `no_std`-friendly type-and-trait spine for media decoders.
 
 </div>
 
-The backend-agnostic core of the [`mediadecode`](https://github.com/findit-ai/mediadecode)
+The backend-agnostic core of the [`mediadecode`](https://github.com/findit-studio/mediadecode)
 workspace. Defines the unified `Packet` / `Frame` types,
 `VideoAdapter` / `AudioAdapter` / `SubtitleAdapter` traits, and the
 matching push-style `*StreamDecoder` traits that concrete decoder
@@ -33,7 +33,7 @@ bytes. Adapter implementations live in sibling crates such as
 ## What's in the box
 
 - **Pixel and sample formats** — `PixelFormat` (~270 variants
-  covering every FFmpeg `n8.1` `AVPixelFormat` slug plus cinema-RAW
+  covering every FFmpeg `n9.0` `AVPixelFormat` slug plus cinema-RAW
   additions; sourced from
   [`videoframe`](https://crates.io/crates/videoframe) and re-exported
   here so consumers keep their `mediadecode::PixelFormat` import).
@@ -79,15 +79,27 @@ the rest of the findit-studio workspace uses:
 | ------------ | :-----: | ------------------------------------------------------------- |
 | `std`        |   yes   | Enable the standard library and `mediatime/default`.          |
 | `alloc`      |    —    | Enable owning collections (`Vec`, `String`) without `std`.    |
-| `serde`      |    —    | The channel vocabularies as their slug, plus `mediatime`.     |
-| `arbitrary`  |    —    | `Arbitrary` impls for fuzzing (the channel vocabularies).     |
-| `quickcheck` |    —    | The same coverage for `quickcheck`.                           |
+| `serde`      |    —    | Every type below on the wire, plus `mediatime`.               |
+| `arbitrary`  |    —    | `Arbitrary` impls for fuzzing, same coverage.                 |
+| `quickcheck` |    —    | The same coverage again, for `quickcheck`.                    |
 
-The three optional matrices cover the same types — today
-`channel::ChannelLayoutKind` and `channel::AudioChannelOrderKind`, which
-serde carries as their canonical slug (`"5.1"`, `"native"`) rather than
-their `u32` code: an unrecognised name is a deserialization error, where
-an unrecognised code would decode to `Unknown` / `Unspecified`.
+The three optional matrices cover the same types, and each type's wire
+shape follows what it *is*:
+
+| Type | Tier | serde wire shape |
+| ---- | ---- | ---------------- |
+| `channel::ChannelLayoutKind`     | any     | canonical slug — `"5.1"`, `"7.1-wide-back"` |
+| `channel::AudioChannelOrderKind` | any     | canonical slug — `"native"`, `"ambisonic"`  |
+| `channel::AudioChannelSpec`      | `alloc` | map of its accessor names                   |
+| `channel::AudioChannelLayout`    | `alloc` | map of its accessor names                   |
+| `packet::PacketFlags`            | any     | the raw bits, as a number                   |
+
+A **name vocabulary** travels as its name: an unrecognised slug is a
+deserialization error, where an unrecognised `u32` code would decode to
+`Unknown` / `Unspecified` and invent a value. A **bit set** travels as a
+number, because every bit pattern is meaningful and bits this build has
+no constant for still have to survive the round trip. A **record**
+travels as its fields, each in its own shape.
 
 `no_std` builds: disable defaults and pick `alloc` if you need
 `Vec`-backed payloads:
@@ -145,8 +157,8 @@ See [LICENSE-APACHE](LICENSE-APACHE), [LICENSE-MIT](LICENSE-MIT) for details.
 
 Copyright (c) 2026 FinDIT Studio authors.
 
-[Github-url]: https://github.com/findit-ai/mediadecode
-[CI-url]: https://github.com/findit-ai/mediadecode/actions/workflows/ci.yml
-[codecov-url]: https://app.codecov.io/gh/findit-ai/mediadecode/
+[Github-url]: https://github.com/findit-studio/mediadecode
+[CI-url]: https://github.com/findit-studio/mediadecode/actions/workflows/ci.yml
+[codecov-url]: https://app.codecov.io/gh/findit-studio/mediadecode/
 [doc-url]: https://docs.rs/mediadecode
 [crates-url]: https://crates.io/crates/mediadecode

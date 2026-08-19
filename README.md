@@ -28,8 +28,8 @@ mediadecode, and scenesdetect share one canonical definition.
 See each crate's README for its API surface, usage, and build
 requirements.
 
-[Github-url]: https://github.com/findit-ai/mediadecode
-[CI-url]: https://github.com/findit-ai/mediadecode/actions/workflows/ci.yml
-[codecov-url]: https://app.codecov.io/gh/findit-ai/mediadecode/
+[Github-url]: https://github.com/findit-studio/mediadecode
+[CI-url]: https://github.com/findit-studio/mediadecode/actions/workflows/ci.yml
+[codecov-url]: https://app.codecov.io/gh/findit-studio/mediadecode/
 [doc-url]: https://docs.rs/mediadecode
 [crates-url]: https://crates.io/crates/mediadecode

@@ -9,12 +9,84 @@
 //! See the doc comments on individual functions for what is read as raw
 //! integer vs. constructed from a known constant.
 
-use std::ptr;
+use std::{
+  ffi::{c_char, c_int},
+  ptr,
+};
 
 use ffmpeg_next::ffi::{
   AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX, AVCodec, AVCodecContext, AVHWDeviceType, AVPixelFormat,
   avcodec_get_hw_config,
 };
+use smol_str::SmolStr;
+
+unsafe extern "C" {
+  /// `av_get_pix_fmt_name`, redeclared with a plain `c_int` parameter
+  /// instead of `AVPixelFormat`.
+  ///
+  /// The binding `ffmpeg-sys-next` generates takes the bindgen enum,
+  /// and the whole point of calling this function is to name an integer
+  /// we could *not* map — i.e. one that may well not be in our build's
+  /// discriminant set. Constructing `AVPixelFormat` from such a value to
+  /// pass it in would be immediate UB, the exact hazard this module
+  /// exists to keep out of the crate. `AVPixelFormat` is `#[repr(i32)]`
+  /// and C passes the enum as an `int`, so the redeclared signature is
+  /// ABI-identical; only the Rust-side validity obligation is dropped.
+  ///
+  /// libavutil answers *every* integer, in range or not, with either a
+  /// pointer into its static descriptor table or null — it bounds-checks
+  /// before indexing. That is the property [`pix_fmt_name`] relies on,
+  /// and `pix_fmt_name_refuses_what_ffmpeg_cannot_name` pins it against
+  /// the linked library rather than assuming it.
+  fn av_get_pix_fmt_name(pix_fmt: c_int) -> *const c_char;
+}
+
+/// Upper bound on the NUL search in [`pix_fmt_name`]. FFmpeg's longest
+/// pixel-format name is around fourteen bytes, so this is generous; the
+/// cap exists only so that a corrupt or version-skewed descriptor table
+/// cannot turn the walk into an unbounded read, matching the discipline
+/// the rest of the crate's FFI text handling follows.
+const PIX_FMT_NAME_MAX_BYTES: usize = 64;
+
+/// FFmpeg's own name for a raw `AVFrame.format` integer — `"yuv420p"`,
+/// `"vaapi"` — or `None` when libavutil has no descriptor for it.
+///
+/// Diagnostic only. It never feeds a mapping decision: the raw integer
+/// is turned into a [`mediadecode::PixelFormat`] by
+/// [`crate::boundary::from_av_pixel_format`], which compares against
+/// compile-time constants and is the authority. This function exists so
+/// an error can say *which* format was refused when the vocabulary's
+/// answer for it is `None`.
+pub(crate) fn pix_fmt_name(raw: i32) -> Option<SmolStr> {
+  // SAFETY: the redeclaration above takes a plain `c_int`, so no
+  // `AVPixelFormat` is constructed from `raw` and no invalid enum value
+  // is ever formed. libavutil bounds-checks the index itself and
+  // returns null for anything outside its table, so every `i32` —
+  // negative, `AV_PIX_FMT_NONE`, or past the end — is a defined call.
+  let ptr = unsafe { av_get_pix_fmt_name(raw) };
+  if ptr.is_null() {
+    return None;
+  }
+
+  // A bounded NUL search rather than `CStr::from_ptr`: a missing
+  // terminator violates that function's precondition outright, and
+  // this crate does not hand FFmpeg's word on string lengths to a
+  // function that cannot survive being wrong.
+  for i in 0..PIX_FMT_NAME_MAX_BYTES {
+    // SAFETY: `ptr` is non-null, and libavutil's format names are
+    // string literals in its static `av_pix_fmt_descriptors` table —
+    // NUL-terminated and valid for the process lifetime. We read at
+    // most one byte past the last name byte.
+    let byte = unsafe { *(ptr.add(i) as *const u8) };
+    if byte == 0 {
+      // SAFETY: the `i` bytes below the NUL were just walked, so the
+      // slice is in bounds and initialized.
+      let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, i) };
+      return std::str::from_utf8(bytes).ok().map(SmolStr::new);
+    }
+  }
+  None
+}
 
 /// State pointed to by `AVCodecContext::opaque` so [`get_hw_format`] can pick
 /// the correct hardware pixel format without globals. One instance per
@@ -141,6 +213,38 @@ pub(crate) fn codec_supports_hwaccel(
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn pix_fmt_name_reads_the_linked_librarys_own_table() {
+    assert_eq!(
+      pix_fmt_name(AVPixelFormat::AV_PIX_FMT_YUV420P as i32).as_deref(),
+      Some("yuv420p")
+    );
+    assert_eq!(
+      pix_fmt_name(AVPixelFormat::AV_PIX_FMT_NV12 as i32).as_deref(),
+      Some("nv12")
+    );
+    // A hardware surface: no CPU pixel data, so `from_av_pixel_format`
+    // answers `PixelFormat::None` — and this is what puts a name on the
+    // integer behind that `None` in the error message.
+    assert_eq!(
+      pix_fmt_name(AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX as i32).as_deref(),
+      Some("videotoolbox_vld")
+    );
+  }
+
+  #[test]
+  fn pix_fmt_name_refuses_what_ffmpeg_cannot_name() {
+    // The property the redeclared signature depends on, checked against
+    // the linked library rather than assumed: libavutil bounds-checks
+    // the index and answers out-of-range integers with null, so passing
+    // a value outside the enum's discriminant set is defined.
+    assert_eq!(pix_fmt_name(AVPixelFormat::AV_PIX_FMT_NONE as i32), None);
+    assert_eq!(pix_fmt_name(-99_999), None);
+    assert_eq!(pix_fmt_name(i32::MIN), None);
+    assert_eq!(pix_fmt_name(i32::MAX), None);
+    assert_eq!(pix_fmt_name(AVPixelFormat::AV_PIX_FMT_NB as i32), None);
+  }
 
   // The callback derefs `(*ctx).opaque`, so we need a real-looking
   // AVCodecContext. We construct a zeroed one (the callback only reads opaque).

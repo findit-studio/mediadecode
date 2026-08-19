@@ -20,6 +20,7 @@ use mediadecode::{
   frame::{AudioFrame, Dimensions, Plane, Rect, SubtitleFrame, VideoFrame},
   subtitle::SubtitlePayload,
 };
+use smol_str::SmolStr;
 
 use crate::{
   FfmpegBuffer, boundary,
@@ -36,7 +37,29 @@ pub enum ConvertError {
   NullFrame,
   /// The frame's pixel format isn't in the closed CPU-format set this
   /// crate supports for safe per-plane access.
-  UnsupportedPixelFormat(PixelFormat),
+  UnsupportedPixelFormat {
+    /// The unified vocabulary's answer for [`raw`](Self::UnsupportedPixelFormat::raw).
+    ///
+    /// [`PixelFormat::None`] whenever the raw integer has no mapping —
+    /// a hardware surface, a Bayer mosaic, a format FFmpeg gained after
+    /// this build. That is a *value*, not a failed lookup, and it is
+    /// deliberately not made to carry the integer: the two fields below
+    /// are where the identity survives.
+    format: PixelFormat,
+    /// The raw `AVFrame.format` integer, exactly as FFmpeg wrote it.
+    ///
+    /// Present at every tier — it costs one `i32` — because it is the
+    /// only field that is always available and always precise. Without
+    /// it the message for the fall-through case says `None` and names
+    /// nothing at all.
+    raw: i32,
+    /// FFmpeg's own name for [`raw`](Self::UnsupportedPixelFormat::raw)
+    /// (`av_get_pix_fmt_name`), when libavutil has one.
+    ///
+    /// `None` for an integer libavutil does not describe — a corrupt
+    /// read, or a format from a newer library than the one linked.
+    name: Option<SmolStr>,
+  },
   /// A plane reported `linesize <= 0` or otherwise inconsistent layout.
   InvalidPlaneLayout {
     /// Plane index.
@@ -54,9 +77,16 @@ impl core::fmt::Display for ConvertError {
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
     match self {
       Self::NullFrame => write!(f, "convert: AVFrame pointer was null"),
-      Self::UnsupportedPixelFormat(pf) => {
-        write!(f, "convert: unsupported pixel format {pf:?}")
-      }
+      Self::UnsupportedPixelFormat { format, raw, name } => match name {
+        Some(name) => write!(
+          f,
+          "convert: unsupported pixel format {format:?} (AVPixelFormat {raw} = {name:?})"
+        ),
+        None => write!(
+          f,
+          "convert: unsupported pixel format {format:?} (AVPixelFormat {raw}, unnamed by libavutil)"
+        ),
+      },
       Self::InvalidPlaneLayout { plane } => {
         write!(f, "convert: invalid layout on plane {plane}")
       }
@@ -68,6 +98,19 @@ impl core::fmt::Display for ConvertError {
 }
 
 impl core::error::Error for ConvertError {}
+
+/// Builds [`ConvertError::UnsupportedPixelFormat`] for a frame whose raw
+/// format integer this crate will not deliver.
+///
+/// Both refusal sites go through here so the raw id and the name are
+/// never gathered at one of them and forgotten at the other.
+fn unsupported_pixel_format(format: PixelFormat, raw: i32) -> ConvertError {
+  ConvertError::UnsupportedPixelFormat {
+    format,
+    raw,
+    name: crate::ffi::pix_fmt_name(raw),
+  }
+}
 
 /// Safe wrapper around [`av_frame_to_video_frame`] taking a borrowed
 /// [`ffmpeg::Frame`](ffmpeg_next::Frame). Recommended entry point for
@@ -155,7 +198,7 @@ pub unsafe fn av_frame_to_video_frame(
   // deliverable layout we'd be reading garbage `linesize * height`
   // bytes.
   if !pixdesc::is_deliverable(&pix_fmt) {
-    return Err(ConvertError::UnsupportedPixelFormat(pix_fmt));
+    return Err(unsupported_pixel_format(pix_fmt, format_raw));
   }
   // The per-plane row count and visible (tight) byte width come from
   // `pixdesc::plane_geometry`, which derives them from libavutil's own
@@ -166,7 +209,7 @@ pub unsafe fn av_frame_to_video_frame(
   // unsupported frame rather than guessing a layout.
   let geom = match pixdesc::plane_geometry(&pix_fmt, width as usize, height as usize) {
     Some(g) => g,
-    None => return Err(ConvertError::UnsupportedPixelFormat(pix_fmt)),
+    None => return Err(unsupported_pixel_format(pix_fmt, format_raw)),
   };
 
   let mut planes_out: [Plane<FfmpegBuffer>; 4] = [

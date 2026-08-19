@@ -13,8 +13,12 @@ categories = ["multimedia", "multimedia::video", "multimedia::audio", "no-std", 
 
 [features]
 default = ["std"]
-alloc   = ["smol_str"]
-std     = ["mediatime/default", "smol_str/default"]
+# `serde?/alloc` and `serde?/std` are what let the two alloc-tier structs
+# derive `Deserialize`: their `Vec` and `SmolStr` fields sit behind serde's
+# own capability features. The `?` keeps serde out of the build entirely
+# when this crate's `serde` feature is off.
+alloc   = ["smol_str", "serde?/alloc"]
+std     = ["mediatime/default", "smol_str/default", "serde?/std"]
 
 # Async-fn-in-trait variants of the decoder traits, exposed under
 # `mediadecode::future`. No runtime dependency — only a proc-macro
@@ -22,7 +26,12 @@ std     = ["mediatime/default", "smol_str/default"]
 # each `!Send` trait. Callers pick their own executor.
 future = ["dep:trait-variant"]
 
-serde      = ["dep:serde", "mediatime/serde", "bitflags/serde"]
+# `bitflags/serde` is deliberately absent. It is opt-in per type (a
+# `Serialize` / `Deserialize` derive inside the `bitflags!` body, which
+# `PacketFlags` does not carry) and its wire shape is a flag *grammar*
+# — `"KEY | CORRUPT"` — in any human-readable format. `PacketFlags`
+# serializes as its bits instead, hand-written in `packet::serde_impls`.
+serde      = ["dep:serde", "mediatime/serde", "smol_str?/serde"]
 arbitrary  = ["dep:arbitrary", "mediatime/arbitrary", "smol_str?/arbitrary"]
 quickcheck = ["dep:quickcheck", "mediatime/quickcheck"]
 
@@ -41,8 +50,9 @@ quickcheck = { workspace = true, optional = true }
 trait-variant = { workspace = true, optional = true }
 
 [dev-dependencies]
-criterion = { workspace = true }
-tempfile  = { workspace = true }
+criterion  = { workspace = true }
+tempfile   = { workspace = true }
+serde_json = { workspace = true }
 
 [[bench]]
 path    = "benches/foo.rs"
