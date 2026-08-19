@@ -11,7 +11,7 @@ The backend-agnostic core it adapts has its own log at
 
 ## [Unreleased]
 
-## [0.4.0]
+## [0.4.0] - 2026-08-19
 
 Tracks `mediadecode` 0.4.0, which crosses `mediatime` 0.1 → 0.3 and
 `mediaframe` 0.1 → 0.3 — two breaking minors each. See

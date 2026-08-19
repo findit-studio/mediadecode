@@ -11,6 +11,8 @@ The backend-agnostic core it adapts has its own log at
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-19
+
 ### Changed (BREAKING)
 
 - **`convert::ConvertError::UnsupportedPixelFormat` names the format
@@ -41,8 +43,6 @@ The backend-agnostic core it adapts has its own log at
   turned into an `AVPixelFormat` — which is the whole reason the
   fall-through exists in the first place. Two tests pin that libavutil
   answers such integers with null rather than misbehaving.
-
-## [0.4.0]
 
 Tracks `mediadecode` 0.4.0, which crosses `mediatime` 0.1 → 0.3 and
 `mediaframe` 0.1 → 0.3 — two breaking minors each. Both are public
