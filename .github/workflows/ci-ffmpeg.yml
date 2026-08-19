@@ -90,7 +90,7 @@ jobs:
     - uses: actions/checkout@v7
       with:
         # Audio fixtures live at `tests/fixtures/audio/` as a
-        # submodule pointing at `findit-ai/audio-fixtures`.
+        # submodule pointing at `findit-studio/audio-fixtures`.
         submodules: recursive
     - name: Cache cargo build and registry
       uses: actions/cache@v6
@@ -136,7 +136,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           # Audio fixtures live at `tests/fixtures/audio/` as a
-          # submodule pointing at `findit-ai/audio-fixtures`.
+          # submodule pointing at `findit-studio/audio-fixtures`.
           # `audio_pcm_fixtures` walks the tree and panics on
           # missing files, so tarpaulin needs them too — the
           # `test` job above already runs with submodules.
