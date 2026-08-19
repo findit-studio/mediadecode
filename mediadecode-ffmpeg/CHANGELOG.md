@@ -117,12 +117,12 @@ the same formats are deliverable, and the same frames are rejected.
   `unsupported pixel format None` — the raw integer is no longer in
   that log line.
 
-[0.4.0]: https://github.com/findit-ai/mediadecode/releases/tag/mediadecode-ffmpeg-v0.4.0
+[0.4.0]: https://github.com/findit-studio/mediadecode/releases/tag/mediadecode-ffmpeg-v0.4.0
 
 ## [0.3.3] - 2026-06-25
 
 Every byte-addressable CPU pixel format FFmpeg can produce now decodes
-and delivers ([#15](https://github.com/Findit-AI/mediadecode/pull/15)).
+and delivers ([#15](https://github.com/findit-studio/mediadecode/pull/15)).
 The hand-maintained per-format geometry table is gone from the decode
 path; libavutil's own descriptor is the authority.
 
@@ -164,13 +164,13 @@ path; libavutil's own descriptor is the authority.
 > failed earlier, at decode, before this release — and closing the gap
 > is colconv-side work.
 
-[0.3.3]: https://github.com/findit-ai/mediadecode/releases/tag/mediadecode-ffmpeg-v0.3.3
+[0.3.3]: https://github.com/findit-studio/mediadecode/releases/tag/mediadecode-ffmpeg-v0.3.3
 
 ## [0.3.2] - 2026-06-24
 
 Hardware decode that collapses **after** the probe has committed now
 falls back to software instead of failing the stream
-([#13](https://github.com/Findit-AI/mediadecode/pull/13)).
+([#13](https://github.com/findit-studio/mediadecode/pull/13)).
 
 ### Added
 
@@ -193,11 +193,11 @@ falls back to software instead of failing the stream
   a dead stream. Probe-era failures keep the previous behaviour: the
   buffered history is replayed and the current packet routed on.
 
-[0.3.2]: https://github.com/findit-ai/mediadecode/releases/tag/mediadecode-ffmpeg-v0.3.2
+[0.3.2]: https://github.com/findit-studio/mediadecode/releases/tag/mediadecode-ffmpeg-v0.3.2
 
 ## [0.3.1] - 2026-06-14
 
-Additive release ([#10](https://github.com/Findit-AI/mediadecode/pull/10)).
+Additive release ([#10](https://github.com/findit-studio/mediadecode/pull/10)).
 
 ### Added
 
@@ -210,14 +210,14 @@ Additive release ([#10](https://github.com/Findit-AI/mediadecode/pull/10)).
   same release — see
   [`mediadecode` 0.3.1](../mediadecode/CHANGELOG.md#031---2026-06-14).
 
-[0.3.1]: https://github.com/findit-ai/mediadecode/releases/tag/mediadecode-ffmpeg-v0.3.1
+[0.3.1]: https://github.com/findit-studio/mediadecode/releases/tag/mediadecode-ffmpeg-v0.3.1
 
 ## [0.3.0] - 2026-06-07
 
 Tracks `mediadecode` 0.3.0, which flips the shared vocabulary crate from
 `videoframe` 0.2 to `mediaframe` 0.1
-([#7](https://github.com/Findit-AI/mediadecode/pull/7),
-[#8](https://github.com/Findit-AI/mediadecode/pull/8)). See
+([#7](https://github.com/findit-studio/mediadecode/pull/7),
+[#8](https://github.com/findit-studio/mediadecode/pull/8)). See
 [`mediadecode` 0.3.0](../mediadecode/CHANGELOG.md#030---2026-06-07) for
 what moved in the vocabulary itself.
 
@@ -235,7 +235,7 @@ what moved in the vocabulary itself.
 
 - Version bumped to 0.3.0 with the rest of the workspace.
 
-[0.3.0]: https://github.com/findit-ai/mediadecode/releases/tag/mediadecode-ffmpeg-v0.3.0
+[0.3.0]: https://github.com/findit-studio/mediadecode/releases/tag/mediadecode-ffmpeg-v0.3.0
 
 ## [0.2.0] - 2026-05-15
 
@@ -294,13 +294,13 @@ shape and updates the type aliases the crate re-exports.
 - **`Debug` impl for `Frame`** — manual `core::fmt::Debug` impl
   showing dimensions / format so the only public type previously
   without `Debug` is now printable.
-  Closes [issue #4 — finding 2](https://github.com/Findit-AI/mediadecode/issues/4).
+  Closes [issue #4 — finding 2](https://github.com/findit-studio/mediadecode/issues/4).
 - **`#[must_use]`** on every consuming `with_*` builder method
   across the crate's public surface.
-  Closes [issue #4 — finding 3](https://github.com/Findit-AI/mediadecode/issues/4).
+  Closes [issue #4 — finding 3](https://github.com/findit-studio/mediadecode/issues/4).
 
-[0.1.0]: https://github.com/findit-ai/mediadecode/releases/tag/mediadecode-ffmpeg-v0.1.0
-[0.2.0]: https://github.com/findit-ai/mediadecode/releases/tag/mediadecode-ffmpeg-v0.2.0
+[0.1.0]: https://github.com/findit-studio/mediadecode/releases/tag/mediadecode-ffmpeg-v0.1.0
+[0.2.0]: https://github.com/findit-studio/mediadecode/releases/tag/mediadecode-ffmpeg-v0.2.0
 
 ## [0.1.0] - 2026-05-09
 

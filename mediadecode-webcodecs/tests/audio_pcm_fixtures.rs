@@ -24,7 +24,7 @@
 //! headless Chrome, and decode is sample-shuffling so each clip
 //! finishes in tens of milliseconds.
 //!
-//! [1]: https://github.com/findit-ai/audio-fixtures
+//! [1]: https://github.com/findit-studio/audio-fixtures
 #![cfg(target_arch = "wasm32")]
 
 use mediadecode::{

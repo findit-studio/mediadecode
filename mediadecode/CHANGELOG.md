@@ -103,7 +103,7 @@ what follows is only what changes **here**.
 
 - Version bumped to 0.4.0. The sibling adapters move to 0.4.0 with it.
 - **Fifteen `channel::ChannelLayoutKind` renderings move**
-  ([#19](https://github.com/Findit-AI/mediadecode/pull/19)). The
+  ([#19](https://github.com/findit-studio/mediadecode/pull/19)). The
   multi-word names are hyphenated rather than spaced, so `Display` (and
   the new `as_str`) now print `"stereo-downmix"`, `"5.1-back"`,
   `"7.1-wide-back"` where they printed `"stereo downmix"`, `"5.1 back"`,
@@ -119,7 +119,7 @@ what follows is only what changes **here**.
 ### Added
 
 - **A text form for the two `channel` vocabularies**
-  ([#19](https://github.com/Findit-AI/mediadecode/pull/19)).
+  ([#19](https://github.com/findit-studio/mediadecode/pull/19)).
   `ChannelLayoutKind` and `AudioChannelOrderKind` gain a `const fn
   as_str` returning a canonical lowercase slug, `FromStr` reading it
   back, and one error type each — `ParseChannelLayoutKindError` /
@@ -131,7 +131,7 @@ what follows is only what changes **here**.
   no-`alloc` tier where both enums live. The numeric doors (`to_u32` /
   `as_u32` / `from_u32`) are unchanged and stay the compact form.
 - **`serde` / `arbitrary` / `quickcheck` for those two vocabularies**
-  ([#19](https://github.com/Findit-AI/mediadecode/pull/19)). Before
+  ([#19](https://github.com/findit-studio/mediadecode/pull/19)). Before
   this, all three features compiled and no type in the crate
   implemented anything. serde carries them as their slug rather than
   their `u32` code: an unrecognised name is a deserialization error,
@@ -152,11 +152,11 @@ what follows is only what changes **here**.
   mediadecode parses none of those vocabularies, calls no conversion
   kernel, and its `serde` feature does not reach mediaframe.
 
-[0.4.0]: https://github.com/findit-ai/mediadecode/releases/tag/mediadecode-v0.4.0
+[0.4.0]: https://github.com/findit-studio/mediadecode/releases/tag/mediadecode-v0.4.0
 
 ## [0.3.1] - 2026-06-14
 
-Additive release ([#10](https://github.com/Findit-AI/mediadecode/pull/10)).
+Additive release ([#10](https://github.com/findit-studio/mediadecode/pull/10)).
 
 ### Added
 
@@ -170,7 +170,7 @@ Additive release ([#10](https://github.com/Findit-AI/mediadecode/pull/10)).
   release — see
   [`mediadecode-ffmpeg` 0.3.1](../mediadecode-ffmpeg/CHANGELOG.md#031---2026-06-14).
 
-[0.3.1]: https://github.com/findit-ai/mediadecode/releases/tag/mediadecode-v0.3.1
+[0.3.1]: https://github.com/findit-studio/mediadecode/releases/tag/mediadecode-v0.3.1
 
 ## [0.3.0] - 2026-06-07
 
@@ -178,8 +178,8 @@ The shared vocabulary crate is renamed: `videoframe` 0.2 became
 `mediaframe` 0.1 when its charter broadened from pixel/frame to all
 media-stream vocabulary, and the old `videoframe` 0.x line is yanked.
 mediadecode flips in lockstep
-([#7](https://github.com/Findit-AI/mediadecode/pull/7),
-[#8](https://github.com/Findit-AI/mediadecode/pull/8)). Because the
+([#7](https://github.com/findit-studio/mediadecode/pull/7),
+[#8](https://github.com/findit-studio/mediadecode/pull/8)). Because the
 re-exported types *are* mediadecode's public surface, a rename upstream
 is a break here even where this crate's own spellings do not move.
 
@@ -212,7 +212,7 @@ is a break here even where this crate's own spellings do not move.
 - Version bumped to 0.3.0 — pre-1.0 SemVer puts a breaking change in
   the minor. All three workspace members move together.
 
-[0.3.0]: https://github.com/findit-ai/mediadecode/releases/tag/mediadecode-v0.3.0
+[0.3.0]: https://github.com/findit-studio/mediadecode/releases/tag/mediadecode-v0.3.0
 
 ## [0.2.0] - 2026-05-15
 
@@ -310,9 +310,9 @@ re-exports.
   `AudioFrame::new` asserts `plane_count <= 8`. Previously,
   out-of-range values would panic later inside `planes()` /
   `samples()`; now they fail-fast at construction.
-  Closes [issue #4 — finding 1](https://github.com/Findit-AI/mediadecode/issues/4).
+  Closes [issue #4 — finding 1](https://github.com/findit-studio/mediadecode/issues/4).
 
-[0.2.0]: https://github.com/findit-ai/mediadecode/releases/tag/mediadecode-v0.2.0
+[0.2.0]: https://github.com/findit-studio/mediadecode/releases/tag/mediadecode-v0.2.0
 
 ## [0.1.0] - 2026-05-09
 
@@ -357,4 +357,4 @@ Initial public release.
 - **Optional features.** `serde`, `arbitrary`, `quickcheck` (each
   forwards to `mediatime`'s matching feature).
 
-[0.1.0]: https://github.com/findit-ai/mediadecode/releases/tag/mediadecode-v0.1.0
+[0.1.0]: https://github.com/findit-studio/mediadecode/releases/tag/mediadecode-v0.1.0

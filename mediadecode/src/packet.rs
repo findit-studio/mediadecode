@@ -573,6 +573,15 @@ mod tests {
   // an allocator; the impls themselves compile at every tier.
   #[cfg(all(feature = "serde", any(feature = "alloc", feature = "std")))]
   mod serde_tests {
+    // The crate root links `alloc` under the name `std` (the workspace's
+    // alloc-as-std alias), so `alloc` has to be named here to reach
+    // `ToString` — which the std prelude would otherwise have supplied.
+    // Both this and the `use` are valid under `std` too, hence no `cfg`:
+    // the enclosing module is already gated on `alloc` or `std`.
+    extern crate alloc;
+
+    use alloc::string::ToString;
+
     use super::*;
 
     #[test]

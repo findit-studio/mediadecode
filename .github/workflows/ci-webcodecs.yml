@@ -95,7 +95,7 @@ jobs:
     - uses: actions/checkout@v7
       with:
         # Audio fixtures live at `tests/fixtures/audio/` as a
-        # submodule pointing at `findit-ai/audio-fixtures`
+        # submodule pointing at `findit-studio/audio-fixtures`
         # (~283 MiB of mono 16 kHz pcm_s16le clips).
         submodules: recursive
     - name: Cache cargo build and registry

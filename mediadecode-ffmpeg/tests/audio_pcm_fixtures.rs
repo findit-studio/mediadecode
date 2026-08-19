@@ -19,7 +19,7 @@
 //! yet, while CI (always-`submodules: recursive`) exercises the
 //! full sweep.
 //!
-//! [1]: https://github.com/findit-ai/audio-fixtures
+//! [1]: https://github.com/findit-studio/audio-fixtures
 
 use std::{num::NonZeroI32, path::PathBuf};
 

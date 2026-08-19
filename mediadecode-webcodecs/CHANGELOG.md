@@ -42,12 +42,12 @@ behaviour changes.
 - README: the install snippet said the crate was unpublished and
   pinned `"0.0"`; it has been on crates.io since 0.3.1. Now `"0.4"`.
 
-[0.4.0]: https://github.com/findit-ai/mediadecode/releases/tag/mediadecode-webcodecs-v0.4.0
+[0.4.0]: https://github.com/findit-studio/mediadecode/releases/tag/mediadecode-webcodecs-v0.4.0
 
 ## [0.3.1] - 2026-06-14
 
 Version-tracking release
-([#10](https://github.com/Findit-AI/mediadecode/pull/10)). No adapter
+([#10](https://github.com/findit-studio/mediadecode/pull/10)). No adapter
 source changed.
 
 ### Changed
@@ -56,14 +56,14 @@ source changed.
   `AudioFrame` — see
   [`mediadecode` 0.3.1](../mediadecode/CHANGELOG.md#031---2026-06-14).
 
-[0.3.1]: https://github.com/findit-ai/mediadecode/releases/tag/mediadecode-webcodecs-v0.3.1
+[0.3.1]: https://github.com/findit-studio/mediadecode/releases/tag/mediadecode-webcodecs-v0.3.1
 
 ## [0.3.0] - 2026-06-07
 
 Tracks `mediadecode` 0.3.0, which flips the shared vocabulary crate from
 `videoframe` 0.2 to `mediaframe` 0.1
-([#7](https://github.com/Findit-AI/mediadecode/pull/7),
-[#8](https://github.com/Findit-AI/mediadecode/pull/8)). No adapter source
+([#7](https://github.com/findit-studio/mediadecode/pull/7),
+[#8](https://github.com/findit-studio/mediadecode/pull/8)). No adapter source
 changed — but the vocabulary this crate re-exports through its frame
 types is a different crate's now, so the release is breaking for its
 consumers all the same. See
@@ -77,12 +77,12 @@ consumers all the same. See
 
 - Version bumped to 0.3.0 with the rest of the workspace.
 
-[0.3.0]: https://github.com/findit-ai/mediadecode/releases/tag/mediadecode-webcodecs-v0.3.0
+[0.3.0]: https://github.com/findit-studio/mediadecode/releases/tag/mediadecode-webcodecs-v0.3.0
 
 ## [0.2.0] - 2026-05-15
 
 Tracks the `mediadecode` 0.2.0 / `videoframe` 0.2 cutover
-([#5](https://github.com/Findit-AI/mediadecode/pull/5)).
+([#5](https://github.com/findit-studio/mediadecode/pull/5)).
 
 ### Changed
 
@@ -97,15 +97,15 @@ Tracks the `mediadecode` 0.2.0 / `videoframe` 0.2 cutover
 - New `tests/native_stub.rs` — verifies the crate compiles to an
   empty stub on non-wasm32 targets and that no wasm-only names
   leak through. Closes
-  [issue #4 — finding 4](https://github.com/Findit-AI/mediadecode/issues/4).
+  [issue #4 — finding 4](https://github.com/findit-studio/mediadecode/issues/4).
 
-[0.2.0]: https://github.com/findit-ai/mediadecode/releases/tag/mediadecode-webcodecs-v0.2.0
+[0.2.0]: https://github.com/findit-studio/mediadecode/releases/tag/mediadecode-webcodecs-v0.2.0
 
 ## [0.0.0] - 2026-05-15
 
 Placeholder publish — the name is reserved and the shape is scaffolded;
 there is no public API yet
-([#3](https://github.com/Findit-AI/mediadecode/pull/3)).
+([#3](https://github.com/findit-studio/mediadecode/pull/3)).
 
 ### Added
 
@@ -114,4 +114,4 @@ there is no public API yet
   `docs/superpowers/specs/2026-05-09-webcodecs-design.md`.
   Public API lands in a subsequent release.
 
-[0.0.0]: https://github.com/findit-ai/mediadecode/releases/tag/mediadecode-webcodecs-v0.0.0
+[0.0.0]: https://github.com/findit-studio/mediadecode/releases/tag/mediadecode-webcodecs-v0.0.0

@@ -10,13 +10,13 @@ members = [
 edition      = "2024"
 rust-version = "1.95.0"
 license      = "MIT OR Apache-2.0"
-repository   = "https://github.com/findit-ai/mediadecode"
-homepage     = "https://github.com/findit-ai/mediadecode"
+repository   = "https://github.com/findit-studio/mediadecode"
+homepage     = "https://github.com/findit-studio/mediadecode"
 
 [workspace.dependencies]
 # Workspace-internal crates — referenced by sibling members via workspace inheritance.
 mediadecode = { version = "0.4", path = "mediadecode", default-features = false }
-mediaframe  = { version = "0.3", default-features = false, features = ["frame"] }
+mediaframe  = { version = "0.4", default-features = false, features = ["frame"] }
 
 # External deps used by more than one member, pinned at the workspace level.
 mediatime   = { version = "0.3", default-features = false }
