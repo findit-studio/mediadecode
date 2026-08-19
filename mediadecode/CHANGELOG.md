@@ -11,6 +11,8 @@ The sibling FFmpeg adapter has its own log at
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-19
+
 ### Added
 
 - **The three optional matrices reach every type that owns a wire
@@ -35,8 +37,6 @@ The sibling FFmpeg adapter has its own log at
   `bitflags!` body, which `PacketFlags` does not carry), and its wire
   shape is a flag grammar — `"KEY | CORRUPT"` — in any human-readable
   format, which is not the shape `PacketFlags` takes.
-
-## [0.4.0]
 
 Both public dependencies cross **two** breaking minors at once:
 `mediatime` 0.1 → 0.3 and `mediaframe` 0.1 → 0.3. Neither is an
