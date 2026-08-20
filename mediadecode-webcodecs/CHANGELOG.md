@@ -11,6 +11,14 @@ The backend-agnostic core it adapts has its own log at
 
 ## [Unreleased]
 
+## [0.5.0]
+
+Tracks `mediadecode` 0.5.0, which crosses `mediaframe` 0.4 → 0.5 — a
+breaking minor in a public dependency whose `PixelFormat` and `color`
+types this adapter re-exports. See
+[`mediadecode` 0.5.0](../mediadecode/CHANGELOG.md#050). No adapter
+source line moved and no adapter behaviour changes.
+
 ## [0.4.0] - 2026-08-19
 
 Tracks `mediadecode` 0.4.0, which crosses `mediatime` 0.1 → 0.3 and
