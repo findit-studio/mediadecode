@@ -11,6 +11,26 @@ The backend-agnostic core it adapts has its own log at
 
 ## [Unreleased]
 
+## [0.5.0]
+
+Tracks `mediadecode` 0.5.0, which crosses `mediaframe` 0.4 → 0.5 — a
+breaking minor. `mediaframe` is a public dependency of the core crate
+and its `PixelFormat` and `color` types appear in this adapter's own
+signatures (`convert`, `pixdesc`, `frame`), so this adapter's
+re-exported surface moves with it. See
+[`mediadecode` 0.5.0](../mediadecode/CHANGELOG.md#050).
+
+Nothing about the FFmpeg boundary's behaviour changes, and no source
+line moved. The version bump is the public-dependency crossing, not a
+change of conduct: `mediaframe` 0.5 adds no pixel-format or colour
+variant, so this crate's exhaustive maps over `PixelFormat` — which
+would have been `E0004` had one appeared — are unchanged, and the
+FFmpeg constant tables still round-trip.
+
+Two upstream conveniences arrive for free: the re-exported vocabularies
+carry `ROSTER`, and `BayerPattern` is closed, so a downstream matching
+it can drop its wildcard arm.
+
 ## [0.4.0] - 2026-08-19
 
 ### Changed (BREAKING)

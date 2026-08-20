@@ -11,6 +11,67 @@ The sibling FFmpeg adapter has its own log at
 
 ## [Unreleased]
 
+## [0.5.0]
+
+Tracks `mediaframe` 0.4 → 0.5, a breaking minor. No `mediadecode`
+source line changed: the whole diff is the pin, the version and this
+note. It is still breaking, because `mediaframe` is a **public**
+dependency — `color`, `pixel_format`, `cfa` and `frame` are re-export
+modules — so a downstream that still spells `mediaframe` 0.4 gets
+`expected ColorMatrix, found Matrix`, with the compiler adding "there
+are multiple different versions of crate `mediaframe` in the
+dependency graph". Bump `mediaframe` in lockstep and that error goes
+away.
+
+### Changed (BREAKING)
+
+- **`mediaframe` 0.4 → 0.5**, at the same pin as before
+  (`default-features = false`, `frame` — the no-alloc tier). Upstream
+  breaks on three counts; here is where each one lands.
+
+  - **`FromStr::Err` is `Infallible` at the alloc / std tier** for ten
+    vocabularies, six of which this crate re-exports
+    (`pixel_format::PixelFormat` and `color`'s `Matrix`, `Primaries`,
+    `Transfer`, `DynamicRange`, `ChromaLocation`). At *this* crate's
+    pin nothing moves — the parse still returns
+    `ParsePixelFormatError` / `ParseMatrixError`, because the escape
+    arm those errors exist for is `alloc`-gated and this crate does
+    not enable `alloc` on `mediaframe`. But the tier is not this
+    crate's to fix: any dependency anywhere in the graph that turns on
+    `mediaframe/alloc` unifies the feature and flips the re-exported
+    associated type to `core::convert::Infallible`. Code that names
+    the old error through a `mediadecode::` path — a `match` arm, a
+    `From` impl, an annotated binding — moves the way upstream
+    describes; code that only propagated it needs nothing.
+  - **`subtitle::TrackOrigin` opened** (no longer `Copy`, `as_str` no
+    longer `const fn -> &'static str`, `to_u32` returns `Option<u32>`,
+    both wire forms changed) — **not reachable from here**.
+    `mediaframe`'s `subtitle` module is compiled only at the `alloc`
+    tier, and this crate neither enables it nor re-exports it. The
+    `to_u32` and `Parse*Error` names that do appear in this crate are
+    its own — `channel::ChannelLayoutKind`, `channel::AudioChannelOrderKind`
+    — and are untouched.
+  - **`subtitle::Format::PgsSub` merged into `HdmvPgs`** — likewise
+    not reachable; this crate names neither.
+
+### Added
+
+- **`ROSTER` on the re-exported open vocabularies.**
+  `mediadecode::pixel_format::PixelFormat` and the five re-exported
+  `color` enums gain `pub const ROSTER: &'static [Self]`, upstream's
+  declaration-order list of the named variants, excluding the open
+  escape. It is available at this crate's no-alloc pin. Consumers that
+  were hand-copying one of these vocabularies can read the list
+  instead.
+
+### Changed
+
+- **`cfa::BayerPattern` is closed.** Upstream removed
+  `#[non_exhaustive]`, so a downstream matching
+  `mediadecode::cfa::BayerPattern` may now drop its wildcard arm and
+  get a completeness proof from the compiler. Existing matches keep
+  compiling; this only removes a restriction.
+
 ## [0.4.0] - 2026-08-19
 
 ### Added
