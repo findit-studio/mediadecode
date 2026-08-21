@@ -331,7 +331,8 @@ impl<P, E, D> VideoFrame<P, E, D> {
 ///
 /// Generic parameters:
 /// - `S` — sample-format identifier.
-/// - `C` — channel layout (e.g. `mediadecode::channel::AudioChannelLayout`).
+/// - `C` — channel layout (e.g.
+///   `mediaframe::audio::ChannelLayoutDescription`).
 /// - `E` — backend-specific frame extras.
 /// - `D` — plane data buffer type (`D: AsRef<[u8]>` at the use site).
 ///

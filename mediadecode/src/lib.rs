@@ -14,24 +14,11 @@
 #[allow(unused_extern_crates)]
 extern crate alloc as std;
 
-// Test-only re-extern with `#[macro_use]` so `#[cfg(test)]` modules
-// can use `vec!` / `format!` / `write!` under
-// `--no-default-features --features alloc` (the std prelude that
-// normally provides those macros is gone). `#[macro_use]` on the
-// non-test alias would be flagged as `unused_imports` by `-Dwarnings`
-// because the lib code itself doesn't use the macros — keeping it
-// `cfg(test)`-scoped sidesteps that lint.
-#[cfg(all(test, not(feature = "std"), feature = "alloc"))]
-#[allow(unused_extern_crates)]
-#[macro_use]
-extern crate alloc as alloc_test_macros;
-
 #[cfg(feature = "std")]
 extern crate std;
 
 pub mod adapter;
 pub mod cfa;
-pub mod channel;
 pub mod color;
 pub mod decoder;
 pub mod frame;

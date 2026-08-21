@@ -83,23 +83,23 @@ the rest of the findit-studio workspace uses:
 | `arbitrary`  |    —    | `Arbitrary` impls for fuzzing, same coverage.                 |
 | `quickcheck` |    —    | The same coverage again, for `quickcheck`.                    |
 
-The three optional matrices cover the same types, and each type's wire
-shape follows what it *is*:
+The three optional matrices cover the same type, and its wire shape
+follows what it *is*:
 
 | Type | Tier | serde wire shape |
 | ---- | ---- | ---------------- |
-| `channel::ChannelLayoutKind`     | any     | canonical slug — `"5.1"`, `"7.1-wide-back"` |
-| `channel::AudioChannelOrderKind` | any     | canonical slug — `"native"`, `"ambisonic"`  |
-| `channel::AudioChannelSpec`      | `alloc` | map of its accessor names                   |
-| `channel::AudioChannelLayout`    | `alloc` | map of its accessor names                   |
 | `packet::PacketFlags`            | any     | the raw bits, as a number                   |
 
-A **name vocabulary** travels as its name: an unrecognised slug is a
-deserialization error, where an unrecognised `u32` code would decode to
-`Unknown` / `Unspecified` and invent a value. A **bit set** travels as a
-number, because every bit pattern is meaningful and bits this build has
-no constant for still have to survive the round trip. A **record**
-travels as its fields, each in its own shape.
+A **bit set** travels as a number, because every bit pattern is
+meaningful and bits this build has no constant for still have to survive
+the round trip.
+
+The audio channel-layout vocabulary this crate used to own —
+`ChannelLayoutKind`, `AudioChannelOrderKind`, `AudioChannelSpec`,
+`AudioChannelLayout` — now lives in
+[`mediaframe::audio`](https://docs.rs/mediaframe/latest/mediaframe/audio/),
+whose wire shapes are documented there. `AudioFrame`'s channel-layout
+parameter is generic, so this crate names no channel type at all.
 
 `no_std` builds: disable defaults and pick `alloc` if you need
 `Vec`-backed payloads:
