@@ -15,11 +15,11 @@ use ffmpeg_next::ffi::{
 };
 use mediadecode::{
   PixelFormat, Timebase, Timestamp,
-  channel::AudioChannelLayout,
   color::{ChromaLocation, ColorInfo, ColorMatrix, ColorPrimaries, ColorRange, ColorTransfer},
   frame::{AudioFrame, Dimensions, Plane, Rect, SubtitleFrame, VideoFrame},
   subtitle::SubtitlePayload,
 };
+use mediaframe::audio::ChannelLayoutDescription;
 use smol_str::SmolStr;
 
 use crate::{
@@ -132,8 +132,10 @@ pub fn video_frame_from(
 pub fn audio_frame_from(
   frame: &ffmpeg_next::frame::Audio,
   time_base: Timebase,
-) -> Result<AudioFrame<SampleFormat, AudioChannelLayout, AudioFrameExtra, FfmpegBuffer>, ConvertError>
-{
+) -> Result<
+  AudioFrame<SampleFormat, ChannelLayoutDescription, AudioFrameExtra, FfmpegBuffer>,
+  ConvertError,
+> {
   // SAFETY: `&frame` keeps the AVFrame alive for the duration of this
   // call.
   unsafe { av_frame_to_audio_frame(frame.as_ptr(), time_base) }
@@ -800,15 +802,18 @@ fn map_chroma_loc(raw: i32) -> ChromaLocation {
 pub unsafe fn av_frame_to_audio_frame(
   av_frame: *const AVFrame,
   time_base: Timebase,
-) -> Result<AudioFrame<SampleFormat, AudioChannelLayout, AudioFrameExtra, FfmpegBuffer>, ConvertError>
-{
+) -> Result<
+  AudioFrame<SampleFormat, ChannelLayoutDescription, AudioFrameExtra, FfmpegBuffer>,
+  ConvertError,
+> {
   if av_frame.is_null() {
     return Err(ConvertError::NullFrame);
   }
   // Same stance as `av_frame_to_video_frame`: never form `&AVFrame`.
   // Read every field through the raw pointer; for `ch_layout` (which
   // contains an `order: AVChannelOrder` enum) we hand the raw pointer
-  // straight into `channel_layout::audio_channel_layout_from_raw_ptr`,
+  // straight into
+  // `channel_layout::channel_layout_description_from_raw_ptr`,
   // which validates `order` as `i32` before constructing any
   // `AVChannelOrder` value.
   let format_raw = unsafe { (*av_frame).format };
@@ -827,7 +832,7 @@ pub unsafe fn av_frame_to_audio_frame(
   // is sound because `addr_of!` doesn't form a reference.
   let ch_layout_ptr = unsafe { addr_of!((*av_frame).ch_layout) };
   let channel_layout =
-    unsafe { crate::channel_layout::audio_channel_layout_from_raw_ptr(ch_layout_ptr) };
+    unsafe { crate::channel_layout::channel_layout_description_from_raw_ptr(ch_layout_ptr) };
   let channel_count_full = channel_layout.channels();
   let channel_count = channel_count_full.min(255) as u8;
 

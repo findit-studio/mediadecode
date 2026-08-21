@@ -16,7 +16,7 @@ default = ["std"]
 # `std` adds `mediadecode/default` (the core's `std` feature)
 # on top of `mediadecode/alloc` already pinned via dep
 # features below. The adapter unconditionally uses
-# alloc-gated types (`AudioChannelLayout`,
+# alloc-gated types (`mediaframe::audio::ChannelLayoutDescription`,
 # `SubtitlePayload::Bitmap`, etc.) so `alloc` cannot be
 # optional — pinning it via the dep features keeps
 # `--no-default-features` builds compiling.
@@ -25,6 +25,11 @@ alloc   = []
 
 [dependencies]
 mediadecode = { workspace = true, features = ["alloc"] }
+# The channel-layout vocabulary this adapter produces lives in
+# `mediaframe::audio`, which is compiled only at the alloc-or-std
+# tier — hence the unconditional `alloc`, the same shape as the
+# `mediadecode` pin above.
+mediaframe  = { workspace = true, features = ["alloc"] }
 ffmpeg-next = { workspace = true }
 smol_str    = { workspace = true }
 thiserror   = { workspace = true }
