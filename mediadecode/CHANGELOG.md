@@ -11,6 +11,8 @@ The sibling FFmpeg adapter has its own log at
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-21
+
 ### Removed (BREAKING)
 
 - **The `channel` module is gone, whole.** `ChannelLayoutKind`,
