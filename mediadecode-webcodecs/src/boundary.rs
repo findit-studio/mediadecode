@@ -12,10 +12,10 @@
 #![cfg(target_arch = "wasm32")]
 
 use mediadecode::{
-  channel::AudioChannelLayout,
   frame::{AudioFrame, Dimensions, Plane, VideoFrame},
   pixel_format::PixelFormat,
 };
+use mediaframe::audio::ChannelLayoutDescription;
 
 use crate::{
   buffer::WebCodecsBuffer,
@@ -52,7 +52,7 @@ pub fn empty_video_frame() -> VideoFrame<PixelFormat, VideoFrameExtra, WebCodecs
 /// representative choice — the adapter overwrites it before the
 /// frame is observable).
 pub fn empty_audio_frame()
--> AudioFrame<SampleFormat, AudioChannelLayout, AudioFrameExtra, WebCodecsBuffer> {
+-> AudioFrame<SampleFormat, ChannelLayoutDescription, AudioFrameExtra, WebCodecsBuffer> {
   let planes = [
     Plane::new(WebCodecsBuffer::empty(), 0),
     Plane::new(WebCodecsBuffer::empty(), 0),
@@ -68,7 +68,7 @@ pub fn empty_audio_frame()
     0,
     0,
     SampleFormat::S16,
-    AudioChannelLayout::new(0),
+    ChannelLayoutDescription::new(0),
     planes,
     0,
     AudioFrameExtra::new(false),

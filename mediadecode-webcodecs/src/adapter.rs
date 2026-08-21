@@ -2,9 +2,9 @@
 
 use mediadecode::{
   adapter::{AudioAdapter, VideoAdapter},
-  channel::AudioChannelLayout,
   pixel_format::PixelFormat,
 };
+use mediaframe::audio::ChannelLayoutDescription;
 
 use crate::{
   codec_id::{AudioCodecId, VideoCodecId},
@@ -37,7 +37,7 @@ impl AudioAdapter for WebCodecs {
   /// the appropriate `mediadecode::sample_format::SampleFormat`
   /// at frame boundary.
   type SampleFormat = SampleFormat;
-  type ChannelLayout = AudioChannelLayout;
+  type ChannelLayout = ChannelLayoutDescription;
   type PacketExtra = AudioPacketExtra;
   type FrameExtra = AudioFrameExtra;
 }

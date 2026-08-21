@@ -14,9 +14,10 @@ categories    = ["multimedia", "multimedia::video", "multimedia::audio", "wasm"]
 [features]
 default = ["std"]
 # `mediadecode/alloc` is pinned via the dep features below
-# (the adapter uses `AudioChannelLayout` / alloc-gated types
-# unconditionally), so the `alloc` feature here is a
-# compatibility no-op. Same shape as `mediadecode-ffmpeg`.
+# (the adapter uses `mediaframe::audio::ChannelLayoutDescription`
+# and other alloc-gated types unconditionally), so the `alloc`
+# feature here is a compatibility no-op. Same shape as
+# `mediadecode-ffmpeg`.
 std     = ["mediadecode/default"]
 alloc   = []
 
@@ -29,6 +30,9 @@ alloc   = []
 # traits, not the sync ones.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 mediadecode    = { workspace = true, features = ["alloc", "future"] }
+# The channel-layout vocabulary this adapter binds lives in
+# `mediaframe::audio`, compiled only at the alloc-or-std tier.
+mediaframe     = { workspace = true, features = ["alloc"] }
 wasm-bindgen   = { workspace = true }
 js-sys         = { workspace = true }
 web-sys        = { workspace = true, features = [
