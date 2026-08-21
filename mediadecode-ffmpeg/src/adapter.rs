@@ -9,8 +9,8 @@
 use mediadecode::{
   PixelFormat,
   adapter::{AudioAdapter, SubtitleAdapter, VideoAdapter},
-  channel::AudioChannelLayout,
 };
+use mediaframe::audio::ChannelLayoutDescription;
 
 use crate::{
   codec_id::CodecId,
@@ -40,7 +40,7 @@ impl VideoAdapter for Ffmpeg {
 impl AudioAdapter for Ffmpeg {
   type CodecId = CodecId;
   type SampleFormat = SampleFormat;
-  type ChannelLayout = AudioChannelLayout;
+  type ChannelLayout = ChannelLayoutDescription;
   type PacketExtra = AudioPacketExtra;
   type FrameExtra = AudioFrameExtra;
 }
