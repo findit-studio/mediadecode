@@ -13,12 +13,12 @@ categories = ["multimedia", "multimedia::video", "multimedia::audio", "no-std", 
 
 [features]
 default = ["std"]
-# `serde?/alloc` and `serde?/std` are what let the two alloc-tier structs
-# derive `Deserialize`: their `Vec` and `SmolStr` fields sit behind serde's
-# own capability features. The `?` keeps serde out of the build entirely
-# when this crate's `serde` feature is off.
-alloc   = ["smol_str", "serde?/alloc"]
-std     = ["mediatime/default", "smol_str/default", "serde?/std"]
+# `serde?/alloc` and `serde?/std` keep serde's own capability tier in
+# step with this crate's, so a type that gains an owning payload at one
+# of them can still derive `Deserialize`. The `?` keeps serde out of the
+# build entirely when this crate's `serde` feature is off.
+alloc   = ["serde?/alloc"]
+std     = ["mediatime/default", "serde?/std"]
 
 # Async-fn-in-trait variants of the decoder traits, exposed under
 # `mediadecode::future`. No runtime dependency — only a proc-macro
@@ -31,8 +31,8 @@ future = ["dep:trait-variant"]
 # `PacketFlags` does not carry) and its wire shape is a flag *grammar*
 # — `"KEY | CORRUPT"` — in any human-readable format. `PacketFlags`
 # serializes as its bits instead, hand-written in `packet::serde_impls`.
-serde      = ["dep:serde", "mediatime/serde", "smol_str?/serde"]
-arbitrary  = ["dep:arbitrary", "mediatime/arbitrary", "smol_str?/arbitrary"]
+serde      = ["dep:serde", "mediatime/serde"]
+arbitrary  = ["dep:arbitrary", "mediatime/arbitrary"]
 quickcheck = ["dep:quickcheck", "mediatime/quickcheck"]
 
 [dependencies]
@@ -40,7 +40,6 @@ mediatime   = { workspace = true }
 bitflags    = { workspace = true }
 derive_more = { workspace = true, features = ["display", "is_variant"] }
 thiserror   = { workspace = true }
-smol_str    = { workspace = true, optional = true }
 mediaframe  = { workspace = true }
 
 serde      = { workspace = true, optional = true }

@@ -13,10 +13,8 @@
 //! across decoder calls without copying.
 
 use ffmpeg_next::{codec::Parameters, frame};
-use mediadecode::{
-  Timebase, channel::AudioChannelLayout, decoder::AudioStreamDecoder, frame::AudioFrame,
-  packet::AudioPacket,
-};
+use mediadecode::{Timebase, decoder::AudioStreamDecoder, frame::AudioFrame, packet::AudioPacket};
+use mediaframe::audio::ChannelLayoutDescription;
 
 use crate::{
   Error, Ffmpeg, FfmpegBuffer, boundary,
@@ -85,7 +83,7 @@ impl AudioStreamDecoder for FfmpegAudioStreamDecoder {
 
   fn receive_frame(
     &mut self,
-    dst: &mut AudioFrame<SampleFormat, AudioChannelLayout, AudioFrameExtra, Self::Buffer>,
+    dst: &mut AudioFrame<SampleFormat, ChannelLayoutDescription, AudioFrameExtra, Self::Buffer>,
   ) -> Result<(), Self::Error> {
     self
       .decoder

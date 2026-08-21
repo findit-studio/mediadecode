@@ -11,11 +11,11 @@ use core::ffi::c_int;
 use ffmpeg_next::{Packet, ffi::AVPixelFormat};
 use mediadecode::{
   PixelFormat, Timestamp,
-  channel::AudioChannelLayout,
   frame::{AudioFrame, Dimensions, Plane, SubtitleFrame, VideoFrame},
   packet::{AudioPacket, PacketFlags as MdPacketFlags, SubtitlePacket, VideoPacket},
   subtitle::SubtitlePayload,
 };
+use mediaframe::audio::ChannelLayoutDescription;
 
 use crate::{
   FfmpegBuffer,
@@ -649,14 +649,14 @@ pub fn try_empty_video_frame() -> Option<VideoFrame<PixelFormat, VideoFrameExtra
 /// Panics on FFmpeg-side OOM. See [`try_empty_audio_frame`] for the
 /// fallible variant.
 pub fn empty_audio_frame()
--> AudioFrame<SampleFormat, AudioChannelLayout, AudioFrameExtra, FfmpegBuffer> {
+-> AudioFrame<SampleFormat, ChannelLayoutDescription, AudioFrameExtra, FfmpegBuffer> {
   try_empty_audio_frame().expect("empty_audio_frame: av_buffer_alloc returned null (OOM)")
 }
 
 /// Fallible counterpart to [`empty_audio_frame`]. Returns `None` if
 /// any of the eight placeholder allocations fails.
 pub fn try_empty_audio_frame()
--> Option<AudioFrame<SampleFormat, AudioChannelLayout, AudioFrameExtra, FfmpegBuffer>> {
+-> Option<AudioFrame<SampleFormat, ChannelLayoutDescription, AudioFrameExtra, FfmpegBuffer>> {
   let planes = [
     Plane::new(FfmpegBuffer::try_empty()?, 0),
     Plane::new(FfmpegBuffer::try_empty()?, 0),
@@ -672,7 +672,7 @@ pub fn try_empty_audio_frame()
     0,
     0,
     SampleFormat::NONE,
-    AudioChannelLayout::default(),
+    ChannelLayoutDescription::default(),
     planes,
     0,
     AudioFrameExtra::default(),

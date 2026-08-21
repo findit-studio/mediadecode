@@ -11,6 +11,58 @@ The backend-agnostic core it adapts has its own log at
 
 ## [Unreleased]
 
+### Changed (BREAKING)
+
+- **`channel_layout`'s conversions produce `mediaframe::audio` types,
+  and are named after them.** `mediadecode::channel` is gone (see
+  [`mediadecode`](../mediadecode/CHANGELOG.md#unreleased)); the
+  vocabulary lives upstream now, and the `Kind` ornament is buried with
+  the enum it named.
+
+  | was | is | returns |
+  | --- | -- | ------- |
+  | `channel_layout_kind_from_ffmpeg` | `channel_layout_from_ffmpeg` | `ChannelLayout` |
+  | `audio_channel_order_kind_from_ffmpeg` | `channel_order_from_ffmpeg` | `ChannelOrder` |
+  | `audio_channel_order_kind_from_raw` | `channel_order_from_raw` | `ChannelOrder` |
+  | `audio_channel_layout_from_ffmpeg` | `channel_layout_description_from_ffmpeg` | `ChannelLayoutDescription` |
+  | `audio_channel_layout_from_raw_ptr` | `channel_layout_description_from_raw_ptr` | `ChannelLayoutDescription` |
+
+  The bodies are unchanged: same raw-pointer discipline (`order` is
+  read as `i32` before any `AVChannelOrder` value is formed), same
+  union guards, same `av_channel_layout_describe` buffer growth, same
+  UTF-8-lossy label decoding. Only the target vocabulary moves.
+  FFmpeg's own `ChannelLayout` is imported as `AvChannelLayout` inside
+  the module so the plain name belongs to what the functions produce.
+
+- **`AudioAdapter::ChannelLayout` and the `AudioFrame` alias bind
+  `mediaframe::audio::ChannelLayoutDescription`.** A caller that stored
+  a decoded layout in a type of its own re-spells that type; a caller
+  that only passed frames along needs nothing. The layout's *name* now
+  arrives as `ChannelLayout` rather than `ChannelLayoutKind`, the
+  absent case is `ChannelLayout::default()` (the `Other("")` sentinel)
+  rather than `ChannelLayoutKind::Unknown`, and FFmpeg's rendering is
+  read back with `text()` where it was `description()`.
+
+- **Three layout arms answer to different idents, and one is gone.**
+  Upstream's idents follow FFmpeg's constants except where a constant
+  names an arrangement no reader would recognise, so `SURROUND` is
+  `Ch3_0`, `AV_CH_LAYOUT_2_1` is `Ch3_0Back` and `AV_CH_LAYOUT_2_2` is
+  `QuadSide`. The `_7POINT1_TOP_BACK` arm is deleted outright:
+  `ffmpeg-next` defines that constant as an alias of
+  `AV_CH_LAYOUT_5POINT1POINT2_BACK`, which this table already matches
+  twelve arms earlier, so the arm could never be reached and the
+  variant it produced does not exist upstream.
+
+  Layouts the table still cannot name — `BINAURAL`, `_5POINT1POINT2`
+  (the side one) and `_9POINT1POINT6`, all three named by
+  `mediaframe::audio::ChannelLayout` — have no `ffmpeg_next`
+  `ChannelLayout` constant to match against, so they keep arriving as
+  the absent sentinel with FFmpeg's spelling preserved in `text()`,
+  exactly as before.
+
+- **`mediaframe` is a direct dependency**, pinned with `alloc`: the
+  audio household is compiled only at the alloc-or-std tier.
+
 ## [0.5.0]
 
 Tracks `mediadecode` 0.5.0, which crosses `mediaframe` 0.4 → 0.5 — a

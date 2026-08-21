@@ -31,8 +31,7 @@ pub use boundary::{
 };
 pub use buffer::FfmpegBuffer;
 pub use channel_layout::{
-  audio_channel_layout_from_ffmpeg, audio_channel_order_kind_from_ffmpeg,
-  channel_layout_kind_from_ffmpeg,
+  channel_layout_description_from_ffmpeg, channel_layout_from_ffmpeg, channel_order_from_ffmpeg,
 };
 pub use codec_id::CodecId;
 pub use decoder::VideoDecoder;
@@ -66,7 +65,7 @@ pub type VideoFrame =
 /// format / channel layout / extras / refcounted buffer.
 pub type AudioFrame = mediadecode::frame::AudioFrame<
   SampleFormat,
-  mediadecode::channel::AudioChannelLayout,
+  mediaframe::audio::ChannelLayoutDescription,
   extras::AudioFrameExtra,
   FfmpegBuffer,
 >;

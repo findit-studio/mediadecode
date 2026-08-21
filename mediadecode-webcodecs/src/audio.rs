@@ -17,11 +17,11 @@ use std::num::NonZeroI32;
 
 use mediadecode::{
   Timebase, Timestamp,
-  channel::AudioChannelLayout,
   frame::{AudioFrame, Plane},
   future::local::AudioStreamDecoder,
   packet::{AudioPacket, PacketFlags},
 };
+use mediaframe::audio::ChannelLayoutDescription;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 
@@ -584,7 +584,7 @@ impl AudioStreamDecoder for WebCodecsAudioStreamDecoder {
 
   async fn receive_frame(
     &mut self,
-    dst: &mut AudioFrame<SampleFormat, AudioChannelLayout, AudioFrameExtra, Self::Buffer>,
+    dst: &mut AudioFrame<SampleFormat, ChannelLayoutDescription, AudioFrameExtra, Self::Buffer>,
   ) -> Result<(), Self::Error> {
     let frame = wait_for_frame(&self.state, &self.decoder, self.eof).await?;
 
@@ -614,10 +614,10 @@ impl AudioStreamDecoder for WebCodecsAudioStreamDecoder {
       channel_count,
       format,
       // WebCodecs gives us a channel count but not a layout
-      // tag — `AudioChannelLayout::new(N)` produces a layout
-      // with the right channel count and `Unspecified` order
-      // (vs. `default()` which is 0-channel).
-      AudioChannelLayout::new(channel_count as u32),
+      // name — `ChannelLayoutDescription::new(N)` produces a
+      // description with the right channel count and `Unspecified`
+      // order (vs. `default()` which is 0-channel).
+      ChannelLayoutDescription::new(channel_count as u32),
       planes,
       plane_count,
       AudioFrameExtra::new(key),
