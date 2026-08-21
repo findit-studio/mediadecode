@@ -11,6 +11,37 @@ The backend-agnostic core it adapts has its own log at
 
 ## [Unreleased]
 
+### Added
+
+- **A layout that falls off the constant table now gets one more
+  chance: FFmpeg's own name for it.** `channel_layout_from_ffmpeg`
+  keeps its constant-arm table as the first and authoritative rung —
+  a mapped constant is answered there, byte for byte, and renders
+  nothing and parses nothing. Only on a miss does the adapter ask
+  `av_channel_layout_describe` what FFmpeg calls the layout and read
+  that word through `mediaframe::audio::ChannelLayout`'s `FromStr`,
+  the total door the vocabulary already exposes.
+
+  A named variant wins; anything the vocabulary does not name still
+  lands on the absent sentinel with FFmpeg's rendering in `text()`.
+  The rendering never rides `known_kind`'s `Other` escape, so
+  "unrecognised" stays one value rather than one per spelling.
+
+  What the rung reaches that the table cannot: `binaural`, `5.1.2`
+  and `9.1.6` — all three named by `ChannelLayout`, none of them
+  minted as an `ffmpeg_next` constant — plus FFmpeg 9's own `5.1.4`,
+  whose side-surround mask `ffmpeg_sys_next`'s bundled
+  `channel_layout_fixed.h` misses, its
+  `AV_CH_LAYOUT_5POINT1POINT4_BACK` still carrying FFmpeg 8's
+  back-surround formula. And, from here on, any layout a later
+  FFmpeg adds that the vocabulary already names, with no edit in
+  this crate: FFmpeg speaks the name, the vocabulary reads the word,
+  one source.
+
+  On the `ChannelLayoutDescription` path the layout is described
+  once and that single rendering feeds both `known_kind` and
+  `text`, so the two can never answer from different FFmpeg calls.
+
 ### Changed (BREAKING)
 
 - **`channel_layout`'s conversions produce `mediaframe::audio` types,
@@ -56,7 +87,8 @@ The backend-agnostic core it adapts has its own log at
   Layouts the table still cannot name — `BINAURAL`, `_5POINT1POINT2`
   (the side one) and `_9POINT1POINT6`, all three named by
   `mediaframe::audio::ChannelLayout` — have no `ffmpeg_next`
-  `ChannelLayout` constant to match against, so they keep arriving as
+  `ChannelLayout` constant to match against. The describe rung above
+  reaches them all the same; without it they would keep arriving as
   the absent sentinel with FFmpeg's spelling preserved in `text()`,
   exactly as before.
 
