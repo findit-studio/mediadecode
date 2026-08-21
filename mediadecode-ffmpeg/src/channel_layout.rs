@@ -13,7 +13,7 @@
 //! [`ChannelLayout`] can stay with the vocabulary these functions
 //! produce.
 
-use core::{ffi::c_char, slice};
+use core::{ffi::c_char, slice, str::FromStr};
 
 use ffmpeg_next::{ChannelLayout as AvChannelLayout, ffi};
 use mediaframe::audio::{ChannelLayout, ChannelLayoutDescription, ChannelOrder, ChannelSpec};
@@ -23,17 +23,43 @@ use std::vec::Vec;
 /// Maps an FFmpeg [`AvChannelLayout`] to the named
 /// [`ChannelLayout`] vocabulary.
 ///
+/// Two rungs, in order:
+///
+/// 1. the **constant-arm table** — exactly `ffmpeg_next`'s
+///    `ChannelLayout` constant set, compared through
+///    `av_channel_layout_compare`;
+/// 2. the **describe rung** — for a layout that falls off the table,
+///    FFmpeg names it via `av_channel_layout_describe` and that name
+///    goes through [`ChannelLayout`]'s own total door (`FromStr`).
+///
+/// The second rung is what makes `binaural` / `5.1.2` / `9.1.6`
+/// reachable: [`ChannelLayout`] names all three, `ffmpeg_next` 9.0.0
+/// mints no constant for any of them, so the table alone can never
+/// produce them. It is also why a layout a *later* FFmpeg adds is
+/// reachable with no edit here, as long as the vocabulary already
+/// names it — FFmpeg speaks the name, the vocabulary reads the word,
+/// one source.
+///
 /// Returns [`ChannelLayout::default`] — the `Other("")` absent sentinel
-/// — for layouts that don't match one of FFmpeg's named-layout
-/// constants.
+/// — when neither rung names the layout. The rendering itself is not
+/// smuggled into `Other`: an unrecognised layout stays *absent*, and
+/// [`ChannelLayoutDescription::text`] is where its FFmpeg rendering
+/// lives.
+pub fn channel_layout_from_ffmpeg(value: &AvChannelLayout) -> ChannelLayout {
+  mapped_constant(value).unwrap_or_else(|| channel_layout_from_describe(&describe_layout(value)))
+}
+
+/// The constant-arm table — the first and authoritative rung of
+/// [`channel_layout_from_ffmpeg`]. `None` means the layout fell off the
+/// table and the caller should try the describe rung.
 ///
 /// The arm list is exactly `ffmpeg_next`'s `ChannelLayout` constant set:
 /// its `_7POINT1_TOP_BACK` is a `#define` alias of
 /// `AV_CH_LAYOUT_5POINT1POINT2_BACK` and so has no arm of its own, and
 /// its `BINAURAL` / `_5POINT1POINT2` / `_9POINT1POINT6` siblings — which
 /// [`ChannelLayout`] does name — have no constant to match against.
-pub fn channel_layout_from_ffmpeg(value: &AvChannelLayout) -> ChannelLayout {
-  match () {
+fn mapped_constant(value: &AvChannelLayout) -> Option<ChannelLayout> {
+  let named = match () {
     () if value.eq(&AvChannelLayout::MONO) => ChannelLayout::Mono,
     () if value.eq(&AvChannelLayout::STEREO) => ChannelLayout::Stereo,
     () if value.eq(&AvChannelLayout::STEREO_DOWNMIX) => ChannelLayout::StereoDownmix,
@@ -71,8 +97,29 @@ pub fn channel_layout_from_ffmpeg(value: &AvChannelLayout) -> ChannelLayout {
     () if value.eq(&AvChannelLayout::_7POINT2POINT3) => ChannelLayout::Ch7_2_3,
     () if value.eq(&AvChannelLayout::_9POINT1POINT4_BACK) => ChannelLayout::Ch9_1_4Back,
     () if value.eq(&AvChannelLayout::_22POINT2) => ChannelLayout::Ch22_2,
-    () => ChannelLayout::default(),
-  }
+    () => return None,
+  };
+  Some(named)
+}
+
+/// The describe rung: read FFmpeg's own rendering of a layout
+/// (`av_channel_layout_describe`, e.g. `"binaural"`, `"5.1(side)"`)
+/// through [`ChannelLayout`]'s total `FromStr` door.
+///
+/// A **named** variant wins. Anything the vocabulary does not name —
+/// `FromStr`'s `Other` escape, which is where `"3 channels (FL+FR+TFL)"`
+/// and every custom-order rendering land — collapses to
+/// [`ChannelLayout::default`], the absent sentinel. That collapse is
+/// deliberate: `known_kind` answers *which named layout is this*, and
+/// "none of them" is `Other("")`; the rendering is already carried
+/// verbatim by [`ChannelLayoutDescription::text`], so letting it ride
+/// `Other` too would put a second, differently-shaped copy of the same
+/// string in the same struct.
+fn channel_layout_from_describe(rendered: &str) -> ChannelLayout {
+  ChannelLayout::from_str(rendered)
+    .ok()
+    .filter(|layout| !matches!(layout, ChannelLayout::Other(_)))
+    .unwrap_or_default()
 }
 
 /// Maps FFmpeg's [`AVChannelOrder`](ffi::AVChannelOrder) to the
@@ -110,6 +157,9 @@ pub fn channel_order_from_raw(raw: i32) -> ChannelOrder {
 ///   `AVChannelCustom.name`.
 /// - `text` carries the result of `av_channel_layout_describe`
 ///   (FFmpeg's human-readable rendering — e.g. `"5.1(side)"`).
+/// - `known_kind` runs [`channel_layout_from_ffmpeg`]'s two rungs
+///   against that same single rendering: constant table first, then
+///   the describe rung.
 pub fn channel_layout_description_from_ffmpeg(value: &AvChannelLayout) -> ChannelLayoutDescription {
   // SAFETY: `value` is a live reference; the inner `AVChannelLayout`
   // stays valid for the duration of this call. We hand the raw
@@ -166,23 +216,24 @@ pub unsafe fn channel_layout_description_from_raw_ptr(
   // struct* still has the original raw bytes. We can't form `&AVChannelLayout`
   // over an unknown order without UB, so for those helpers we
   // explicitly only call them when order is one of the known variants.
-  let known_kind = if matches!(order, ChannelOrder::Unspecified) {
-    ChannelLayout::default()
+  let (known_kind, text) = if matches!(order, ChannelOrder::Unspecified) {
+    (ChannelLayout::default(), SmolStr::default())
   } else {
     // SAFETY: `order` is one of {Native, Custom, Ambisonic} — all of
     // which are valid `AVChannelOrder` discriminants present in our
     // bindgen output, so `&*ptr` is sound to form here.
     let layout_ref = unsafe { &*(ptr as *const AvChannelLayout) };
-    channel_layout_from_ffmpeg(layout_ref)
+    let text = describe_layout(layout_ref);
+    // Constant-arm table first, exactly as in
+    // `channel_layout_from_ffmpeg`; the rendering is consulted only
+    // when the layout falls off it. Describing once and feeding both
+    // fields from that one string keeps `known_kind` and `text`
+    // answering from the same FFmpeg call.
+    let known_kind =
+      mapped_constant(layout_ref).unwrap_or_else(|| channel_layout_from_describe(&text));
+    (known_kind, text)
   };
   let custom_channels_vec = unsafe { custom_channels_raw(ptr, order) };
-  let text = if matches!(order, ChannelOrder::Unspecified) {
-    SmolStr::default()
-  } else {
-    // SAFETY: same as above — `order` is a known, valid discriminant.
-    let layout_ref = unsafe { &*(ptr as *const AvChannelLayout) };
-    describe_layout(layout_ref)
-  };
 
   ChannelLayoutDescription::new(nb_channels.max(0) as u32)
     .with_order(order)
@@ -319,6 +370,7 @@ fn custom_channel_label(channel: &ffi::AVChannelCustom) -> SmolStr {
   SmolStr::new(std::string::String::from_utf8_lossy(&bytes[..end]))
 }
 
+/// Renders a layout the way FFmpeg names it (`av_channel_layout_describe`).
 fn describe_layout(layout: &AvChannelLayout) -> SmolStr {
   // `av_channel_layout_describe` returns the number of bytes needed
   // (excluding the NUL terminator). Start with a 128-byte buffer —
@@ -350,4 +402,271 @@ fn describe_layout(layout: &AvChannelLayout) -> SmolStr {
     return SmolStr::default();
   }
   SmolStr::new(std::string::String::from_utf8_lossy(&bytes[..end]))
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// Builds a NATIVE-order layout from a channel mask, the way a decoder
+  /// hands one over. This is how a layout `ffmpeg_next` mints no constant
+  /// for can be reached at all: `av_channel_layout_from_mask` fills in the
+  /// order and the channel count, so nothing about the value is
+  /// hand-forged.
+  fn native(mask: u64) -> AvChannelLayout {
+    // SAFETY: an all-zero `AVChannelLayout` is `AV_CHANNEL_ORDER_UNSPEC`
+    // with no channels — a valid value, and the same starting point
+    // `ffmpeg_next`'s own `ChannelLayout::default` uses. The constructor
+    // then overwrites every field.
+    let mut raw: ffi::AVChannelLayout = unsafe { core::mem::zeroed() };
+    // SAFETY: `raw` is a live, writable `AVChannelLayout`.
+    let rc = unsafe { ffi::av_channel_layout_from_mask(&mut raw, mask) };
+    assert_eq!(rc, 0, "av_channel_layout_from_mask({mask:#x}) failed");
+    AvChannelLayout(raw)
+  }
+
+  /// `AV_CH_LAYOUT_BINAURAL`, spelled the way the FFmpeg header spells it
+  /// (`1ULL << AV_CHAN_BINAURAL_*`). The composed `AV_CH_BINAURAL_LEFT` /
+  /// `_RIGHT` macros do not survive bindgen's macro evaluation, but the
+  /// `AVChannel` enum they shift by does, so the mask is still derived
+  /// from FFmpeg's own numbers rather than typed out.
+  fn binaural_mask() -> u64 {
+    (1u64 << ffi::AVChannel::AV_CHAN_BINAURAL_LEFT as u64)
+      | (1u64 << ffi::AVChannel::AV_CHAN_BINAURAL_RIGHT as u64)
+  }
+
+  /// The three layouts [`ChannelLayout`] names but `ffmpeg_next` 9.0.0
+  /// mints no constant for. The constant table cannot reach them by
+  /// construction; the describe rung does, because FFmpeg's own layout
+  /// map names all three and the vocabulary reads that word.
+  #[test]
+  fn orphan_layouts_are_named_through_the_describe_rung() {
+    let cases = [
+      (binaural_mask(), "binaural", ChannelLayout::Binaural),
+      (
+        ffi::AV_CH_LAYOUT_5POINT1 | ffi::AV_CH_TOP_FRONT_LEFT | ffi::AV_CH_TOP_FRONT_RIGHT,
+        "5.1.2",
+        ChannelLayout::Ch5_1_2,
+      ),
+      (
+        ffi::AV_CH_LAYOUT_9POINT1POINT4_BACK | ffi::AV_CH_TOP_SIDE_LEFT | ffi::AV_CH_TOP_SIDE_RIGHT,
+        "9.1.6",
+        ChannelLayout::Ch9_1_6,
+      ),
+    ];
+    for (mask, slug, expected) in cases {
+      let layout = native(mask);
+      assert_eq!(
+        mapped_constant(&layout),
+        None,
+        "{slug} must fall off the constant table — that is what makes it an orphan"
+      );
+      assert_eq!(
+        describe_layout(&layout).as_str(),
+        slug,
+        "FFmpeg must name {slug} for the rung to have a word to read"
+      );
+      assert_eq!(
+        channel_layout_from_ffmpeg(&layout),
+        expected,
+        "{slug} must reach its named variant through the rung"
+      );
+
+      let described = channel_layout_description_from_ffmpeg(&layout);
+      assert_eq!(
+        described.known_kind(),
+        &expected,
+        "{slug} must be named on the description path too"
+      );
+      assert_eq!(described.text(), slug, "{slug} rendering rides `text`");
+    }
+  }
+
+  /// FFmpeg 9's actual `5.1.4`: the *side*-surround mask
+  /// (`FL+FR+FC+LFE+SL+SR` plus the four heights), which its layout map
+  /// names and no constant here reaches.
+  ///
+  /// `ffmpeg_sys_next` 9.0.0 bundles a `channel_layout_fixed.h` that
+  /// `#undef`s FFmpeg's layout macros and re-declares them as C
+  /// constants, and its `AV_CH_LAYOUT_5POINT1POINT4_BACK` still carries
+  /// FFmpeg 8's *back*-surround formula. So `ffmpeg_next`'s
+  /// `_5POINT1POINT4_BACK` constant — the one the table compares against
+  /// — is a mask FFmpeg 9 no longer names, and the mask FFmpeg 9 *does*
+  /// name has no constant at all. This is the ruling's "a layout the
+  /// vocabulary already names is reachable with zero adapter edits",
+  /// arriving earlier than expected.
+  ///
+  /// Asserted through the public entry point alone, deliberately: if the
+  /// upstream shim is ever refreshed the constant table will start
+  /// answering this mask itself, and `5.1.4` must come out named either
+  /// way.
+  #[test]
+  fn ffmpeg_nines_own_5_1_4_is_named() {
+    let layout = native(
+      ffi::AV_CH_LAYOUT_5POINT1
+        | ffi::AV_CH_TOP_FRONT_LEFT
+        | ffi::AV_CH_TOP_FRONT_RIGHT
+        | ffi::AV_CH_TOP_BACK_LEFT
+        | ffi::AV_CH_TOP_BACK_RIGHT,
+    );
+    assert_eq!(describe_layout(&layout).as_str(), "5.1.4");
+    assert_eq!(
+      channel_layout_from_ffmpeg(&layout),
+      ChannelLayout::Ch5_1_4Back
+    );
+  }
+
+  /// The constant table is the first rung and answers alone.
+  ///
+  /// `Some` here *is* the bypass proof: [`channel_layout_from_ffmpeg`] is
+  /// `mapped_constant(..).unwrap_or_else(<describe rung>)`, and
+  /// `unwrap_or_else` does not evaluate its closure on `Some` — so a
+  /// mapped constant never renders, never parses, and cannot be
+  /// re-answered by a word.
+  ///
+  /// The sample is the crossed-slug family (where FFmpeg qualifies the
+  /// *side* layout in one place and the *back* one in another, so a
+  /// name-based answer is the one that could plausibly differ), plus the
+  /// `_7POINT1_TOP_BACK` alias that shares `_5POINT1POINT2_BACK`'s mask
+  /// and therefore has no arm of its own.
+  #[test]
+  fn mapped_constants_are_answered_by_the_table_alone() {
+    let table = [
+      ("MONO", AvChannelLayout::MONO, ChannelLayout::Mono),
+      ("STEREO", AvChannelLayout::STEREO, ChannelLayout::Stereo),
+      (
+        "STEREO_DOWNMIX",
+        AvChannelLayout::STEREO_DOWNMIX,
+        ChannelLayout::StereoDownmix,
+      ),
+      ("SURROUND", AvChannelLayout::SURROUND, ChannelLayout::Ch3_0),
+      ("_5POINT0", AvChannelLayout::_5POINT0, ChannelLayout::Ch5_0),
+      (
+        "_5POINT0_BACK",
+        AvChannelLayout::_5POINT0_BACK,
+        ChannelLayout::Ch5_0Back,
+      ),
+      ("_5POINT1", AvChannelLayout::_5POINT1, ChannelLayout::Ch5_1),
+      (
+        "_5POINT1_BACK",
+        AvChannelLayout::_5POINT1_BACK,
+        ChannelLayout::Ch5_1Back,
+      ),
+      (
+        "_5POINT1POINT2_BACK",
+        AvChannelLayout::_5POINT1POINT2_BACK,
+        ChannelLayout::Ch5_1_2Back,
+      ),
+      (
+        "_7POINT1_TOP_BACK",
+        AvChannelLayout::_7POINT1_TOP_BACK,
+        ChannelLayout::Ch5_1_2Back,
+      ),
+      (
+        "_7POINT1_WIDE",
+        AvChannelLayout::_7POINT1_WIDE,
+        ChannelLayout::Ch7_1Wide,
+      ),
+      (
+        "_7POINT1_WIDE_BACK",
+        AvChannelLayout::_7POINT1_WIDE_BACK,
+        ChannelLayout::Ch7_1WideBack,
+      ),
+      (
+        "_22POINT2",
+        AvChannelLayout::_22POINT2,
+        ChannelLayout::Ch22_2,
+      ),
+    ];
+    for (name, layout, expected) in table {
+      assert_eq!(
+        mapped_constant(&layout),
+        Some(expected.clone()),
+        "{name} must be answered by the constant table, not by a rendering"
+      );
+      assert_eq!(channel_layout_from_ffmpeg(&layout), expected, "{name}");
+    }
+  }
+
+  /// A layout nobody names stays *absent*. The rung upgrades the sentinel
+  /// to a named variant or leaves it alone; it never smuggles FFmpeg's
+  /// rendering into `known_kind`'s escape, because `text` already carries
+  /// that rendering verbatim.
+  #[test]
+  fn an_unnamed_layout_stays_absent_with_its_rendering_in_text() {
+    // FL+FR+TFL: a native mask FFmpeg's layout map does not carry, so
+    // `av_channel_layout_describe` falls back to listing the channels.
+    let layout = native(ffi::AV_CH_FRONT_LEFT | ffi::AV_CH_FRONT_RIGHT | ffi::AV_CH_TOP_FRONT_LEFT);
+    assert_eq!(mapped_constant(&layout), None);
+
+    let rendering = describe_layout(&layout);
+    assert!(
+      rendering.contains("TFL"),
+      "FFmpeg should list the channels it cannot name: {rendering:?}"
+    );
+    assert_eq!(
+      channel_layout_from_ffmpeg(&layout),
+      ChannelLayout::default(),
+      "an unnamed layout must land on the absent sentinel"
+    );
+
+    let described = channel_layout_description_from_ffmpeg(&layout);
+    assert_eq!(described.known_kind(), &ChannelLayout::default());
+    assert_eq!(
+      described.text(),
+      rendering.as_str(),
+      "the rendering is what `text` carries"
+    );
+  }
+
+  /// The rung itself, on describe-shaped strings — the half of the door
+  /// that needs no `AVChannelLayout` to exercise.
+  #[test]
+  fn the_describe_rung_reads_names_and_refuses_everything_else() {
+    // The three orphans, as words.
+    assert_eq!(
+      channel_layout_from_describe("binaural"),
+      ChannelLayout::Binaural
+    );
+    assert_eq!(
+      channel_layout_from_describe("5.1.2"),
+      ChannelLayout::Ch5_1_2
+    );
+    assert_eq!(
+      channel_layout_from_describe("9.1.6"),
+      ChannelLayout::Ch9_1_6
+    );
+    // The crossed slugs: unqualified `5.1` is the *back* layout and the
+    // side one is qualified, so reading the word is the only way to tell
+    // these two apart.
+    assert_eq!(
+      channel_layout_from_describe("5.1"),
+      ChannelLayout::Ch5_1Back
+    );
+    assert_eq!(
+      channel_layout_from_describe("5.1(side)"),
+      ChannelLayout::Ch5_1
+    );
+    // Case folding is the vocabulary's, not ours.
+    assert_eq!(
+      channel_layout_from_describe("BINAURAL"),
+      ChannelLayout::Binaural
+    );
+
+    // Everything else is absent — never `Other(<the rendering>)`.
+    for unnamed in [
+      "",
+      "3 channels",
+      "3 channels (FL+FR+TFL)",
+      "FL@Left+FR@Right",
+      "ambisonic 2",
+      "not-a-layout",
+    ] {
+      assert_eq!(
+        channel_layout_from_describe(unnamed),
+        ChannelLayout::default(),
+        "{unnamed:?} must stay absent"
+      );
+    }
+  }
 }
