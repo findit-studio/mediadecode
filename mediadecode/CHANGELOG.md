@@ -11,6 +11,90 @@ The sibling FFmpeg adapter has its own log at
 
 ## [Unreleased]
 
+### Removed (BREAKING)
+
+- **The `channel` module is gone, whole.** `ChannelLayoutKind`,
+  `AudioChannelOrderKind`, `AudioChannelSpec`, `AudioChannelLayout`,
+  their two parse errors (`ParseChannelLayoutKindError`,
+  `ParseAudioChannelOrderKindError`) and the `serde` / `arbitrary` /
+  `quickcheck` matrices that covered them are deleted, not moved and
+  not deprecated. The vocabulary's house is `mediaframe::audio`, which
+  now carries all four:
+
+  | was (`mediadecode::channel`) | is (`mediaframe::audio`) |
+  | ---------------------------- | ------------------------ |
+  | `ChannelLayoutKind` (39 named + `Unknown`) | `ChannelLayout` (43 named + `Other(SmolStr)`) |
+  | `AudioChannelOrderKind`      | `ChannelOrder`           |
+  | `AudioChannelSpec`           | `ChannelSpec`            |
+  | `AudioChannelLayout`         | `ChannelLayoutDescription` |
+
+  **Nothing is re-exported.** `AudioFrame`'s channel-layout parameter
+  `C` is generic and always was, so this crate never named a channel
+  type in a signature and needs none now; a consumer that wants one
+  adds `mediaframe` and spells `mediaframe::audio::*`. Both adapters in
+  this workspace did exactly that.
+
+  Renamings ride along inside the moved types. `ChannelLayout`'s slugs
+  are FFmpeg's own, taken from `channel_layout_map[]` rather than from
+  the constant names, so several spellings change: `"5.0"` / `"5.1"` /
+  `"7.1(wide)"` are the **back**-speaker layouts and the side ones are
+  qualified `"5.0(side)"` / `"5.1(side)"` / `"7.1(wide-side)"`;
+  `"5.1.4"`, `"7.1.4"` and `"9.1.4"` carry no `(back)` suffix even
+  though their constants do; `StereoDownmix` is `"downmix"`.
+  `ChannelLayoutDescription` renames the free-text field `description`
+  to `text` (`text()` / `with_text()` / `set_text()`), and its
+  `known_kind()` returns `&ChannelLayout` — borrowed, because the
+  escape arm costs the type `Copy` — with `ChannelLayout::default()`
+  (the `Other("")` sentinel) where `ChannelLayoutKind::Unknown` used to
+  sit.
+
+  Four defects leave with the table that held them rather than being
+  fixed in place:
+
+  - `Ch7_1Wide` and `Ch7_1WideBack` carried each other's slugs. FFmpeg
+    gives the unqualified `"7.1(wide)"` to the **back** layout and
+    qualifies the side one; this crate had it the other way round.
+  - `Ch7_1TopBack` named nothing. `AV_CH_LAYOUT_7POINT1_TOP_BACK` is a
+    `#define` alias of `AV_CH_LAYOUT_5POINT1POINT2_BACK`, matched
+    earlier in this workspace's own FFmpeg adapter, so the variant was
+    unreachable — a value writable through `as_str` / `to_u32` and
+    produced by nothing.
+  - `Ch2_2`'s doc promised "left, right, subwoofer, and an additional
+    channel"; `AV_CH_LAYOUT_2_2`'s mask is FL+FR+SL+SR — no LFE and no
+    centre. Upstream spells it `QuadSide`, after its `"quad(side)"`
+    slug, for that reason.
+  - `Ch5_1`'s doc described rear speakers while the adapter mapped it
+    from `AV_CH_LAYOUT_5POINT1`, which is the side layout. The two
+    sentences could not both be true.
+
+  Also gone: the runtime roster check that could not see any of this.
+  It walked `from_u32`, so a variant with an `as_str` and a `to_u32`
+  but no `from_u32` arm stayed invisible to it — which is exactly the
+  shape `Ch7_1TopBack` had. Upstream's `roster!` pins its list with a
+  compile-time exhaustive match instead.
+
+- **`smol_str` is no longer a dependency.** It was reachable only from
+  the two deleted records, so the optional dep and its four feature
+  edges (`alloc`'s `smol_str`, `std`'s `smol_str/default`, `serde`'s
+  `smol_str?/serde`, `arbitrary`'s `smol_str?/arbitrary`) go with them.
+  A build that turned on `mediadecode/alloc` to get `smol_str` into the
+  graph now names it directly.
+
+### Changed (BREAKING)
+
+- **`mediaframe` 0.5 → 0.6**, at the same pin as before
+  (`default-features = false`, `frame` — the no-alloc tier). This is
+  the release that carries the channel household, and `mediaframe` is a
+  public dependency here (`color`, `pixel_format`, `cfa` and `frame`
+  are re-export modules), so a downstream still spelling `mediaframe`
+  0.5 gets two versions of it in one graph. Bump in lockstep.
+
+  Note the tier: `mediaframe::audio` is compiled only at `mediaframe`'s
+  alloc-or-std tier, and this crate's pin does not enable it. A
+  consumer naming `mediaframe::audio::*` turns on `mediaframe/alloc`
+  (or `std`) on its own dependency edge, as both adapters in this
+  workspace do.
+
 ## [0.5.0]
 
 Tracks `mediaframe` 0.4 → 0.5, a breaking minor. No `mediadecode`

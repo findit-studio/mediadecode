@@ -11,6 +11,23 @@ The backend-agnostic core it adapts has its own log at
 
 ## [Unreleased]
 
+### Changed (BREAKING)
+
+- **`AudioAdapter::ChannelLayout` binds
+  `mediaframe::audio::ChannelLayoutDescription`.** `mediadecode::channel`
+  is gone (see
+  [`mediadecode`](../mediadecode/CHANGELOG.md#unreleased)) and the
+  channel vocabulary lives in `mediaframe::audio` now. The adapter's
+  conduct is unchanged: WebCodecs reports a channel count and no layout
+  name, so `boundary::empty_audio_frame` and the decode path still
+  build `ChannelLayoutDescription::new(N)` — the count with an
+  `Unspecified` order — and `default()` is still the zero-channel
+  placeholder.
+
+- **`mediaframe` is a direct `wasm32` dependency**, pinned with
+  `alloc`: the audio household is compiled only at the alloc-or-std
+  tier.
+
 ## [0.5.0]
 
 Tracks `mediadecode` 0.5.0, which crosses `mediaframe` 0.4 → 0.5 — a
