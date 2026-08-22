@@ -18,6 +18,7 @@ pub mod extras;
 mod ffi;
 mod frame;
 mod pixdesc;
+mod reader_guard;
 mod resampler;
 mod sample_format;
 mod subtitle;

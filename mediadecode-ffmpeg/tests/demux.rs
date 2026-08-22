@@ -24,14 +24,17 @@
 
 mod support;
 
-use std::fs::File;
+use std::{
+  fs::File,
+  io::{Read, Seek},
+};
 
 use mediadecode::{
   Timebase, Timestamp,
   demuxer::{DemuxedPacket, Demuxer, TrackKind},
   packet::PacketFlags,
 };
-use mediadecode_ffmpeg::FfmpegDemuxer;
+use mediadecode_ffmpeg::{DemuxError, FfmpegDemuxer};
 use support::Corpus;
 
 /// Drains a session, returning `(track, kind, pts)` for every delivered
@@ -359,6 +362,133 @@ fn none_means_eof_and_keeps_meaning_it() {
     !drain(&mut demuxer).is_empty(),
     "an EOF latch left in place would make every later read fail",
   );
+}
+
+/// A byte source that serves `path` faithfully for `budget` bytes and
+/// then panics — the shape that used to abort the process inside
+/// libavformat's `extern "C"` read callback.
+struct PanicAfter {
+  file: File,
+  budget: u64,
+  served: u64,
+}
+
+impl PanicAfter {
+  fn new(path: &std::path::Path, budget: u64) -> Self {
+    Self {
+      file: File::open(path).expect("open file"),
+      budget,
+      served: 0,
+    }
+  }
+}
+
+impl Read for PanicAfter {
+  fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+    assert!(
+      self.served < self.budget,
+      "the reader is out of patience at byte {}",
+      self.served,
+    );
+    let n = self.file.read(buf)?;
+    self.served += n as u64;
+    Ok(n)
+  }
+}
+
+impl Seek for PanicAfter {
+  fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+    self.file.seek(pos)
+  }
+}
+
+/// Counts the bytes a reader is asked for, so the lane below can put
+/// its panic *past* whatever opening the container consumes.
+struct Counting {
+  file: File,
+  served: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl Read for Counting {
+  fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+    let n = self.file.read(buf)?;
+    self
+      .served
+      .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+    Ok(n)
+  }
+}
+
+impl Seek for Counting {
+  fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+    self.file.seek(pos)
+  }
+}
+
+#[test]
+fn a_panicking_reader_is_an_error_not_an_abort() {
+  let Some(corpus) = Corpus::new() else { return };
+  let path = corpus.multi_track_mkv();
+
+  // Deliberate panics print through the default hook; the noise below
+  // is the test working, not the test failing.
+
+  // 1. The panic lands during `avformat_open_input` — the very first
+  //    read. Without the guard this call terminates the process.
+  let Err(err) = FfmpegDemuxer::open_reader(PanicAfter::new(&path, 0), Some("multi.mkv")) else {
+    panic!("a panicking reader cannot open a container");
+  };
+  match err {
+    DemuxError::ReaderPanic { ref message } => {
+      assert!(
+        message.contains("out of patience"),
+        "the panic's own words are carried: {message}",
+      );
+    }
+    other => panic!("expected ReaderPanic, got {other:?}"),
+  }
+
+  // 2. The panic lands mid-demux, after the session is open. How many
+  //    bytes opening consumes is libavformat's business, so it is
+  //    measured rather than guessed.
+  let served = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+  let counting = Counting {
+    file: File::open(&path).expect("open file"),
+    served: std::sync::Arc::clone(&served),
+  };
+  let opened = FfmpegDemuxer::open_reader(counting, Some("multi.mkv")).expect("open");
+  let at_open = served.load(std::sync::atomic::Ordering::Relaxed);
+  drop(opened);
+
+  let mut demuxer =
+    FfmpegDemuxer::open_reader(PanicAfter::new(&path, at_open + 1), Some("multi.mkv"))
+      .expect("opening reads fewer bytes than the budget");
+  let mut failure = None;
+  loop {
+    match demuxer.next_packet() {
+      Ok(Some(_)) => continue,
+      Ok(None) => break,
+      Err(e) => {
+        failure = Some(e);
+        break;
+      }
+    }
+  }
+  let failure = failure.expect("the pull loop must fail, not end");
+  assert!(
+    matches!(failure, DemuxError::ReaderPanic { .. }),
+    "a panic mid-demux is named, not mistaken for EOF: {failure:?}",
+  );
+
+  // 3. And the session stays terminal: the same cause, every time.
+  assert!(matches!(
+    demuxer.next_packet(),
+    Err(DemuxError::ReaderPanic { .. })
+  ));
+  assert!(matches!(
+    demuxer.seek(Timestamp::new(0, Timebase::SECONDS)),
+    Err(DemuxError::ReaderPanic { .. })
+  ));
 }
 
 #[test]

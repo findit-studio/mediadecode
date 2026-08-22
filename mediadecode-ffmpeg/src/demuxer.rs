@@ -41,15 +41,17 @@
 
 use std::{
   collections::VecDeque,
+  ffi::CStr,
   io::{Read, Seek},
   num::NonZeroI32,
   path::Path,
   ptr::{addr_of, read_unaligned},
+  sync::Arc,
 };
 
 use ffmpeg_next::{
   Packet, Rational,
-  ffi::AV_NOPTS_VALUE,
+  ffi::{AV_NOPTS_VALUE, AVDictionary, av_dict_get},
   format::{self, context::Input, stream::Disposition},
   media,
 };
@@ -65,6 +67,7 @@ use crate::{
   Ffmpeg, FfmpegBuffer, boundary,
   codec_id::CodecId,
   extras::{AttachmentPacketExtra, TrackExtra},
+  reader_guard::{GuardedReader, PanicLatch},
   sample_format::SampleFormat,
 };
 
@@ -107,6 +110,10 @@ pub struct FfmpegDemuxer {
   /// unconditionally would also erase a genuine sticky I/O error, which
   /// `Input::seek` goes out of its way to preserve.
   eof: bool,
+  /// Set for a session opened over a caller's reader: where a panic
+  /// raised inside that reader is recorded. `None` for a path-opened
+  /// session, which runs no caller code.
+  reader_panic: Option<Arc<PanicLatch>>,
 }
 
 impl FfmpegDemuxer {
@@ -134,12 +141,33 @@ impl FfmpegDemuxer {
   /// `filename` is a probe hint, not a path: libavformat uses its
   /// extension to break ties between formats whose byte signatures are
   /// ambiguous. Pass `None` when there is nothing to hint with.
+  ///
+  /// # A panicking reader
+  ///
+  /// libavformat drives the reader from `extern "C"` callbacks, where a
+  /// panic would abort the process rather than unwind. Every call into
+  /// `reader` therefore runs under `catch_unwind`: a panic becomes an
+  /// I/O error for libavformat and surfaces here — or from the next
+  /// [`next_packet`](Demuxer::next_packet) / [`seek`](Demuxer::seek) —
+  /// as [`DemuxError::ReaderPanic`], carrying the panic's message. The
+  /// session is terminal from that point: the `AVIOContext`'s error
+  /// state is sticky and the reader's own state is unknown.
   pub fn open_reader<R: Read + Seek + Send + 'static>(
     reader: R,
     filename: Option<&str>,
   ) -> Result<Self, DemuxError> {
-    let io = format::context::StreamIo::from_read_seek(reader)?;
-    Self::from_input(format::input_from_stream(io, filename, None)?)
+    let (guarded, latch) = GuardedReader::new(reader);
+    let io = format::context::StreamIo::from_read_seek(guarded)?;
+    let input = format::input_from_stream(io, filename, None)
+      .map_err(|e| reader_panic(&latch).unwrap_or(DemuxError::Ffmpeg(e)))?;
+    // A panic libavformat tolerated (a failed probe it recovered from)
+    // still poisoned the reader; the session must not open over it.
+    if let Some(panicked) = reader_panic(&latch) {
+      return Err(panicked);
+    }
+    let mut demuxer = Self::from_input(input)?;
+    demuxer.reader_panic = Some(latch);
+    Ok(demuxer)
   }
 
   /// Borrows the wrapped `ffmpeg::format::context::Input` — for
@@ -158,8 +186,21 @@ impl FfmpegDemuxer {
       attachments,
       pending,
       eof: false,
+      reader_panic: None,
     })
   }
+
+  /// The error a panicked reader owes this session, if one panicked.
+  fn panicked(&self) -> Option<DemuxError> {
+    self.reader_panic.as_deref().and_then(reader_panic)
+  }
+}
+
+/// Turns a latched reader panic into the error that names it.
+fn reader_panic(latch: &PanicLatch) -> Option<DemuxError> {
+  latch
+    .message()
+    .map(|message| DemuxError::ReaderPanic { message })
 }
 
 impl Demuxer for FfmpegDemuxer {
@@ -181,7 +222,16 @@ impl Demuxer for FfmpegDemuxer {
 
     loop {
       let mut packet = Packet::empty();
-      match packet.read(&mut self.input) {
+      let read = packet.read(&mut self.input);
+      // A panicking reader reported an ordinary I/O error to C, and
+      // libavformat may answer that with the error, with EOF (a stream
+      // it cannot read looks finished), or with a packet it had already
+      // buffered. None of those are the file's word, so the latch is
+      // consulted whatever the outcome was.
+      if let Some(panicked) = self.panicked() {
+        return Err(panicked);
+      }
+      match read {
         Ok(()) => {}
         Err(ffmpeg_next::Error::Eof) => {
           self.eof = true;
@@ -259,7 +309,11 @@ impl Demuxer for FfmpegDemuxer {
     // point inside it — the nearest keyframe at or before the target.
     // Never after: a decoder started past the target has no reference
     // frame.
-    self.input.seek(ts, ..ts)?;
+    let sought = self.input.seek(ts, ..ts);
+    if let Some(panicked) = self.panicked() {
+      return Err(panicked);
+    }
+    sought?;
     Ok(())
   }
 }
@@ -278,6 +332,19 @@ pub enum DemuxError {
   AttachmentAlloc {
     /// The `AVStream.index` whose payload could not be captured.
     stream_index: usize,
+  },
+
+  /// The `Read + Seek` source given to
+  /// [`FfmpegDemuxer::open_reader`] panicked inside a libavformat
+  /// callback.
+  ///
+  /// The panic was caught before it could cross the `extern "C"`
+  /// boundary and abort the process; this is what it said. The session
+  /// is terminal — every later call reports the same panic.
+  #[error("the reader panicked: {message}")]
+  ReaderPanic {
+    /// What the panic payload said.
+    message: SmolStr,
   },
 }
 
@@ -376,11 +443,15 @@ fn build_tracks(input: &Input) -> Result<BuiltTracks, DemuxError> {
       .with_start_time((raw_start != AV_NOPTS_VALUE).then_some(raw_start))
       .with_frame_count((frames > 0).then_some(frames));
 
-    let metadata = stream.metadata();
+    // SAFETY: `stream` keeps the `AVStream` — and so its metadata
+    // dictionary — live across both reads. The dictionary is read
+    // through `av_dict_get` rather than through
+    // `DictionaryRef::get`: see [`metadata_text`].
+    let metadata = unsafe { (*stream.as_ptr()).metadata };
     let info = TrackInfo::new(time_base, params, extra)
       .with_duration(duration)
-      .with_filename(metadata.get("filename").map(SmolStr::new))
-      .with_mime_type(metadata.get("mimetype").map(SmolStr::new));
+      .with_filename(unsafe { metadata_text(metadata, c"filename") })
+      .with_mime_type(unsafe { metadata_text(metadata, c"mimetype") });
 
     // Capture the attachment payload now, so the queue is complete
     // before a single timed packet has been read.
@@ -409,6 +480,69 @@ fn build_tracks(input: &Input) -> Result<BuiltTracks, DemuxError> {
   }
 
   Ok((tracks, attachments, pending))
+}
+
+/// Upper bound on the NUL search in [`metadata_text`].
+///
+/// Generous by four orders of magnitude for a filename or a MIME type,
+/// and there only so that a value libavutil did not terminate cannot
+/// turn the walk into an unbounded read — the same discipline
+/// [`crate::channel_layout`] and the pixel-format namer follow. A value
+/// longer than this is refused rather than truncated: a truncated
+/// filename is a different filename.
+const METADATA_VALUE_MAX_BYTES: usize = 64 * 1024;
+
+/// Reads one entry out of a container's metadata dictionary as text
+/// this crate can own.
+///
+/// **Why not `DictionaryRef::get`.** ffmpeg-next 9.0.0 builds its
+/// `&str` with `from_utf8_unchecked`
+/// (`src/util/dictionary/immutable.rs`), and FFmpeg does not validate
+/// demuxed metadata as UTF-8 — an ID3 frame, a Matroska attachment
+/// name or a MOV atom carries whatever bytes the file carries. A
+/// `filename` holding a stray `0x80` would therefore have produced a
+/// `&str` that is not UTF-8: undefined behaviour the moment it exists,
+/// before `SmolStr` ever copies it.
+///
+/// Invalid bytes are replaced (`U+FFFD`), not refused. This is
+/// *identity* metadata — the name a font was attached under, the MIME
+/// type declared for a cover — and a file that names its attachment in
+/// some legacy codepage is still a file worth opening. The replacement
+/// characters say plainly that the container's bytes were not text.
+///
+/// # Safety
+///
+/// `dict` must be null or a live `*const AVDictionary` for the
+/// duration of this call.
+unsafe fn metadata_text(dict: *const AVDictionary, key: &CStr) -> Option<SmolStr> {
+  if dict.is_null() {
+    return None;
+  }
+  // SAFETY: `dict` is live per the contract above and `key` is a
+  // NUL-terminated C string by construction; `av_dict_get` reads both
+  // and returns a borrowed entry owned by the dictionary.
+  let entry = unsafe { av_dict_get(dict, key.as_ptr(), std::ptr::null(), 0) };
+  if entry.is_null() {
+    return None;
+  }
+  // SAFETY: a non-null entry is a live `AVDictionaryEntry` for as long
+  // as the dictionary is not modified, which it is not here.
+  let value = unsafe { (*entry).value };
+  if value.is_null() {
+    return None;
+  }
+  for len in 0..METADATA_VALUE_MAX_BYTES {
+    // SAFETY: `value` is a NUL-terminated string libavutil allocated
+    // with `av_strdup`; the walk reads at most one byte past the last
+    // value byte and stops at the terminator.
+    if unsafe { *value.add(len).cast::<u8>() } == 0 {
+      // SAFETY: the `len` bytes below the terminator were just walked,
+      // so the slice is in bounds and initialised.
+      let bytes = unsafe { std::slice::from_raw_parts(value.cast::<u8>(), len) };
+      return Some(SmolStr::new(std::string::String::from_utf8_lossy(bytes)));
+    }
+  }
+  None
 }
 
 /// Wraps `AVStream.attached_pic` — the real packet libavformat parsed
@@ -496,7 +630,75 @@ fn rate_to_timebase(value: Rational) -> Option<Timebase> {
 
 #[cfg(test)]
 mod tests {
+  use ffmpeg_next::ffi::{av_dict_free, av_dict_set};
+
   use super::*;
+
+  /// Builds a dictionary holding one entry whose *value* is the given
+  /// raw bytes. The bytes go in as a C string, which is all
+  /// `av_dict_set` promises to copy — FFmpeg never asks whether they
+  /// are UTF-8, which is the whole point of the lane below.
+  fn dict_with(key: &CStr, value: &[u8]) -> *mut AVDictionary {
+    let mut dict: *mut AVDictionary = std::ptr::null_mut();
+    let mut terminated = value.to_vec();
+    terminated.push(0);
+    let rc = unsafe {
+      av_dict_set(
+        &mut dict,
+        key.as_ptr(),
+        terminated.as_ptr().cast::<std::ffi::c_char>(),
+        0,
+      )
+    };
+    assert!(rc >= 0, "av_dict_set failed: {rc}");
+    dict
+  }
+
+  #[test]
+  fn metadata_that_is_not_utf8_is_read_lossily_not_unsoundly() {
+    // The bytes a real container can hold: a Latin-1 "café.ttf" whose
+    // 0xE9 is not valid UTF-8 on its own. Read through
+    // `DictionaryRef::get` this produced a `&str` that violates the
+    // type's invariant — undefined behaviour before `SmolStr` ever
+    // copied it.
+    let raw = b"caf\xE9.ttf".to_vec();
+    assert!(
+      std::str::from_utf8(&raw).is_err(),
+      "the source bytes really are not UTF-8",
+    );
+    let dict = dict_with(c"filename", &raw);
+    let text = unsafe { metadata_text(dict, c"filename") }.expect("the entry exists");
+    assert_eq!(text.as_str(), "caf\u{FFFD}.ttf");
+    // A key the dictionary does not hold, and a null dictionary, are
+    // both simply absent.
+    assert_eq!(unsafe { metadata_text(dict, c"mimetype") }, None);
+    assert_eq!(
+      unsafe { metadata_text(std::ptr::null(), c"filename") },
+      None
+    );
+    unsafe { av_dict_free(&mut { dict }) };
+  }
+
+  #[test]
+  fn valid_metadata_survives_unchanged() {
+    let dict = dict_with(c"mimetype", b"application/x-truetype-font");
+    assert_eq!(
+      unsafe { metadata_text(dict, c"mimetype") }.as_deref(),
+      Some("application/x-truetype-font"),
+    );
+    unsafe { av_dict_free(&mut { dict }) };
+  }
+
+  #[test]
+  fn an_unterminated_length_is_refused_rather_than_truncated() {
+    // Nothing libavutil produces is this long; the cap exists so a
+    // value it did not terminate cannot walk off the end. A value that
+    // reaches the cap is absent, never a prefix of itself.
+    let long = vec![b'a'; METADATA_VALUE_MAX_BYTES + 1];
+    let dict = dict_with(c"filename", &long);
+    assert_eq!(unsafe { metadata_text(dict, c"filename") }, None);
+    unsafe { av_dict_free(&mut { dict }) };
+  }
 
   #[test]
   fn a_zero_denominator_timebase_is_clamped_not_refused() {
