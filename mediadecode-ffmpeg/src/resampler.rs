@@ -28,8 +28,8 @@ use ffmpeg_next::{
   ChannelLayout,
   codec::Parameters,
   ffi::{
-    AV_NOPTS_VALUE, AVChannelOrder, AVSampleFormat, av_channel_layout_from_mask,
-    av_frame_get_buffer,
+    AV_NOPTS_VALUE, AVChannelOrder, AVMatrixEncoding, AVSampleFormat, av_channel_layout_from_mask,
+    av_frame_get_buffer, swr_build_matrix2,
   },
   format::Sample,
   frame,
@@ -246,6 +246,7 @@ impl FfmpegResampler {
   pub fn new(source: ResampleSpec, target: ResampleSpec) -> Result<Self, ResampleError> {
     check_spec(&source, SpecEnd::Source)?;
     check_spec(&target, SpecEnd::Target)?;
+    check_pair(&source, &target)?;
 
     let staged_source_layout = initialized_layout(source.layout);
     let staged_target_layout = initialized_layout(target.layout);
@@ -732,6 +733,40 @@ pub enum ResampleError {
     pts: i64,
   },
 
+  /// The conversion between these two layouts would silently drop a
+  /// source channel: FFmpeg's own mixing matrix routes it to no output.
+  ///
+  /// `swr` mixes the channel positions its rematrix table knows and
+  /// processes the rest of the input as though it were absent — a log
+  /// line at most. Measured against FFmpeg 9, packed 22.2 → mono loses
+  /// fifteen of twenty-four channels and `cube` → stereo loses two of
+  /// eight, so this is not a matter of channel count. Installing an
+  /// explicit mix matrix is how such a conversion would be accepted
+  /// deliberately; until this crate has a seat for one, the pair is
+  /// refused.
+  #[error(
+    "converting {source_channels} channels to {target_channels} would drop source channel \
+     {channel}: FFmpeg's mixing matrix routes it to no output"
+  )]
+  ChannelDropped {
+    /// Channels the source layout declares.
+    source_channels: i32,
+    /// Channels the target layout declares.
+    target_channels: i32,
+    /// The first source channel that reaches no output channel.
+    channel: i32,
+  },
+
+  /// FFmpeg will not build a mixing matrix between these two layouts at
+  /// all.
+  #[error("FFmpeg builds no mixing matrix from {source_channels} channels to {target_channels}")]
+  RematrixUnsupported {
+    /// Channels the source layout declares.
+    source_channels: i32,
+    /// Channels the target layout declares.
+    target_channels: i32,
+  },
+
   /// The output timeline would leave `i64`. Counted timestamps are
   /// exact or they are nothing, so this is named rather than saturated.
   #[error("the output timeline overflows: {pts} + {samples} samples")]
@@ -800,14 +835,7 @@ fn check_spec(spec: &ResampleSpec, end: SpecEnd) -> Result<(), ResampleError> {
   if spec.format == Sample::None {
     return Err(ResampleError::UnsupportedFormat { end });
   }
-  // The order is read as the integer it is on the wire rather than
-  // matched as an `AVChannelOrder`, the discipline this crate keeps
-  // everywhere it touches a bindgen enum.
-  //
-  // SAFETY: `spec.layout` is a live `ChannelLayout` owned by the
-  // caller's spec for the duration of this call; `addr_of!` reaches its
-  // `order` field without forming a reference to the enum.
-  let order = unsafe { read_unaligned(addr_of!(spec.layout.0.order).cast::<i32>()) };
+  let order = layout_order(&spec.layout);
   let channels = spec.layout.channels();
   let carried = order == AVChannelOrder::AV_CHANNEL_ORDER_NATIVE as i32
     || order == AVChannelOrder::AV_CHANNEL_ORDER_UNSPEC as i32;
@@ -830,6 +858,109 @@ fn check_spec(spec: &ResampleSpec, end: SpecEnd) -> Result<(), ResampleError> {
       channels,
       limit: MAX_AUDIO_PLANES,
     });
+  }
+  Ok(())
+}
+
+/// A layout's `AVChannelOrder` as the integer it is on the wire.
+///
+/// Read raw rather than matched as an `AVChannelOrder`, the discipline
+/// this crate keeps everywhere it touches a bindgen enum: a value
+/// outside this build's discriminant set would be undefined behaviour
+/// the moment it existed as one.
+fn layout_order(layout: &ChannelLayout) -> i32 {
+  // SAFETY: `layout` is a live `ChannelLayout` for the duration of this
+  // call; `addr_of!` reaches its `order` field without forming a
+  // reference to the enum.
+  unsafe { read_unaligned(addr_of!(layout.0.order).cast::<i32>()) }
+}
+
+/// FFmpeg's `SWR_CH_MAX`: the square its own matrix builder writes,
+/// whatever the two layouts' channel counts are.
+///
+/// Not a convenience. `swr_build_matrix2` copies its internal
+/// `[SWR_CH_MAX][SWR_CH_MAX]` block out at the caller's stride, so a
+/// buffer sized to the actual channel counts is written far past its
+/// end — measured, and the measurement is a killed process.
+const SWR_CH_MAX: usize = 64;
+
+/// Refuses a **pair** whose rematrixing would silently drop input
+/// channels.
+///
+/// Each end can be perfectly valid on its own and the conversion
+/// between them still lose whole channels: `swr` mixes only the channel
+/// positions its rematrix table knows, and quietly processes the rest
+/// of the input as though it were not there. Measured against the
+/// linked FFmpeg 9 with a tone isolated in each source channel: packed
+/// 22.2 → mono drops fifteen of twenty-four (`swr` says as much in a
+/// log line and converts anyway), `cube` → stereo drops two of *eight*
+/// — so a channel-count threshold is both too strict and too loose to
+/// be the rule.
+///
+/// The rule is asked of FFmpeg instead: build the mixing matrix its own
+/// builder would use, and refuse when any input channel reaches no
+/// output at all. `lfe_mix_level` is deliberately non-zero, so the
+/// question is "can this channel reach the output" rather than "does
+/// FFmpeg's default downmix policy include it" — the default leaves LFE
+/// out of a downmix on purpose, and refusing an everyday 5.1 → stereo
+/// over that would be absurd. The predicate matched the tone sweep
+/// exactly on every pair measured.
+///
+/// A pair `swr` cannot matrix at all is refused too. Accepting these
+/// deliberately is a *mix matrix* seat on the spec — a real design, not
+/// something to mint in passing; until it exists, refusal is the honest
+/// answer.
+fn check_pair(source: &ResampleSpec, target: &ResampleSpec) -> Result<(), ResampleError> {
+  let native = AVChannelOrder::AV_CHANNEL_ORDER_NATIVE as i32;
+  // An unspecified layout is mapped positionally by `swr` with no
+  // rematrixing at all, and identical layouts need no matrix: neither
+  // can drop a channel, and neither is what the builder describes.
+  if layout_order(&source.layout) != native
+    || layout_order(&target.layout) != native
+    || source.layout == target.layout
+  {
+    return Ok(());
+  }
+  let source_channels = source.layout.channels();
+  let target_channels = target.layout.channels();
+
+  let mut matrix = vec![0f64; SWR_CH_MAX * SWR_CH_MAX];
+  // SAFETY: both layouts are live for the call; `matrix` is the full
+  // `SWR_CH_MAX` square the builder writes, passed with the matching
+  // stride; the encoding is a compile-time constant of this build; and
+  // a null log context is documented as allowed.
+  let rc = unsafe {
+    swr_build_matrix2(
+      &source.layout.0,
+      &target.layout.0,
+      core::f64::consts::FRAC_1_SQRT_2,
+      core::f64::consts::FRAC_1_SQRT_2,
+      1.0,
+      1.0,
+      1.0,
+      matrix.as_mut_ptr(),
+      SWR_CH_MAX as isize,
+      AVMatrixEncoding::AV_MATRIX_ENCODING_NONE,
+      core::ptr::null_mut(),
+    )
+  };
+  if rc < 0 {
+    return Err(ResampleError::RematrixUnsupported {
+      source_channels,
+      target_channels,
+    });
+  }
+  for channel in 0..source_channels.min(SWR_CH_MAX as i32) {
+    let index = channel as usize;
+    if (0..target_channels.min(SWR_CH_MAX as i32) as usize)
+      .all(|out| matrix[index + SWR_CH_MAX * out] == 0.0)
+    {
+      return Err(ResampleError::ChannelDropped {
+        source_channels,
+        target_channels,
+        channel,
+      });
+    }
   }
   Ok(())
 }

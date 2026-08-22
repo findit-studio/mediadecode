@@ -524,6 +524,176 @@ fn a_custom_layout_is_refused_by_name() {
   ));
 }
 
+/// A packed s16 frame at `rate` whose 440 Hz tone lives in exactly one
+/// of `layout`'s channels — every other channel is silence. Sweeping
+/// `channel` across a layout answers "does this input channel reach the
+/// output at all".
+fn tone_in_one_channel(
+  rate: u32,
+  samples: u32,
+  layout: ChannelLayout,
+  channel: usize,
+) -> mediadecode_ffmpeg::AudioFrame {
+  let channels = layout.channels() as usize;
+  let mut bytes = Vec::with_capacity(samples as usize * channels * 2);
+  for n in 0..samples {
+    let phase = f64::from(n) * 2.0 * std::f64::consts::PI * 440.0 / f64::from(rate);
+    let value = (phase.sin() * 20_000.0) as i16;
+    for ch in 0..channels {
+      bytes.extend_from_slice(&if ch == channel { value } else { 0 }.to_le_bytes());
+    }
+  }
+  filled_frame(rate, samples, channels as u8, layout, &bytes, None)
+}
+
+/// Root-mean-square of everything a conversion produced for that frame.
+/// Zero means the channel the tone was in reached nothing.
+fn converted_rms(resampler: &mut FfmpegResampler, frame: &mediadecode_ffmpeg::AudioFrame) -> f64 {
+  let mut out = empty_audio_frame();
+  let mut energy = 0f64;
+  let mut count = 0usize;
+  for _ in 0..3 {
+    resampler.send_frame(frame).expect("send_frame");
+    while resampler.receive_frame(&mut out).is_ok() {
+      let valid = out.nb_samples() as usize * out.channel_count() as usize * 2;
+      for chunk in out.planes()[0].data_ref().as_ref()[..valid]
+        .as_chunks::<2>()
+        .0
+      {
+        let sample = f64::from(i16::from_le_bytes(*chunk));
+        energy += sample * sample;
+        count += 1;
+      }
+    }
+  }
+  if count == 0 {
+    0.0
+  } else {
+    (energy / count as f64).sqrt()
+  }
+}
+
+#[test]
+fn no_accepted_conversion_silently_drops_a_channel() {
+  support::init_ffmpeg();
+  // The bar this lane exists to meet: a tone isolated in each source
+  // channel in turn, measured at the output. A conversion this crate
+  // accepts may not lose one.
+  let rate = 48_000;
+  let samples = 4_800;
+
+  // 7.1 -> mono: an everyday downmix, accepted.
+  let source = ResampleSpec::new(rate, Sample::I16(Type::Packed), ChannelLayout::_7POINT1);
+  for channel in 0..8 {
+    let mut resampler = FfmpegResampler::new(source, mono_16k()).expect("7.1 -> mono opens");
+    let rms = converted_rms(
+      &mut resampler,
+      &tone_in_one_channel(rate, samples, ChannelLayout::_7POINT1, channel),
+    );
+    if channel == 3 {
+      // Channel 3 is LFE, and FFmpeg's default downmix leaves it out
+      // *on purpose* (`lfe_mix_level` is zero unless a caller asks
+      // otherwise). Naming it here is the difference between a policy
+      // and a defect: the construction check asks whether a channel
+      // *can* reach the output, with LFE's mix level forced non-zero,
+      // so this exception cannot hide a channel swr simply cannot mix.
+      assert!(rms < 1.0, "LFE unexpectedly mixed at {rms}");
+      continue;
+    }
+    assert!(rms > 100.0, "source channel {channel} vanished (rms {rms})");
+  }
+
+  // 22.2 -> 22.2 at another rate: no rematrixing, twenty-four channels,
+  // every one of them must come through — LFE included, since nothing
+  // is being mixed away.
+  let big = ChannelLayout::_22POINT2;
+  let source = ResampleSpec::new(rate, Sample::I16(Type::Packed), big);
+  let target = ResampleSpec::new(16_000, Sample::I16(Type::Packed), big);
+  for channel in 0..24 {
+    let mut resampler = FfmpegResampler::new(source, target).expect("22.2 -> 22.2 opens");
+    let rms = converted_rms(
+      &mut resampler,
+      &tone_in_one_channel(rate, samples, big, channel),
+    );
+    assert!(
+      rms > 10.0,
+      "source channel {channel} vanished from a same-layout conversion (rms {rms})",
+    );
+  }
+}
+
+#[test]
+fn a_rematrix_that_would_drop_channels_is_refused_by_name() {
+  support::init_ffmpeg();
+  // Packed 22.2 -> mono: swr mixes nine of the twenty-four channels and
+  // processes the rest as though they were not there. It used to open
+  // happily — the planar-only refusal never looked at it.
+  let source = ResampleSpec::new(48_000, Sample::I16(Type::Packed), ChannelLayout::_22POINT2);
+  match FfmpegResampler::new(source, mono_16k()) {
+    Err(ResampleError::ChannelDropped {
+      source_channels,
+      target_channels,
+      channel,
+    }) => {
+      assert_eq!((source_channels, target_channels), (24, 1));
+      assert_eq!(channel, 9, "the first channel swr's matrix cannot route");
+    }
+    Err(other) => panic!("expected ChannelDropped, got {other:?}"),
+    Ok(_) => panic!("a conversion that drops fifteen channels must not open"),
+  }
+
+  // And the case a channel-count threshold would have waved through:
+  // `cube` is eight channels, and two of them reach nothing.
+  assert!(
+    matches!(
+      FfmpegResampler::new(
+        ResampleSpec::new(48_000, Sample::I16(Type::Packed), ChannelLayout::CUBE),
+        ResampleSpec::new(16_000, Sample::I16(Type::Packed), ChannelLayout::STEREO),
+      )
+      .map(|_| ()),
+      Err(ResampleError::ChannelDropped { channel: 6, .. }),
+    ),
+    "eight channels is not a safe count, it is just a small one",
+  );
+
+  // The controls: every one of these routes every source channel, and
+  // every one of them still opens.
+  for (name, source_layout, target_layout) in [
+    ("7.1 -> mono", ChannelLayout::_7POINT1, ChannelLayout::MONO),
+    (
+      "octagonal -> mono",
+      ChannelLayout::OCTAGONAL,
+      ChannelLayout::MONO,
+    ),
+    (
+      "7.1.2 -> stereo",
+      ChannelLayout::_7POINT1POINT2,
+      ChannelLayout::STEREO,
+    ),
+    (
+      "stereo -> 22.2",
+      ChannelLayout::STEREO,
+      ChannelLayout::_22POINT2,
+    ),
+    (
+      "22.2 -> 22.2",
+      ChannelLayout::_22POINT2,
+      ChannelLayout::_22POINT2,
+    ),
+    (
+      "5.1 -> 7.1",
+      ChannelLayout::_5POINT1,
+      ChannelLayout::_7POINT1,
+    ),
+  ] {
+    FfmpegResampler::new(
+      ResampleSpec::new(48_000, Sample::I16(Type::Packed), source_layout),
+      ResampleSpec::new(16_000, Sample::I16(Type::Packed), target_layout),
+    )
+    .unwrap_or_else(|e| panic!("{name} must still open: {e}"));
+  }
+}
+
 #[test]
 fn a_planar_layout_past_eight_channels_is_refused_at_construction() {
   support::init_ffmpeg();
@@ -562,13 +732,28 @@ fn a_planar_layout_past_eight_channels_is_refused_at_construction() {
     "the target end is the one that used to fail mid-stream",
   );
 
-  // Packed 22.2 is one plane and stays welcome, and planar right up to
-  // the limit does too: the refusal is about plane slots, not channels.
+  // Packed 22.2 is one plane and stays welcome — to *this* rule.
+  // Converting it to mono is refused by the pair check instead, for
+  // dropping channels, which `a_rematrix_that_would_drop_channels_is_refused_by_name`
+  // pins; a same-layout conversion has no rematrixing to refuse and
+  // opens, which is what proves this rule is about plane slots rather
+  // than channel count.
   FfmpegResampler::new(
     ResampleSpec::new(48_000, Sample::I16(Type::Packed), ChannelLayout::_22POINT2),
-    mono_16k(),
+    ResampleSpec::new(16_000, Sample::I16(Type::Packed), ChannelLayout::_22POINT2),
   )
   .expect("packed 22.2 is one plane");
+  assert!(
+    matches!(
+      FfmpegResampler::new(
+        ResampleSpec::new(48_000, Sample::F32(Type::Planar), ChannelLayout::_22POINT2),
+        ResampleSpec::new(16_000, Sample::F32(Type::Planar), ChannelLayout::_22POINT2),
+      )
+      .map(|_| ()),
+      Err(ResampleError::TooManyPlanes { .. }),
+    ),
+    "and the same conversion planar is refused for its planes, not its pair",
+  );
   FfmpegResampler::new(
     ResampleSpec::new(48_000, Sample::F32(Type::Planar), ChannelLayout::_7POINT1),
     mono_16k(),

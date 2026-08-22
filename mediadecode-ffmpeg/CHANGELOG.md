@@ -133,6 +133,22 @@ The backend-agnostic core it adapts has its own log at
   unusable, reaches `swr` or a staged `AVFrame` whichever route a spec
   came in by.
 
+  **The pair is checked too, not just each end.** Two individually
+  valid layouts can still lose whole channels between them: `swr` mixes
+  the channel positions its rematrix table knows and processes the rest
+  of the input as though it were absent. Measured against the linked
+  FFmpeg 9 with a tone isolated in each source channel, packed
+  22.2 → mono drops fifteen of twenty-four and `cube` → stereo drops two
+  of *eight* — so channel count is not the rule. The rule is asked of
+  FFmpeg: `swr_build_matrix2` builds the matrix it would use, and a pair
+  where any source channel reaches no output is refused
+  (`ResampleError::ChannelDropped`), as is one FFmpeg will not matrix at
+  all (`ResampleError::RematrixUnsupported`). LFE's mix level is forced
+  non-zero for the question, so FFmpeg's deliberate downmix policy —
+  which leaves LFE out — is not mistaken for a channel it cannot carry.
+  Accepting such a conversion knowingly needs an explicit mix-matrix
+  seat on the spec; until that exists, refusal is the honest answer.
+
   **State is committed after the work it describes succeeds.** A frame
   refused for its geometry does not anchor or advance the output
   timeline; timestamps are counted with checked arithmetic and an
