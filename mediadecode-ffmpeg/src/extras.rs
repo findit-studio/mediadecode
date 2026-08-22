@@ -1011,6 +1011,16 @@ pub(crate) fn clone_parameters(
   source: &Parameters,
   stream_index: usize,
 ) -> Result<Parameters, DemuxError> {
+  // The *source* first. `Parameters::new()` and `Parameters::default()`
+  // hand back a value whose pointer is null when
+  // `avcodec_parameters_alloc` failed — safe code, no error, no way to
+  // tell — and `avcodec_parameters_copy` dereferences its source. So a
+  // copier that checks only what it allocates still crashes, one
+  // allocator recovery later, on a `Parameters` that never allocated.
+  // SAFETY: reading the pointer without dereferencing it.
+  if unsafe { source.as_ptr() }.is_null() {
+    return Err(DemuxError::ParametersMissing { stream_index });
+  }
   let mut out = Parameters::new();
   // SAFETY: reading the pointer the constructor stored without
   // dereferencing it — which is exactly what the check is for.
@@ -1063,16 +1073,30 @@ impl TrackExtra {
   /// Constructs a `TrackExtra` from the stream index and its codec
   /// parameters. Everything else starts absent.
   ///
+  /// **Fallible, and that is the point.** `Parameters::new()` and
+  /// `Parameters::default()` are safe constructors that hand back a
+  /// null-backed value when `avcodec_parameters_alloc` fails, saying
+  /// nothing; accepting one here would store a landmine that goes off
+  /// later, in a copy, on a thread that has forgotten the allocator
+  /// ever failed. Refusing it at the door is what lets every other
+  /// method on this type — and every reader of
+  /// [`Self::parameters`] — rely on there being parameters at all.
+  ///
   /// Not `const fn`: [`Parameters`] owns a heap allocation.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn new(stream_index: i32, parameters: Parameters) -> Self {
-    Self {
+  pub fn new(stream_index: i32, parameters: Parameters) -> Result<Self, DemuxError> {
+    // SAFETY: reading the pointer without dereferencing it.
+    if unsafe { parameters.as_ptr() }.is_null() {
+      return Err(DemuxError::ParametersMissing {
+        stream_index: stream_index.max(0) as usize,
+      });
+    }
+    Ok(Self {
       stream_index,
       disposition: 0,
       start_time: None,
       frame_count: None,
       parameters,
-    }
+    })
   }
 
   /// A deep copy of this row, with the codec-parameter copy checked.
@@ -1080,6 +1104,8 @@ impl TrackExtra {
   /// The fallible counterpart of the `Clone` this type deliberately
   /// does not implement — see the type's own documentation for why.
   pub fn try_clone(&self) -> Result<Self, DemuxError> {
+    // No re-check: `self` cannot exist over null-backed parameters, and
+    // `clone_parameters` never returns one.
     Ok(Self {
       stream_index: self.stream_index,
       disposition: self.disposition,

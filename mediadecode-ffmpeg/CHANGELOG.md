@@ -326,6 +326,21 @@ The backend-agnostic core it adapts has its own log at
   `ResampleSpec::from_parameters` reads them — but nothing in this crate
   asks a caller to clone them unchecked any more.
 
+  **And a `TrackExtra` cannot exist over parameters that were never
+  allocated.** `Parameters::new()` / `Default` hand back a null-backed
+  value when `avcodec_parameters_alloc` failed and report nothing, so
+  checking only the destination of a copy left the source trusted: once
+  the allocator recovered, `avcodec_parameters_copy(out, NULL)`
+  dereferenced null from safe public code. `TrackExtra::new` is
+  therefore fallible and refuses one
+  (`DemuxError::ParametersMissing`), which gives the type a non-null
+  invariant from birth, and the copier checks its source as well —
+  belt and braces, because the invariant is a promise and the check is
+  a fact. `ResampleSpec::from_parameters` and `from_decoder` grew the
+  same guard: the first used to ask `medium()` on the way in, which
+  dereferences the pointer inside ffmpeg-next before any code of this
+  crate runs.
+
 - **A track's codec parameters are copied with both fallible steps
   checked.** `ffmpeg_next`'s `Clone` for `Parameters` checks neither:
   `Parameters::new` does not test `avcodec_parameters_alloc` for null

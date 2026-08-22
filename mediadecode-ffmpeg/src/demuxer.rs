@@ -350,6 +350,20 @@ pub enum DemuxError {
     stream_index: usize,
   },
 
+  /// Codec parameters arrived that were never allocated.
+  ///
+  /// `ffmpeg_next::codec::Parameters` has safe constructors that hand
+  /// back a null-backed value when FFmpeg's allocation failed, and they
+  /// report nothing. Copying from one dereferences null, so it is
+  /// refused where it arrives — at construction, and again in the
+  /// copier — rather than crashing later somewhere that has forgotten
+  /// the allocator ever failed.
+  #[error("the codec parameters for stream {stream_index} were never allocated")]
+  ParametersMissing {
+    /// The `AVStream.index` the parameters were offered for.
+    stream_index: usize,
+  },
+
   /// Codec parameters for a track could not be allocated.
   #[error("out of memory allocating the codec parameters for stream {stream_index}")]
   ParametersAlloc {
@@ -489,7 +503,7 @@ fn build_tracks(input: &Input) -> Result<BuiltTracks, DemuxError> {
     let extra = TrackExtra::new(
       index as i32,
       crate::extras::clone_parameters(&parameters, index)?,
-    )
+    )?
     .with_disposition(disposition)
     .with_start_time((raw_start != AV_NOPTS_VALUE).then_some(raw_start))
     .with_frame_count((frames > 0).then_some(frames));
@@ -914,7 +928,8 @@ mod tests {
         let extra = TrackExtra::new(
           6,
           crate::extras::clone_parameters(&source, 6).expect("uncapped"),
-        );
+        )
+        .expect("real parameters");
 
         crate::fault_subprocess::cap_ffmpeg_allocations(1);
         let cloned = extra.try_clone().map(|_| ());
@@ -933,6 +948,81 @@ mod tests {
         // And both work once the allocator does.
         extra.try_clone().expect("an uncapped row copy");
         extra.clone_parameters().expect("an uncapped handoff");
+      },
+    );
+  }
+
+  #[test]
+  fn parameters_that_never_allocated_are_refused_at_the_door() {
+    // The route the destination check could not see. A safe
+    // `Parameters::new()` under a failed allocation hands back a
+    // null-backed value and says nothing; the copier then allocated its
+    // own destination happily — the allocator having recovered by
+    // then — and called `avcodec_parameters_copy(out, NULL)`, which
+    // dereferences its source. Same crash, one recovery later, still
+    // from safe public code.
+    crate::fault_subprocess::in_subprocess(
+      "demuxer::tests::parameters_that_never_allocated_are_refused_at_the_door",
+      || {
+        // The cap is on *while the source is built* — that is the whole
+        // difference from the destination lane.
+        crate::fault_subprocess::cap_ffmpeg_allocations(1);
+        let never_allocated = Parameters::new();
+        crate::fault_subprocess::uncap_ffmpeg_allocations();
+        assert!(
+          unsafe { never_allocated.as_ptr() }.is_null(),
+          "the safe constructor really does hand back a null-backed value",
+        );
+
+        // The door: a `TrackExtra` cannot exist over it, so the copy
+        // methods have nothing to be asked on.
+        let refused = TrackExtra::new(9, never_allocated);
+        let Err(DemuxError::ParametersMissing { stream_index }) = refused.map(|_| ()) else {
+          panic!("a null-backed source must not become a track row");
+        };
+        assert_eq!(stream_index, 9);
+
+        // And the copier refuses it too, so the invariant is not the
+        // only thing standing between this and a null dereference.
+        let never_allocated = {
+          crate::fault_subprocess::cap_ffmpeg_allocations(1);
+          let p = Parameters::new();
+          crate::fault_subprocess::uncap_ffmpeg_allocations();
+          p
+        };
+        assert!(matches!(
+          crate::extras::clone_parameters(&never_allocated, 9).map(|_| ()),
+          Err(DemuxError::ParametersMissing { stream_index: 9 }),
+        ));
+
+        // A row built over real parameters still copies both ways, so
+        // the refusal is about the null and nothing else.
+        let real = Parameters::new();
+        let extra = TrackExtra::new(9, real).expect("real parameters");
+        extra.try_clone().expect("row copy");
+        extra.clone_parameters().expect("handoff");
+      },
+    );
+  }
+
+  #[test]
+  fn a_spec_read_from_parameters_that_never_allocated_is_absent() {
+    // The same trap at another public door, found by the sweep:
+    // `ResampleSpec::from_parameters` asks `parameters.medium()`
+    // first, and *that* dereferences the pointer inside ffmpeg-next
+    // before any code of ours runs.
+    crate::fault_subprocess::in_subprocess(
+      "demuxer::tests::a_spec_read_from_parameters_that_never_allocated_is_absent",
+      || {
+        crate::fault_subprocess::cap_ffmpeg_allocations(1);
+        let never_allocated = Parameters::new();
+        crate::fault_subprocess::uncap_ffmpeg_allocations();
+        assert!(unsafe { never_allocated.as_ptr() }.is_null());
+        assert_eq!(
+          crate::ResampleSpec::from_parameters(&never_allocated),
+          None,
+          "parameters that do not exist describe no audio",
+        );
       },
     );
   }

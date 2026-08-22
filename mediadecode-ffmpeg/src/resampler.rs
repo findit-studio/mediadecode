@@ -93,6 +93,16 @@ impl ResampleSpec {
   /// channel layout — see [`Self::from_decoder`] for the first case and
   /// the note on [`unspecified_layout`] for the last.
   pub fn from_parameters(parameters: &Parameters) -> Option<Self> {
+    // Before `medium()`, which dereferences the pointer inside
+    // ffmpeg-next. `Parameters`' safe constructors hand back a
+    // null-backed value when FFmpeg's allocation failed and report
+    // nothing, so a caller can arrive here holding one without ever
+    // having been told. Parameters that were never allocated describe
+    // no audio, which this function already has a word for.
+    // SAFETY: reading the pointer without dereferencing it.
+    if unsafe { parameters.as_ptr() }.is_null() {
+      return None;
+    }
     if parameters.medium() != ffmpeg_next::media::Type::Audio {
       return None;
     }
@@ -122,6 +132,12 @@ impl ResampleSpec {
     // `decoder.format()`, which would construct an `AVSampleFormat`
     // out of foreign memory.
     let ctx = unsafe { decoder.as_ptr() };
+    // Same reason as `from_parameters`: `codec::Context::new()` is a
+    // safe constructor over an unchecked `avcodec_alloc_context3`, so a
+    // decoder can be null-backed without anyone having been told.
+    if ctx.is_null() {
+      return None;
+    }
     let format =
       SampleFormat::from_raw(unsafe { read_unaligned(addr_of!((*ctx).sample_fmt).cast::<i32>()) })
         .to_ffmpeg()?;
