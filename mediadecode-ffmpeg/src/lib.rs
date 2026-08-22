@@ -28,9 +28,9 @@ pub use adapter::Ffmpeg;
 pub use audio::{AudioDecodeError, FfmpegAudioStreamDecoder};
 pub use backend::Backend;
 pub use boundary::{
-  attachment_packet_from_ffmpeg, audio_packet_from_ffmpeg, audio_packet_from_ffmpeg_in,
-  data_packet_from_ffmpeg_in, empty_audio_frame, empty_subtitle_frame, empty_video_frame,
-  from_av_pixel_format, is_hardware_pix_fmt, subtitle_packet_from_ffmpeg,
+  PacketBuildError, attachment_packet_from_ffmpeg, audio_packet_from_ffmpeg,
+  audio_packet_from_ffmpeg_in, data_packet_from_ffmpeg_in, empty_audio_frame, empty_subtitle_frame,
+  empty_video_frame, from_av_pixel_format, is_hardware_pix_fmt, subtitle_packet_from_ffmpeg,
   subtitle_packet_from_ffmpeg_in, try_empty_audio_frame, try_empty_subtitle_frame,
   try_empty_video_frame, video_packet_from_ffmpeg, video_packet_from_ffmpeg_in,
 };

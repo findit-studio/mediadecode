@@ -441,6 +441,78 @@ fn map_md_flags_to_av(flags: MdPacketFlags) -> ffmpeg_next::packet::Flags {
   av_flags
 }
 
+/// Why a portable packet could not be rebuilt as an `AVPacket`.
+///
+/// The reverse direction is what feeds a decoder, so everything the
+/// forward direction captured has to survive it or the capture was
+/// theatre.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum PacketBuildError {
+  /// The packet body could not be allocated or is larger than
+  /// `AVPacket.size` can hold.
+  #[error(transparent)]
+  Ffmpeg(#[from] ffmpeg_next::Error),
+
+  /// A side-data entry whose type this build of FFmpeg does not name.
+  ///
+  /// Refused rather than dropped: this crate carries side-data types as
+  /// the raw integers they are on the wire, and handing an unknown one
+  /// to C would either form an invalid enum discriminant or attach a
+  /// type nothing downstream can read. Everything the demuxer captured
+  /// came from this same build and is in range, so this only answers a
+  /// hand-built entry.
+  #[error("side-data type {kind} is not one this FFmpeg build names (0..{limit})")]
+  UnknownSideData {
+    /// The type integer the entry carried.
+    kind: i32,
+    /// How many side-data types this build names.
+    limit: i32,
+  },
+
+  /// FFmpeg refused the side-data allocation.
+  #[error("out of memory attaching {size} bytes of side data of type {kind}")]
+  SideDataAlloc {
+    /// The entry's type integer.
+    kind: i32,
+    /// The entry's payload length.
+    size: usize,
+  },
+}
+
+/// Copies `entries` onto an `AVPacket` under construction.
+///
+/// A decoder learns things only this way: `AV_PKT_DATA_NEW_EXTRADATA`
+/// replaces its parameters mid-stream, `AV_PKT_DATA_PARAM_CHANGE` moves
+/// its rate or layout, `AV_PKT_DATA_SKIP_SAMPLES` is the encoder-delay
+/// trim without which a gapless stream is not gapless. Rebuilding a
+/// packet without them hands the decoder a body and a lie.
+fn attach_side_data(out: &mut Packet, entries: &[SideDataEntry]) -> Result<(), PacketBuildError> {
+  use ffmpeg_next::packet::Mut;
+  for entry in entries {
+    let kind = entry.kind();
+    let size = entry.data().len();
+    // SAFETY: `out` owns a live `AVPacket`; `packet_new_side_data`
+    // validates the type against this build's own range before handing
+    // it to C and reports a failed allocation as `None`.
+    let slot = unsafe { crate::ffi::packet_new_side_data(out.as_mut_ptr(), kind, size) };
+    let Some(slot) = slot else {
+      let limit = crate::ffi::side_data_type_count();
+      return Err(if kind < 0 || kind >= limit {
+        PacketBuildError::UnknownSideData { kind, limit }
+      } else {
+        PacketBuildError::SideDataAlloc { kind, size }
+      });
+    };
+    if size > 0 {
+      // SAFETY: FFmpeg just allocated `size` bytes at `slot` (plus its
+      // padding), and `entry.data()` is a `&[u8]` of exactly that
+      // length; the two regions belong to different allocations.
+      unsafe { core::ptr::copy_nonoverlapping(entry.data().as_ptr(), slot, size) };
+    }
+  }
+  Ok(())
+}
+
 /// Builds an `ffmpeg::Packet` from a [`mediadecode::VideoPacket`]
 /// parameterized by [`crate::extras::VideoPacketExtra`] and
 /// [`crate::FfmpegBuffer`].
@@ -451,13 +523,19 @@ fn map_md_flags_to_av(flags: MdPacketFlags) -> ffmpeg_next::packet::Flags {
 /// `AVPacket.buf` directly via `av_packet_alloc` + manual buffer set).
 /// PTS / DTS / duration / flags / stream_index are propagated.
 ///
-/// Returns `Err(ffmpeg_next::Error)` on:
+/// Side data on the extras is reattached to the rebuilt packet — see
+/// [`attach_side_data`] for why that is not optional.
+///
+/// Returns [`PacketBuildError`] on:
 /// * payload larger than `c_int::MAX` (would overflow `AVPacket.size`);
-/// * `av_new_packet` allocation failure (OOM).
+/// * `av_new_packet` allocation failure (OOM);
+/// * a side-data entry this build of FFmpeg cannot name, or one whose
+///   allocation failed.
 pub fn ffmpeg_packet_from_video_packet(
   packet: &mediadecode::packet::VideoPacket<VideoPacketExtra, FfmpegBuffer>,
-) -> std::result::Result<Packet, ffmpeg_next::Error> {
+) -> std::result::Result<Packet, PacketBuildError> {
   let mut out = try_packet_copy(packet.data().as_ref())?;
+  attach_side_data(&mut out, packet.extra().side_data())?;
   if let Some(ts) = packet.pts() {
     out.set_pts(Some(ts.pts()));
   }
@@ -474,12 +552,13 @@ pub fn ffmpeg_packet_from_video_packet(
 
 /// Builds an `ffmpeg::Packet` from a [`mediadecode::AudioPacket`].
 /// Same shape as [`ffmpeg_packet_from_video_packet`] — bytes are
-/// copied; pts/dts/duration/flags/stream_index are forwarded. Same
-/// failure modes.
+/// copied; pts/dts/duration/flags/stream_index and side data are
+/// forwarded. Same failure modes.
 pub fn ffmpeg_packet_from_audio_packet(
   packet: &mediadecode::packet::AudioPacket<AudioPacketExtra, FfmpegBuffer>,
-) -> std::result::Result<Packet, ffmpeg_next::Error> {
+) -> std::result::Result<Packet, PacketBuildError> {
   let mut out = try_packet_copy(packet.data().as_ref())?;
+  attach_side_data(&mut out, packet.extra().side_data())?;
   if let Some(ts) = packet.pts() {
     out.set_pts(Some(ts.pts()));
   }
@@ -495,13 +574,14 @@ pub fn ffmpeg_packet_from_audio_packet(
 }
 
 /// Builds an `ffmpeg::Packet` from a [`mediadecode::SubtitlePacket`].
-/// Bytes copied; pts/duration/flags/stream_index forwarded. Subtitle
-/// packets have no `dts` in the mediadecode model. Same failure
-/// modes as [`ffmpeg_packet_from_video_packet`].
+/// Bytes copied; pts/duration/flags/stream_index and side data
+/// forwarded. Subtitle packets have no `dts` in the mediadecode model.
+/// Same failure modes as [`ffmpeg_packet_from_video_packet`].
 pub fn ffmpeg_packet_from_subtitle_packet(
   packet: &mediadecode::packet::SubtitlePacket<SubtitlePacketExtra, FfmpegBuffer>,
-) -> std::result::Result<Packet, ffmpeg_next::Error> {
+) -> std::result::Result<Packet, PacketBuildError> {
   let mut out = try_packet_copy(packet.data().as_ref())?;
+  attach_side_data(&mut out, packet.extra().side_data())?;
   if let Some(ts) = packet.pts() {
     out.set_pts(Some(ts.pts()));
   }
@@ -988,6 +1068,98 @@ mod tests {
 
   const NEW_EXTRADATA: i32 =
     ffmpeg_next::ffi::AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA as i32;
+
+  #[test]
+  fn side_data_survives_the_round_trip_on_every_decoder_bound_arm() {
+    // The forward direction captures side data; the reverse direction
+    // is what a decoder is actually handed. Capturing without
+    // reattaching is theatre: `NEW_EXTRADATA` never reaches the codec,
+    // `SKIP_SAMPLES` never trims, and nothing says so.
+    let tb = mediadecode::Timebase::default();
+    let mut with_body = Packet::copy(&[4u8, 5, 6]);
+    {
+      use ffmpeg_next::{
+        ffi::{AVPacketSideDataType, av_packet_new_side_data},
+        packet::Mut,
+      };
+      unsafe {
+        let ptr = av_packet_new_side_data(
+          with_body.as_mut_ptr(),
+          AVPacketSideDataType::AV_PKT_DATA_SKIP_SAMPLES,
+          3,
+        );
+        assert!(!ptr.is_null());
+        core::ptr::copy_nonoverlapping([1u8, 2, 3].as_ptr(), ptr, 3);
+      }
+    }
+    const SKIP_SAMPLES: i32 =
+      ffmpeg_next::ffi::AVPacketSideDataType::AV_PKT_DATA_SKIP_SAMPLES as i32;
+
+    for (name, source) in [
+      ("body plus side data", &with_body),
+      ("side data only", &side_data_only_packet()),
+    ] {
+      let expected_kind = if name == "side data only" {
+        NEW_EXTRADATA
+      } else {
+        SKIP_SAMPLES
+      };
+
+      let video = video_packet_from_ffmpeg_in(source, tb)
+        .expect("wrappable")
+        .expect("present");
+      let rebuilt = ffmpeg_packet_from_video_packet(&video).expect("rebuilt");
+      let carried = packet_side_data(&rebuilt);
+      assert_eq!(carried.len(), 1, "{name}: video lost its side data");
+      assert_eq!(carried[0].kind(), expected_kind, "{name}: video");
+      assert_eq!(carried[0].data(), video.extra().side_data()[0].data());
+
+      let audio = audio_packet_from_ffmpeg_in(source, tb)
+        .expect("wrappable")
+        .expect("present");
+      let rebuilt = ffmpeg_packet_from_audio_packet(&audio).expect("rebuilt");
+      let carried = packet_side_data(&rebuilt);
+      assert_eq!(carried.len(), 1, "{name}: audio lost its side data");
+      assert_eq!(carried[0].data(), audio.extra().side_data()[0].data());
+
+      let subtitle = subtitle_packet_from_ffmpeg_in(source, tb)
+        .expect("wrappable")
+        .expect("present");
+      let rebuilt = ffmpeg_packet_from_subtitle_packet(&subtitle).expect("rebuilt");
+      let carried = packet_side_data(&rebuilt);
+      assert_eq!(carried.len(), 1, "{name}: subtitle lost its side data");
+      assert_eq!(carried[0].data(), subtitle.extra().side_data()[0].data());
+    }
+  }
+
+  #[test]
+  fn a_side_data_type_this_build_cannot_name_is_refused_not_dropped() {
+    // This crate carries side-data types as the raw integers they are
+    // on the wire, so a hand-built entry can name anything. Handing an
+    // unknown one to C would either form an invalid discriminant or
+    // attach a type nothing downstream reads — and dropping it quietly
+    // is the very defect this whole seam exists to close.
+    let limit = crate::ffi::side_data_type_count();
+    let packet = mediadecode::packet::VideoPacket::new(
+      FfmpegBuffer::copy_from_slice(&[1u8]).expect("body"),
+      VideoPacketExtra::new(0).with_side_data(vec![SideDataEntry::new(limit, vec![9u8])]),
+    );
+    match ffmpeg_packet_from_video_packet(&packet).map(|_| ()) {
+      Err(PacketBuildError::UnknownSideData { kind, limit: named }) => {
+        assert_eq!(kind, limit);
+        assert_eq!(named, limit);
+      }
+      other => panic!("expected UnknownSideData, got {other:?}"),
+    }
+    assert!(matches!(
+      ffmpeg_packet_from_video_packet(&mediadecode::packet::VideoPacket::new(
+        FfmpegBuffer::copy_from_slice(&[1u8]).expect("body"),
+        VideoPacketExtra::new(0).with_side_data(vec![SideDataEntry::new(-1, vec![9u8])]),
+      ))
+      .map(|_| ()),
+      Err(PacketBuildError::UnknownSideData { kind: -1, .. }),
+    ));
+  }
 
   #[test]
   fn a_side_data_only_packet_is_delivered_on_every_timed_arm() {

@@ -224,6 +224,17 @@ The backend-agnostic core it adapts has its own log at
   attachment is its bytes, so a packet carrying none carries no
   attachment, and that arm still answers `Ok(None)`.
 
+  **And the reverse direction reattaches it**, which is what makes the
+  capture worth anything: the three `ffmpeg_packet_from_*_packet`
+  helpers are what the trait decoders hand to the codec, and they
+  rebuilt a packet from body and timestamps alone. Measured end to end
+  on `cover.mp3`: with the trim reattached the decoder returns 88 200
+  samples — exactly the two seconds the file holds — and without it
+  89 856, the encoder's padding included. A side-data type this build of
+  FFmpeg does not name is refused
+  (`PacketBuildError::UnknownSideData`) rather than dropped or handed to
+  C as an invalid discriminant.
+
 ### Changed (BREAKING)
 
 - **Wrapping a packet's payload answers `Result<Option<_>>`.**
@@ -244,6 +255,12 @@ The backend-agnostic core it adapts has its own log at
 
   Call sites that skipped `None` add one `?` or an `expect`; nothing
   else changes.
+
+- **The three `ffmpeg_packet_from_*_packet` helpers answer
+  `Result<Packet, PacketBuildError>`.** They can now fail for a reason
+  `ffmpeg_next::Error` cannot spell: a side-data entry whose type this
+  build of FFmpeg does not name, or whose allocation failed.
+  `Error::PacketBuild` carries it into the decoder error types.
 
 ## [0.6.0] - 2026-08-21
 

@@ -22,6 +22,11 @@ pub enum Error {
   #[error("ffmpeg error: {0}")]
   Ffmpeg(#[from] ffmpeg_next::Error),
 
+  /// A portable packet could not be rebuilt as an `AVPacket` on its
+  /// way into a decoder — see [`crate::boundary::PacketBuildError`].
+  #[error(transparent)]
+  PacketBuild(#[from] crate::boundary::PacketBuildError),
+
   /// `avcodec_find_decoder` returned null for the input codec id. The id
   /// is reported as the raw integer (`AVCodecID` discriminant) — we do not
   /// construct the bindgen `AVCodecID` enum from a runtime value, since

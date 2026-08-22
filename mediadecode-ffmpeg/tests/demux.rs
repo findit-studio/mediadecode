@@ -289,6 +289,83 @@ fn a_packets_side_data_arrives_with_it() {
   );
 }
 
+/// Decodes every audio packet of `path` through the trait decoder,
+/// counting samples. With `strip_side_data`, each packet is rebuilt
+/// carrying its body and timestamps but none of its side data — which
+/// is exactly what the boundary used to hand the codec.
+fn decoded_samples(path: &std::path::Path, strip_side_data: bool) -> u64 {
+  use mediadecode::decoder::AudioStreamDecoder;
+
+  let mut demuxer = FfmpegDemuxer::open(path).expect("open");
+  let track = demuxer
+    .tracks()
+    .iter()
+    .position(|t| t.kind() == TrackKind::Audio)
+    .expect("an audio track");
+  let info = &demuxer.tracks()[track];
+  let mut decoder = mediadecode_ffmpeg::FfmpegAudioStreamDecoder::open(
+    info.extra().parameters().clone(),
+    info.timebase(),
+  )
+  .expect("open decoder");
+
+  let mut frame = mediadecode_ffmpeg::empty_audio_frame();
+  let mut total = 0u64;
+  while let Some(packet) = demuxer.next_packet().expect("pull") {
+    let DemuxedPacket::Audio { packet, .. } = packet else {
+      continue;
+    };
+    let packet = if strip_side_data {
+      mediadecode_ffmpeg::AudioPacket::new(
+        packet.data().clone(),
+        mediadecode_ffmpeg::extras::AudioPacketExtra::new(packet.extra().stream_index()),
+      )
+      .with_pts(packet.pts())
+      .with_dts(packet.dts())
+      .with_duration(packet.duration())
+      .with_flags(packet.flags())
+    } else {
+      packet
+    };
+    decoder.send_packet(&packet).expect("send_packet");
+    while decoder.receive_frame(&mut frame).is_ok() {
+      total += u64::from(frame.nb_samples());
+    }
+  }
+  decoder.send_eof().expect("eof");
+  while decoder.receive_frame(&mut frame).is_ok() {
+    total += u64::from(frame.nb_samples());
+  }
+  total
+}
+
+#[test]
+fn side_data_survives_from_the_container_to_the_codec() {
+  let Some(corpus) = Corpus::new() else { return };
+  // The whole path, end to end: the demuxer captures the packet's side
+  // data, the reverse conversion reattaches it, and the codec acts on
+  // it. `AV_PKT_DATA_SKIP_SAMPLES` is the encoder-delay trim an MP3
+  // carries, and acting on it is *observable* — the decoder returns
+  // fewer samples, because the padding LAME added is dropped.
+  let path = corpus.cover_art_mp3();
+  let carried = decoded_samples(&path, false);
+  let stripped = decoded_samples(&path, true);
+
+  assert!(carried > 0 && stripped > 0, "both runs must decode");
+  assert!(
+    carried < stripped,
+    "the trim changed nothing: {carried} samples with side data, {stripped} without — \
+     the codec never saw it",
+  );
+  // And the trimmed length is the *true* one: the corpus generates two
+  // seconds of 44.1 kHz tone, so 88 200 samples is the answer the file
+  // is owed. Whatever padding LAME chose is what the other run keeps.
+  assert_eq!(
+    carried, 88_200,
+    "the trim is applied but lands wrong ({stripped} untrimmed)",
+  );
+}
+
 #[test]
 fn the_data_arm_delivers_the_timecode_track() {
   let Some(corpus) = Corpus::new() else { return };

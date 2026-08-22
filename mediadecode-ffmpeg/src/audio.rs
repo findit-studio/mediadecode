@@ -74,7 +74,7 @@ impl AudioStreamDecoder for FfmpegAudioStreamDecoder {
     packet: &AudioPacket<AudioPacketExtra, Self::Buffer>,
   ) -> Result<(), Self::Error> {
     let av_pkt = boundary::ffmpeg_packet_from_audio_packet(packet)
-      .map_err(|e| AudioDecodeError::Decode(Error::Ffmpeg(e)))?;
+      .map_err(|e| AudioDecodeError::Decode(Error::PacketBuild(e)))?;
     self
       .decoder
       .send_packet(&av_pkt)
