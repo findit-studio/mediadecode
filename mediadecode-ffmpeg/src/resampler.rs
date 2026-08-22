@@ -664,6 +664,27 @@ pub enum ResampleError {
     channels: i32,
   },
 
+  /// A planar spec with more channels than a decoded frame has plane
+  /// slots.
+  ///
+  /// `mediadecode`'s `AudioFrame` carries a fixed eight planes
+  /// (`AV_NUM_DATA_POINTERS`); planar audio past that lives in
+  /// `AVFrame.extended_data[]`, which this crate does not plumb
+  /// through. As a **source** no valid frame could ever arrive; as a
+  /// **target** `swr` would produce one this crate cannot hand back —
+  /// and it would fail only after the input had been consumed, leaving
+  /// a session that cannot be retried. Both are refused at
+  /// construction, where nothing has happened yet.
+  #[error("the {end} spec is planar with {channels} channels; a frame carries {limit} planes")]
+  TooManyPlanes {
+    /// Which end of the conversion.
+    end: SpecEnd,
+    /// The channel count the layout declares.
+    channels: i32,
+    /// Plane slots a frame has.
+    limit: i32,
+  },
+
   /// The output timeline would leave `i64`. Counted timestamps are
   /// exact or they are nothing, so this is named rather than saturated.
   #[error("the output timeline overflows: {pts} + {samples} samples")]
@@ -711,6 +732,13 @@ impl core::fmt::Display for SpecEnd {
   }
 }
 
+/// Plane slots a `mediadecode::frame::AudioFrame` has — the fixed array
+/// matching `AV_NUM_DATA_POINTERS`. Planar audio past this many
+/// channels lives in `AVFrame.extended_data[]` / `extended_buf[]`,
+/// which this crate does not plumb through: `convert` refuses such a
+/// frame and `AudioFrame::new` will not build one.
+const MAX_AUDIO_PLANES: i32 = 8;
+
 /// Refuses a spec `swr` cannot be driven with, or whose channel layout
 /// cannot be carried by value — see [`ResampleError::UnsupportedLayout`]
 /// for that one, which is the whole reason this check exists at the
@@ -741,6 +769,19 @@ fn check_spec(spec: &ResampleSpec, end: SpecEnd) -> Result<(), ResampleError> {
       end,
       order,
       channels,
+    });
+  }
+  // A planar spec with more channels than the frame model has plane
+  // slots is a resampler that cannot work in either direction, and
+  // saying so here is the difference between a refusal at construction
+  // and a refusal on every frame — the target one arriving *after*
+  // `swr` has already consumed the input, which is not a state a caller
+  // can retry from.
+  if spec.format.is_planar() && channels > MAX_AUDIO_PLANES {
+    return Err(ResampleError::TooManyPlanes {
+      end,
+      channels,
+      limit: MAX_AUDIO_PLANES,
     });
   }
   Ok(())

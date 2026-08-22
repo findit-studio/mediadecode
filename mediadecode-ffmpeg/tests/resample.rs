@@ -525,6 +525,58 @@ fn a_custom_layout_is_refused_by_name() {
 }
 
 #[test]
+fn a_planar_layout_past_eight_channels_is_refused_at_construction() {
+  support::init_ffmpeg();
+  // 22.2 is twenty-four channels. Planar, that is twenty-four planes,
+  // and a `mediadecode` audio frame has eight slots. As a source no
+  // frame could ever arrive; as a target `swr` would produce one this
+  // crate cannot hand back — and only after consuming the input, so the
+  // failure would land on a session the caller cannot retry. Both are
+  // refused where nothing has happened yet.
+  let planar_22_2 = ResampleSpec::new(48_000, Sample::F32(Type::Planar), ChannelLayout::_22POINT2);
+  assert_eq!(planar_22_2.channels(), 24, "22.2 really is 24 channels");
+
+  match FfmpegResampler::new(planar_22_2, mono_16k()) {
+    Err(ResampleError::TooManyPlanes {
+      end,
+      channels,
+      limit,
+    }) => {
+      assert_eq!(end.to_string(), "source");
+      assert_eq!((channels, limit), (24, 8));
+    }
+    Err(other) => panic!("expected TooManyPlanes for the source, got {other:?}"),
+    Ok(_) => panic!("a source no frame can represent must not open"),
+  }
+
+  let stereo = ResampleSpec::new(48_000, Sample::I16(Type::Packed), ChannelLayout::STEREO);
+  assert!(
+    matches!(
+      FfmpegResampler::new(stereo, planar_22_2).map(|_| ()),
+      Err(ResampleError::TooManyPlanes {
+        end: mediadecode_ffmpeg::SpecEnd::Target,
+        channels: 24,
+        ..
+      }),
+    ),
+    "the target end is the one that used to fail mid-stream",
+  );
+
+  // Packed 22.2 is one plane and stays welcome, and planar right up to
+  // the limit does too: the refusal is about plane slots, not channels.
+  FfmpegResampler::new(
+    ResampleSpec::new(48_000, Sample::I16(Type::Packed), ChannelLayout::_22POINT2),
+    mono_16k(),
+  )
+  .expect("packed 22.2 is one plane");
+  FfmpegResampler::new(
+    ResampleSpec::new(48_000, Sample::F32(Type::Planar), ChannelLayout::_7POINT1),
+    mono_16k(),
+  )
+  .expect("eight planar channels is exactly the limit");
+}
+
+#[test]
 fn a_forged_frame_geometry_is_refused_before_it_can_allocate() {
   support::init_ffmpeg();
   let source = ResampleSpec::new(48_000, Sample::I16(Type::Packed), ChannelLayout::STEREO);

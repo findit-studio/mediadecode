@@ -124,8 +124,14 @@ The backend-agnostic core it adapts has its own log at
   and — because `ResampleSpec::new` is `const` and total —
   `FfmpegResampler::new` is the choke point that refuses them by name
   (`ResampleError::UnsupportedLayout`), along with a rate of zero or
-  past `c_int` and `AV_SAMPLE_FMT_NONE`. Nothing hazardous reaches
-  `swr` or a staged `AVFrame` whichever route a spec came in by.
+  past `c_int`, `AV_SAMPLE_FMT_NONE`, and a planar spec with more
+  channels than a frame has plane slots
+  (`ResampleError::TooManyPlanes` — planar 22.2 is twenty-four planes
+  against the model's eight, unusable as a source because no frame
+  could carry it and worse as a target because the failure would land
+  after `swr` had consumed the input). Nothing hazardous, and nothing
+  unusable, reaches `swr` or a staged `AVFrame` whichever route a spec
+  came in by.
 
   **State is committed after the work it describes succeeds.** A frame
   refused for its geometry does not anchor or advance the output
