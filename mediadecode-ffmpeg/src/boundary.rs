@@ -20,6 +20,7 @@ use mediaframe::audio::ChannelLayoutDescription;
 
 use crate::{
   FfmpegBuffer,
+  buffer::PacketBufferError,
   extras::{
     AttachmentPacketExtra, AudioFrameExtra, AudioPacketExtra, DataPacketExtra, SubtitleFrameExtra,
     SubtitlePacketExtra, VideoFrameExtra, VideoPacketExtra,
@@ -518,13 +519,15 @@ pub fn ffmpeg_packet_from_subtitle_packet(
 /// Timestamps, duration, key/corrupt flags, and the source stream
 /// index are forwarded to the produced packet.
 ///
-/// Returns `None` when the source packet has no buffer attached
-/// (empty packet — typical after EOF). Caller can also fill in
-/// [`VideoPacketExtra::byte_pos`] / `side_data` post-construction
-/// if they need those.
+/// Returns `Ok(None)` when the source packet has no payload at all
+/// (an empty packet — typical after EOF), and
+/// [`PacketBufferError`] when a payload that *is* there could not be
+/// referenced: the two are never the same answer. Caller can also fill
+/// in [`VideoPacketExtra::byte_pos`] / `side_data` post-construction if
+/// they need those.
 pub fn video_packet_from_ffmpeg(
   packet: &Packet,
-) -> Option<VideoPacket<VideoPacketExtra, FfmpegBuffer>> {
+) -> Result<Option<VideoPacket<VideoPacketExtra, FfmpegBuffer>>, PacketBufferError> {
   video_packet_from_ffmpeg_in(packet, mediadecode::Timebase::default())
 }
 
@@ -534,7 +537,7 @@ pub fn video_packet_from_ffmpeg(
 /// metadata.
 pub fn audio_packet_from_ffmpeg(
   packet: &Packet,
-) -> Option<AudioPacket<AudioPacketExtra, FfmpegBuffer>> {
+) -> Result<Option<AudioPacket<AudioPacketExtra, FfmpegBuffer>>, PacketBufferError> {
   audio_packet_from_ffmpeg_in(packet, mediadecode::Timebase::default())
 }
 
@@ -544,7 +547,7 @@ pub fn audio_packet_from_ffmpeg(
 /// [`video_packet_from_ffmpeg`].
 pub fn subtitle_packet_from_ffmpeg(
   packet: &Packet,
-) -> Option<SubtitlePacket<SubtitlePacketExtra, FfmpegBuffer>> {
+) -> Result<Option<SubtitlePacket<SubtitlePacketExtra, FfmpegBuffer>>, PacketBufferError> {
   subtitle_packet_from_ffmpeg_in(packet, mediadecode::Timebase::default())
 }
 
@@ -564,8 +567,10 @@ pub fn subtitle_packet_from_ffmpeg(
 pub fn video_packet_from_ffmpeg_in(
   packet: &Packet,
   time_base: mediadecode::Timebase,
-) -> Option<VideoPacket<VideoPacketExtra, FfmpegBuffer>> {
-  let buf = FfmpegBuffer::from_packet(packet)?;
+) -> Result<Option<VideoPacket<VideoPacketExtra, FfmpegBuffer>>, PacketBufferError> {
+  let Some(buf) = FfmpegBuffer::from_packet(packet)? else {
+    return Ok(None);
+  };
   let mut out = VideoPacket::new(buf, VideoPacketExtra::new(packet.stream() as i32))
     .with_flags(md_flags_from_av(packet.flags()))
     .with_pts(packet.pts().map(|p| Timestamp::new(p, time_base)))
@@ -574,7 +579,7 @@ pub fn video_packet_from_ffmpeg_in(
   if dur > 0 {
     out = out.with_duration(Some(Timestamp::new(dur, time_base)));
   }
-  Some(out)
+  Ok(Some(out))
 }
 
 /// [`audio_packet_from_ffmpeg`], with the stream's timebase stamped
@@ -582,8 +587,10 @@ pub fn video_packet_from_ffmpeg_in(
 pub fn audio_packet_from_ffmpeg_in(
   packet: &Packet,
   time_base: mediadecode::Timebase,
-) -> Option<AudioPacket<AudioPacketExtra, FfmpegBuffer>> {
-  let buf = FfmpegBuffer::from_packet(packet)?;
+) -> Result<Option<AudioPacket<AudioPacketExtra, FfmpegBuffer>>, PacketBufferError> {
+  let Some(buf) = FfmpegBuffer::from_packet(packet)? else {
+    return Ok(None);
+  };
   let mut out = AudioPacket::new(buf, AudioPacketExtra::new(packet.stream() as i32))
     .with_flags(md_flags_from_av(packet.flags()))
     .with_pts(packet.pts().map(|p| Timestamp::new(p, time_base)))
@@ -592,7 +599,7 @@ pub fn audio_packet_from_ffmpeg_in(
   if dur > 0 {
     out = out.with_duration(Some(Timestamp::new(dur, time_base)));
   }
-  Some(out)
+  Ok(Some(out))
 }
 
 /// [`subtitle_packet_from_ffmpeg`], with the stream's timebase stamped
@@ -600,8 +607,10 @@ pub fn audio_packet_from_ffmpeg_in(
 pub fn subtitle_packet_from_ffmpeg_in(
   packet: &Packet,
   time_base: mediadecode::Timebase,
-) -> Option<SubtitlePacket<SubtitlePacketExtra, FfmpegBuffer>> {
-  let buf = FfmpegBuffer::from_packet(packet)?;
+) -> Result<Option<SubtitlePacket<SubtitlePacketExtra, FfmpegBuffer>>, PacketBufferError> {
+  let Some(buf) = FfmpegBuffer::from_packet(packet)? else {
+    return Ok(None);
+  };
   let mut out = SubtitlePacket::new(buf, SubtitlePacketExtra::new(packet.stream() as i32))
     .with_flags(md_flags_from_av(packet.flags()))
     .with_pts(packet.pts().map(|p| Timestamp::new(p, time_base)));
@@ -609,7 +618,7 @@ pub fn subtitle_packet_from_ffmpeg_in(
   if dur > 0 {
     out = out.with_duration(Some(Timestamp::new(dur, time_base)));
   }
-  Some(out)
+  Ok(Some(out))
 }
 
 /// Wraps a borrowed [`ffmpeg::Packet`] from a **data** track — timecode,
@@ -624,8 +633,10 @@ pub fn subtitle_packet_from_ffmpeg_in(
 pub fn data_packet_from_ffmpeg_in(
   packet: &Packet,
   time_base: mediadecode::Timebase,
-) -> Option<DataPacket<DataPacketExtra, FfmpegBuffer>> {
-  let buf = FfmpegBuffer::from_packet(packet)?;
+) -> Result<Option<DataPacket<DataPacketExtra, FfmpegBuffer>>, PacketBufferError> {
+  let Some(buf) = FfmpegBuffer::from_packet(packet)? else {
+    return Ok(None);
+  };
   let pos = packet.position();
   let extra =
     DataPacketExtra::new(packet.stream() as i32).with_byte_pos((pos >= 0).then_some(pos as i64));
@@ -636,7 +647,7 @@ pub fn data_packet_from_ffmpeg_in(
   if dur > 0 {
     out = out.with_duration(Some(Timestamp::new(dur, time_base)));
   }
-  Some(out)
+  Ok(Some(out))
 }
 
 /// Wraps a borrowed [`ffmpeg::Packet`] from an **attachment** track —
@@ -649,12 +660,14 @@ pub fn data_packet_from_ffmpeg_in(
 /// the packets it builds out of codec extradata.
 pub fn attachment_packet_from_ffmpeg(
   packet: &Packet,
-) -> Option<AttachmentPacket<AttachmentPacketExtra, FfmpegBuffer>> {
-  let buf = FfmpegBuffer::from_packet(packet)?;
-  Some(
+) -> Result<Option<AttachmentPacket<AttachmentPacketExtra, FfmpegBuffer>>, PacketBufferError> {
+  let Some(buf) = FfmpegBuffer::from_packet(packet)? else {
+    return Ok(None);
+  };
+  Ok(Some(
     AttachmentPacket::new(buf, AttachmentPacketExtra::new(packet.stream() as i32))
       .with_flags(md_flags_from_av(packet.flags())),
-  )
+  ))
 }
 
 fn md_flags_from_av(flags: ffmpeg_next::packet::Flags) -> MdPacketFlags {
@@ -783,6 +796,75 @@ pub fn try_empty_subtitle_frame() -> Option<SubtitleFrame<SubtitleFrameExtra, Ff
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// A refcounted packet whose header claims a payload larger than the
+  /// buffer behind it — the shape a malformed container, or an
+  /// `av_packet_split_side_data` gone wrong, produces. Its payload is
+  /// *there* and cannot be wrapped, which is exactly the case that must
+  /// not read as "empty".
+  fn out_of_bounds_packet() -> Packet {
+    use ffmpeg_next::packet::Mut;
+    let mut packet = Packet::copy(&[1u8, 2, 3, 4]);
+    // SAFETY: `packet` owns a live `AVPacket` with a refcounted buffer;
+    // `size` is a public field.
+    unsafe {
+      (*packet.as_mut_ptr()).size = 1 << 20;
+    }
+    packet
+  }
+
+  #[test]
+  fn a_payload_that_cannot_be_wrapped_is_an_error_on_every_arm() {
+    // All five delivery arms plus the attachment path go through the
+    // same wrapper. If one of them still folded the failure into
+    // `None`, the demuxer would drop that kind of packet in silence.
+    let forged = out_of_bounds_packet();
+    let tb = mediadecode::Timebase::default();
+    assert!(matches!(
+      video_packet_from_ffmpeg_in(&forged, tb),
+      Err(PacketBufferError::Bounds { .. }),
+    ));
+    assert!(matches!(
+      audio_packet_from_ffmpeg_in(&forged, tb),
+      Err(PacketBufferError::Bounds { .. }),
+    ));
+    assert!(matches!(
+      subtitle_packet_from_ffmpeg_in(&forged, tb),
+      Err(PacketBufferError::Bounds { .. }),
+    ));
+    assert!(matches!(
+      data_packet_from_ffmpeg_in(&forged, tb),
+      Err(PacketBufferError::Bounds { .. }),
+    ));
+    assert!(matches!(
+      attachment_packet_from_ffmpeg(&forged),
+      Err(PacketBufferError::Bounds { .. }),
+    ));
+  }
+
+  #[test]
+  fn an_empty_packet_is_absent_and_a_real_one_is_present() {
+    let tb = mediadecode::Timebase::default();
+    // No payload at all: the marker some demuxers emit. Absent, not an
+    // error — this is the only thing a pull loop may skip.
+    let empty = Packet::empty();
+    assert!(
+      video_packet_from_ffmpeg_in(&empty, tb)
+        .expect("not a failure")
+        .is_none()
+    );
+    assert!(
+      attachment_packet_from_ffmpeg(&empty)
+        .expect("not a failure")
+        .is_none()
+    );
+
+    let real = Packet::copy(&[9u8, 8, 7]);
+    let wrapped = video_packet_from_ffmpeg_in(&real, tb)
+      .expect("wrappable")
+      .expect("present");
+    assert_eq!(wrapped.data().as_ref(), &[9, 8, 7]);
+  }
 
   #[test]
   fn nv12_round_trips() {

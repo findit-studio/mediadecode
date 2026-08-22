@@ -221,6 +221,46 @@ fn an_attachment_is_delivered_exactly_once_and_before_any_timed_packet() {
 }
 
 #[test]
+fn every_attachment_track_is_delivered_before_the_first_timed_packet() {
+  let Some(corpus) = Corpus::new() else { return };
+
+  // The contract, counted rather than sampled: one packet per
+  // attachment track, all of them ahead of every timed packet, on every
+  // shape the corpus can make. Nothing is left owed at EOF, because
+  // nothing about the delivery depends on a packet arriving.
+  for path in [
+    corpus.multi_track_mkv(),
+    corpus.cover_art_mp3(),
+    corpus.timecode_mov(),
+  ] {
+    let mut demuxer = FfmpegDemuxer::open(&path).expect("open");
+    let expected = demuxer
+      .tracks()
+      .iter()
+      .filter(|t| t.kind() == TrackKind::Attachment)
+      .count();
+    let delivered = drain(&mut demuxer);
+
+    let attachments = delivered
+      .iter()
+      .take_while(|(_, kind, _)| *kind == TrackKind::Attachment)
+      .count();
+    assert_eq!(
+      attachments, expected,
+      "{path:?}: {expected} attachment tracks, {attachments} packets ahead of the timeline",
+    );
+    assert_eq!(
+      delivered
+        .iter()
+        .filter(|(_, kind, _)| *kind == TrackKind::Attachment)
+        .count(),
+      expected,
+      "{path:?}: and none of them arrived later",
+    );
+  }
+}
+
+#[test]
 fn the_data_arm_delivers_the_timecode_track() {
   let Some(corpus) = Corpus::new() else { return };
   let mut demuxer = FfmpegDemuxer::open(&corpus.timecode_mov()).expect("open mov");

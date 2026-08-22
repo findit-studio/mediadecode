@@ -35,9 +35,15 @@ The backend-agnostic core it adapts has its own log at
   payload lives in codec extradata — so the packet is synthesized at
   open. And cover art's real packet, which libavformat parks in
   `AVStream.attached_pic` *and* some demuxers also emit, is hoisted at
-  open and its duplicate dropped. Both kinds are queued before a single
+  open and its duplicate dropped. Every attachment track leaves the open
+  with exactly one packet queued — or the open fails — before a single
   `av_read_frame` has run, which is what makes "exactly one packet,
-  before any timed packet" true rather than aspirational.
+  before any timed packet" a property of the construction rather than a
+  promise the pull loop has to keep. A stream that declares cover art
+  and parks no payload (a state this build's demuxers do not produce:
+  `ff_add_attached_pic` sets the disposition and fills the packet in one
+  call) still gets its one packet, empty and marked `synthesized`,
+  rather than a place in a queue of packets that may never arrive.
 
   `seek` converts the target to `AV_TIME_BASE` units and seeks over the
   window `[i64::MIN, target]` — FFmpeg's backward convention, landing on
@@ -50,6 +56,22 @@ The backend-agnostic core it adapts has its own log at
   A track whose kind is `Unknown` has no delivery arm and its packets
   are not delivered; a corrupt packet is skipped and the read resumed,
   since `AVERROR_INVALIDDATA` is not latched into the `AVIOContext`.
+
+  **A panicking reader is an error, not an abort.** libavformat drives
+  an `open_reader` byte source from `extern "C"` callbacks, where a
+  panic cannot unwind and terminates the process. Every call into the
+  caller's reader runs under `catch_unwind`: the panic is latched,
+  reported to C as an ordinary I/O error, and surfaced as
+  `DemuxError::ReaderPanic` with the panic's own message from the next
+  `open_reader`, `next_packet` or `seek`. The session is terminal from
+  there.
+
+  **Container metadata is read as bytes, not trusted as text.**
+  `ffmpeg_next`'s `DictionaryRef::get` builds its `&str` with
+  `from_utf8_unchecked`, and FFmpeg does not validate demuxed metadata
+  as UTF-8; a track's `filename` / `mimetype` therefore go through
+  `av_dict_get` and a bounded walk, with invalid bytes replaced rather
+  than trusted.
 
 - **Boundary helpers that carry a timebase.**
   `video_packet_from_ffmpeg_in`, `audio_packet_from_ffmpeg_in`,
@@ -95,10 +117,29 @@ The backend-agnostic core it adapts has its own log at
   substitute a default internally, and then compares every frame handed
   to it against that one — so the frames this layer stages carry the
   post-init layout while the mid-stream check keeps comparing against
-  the declared one. Custom and ambisonic layouts are refused outright
-  (`from_parameters` / `from_decoder` return `None`): both keep a
-  heap-allocated channel map that a `Copy` layout wrapper cannot own
-  safely, and a silent approximation would be worse than a `None`.
+  the declared one. Custom and ambisonic layouts are refused outright:
+  both keep a heap-allocated channel map that a `Copy` layout wrapper
+  cannot own safely, and a silent approximation would be worse than a
+  refusal. `from_parameters` / `from_decoder` answer `None` for them,
+  and — because `ResampleSpec::new` is `const` and total —
+  `FfmpegResampler::new` is the choke point that refuses them by name
+  (`ResampleError::UnsupportedLayout`), along with a rate of zero or
+  past `c_int` and `AV_SAMPLE_FMT_NONE`. Nothing hazardous reaches
+  `swr` or a staged `AVFrame` whichever route a spec came in by.
+
+  **State is committed after the work it describes succeeds.** A frame
+  refused for its geometry does not anchor or advance the output
+  timeline; timestamps are counted with checked arithmetic and an
+  overflow is `ResampleError::TimestampOverflow` rather than `i64::MAX`
+  repeated; plane geometry is settled in checked arithmetic *before* any
+  allocation is sized from a frame header, and every allocation is
+  checked (`frame::Audio::new` dereferences `av_frame_alloc` unchecked
+  and discards `av_frame_get_buffer`'s return, so this crate allocates
+  its audio frames through a local helper that does neither). `flush`
+  rebuilds the `swr` context rather than draining it: a drain that gave
+  up and a drain that finished are indistinguishable from outside, and a
+  reset that reports success must not leave the previous stream's tail
+  inside the filter.
 
 - **`SampleFormat::to_ffmpeg` / `SampleFormat::from_ffmpeg`** — the
   direction this newtype was missing. A raw sample-format integer read
@@ -115,6 +156,27 @@ The backend-agnostic core it adapts has its own log at
   `TrackExtra::disposition` is the raw `AV_DISPOSITION_*` bit set rather
   than `ffmpeg_next`'s `Disposition`, whose `from_bits_truncate` would
   drop bits this build has no constant for.
+
+### Changed (BREAKING)
+
+- **Wrapping a packet's payload answers `Result<Option<_>>`.**
+  `FfmpegBuffer::from_packet`, `video_packet_from_ffmpeg`,
+  `audio_packet_from_ffmpeg`, `subtitle_packet_from_ffmpeg`, the four
+  `*_packet_from_ffmpeg_in` variants and `attachment_packet_from_ffmpeg`
+  now return `Result<Option<_>, PacketBufferError>`.
+
+  `Ok(None)` is a packet that carries no payload — the empty marker some
+  demuxers emit, and the only thing a pull loop may skip. An `Err` is a
+  payload that *is* there and could not be carried: `av_buffer_ref`
+  refusing a reference under memory pressure, or a packet whose payload
+  does not lie inside its own buffer. The single `None` these used to
+  share made the second look like the first, so a demuxer under memory
+  pressure dropped real compressed bytes and read on as though the file
+  had said so. `FfmpegDemuxer::next_packet` surfaces the failure as
+  `DemuxError::PacketBuffer`, naming the stream.
+
+  Call sites that skipped `None` add one `?` or an `expect`; nothing
+  else changes.
 
 ## [0.6.0] - 2026-08-21
 

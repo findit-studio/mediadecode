@@ -102,7 +102,7 @@ where
     if s.index() != stream_index {
       continue;
     }
-    let pkt = match video_packet_from_ffmpeg(&av_packet) {
+    let pkt = match video_packet_from_ffmpeg(&av_packet)? {
       Some(p) => p,
       None => continue,
     };

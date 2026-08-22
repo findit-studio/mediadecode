@@ -24,9 +24,13 @@
 //!   `attached_pic` at open time and drops the duplicate if it ever
 //!   arrives, so the count is exactly one either way.
 //!
-//! Both kinds are queued at open, which is what makes the face's
-//! "exactly one packet, before any timed packet" true here: the queue
-//! drains before the first `av_read_frame` call ever runs.
+//! Both kinds are queued at open — every attachment track, without
+//! exception, or the open fails. That is what makes the face's "exactly
+//! one packet, before any timed packet" true *by construction* here:
+//! the queue is complete and drains before the first `av_read_frame`
+//! call ever runs, so no packet on an attachment track can be anything
+//! but a duplicate, and no seek can move a packet that was never on the
+//! timeline.
 //!
 //! # Seeking
 //!
@@ -65,6 +69,7 @@ use smol_str::SmolStr;
 
 use crate::{
   Ffmpeg, FfmpegBuffer, boundary,
+  buffer::PacketBufferError,
   codec_id::CodecId,
   extras::{AttachmentPacketExtra, TrackExtra},
   reader_guard::{GuardedReader, PanicLatch},
@@ -77,22 +82,6 @@ fn av_time_base_q() -> Timebase {
   Timebase::new(1, NonZeroI32::new(1_000_000).expect("1e6 is non-zero"))
 }
 
-/// What this layer still owes a given attachment track.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum AttachmentState {
-  /// Not an attachment track.
-  None,
-  /// The payload was captured at open time; it is either queued or
-  /// already handed out. Either way a packet arriving on this track is
-  /// a duplicate and is dropped.
-  Captured,
-  /// The payload could not be captured at open time (the container
-  /// declares the track but libavformat parked no `attached_pic` and
-  /// the codec carries no extradata). The first packet that arrives on
-  /// this track is the attachment; every later one is dropped.
-  AwaitingPacket,
-}
-
 /// `mediadecode::demuxer::Demuxer` impl wrapping `ffmpeg::format::context::Input`.
 ///
 /// Construction is deliberately not on the trait — see [`Self::open`]
@@ -100,7 +89,6 @@ enum AttachmentState {
 pub struct FfmpegDemuxer {
   input: Input,
   tracks: Vec<TrackInfo<Ffmpeg>>,
-  attachments: Vec<AttachmentState>,
   pending: VecDeque<(
     TrackIndex,
     AttachmentPacket<AttachmentPacketExtra, FfmpegBuffer>,
@@ -179,11 +167,10 @@ impl FfmpegDemuxer {
   }
 
   fn from_input(input: Input) -> Result<Self, DemuxError> {
-    let (tracks, attachments, pending) = build_tracks(&input)?;
+    let (tracks, pending) = build_tracks(&input)?;
     Ok(Self {
       input,
       tracks,
-      attachments,
       pending,
       eof: false,
       reader_panic: None,
@@ -194,6 +181,18 @@ impl FfmpegDemuxer {
   fn panicked(&self) -> Option<DemuxError> {
     self.reader_panic.as_deref().and_then(reader_panic)
   }
+}
+
+/// Names the stream a payload failure happened on. Shared by all five
+/// delivery arms so the failure cannot be swallowed on one of them.
+fn on_stream<T>(
+  stream_index: usize,
+  result: Result<Option<T>, PacketBufferError>,
+) -> Result<Option<T>, DemuxError> {
+  result.map_err(|source| DemuxError::PacketBuffer {
+    stream_index,
+    source,
+  })
 }
 
 /// Turns a latched reader panic into the error that names it.
@@ -255,38 +254,43 @@ impl Demuxer for FfmpegDemuxer {
       let track = TrackIndex::new(index);
       let time_base = info.timebase();
 
+      // A payload that is there and cannot be referenced is an error,
+      // never a silently dropped packet: `Ok(None)` below means the
+      // packet carried nothing, and that is the only thing that reads
+      // the next one.
       let built = match info.kind() {
-        TrackKind::Video => boundary::video_packet_from_ffmpeg_in(&packet, time_base)
-          .map(|packet| DemuxedPacket::Video { track, packet }),
-        TrackKind::Audio => boundary::audio_packet_from_ffmpeg_in(&packet, time_base)
-          .map(|packet| DemuxedPacket::Audio { track, packet }),
-        TrackKind::Subtitle => boundary::subtitle_packet_from_ffmpeg_in(&packet, time_base)
-          .map(|packet| DemuxedPacket::Subtitle { track, packet }),
-        TrackKind::Data => boundary::data_packet_from_ffmpeg_in(&packet, time_base)
-          .map(|packet| DemuxedPacket::Data { track, packet }),
-        TrackKind::Attachment => match self.attachments[index] {
-          // Already captured at open time: this is the duplicate some
-          // demuxers emit for cover art. Drop it — the contract is
-          // exactly one.
-          AttachmentState::Captured | AttachmentState::None => continue,
-          AttachmentState::AwaitingPacket => {
-            // The state moves only once a payload really came out. An
-            // unwrappable packet (no refcounted buffer) leaves the
-            // track still owed, so the next one on it is taken instead
-            // of silently swallowed.
-            boundary::attachment_packet_from_ffmpeg(&packet).map(|packet| {
-              self.attachments[index] = AttachmentState::Captured;
-              DemuxedPacket::Attachment { track, packet }
-            })
-          }
-        },
+        TrackKind::Video => on_stream(
+          index,
+          boundary::video_packet_from_ffmpeg_in(&packet, time_base),
+        )?
+        .map(|packet| DemuxedPacket::Video { track, packet }),
+        TrackKind::Audio => on_stream(
+          index,
+          boundary::audio_packet_from_ffmpeg_in(&packet, time_base),
+        )?
+        .map(|packet| DemuxedPacket::Audio { track, packet }),
+        TrackKind::Subtitle => on_stream(
+          index,
+          boundary::subtitle_packet_from_ffmpeg_in(&packet, time_base),
+        )?
+        .map(|packet| DemuxedPacket::Subtitle { track, packet }),
+        TrackKind::Data => on_stream(
+          index,
+          boundary::data_packet_from_ffmpeg_in(&packet, time_base),
+        )?
+        .map(|packet| DemuxedPacket::Data { track, packet }),
+        // Every attachment track's one packet was queued at open time,
+        // so anything arriving on one now is the duplicate some
+        // demuxers emit for cover art. Drop it — the contract is
+        // exactly one, and the one has already left.
+        TrackKind::Attachment => continue,
         // The roster of arms is five; a track nothing can name has no
         // arm and its packets are not delivered.
         TrackKind::Unknown => continue,
       };
 
-      // `None` here means the packet had no refcounted payload — an
-      // empty packet, which some demuxers emit as a marker. Nothing to
+      // `None` here means the packet carried no payload — an empty
+      // packet, which some demuxers emit as a marker. Nothing to
       // deliver; read the next one.
       if let Some(out) = built {
         return Ok(Some(out));
@@ -334,6 +338,23 @@ pub enum DemuxError {
     stream_index: usize,
   },
 
+  /// A packet's payload could not be referenced — the bytes are there
+  /// and this layer could not carry them.
+  ///
+  /// Never raised for a packet that simply has no payload: an empty
+  /// packet is a marker some demuxers emit, and it is skipped in
+  /// silence. Distinguishing the two is what keeps a refcount failure
+  /// under memory pressure from looking like the file's own word and
+  /// dropping real compressed bytes.
+  #[error("stream {stream_index}: {source}")]
+  PacketBuffer {
+    /// The `AVStream.index` the packet belongs to.
+    stream_index: usize,
+    /// What went wrong.
+    #[source]
+    source: PacketBufferError,
+  },
+
   /// The `Read + Seek` source given to
   /// [`FfmpegDemuxer::open_reader`] panicked inside a libavformat
   /// callback.
@@ -354,7 +375,6 @@ pub enum DemuxError {
 
 type BuiltTracks = (
   Vec<TrackInfo<Ffmpeg>>,
-  Vec<AttachmentState>,
   VecDeque<(
     TrackIndex,
     AttachmentPacket<AttachmentPacketExtra, FfmpegBuffer>,
@@ -364,7 +384,6 @@ type BuiltTracks = (
 fn build_tracks(input: &Input) -> Result<BuiltTracks, DemuxError> {
   let count = input.streams().len();
   let mut tracks = Vec::with_capacity(count);
-  let mut attachments = Vec::with_capacity(count);
   let mut pending = VecDeque::new();
 
   for stream in input.streams() {
@@ -454,32 +473,29 @@ fn build_tracks(input: &Input) -> Result<BuiltTracks, DemuxError> {
       .with_mime_type(unsafe { metadata_text(metadata, c"mimetype") });
 
     // Capture the attachment payload now, so the queue is complete
-    // before a single timed packet has been read.
-    let state = if info.kind() == TrackKind::Attachment {
-      let captured = if attached_pic {
-        attached_pic_payload(&stream)
+    // before a single timed packet has been read. Every attachment
+    // track leaves this loop with exactly one packet queued, or the
+    // open fails: that is what makes "exactly one packet, before any
+    // timed packet" a property of the construction rather than a
+    // promise the pull loop has to keep.
+    if info.kind() == TrackKind::Attachment {
+      let packet = if attached_pic {
+        // SAFETY: `stream` keeps the format context (and so the
+        // `AVStream`) live; `attached_pic` is an `AVPacket` embedded by
+        // value, and `addr_of!` reaches it without forming a reference
+        // to the stream.
+        let pkt = unsafe { std::ptr::addr_of!((*stream.as_ptr()).attached_pic) };
+        unsafe { attached_pic_payload(pkt, index) }?
       } else {
         extradata_payload(&stream)?
       };
-      match captured {
-        Some(packet) => {
-          pending.push_back((TrackIndex::new(index), packet));
-          AttachmentState::Captured
-        }
-        // Nothing to capture: an ATTACHED_PIC stream whose
-        // `attached_pic` libavformat left empty. Fall back to taking
-        // the first packet the stream produces.
-        None => AttachmentState::AwaitingPacket,
-      }
-    } else {
-      AttachmentState::None
-    };
+      pending.push_back((TrackIndex::new(index), packet));
+    }
 
     tracks.push(info);
-    attachments.push(state);
   }
 
-  Ok((tracks, attachments, pending))
+  Ok((tracks, pending))
 }
 
 /// Upper bound on the NUL search in [`metadata_text`].
@@ -546,33 +562,50 @@ unsafe fn metadata_text(dict: *const AVDictionary, key: &CStr) -> Option<SmolStr
 }
 
 /// Wraps `AVStream.attached_pic` — the real packet libavformat parsed
-/// for a cover-art stream — as an attachment payload. `None` when the
-/// stream carries none.
-fn attached_pic_payload(
-  stream: &ffmpeg_next::format::stream::Stream<'_>,
-) -> Option<AttachmentPacket<AttachmentPacketExtra, FfmpegBuffer>> {
-  // SAFETY: `stream` keeps the format context (and so the `AVStream`)
-  // live; `attached_pic` is an `AVPacket` embedded by value, and
-  // `addr_of!` reaches it without forming a reference to the stream.
-  let pkt = unsafe { std::ptr::addr_of!((*stream.as_ptr()).attached_pic) };
-  let buf = unsafe { (*pkt).buf };
-  let data = unsafe { (*pkt).data };
-  let size = unsafe { (*pkt).size };
-  if buf.is_null() || data.is_null() || size <= 0 {
-    return None;
-  }
-  let buf_data = unsafe { (*buf).data };
-  if buf_data.is_null() {
-    return None;
-  }
-  let offset = (data as usize).wrapping_sub(buf_data as usize);
-  // SAFETY: `buf` is a live `AVBufferRef` owned by the `AVStream`;
-  // `from_ref_view` bumps its refcount and bounds-checks the view.
-  let payload = unsafe { FfmpegBuffer::from_ref_view(buf, offset, size as usize) }?;
-  Some(AttachmentPacket::new(
-    payload,
-    AttachmentPacketExtra::new(stream.index() as i32),
-  ))
+/// for a cover-art stream — as this track's one attachment packet.
+///
+/// A stream that declares cover art but parks no payload still gets a
+/// packet: an empty one, marked `synthesized`, because the contract is
+/// one packet per attachment track and a consumer that sees an empty
+/// payload learns something true about the file. The alternative shipped
+/// once — waiting for the payload to arrive as a packet later — and it
+/// cannot hold: nothing stops a timed packet, or a seek, from coming
+/// first, so the track's packet would arrive out of order or never.
+///
+/// Measured before it was written: across MP3 (ID3 APIC), M4A (`covr`),
+/// FLAC (`METADATA_BLOCK_PICTURE`) and Matroska (an `image/*`
+/// attachment), every stream libavformat gives
+/// `AV_DISPOSITION_ATTACHED_PIC` also carries the parked packet —
+/// `ff_add_attached_pic` sets the disposition and fills
+/// `attached_pic` in the same breath. The empty case is the honest
+/// answer to a state this build's demuxers do not produce, not a
+/// fallback anything relies on.
+///
+/// # Safety
+///
+/// `pkt` must be a live `*const AVPacket` — in practice the
+/// `attached_pic` embedded in the `AVStream` at `index` — for the
+/// duration of this call.
+unsafe fn attached_pic_payload(
+  pkt: *const ffmpeg_next::ffi::AVPacket,
+  index: usize,
+) -> Result<AttachmentPacket<AttachmentPacketExtra, FfmpegBuffer>, DemuxError> {
+  // SAFETY: `pkt` is live per the contract above.
+  let captured =
+    unsafe { crate::buffer::payload_of(pkt) }.map_err(|source| DemuxError::PacketBuffer {
+      stream_index: index,
+      source,
+    })?;
+  let extra = AttachmentPacketExtra::new(index as i32);
+  Ok(match captured {
+    Some(payload) => AttachmentPacket::new(payload, extra),
+    None => AttachmentPacket::new(
+      FfmpegBuffer::copy_from_slice(&[]).ok_or(DemuxError::AttachmentAlloc {
+        stream_index: index,
+      })?,
+      extra.with_synthesized(true),
+    ),
+  })
 }
 
 /// Builds an attachment payload out of a track's codec extradata — the
@@ -585,7 +618,7 @@ fn attached_pic_payload(
 /// file. Only an allocation failure is an error.
 fn extradata_payload(
   stream: &ffmpeg_next::format::stream::Stream<'_>,
-) -> Result<Option<AttachmentPacket<AttachmentPacketExtra, FfmpegBuffer>>, DemuxError> {
+) -> Result<AttachmentPacket<AttachmentPacketExtra, FfmpegBuffer>, DemuxError> {
   let index = stream.index();
   let parameters = stream.parameters();
   // SAFETY: `parameters` keeps the `AVCodecParameters` live;
@@ -604,10 +637,10 @@ fn extradata_payload(
   let payload = FfmpegBuffer::copy_from_slice(bytes).ok_or(DemuxError::AttachmentAlloc {
     stream_index: index,
   })?;
-  Ok(Some(AttachmentPacket::new(
+  Ok(AttachmentPacket::new(
     payload,
     AttachmentPacketExtra::new(index as i32).with_synthesized(true),
-  )))
+  ))
 }
 
 /// A stream's `AVRational` timebase as a [`Timebase`]. A zero or
@@ -698,6 +731,31 @@ mod tests {
     let dict = dict_with(c"filename", &long);
     assert_eq!(unsafe { metadata_text(dict, c"filename") }, None);
     unsafe { av_dict_free(&mut { dict }) };
+  }
+
+  #[test]
+  fn an_uncapturable_cover_still_gets_its_one_packet() {
+    // The state the shipped `AwaitingPacket` fallback existed for: a
+    // stream that declares cover art and parks no payload. The fallback
+    // waited for a packet that may never come, and let timed packets —
+    // and seeks — go first, which the face forbids. The track now gets
+    // its one packet at open like every other attachment track: empty,
+    // and marked as this layer's own work.
+    //
+    // Not reachable from a file: across MP3, M4A, FLAC and Matroska,
+    // every ATTACHED_PIC stream libavformat produces carries the parked
+    // packet, because `ff_add_attached_pic` sets the disposition and
+    // fills it in the same call. A zeroed `AVPacket` is exactly what
+    // `attached_pic` would hold if one ever did not.
+    let empty: ffmpeg_next::ffi::AVPacket = unsafe { std::mem::zeroed() };
+    let packet = unsafe { attached_pic_payload(&empty, 7) }
+      .expect("an unparked cover is a degenerate track, not an unreadable file");
+    assert!(packet.data().as_ref().is_empty());
+    assert!(
+      packet.extra().synthesized(),
+      "nothing in the container handed this payload over",
+    );
+    assert_eq!(packet.extra().stream_index(), 7);
   }
 
   #[test]

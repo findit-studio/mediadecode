@@ -95,7 +95,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   let mut frame = empty_video_frame();
   for (s, av_packet) in input.packets() {
     if s.index() != stream_index { continue; }
-    let Some(pkt) = video_packet_from_ffmpeg(&av_packet) else { continue };
+    // `Ok(None)` is an empty packet; an `Err` is a payload that is
+    // there and could not be referenced, which is never silently
+    // skipped.
+    let Some(pkt) = video_packet_from_ffmpeg(&av_packet)? else { continue };
 
     match decoder.send_packet(&pkt) {
       Ok(()) => {}

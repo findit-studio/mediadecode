@@ -34,7 +34,7 @@ pub use boundary::{
   subtitle_packet_from_ffmpeg_in, try_empty_audio_frame, try_empty_subtitle_frame,
   try_empty_video_frame, video_packet_from_ffmpeg, video_packet_from_ffmpeg_in,
 };
-pub use buffer::FfmpegBuffer;
+pub use buffer::{FfmpegBuffer, PacketBufferError};
 pub use channel_layout::{
   channel_layout_description_from_ffmpeg, channel_layout_from_ffmpeg, channel_order_from_ffmpeg,
 };
