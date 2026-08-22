@@ -674,14 +674,6 @@ pub enum ResampleError {
     samples: i64,
   },
 
-  /// `av_frame_alloc` returned null — the frame header itself could not
-  /// be allocated.
-  #[error("out of memory allocating an audio frame of {samples} samples")]
-  FrameAlloc {
-    /// The sample count the frame was to hold.
-    samples: usize,
-  },
-
   /// The wrapped `swresample` call reported an error.
   #[error(transparent)]
   Resample(#[from] Error),
@@ -781,7 +773,11 @@ fn open_context(
 /// without a null check and discards `av_frame_get_buffer`'s return
 /// value, so an allocation failure there yields a frame whose planes
 /// are not backed — which is then handed to FFI. Both are checked here;
-/// on failure the caller gets a named error and no frame at all.
+/// on failure the caller gets a named error and no frame at all. The
+/// null check is the crate's existing one
+/// ([`crate::frame::alloc_av_audio_frame`], which the decoders already
+/// allocate through), so there is one answer to `av_frame_alloc`
+/// returning null rather than two.
 fn new_audio_frame(
   format: Sample,
   samples: usize,
@@ -791,15 +787,7 @@ fn new_audio_frame(
   if samples == 0 || samples > i32::MAX as usize {
     return Err(ResampleError::SampleCount { requested: samples });
   }
-  // `Audio::empty()` owns the `av_frame_alloc` it performs and frees it
-  // on drop; `av_frame_free` tolerates the null pointer a failed
-  // allocation would leave behind, so an early return here is sound.
-  let mut out = frame::Audio::empty();
-  // SAFETY: reading the pointer the constructor stored. Every setter
-  // below dereferences it, so the null check has to come first.
-  if unsafe { out.as_ptr() }.is_null() {
-    return Err(ResampleError::FrameAlloc { samples });
-  }
+  let mut out = crate::frame::alloc_av_audio_frame()?;
   out.set_format(format);
   out.set_samples(samples);
   // The layout is assigned by value, which is sound only because
