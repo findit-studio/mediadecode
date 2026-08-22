@@ -132,6 +132,18 @@ impl<R> GuardedReader<R> {
       Ok(result) => result,
       Err(payload) => {
         latch.latch(&*payload);
+        // The payload is described and then deliberately forgotten.
+        // `panic_any` takes any `Send` value, and safe code can give it
+        // a `Drop` that panics; dropping it here — after the unwind has
+        // been caught, outside any `catch_unwind` — would send that
+        // second panic straight out of `read`/`seek` and into
+        // ffmpeg-next's `extern "C"` AVIO callback. That is the abort
+        // this guard exists to prevent, reached through the guard
+        // itself. Leaking one value on a path that has already made the
+        // session terminal is the cheaper half of that trade by a
+        // distance, and a nested `catch_unwind` would only move the
+        // question to the payload's payload.
+        core::mem::forget(payload);
         Err(io::Error::other("the caller's reader panicked"))
       }
     }
@@ -223,6 +235,44 @@ mod tests {
       Some("panic number 1"),
       "the description nearest the cause is the one kept",
     );
+  }
+
+  /// A panic payload whose destructor panics in turn — safe code, and
+  /// the shape that turned this guard into the abort it prevents.
+  struct PanicOnDrop;
+
+  impl Drop for PanicOnDrop {
+    fn drop(&mut self) {
+      panic!("and the payload went too");
+    }
+  }
+
+  struct PanicsWithAPayload;
+
+  impl Read for PanicsWithAPayload {
+    fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+      std::panic::panic_any(PanicOnDrop);
+    }
+  }
+
+  impl Seek for PanicsWithAPayload {
+    fn seek(&mut self, _pos: SeekFrom) -> io::Result<u64> {
+      std::panic::panic_any(PanicOnDrop);
+    }
+  }
+
+  #[test]
+  fn a_payload_that_panics_on_drop_does_not_get_dropped() {
+    // The guard used to borrow the payload for its message and then let
+    // it fall out of scope — outside `catch_unwind`, so the
+    // destructor's panic unwound out of `read` and into C. This test
+    // completing at all is the assertion; the process reaching the end
+    // of it is what used to be impossible.
+    let (mut guarded, latch) = GuardedReader::new(PanicsWithAPayload);
+    let mut buf = [0u8; 8];
+    assert!(quietly(|| guarded.read(&mut buf)).is_err());
+    assert_eq!(latch.message().as_deref(), Some(UNNAMED));
+    assert!(quietly(|| guarded.seek(SeekFrom::Start(0))).is_err());
   }
 
   #[test]

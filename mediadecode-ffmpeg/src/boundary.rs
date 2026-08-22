@@ -423,22 +423,24 @@ fn try_packet_copy(data: &[u8]) -> std::result::Result<Packet, ffmpeg_next::Erro
   }
 }
 
-/// Centralised mediadecode→AV packet flag mapping so the three
-/// packet-conversion helpers stay aligned.
-fn map_md_flags_to_av(flags: MdPacketFlags) -> ffmpeg_next::packet::Flags {
-  let mut av_flags = ffmpeg_next::packet::Flags::empty();
-  if flags.contains(MdPacketFlags::KEY) {
-    av_flags |= ffmpeg_next::packet::Flags::KEY;
+/// Writes every flag the portable packet carries onto the `AVPacket`
+/// being rebuilt.
+///
+/// Not through `Packet::set_flags`, which takes `ffmpeg_next`'s `Flags`
+/// and so can only spell `KEY` and `CORRUPT`: the bits are written to
+/// `AVPacket.flags` directly, so `DISCARD` — and anything else the
+/// forward direction retained — reaches the decoder that has to obey
+/// it. `PacketFlags` is a `u8` bit set and the field is a `c_int`, so
+/// the widening is total and nothing needs deciding here.
+///
+/// # Safety
+///
+/// `packet` must own a live `AVPacket`.
+unsafe fn write_md_flags(packet: &mut Packet, flags: MdPacketFlags) {
+  use ffmpeg_next::packet::Mut;
+  unsafe {
+    (*packet.as_mut_ptr()).flags = c_int::from(flags.bits());
   }
-  if flags.contains(MdPacketFlags::CORRUPT) {
-    av_flags |= ffmpeg_next::packet::Flags::CORRUPT;
-  }
-  // ffmpeg-next 8.x doesn't expose a DISCARD flag constant on
-  // `packet::Flags`; the upstream `AV_PKT_FLAG_DISCARD` bit is
-  // documented as a demuxer hint and rarely set on packets passed
-  // to a decoder. We forward KEY and CORRUPT (the meaningful subset)
-  // and silently drop DISCARD until ffmpeg-next adds it.
-  av_flags
 }
 
 /// Why a portable packet could not be rebuilt as an `AVPacket`.
@@ -545,7 +547,8 @@ pub fn ffmpeg_packet_from_video_packet(
   if let Some(d) = packet.duration() {
     out.set_duration(d.pts());
   }
-  out.set_flags(map_md_flags_to_av(packet.flags()));
+  // SAFETY: `out` owns the `AVPacket` `try_packet_copy` just built.
+  unsafe { write_md_flags(&mut out, packet.flags()) };
   out.set_stream(packet.extra().stream_index() as usize);
   Ok(out)
 }
@@ -568,7 +571,8 @@ pub fn ffmpeg_packet_from_audio_packet(
   if let Some(d) = packet.duration() {
     out.set_duration(d.pts());
   }
-  out.set_flags(map_md_flags_to_av(packet.flags()));
+  // SAFETY: `out` owns the `AVPacket` `try_packet_copy` just built.
+  unsafe { write_md_flags(&mut out, packet.flags()) };
   out.set_stream(packet.extra().stream_index() as usize);
   Ok(out)
 }
@@ -588,7 +592,8 @@ pub fn ffmpeg_packet_from_subtitle_packet(
   if let Some(d) = packet.duration() {
     out.set_duration(d.pts());
   }
-  out.set_flags(map_md_flags_to_av(packet.flags()));
+  // SAFETY: `out` owns the `AVPacket` `try_packet_copy` just built.
+  unsafe { write_md_flags(&mut out, packet.flags()) };
   out.set_stream(packet.extra().stream_index() as usize);
   Ok(out)
 }
@@ -679,17 +684,26 @@ fn packet_side_data(packet: &Packet) -> Result<Vec<SideDataEntry>, PacketBufferE
   // `side_data_elems` are public fields.
   let count_raw = unsafe { (*packet.as_ptr()).side_data_elems };
   let entries = unsafe { (*packet.as_ptr()).side_data };
-  if count_raw == 0 || entries.is_null() {
+  // Zero entries is the only shape that means "no side data". Every
+  // other reading of that answer — a malformed count, a missing array —
+  // is judged, and judged *before* the pointer: a count this crate
+  // cannot walk stays an error whether or not the array happens to be
+  // null, and a null array with entries to read is malformed rather
+  // than empty. Both used to leave here as `Ok(vec![])`, which is the
+  // silent loss the caps taught us to name, reached through the
+  // pointer instead of the budget.
+  if count_raw == 0 {
     return Ok(Vec::new());
   }
   let cap = side_data_entry_cap();
-  // A negative count is a malformed packet, not an empty one: reading
-  // it as "no side data" is the same silent loss by another route.
   if count_raw < 0 || count_raw as usize > cap {
     return Err(PacketBufferError::SideDataEntries {
       count: count_raw,
       cap,
     });
+  }
+  if entries.is_null() {
+    return Err(PacketBufferError::SideDataArray { count: count_raw });
   }
   let count = count_raw as usize;
   let mut out: Vec<SideDataEntry> = Vec::new();
@@ -707,8 +721,15 @@ fn packet_side_data(packet: &Packet) -> Result<Vec<SideDataEntry>, PacketBufferE
     let kind = unsafe { read_unaligned(addr_of!((*entry).type_).cast::<i32>()) };
     let size = unsafe { (*entry).size };
     let data_ptr = unsafe { (*entry).data };
-    let data = if size == 0 || data_ptr.is_null() {
+    let data = if size == 0 {
+      // A marker entry: a type and no bytes. FFmpeg emits these, and
+      // there is nothing to carry or to charge the budget for.
       Vec::new()
+    } else if data_ptr.is_null() {
+      // Bytes declared and not carried. Reading this as an empty entry
+      // delivered a packet whose side data was a lie, and charged the
+      // budget nothing for it.
+      return Err(PacketBufferError::SideDataPayload { index, size });
     } else {
       total_bytes = total_bytes.saturating_add(size);
       if total_bytes > SIDE_DATA_MAX_TOTAL_BYTES {
@@ -782,7 +803,7 @@ pub fn video_packet_from_ffmpeg_in(
   };
   let extra = VideoPacketExtra::new(packet.stream() as i32).with_side_data(side_data);
   let mut out = VideoPacket::new(buf, extra)
-    .with_flags(md_flags_from_av(packet.flags()))
+    .with_flags(md_flags_from_packet(packet)?)
     .with_pts(packet.pts().map(|p| Timestamp::new(p, time_base)))
     .with_dts(packet.dts().map(|d| Timestamp::new(d, time_base)));
   let dur = packet.duration();
@@ -804,7 +825,7 @@ pub fn audio_packet_from_ffmpeg_in(
   };
   let extra = AudioPacketExtra::new(packet.stream() as i32).with_side_data(side_data);
   let mut out = AudioPacket::new(buf, extra)
-    .with_flags(md_flags_from_av(packet.flags()))
+    .with_flags(md_flags_from_packet(packet)?)
     .with_pts(packet.pts().map(|p| Timestamp::new(p, time_base)))
     .with_dts(packet.dts().map(|d| Timestamp::new(d, time_base)));
   let dur = packet.duration();
@@ -826,7 +847,7 @@ pub fn subtitle_packet_from_ffmpeg_in(
   };
   let extra = SubtitlePacketExtra::new(packet.stream() as i32).with_side_data(side_data);
   let mut out = SubtitlePacket::new(buf, extra)
-    .with_flags(md_flags_from_av(packet.flags()))
+    .with_flags(md_flags_from_packet(packet)?)
     .with_pts(packet.pts().map(|p| Timestamp::new(p, time_base)));
   let dur = packet.duration();
   if dur > 0 {
@@ -857,7 +878,7 @@ pub fn data_packet_from_ffmpeg_in(
     .with_byte_pos((pos >= 0).then_some(pos as i64))
     .with_side_data(side_data);
   let mut out = DataPacket::new(buf, extra)
-    .with_flags(md_flags_from_av(packet.flags()))
+    .with_flags(md_flags_from_packet(packet)?)
     .with_pts(packet.pts().map(|p| Timestamp::new(p, time_base)));
   let dur = packet.duration();
   if dur > 0 {
@@ -890,20 +911,51 @@ pub fn attachment_packet_from_ffmpeg(
   };
   Ok(Some(
     AttachmentPacket::new(buf, AttachmentPacketExtra::new(packet.stream() as i32))
-      .with_flags(md_flags_from_av(packet.flags())),
+      .with_flags(md_flags_from_packet(packet)?),
   ))
 }
 
-fn md_flags_from_av(flags: ffmpeg_next::packet::Flags) -> MdPacketFlags {
-  let mut out = MdPacketFlags::empty();
-  if flags.contains(ffmpeg_next::packet::Flags::KEY) {
-    out |= MdPacketFlags::KEY;
+/// Every flag the packet really carries.
+///
+/// Read from `AVPacket.flags` as the raw integer rather than through
+/// `ffmpeg_next`'s `Packet::flags()`, whose `Flags` bit set names only
+/// `KEY` and `CORRUPT` and drops the rest in `from_bits_truncate`.
+/// `AV_PKT_FLAG_DISCARD` is among the dropped: it tells a consumer that
+/// a packet must be fed to the decoder and its output thrown away, and
+/// losing it makes preroll output look like something to keep.
+///
+/// `PacketFlags` is a bit set whose documented lossless door is
+/// `from_bits_retain`, and every packet flag FFmpeg names lives inside
+/// the byte it carries — including the three bits nothing names yet.
+/// A bit outside that byte cannot be carried at all, and is refused
+/// rather than dropped; the assertion below states the fact that keeps
+/// the refusal unreachable against this build.
+fn md_flags_from_packet(packet: &Packet) -> Result<MdPacketFlags, PacketBufferError> {
+  use ffmpeg_next::packet::Ref;
+  // SAFETY: `packet` keeps the `AVPacket` live; `flags` is a public
+  // field and a plain `c_int`.
+  let raw = unsafe { (*packet.as_ptr()).flags };
+  let carried = i32::from(u8::MAX);
+  if raw & !carried != 0 {
+    return Err(PacketBufferError::UnrepresentableFlags { raw });
   }
-  if flags.contains(ffmpeg_next::packet::Flags::CORRUPT) {
-    out |= MdPacketFlags::CORRUPT;
-  }
-  out
+  Ok(MdPacketFlags::from_bits_retain(raw as u8))
 }
+
+/// Every packet flag this build of FFmpeg names fits the byte
+/// `PacketFlags` carries. If that stops being true, this fails the
+/// build rather than letting a flag go missing at run time.
+const _: () = {
+  assert!(
+    (ffmpeg_next::ffi::AV_PKT_FLAG_KEY
+      | ffmpeg_next::ffi::AV_PKT_FLAG_CORRUPT
+      | ffmpeg_next::ffi::AV_PKT_FLAG_DISCARD
+      | ffmpeg_next::ffi::AV_PKT_FLAG_TRUSTED
+      | ffmpeg_next::ffi::AV_PKT_FLAG_DISPOSABLE)
+      <= u8::MAX as c_int,
+    "FFmpeg names a packet flag outside the byte `PacketFlags` carries",
+  );
+};
 
 // ---------------------------------------------------------------------------
 //  Empty-frame placeholders for `receive_frame` destinations.
@@ -1095,6 +1147,8 @@ mod tests {
   const NEW_EXTRADATA: i32 =
     ffmpeg_next::ffi::AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA as i32;
 
+  use ffmpeg_next::ffi::{AVPacketSideData, AVPacketSideDataType, av_malloc};
+
   /// A packet carrying one side-data entry of exactly `size` bytes,
   /// with a body when `body` is set.
   fn packet_with_side_data(size: usize, body: bool) -> Packet {
@@ -1120,38 +1174,210 @@ mod tests {
     packet
   }
 
-  /// Forges a packet declaring `count` side-data entries — a shape
-  /// FFmpeg's own API cannot produce, since both
-  /// `av_packet_new_side_data` and `av_packet_add_side_data` replace an
-  /// entry of the same type (measured: seventy calls leave one entry).
-  /// A count above the cap therefore only ever comes from a corrupt or
-  /// hostile packet, which is what the cap is for.
-  fn packet_with_forged_entry_count(count: usize) -> Packet {
-    use ffmpeg_next::{
-      ffi::{AVPacketSideData, AVPacketSideDataType, av_malloc},
-      packet::Mut,
-    };
-    let mut packet = Packet::copy(&[1u8]);
-    // SAFETY: the array and every entry payload are allocated with
-    // FFmpeg's own allocator and handed to the packet, which frees them
-    // in `av_packet_free_side_data` on drop. The packet had no side
-    // data of its own, so nothing is leaked by the overwrite.
-    unsafe {
-      let array =
-        av_malloc(count * core::mem::size_of::<AVPacketSideData>()) as *mut AVPacketSideData;
-      assert!(!array.is_null(), "av_malloc");
-      for index in 0..count {
-        let data = av_malloc(4) as *mut u8;
-        assert!(!data.is_null(), "av_malloc");
-        core::ptr::write_bytes(data, 7, 4);
-        (*array.add(index)).data = data;
-        (*array.add(index)).size = 4;
-        (*array.add(index)).type_ = AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA;
-      }
-      (*packet.as_mut_ptr()).side_data = array;
-      (*packet.as_mut_ptr()).side_data_elems = count as i32;
+  /// A packet whose side-data array has been forged into a shape
+  /// FFmpeg's own API cannot produce, and cannot free either: `Drop`
+  /// puts the header back into a state `av_packet_free_side_data` can
+  /// walk, so a fixture for a malformed packet cannot take the test
+  /// process down with it.
+  ///
+  /// Both `av_packet_new_side_data` and `av_packet_add_side_data`
+  /// replace an existing entry of the same type (measured: seventy
+  /// calls leave one entry), so every shape below — an over-cap count, a
+  /// negative count, a missing array, an entry that declares bytes it
+  /// does not carry — is one no FFmpeg call produces. That is exactly
+  /// what the validation is for.
+  struct Forged {
+    packet: Packet,
+    freeable: i32,
+  }
+
+  impl Drop for Forged {
+    fn drop(&mut self) {
+      use ffmpeg_next::packet::Mut;
+      // SAFETY: `packet` owns a live `AVPacket`; putting the count back
+      // to what the array really holds is what makes the free sound.
+      unsafe { (*self.packet.as_mut_ptr()).side_data_elems = self.freeable };
     }
-    packet
+  }
+
+  impl Forged {
+    /// `count` real entries of four bytes each.
+    fn entries(count: usize, body: bool) -> Self {
+      let mut packet = Self::carrier(body);
+      // SAFETY: the array and every entry payload come from FFmpeg's
+      // own allocator and are handed to the packet, which frees them in
+      // `av_packet_free_side_data`. The carrier has no side data of its
+      // own, so the overwrite leaks nothing.
+      unsafe {
+        let array = Self::array(count);
+        for index in 0..count {
+          let data = av_malloc(4) as *mut u8;
+          assert!(!data.is_null(), "av_malloc");
+          core::ptr::write_bytes(data, 7, 4);
+          (*array.add(index)).data = data;
+          (*array.add(index)).size = 4;
+          (*array.add(index)).type_ = AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA;
+        }
+        Self::attach(&mut packet, array, count as i32);
+      }
+      Self {
+        packet,
+        freeable: count as i32,
+      }
+    }
+
+    /// A count with no array behind it at all.
+    fn null_array(count: i32, body: bool) -> Self {
+      let mut packet = Self::carrier(body);
+      use ffmpeg_next::packet::Mut;
+      // SAFETY: the packet's side data is null already; only the count
+      // is forged, and `Drop` puts it back to zero before the free.
+      unsafe { (*packet.as_mut_ptr()).side_data_elems = count };
+      Self {
+        packet,
+        freeable: 0,
+      }
+    }
+
+    /// One entry declaring `size` bytes it does not carry.
+    fn null_entry_data(size: usize, body: bool) -> Self {
+      let mut packet = Self::carrier(body);
+      // SAFETY: as in `entries`, except the payload pointer is left
+      // null — `av_freep(&NULL)` is a no-op, so the free stays sound.
+      unsafe {
+        let array = Self::array(1);
+        (*array).data = core::ptr::null_mut();
+        (*array).size = size;
+        (*array).type_ = AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA;
+        Self::attach(&mut packet, array, 1);
+      }
+      Self {
+        packet,
+        freeable: 1,
+      }
+    }
+
+    /// Overrides the declared count, keeping the array intact.
+    fn with_declared_count(mut self, count: i32) -> Self {
+      use ffmpeg_next::packet::Mut;
+      // SAFETY: `Drop` restores `freeable`, which still describes the
+      // array really attached.
+      unsafe { (*self.packet.as_mut_ptr()).side_data_elems = count };
+      self
+    }
+
+    fn carrier(body: bool) -> Packet {
+      if body {
+        Packet::copy(&[1u8, 2, 3])
+      } else {
+        Packet::empty()
+      }
+    }
+
+    /// # Safety
+    /// The returned array is FFmpeg-allocated and uninitialised.
+    unsafe fn array(count: usize) -> *mut AVPacketSideData {
+      let array = unsafe { av_malloc(count * core::mem::size_of::<AVPacketSideData>()) }
+        as *mut AVPacketSideData;
+      assert!(!array.is_null(), "av_malloc");
+      array
+    }
+
+    /// # Safety
+    /// `array` must hold `count` initialised entries owned by FFmpeg.
+    unsafe fn attach(packet: &mut Packet, array: *mut AVPacketSideData, count: i32) {
+      use ffmpeg_next::packet::Mut;
+      unsafe {
+        (*packet.as_mut_ptr()).side_data = array;
+        (*packet.as_mut_ptr()).side_data_elems = count;
+      }
+    }
+  }
+
+  /// Runs one packet through all four timed conversions, returning what
+  /// each answered — the arms share a collector, and a fix that misses
+  /// one of them is a fix that misses.
+  fn every_timed_arm(packet: &Packet) -> [(&'static str, Result<bool, PacketBufferError>); 4] {
+    let tb = mediadecode::Timebase::default();
+    [
+      (
+        "video",
+        video_packet_from_ffmpeg_in(packet, tb).map(|p| p.is_some()),
+      ),
+      (
+        "audio",
+        audio_packet_from_ffmpeg_in(packet, tb).map(|p| p.is_some()),
+      ),
+      (
+        "subtitle",
+        subtitle_packet_from_ffmpeg_in(packet, tb).map(|p| p.is_some()),
+      ),
+      (
+        "data",
+        data_packet_from_ffmpeg_in(packet, tb).map(|p| p.is_some()),
+      ),
+    ]
+  }
+
+  #[test]
+  fn side_data_a_packet_declares_and_does_not_carry_refuses_it() {
+    // Two pointer paths walked straight past the all-or-error rule: a
+    // count with no array behind it returned "no side data", and an
+    // entry declaring bytes it did not carry became an empty entry —
+    // charged nothing, delivered as though the packet had said so. Both
+    // are how a body-bearing packet reached a decoder stripped of its
+    // control data, and how a side-data-only packet became `None` and
+    // was skipped.
+    for body in [true, false] {
+      let forged = Forged::null_array(3, body);
+      for (arm, result) in every_timed_arm(&forged.packet) {
+        match result {
+          Err(PacketBufferError::SideDataArray { count }) => assert_eq!(count, 3, "{arm}"),
+          other => panic!("{arm} (body={body}): expected SideDataArray, got {other:?}"),
+        }
+      }
+
+      let forged = Forged::null_entry_data(64, body);
+      for (arm, result) in every_timed_arm(&forged.packet) {
+        match result {
+          Err(PacketBufferError::SideDataPayload { index, size }) => {
+            assert_eq!((index, size), (0, 64), "{arm}");
+          }
+          other => panic!("{arm} (body={body}): expected SideDataPayload, got {other:?}"),
+        }
+      }
+
+      // And the malformed count keeps being refused when the array is
+      // missing too — the count is judged on its own, before the
+      // pointer, so one cannot excuse the other.
+      let forged = Forged::null_array(-3, body);
+      for (arm, result) in every_timed_arm(&forged.packet) {
+        assert!(
+          matches!(
+            result,
+            Err(PacketBufferError::SideDataEntries { count: -3, .. })
+          ),
+          "{arm} (body={body}): {result:?}",
+        );
+      }
+      let forged = Forged::null_array(i32::MAX, body);
+      for (arm, result) in every_timed_arm(&forged.packet) {
+        assert!(
+          matches!(result, Err(PacketBufferError::SideDataEntries { .. })),
+          "{arm} (body={body}): {result:?}",
+        );
+      }
+    }
+
+    // A zero-size entry is a marker, not a lie: a type with no bytes is
+    // exactly what FFmpeg emits for some side data, and it stays
+    // welcome.
+    let marker = Forged::null_entry_data(0, true);
+    let packet = video_packet_from_ffmpeg_in(&marker.packet, mediadecode::Timebase::default())
+      .expect("a marker entry is carriable")
+      .expect("present");
+    assert_eq!(packet.extra().side_data().len(), 1);
+    assert!(packet.extra().side_data()[0].data().is_empty());
   }
 
   #[test]
@@ -1229,14 +1455,14 @@ mod tests {
     let cap = side_data_entry_cap();
     assert_eq!(cap, SIDE_DATA_MAX_ENTRIES, "the cap this lane straddles");
 
-    let at_cap = packet_with_forged_entry_count(cap);
-    let packet = video_packet_from_ffmpeg_in(&at_cap, tb)
+    let at_cap = Forged::entries(cap, true);
+    let packet = video_packet_from_ffmpeg_in(&at_cap.packet, tb)
       .expect("exactly at the cap is not over it")
       .expect("present");
     assert_eq!(packet.extra().side_data().len(), cap);
 
-    let past = packet_with_forged_entry_count(cap + 1);
-    match video_packet_from_ffmpeg_in(&past, tb).map(|p| p.is_some()) {
+    let past = Forged::entries(cap + 1, true);
+    match video_packet_from_ffmpeg_in(&past.packet, tb).map(|p| p.is_some()) {
       Err(PacketBufferError::SideDataEntries { count, cap: named }) => {
         assert_eq!(count as usize, cap + 1);
         assert_eq!(named, cap);
@@ -1246,20 +1472,111 @@ mod tests {
 
     // A negative count is malformed, not empty — reading it as "no side
     // data" would be the same silent loss by another route.
-    let mut corrupt = packet_with_forged_entry_count(1);
-    {
-      use ffmpeg_next::packet::Mut;
-      unsafe { (*corrupt.as_mut_ptr()).side_data_elems = -3 };
-    }
+    let corrupt = Forged::entries(1, true).with_declared_count(-3);
     assert!(matches!(
-      video_packet_from_ffmpeg_in(&corrupt, tb).map(|p| p.is_some()),
+      video_packet_from_ffmpeg_in(&corrupt.packet, tb).map(|p| p.is_some()),
       Err(PacketBufferError::SideDataEntries { count: -3, .. }),
     ));
-    // Put the count back so the packet frees what it owns.
-    {
-      use ffmpeg_next::packet::Mut;
-      unsafe { (*corrupt.as_mut_ptr()).side_data_elems = 1 };
+  }
+
+  #[test]
+  fn every_flag_bit_survives_both_directions() {
+    // `PacketFlags` is a bit set whose documented lossless door is
+    // `from_bits_retain`, and both directions used to squeeze it
+    // through `ffmpeg_next`'s `Flags`, which names `KEY` and `CORRUPT`
+    // and truncates the rest away. `AV_PKT_FLAG_DISCARD` is the one
+    // that matters most: it tells a consumer to decode a packet and
+    // throw its output away, and without it preroll output looks like
+    // something to keep.
+    use ffmpeg_next::packet::{Mut, Ref};
+    const DISCARD: i32 = ffmpeg_next::ffi::AV_PKT_FLAG_DISCARD;
+    const TRUSTED: i32 = ffmpeg_next::ffi::AV_PKT_FLAG_TRUSTED;
+    const DISPOSABLE: i32 = ffmpeg_next::ffi::AV_PKT_FLAG_DISPOSABLE;
+    const UNNAMED: i32 = 0b0010_0000; // nothing names this bit yet
+    let raw = ffmpeg_next::ffi::AV_PKT_FLAG_KEY | DISCARD | TRUSTED | DISPOSABLE | UNNAMED;
+
+    let mut packet = Packet::copy(&[1u8, 2, 3]);
+    // SAFETY: `packet` owns a live `AVPacket`; `flags` is a public
+    // field and this is the only way to set a bit `ffmpeg_next`'s
+    // `Flags` cannot spell.
+    unsafe { (*packet.as_mut_ptr()).flags = raw };
+    assert_ne!(
+      packet.flags().bits(),
+      raw,
+      "the wrapper's own accessor is what loses them",
+    );
+
+    let tb = mediadecode::Timebase::default();
+    let expected = MdPacketFlags::from_bits_retain(raw as u8);
+
+    let video = video_packet_from_ffmpeg_in(&packet, tb)
+      .expect("wrappable")
+      .expect("present");
+    assert_eq!(video.flags(), expected);
+    assert!(video.flags().contains(MdPacketFlags::DISCARD));
+    let audio = audio_packet_from_ffmpeg_in(&packet, tb)
+      .expect("wrappable")
+      .expect("present");
+    assert_eq!(audio.flags(), expected);
+    let subtitle = subtitle_packet_from_ffmpeg_in(&packet, tb)
+      .expect("wrappable")
+      .expect("present");
+    assert_eq!(subtitle.flags(), expected);
+    let data = data_packet_from_ffmpeg_in(&packet, tb)
+      .expect("wrappable")
+      .expect("present");
+    assert_eq!(data.flags(), expected);
+    let attachment = attachment_packet_from_ffmpeg(&packet)
+      .expect("wrappable")
+      .expect("present");
+    assert_eq!(attachment.flags(), expected);
+
+    // And back out again, on the three paths a decoder is fed from.
+    for (arm, rebuilt) in [
+      (
+        "video",
+        ffmpeg_packet_from_video_packet(&video).expect("rebuilt"),
+      ),
+      (
+        "audio",
+        ffmpeg_packet_from_audio_packet(&audio).expect("rebuilt"),
+      ),
+      (
+        "subtitle",
+        ffmpeg_packet_from_subtitle_packet(&subtitle).expect("rebuilt"),
+      ),
+    ] {
+      // SAFETY: `rebuilt` owns a live `AVPacket`.
+      let carried = unsafe { (*rebuilt.as_ptr()).flags };
+      assert_eq!(carried, raw, "{arm} rebuilt {carried:#x} from {raw:#x}");
     }
+  }
+
+  #[test]
+  fn a_flag_bit_the_vocabulary_cannot_hold_refuses_the_packet() {
+    // Unreachable against this build — every flag FFmpeg names lives in
+    // the byte `PacketFlags` carries, and a compile-time assertion says
+    // so. It is here because the day that stops being true, a packet
+    // must be refused rather than delivered with a bit missing.
+    use ffmpeg_next::packet::Mut;
+    let mut packet = Packet::copy(&[1u8]);
+    // SAFETY: `packet` owns a live `AVPacket`.
+    unsafe { (*packet.as_mut_ptr()).flags = 0x1_00 };
+    let tb = mediadecode::Timebase::default();
+    for (arm, result) in every_timed_arm(&packet) {
+      assert!(
+        matches!(
+          result,
+          Err(PacketBufferError::UnrepresentableFlags { raw: 0x1_00 })
+        ),
+        "{arm}: {result:?}",
+      );
+    }
+    assert!(matches!(
+      attachment_packet_from_ffmpeg(&packet).map(|p| p.is_some()),
+      Err(PacketBufferError::UnrepresentableFlags { .. }),
+    ));
+    let _ = tb;
   }
 
   #[test]

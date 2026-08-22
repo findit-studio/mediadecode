@@ -64,7 +64,14 @@ The backend-agnostic core it adapts has its own log at
   reported to C as an ordinary I/O error, and surfaced as
   `DemuxError::ReaderPanic` with the panic's own message from the next
   `open_reader`, `next_packet` or `seek`. The session is terminal from
-  there.
+  there. The caught payload is described and then deliberately
+  forgotten: `panic_any` takes any `Send` value and safe code can give
+  it a `Drop` that panics, and dropping it after the catch would send
+  that second panic out of `read`/`seek` and into the `extern "C"`
+  callback — the abort this guard exists to prevent, reached through the
+  guard itself (measured: SIGABRT). Leaking one value on a path that has
+  already made the session terminal is the cheaper half of that trade by
+  a distance.
 
   **Container metadata is read as bytes, not trusted as text.**
   `ffmpeg_next`'s `DictionaryRef::get` builds its `&str` with
@@ -163,6 +170,19 @@ The backend-agnostic core it adapts has its own log at
   channel resolving to mono, two to stereo — keeps converting exactly as
   before.
 
+  **Nothing that can fail is left on the far side of the conversion.**
+  Every resource a converted frame needs — the output frame, one
+  refcounted view per plane, a placeholder for every unused slot, and
+  the room in the ready queue — is acquired *before*
+  `swr_convert_frame` touches a sample, on the ordinary path and on the
+  EOF drain alike; the views are taken at full capacity and trimmed
+  afterwards by a shrink that allocates nothing. The step that turns a
+  converted frame into a `mediadecode` one is consequently infallible by
+  signature, which is what makes the property hold rather than
+  hold-for-now: a failure after `swr` has consumed input leaves a
+  session no caller can act on, since retrying feeds the same samples
+  twice and continuing loses them.
+
   **State is committed after the work it describes succeeds.** A frame
   refused for its geometry does not anchor or advance the output
   timeline; timestamps are counted with checked arithmetic and an
@@ -247,6 +267,14 @@ The backend-agnostic core it adapts has its own log at
   the codec without its `NEW_EXTRADATA`, and a side-data-only packet
   losing its only content and vanishing as an empty marker. The arms
   also deliver a side-data-only packet with an owned empty buffer.
+
+  The same rule reaches the pointers, not only the caps: a count is
+  judged before the array it describes, so a malformed or over-cap count
+  is refused whether or not the array happens to be null
+  (`SideDataArray` names the missing array), and an entry declaring
+  bytes it does not carry is refused (`SideDataPayload`) rather than
+  read as an empty entry that charges the budget nothing. A zero-size
+  entry is still a marker and still welcome.
   `SubtitlePacketExtra` and `DataPacketExtra` gained the seat the other
   two already had. `AttachmentPacketExtra` deliberately did not: an
   attachment is its bytes, so a packet carrying none carries no
@@ -262,6 +290,34 @@ The backend-agnostic core it adapts has its own log at
   FFmpeg does not name is refused
   (`PacketBuildError::UnknownSideData`) rather than dropped or handed to
   C as an invalid discriminant.
+
+- **Every packet flag survives both directions.** Forward conversion
+  went through `ffmpeg_next`'s `Packet::flags()`, whose `Flags` bit set
+  names `KEY` and `CORRUPT` and truncates the rest away before this
+  crate sees them; the reverse rebuilt only those two. `PacketFlags` is
+  a bit set whose documented lossless door is `from_bits_retain`, so
+  both directions were breaking its contract — and losing
+  `AV_PKT_FLAG_DISCARD`, which tells a consumer to decode a packet and
+  throw its output away, makes preroll output look like something to
+  keep. `AVPacket.flags` is now read and written as the raw integer it
+  is, so `DISCARD`, `TRUSTED`, `DISPOSABLE` and the bits nothing names
+  yet all round-trip. A compile-time assertion states that every flag
+  this build names fits the byte `PacketFlags` carries; a packet
+  carrying one that does not is refused
+  (`PacketBufferError::UnrepresentableFlags`) rather than delivered a
+  bit short.
+
+- **A track's codec parameters are copied with both fallible steps
+  checked.** `ffmpeg_next`'s `Clone` for `Parameters` checks neither:
+  `Parameters::new` does not test `avcodec_parameters_alloc` for null
+  and `clone_from` dereferences it immediately — measured, that is a
+  SIGSEGV under a failed allocation — while the copy's return value is
+  discarded, so a partial copy (a failed extradata allocation, say)
+  produced parameters that look complete and open a decoder wrong.
+  Every track in the table goes through this, so it is a whole session
+  built on parameters that are not the file's. A local helper checks
+  both legs and reports `DemuxError::ParametersAlloc` /
+  `ParametersCopy`; a partial copy is freed on the way out.
 
 ### Changed (BREAKING)
 

@@ -15,6 +15,8 @@ mod decoder;
 mod demuxer;
 mod error;
 pub mod extras;
+#[cfg(test)]
+mod fault_subprocess;
 mod ffi;
 mod frame;
 mod pixdesc;

@@ -301,6 +301,21 @@ impl FfmpegBuffer {
     self.offset
   }
 
+  /// Narrows this view to at most `len` bytes, keeping its start.
+  ///
+  /// Shrink-only and allocation-free: the refcount is untouched and the
+  /// end of the view can only move inward, so the constructor's
+  /// `offset + len <= size` invariant survives by construction. This is
+  /// what lets a view be taken before its final length is known — the
+  /// resampler acquires its output planes' references *before* `swr`
+  /// runs and trims them to what it produced afterwards, so no
+  /// allocation and no failure is left on the far side of the
+  /// conversion.
+  #[inline]
+  pub(crate) fn shrink_to(&mut self, len: usize) {
+    self.len = self.len.min(len);
+  }
+
   /// Fallible counterpart to [`Clone::clone`]. Returns `None` if
   /// `av_buffer_ref` fails (out-of-memory) instead of panicking.
   /// Use this in OOM-recoverable paths; the `Clone` impl panics on
@@ -374,6 +389,27 @@ pub enum PacketBufferError {
     cap: usize,
   },
 
+  /// A packet declares side-data entries and carries no array to read
+  /// them from.
+  ///
+  /// Malformed, and named rather than read as "no side data": a null
+  /// array with a positive count is the same silent loss as a truncated
+  /// copy, reached through the pointer instead of the cap.
+  #[error("a packet declaring {count} side-data entries carries no array")]
+  SideDataArray {
+    /// The count the packet declared.
+    count: i32,
+  },
+
+  /// A side-data entry declares bytes it does not carry.
+  #[error("side-data entry {index} declares {size} bytes and carries no data")]
+  SideDataPayload {
+    /// The entry's position in the packet's array.
+    index: usize,
+    /// The length the entry declared.
+    size: usize,
+  },
+
   /// A packet's side data is larger than this crate will copy.
   #[error("{bytes} bytes of side data cannot be carried (limit {cap})")]
   SideDataBytes {
@@ -381,6 +417,19 @@ pub enum PacketBufferError {
     bytes: usize,
     /// The most bytes this crate will copy.
     cap: usize,
+  },
+
+  /// A packet carries flag bits the portable vocabulary cannot hold.
+  ///
+  /// `mediadecode`'s `PacketFlags` is a `u8` bit set, and every packet
+  /// flag FFmpeg names today lives in that byte — so this cannot fire
+  /// against this build. It exists so that the day one does not, the
+  /// packet is refused by name instead of arriving with a bit quietly
+  /// missing: the same rule the rest of this boundary keeps.
+  #[error("packet flags {raw:#x} do not fit the portable flag set")]
+  UnrepresentableFlags {
+    /// `AVPacket.flags` as FFmpeg wrote it.
+    raw: i32,
   },
 
   /// Out of memory copying a side-data entry.

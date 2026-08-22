@@ -966,9 +966,12 @@ fn audio_plane_placeholder() -> Result<Plane<FfmpegBuffer>, ConvertError> {
   Ok(Plane::new(buf, 0))
 }
 
+/// The `AVBufferRef` in `(*av_frame).buf[]` that backs `data_ptr` for
+/// `bytes` bytes, or `None` when none of them does.
+///
 /// # Safety
 /// `av_frame` must be a live `*const AVFrame`.
-unsafe fn find_audio_backing_buffer(
+pub(crate) unsafe fn find_audio_backing_buffer(
   av_frame: *const AVFrame,
   data_ptr: *const u8,
   bytes: usize,

@@ -55,9 +55,10 @@ use std::{
 
 use ffmpeg_next::{
   Packet, Rational,
+  codec::Parameters,
   ffi::{
     AV_DISPOSITION_ATTACHED_PIC, AV_DISPOSITION_TIMED_THUMBNAILS, AV_NOPTS_VALUE, AVDictionary,
-    av_dict_get,
+    av_dict_get, avcodec_parameters_copy,
   },
   format::{self, context::Input},
   media,
@@ -350,6 +351,23 @@ pub enum DemuxError {
     stream_index: usize,
   },
 
+  /// Codec parameters for a track could not be allocated.
+  #[error("out of memory allocating the codec parameters for stream {stream_index}")]
+  ParametersAlloc {
+    /// The `AVStream.index` whose parameters could not be copied.
+    stream_index: usize,
+  },
+
+  /// Copying a track's codec parameters failed part way.
+  #[error("the codec parameters for stream {stream_index} could not be copied: {source}")]
+  ParametersCopy {
+    /// The `AVStream.index` whose parameters could not be copied.
+    stream_index: usize,
+    /// What FFmpeg said.
+    #[source]
+    source: ffmpeg_next::Error,
+  },
+
   /// A packet's payload could not be referenced — the bytes are there
   /// and this layer could not carry them.
   ///
@@ -469,7 +487,7 @@ fn build_tracks(input: &Input) -> Result<BuiltTracks, DemuxError> {
       }
     };
 
-    let extra = TrackExtra::new(index as i32, parameters.clone())
+    let extra = TrackExtra::new(index as i32, clone_parameters(&parameters, index)?)
       .with_disposition(disposition)
       .with_start_time((raw_start != AV_NOPTS_VALUE).then_some(raw_start))
       .with_frame_count((frames > 0).then_some(frames));
@@ -508,6 +526,42 @@ fn build_tracks(input: &Input) -> Result<BuiltTracks, DemuxError> {
   }
 
   Ok((tracks, pending))
+}
+
+/// A deep copy of a track's codec parameters, with both fallible steps
+/// checked.
+///
+/// `ffmpeg_next`'s `Clone` for `Parameters` checks neither.
+/// `Parameters::new` does not test `avcodec_parameters_alloc` for null,
+/// and the very next thing `clone_from` does is dereference it; and
+/// `clone_from` discards `avcodec_parameters_copy`'s return, so a copy
+/// that failed part way — an extradata allocation, typically — yields
+/// parameters that look fine, open a decoder wrong, and say nothing.
+/// Every track in the table goes through this, so the failure would be
+/// a whole session built on parameters that are not the file's.
+///
+/// A partial copy is freed by `out`'s own destructor on the way out:
+/// `avcodec_parameters_copy` resets the destination before it starts,
+/// so whatever it managed to allocate belongs to `out` and goes with
+/// it.
+fn clone_parameters(source: &Parameters, stream_index: usize) -> Result<Parameters, DemuxError> {
+  let mut out = Parameters::new();
+  // SAFETY: reading the pointer the constructor stored, without
+  // dereferencing it — which is exactly what the check is for.
+  if unsafe { out.as_ptr() }.is_null() {
+    return Err(DemuxError::ParametersAlloc { stream_index });
+  }
+  // SAFETY: both pointers are live `AVCodecParameters` — the
+  // destination freshly allocated and non-null, the source owned by the
+  // stream for the duration of this call.
+  let rc = unsafe { avcodec_parameters_copy(out.as_mut_ptr(), source.as_ptr()) };
+  if rc < 0 {
+    return Err(DemuxError::ParametersCopy {
+      stream_index,
+      source: ffmpeg_next::Error::from(rc),
+    });
+  }
+  Ok(out)
 }
 
 /// Whether a stream's disposition makes it an **attachment** — a
@@ -778,6 +832,123 @@ mod tests {
     let dict = dict_with(c"filename", &long);
     assert_eq!(unsafe { metadata_text(dict, c"filename") }, None);
     unsafe { av_dict_free(&mut { dict }) };
+  }
+
+  /// A reader that panics with a payload whose destructor panics in
+  /// turn. Both panics are safe code; the second one is what used to
+  /// leave the guard and enter the `extern "C"` AVIO callback.
+  struct PanicsWithAHostilePayload;
+
+  struct PanicOnDrop;
+
+  impl Drop for PanicOnDrop {
+    fn drop(&mut self) {
+      panic!("and the payload went too");
+    }
+  }
+
+  impl std::io::Read for PanicsWithAHostilePayload {
+    fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+      std::panic::panic_any(PanicOnDrop);
+    }
+  }
+
+  impl std::io::Seek for PanicsWithAHostilePayload {
+    fn seek(&mut self, _pos: std::io::SeekFrom) -> std::io::Result<u64> {
+      std::panic::panic_any(PanicOnDrop);
+    }
+  }
+
+  #[test]
+  fn a_reader_panic_with_a_hostile_payload_does_not_abort_the_process() {
+    // In its own process, because the assertion *is* the process: a
+    // parent that sees the child exit cleanly has seen the abort not
+    // happen. The guard caught the reader's panic and then dropped its
+    // payload outside `catch_unwind`, so a payload whose `Drop` panics
+    // sent that second panic straight out of `read` and into C —
+    // through the very guard that exists to stop it.
+    crate::fault_subprocess::in_subprocess(
+      "demuxer::tests::a_reader_panic_with_a_hostile_payload_does_not_abort_the_process",
+      || {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let opened = FfmpegDemuxer::open_reader(PanicsWithAHostilePayload, Some("x.mkv"));
+        std::panic::set_hook(previous);
+        match opened {
+          Err(DemuxError::ReaderPanic { .. }) => {}
+          Err(other) => panic!("expected ReaderPanic, got {other:?}"),
+          Ok(_) => panic!("a reader that only panics cannot open a container"),
+        }
+      },
+    );
+  }
+
+  #[test]
+  fn codec_parameters_that_cannot_be_allocated_are_named() {
+    // `Parameters::new` does not check `avcodec_parameters_alloc`, and
+    // `clone_from` dereferences the result immediately: under a failed
+    // allocation the shipped clone would write through null.
+    crate::fault_subprocess::in_subprocess(
+      "demuxer::tests::codec_parameters_that_cannot_be_allocated_are_named",
+      || {
+        let source = Parameters::new();
+        assert!(
+          !unsafe { source.as_ptr() }.is_null(),
+          "the source allocates before the cap goes on",
+        );
+        crate::fault_subprocess::cap_ffmpeg_allocations(1);
+        let refused = clone_parameters(&source, 4);
+        crate::fault_subprocess::uncap_ffmpeg_allocations();
+        assert!(
+          matches!(
+            refused,
+            Err(DemuxError::ParametersAlloc { stream_index: 4 })
+          ),
+          "expected ParametersAlloc, got {:?}",
+          refused.map(|_| ()),
+        );
+        // And with the cap lifted the same copy succeeds, so the
+        // refusal was the allocator's answer and not a broken helper.
+        clone_parameters(&source, 4).expect("an uncapped copy");
+      },
+    );
+  }
+
+  #[test]
+  fn codec_parameters_whose_copy_fails_are_named() {
+    // The other leg: the destination allocates, and the deep copy of
+    // the extradata does not. `clone_from` discards that return value,
+    // so the shipped clone handed back parameters missing the very
+    // bytes a decoder needs to open — and said nothing.
+    crate::fault_subprocess::in_subprocess(
+      "demuxer::tests::codec_parameters_whose_copy_fails_are_named",
+      || {
+        const EXTRADATA: usize = 8 * 1024 * 1024;
+        let mut source = Parameters::new();
+        // SAFETY: `source` owns a live `AVCodecParameters`; the buffer
+        // comes from FFmpeg's allocator and is handed to it, so
+        // `avcodec_parameters_free` releases it with the rest.
+        unsafe {
+          let par = source.as_mut_ptr();
+          let extradata = ffmpeg_next::ffi::av_mallocz(EXTRADATA) as *mut u8;
+          assert!(!extradata.is_null(), "av_mallocz");
+          (*par).extradata = extradata;
+          (*par).extradata_size = EXTRADATA as i32;
+        }
+
+        // Big enough for the destination `AVCodecParameters`, far too
+        // small for its extradata.
+        crate::fault_subprocess::cap_ffmpeg_allocations(64 * 1024);
+        let refused = clone_parameters(&source, 2);
+        crate::fault_subprocess::uncap_ffmpeg_allocations();
+        match refused {
+          Err(DemuxError::ParametersCopy { stream_index, .. }) => assert_eq!(stream_index, 2),
+          Err(other) => panic!("expected ParametersCopy, got {other:?}"),
+          Ok(_) => panic!("a copy that could not copy the extradata must not succeed"),
+        }
+        clone_parameters(&source, 2).expect("an uncapped copy");
+      },
+    );
   }
 
   #[test]
