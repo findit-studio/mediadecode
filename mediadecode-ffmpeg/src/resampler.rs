@@ -418,10 +418,15 @@ impl FfmpegResampler {
     Ok(input)
   }
 
-  /// Allocates an output frame large enough for everything currently
-  /// convertible: the delay line's contents plus `in_samples` of new
-  /// input, rescaled to the output rate and rounded up.
-  fn alloc_output(&self, in_samples: i64) -> Result<frame::Audio, ResampleError> {
+  /// The most samples the next conversion could produce: the delay
+  /// line's contents plus `in_samples` of new input, rescaled to the
+  /// output rate and rounded up.
+  ///
+  /// Separate from the allocation because it is also the preflight the
+  /// output timeline is checked against — *before* `swr` consumes
+  /// anything, so a refusal leaves the session where a caller can retry
+  /// it.
+  fn output_capacity(&self, in_samples: i64) -> Result<usize, ResampleError> {
     let delay_in = self.ctx.delay().map_or(0, |d| d.input.max(0));
     let total = delay_in.saturating_add(in_samples).max(0) as i128;
     let scaled = (total * i128::from(self.target.rate) + i128::from(self.source.rate) - 1)
@@ -441,12 +446,34 @@ impl FfmpegResampler {
         requested: usize::try_from(samples).unwrap_or(usize::MAX),
       });
     }
+    Ok(samples.max(1) as usize)
+  }
+
+  /// Allocates an output frame of `samples` samples in the target spec.
+  fn alloc_output(&self, samples: usize) -> Result<frame::Audio, ResampleError> {
     new_audio_frame(
       self.target.format,
-      samples.max(1) as usize,
+      samples,
       self.target.rate,
       self.staged_target_layout,
     )
+  }
+
+  /// Refuses a conversion whose output could not be labelled: the
+  /// timeline plus everything this call might produce has to stay
+  /// inside `i64`.
+  ///
+  /// Asked before `swr` sees a sample. The same addition is checked
+  /// again in [`Self::take_output`] against the count actually
+  /// produced — that one cannot fire once this has passed, and stays as
+  /// the arithmetic's last line of defence.
+  fn check_timeline(&self, anchor: Option<i64>, capacity: usize) -> Result<(), ResampleError> {
+    let pts = self.next_pts.or(anchor).unwrap_or(0);
+    let samples = capacity as i64;
+    if pts.checked_add(samples).is_none() {
+      return Err(ResampleError::TimestampOverflow { pts, samples });
+    }
+    Ok(())
   }
 
   /// Labels a converted `AVFrame` on the counted output timeline and
@@ -508,7 +535,9 @@ impl AudioResampler for FfmpegResampler {
     // timestamp.
     let anchor = self.anchor_of(frame)?;
     let input = self.stage_input(frame)?;
-    let mut out = self.alloc_output(frame.nb_samples() as i64)?;
+    let capacity = self.output_capacity(frame.nb_samples() as i64)?;
+    self.check_timeline(anchor, capacity)?;
+    let mut out = self.alloc_output(capacity)?;
     self
       .ctx
       .run(&input, &mut out)
@@ -541,9 +570,14 @@ impl AudioResampler for FfmpegResampler {
     if remaining <= 0 {
       return Err(ResampleError::Again);
     }
+    let capacity = remaining.min(i64::from(i32::MAX)) as usize;
+    // Same discipline as `send_frame`: the tail is drained only once
+    // the timeline can hold it, so a refusal leaves the delay line
+    // intact instead of converting samples into an error.
+    self.check_timeline(None, capacity)?;
     let mut out = new_audio_frame(
       self.target.format,
-      remaining.min(i64::from(i32::MAX)) as usize,
+      capacity,
       self.target.rate,
       self.staged_target_layout,
     )?;

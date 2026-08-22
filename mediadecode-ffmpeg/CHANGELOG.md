@@ -152,8 +152,13 @@ The backend-agnostic core it adapts has its own log at
   **State is committed after the work it describes succeeds.** A frame
   refused for its geometry does not anchor or advance the output
   timeline; timestamps are counted with checked arithmetic and an
-  overflow is `ResampleError::TimestampOverflow` rather than `i64::MAX`
-  repeated; the anchor itself is rescaled with the checked rung before
+  overflow is `ResampleError::TimestampOverflow` — raised *before*
+  `swr` consumes the frame, checked against the most samples the call
+  could produce, so a refused conversion leaves a session the caller can
+  still use (the check used to run after the conversion, which left the
+  filter's history moved, an output frame built and dropped, and the
+  timeline anchored where every later frame overflowed too) — rather
+  than `i64::MAX` repeated; the anchor itself is rescaled with the checked rung before
   anything is staged, so a timestamp that cannot land on the output
   timeline is `ResampleError::TimestampOutOfRange` with the resampler
   untouched, rather than a clamp — a positive clamp used to surface only

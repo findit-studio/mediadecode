@@ -910,6 +910,35 @@ fn the_output_timeline_refuses_to_overflow() {
     }
     other => panic!("expected TimestampOverflow, got {other:?}"),
   }
+
+  // And the refusal is transactional. The check used to live after
+  // `ctx.run`, so the frame was already inside the filter when the
+  // error came back: the caller was told nothing happened while the
+  // filter's history had moved and an output frame had been built and
+  // dropped.
+  assert_eq!(
+    resampler.delay(),
+    0,
+    "the refused frame was consumed before the timeline was checked",
+  );
+  let mut dst = empty_audio_frame();
+  assert!(
+    resampler
+      .receive_frame(&mut dst)
+      .expect_err("nothing was converted")
+      .is_again(),
+    "a refused frame left output ready",
+  );
+
+  // A session refused this way is still usable: the very next honest
+  // frame converts, and anchors the timeline itself.
+  resampler
+    .send_frame(&stereo_frame(samples, samples as usize * 2 * 2, Some(0)))
+    .expect("the session survived the refusal");
+  resampler
+    .receive_frame(&mut dst)
+    .expect("and converts the next frame");
+  assert_eq!(dst.pts().expect("stamped").pts(), 0);
 }
 
 #[test]
