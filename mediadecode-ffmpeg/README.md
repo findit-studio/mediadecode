@@ -135,6 +135,12 @@ for end-to-end demuxer-driven runs that cover all three streams.
   `libavformat`, opened from a path (`open`) or from any
   `Read + Seek` byte source through a custom `AVIOContext`
   (`open_reader`). Plus `DemuxError`.
+- **Resampler**: `FfmpegResampler` — `mediadecode`'s `AudioResampler`
+  over `swresample`, built from two explicit `ResampleSpec`s (the
+  source read off a track or off the opened decoder, the target the
+  caller's). Plus `ResampleError`, whose `Again` variant is the
+  "needs more input" signal and whose `SourceChanged` variant is the
+  mid-stream refusal.
 - **Type aliases**: `VideoPacket`, `AudioPacket`, `SubtitlePacket`,
   `DataPacket`, `AttachmentPacket`, `DemuxedPacket`, `VideoFrame`,
   `AudioFrame`, `SubtitleFrame`, `TrackInfo`, `TrackParams` — the

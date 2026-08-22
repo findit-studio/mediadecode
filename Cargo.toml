@@ -24,7 +24,13 @@ bitflags    = { version = "2", default-features = false }
 derive_more = { version = "2", default-features = false }
 thiserror   = { version = "2", default-features = false }
 smol_str    = { version = "0.3", default-features = false }
-ffmpeg-next = { version = "9", default-features = false, features = ["codec", "format"] }
+ffmpeg-next = { version = "9", default-features = false, features = [
+  "codec",
+  "format",
+  # The resample seam's first implementation. `swresample` is a
+  # separate FFmpeg library, so it is a separate feature.
+  "software-resampling",
+] }
 tracing     = { version = "0.1", default-features = false }
 libc        = "0.2"
 

@@ -62,6 +62,51 @@ The backend-agnostic core it adapts has its own log at
   and now delegate. `attachment_packet_from_ffmpeg` joins them for
   cover-art payloads, which have no timestamps to carry.
 
+- **`FfmpegResampler` — `mediadecode`'s resample seam over
+  `swresample`.** `FfmpegResampler::new(source, target)` takes both
+  specs as [`ResampleSpec`]s and neither is inferred. The source is read
+  off a demuxed track (`ResampleSpec::from_parameters`, the
+  "source from `TrackInfo`" path) or off the opened decoder
+  (`ResampleSpec::from_decoder`); the target is the caller's options.
+
+  **Output timestamps are counted, not computed.** The timeline is
+  anchored on the first *input* timestamp and advanced by the number of
+  samples actually produced, so no arithmetic depends on how many
+  samples a given `swr_convert_frame` happened to yield and the frames
+  drained after `send_eof` continue the same line. The tail is real:
+  the 44.1 kHz → 16 kHz lane pins that `send_eof` still has a frame to
+  give, which is the difference between a file's last tens of
+  milliseconds surviving and not.
+
+  **A frame whose rate, sample format or channel layout is not the
+  source spec is refused by name** (`ResampleError::SourceChanged`), and
+  "nothing ready yet" is `ResampleError::Again` — the same mechanism
+  `AudioStreamDecoder::receive_frame` uses, one tier along.
+  `send_frame` after `send_eof` is refused too rather than silently
+  accepted; `flush` is the way back to a reusable resampler.
+
+  Two things this layer had to learn about FFmpeg to be correct, both
+  recorded where they are relied on. A WAV without a
+  `WAVE_FORMAT_EXTENSIBLE` channel mask genuinely declares **no**
+  layout, and FFmpeg reports that unspecified layout in the codec
+  parameters, in the codec context and on every decoded frame —
+  substituting a default would make the source spec disagree with the
+  frames it describes and refuse all of them. But `swr_init` *does*
+  substitute a default internally, and then compares every frame handed
+  to it against that one — so the frames this layer stages carry the
+  post-init layout while the mid-stream check keeps comparing against
+  the declared one. Custom and ambisonic layouts are refused outright
+  (`from_parameters` / `from_decoder` return `None`): both keep a
+  heap-allocated channel map that a `Copy` layout wrapper cannot own
+  safely, and a silent approximation would be worse than a `None`.
+
+- **`SampleFormat::to_ffmpeg` / `SampleFormat::from_ffmpeg`** — the
+  direction this newtype was missing. A raw sample-format integer read
+  out of a container cannot be cast back into the bindgen enum to reach
+  FFmpeg's safe API, so `to_ffmpeg` matches it against compile-time
+  constants instead, exactly as `boundary::from_av_pixel_format` comes
+  the other way.
+
 - **`DataPacketExtra`, `AttachmentPacketExtra`, `TrackExtra`** — the
   demux tier's `*Extra` carriers, and `impl DemuxAdapter for Ffmpeg`
   binding them. `AttachmentPacketExtra::synthesized` records whether a
