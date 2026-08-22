@@ -476,14 +476,14 @@ unsafe fn build_video_frame_extra(av_frame: *const AVFrame) -> VideoFrameExtra {
 /// timecodes, A53 captions, …) — usually < 8. The cap exists so a
 /// crafted stream can't drive the safe converter into a long
 /// per-frame entry-allocation loop.
-const SIDE_DATA_MAX_ENTRIES: usize = 64;
+pub(crate) const SIDE_DATA_MAX_ENTRIES: usize = 64;
 /// Per-AVFrame total side-data byte cap. HDR / dynamic-metadata
 /// payloads are typically a few hundred bytes; A53 captions can run
 /// to a few kilobytes; SEI dumps in pathological streams have been
 /// observed in the tens of kilobytes. 256 KiB is two orders of
 /// magnitude over the realistic upper bound while still bounded
 /// enough that an attacker-driven OOM via metadata is impossible.
-const SIDE_DATA_MAX_TOTAL_BYTES: usize = 256 * 1024;
+pub(crate) const SIDE_DATA_MAX_TOTAL_BYTES: usize = 256 * 1024;
 
 /// Maximum number of `AVSubtitleRect` entries we copy from a single
 /// AVSubtitle. Realistic subtitles attach 1–4 rects per cue; 64

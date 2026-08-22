@@ -261,6 +261,35 @@ fn every_attachment_track_is_delivered_before_the_first_timed_packet() {
 }
 
 #[test]
+fn a_packets_side_data_arrives_with_it() {
+  let Some(corpus) = Corpus::new() else { return };
+  // Measured on this corpus: every generated container carries at
+  // least one packet with real side data — `AV_PKT_DATA_SKIP_SAMPLES`
+  // (kind 11), the encoder-delay trim an MP3 or AAC stream needs to be
+  // cut correctly. The extras have always documented a `side_data`
+  // seat; nothing ever filled it, so that trim was dropped at the
+  // boundary on every packet of every file.
+  const SKIP_SAMPLES: i32 = 11;
+
+  let mut demuxer = FfmpegDemuxer::open(&corpus.cover_art_mp3()).expect("open mp3");
+  let mut seen = 0;
+  while let Some(packet) = demuxer.next_packet().expect("pull") {
+    if let DemuxedPacket::Audio { packet, .. } = packet {
+      seen += packet
+        .extra()
+        .side_data()
+        .iter()
+        .filter(|entry| entry.kind() == SKIP_SAMPLES)
+        .count();
+    }
+  }
+  assert!(
+    seen > 0,
+    "no packet arrived carrying the side data the container really holds",
+  );
+}
+
+#[test]
 fn the_data_arm_delivers_the_timecode_track() {
   let Some(corpus) = Corpus::new() else { return };
   let mut demuxer = FfmpegDemuxer::open(&corpus.timecode_mov()).expect("open mov");

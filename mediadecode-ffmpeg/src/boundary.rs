@@ -6,7 +6,10 @@
 //! the bindgen enum (UB hazard when the value isn't in the enum's
 //! discriminant set).
 
-use core::ffi::c_int;
+use core::{
+  ffi::c_int,
+  ptr::{addr_of, read_unaligned},
+};
 
 use ffmpeg_next::{Packet, ffi::AVPixelFormat};
 use mediadecode::{
@@ -21,9 +24,10 @@ use mediaframe::audio::ChannelLayoutDescription;
 use crate::{
   FfmpegBuffer,
   buffer::PacketBufferError,
+  convert::{SIDE_DATA_MAX_ENTRIES, SIDE_DATA_MAX_TOTAL_BYTES},
   extras::{
-    AttachmentPacketExtra, AudioFrameExtra, AudioPacketExtra, DataPacketExtra, SubtitleFrameExtra,
-    SubtitlePacketExtra, VideoFrameExtra, VideoPacketExtra,
+    AttachmentPacketExtra, AudioFrameExtra, AudioPacketExtra, DataPacketExtra, SideDataEntry,
+    SubtitleFrameExtra, SubtitlePacketExtra, VideoFrameExtra, VideoPacketExtra,
   },
   sample_format::SampleFormat,
 };
@@ -551,6 +555,104 @@ pub fn subtitle_packet_from_ffmpeg(
   subtitle_packet_from_ffmpeg_in(packet, mediadecode::Timebase::default())
 }
 
+/// The side-data entries an `AVPacket` carries, copied into owned
+/// values.
+///
+/// The packet twin of `convert::collect_side_data`, and bounded the
+/// same way: at most [`SIDE_DATA_MAX_ENTRIES`] entries and
+/// [`SIDE_DATA_MAX_TOTAL_BYTES`] bytes per packet, allocated through
+/// `try_reserve_exact` so an out-of-memory answer drops an entry rather
+/// than aborting the process. `AVPacket.side_data` is a flat array of
+/// `AVPacketSideData` (not the array of pointers an `AVFrame` keeps),
+/// and its `type_` is read as the integer it is on the wire — a
+/// discriminant this build has no name for would be undefined behaviour
+/// the moment it existed as an `AVPacketSideDataType`.
+fn packet_side_data(packet: &Packet) -> Vec<SideDataEntry> {
+  use ffmpeg_next::packet::Ref;
+  // SAFETY: `packet` keeps the `AVPacket` live; `side_data` and
+  // `side_data_elems` are public fields.
+  let count_raw = unsafe { (*packet.as_ptr()).side_data_elems };
+  let entries = unsafe { (*packet.as_ptr()).side_data };
+  if count_raw <= 0 || entries.is_null() {
+    return Vec::new();
+  }
+  let requested = count_raw as usize;
+  let count = requested.min(SIDE_DATA_MAX_ENTRIES);
+  if requested > SIDE_DATA_MAX_ENTRIES {
+    tracing::warn!(
+      cap = SIDE_DATA_MAX_ENTRIES,
+      requested,
+      "mediadecode-ffmpeg: AVPacket.side_data_elems exceeds entry cap; truncating",
+    );
+  }
+  let mut out: Vec<SideDataEntry> = Vec::new();
+  if out.try_reserve_exact(count).is_err() {
+    return Vec::new();
+  }
+  let mut total_bytes: usize = 0;
+  for index in 0..count {
+    // SAFETY: `entries` is valid for `count_raw` contiguous
+    // `AVPacketSideData` values per FFmpeg's contract, and `index` is
+    // below the clamped count.
+    let entry = unsafe { entries.add(index) };
+    let kind = unsafe { read_unaligned(addr_of!((*entry).type_).cast::<i32>()) };
+    let size = unsafe { (*entry).size };
+    let data_ptr = unsafe { (*entry).data };
+    let data = if size == 0 || data_ptr.is_null() {
+      Vec::new()
+    } else {
+      let projected = total_bytes.saturating_add(size);
+      if projected > SIDE_DATA_MAX_TOTAL_BYTES {
+        tracing::warn!(
+          cap = SIDE_DATA_MAX_TOTAL_BYTES,
+          projected,
+          "mediadecode-ffmpeg: AVPacket side-data byte cap reached; dropping remaining entries",
+        );
+        break;
+      }
+      total_bytes = projected;
+      let mut buf: Vec<u8> = Vec::new();
+      if buf.try_reserve_exact(size).is_err() {
+        continue;
+      }
+      // SAFETY: `data` is valid for `size` bytes per FFmpeg's
+      // `AVPacketSideData` contract.
+      buf.extend_from_slice(unsafe { core::slice::from_raw_parts(data_ptr, size) });
+      buf
+    };
+    out.push(SideDataEntry::new(kind, data));
+  }
+  out
+}
+
+/// The buffer a timed packet is delivered with, or `None` when there is
+/// no packet to deliver at all.
+///
+/// **`size == 0` is not the same as "nothing".** A packet with no body
+/// and one or more side-data entries is a real packet: FFmpeg uses that
+/// shape for `AV_PKT_DATA_NEW_EXTRADATA` and for a parameter change,
+/// and a decoder that never sees it keeps decoding on parameters the
+/// container has already replaced. Such a packet is delivered with an
+/// owned empty buffer — zero bytes, but a buffer, so the packet exists
+/// and its side data rides the extras.
+///
+/// `Ok(None)` therefore means the packet carried neither a payload nor
+/// side data: the empty marker, and the only thing a pull loop may skip.
+fn delivered_payload(
+  packet: &Packet,
+  side_data: &[SideDataEntry],
+) -> Result<Option<FfmpegBuffer>, PacketBufferError> {
+  if let Some(buf) = FfmpegBuffer::from_packet(packet)? {
+    return Ok(Some(buf));
+  }
+  if side_data.is_empty() {
+    return Ok(None);
+  }
+  FfmpegBuffer::copy_from_slice(&[])
+    .map(Some)
+    .ok_or(PacketBufferError::Refcount { len: 0 })
+}
+
 // ---------------------------------------------------------------------------
 //  Timebase-carrying variants.
 //
@@ -568,10 +670,12 @@ pub fn video_packet_from_ffmpeg_in(
   packet: &Packet,
   time_base: mediadecode::Timebase,
 ) -> Result<Option<VideoPacket<VideoPacketExtra, FfmpegBuffer>>, PacketBufferError> {
-  let Some(buf) = FfmpegBuffer::from_packet(packet)? else {
+  let side_data = packet_side_data(packet);
+  let Some(buf) = delivered_payload(packet, &side_data)? else {
     return Ok(None);
   };
-  let mut out = VideoPacket::new(buf, VideoPacketExtra::new(packet.stream() as i32))
+  let extra = VideoPacketExtra::new(packet.stream() as i32).with_side_data(side_data);
+  let mut out = VideoPacket::new(buf, extra)
     .with_flags(md_flags_from_av(packet.flags()))
     .with_pts(packet.pts().map(|p| Timestamp::new(p, time_base)))
     .with_dts(packet.dts().map(|d| Timestamp::new(d, time_base)));
@@ -588,10 +692,12 @@ pub fn audio_packet_from_ffmpeg_in(
   packet: &Packet,
   time_base: mediadecode::Timebase,
 ) -> Result<Option<AudioPacket<AudioPacketExtra, FfmpegBuffer>>, PacketBufferError> {
-  let Some(buf) = FfmpegBuffer::from_packet(packet)? else {
+  let side_data = packet_side_data(packet);
+  let Some(buf) = delivered_payload(packet, &side_data)? else {
     return Ok(None);
   };
-  let mut out = AudioPacket::new(buf, AudioPacketExtra::new(packet.stream() as i32))
+  let extra = AudioPacketExtra::new(packet.stream() as i32).with_side_data(side_data);
+  let mut out = AudioPacket::new(buf, extra)
     .with_flags(md_flags_from_av(packet.flags()))
     .with_pts(packet.pts().map(|p| Timestamp::new(p, time_base)))
     .with_dts(packet.dts().map(|d| Timestamp::new(d, time_base)));
@@ -608,10 +714,12 @@ pub fn subtitle_packet_from_ffmpeg_in(
   packet: &Packet,
   time_base: mediadecode::Timebase,
 ) -> Result<Option<SubtitlePacket<SubtitlePacketExtra, FfmpegBuffer>>, PacketBufferError> {
-  let Some(buf) = FfmpegBuffer::from_packet(packet)? else {
+  let side_data = packet_side_data(packet);
+  let Some(buf) = delivered_payload(packet, &side_data)? else {
     return Ok(None);
   };
-  let mut out = SubtitlePacket::new(buf, SubtitlePacketExtra::new(packet.stream() as i32))
+  let extra = SubtitlePacketExtra::new(packet.stream() as i32).with_side_data(side_data);
+  let mut out = SubtitlePacket::new(buf, extra)
     .with_flags(md_flags_from_av(packet.flags()))
     .with_pts(packet.pts().map(|p| Timestamp::new(p, time_base)));
   let dur = packet.duration();
@@ -634,12 +742,14 @@ pub fn data_packet_from_ffmpeg_in(
   packet: &Packet,
   time_base: mediadecode::Timebase,
 ) -> Result<Option<DataPacket<DataPacketExtra, FfmpegBuffer>>, PacketBufferError> {
-  let Some(buf) = FfmpegBuffer::from_packet(packet)? else {
+  let side_data = packet_side_data(packet);
+  let Some(buf) = delivered_payload(packet, &side_data)? else {
     return Ok(None);
   };
   let pos = packet.position();
-  let extra =
-    DataPacketExtra::new(packet.stream() as i32).with_byte_pos((pos >= 0).then_some(pos as i64));
+  let extra = DataPacketExtra::new(packet.stream() as i32)
+    .with_byte_pos((pos >= 0).then_some(pos as i64))
+    .with_side_data(side_data);
   let mut out = DataPacket::new(buf, extra)
     .with_flags(md_flags_from_av(packet.flags()))
     .with_pts(packet.pts().map(|p| Timestamp::new(p, time_base)));
@@ -658,6 +768,14 @@ pub fn data_packet_from_ffmpeg_in(
 /// attachment is not on the timeline. `synthesized` is `false`, because
 /// this payload came from a real packet; the demuxer sets it `true` for
 /// the packets it builds out of codec extradata.
+///
+/// **The one arm where a payload-less packet really is nothing.** The
+/// four timed conversions deliver a side-data-only packet, because
+/// codec-control side data is content a decoder must see. An attachment
+/// is not decoded and is not on a timeline: it *is* its bytes, so a
+/// packet carrying none carries no attachment, and this answers
+/// `Ok(None)`. `AttachmentPacketExtra` accordingly has no side-data
+/// seat — a deliberate absence, not an oversight.
 pub fn attachment_packet_from_ffmpeg(
   packet: &Packet,
 ) -> Result<Option<AttachmentPacket<AttachmentPacketExtra, FfmpegBuffer>>, PacketBufferError> {
@@ -840,6 +958,104 @@ mod tests {
       attachment_packet_from_ffmpeg(&forged),
       Err(PacketBufferError::Bounds { .. }),
     ));
+  }
+
+  /// A packet with **no body** and one side-data entry — the shape
+  /// FFmpeg uses to hand a decoder new extradata or a parameter change.
+  /// `size` is 0 and `buf` is null, which is exactly what used to read
+  /// as "empty, skip it".
+  fn side_data_only_packet() -> Packet {
+    use ffmpeg_next::{
+      ffi::{AVPacketSideDataType, av_packet_new_side_data},
+      packet::Mut,
+    };
+    let mut packet = Packet::empty();
+    // SAFETY: `packet` owns a live `AVPacket`; the side-data type is a
+    // compile-time constant of this build, so no invalid discriminant
+    // is formed. The returned pointer is valid for the four bytes just
+    // allocated.
+    unsafe {
+      let ptr = av_packet_new_side_data(
+        packet.as_mut_ptr(),
+        AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA,
+        4,
+      );
+      assert!(!ptr.is_null(), "av_packet_new_side_data");
+      core::ptr::copy_nonoverlapping([1u8, 2, 3, 4].as_ptr(), ptr, 4);
+    }
+    packet
+  }
+
+  const NEW_EXTRADATA: i32 =
+    ffmpeg_next::ffi::AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA as i32;
+
+  #[test]
+  fn a_side_data_only_packet_is_delivered_on_every_timed_arm() {
+    // Codec-control data with no body is still a packet. Dropped as an
+    // "empty marker", it leaves a decoder running on parameters the
+    // container has already replaced — and says nothing about it.
+    let packet = side_data_only_packet();
+    let tb = mediadecode::Timebase::default();
+
+    let video = video_packet_from_ffmpeg_in(&packet, tb)
+      .expect("wrappable")
+      .expect("a side-data-only packet is a packet");
+    assert!(video.data().as_ref().is_empty(), "no body, but a buffer");
+    assert_eq!(video.extra().side_data().len(), 1);
+    assert_eq!(video.extra().side_data()[0].kind(), NEW_EXTRADATA);
+    assert_eq!(video.extra().side_data()[0].data(), &[1, 2, 3, 4]);
+
+    let audio = audio_packet_from_ffmpeg_in(&packet, tb)
+      .expect("wrappable")
+      .expect("present");
+    assert!(audio.data().as_ref().is_empty());
+    assert_eq!(audio.extra().side_data()[0].data(), &[1, 2, 3, 4]);
+
+    let subtitle = subtitle_packet_from_ffmpeg_in(&packet, tb)
+      .expect("wrappable")
+      .expect("present");
+    assert!(subtitle.data().as_ref().is_empty());
+    assert_eq!(subtitle.extra().side_data()[0].data(), &[1, 2, 3, 4]);
+
+    let data = data_packet_from_ffmpeg_in(&packet, tb)
+      .expect("wrappable")
+      .expect("present");
+    assert!(data.data().as_ref().is_empty());
+    assert_eq!(data.extra().side_data()[0].data(), &[1, 2, 3, 4]);
+
+    // The one arm where a payload-less packet really is nothing: an
+    // attachment is its bytes, and there are none.
+    assert!(
+      attachment_packet_from_ffmpeg(&packet)
+        .expect("wrappable")
+        .is_none(),
+      "an attachment with no bytes is no attachment",
+    );
+  }
+
+  #[test]
+  fn side_data_rides_a_packet_that_has_a_body_too() {
+    // The seat's documented promise — "the raw side-data entries from
+    // `AVPacket.side_data`" — was never kept by the conversion before.
+    use ffmpeg_next::{
+      ffi::{AVPacketSideDataType, av_packet_new_side_data},
+      packet::Mut,
+    };
+    let mut packet = Packet::copy(&[7u8, 7, 7]);
+    unsafe {
+      let ptr = av_packet_new_side_data(
+        packet.as_mut_ptr(),
+        AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA,
+        2,
+      );
+      assert!(!ptr.is_null());
+      core::ptr::copy_nonoverlapping([9u8, 9].as_ptr(), ptr, 2);
+    }
+    let video = video_packet_from_ffmpeg_in(&packet, mediadecode::Timebase::default())
+      .expect("wrappable")
+      .expect("present");
+    assert_eq!(video.data().as_ref(), &[7, 7, 7]);
+    assert_eq!(video.extra().side_data()[0].data(), &[9, 9]);
   }
 
   #[test]

@@ -157,6 +157,28 @@ The backend-agnostic core it adapts has its own log at
   than `ffmpeg_next`'s `Disposition`, whose `from_bits_truncate` would
   drop bits this build has no constant for.
 
+### Fixed
+
+- **A packet's side data arrives with the packet, and a side-data-only
+  packet is no longer mistaken for an empty marker.** The `*Extra`
+  carriers have always documented a `side_data` seat and the conversion
+  never filled one; measured on this repository's own generated corpus,
+  every container carries at least one packet with real side data
+  (`AV_PKT_DATA_SKIP_SAMPLES` — the encoder-delay trim an MP3 or AAC
+  stream must be cut by), so that data was dropped at the boundary on
+  every file. Worse, a packet with **no body** and only side data —
+  FFmpeg's shape for `AV_PKT_DATA_NEW_EXTRADATA` and for a parameter
+  change — read as "empty, skip it", so a decoder could be left running
+  on parameters the container had already replaced, with nothing said.
+
+  All four timed arms now collect side data (bounded exactly as the
+  frame-side collector is: 64 entries, 256 KiB, `try_reserve_exact`) and
+  deliver a side-data-only packet with an owned empty buffer.
+  `SubtitlePacketExtra` and `DataPacketExtra` gained the seat the other
+  two already had. `AttachmentPacketExtra` deliberately did not: an
+  attachment is its bytes, so a packet carrying none carries no
+  attachment, and that arm still answers `Ok(None)`.
+
 ### Changed (BREAKING)
 
 - **Wrapping a packet's payload answers `Result<Option<_>>`.**

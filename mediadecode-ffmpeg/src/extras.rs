@@ -449,16 +449,19 @@ pub struct SubtitlePacketExtra {
   stream_index: i32,
   language: Option<[u8; 3]>,
   forced: bool,
+  side_data: Vec<SideDataEntry>,
 }
 
 impl SubtitlePacketExtra {
   /// Constructs a `SubtitlePacketExtra` with the given stream index.
+  /// `side_data` defaults to empty.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new(stream_index: i32) -> Self {
     Self {
       stream_index,
       language: None,
       forced: false,
+      side_data: Vec::new(),
     }
   }
 
@@ -477,6 +480,16 @@ impl SubtitlePacketExtra {
   pub const fn forced(&self) -> bool {
     self.forced
   }
+  /// Returns the raw side-data entries from `AVPacket.side_data`.
+  ///
+  /// A subtitle packet's side data is rare but not absent — and a
+  /// packet that carries *nothing else* is exactly the case this seat
+  /// exists for: with no seat, a side-data-only packet has nowhere to
+  /// put its only content.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn side_data(&self) -> &[SideDataEntry] {
+    self.side_data.as_slice()
+  }
 
   /// Sets the stream index (consuming builder).
   #[cfg_attr(not(tarpaulin), inline(always))]
@@ -490,6 +503,19 @@ impl SubtitlePacketExtra {
   #[must_use]
   pub const fn with_language(mut self, value: Option<[u8; 3]>) -> Self {
     self.language = value;
+    self
+  }
+  /// Sets the side-data list (consuming builder).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
+  pub fn with_side_data(mut self, value: Vec<SideDataEntry>) -> Self {
+    self.side_data = value;
+    self
+  }
+  /// Sets the side-data list in place.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn set_side_data(&mut self, value: Vec<SideDataEntry>) -> &mut Self {
+    self.side_data = value;
     self
   }
   /// Sets the forced flag (consuming builder).
@@ -816,24 +842,27 @@ impl ContentLightLevel {
 
 /// Per-`DataPacket` extras — timecode, KLV, timed ID3.
 ///
-/// Same two seats as [`VideoPacketExtra`] minus the side-data list:
-/// FFmpeg's data demuxers carry the whole payload in the packet body,
-/// and a side-data entry on a data packet has never been observed in
-/// this workspace's corpora. Add it here if one ever is.
+/// The same three seats as [`VideoPacketExtra`]. The side-data list was
+/// left off at first — data demuxers carry their whole payload in the
+/// packet body — and then earned its place: a packet with no body and
+/// only side data is a real packet, and without this seat its only
+/// content would have nowhere to go.
 #[derive(Clone, Debug, Default)]
 pub struct DataPacketExtra {
   stream_index: i32,
   byte_pos: Option<i64>,
+  side_data: Vec<SideDataEntry>,
 }
 
 impl DataPacketExtra {
   /// Constructs a `DataPacketExtra` with the given stream index.
-  /// `byte_pos` defaults to `None`.
+  /// `byte_pos` defaults to `None` and `side_data` to empty.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new(stream_index: i32) -> Self {
     Self {
       stream_index,
       byte_pos: None,
+      side_data: Vec::new(),
     }
   }
 
@@ -847,6 +876,11 @@ impl DataPacketExtra {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn byte_pos(&self) -> Option<i64> {
     self.byte_pos
+  }
+  /// Returns the raw side-data entries from `AVPacket.side_data`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn side_data(&self) -> &[SideDataEntry] {
+    self.side_data.as_slice()
   }
 
   /// Sets the stream index (consuming builder).
@@ -863,6 +897,13 @@ impl DataPacketExtra {
     self.byte_pos = value;
     self
   }
+  /// Sets the side-data list (consuming builder).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
+  pub fn with_side_data(mut self, value: Vec<SideDataEntry>) -> Self {
+    self.side_data = value;
+    self
+  }
 
   /// Sets the stream index in place.
   #[cfg_attr(not(tarpaulin), inline(always))]
@@ -874,6 +915,12 @@ impl DataPacketExtra {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn set_byte_pos(&mut self, value: Option<i64>) -> &mut Self {
     self.byte_pos = value;
+    self
+  }
+  /// Sets the side-data list in place.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn set_side_data(&mut self, value: Vec<SideDataEntry>) -> &mut Self {
+    self.side_data = value;
     self
   }
 }
