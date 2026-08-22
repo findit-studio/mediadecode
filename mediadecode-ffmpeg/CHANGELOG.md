@@ -149,6 +149,20 @@ The backend-agnostic core it adapts has its own log at
   Accepting such a conversion knowingly needs an explicit mix-matrix
   seat on the spec; until that exists, refusal is the honest answer.
 
+  The pair judged is the **effective** one — the layouts `swr` is
+  configured with, resolved before the check rather than after it. An
+  unspecified layout becomes FFmpeg's default for its channel count, and
+  twenty-four unspecified channels resolve to exactly the 22.2 whose
+  explicit conversion is refused, so judging the declared pair left that
+  routing a door. This is the second half of the crate's two-layout
+  bookkeeping and it composes with the first: the **declared** layout is
+  what decoded frames carry and stays the yardstick for the mid-stream
+  refusal (*is this frame the stream I was built for?*), while the
+  **effective** layout is what `swr`, every staged `AVFrame` and now
+  this check use (*what will `swr` actually do?*). A maskless WAV — one
+  channel resolving to mono, two to stereo — keeps converting exactly as
+  before.
+
   **State is committed after the work it describes succeeds.** A frame
   refused for its geometry does not anchor or advance the output
   timeline; timestamps are counted with checked arithmetic and an

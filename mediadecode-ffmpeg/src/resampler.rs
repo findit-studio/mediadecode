@@ -246,10 +246,17 @@ impl FfmpegResampler {
   pub fn new(source: ResampleSpec, target: ResampleSpec) -> Result<Self, ResampleError> {
     check_spec(&source, SpecEnd::Source)?;
     check_spec(&target, SpecEnd::Target)?;
-    check_pair(&source, &target)?;
 
+    // The layouts `swr` is really configured with, resolved *before*
+    // the pair is judged — because the conversion that will run is
+    // between these two, not between the two that were declared. An
+    // unspecified layout becomes FFmpeg's default for its channel count
+    // (twenty-four unspecified channels are 22.2), so judging the
+    // declared pair let exactly the routing the explicit 22.2 refusal
+    // blocks walk in through the unspecified door.
     let staged_source_layout = initialized_layout(source.layout);
     let staged_target_layout = initialized_layout(target.layout);
+    check_pair(&staged_source_layout, &staged_target_layout)?;
     let ctx = open_context(&source, &target, staged_source_layout, staged_target_layout)?;
 
     let source_format = SampleFormat::from_ffmpeg(source.format);
@@ -918,8 +925,23 @@ fn layout_order(layout: &ChannelLayout) -> i32 {
 /// end — measured, and the measurement is a killed process.
 const SWR_CH_MAX: usize = 64;
 
-/// Refuses a **pair** whose rematrixing would silently drop input
-/// channels.
+/// Refuses an **effective pair** whose rematrixing would silently drop
+/// input channels.
+///
+/// Takes the layouts `swr` is configured with, not the ones the caller
+/// declared. The two differ exactly where it matters: an unspecified
+/// layout is resolved to FFmpeg's default for its channel count before
+/// the context is opened, and twenty-four unspecified channels resolve
+/// to 22.2 — so the declared pair says "unspecified, nothing to
+/// rematrix" while the conversion that runs is the lossy one.
+///
+/// This is the second half of the crate's two-layout bookkeeping, and
+/// the halves answer different questions. The **declared** layout is
+/// what decoded frames carry (a WAV without a channel mask hands out
+/// unspecified frames forever) and stays the yardstick for the
+/// mid-stream refusal: *is this frame the stream I was built for?* The
+/// **effective** layout is what `swr` and every staged `AVFrame` use,
+/// and it is the one judged here: *what will `swr` actually do?*
 ///
 /// Each end can be perfectly valid on its own and the conversion
 /// between them still lose whole channels: `swr` mixes only the channel
@@ -944,19 +966,17 @@ const SWR_CH_MAX: usize = 64;
 /// deliberately is a *mix matrix* seat on the spec — a real design, not
 /// something to mint in passing; until it exists, refusal is the honest
 /// answer.
-fn check_pair(source: &ResampleSpec, target: &ResampleSpec) -> Result<(), ResampleError> {
+fn check_pair(source: &ChannelLayout, target: &ChannelLayout) -> Result<(), ResampleError> {
   let native = AVChannelOrder::AV_CHANNEL_ORDER_NATIVE as i32;
-  // An unspecified layout is mapped positionally by `swr` with no
+  // A layout still unspecified *after* resolution — a channel count
+  // FFmpeg has no default for — is mapped positionally by `swr` with no
   // rematrixing at all, and identical layouts need no matrix: neither
   // can drop a channel, and neither is what the builder describes.
-  if layout_order(&source.layout) != native
-    || layout_order(&target.layout) != native
-    || source.layout == target.layout
-  {
+  if layout_order(source) != native || layout_order(target) != native || source == target {
     return Ok(());
   }
-  let source_channels = source.layout.channels();
-  let target_channels = target.layout.channels();
+  let source_channels = source.channels();
+  let target_channels = target.channels();
 
   let mut matrix = vec![0f64; SWR_CH_MAX * SWR_CH_MAX];
   // SAFETY: both layouts are live for the call; `matrix` is the full
@@ -965,8 +985,8 @@ fn check_pair(source: &ResampleSpec, target: &ResampleSpec) -> Result<(), Resamp
   // a null log context is documented as allowed.
   let rc = unsafe {
     swr_build_matrix2(
-      &source.layout.0,
-      &target.layout.0,
+      &source.0,
+      &target.0,
       core::f64::consts::FRAC_1_SQRT_2,
       core::f64::consts::FRAC_1_SQRT_2,
       1.0,

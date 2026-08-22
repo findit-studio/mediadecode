@@ -694,6 +694,182 @@ fn a_rematrix_that_would_drop_channels_is_refused_by_name() {
   }
 }
 
+/// Runs one conversion straight through `swresample`, with none of this
+/// crate's checks in the way, and returns the output's RMS for a tone
+/// isolated in `channel`. The only way to measure a pair the crate now
+/// refuses — which is the point: the refusal has to match what the
+/// library really does with it.
+fn raw_swr_rms(source_layout: ChannelLayout, channel: usize) -> f64 {
+  use ffmpeg_next::{frame, software::resampling::Context};
+
+  let channels = source_layout.channels() as usize;
+  let samples = 4_800usize;
+  let mut context = Context::get(
+    Sample::I16(Type::Packed),
+    source_layout,
+    48_000,
+    Sample::I16(Type::Packed),
+    ChannelLayout::MONO,
+    16_000,
+  )
+  .expect("swresample opens this pair happily — that is the whole problem");
+
+  // The frame carries the *resolved* layout, not the declared one:
+  // `swr_init` substitutes its default for an unspecified layout and
+  // then compares every frame against that, answering
+  // `AVERROR_INPUT_CHANGED` to anything else. Which is the same fact
+  // this round is about — the conversion that runs is between the
+  // effective layouts — arriving from the other side.
+  let staged = if source_layout.is_empty() {
+    ChannelLayout::default(source_layout.channels())
+  } else {
+    source_layout
+  };
+  let mut input = frame::Audio::new(Sample::I16(Type::Packed), samples, staged);
+  input.set_rate(48_000);
+  {
+    let plane = input.data_mut(0);
+    for n in 0..samples {
+      let phase = n as f64 * 2.0 * std::f64::consts::PI * 440.0 / 48_000.0;
+      let value = (phase.sin() * 20_000.0) as i16;
+      for ch in 0..channels {
+        let offset = (n * channels + ch) * 2;
+        let sample = if ch == channel { value } else { 0 };
+        plane[offset..offset + 2].copy_from_slice(&sample.to_le_bytes());
+      }
+    }
+  }
+
+  let mut out = frame::Audio::new(Sample::I16(Type::Packed), samples, ChannelLayout::MONO);
+  out.set_rate(16_000);
+  context.run(&input, &mut out).expect("convert");
+  let produced = out.samples();
+  if produced == 0 {
+    return 0.0;
+  }
+  let bytes = &out.data(0)[..produced * 2];
+  let energy: f64 = bytes
+    .as_chunks::<2>()
+    .0
+    .iter()
+    .map(|chunk| {
+      let sample = f64::from(i16::from_le_bytes(*chunk));
+      sample * sample
+    })
+    .sum();
+  (energy / produced as f64).sqrt()
+}
+
+#[test]
+fn an_unspecified_layout_cannot_smuggle_a_lossy_conversion_past_the_pair_check() {
+  support::init_ffmpeg();
+  // The bypass: the pair was judged on the layouts the caller
+  // *declared*, and an unspecified one declares nothing to rematrix.
+  // But construction resolves it to FFmpeg's default for its channel
+  // count before opening `swr` — and twenty-four unspecified channels
+  // resolve to exactly the 22.2 whose explicit conversion is refused.
+  assert_eq!(
+    ChannelLayout::default(24),
+    ChannelLayout::_22POINT2,
+    "the resolution that made the door: 24 unspecified channels are 22.2",
+  );
+
+  // What the library really does with the effective pair, measured
+  // through raw `swresample` because this crate will not open it now.
+  let unspec24 = ResampleSpec::unspecified_layout(24);
+  assert!(
+    raw_swr_rms(unspec24, 0) > 100.0,
+    "channel 0 must survive, or the probe measures nothing",
+  );
+  for channel in [9, 23] {
+    assert_eq!(
+      raw_swr_rms(unspec24, channel),
+      0.0,
+      "source channel {channel} was expected to vanish through raw swr",
+    );
+  }
+
+  // And the refusal names the first channel that vanishes.
+  let source = ResampleSpec::new(48_000, Sample::I16(Type::Packed), unspec24);
+  for target_layout in [ChannelLayout::MONO, ChannelLayout::STEREO] {
+    let target = ResampleSpec::new(16_000, Sample::I16(Type::Packed), target_layout);
+    match FfmpegResampler::new(source, target).map(|_| ()) {
+      Err(ResampleError::ChannelDropped {
+        source_channels,
+        channel,
+        ..
+      }) => {
+        assert_eq!(source_channels, 24);
+        assert_eq!(
+          channel, 9,
+          "the refusal names the channel the tone probe found silent",
+        );
+      }
+      other => panic!("unspecified 24 channels must not open: {other:?}"),
+    }
+  }
+}
+
+#[test]
+fn the_maskless_wav_population_still_converts() {
+  support::init_ffmpeg();
+  // The legitimate unspecified population, and the reason the check is
+  // about the *effective* pair rather than a blanket refusal of
+  // unspecified layouts: a WAV without a `WAVE_FORMAT_EXTENSIBLE`
+  // channel mask declares no layout at all, and every one of them must
+  // keep working. One channel resolves to mono (an identical effective
+  // pair, nothing to rematrix); two resolve to stereo, whose downmix
+  // routes both channels.
+  let rate = 48_000;
+  let samples = 4_800;
+
+  let mono = ResampleSpec::new(
+    rate,
+    Sample::I16(Type::Packed),
+    ResampleSpec::unspecified_layout(1),
+  );
+  let mut resampler = FfmpegResampler::new(mono, mono_16k()).expect("maskless mono still opens");
+  let rms = converted_rms(
+    &mut resampler,
+    &tone_in_one_channel(rate, samples, ResampleSpec::unspecified_layout(1), 0),
+  );
+  assert!(
+    rms > 100.0,
+    "maskless mono converted to silence (rms {rms})"
+  );
+
+  let stereo_layout = ResampleSpec::unspecified_layout(2);
+  let stereo = ResampleSpec::new(rate, Sample::I16(Type::Packed), stereo_layout);
+  for channel in 0..2 {
+    let mut resampler =
+      FfmpegResampler::new(stereo, mono_16k()).expect("maskless stereo still opens");
+    let rms = converted_rms(
+      &mut resampler,
+      &tone_in_one_channel(rate, samples, stereo_layout, channel),
+    );
+    assert!(
+      rms > 100.0,
+      "maskless stereo lost channel {channel} (rms {rms})",
+    );
+  }
+
+  // And an unspecified pair that resolves to the same layout on both
+  // ends still needs no matrix at all, whatever its channel count.
+  FfmpegResampler::new(
+    ResampleSpec::new(
+      rate,
+      Sample::I16(Type::Packed),
+      ResampleSpec::unspecified_layout(24),
+    ),
+    ResampleSpec::new(
+      16_000,
+      Sample::I16(Type::Packed),
+      ResampleSpec::unspecified_layout(24),
+    ),
+  )
+  .expect("nothing is being rematrixed here");
+}
+
 #[test]
 fn a_planar_layout_past_eight_channels_is_refused_at_construction() {
   support::init_ffmpeg();
