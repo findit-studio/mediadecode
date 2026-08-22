@@ -8,6 +8,8 @@
 
 use std::vec::Vec;
 
+use ffmpeg_next::codec::Parameters;
+
 /// Per-`VideoPacket` extras.
 #[derive(Clone, Debug, Default)]
 pub struct VideoPacketExtra {
@@ -805,6 +807,268 @@ impl ContentLightLevel {
   pub const fn set_max_fall(&mut self, value: u32) -> &mut Self {
     self.max_fall = value;
     self
+  }
+}
+
+// ---------------------------------------------------------------------------
+//  The demux tier's carriers.
+// ---------------------------------------------------------------------------
+
+/// Per-`DataPacket` extras — timecode, KLV, timed ID3.
+///
+/// Same two seats as [`VideoPacketExtra`] minus the side-data list:
+/// FFmpeg's data demuxers carry the whole payload in the packet body,
+/// and a side-data entry on a data packet has never been observed in
+/// this workspace's corpora. Add it here if one ever is.
+#[derive(Clone, Debug, Default)]
+pub struct DataPacketExtra {
+  stream_index: i32,
+  byte_pos: Option<i64>,
+}
+
+impl DataPacketExtra {
+  /// Constructs a `DataPacketExtra` with the given stream index.
+  /// `byte_pos` defaults to `None`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(stream_index: i32) -> Self {
+    Self {
+      stream_index,
+      byte_pos: None,
+    }
+  }
+
+  /// Returns the source `AVStream.index`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn stream_index(&self) -> i32 {
+    self.stream_index
+  }
+  /// Returns the byte position of the packet in the input file, or
+  /// `None` if unknown.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn byte_pos(&self) -> Option<i64> {
+    self.byte_pos
+  }
+
+  /// Sets the stream index (consuming builder).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
+  pub const fn with_stream_index(mut self, value: i32) -> Self {
+    self.stream_index = value;
+    self
+  }
+  /// Sets the byte position (consuming builder).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
+  pub const fn with_byte_pos(mut self, value: Option<i64>) -> Self {
+    self.byte_pos = value;
+    self
+  }
+
+  /// Sets the stream index in place.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn set_stream_index(&mut self, value: i32) -> &mut Self {
+    self.stream_index = value;
+    self
+  }
+  /// Sets the byte position in place.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn set_byte_pos(&mut self, value: Option<i64>) -> &mut Self {
+    self.byte_pos = value;
+    self
+  }
+}
+
+/// Per-`AttachmentPacket` extras — fonts, cover art.
+///
+/// `synthesized` records where the payload came from, which is not a
+/// detail: an attachment track's single packet is either a real packet
+/// the container stores (cover art, which libavformat parks in
+/// `AVStream.attached_pic`) or one this crate builds out of the
+/// track's codec extradata (fonts, whose bytes never appear in the
+/// packet stream at all). A consumer chasing a payload that looks
+/// wrong needs to know which.
+#[derive(Clone, Debug, Default)]
+pub struct AttachmentPacketExtra {
+  stream_index: i32,
+  synthesized: bool,
+}
+
+impl AttachmentPacketExtra {
+  /// Constructs an `AttachmentPacketExtra` with the given stream index.
+  /// `synthesized` defaults to `false`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(stream_index: i32) -> Self {
+    Self {
+      stream_index,
+      synthesized: false,
+    }
+  }
+
+  /// Returns the source `AVStream.index`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn stream_index(&self) -> i32 {
+    self.stream_index
+  }
+  /// `true` when the payload was built from the track's codec
+  /// extradata rather than taken from a packet the container stores.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn synthesized(&self) -> bool {
+    self.synthesized
+  }
+
+  /// Sets the stream index (consuming builder).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
+  pub const fn with_stream_index(mut self, value: i32) -> Self {
+    self.stream_index = value;
+    self
+  }
+  /// Sets the synthesized flag (consuming builder).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
+  pub const fn with_synthesized(mut self, value: bool) -> Self {
+    self.synthesized = value;
+    self
+  }
+
+  /// Sets the stream index in place.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn set_stream_index(&mut self, value: i32) -> &mut Self {
+    self.stream_index = value;
+    self
+  }
+  /// Sets the synthesized flag in place.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn set_synthesized(&mut self, value: bool) -> &mut Self {
+    self.synthesized = value;
+    self
+  }
+}
+
+/// Per-`TrackInfo` extras — the FFmpeg side of one track-table row.
+///
+/// Carries the stream's [`Parameters`], which is what opens a decoder
+/// for the track: `FfmpegAudioStreamDecoder::open(track.extra()
+/// .parameters().clone(), track.timebase())`. The clone is a deep
+/// `avcodec_parameters_copy` with no tie back to the format context,
+/// so a decoder outlives the demuxer that named it.
+///
+/// `disposition` is the raw `AV_DISPOSITION_*` bit set, not
+/// `ffmpeg_next::format::stream::Disposition`. That type's
+/// `from_bits_truncate` drops bits the linked build has no constant
+/// for, and this crate's stance on bit sets is that every pattern is a
+/// value — the same reason `PacketFlags` reaches the wire as a number.
+#[derive(Clone, Default)]
+pub struct TrackExtra {
+  stream_index: i32,
+  disposition: i32,
+  start_time: Option<i64>,
+  frame_count: Option<i64>,
+  parameters: Parameters,
+}
+
+impl TrackExtra {
+  /// Constructs a `TrackExtra` from the stream index and its codec
+  /// parameters. Everything else starts absent.
+  ///
+  /// Not `const fn`: [`Parameters`] owns a heap allocation.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn new(stream_index: i32, parameters: Parameters) -> Self {
+    Self {
+      stream_index,
+      disposition: 0,
+      start_time: None,
+      frame_count: None,
+      parameters,
+    }
+  }
+
+  /// Returns the source `AVStream.index`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn stream_index(&self) -> i32 {
+    self.stream_index
+  }
+  /// Returns the raw `AVStream.disposition` bit set.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn disposition(&self) -> i32 {
+    self.disposition
+  }
+  /// Returns the stream's start time in the track's timebase, or
+  /// `None` when the container does not carry one.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn start_time(&self) -> Option<i64> {
+    self.start_time
+  }
+  /// Returns `AVStream.nb_frames` when the container carries it.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn frame_count(&self) -> Option<i64> {
+    self.frame_count
+  }
+  /// Returns the stream's codec parameters — the handle a decoder is
+  /// opened from.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn parameters(&self) -> &Parameters {
+    &self.parameters
+  }
+
+  /// Sets the disposition bits (consuming builder).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
+  pub const fn with_disposition(mut self, value: i32) -> Self {
+    self.disposition = value;
+    self
+  }
+  /// Sets the start time (consuming builder).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
+  pub const fn with_start_time(mut self, value: Option<i64>) -> Self {
+    self.start_time = value;
+    self
+  }
+  /// Sets the frame count (consuming builder).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
+  pub const fn with_frame_count(mut self, value: Option<i64>) -> Self {
+    self.frame_count = value;
+    self
+  }
+
+  /// Sets the disposition bits in place.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn set_disposition(&mut self, value: i32) -> &mut Self {
+    self.disposition = value;
+    self
+  }
+  /// Sets the start time in place.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn set_start_time(&mut self, value: Option<i64>) -> &mut Self {
+    self.start_time = value;
+    self
+  }
+  /// Sets the frame count in place.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn set_frame_count(&mut self, value: Option<i64>) -> &mut Self {
+    self.frame_count = value;
+    self
+  }
+}
+
+impl std::fmt::Debug for TrackExtra {
+  /// Hand-written because [`Parameters`] does not derive `Debug`. The
+  /// medium and codec id are the two fields worth printing; the rest of
+  /// `AVCodecParameters` is per-kind detail the track row already
+  /// carries in typed form.
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("TrackExtra")
+      .field("stream_index", &self.stream_index)
+      .field("disposition", &format_args!("{:#x}", self.disposition))
+      .field("start_time", &self.start_time)
+      .field("frame_count", &self.frame_count)
+      .field(
+        "parameters",
+        &format_args!("{:?}", self.parameters.medium()),
+      )
+      .finish()
   }
 }
 

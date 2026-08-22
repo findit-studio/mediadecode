@@ -1,22 +1,30 @@
 //! `Ffmpeg` adapter — implements [`mediadecode::VideoAdapter`],
-//! [`mediadecode::AudioAdapter`], and [`mediadecode::SubtitleAdapter`]
-//! for this crate.
+//! [`mediadecode::AudioAdapter`], [`mediadecode::SubtitleAdapter`] and
+//! [`mediadecode::demuxer::DemuxAdapter`] for this crate.
 //!
 //! The adapter is a zero-sized type whose sole purpose is to bind the
 //! associated types together so the rest of the API (Packet / Frame /
 //! Decoder) reads cleanly: `VideoPacket<Ffmpeg, FfmpegBuffer>` etc.
+//!
+//! `DemuxAdapter` bundles the other three, and `Ffmpeg` fills all four
+//! seats with itself — the demux tier's `CodecId` bound (one
+//! codec-identifier namespace across a container's whole track table) is
+//! trivially satisfied when every family already binds
+//! [`crate::CodecId`].
 
 use mediadecode::{
   PixelFormat,
   adapter::{AudioAdapter, SubtitleAdapter, VideoAdapter},
+  demuxer::DemuxAdapter,
 };
 use mediaframe::audio::ChannelLayoutDescription;
+use smol_str::SmolStr;
 
 use crate::{
   codec_id::CodecId,
   extras::{
-    AudioFrameExtra, AudioPacketExtra, SubtitleFrameExtra, SubtitlePacketExtra, VideoFrameExtra,
-    VideoPacketExtra,
+    AttachmentPacketExtra, AudioFrameExtra, AudioPacketExtra, DataPacketExtra, SubtitleFrameExtra,
+    SubtitlePacketExtra, TrackExtra, VideoFrameExtra, VideoPacketExtra,
   },
   sample_format::SampleFormat,
 };
@@ -49,6 +57,22 @@ impl SubtitleAdapter for Ffmpeg {
   type CodecId = CodecId;
   type PacketExtra = SubtitlePacketExtra;
   type FrameExtra = SubtitleFrameExtra;
+}
+
+impl DemuxAdapter for Ffmpeg {
+  type CodecId = CodecId;
+  type Video = Ffmpeg;
+  type Audio = Ffmpeg;
+  type Subtitle = Ffmpeg;
+  type DataExtra = DataPacketExtra;
+  type AttachmentExtra = AttachmentPacketExtra;
+  type TrackExtra = TrackExtra;
+  // `AVStream.metadata` hands out borrowed `&str` that dies with the
+  // format context, so a track row has to own its identity strings.
+  // `SmolStr` stores a filename or a MIME type inline — both are short
+  // — which is why the rest of this crate's FFI text handling already
+  // uses it.
+  type Text = SmolStr;
 }
 
 #[cfg(test)]

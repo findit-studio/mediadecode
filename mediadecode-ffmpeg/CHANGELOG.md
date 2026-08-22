@@ -11,6 +11,66 @@ The backend-agnostic core it adapts has its own log at
 
 ## [Unreleased]
 
+### Added
+
+- **`FfmpegDemuxer` — `mediadecode`'s demux tier over `libavformat`.**
+  Opens from a path (`open`) or from any `Read + Seek` byte source
+  through a custom `AVIOContext` (`open_reader`). `Seek` is mandatory
+  and not negotiable: MP4 routinely puts `moov` at the end, so a reader
+  that cannot go backwards cannot be probed at all — and the face's seek
+  law would be unimplementable.
+
+  The track table is built once at open, in stream order, so
+  `TrackIndex(i)` and `AVStream.index` are the same number by
+  construction. Each row carries the stream's `Parameters`, which is
+  what opens a decoder for it — a deep copy with no tie back to the
+  format context, so a decoder outlives the demuxer that named it.
+
+  **Three normalizations happen here, and they are all about
+  attachments.** libavformat presents cover art as a *video* stream
+  carrying `AV_DISPOSITION_ATTACHED_PIC`; this layer maps it to
+  `TrackKind::Attachment`, so the `Video` arm is true motion video and
+  nothing else. A font's bytes never appear in the packet stream at all
+  — an `AVMEDIA_TYPE_ATTACHMENT` stream produces no packets and the
+  payload lives in codec extradata — so the packet is synthesized at
+  open. And cover art's real packet, which libavformat parks in
+  `AVStream.attached_pic` *and* some demuxers also emit, is hoisted at
+  open and its duplicate dropped. Both kinds are queued before a single
+  `av_read_frame` has run, which is what makes "exactly one packet,
+  before any timed packet" true rather than aspirational.
+
+  `seek` converts the target to `AV_TIME_BASE` units and seeks over the
+  window `[i64::MIN, target]` — FFmpeg's backward convention, landing on
+  the nearest keyframe at or before the target. It clears only the EOF
+  latch this layer set itself, leaving a genuine sticky I/O error
+  intact, and does not touch the attachment bookkeeping: an attachment
+  already handed out is never handed out again, and one not yet handed
+  out is still owed.
+
+  A track whose kind is `Unknown` has no delivery arm and its packets
+  are not delivered; a corrupt packet is skipped and the read resumed,
+  since `AVERROR_INVALIDDATA` is not latched into the `AVIOContext`.
+
+- **Boundary helpers that carry a timebase.**
+  `video_packet_from_ffmpeg_in`, `audio_packet_from_ffmpeg_in`,
+  `subtitle_packet_from_ffmpeg_in` and `data_packet_from_ffmpeg_in` take
+  the stream's timebase and stamp it onto every timestamp. An
+  `AVPacket`'s integers are ticks in a timebase the packet does not
+  carry, so the existing four-argument-less helpers stamp `1/1` and
+  leave the caller to remember what the ticks meant; a demuxer holds the
+  track table and has no reason to forget. The originals are unchanged
+  and now delegate. `attachment_packet_from_ffmpeg` joins them for
+  cover-art payloads, which have no timestamps to carry.
+
+- **`DataPacketExtra`, `AttachmentPacketExtra`, `TrackExtra`** — the
+  demux tier's `*Extra` carriers, and `impl DemuxAdapter for Ffmpeg`
+  binding them. `AttachmentPacketExtra::synthesized` records whether a
+  payload came from a real packet or was built out of codec extradata,
+  which is the first thing to check when an attachment looks wrong.
+  `TrackExtra::disposition` is the raw `AV_DISPOSITION_*` bit set rather
+  than `ffmpeg_next`'s `Disposition`, whose `from_bits_truncate` would
+  drop bits this build has no constant for.
+
 ## [0.6.0] - 2026-08-21
 
 ### Added

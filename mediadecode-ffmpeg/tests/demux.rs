@@ -1,0 +1,383 @@
+//! The demux tier's contracts, pinned against real containers.
+//!
+//! Every lane here reads a file. The media is generated at run time —
+//! see `support/mod.rs` for why the committed corpus cannot serve these
+//! shapes — and each lane returns early with a printed reason when the
+//! `ffmpeg` CLI that generates it is absent.
+//!
+//! What is pinned:
+//!
+//! - the five track kinds map to the five delivery arms, cover art
+//!   landing on `Attachment` rather than `Video`;
+//! - packets arrive in interleaved file order, compared against a bare
+//!   `av_read_frame` loop over the same file rather than a hand-written
+//!   expectation;
+//! - an attachment track delivers exactly one packet, before any timed
+//!   packet, whether its payload is synthesized from codec extradata (a
+//!   font) or hoisted out of `AVStream.attached_pic` (cover art) — and
+//!   in the cover-art case the duplicate the container *also* emits is
+//!   dropped;
+//! - a seek lands on a keyframe at or before the target, and replays no
+//!   attachment;
+//! - `None` means EOF and stays meaning it;
+//! - timestamps carry their track's timebase, not a placeholder.
+
+mod support;
+
+use std::fs::File;
+
+use mediadecode::{
+  Timebase, Timestamp,
+  demuxer::{DemuxedPacket, Demuxer, TrackKind},
+  packet::PacketFlags,
+};
+use mediadecode_ffmpeg::FfmpegDemuxer;
+use support::Corpus;
+
+/// Drains a session, returning `(track, kind, pts)` for every delivered
+/// packet.
+fn drain(demuxer: &mut FfmpegDemuxer) -> Vec<(usize, TrackKind, Option<Timestamp>)> {
+  let mut out = Vec::new();
+  while let Some(packet) = demuxer.next_packet().expect("pull") {
+    let pts = match &packet {
+      DemuxedPacket::Video { packet, .. } => packet.pts(),
+      DemuxedPacket::Audio { packet, .. } => packet.pts(),
+      DemuxedPacket::Subtitle { packet, .. } => packet.pts(),
+      DemuxedPacket::Data { packet, .. } => packet.pts(),
+      DemuxedPacket::Attachment { .. } => None,
+    };
+    out.push((packet.track().get(), packet.kind(), pts));
+  }
+  out
+}
+
+#[test]
+fn the_five_kinds_map_to_the_five_arms() {
+  let Some(corpus) = Corpus::new() else { return };
+
+  let multi = FfmpegDemuxer::open(&corpus.multi_track_mkv()).expect("open mkv");
+  let kinds: Vec<_> = multi.tracks().iter().map(|t| t.kind()).collect();
+  assert_eq!(
+    kinds,
+    vec![
+      TrackKind::Video,
+      TrackKind::Audio,
+      TrackKind::Subtitle,
+      TrackKind::Attachment,
+    ],
+    "the Matroska file's four tracks",
+  );
+
+  // The normalization that matters: a still image in a video-shaped
+  // slot is an attachment. If this ever reads `Video`, a thumbnailer
+  // downstream starts treating a single JPEG as a motion track.
+  let cover = FfmpegDemuxer::open(&corpus.cover_art_mp3()).expect("open mp3");
+  let kinds: Vec<_> = cover.tracks().iter().map(|t| t.kind()).collect();
+  assert_eq!(kinds, vec![TrackKind::Audio, TrackKind::Attachment]);
+
+  let mov = FfmpegDemuxer::open(&corpus.timecode_mov()).expect("open mov");
+  let kinds: Vec<_> = mov.tracks().iter().map(|t| t.kind()).collect();
+  assert_eq!(
+    kinds,
+    vec![TrackKind::Video, TrackKind::Audio, TrackKind::Data],
+    "-timecode adds a tmcd data track",
+  );
+}
+
+#[test]
+fn a_track_row_carries_its_codec_parameters_and_attachment_identity() {
+  let Some(corpus) = Corpus::new() else { return };
+  let demuxer = FfmpegDemuxer::open(&corpus.multi_track_mkv()).expect("open mkv");
+
+  let video = &demuxer.tracks()[0];
+  match video.params() {
+    mediadecode::demuxer::TrackParams::Video { width, height, .. } => {
+      assert_eq!((*width, *height), (160, 120));
+    }
+    other => panic!("expected video params, got {:?}", other.kind()),
+  }
+
+  let audio = &demuxer.tracks()[1];
+  match audio.params() {
+    mediadecode::demuxer::TrackParams::Audio {
+      sample_rate,
+      channel_count,
+      channel_layout,
+      ..
+    } => {
+      assert_eq!(*sample_rate, 48_000);
+      assert_eq!(*channel_count, 2);
+      assert_eq!(channel_layout.channels(), 2);
+    }
+    other => panic!("expected audio params, got {:?}", other.kind()),
+  }
+
+  // Identity lives on the row, not on the packet.
+  let font = &demuxer.tracks()[3];
+  assert_eq!(font.filename().map(|s| s.as_str()), Some("font.ttf"));
+  assert_eq!(
+    font.mime_type().map(|s| s.as_str()),
+    Some("application/x-truetype-font"),
+  );
+
+  // The parameters seat is what opens a decoder for the track.
+  assert_eq!(
+    audio.extra().parameters().medium(),
+    ffmpeg_next::media::Type::Audio,
+  );
+  assert_eq!(audio.extra().stream_index(), 1);
+}
+
+#[test]
+fn packets_arrive_in_interleaved_file_order() {
+  let Some(corpus) = Corpus::new() else { return };
+  let path = corpus.multi_track_mkv();
+
+  let expected = support::raw_packet_order(&path);
+  let mut demuxer = FfmpegDemuxer::open(&path).expect("open mkv");
+  let delivered = drain(&mut demuxer);
+
+  // The Matroska attachment produces no packet of its own, so the one
+  // this layer synthesizes is the only difference from the raw order —
+  // and it comes first.
+  let (head, timed) = delivered.split_first().expect("at least one packet");
+  assert_eq!(head.1, TrackKind::Attachment);
+
+  let observed: Vec<(usize, Option<i64>)> = timed
+    .iter()
+    .map(|(track, _, pts)| (*track, pts.map(|t| t.pts())))
+    .collect();
+  assert_eq!(
+    observed, expected,
+    "the delivered order is the container's own order, packet for packet",
+  );
+}
+
+#[test]
+fn an_attachment_is_delivered_exactly_once_and_before_any_timed_packet() {
+  let Some(corpus) = Corpus::new() else { return };
+
+  // A font: no packet exists in the stream at all; the payload is
+  // synthesized out of codec extradata.
+  let mut demuxer = FfmpegDemuxer::open(&corpus.multi_track_mkv()).expect("open mkv");
+  let first = demuxer.next_packet().expect("pull").expect("a packet");
+  match first {
+    DemuxedPacket::Attachment { track, packet } => {
+      assert_eq!(track.get(), 3);
+      assert!(
+        packet.extra().synthesized(),
+        "a font's bytes never appear in the packet stream",
+      );
+      assert_eq!(packet.data().as_ref(), support::FONT_PAYLOAD);
+    }
+    other => panic!(
+      "the attachment must precede every timed packet, got {:?}",
+      other.kind()
+    ),
+  }
+  let rest = drain(&mut demuxer);
+  assert_eq!(
+    rest
+      .iter()
+      .filter(|(_, k, _)| *k == TrackKind::Attachment)
+      .count(),
+    0,
+    "exactly one, and it was the first",
+  );
+
+  // Cover art: the container *does* store a packet for it, and MP3
+  // emits that packet in the stream as well. Exactly one must come out.
+  let mut demuxer = FfmpegDemuxer::open(&corpus.cover_art_mp3()).expect("open mp3");
+  let first = demuxer.next_packet().expect("pull").expect("a packet");
+  let cover_len = match first {
+    DemuxedPacket::Attachment { track, packet } => {
+      assert_eq!(track.get(), 1);
+      assert!(
+        !packet.extra().synthesized(),
+        "cover art is hoisted from AVStream.attached_pic, not synthesized",
+      );
+      assert!(!packet.data().as_ref().is_empty());
+      packet.data().as_ref().len()
+    }
+    other => panic!("expected the cover first, got {:?}", other.kind()),
+  };
+  assert!(cover_len > 8, "a PNG payload, not a marker");
+  let rest = drain(&mut demuxer);
+  assert_eq!(
+    rest
+      .iter()
+      .filter(|(_, k, _)| *k == TrackKind::Attachment)
+      .count(),
+    0,
+    "the duplicate the MP3 demuxer emits is dropped",
+  );
+  assert!(
+    rest.iter().all(|(_, k, _)| *k == TrackKind::Audio),
+    "everything after the cover is audio",
+  );
+}
+
+#[test]
+fn the_data_arm_delivers_the_timecode_track() {
+  let Some(corpus) = Corpus::new() else { return };
+  let mut demuxer = FfmpegDemuxer::open(&corpus.timecode_mov()).expect("open mov");
+  let delivered = drain(&mut demuxer);
+
+  let data: Vec<_> = delivered
+    .iter()
+    .filter(|(_, kind, _)| *kind == TrackKind::Data)
+    .collect();
+  assert_eq!(data.len(), 1, "a tmcd track carries one sample");
+  assert_eq!(data[0].0, 2, "on the third track");
+}
+
+#[test]
+fn timestamps_carry_their_own_track_timebase() {
+  let Some(corpus) = Corpus::new() else { return };
+  let mut demuxer = FfmpegDemuxer::open(&corpus.multi_track_mkv()).expect("open mkv");
+  let expected: Vec<Timebase> = demuxer.tracks().iter().map(|t| t.timebase()).collect();
+
+  let mut seen = [false; 4];
+  while let Some(packet) = demuxer.next_packet().expect("pull") {
+    let track = packet.track().get();
+    let pts = match &packet {
+      DemuxedPacket::Video { packet, .. } => packet.pts(),
+      DemuxedPacket::Audio { packet, .. } => packet.pts(),
+      DemuxedPacket::Subtitle { packet, .. } => packet.pts(),
+      DemuxedPacket::Data { packet, .. } => packet.pts(),
+      DemuxedPacket::Attachment { .. } => continue,
+    };
+    if let Some(pts) = pts {
+      assert_eq!(
+        pts.timebase(),
+        expected[track],
+        "a timestamp whose timebase is a placeholder is not a timestamp",
+      );
+      seen[track] = true;
+    }
+  }
+  assert!(seen[0] && seen[1] && seen[2], "all three timed tracks seen");
+}
+
+#[test]
+fn a_seek_lands_on_a_keyframe_at_or_before_the_target() {
+  let Some(corpus) = Corpus::new() else { return };
+  let mut demuxer = FfmpegDemuxer::open(&corpus.multi_track_mkv()).expect("open mkv");
+  let video_tb = demuxer.tracks()[0].timebase();
+
+  // One second into a two-second clip whose keyframe interval is 25
+  // frames at 25 fps: the landing point is the keyframe at 0 s or the
+  // one at 1 s, and either way not a frame after the target.
+  let target = Timestamp::new(1, Timebase::SECONDS);
+  demuxer.seek(target).expect("seek");
+
+  let mut first_video = None;
+  while let Some(packet) = demuxer.next_packet().expect("pull") {
+    if let DemuxedPacket::Video { packet, .. } = packet {
+      first_video = Some(packet);
+      break;
+    }
+  }
+  let packet = first_video.expect("a video packet after the seek");
+  let pts = packet.pts().expect("a timestamp");
+  assert!(
+    packet.flags().contains(PacketFlags::KEY),
+    "the landing point must be a keyframe, or the decoder has no reference",
+  );
+  assert!(
+    pts.pts() <= target.rescale_to(video_tb).pts(),
+    "landed at {} in {video_tb:?}, past the target",
+    pts.pts(),
+  );
+}
+
+#[test]
+fn attachments_are_not_replayed_after_a_seek() {
+  let Some(corpus) = Corpus::new() else { return };
+
+  for path in [corpus.multi_track_mkv(), corpus.cover_art_mp3()] {
+    let mut demuxer = FfmpegDemuxer::open(&path).expect("open");
+    let first = demuxer.next_packet().expect("pull").expect("a packet");
+    assert_eq!(first.kind(), TrackKind::Attachment);
+
+    // Three seeks, including one back to the very start — the position
+    // where a naive implementation would re-synthesize the payload.
+    for secs in [1, 0, 1] {
+      demuxer
+        .seek(Timestamp::new(secs, Timebase::SECONDS))
+        .expect("seek");
+      let after = drain(&mut demuxer);
+      assert_eq!(
+        after
+          .iter()
+          .filter(|(_, k, _)| *k == TrackKind::Attachment)
+          .count(),
+        0,
+        "{path:?}: a seek moves the timeline, and attachments are not on it",
+      );
+    }
+  }
+}
+
+#[test]
+fn an_attachment_owed_at_seek_time_is_still_owed_after_it() {
+  let Some(corpus) = Corpus::new() else { return };
+  // Seeking before the queue has drained must not silently swallow the
+  // payload: "not replayed" means never delivered twice, not never
+  // delivered.
+  let mut demuxer = FfmpegDemuxer::open(&corpus.multi_track_mkv()).expect("open mkv");
+  demuxer
+    .seek(Timestamp::new(1, Timebase::SECONDS))
+    .expect("seek");
+  let delivered = drain(&mut demuxer);
+  assert_eq!(
+    delivered
+      .iter()
+      .filter(|(_, k, _)| *k == TrackKind::Attachment)
+      .count(),
+    1,
+    "exactly one is still exactly one when the seek comes first",
+  );
+  assert_eq!(delivered[0].1, TrackKind::Attachment, "and still first");
+}
+
+#[test]
+fn none_means_eof_and_keeps_meaning_it() {
+  let Some(corpus) = Corpus::new() else { return };
+  let mut demuxer = FfmpegDemuxer::open(&corpus.timecode_mov()).expect("open mov");
+  let count = drain(&mut demuxer).len();
+  assert!(count > 0);
+  assert!(demuxer.next_packet().expect("pull").is_none());
+  assert!(demuxer.next_packet().expect("pull").is_none());
+
+  // And a seek after EOF resumes: the latch this layer set is the one
+  // it clears.
+  demuxer
+    .seek(Timestamp::new(0, Timebase::SECONDS))
+    .expect("seek after EOF");
+  assert!(
+    !drain(&mut demuxer).is_empty(),
+    "an EOF latch left in place would make every later read fail",
+  );
+}
+
+#[test]
+fn a_reader_opens_the_same_container_as_a_path() {
+  let Some(corpus) = Corpus::new() else { return };
+  let path = corpus.multi_track_mkv();
+
+  let from_path = FfmpegDemuxer::open(&path).expect("open by path");
+  let expected: Vec<_> = from_path.tracks().iter().map(|t| t.kind()).collect();
+  drop(from_path);
+
+  let file = File::open(&path).expect("open file");
+  let mut from_reader =
+    FfmpegDemuxer::open_reader(file, Some("multi.mkv")).expect("open by reader");
+  let observed: Vec<_> = from_reader.tracks().iter().map(|t| t.kind()).collect();
+  assert_eq!(observed, expected, "custom AVIO sees the same track table");
+
+  // And it demuxes, not just probes.
+  let delivered = drain(&mut from_reader);
+  assert!(delivered.len() > 100, "got {} packets", delivered.len());
+  assert_eq!(delivered[0].1, TrackKind::Attachment);
+}

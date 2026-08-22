@@ -131,17 +131,28 @@ for end-to-end demuxer-driven runs that cover all three streams.
   `FfmpegAudioStreamDecoder`, `FfmpegSubtitleStreamDecoder`. Plus
   their error types: `VideoDecodeError`, `AudioDecodeError`,
   `SubtitleDecodeError`.
+- **Demuxer**: `FfmpegDemuxer` — `mediadecode`'s `Demuxer` over
+  `libavformat`, opened from a path (`open`) or from any
+  `Read + Seek` byte source through a custom `AVIOContext`
+  (`open_reader`). Plus `DemuxError`.
 - **Type aliases**: `VideoPacket`, `AudioPacket`, `SubtitlePacket`,
-  `VideoFrame`, `AudioFrame`, `SubtitleFrame` — the `mediadecode`
-  generic types pre-parameterized with this crate's adapter / buffer /
-  extras, so you don't have to spell them out.
+  `DataPacket`, `AttachmentPacket`, `DemuxedPacket`, `VideoFrame`,
+  `AudioFrame`, `SubtitleFrame`, `TrackInfo`, `TrackParams` — the
+  `mediadecode` generic types pre-parameterized with this crate's
+  adapter / buffer / extras, so you don't have to spell them out.
 - **Buffer**: `FfmpegBuffer` — refcounted view over an `AVBufferRef`
   with safe constructors (`empty`, `from_packet`, `try_*`
   panic-free counterparts).
 - **Boundary helpers**: `video_packet_from_ffmpeg`,
   `audio_packet_from_ffmpeg`, `subtitle_packet_from_ffmpeg` — convert a
   borrowed `ffmpeg::Packet` into the matching `mediadecode` packet
-  without copying the compressed payload.
+  without copying the compressed payload. Their `*_in` siblings
+  (`video_packet_from_ffmpeg_in`, `audio_packet_from_ffmpeg_in`,
+  `subtitle_packet_from_ffmpeg_in`, `data_packet_from_ffmpeg_in`) take
+  the stream's timebase, so the produced `Timestamp` says what its
+  ticks mean instead of carrying the 1/1 placeholder an `AVPacket`
+  alone leaves you with. `attachment_packet_from_ffmpeg` wraps a
+  cover-art packet, which has no timestamps to carry.
 - **Empty-frame builders**: `empty_video_frame`, `empty_audio_frame`,
   `empty_subtitle_frame` — well-formed destinations for `receive_frame`.
 

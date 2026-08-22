@@ -11,6 +11,7 @@ use core::ffi::c_int;
 use ffmpeg_next::{Packet, ffi::AVPixelFormat};
 use mediadecode::{
   PixelFormat, Timestamp,
+  demuxer::{AttachmentPacket, DataPacket},
   frame::{AudioFrame, Dimensions, Plane, SubtitleFrame, VideoFrame},
   packet::{AudioPacket, PacketFlags as MdPacketFlags, SubtitlePacket, VideoPacket},
   subtitle::SubtitlePayload,
@@ -20,8 +21,8 @@ use mediaframe::audio::ChannelLayoutDescription;
 use crate::{
   FfmpegBuffer,
   extras::{
-    AudioFrameExtra, AudioPacketExtra, SubtitleFrameExtra, SubtitlePacketExtra, VideoFrameExtra,
-    VideoPacketExtra,
+    AttachmentPacketExtra, AudioFrameExtra, AudioPacketExtra, DataPacketExtra, SubtitleFrameExtra,
+    SubtitlePacketExtra, VideoFrameExtra, VideoPacketExtra,
   },
   sample_format::SampleFormat,
 };
@@ -524,20 +525,7 @@ pub fn ffmpeg_packet_from_subtitle_packet(
 pub fn video_packet_from_ffmpeg(
   packet: &Packet,
 ) -> Option<VideoPacket<VideoPacketExtra, FfmpegBuffer>> {
-  let buf = FfmpegBuffer::from_packet(packet)?;
-  let mut out = VideoPacket::new(buf, VideoPacketExtra::new(packet.stream() as i32))
-    .with_flags(md_flags_from_av(packet.flags()));
-  if let Some(p) = packet.pts() {
-    out = out.with_pts(Some(Timestamp::new(p, mediadecode::Timebase::default())));
-  }
-  if let Some(d) = packet.dts() {
-    out = out.with_dts(Some(Timestamp::new(d, mediadecode::Timebase::default())));
-  }
-  let dur = packet.duration();
-  if dur > 0 {
-    out = out.with_duration(Some(Timestamp::new(dur, mediadecode::Timebase::default())));
-  }
-  Some(out)
+  video_packet_from_ffmpeg_in(packet, mediadecode::Timebase::default())
 }
 
 /// Wraps a borrowed [`ffmpeg::Packet`] as a
@@ -547,20 +535,7 @@ pub fn video_packet_from_ffmpeg(
 pub fn audio_packet_from_ffmpeg(
   packet: &Packet,
 ) -> Option<AudioPacket<AudioPacketExtra, FfmpegBuffer>> {
-  let buf = FfmpegBuffer::from_packet(packet)?;
-  let mut out = AudioPacket::new(buf, AudioPacketExtra::new(packet.stream() as i32))
-    .with_flags(md_flags_from_av(packet.flags()));
-  if let Some(p) = packet.pts() {
-    out = out.with_pts(Some(Timestamp::new(p, mediadecode::Timebase::default())));
-  }
-  if let Some(d) = packet.dts() {
-    out = out.with_dts(Some(Timestamp::new(d, mediadecode::Timebase::default())));
-  }
-  let dur = packet.duration();
-  if dur > 0 {
-    out = out.with_duration(Some(Timestamp::new(dur, mediadecode::Timebase::default())));
-  }
-  Some(out)
+  audio_packet_from_ffmpeg_in(packet, mediadecode::Timebase::default())
 }
 
 /// Wraps a borrowed [`ffmpeg::Packet`] as a
@@ -570,17 +545,116 @@ pub fn audio_packet_from_ffmpeg(
 pub fn subtitle_packet_from_ffmpeg(
   packet: &Packet,
 ) -> Option<SubtitlePacket<SubtitlePacketExtra, FfmpegBuffer>> {
+  subtitle_packet_from_ffmpeg_in(packet, mediadecode::Timebase::default())
+}
+
+// ---------------------------------------------------------------------------
+//  Timebase-carrying variants.
+//
+//  An `AVPacket`'s timestamps are integers in its *stream's* timebase,
+//  which the packet does not carry — the four functions above therefore
+//  stamp `Timebase::default()` (1/1), leaving the caller to know what
+//  the ticks meant. A demuxer knows: it holds the track table. These
+//  variants take that timebase, so the produced `Timestamp` is a
+//  complete, self-describing value.
+// ---------------------------------------------------------------------------
+
+/// [`video_packet_from_ffmpeg`], with the stream's timebase stamped
+/// onto every timestamp instead of the 1/1 placeholder.
+pub fn video_packet_from_ffmpeg_in(
+  packet: &Packet,
+  time_base: mediadecode::Timebase,
+) -> Option<VideoPacket<VideoPacketExtra, FfmpegBuffer>> {
   let buf = FfmpegBuffer::from_packet(packet)?;
-  let mut out = SubtitlePacket::new(buf, SubtitlePacketExtra::new(packet.stream() as i32))
-    .with_flags(md_flags_from_av(packet.flags()));
-  if let Some(p) = packet.pts() {
-    out = out.with_pts(Some(Timestamp::new(p, mediadecode::Timebase::default())));
-  }
+  let mut out = VideoPacket::new(buf, VideoPacketExtra::new(packet.stream() as i32))
+    .with_flags(md_flags_from_av(packet.flags()))
+    .with_pts(packet.pts().map(|p| Timestamp::new(p, time_base)))
+    .with_dts(packet.dts().map(|d| Timestamp::new(d, time_base)));
   let dur = packet.duration();
   if dur > 0 {
-    out = out.with_duration(Some(Timestamp::new(dur, mediadecode::Timebase::default())));
+    out = out.with_duration(Some(Timestamp::new(dur, time_base)));
   }
   Some(out)
+}
+
+/// [`audio_packet_from_ffmpeg`], with the stream's timebase stamped
+/// onto every timestamp instead of the 1/1 placeholder.
+pub fn audio_packet_from_ffmpeg_in(
+  packet: &Packet,
+  time_base: mediadecode::Timebase,
+) -> Option<AudioPacket<AudioPacketExtra, FfmpegBuffer>> {
+  let buf = FfmpegBuffer::from_packet(packet)?;
+  let mut out = AudioPacket::new(buf, AudioPacketExtra::new(packet.stream() as i32))
+    .with_flags(md_flags_from_av(packet.flags()))
+    .with_pts(packet.pts().map(|p| Timestamp::new(p, time_base)))
+    .with_dts(packet.dts().map(|d| Timestamp::new(d, time_base)));
+  let dur = packet.duration();
+  if dur > 0 {
+    out = out.with_duration(Some(Timestamp::new(dur, time_base)));
+  }
+  Some(out)
+}
+
+/// [`subtitle_packet_from_ffmpeg`], with the stream's timebase stamped
+/// onto every timestamp instead of the 1/1 placeholder.
+pub fn subtitle_packet_from_ffmpeg_in(
+  packet: &Packet,
+  time_base: mediadecode::Timebase,
+) -> Option<SubtitlePacket<SubtitlePacketExtra, FfmpegBuffer>> {
+  let buf = FfmpegBuffer::from_packet(packet)?;
+  let mut out = SubtitlePacket::new(buf, SubtitlePacketExtra::new(packet.stream() as i32))
+    .with_flags(md_flags_from_av(packet.flags()))
+    .with_pts(packet.pts().map(|p| Timestamp::new(p, time_base)));
+  let dur = packet.duration();
+  if dur > 0 {
+    out = out.with_duration(Some(Timestamp::new(dur, time_base)));
+  }
+  Some(out)
+}
+
+/// Wraps a borrowed [`ffmpeg::Packet`] from a **data** track — timecode,
+/// KLV, timed ID3 — as a [`mediadecode::demuxer::DataPacket`], with the
+/// stream's timebase stamped onto every timestamp.
+///
+/// Data packets are never reordered, so the mediadecode model gives
+/// them no `dts` seat; everything else mirrors
+/// [`video_packet_from_ffmpeg_in`]. `byte_pos` is forwarded from
+/// `AVPacket.pos`, which data consumers use to correlate a payload with
+/// its position in the file.
+pub fn data_packet_from_ffmpeg_in(
+  packet: &Packet,
+  time_base: mediadecode::Timebase,
+) -> Option<DataPacket<DataPacketExtra, FfmpegBuffer>> {
+  let buf = FfmpegBuffer::from_packet(packet)?;
+  let pos = packet.position();
+  let extra =
+    DataPacketExtra::new(packet.stream() as i32).with_byte_pos((pos >= 0).then_some(pos as i64));
+  let mut out = DataPacket::new(buf, extra)
+    .with_flags(md_flags_from_av(packet.flags()))
+    .with_pts(packet.pts().map(|p| Timestamp::new(p, time_base)));
+  let dur = packet.duration();
+  if dur > 0 {
+    out = out.with_duration(Some(Timestamp::new(dur, time_base)));
+  }
+  Some(out)
+}
+
+/// Wraps a borrowed [`ffmpeg::Packet`] from an **attachment** track —
+/// cover art that the container really does store as a packet — as a
+/// [`mediadecode::demuxer::AttachmentPacket`].
+///
+/// No timestamps are forwarded, and there is nowhere to put them: an
+/// attachment is not on the timeline. `synthesized` is `false`, because
+/// this payload came from a real packet; the demuxer sets it `true` for
+/// the packets it builds out of codec extradata.
+pub fn attachment_packet_from_ffmpeg(
+  packet: &Packet,
+) -> Option<AttachmentPacket<AttachmentPacketExtra, FfmpegBuffer>> {
+  let buf = FfmpegBuffer::from_packet(packet)?;
+  Some(
+    AttachmentPacket::new(buf, AttachmentPacketExtra::new(packet.stream() as i32))
+      .with_flags(md_flags_from_av(packet.flags())),
+  )
 }
 
 fn md_flags_from_av(flags: ffmpeg_next::packet::Flags) -> MdPacketFlags {
