@@ -115,6 +115,10 @@ impl FfmpegDemuxer {
   /// Runs `avformat_open_input` followed by
   /// `avformat_find_stream_info`, then builds the track table and
   /// captures every attachment payload.
+  ///
+  /// Call [`ffmpeg_next::init`] once before the first open if you want
+  /// FFmpeg's logging and network protocols configured; probing a local
+  /// container does not require it.
   pub fn open<P: AsRef<Path> + ?Sized>(path: &P) -> Result<Self, DemuxError> {
     Self::from_input(format::input(path)?)
   }
@@ -216,9 +220,14 @@ impl Demuxer for FfmpegDemuxer {
           // exactly one.
           AttachmentState::Captured | AttachmentState::None => continue,
           AttachmentState::AwaitingPacket => {
-            self.attachments[index] = AttachmentState::Captured;
-            boundary::attachment_packet_from_ffmpeg(&packet)
-              .map(|packet| DemuxedPacket::Attachment { track, packet })
+            // The state moves only once a payload really came out. An
+            // unwrappable packet (no refcounted buffer) leaves the
+            // track still owed, so the next one on it is taken instead
+            // of silently swallowed.
+            boundary::attachment_packet_from_ffmpeg(&packet).map(|packet| {
+              self.attachments[index] = AttachmentState::Captured;
+              DemuxedPacket::Attachment { track, packet }
+            })
           }
         },
         // The roster of arms is five; a track nothing can name has no
