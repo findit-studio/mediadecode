@@ -321,14 +321,17 @@ impl FfmpegBuffer {
   }
 }
 
-/// Why an `AVPacket`'s payload could not be wrapped.
+/// Why a packet could not be carried across the boundary — its payload,
+/// or the side data that comes with it.
 ///
-/// Both arms mean the bytes are real and this crate could not carry
+/// Every arm means the bytes are real and this crate could not carry
 /// them — never that there were none. "No payload" is `Ok(None)` from
 /// [`FfmpegBuffer::from_packet`], and keeping the two apart is the
 /// whole point of the type: a demuxer that reads a refcount failure as
 /// an empty marker drops a video packet under memory pressure and
-/// carries on as though the file said so.
+/// carries on as though the file said so. The side-data arms exist for
+/// the same reason one tier along — a packet whose side data cannot be
+/// carried whole is refused, never delivered with some of it.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PacketBufferError {
   /// `av_buffer_ref` returned null — out of memory taking a second
@@ -350,6 +353,40 @@ pub enum PacketBufferError {
     /// The payload's length in bytes.
     len: usize,
     /// The buffer's own length in bytes.
+    size: usize,
+  },
+
+  /// A packet declares more side-data entries than this crate will
+  /// walk, or a negative count.
+  ///
+  /// The cap bounds the work a crafted packet can demand *before* it is
+  /// refused. It cannot trip on anything FFmpeg's own packet API
+  /// produces: both `av_packet_new_side_data` and
+  /// `av_packet_add_side_data` replace an entry of the same type, so a
+  /// packet carries at most one entry per named type — forty-three in
+  /// this build, and the cap tracks that number if it ever grows past
+  /// the floor.
+  #[error("a packet declaring {count} side-data entries cannot be carried (limit {cap})")]
+  SideDataEntries {
+    /// The count the packet declared.
+    count: i32,
+    /// The most entries this crate will walk.
+    cap: usize,
+  },
+
+  /// A packet's side data is larger than this crate will copy.
+  #[error("{bytes} bytes of side data cannot be carried (limit {cap})")]
+  SideDataBytes {
+    /// The total the packet's entries reached.
+    bytes: usize,
+    /// The most bytes this crate will copy.
+    cap: usize,
+  },
+
+  /// Out of memory copying a side-data entry.
+  #[error("out of memory copying {size} bytes of side data")]
+  SideDataAlloc {
+    /// The entry's length in bytes.
     size: usize,
   },
 }

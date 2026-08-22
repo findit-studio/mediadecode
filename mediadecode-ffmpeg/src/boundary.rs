@@ -635,45 +635,74 @@ pub fn subtitle_packet_from_ffmpeg(
   subtitle_packet_from_ffmpeg_in(packet, mediadecode::Timebase::default())
 }
 
+/// The most side-data entries this crate will walk on one packet.
+///
+/// The floor is [`SIDE_DATA_MAX_ENTRIES`], the same bound the
+/// frame-side collector uses; it rises with `AV_PKT_DATA_NB` so a
+/// future FFmpeg that names more side-data types than the floor cannot
+/// turn a legitimate packet into a refusal. Measured: FFmpeg's own
+/// packet API cannot exceed one entry per named type — both
+/// `av_packet_new_side_data` and `av_packet_add_side_data` replace an
+/// existing entry of the same type — so a packet over this cap is one
+/// no FFmpeg call produced.
+fn side_data_entry_cap() -> usize {
+  SIDE_DATA_MAX_ENTRIES.max(crate::ffi::side_data_type_count().max(0) as usize)
+}
+
 /// The side-data entries an `AVPacket` carries, copied into owned
-/// values.
+/// values — **all of them, or none and an error**.
 ///
 /// The packet twin of `convert::collect_side_data`, and bounded the
-/// same way: at most [`SIDE_DATA_MAX_ENTRIES`] entries and
+/// same way: at most [`side_data_entry_cap`] entries and
 /// [`SIDE_DATA_MAX_TOTAL_BYTES`] bytes per packet, allocated through
-/// `try_reserve_exact` so an out-of-memory answer drops an entry rather
-/// than aborting the process. `AVPacket.side_data` is a flat array of
-/// `AVPacketSideData` (not the array of pointers an `AVFrame` keeps),
-/// and its `type_` is read as the integer it is on the wire — a
-/// discriminant this build has no name for would be undefined behaviour
-/// the moment it existed as an `AVPacketSideDataType`.
-fn packet_side_data(packet: &Packet) -> Vec<SideDataEntry> {
+/// `try_reserve_exact`. What is *not* the same is what happens when a
+/// bound is reached. The frame collector truncates and warns, which it
+/// can afford to — frame side data is descriptive, the frame is
+/// delivered either way, and nothing downstream acts on it. Packet side
+/// data is the opposite: `NEW_EXTRADATA` replaces a decoder's
+/// parameters, `PARAM_CHANGE` moves its rate, `SKIP_SAMPLES` trims the
+/// stream, and the codec acts on every one. A truncated copy is a
+/// decoder quietly running on stale parameters, and a truncated copy of
+/// a side-data-only packet is `Ok(None)` — the packet vanishing
+/// entirely, which is the very defect this seam was built to close. So
+/// every bound here is an error, and a caller either gets a packet with
+/// all of its side data or a `DemuxError` naming what stopped it.
+///
+/// `AVPacket.side_data` is a flat array of `AVPacketSideData` (not the
+/// array of pointers an `AVFrame` keeps), and its `type_` is read as
+/// the integer it is on the wire — a discriminant this build has no
+/// name for would be undefined behaviour the moment it existed as an
+/// `AVPacketSideDataType`.
+fn packet_side_data(packet: &Packet) -> Result<Vec<SideDataEntry>, PacketBufferError> {
   use ffmpeg_next::packet::Ref;
   // SAFETY: `packet` keeps the `AVPacket` live; `side_data` and
   // `side_data_elems` are public fields.
   let count_raw = unsafe { (*packet.as_ptr()).side_data_elems };
   let entries = unsafe { (*packet.as_ptr()).side_data };
-  if count_raw <= 0 || entries.is_null() {
-    return Vec::new();
+  if count_raw == 0 || entries.is_null() {
+    return Ok(Vec::new());
   }
-  let requested = count_raw as usize;
-  let count = requested.min(SIDE_DATA_MAX_ENTRIES);
-  if requested > SIDE_DATA_MAX_ENTRIES {
-    tracing::warn!(
-      cap = SIDE_DATA_MAX_ENTRIES,
-      requested,
-      "mediadecode-ffmpeg: AVPacket.side_data_elems exceeds entry cap; truncating",
-    );
+  let cap = side_data_entry_cap();
+  // A negative count is a malformed packet, not an empty one: reading
+  // it as "no side data" is the same silent loss by another route.
+  if count_raw < 0 || count_raw as usize > cap {
+    return Err(PacketBufferError::SideDataEntries {
+      count: count_raw,
+      cap,
+    });
   }
+  let count = count_raw as usize;
   let mut out: Vec<SideDataEntry> = Vec::new();
   if out.try_reserve_exact(count).is_err() {
-    return Vec::new();
+    return Err(PacketBufferError::SideDataAlloc {
+      size: count * core::mem::size_of::<SideDataEntry>(),
+    });
   }
   let mut total_bytes: usize = 0;
   for index in 0..count {
     // SAFETY: `entries` is valid for `count_raw` contiguous
     // `AVPacketSideData` values per FFmpeg's contract, and `index` is
-    // below the clamped count.
+    // below that count.
     let entry = unsafe { entries.add(index) };
     let kind = unsafe { read_unaligned(addr_of!((*entry).type_).cast::<i32>()) };
     let size = unsafe { (*entry).size };
@@ -681,19 +710,16 @@ fn packet_side_data(packet: &Packet) -> Vec<SideDataEntry> {
     let data = if size == 0 || data_ptr.is_null() {
       Vec::new()
     } else {
-      let projected = total_bytes.saturating_add(size);
-      if projected > SIDE_DATA_MAX_TOTAL_BYTES {
-        tracing::warn!(
-          cap = SIDE_DATA_MAX_TOTAL_BYTES,
-          projected,
-          "mediadecode-ffmpeg: AVPacket side-data byte cap reached; dropping remaining entries",
-        );
-        break;
+      total_bytes = total_bytes.saturating_add(size);
+      if total_bytes > SIDE_DATA_MAX_TOTAL_BYTES {
+        return Err(PacketBufferError::SideDataBytes {
+          bytes: total_bytes,
+          cap: SIDE_DATA_MAX_TOTAL_BYTES,
+        });
       }
-      total_bytes = projected;
       let mut buf: Vec<u8> = Vec::new();
       if buf.try_reserve_exact(size).is_err() {
-        continue;
+        return Err(PacketBufferError::SideDataAlloc { size });
       }
       // SAFETY: `data` is valid for `size` bytes per FFmpeg's
       // `AVPacketSideData` contract.
@@ -702,7 +728,7 @@ fn packet_side_data(packet: &Packet) -> Vec<SideDataEntry> {
     };
     out.push(SideDataEntry::new(kind, data));
   }
-  out
+  Ok(out)
 }
 
 /// The buffer a timed packet is delivered with, or `None` when there is
@@ -750,7 +776,7 @@ pub fn video_packet_from_ffmpeg_in(
   packet: &Packet,
   time_base: mediadecode::Timebase,
 ) -> Result<Option<VideoPacket<VideoPacketExtra, FfmpegBuffer>>, PacketBufferError> {
-  let side_data = packet_side_data(packet);
+  let side_data = packet_side_data(packet)?;
   let Some(buf) = delivered_payload(packet, &side_data)? else {
     return Ok(None);
   };
@@ -772,7 +798,7 @@ pub fn audio_packet_from_ffmpeg_in(
   packet: &Packet,
   time_base: mediadecode::Timebase,
 ) -> Result<Option<AudioPacket<AudioPacketExtra, FfmpegBuffer>>, PacketBufferError> {
-  let side_data = packet_side_data(packet);
+  let side_data = packet_side_data(packet)?;
   let Some(buf) = delivered_payload(packet, &side_data)? else {
     return Ok(None);
   };
@@ -794,7 +820,7 @@ pub fn subtitle_packet_from_ffmpeg_in(
   packet: &Packet,
   time_base: mediadecode::Timebase,
 ) -> Result<Option<SubtitlePacket<SubtitlePacketExtra, FfmpegBuffer>>, PacketBufferError> {
-  let side_data = packet_side_data(packet);
+  let side_data = packet_side_data(packet)?;
   let Some(buf) = delivered_payload(packet, &side_data)? else {
     return Ok(None);
   };
@@ -822,7 +848,7 @@ pub fn data_packet_from_ffmpeg_in(
   packet: &Packet,
   time_base: mediadecode::Timebase,
 ) -> Result<Option<DataPacket<DataPacketExtra, FfmpegBuffer>>, PacketBufferError> {
-  let side_data = packet_side_data(packet);
+  let side_data = packet_side_data(packet)?;
   let Some(buf) = delivered_payload(packet, &side_data)? else {
     return Ok(None);
   };
@@ -1069,6 +1095,173 @@ mod tests {
   const NEW_EXTRADATA: i32 =
     ffmpeg_next::ffi::AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA as i32;
 
+  /// A packet carrying one side-data entry of exactly `size` bytes,
+  /// with a body when `body` is set.
+  fn packet_with_side_data(size: usize, body: bool) -> Packet {
+    use ffmpeg_next::{
+      ffi::{AVPacketSideDataType, av_packet_new_side_data},
+      packet::Mut,
+    };
+    let mut packet = if body {
+      Packet::copy(&[1u8, 2, 3])
+    } else {
+      Packet::empty()
+    };
+    // SAFETY: `packet` owns a live `AVPacket` and the type is a
+    // compile-time constant of this build.
+    let ptr = unsafe {
+      av_packet_new_side_data(
+        packet.as_mut_ptr(),
+        AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA,
+        size,
+      )
+    };
+    assert!(!ptr.is_null(), "av_packet_new_side_data({size})");
+    packet
+  }
+
+  /// Forges a packet declaring `count` side-data entries — a shape
+  /// FFmpeg's own API cannot produce, since both
+  /// `av_packet_new_side_data` and `av_packet_add_side_data` replace an
+  /// entry of the same type (measured: seventy calls leave one entry).
+  /// A count above the cap therefore only ever comes from a corrupt or
+  /// hostile packet, which is what the cap is for.
+  fn packet_with_forged_entry_count(count: usize) -> Packet {
+    use ffmpeg_next::{
+      ffi::{AVPacketSideData, AVPacketSideDataType, av_malloc},
+      packet::Mut,
+    };
+    let mut packet = Packet::copy(&[1u8]);
+    // SAFETY: the array and every entry payload are allocated with
+    // FFmpeg's own allocator and handed to the packet, which frees them
+    // in `av_packet_free_side_data` on drop. The packet had no side
+    // data of its own, so nothing is leaked by the overwrite.
+    unsafe {
+      let array =
+        av_malloc(count * core::mem::size_of::<AVPacketSideData>()) as *mut AVPacketSideData;
+      assert!(!array.is_null(), "av_malloc");
+      for index in 0..count {
+        let data = av_malloc(4) as *mut u8;
+        assert!(!data.is_null(), "av_malloc");
+        core::ptr::write_bytes(data, 7, 4);
+        (*array.add(index)).data = data;
+        (*array.add(index)).size = 4;
+        (*array.add(index)).type_ = AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA;
+      }
+      (*packet.as_mut_ptr()).side_data = array;
+      (*packet.as_mut_ptr()).side_data_elems = count as i32;
+    }
+    packet
+  }
+
+  #[test]
+  fn side_data_that_cannot_be_carried_whole_refuses_the_packet() {
+    let tb = mediadecode::Timebase::default();
+
+    // A body-bearing packet whose side data is over the byte cap. The
+    // caps used to truncate and warn, which handed the codec a packet
+    // that looked complete and was not: `NEW_EXTRADATA` gone, a decoder
+    // left on parameters the container had already replaced.
+    let oversized = packet_with_side_data(SIDE_DATA_MAX_TOTAL_BYTES + 1, true);
+    for (arm, result) in [
+      (
+        "video",
+        video_packet_from_ffmpeg_in(&oversized, tb).map(|p| p.is_some()),
+      ),
+      (
+        "audio",
+        audio_packet_from_ffmpeg_in(&oversized, tb).map(|p| p.is_some()),
+      ),
+      (
+        "subtitle",
+        subtitle_packet_from_ffmpeg_in(&oversized, tb).map(|p| p.is_some()),
+      ),
+      (
+        "data",
+        data_packet_from_ffmpeg_in(&oversized, tb).map(|p| p.is_some()),
+      ),
+    ] {
+      match result {
+        Err(PacketBufferError::SideDataBytes { bytes, cap }) => {
+          assert_eq!(cap, SIDE_DATA_MAX_TOTAL_BYTES);
+          assert!(bytes > cap, "{arm}");
+        }
+        other => panic!("{arm}: expected SideDataBytes, got {other:?}"),
+      }
+    }
+
+    // And the same packet with no body at all. This one used to
+    // collapse twice over: the side data was dropped, the packet
+    // therefore looked empty, and the demuxer skipped it in silence.
+    let oversized = packet_with_side_data(SIDE_DATA_MAX_TOTAL_BYTES + 1, false);
+    assert!(matches!(
+      video_packet_from_ffmpeg_in(&oversized, tb).map(|p| p.is_some()),
+      Err(PacketBufferError::SideDataBytes { .. }),
+    ));
+  }
+
+  #[test]
+  fn the_side_data_caps_are_refusals_at_the_boundary_not_before_it() {
+    let tb = mediadecode::Timebase::default();
+
+    // Exactly at the byte cap: carried, whole.
+    let at_cap = packet_with_side_data(SIDE_DATA_MAX_TOTAL_BYTES, true);
+    let packet = video_packet_from_ffmpeg_in(&at_cap, tb)
+      .expect("exactly at the cap is not over it")
+      .expect("present");
+    assert_eq!(packet.extra().side_data().len(), 1);
+    assert_eq!(
+      packet.extra().side_data()[0].data().len(),
+      SIDE_DATA_MAX_TOTAL_BYTES,
+    );
+
+    // One byte past: refused.
+    let past = packet_with_side_data(SIDE_DATA_MAX_TOTAL_BYTES + 1, true);
+    assert!(matches!(
+      video_packet_from_ffmpeg_in(&past, tb).map(|p| p.is_some()),
+      Err(PacketBufferError::SideDataBytes { .. }),
+    ));
+
+    // The entry cap, both sides of it. FFmpeg names fewer types than
+    // the floor today, so the effective cap is the floor; if a future
+    // build names more, this assertion moves the boundary rather than
+    // letting the lane quietly test nothing.
+    let cap = side_data_entry_cap();
+    assert_eq!(cap, SIDE_DATA_MAX_ENTRIES, "the cap this lane straddles");
+
+    let at_cap = packet_with_forged_entry_count(cap);
+    let packet = video_packet_from_ffmpeg_in(&at_cap, tb)
+      .expect("exactly at the cap is not over it")
+      .expect("present");
+    assert_eq!(packet.extra().side_data().len(), cap);
+
+    let past = packet_with_forged_entry_count(cap + 1);
+    match video_packet_from_ffmpeg_in(&past, tb).map(|p| p.is_some()) {
+      Err(PacketBufferError::SideDataEntries { count, cap: named }) => {
+        assert_eq!(count as usize, cap + 1);
+        assert_eq!(named, cap);
+      }
+      other => panic!("expected SideDataEntries, got {other:?}"),
+    }
+
+    // A negative count is malformed, not empty — reading it as "no side
+    // data" would be the same silent loss by another route.
+    let mut corrupt = packet_with_forged_entry_count(1);
+    {
+      use ffmpeg_next::packet::Mut;
+      unsafe { (*corrupt.as_mut_ptr()).side_data_elems = -3 };
+    }
+    assert!(matches!(
+      video_packet_from_ffmpeg_in(&corrupt, tb).map(|p| p.is_some()),
+      Err(PacketBufferError::SideDataEntries { count: -3, .. }),
+    ));
+    // Put the count back so the packet frees what it owns.
+    {
+      use ffmpeg_next::packet::Mut;
+      unsafe { (*corrupt.as_mut_ptr()).side_data_elems = 1 };
+    }
+  }
+
   #[test]
   fn side_data_survives_the_round_trip_on_every_decoder_bound_arm() {
     // The forward direction captures side data; the reverse direction
@@ -1109,7 +1302,7 @@ mod tests {
         .expect("wrappable")
         .expect("present");
       let rebuilt = ffmpeg_packet_from_video_packet(&video).expect("rebuilt");
-      let carried = packet_side_data(&rebuilt);
+      let carried = packet_side_data(&rebuilt).expect("readable");
       assert_eq!(carried.len(), 1, "{name}: video lost its side data");
       assert_eq!(carried[0].kind(), expected_kind, "{name}: video");
       assert_eq!(carried[0].data(), video.extra().side_data()[0].data());
@@ -1118,7 +1311,7 @@ mod tests {
         .expect("wrappable")
         .expect("present");
       let rebuilt = ffmpeg_packet_from_audio_packet(&audio).expect("rebuilt");
-      let carried = packet_side_data(&rebuilt);
+      let carried = packet_side_data(&rebuilt).expect("readable");
       assert_eq!(carried.len(), 1, "{name}: audio lost its side data");
       assert_eq!(carried[0].data(), audio.extra().side_data()[0].data());
 
@@ -1126,7 +1319,7 @@ mod tests {
         .expect("wrappable")
         .expect("present");
       let rebuilt = ffmpeg_packet_from_subtitle_packet(&subtitle).expect("rebuilt");
-      let carried = packet_side_data(&rebuilt);
+      let carried = packet_side_data(&rebuilt).expect("readable");
       assert_eq!(carried.len(), 1, "{name}: subtitle lost its side data");
       assert_eq!(carried[0].data(), subtitle.extra().side_data()[0].data());
     }

@@ -235,9 +235,18 @@ The backend-agnostic core it adapts has its own log at
   change — read as "empty, skip it", so a decoder could be left running
   on parameters the container had already replaced, with nothing said.
 
-  All four timed arms now collect side data (bounded exactly as the
-  frame-side collector is: 64 entries, 256 KiB, `try_reserve_exact`) and
-  deliver a side-data-only packet with an owned empty buffer.
+  All four timed arms now collect side data — **whole, or not at all**.
+  The collection is bounded (64 entries or as many as this build names,
+  whichever is larger; 256 KiB; `try_reserve_exact`), and every bound is
+  an **error**, not a truncation: a packet whose side data cannot be
+  carried complete is refused by name
+  (`PacketBufferError::SideDataEntries` / `SideDataBytes` /
+  `SideDataAlloc`, surfacing as `DemuxError::PacketBuffer`) rather than
+  delivered missing the entries a decoder acts on. Truncating would put
+  the original defect back twice over: a body-bearing packet reaching
+  the codec without its `NEW_EXTRADATA`, and a side-data-only packet
+  losing its only content and vanishing as an empty marker. The arms
+  also deliver a side-data-only packet with an owned empty buffer.
   `SubtitlePacketExtra` and `DataPacketExtra` gained the seat the other
   two already had. `AttachmentPacketExtra` deliberately did not: an
   attachment is its bytes, so a packet carrying none carries no
