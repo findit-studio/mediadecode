@@ -159,6 +159,23 @@ The backend-agnostic core it adapts has its own log at
 
 ### Fixed
 
+- **A sparse thumbnail track is a timed track, not one attachment.**
+  Classification tested `AV_DISPOSITION_ATTACHED_PIC` alone, and FFmpeg
+  documents `AV_DISPOSITION_TIMED_THUMBNAILS` — "the stream is sparse,
+  and contains thumbnail images, often corresponding to chapter
+  markers" — as *only ever* used together with it. Such a stream was
+  therefore read as cover art: the exactly-once attachment contract
+  queued the parked copy and the delivery loop dropped every timestamped
+  thumbnail after it. The two bits are now read off the raw
+  `AVStream.disposition` (`ffmpeg_next`'s `Disposition` mints no
+  `TIMED_THUMBNAILS` constant, and its `from_bits_truncate` drops what
+  it cannot name — which is how the distinction went missing), and a
+  timed-thumbnail stream goes to the **`Video`** arm. That does not
+  bend "cover art is an attachment, not video": the reason behind that
+  ruling is that a still with no timeline must not look like a motion
+  track, and this stream *is* on the timeline — sparse video, with a
+  codec id, a frame size and packets that carry timestamps.
+
 - **A packet's side data arrives with the packet, and a side-data-only
   packet is no longer mistaken for an empty marker.** The `*Extra`
   carriers have always documented a `side_data` seat and the conversion

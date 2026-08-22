@@ -45,7 +45,7 @@
 
 use std::{
   collections::VecDeque,
-  ffi::CStr,
+  ffi::{CStr, c_int},
   io::{Read, Seek},
   num::NonZeroI32,
   path::Path,
@@ -55,8 +55,11 @@ use std::{
 
 use ffmpeg_next::{
   Packet, Rational,
-  ffi::{AV_NOPTS_VALUE, AVDictionary, av_dict_get},
-  format::{self, context::Input, stream::Disposition},
+  ffi::{
+    AV_DISPOSITION_ATTACHED_PIC, AV_DISPOSITION_TIMED_THUMBNAILS, AV_NOPTS_VALUE, AVDictionary,
+    av_dict_get,
+  },
+  format::{self, context::Input},
   media,
 };
 use mediadecode::{
@@ -421,7 +424,7 @@ fn build_tracks(input: &Input) -> Result<BuiltTracks, DemuxError> {
       CodecId::from_raw(unsafe { read_unaligned(addr_of!((*par).codec_id).cast::<i32>()) });
 
     let disposition = unsafe { (*stream.as_ptr()).disposition };
-    let attached_pic = stream.disposition().contains(Disposition::ATTACHED_PIC);
+    let attached_pic = is_attachment_disposition(disposition);
 
     let time_base = rational_to_timebase(stream.time_base());
     let raw_duration = stream.duration();
@@ -505,6 +508,41 @@ fn build_tracks(input: &Input) -> Result<BuiltTracks, DemuxError> {
   }
 
   Ok((tracks, pending))
+}
+
+/// Whether a stream's disposition makes it an **attachment** — a
+/// payload with no place on the timeline — rather than a timed track.
+///
+/// `AV_DISPOSITION_ATTACHED_PIC` alone says "cover art": one still
+/// image, parked in `AVStream.attached_pic`, no timeline. But FFmpeg
+/// pairs it with `AV_DISPOSITION_TIMED_THUMBNAILS` for a different
+/// thing entirely — "the stream is sparse, and contains thumbnail
+/// images, often corresponding to chapter markers", a flag its own
+/// header documents as *only ever* used together with `ATTACHED_PIC`.
+/// Such a stream has many images and every one of them has a
+/// timestamp.
+///
+/// Classifying that as an attachment loses all but the first: the
+/// attachment contract is exactly one packet, so the queue takes the
+/// parked copy and the delivery loop drops every timed packet on the
+/// track. It goes to the **`Video`** arm instead. That does not
+/// contradict "cover art is an attachment, not video" — the reason
+/// behind that ruling is that a single still with no timeline must not
+/// look like a motion track, and a timed-thumbnail stream *is* on the
+/// timeline. It is sparse video: a codec id, a frame size, a pixel
+/// format and packets with timestamps, which is everything a consumer
+/// needs to decode the images. The `Data` arm was the alternative and
+/// is worse: it would strand encoded pictures in an arm that names no
+/// decoder.
+///
+/// The bits are tested against the raw `AVStream.disposition` rather
+/// than through `ffmpeg_next`'s `Disposition`, which mints no
+/// `TIMED_THUMBNAILS` constant at all — its `from_bits_truncate` drops
+/// every bit this build of the wrapper has no name for, which is how
+/// the distinction went missing in the first place.
+const fn is_attachment_disposition(disposition: c_int) -> bool {
+  disposition & AV_DISPOSITION_ATTACHED_PIC != 0
+    && disposition & AV_DISPOSITION_TIMED_THUMBNAILS == 0
 }
 
 /// Upper bound on the NUL search in [`metadata_text`].
@@ -740,6 +778,36 @@ mod tests {
     let dict = dict_with(c"filename", &long);
     assert_eq!(unsafe { metadata_text(dict, c"filename") }, None);
     unsafe { av_dict_free(&mut { dict }) };
+  }
+
+  #[test]
+  fn a_timed_thumbnail_stream_is_not_an_attachment() {
+    // `TIMED_THUMBNAILS` is documented as only ever appearing beside
+    // `ATTACHED_PIC`, so testing the picture bit alone reads a sparse
+    // chapter-thumbnail track as cover art — and the attachment
+    // contract then delivers exactly one of its images and drops the
+    // rest, every one of which had a timestamp.
+    assert!(
+      is_attachment_disposition(AV_DISPOSITION_ATTACHED_PIC),
+      "a plain attached picture is still an attachment",
+    );
+    assert!(
+      !is_attachment_disposition(AV_DISPOSITION_ATTACHED_PIC | AV_DISPOSITION_TIMED_THUMBNAILS),
+      "a timed-thumbnail stream is a timed track, whatever else it is flagged",
+    );
+    // Neither bit, and the other bits that ride along, change nothing.
+    assert!(!is_attachment_disposition(0));
+    assert!(!is_attachment_disposition(AV_DISPOSITION_TIMED_THUMBNAILS));
+    assert!(is_attachment_disposition(
+      AV_DISPOSITION_ATTACHED_PIC | ffmpeg_next::ffi::AV_DISPOSITION_DEFAULT
+    ));
+    // And the reason the raw bits are read at all: the wrapper's own
+    // flag set cannot express the distinction.
+    assert!(
+      ffmpeg_next::format::stream::Disposition::from_bits(AV_DISPOSITION_TIMED_THUMBNAILS)
+        .is_none(),
+      "ffmpeg_next mints no TIMED_THUMBNAILS bit — from_bits_truncate would drop it silently",
+    );
   }
 
   #[test]
