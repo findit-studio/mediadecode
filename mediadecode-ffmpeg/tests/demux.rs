@@ -531,6 +531,63 @@ fn a_panicking_reader_is_an_error_not_an_abort() {
   ));
 }
 
+/// A byte source that reads faithfully and panics on `seek`, but only
+/// once the test arms it — so the panic lands after the session is
+/// open, with its attachment still queued.
+struct PanicOnArmedSeek {
+  file: File,
+  armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Read for PanicOnArmedSeek {
+  fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+    self.file.read(buf)
+  }
+}
+
+impl Seek for PanicOnArmedSeek {
+  fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+    assert!(
+      !self.armed.load(std::sync::atomic::Ordering::Relaxed),
+      "the reader gave up on seeking",
+    );
+    self.file.seek(pos)
+  }
+}
+
+#[test]
+fn a_latched_panic_outranks_a_queued_attachment() {
+  let Some(corpus) = Corpus::new() else { return };
+  let path = corpus.multi_track_mkv();
+
+  let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+  let reader = PanicOnArmedSeek {
+    file: File::open(&path).expect("open file"),
+    armed: std::sync::Arc::clone(&armed),
+  };
+  let mut demuxer = FfmpegDemuxer::open_reader(reader, Some("multi.mkv")).expect("open");
+  // Nothing has been pulled: the font attachment is still in the queue.
+  armed.store(true, std::sync::atomic::Ordering::Relaxed);
+
+  assert!(
+    matches!(
+      demuxer.seek(Timestamp::new(1, Timebase::SECONDS)),
+      Err(DemuxError::ReaderPanic { .. })
+    ),
+    "the seek must report the panic it caused",
+  );
+
+  // The queue is filled at open and owes nothing to the reader — which
+  // is exactly why draining it here would tell the caller the session
+  // is still alive after it has been told otherwise.
+  match demuxer.next_packet() {
+    Err(DemuxError::ReaderPanic { .. }) => {}
+    Err(other) => panic!("expected ReaderPanic, got {other:?}"),
+    Ok(Some(packet)) => panic!("a terminal session delivered a {:?} packet", packet.kind()),
+    Ok(None) => panic!("a terminal session answered EOF"),
+  }
+}
+
 #[test]
 fn a_reader_opens_the_same_container_as_a_path() {
   let Some(corpus) = Corpus::new() else { return };

@@ -212,6 +212,15 @@ impl Demuxer for FfmpegDemuxer {
   }
 
   fn next_packet(&mut self) -> Result<Option<DemuxedPacket<Ffmpeg, FfmpegBuffer>>, DemuxError> {
+    // A latched reader panic is terminal, and terminal starts here. The
+    // queue is filled at open and owes nothing to the reader, so a pull
+    // that drained it would answer `Ok` to a caller the session has
+    // already told the truth to — `seek` can latch a panic while
+    // attachments are still queued.
+    if let Some(panicked) = self.panicked() {
+      return Err(panicked);
+    }
+
     // The attachment queue drains first and drains completely, which is
     // the whole of "exactly one packet, before any timed packet": no
     // `av_read_frame` has run yet when the last one leaves.
