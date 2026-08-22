@@ -11,6 +11,93 @@ The sibling FFmpeg adapter has its own log at
 
 ## [Unreleased]
 
+### Added
+
+- **The demux tier — `mediadecode::demuxer`.** Until now the spine
+  started at the decoder: something else had to open the container, name
+  its tracks and hand over packets. That something is now a trait.
+
+  - **`Demuxer`** — the opened-session face: `tracks()`, `next_packet()`,
+    `seek(target)`. The session is **pull-style**; the caller owns the
+    loop, holds one packet at a time whatever the file's length, and
+    pulls only when it is ready. `Ok(None)` is end of file.
+
+    Opening is deliberately **not** on the trait. FFmpeg opens from a
+    path or a `Read + Seek` reader, a WebAssembly container parser opens
+    from bytes — the same reason the decoder traits carry no
+    constructor. And not every backend is a demuxer at all: R3D and BRAW
+    are clip-oriented SDKs with no packets to hand out, so they keep
+    joining a pipeline one tier up through `VideoFrameSource` /
+    `AudioFrameSource`.
+
+  - **`DemuxedPacket<E, D>`** — five arms (`Video` / `Audio` /
+    `Subtitle` / `Data` / `Attachment`), each `{ track, packet }`. The
+    packet types stay exactly what a decoder already accepts; the
+    envelope carries the track coordinate, so nothing has to be stripped
+    before `send_packet`.
+
+  - **`DataPacket<E, D>`** and **`AttachmentPacket<E, D>`** — the two
+    packet kinds that had no type because they have no decoder. A data
+    packet is timed and never reordered, so like `SubtitlePacket` it has
+    no DTS seat. An attachment carries **no timestamps at all**: a font
+    or a cover image is not on the timeline.
+
+  - **`TrackKind`** — the closed roster `{ Video, Audio, Subtitle, Data,
+    Attachment, Unknown }`, minted here because `mediaframe` has a track
+    *disposition* vocabulary but no kind vocabulary and the dependency
+    direction forbids reaching the other way. **Cover art is
+    `Attachment`, not `Video`** — one sample, no timeline, no motion —
+    so the `Video` arm carries true motion video and nothing else.
+
+  - **`TrackInfo<E>` / `TrackParams<E>` / `TrackIndex`** — the track
+    table. `TrackIndex(i)` *is* the position of `tracks()[i]`, so a
+    packet's coordinate needs no side map. `TrackInfo::kind()` is read
+    off the `TrackParams` arm rather than stored beside it: there is no
+    way to build a row whose advertised kind disagrees with its payload.
+    Attachment identity — the filename it was attached under, its MIME
+    type — lives on the row, not repeated on every packet.
+
+  - **`DemuxAdapter`** — the demux tier's vocabulary, bundling the three
+    existing adapter families and adding what only a demuxer needs:
+    `DataExtra`, `AttachmentExtra`, `TrackExtra`, and a `Text` carrier
+    for identity metadata (a seat, not a fixed string type, so the core
+    stays allocator-free). The three families are bound to share the
+    bundle's `CodecId`: a demuxer reads one container, and a container's
+    track table has one codec-identifier column.
+
+  Two contracts are stated at the face and binding on every
+  implementation. **An attachment track delivers exactly one packet,
+  before any timed packet** — synthesised when the container keeps the
+  payload outside the packet stream (fonts, whose bytes live in codec
+  extradata), hoisted when it is a real packet (cover art). And **`seek`
+  obeys three laws**: it flushes session state; it lands on the nearest
+  keyframe *at or before* the target, never after, because a decoder
+  started past the target has no reference frame; and attachments are
+  never replayed, however many times the session seeks.
+
+- **The resample seam — `mediadecode::resampler`.** `AudioResampler`:
+  `send_frame` / `receive_frame` / `send_eof` / `flush`, the
+  `AudioStreamDecoder` push pair one tier along, with "nothing ready
+  yet" signalled the same way — a backend-specific `Error` variant out
+  of `receive_frame`.
+
+  Three contract lines ride the face. **Both specs are explicit at
+  construction**: the source is read off the track's `TrackInfo`, the
+  target is the caller's — 16 kHz mono for a speech model, 48 kHz for an
+  audio-event one, from the same file at the same time. The target is
+  options, never a constant. **A mid-stream format change is a named
+  refusal**: the face does not silently reconfigure, because that would
+  resample the two halves of a stream on different terms and hand back
+  one unbroken timeline built out of them. And **EOF drains the
+  conversion tail** — a rate converter holds tens of milliseconds inside
+  its filter, and skipping the drain loses the end of every file. Output
+  timestamps are kept by delay-compensated accounting, so the drained
+  tail continues the same timeline.
+
+  No FFmpeg in the shape: `swresample` is merely the first
+  implementation, and a pure-Rust polyphase resampler fits the same
+  face.
+
 ## [0.6.0] - 2026-08-21
 
 ### Removed (BREAKING)

@@ -128,7 +128,7 @@ fn decode_clip(path: &std::path::Path, expected: (u32, u8, u64)) {
     if s.index() != stream_index {
       continue;
     }
-    let Some(pkt) = audio_packet_from_ffmpeg(&av_packet) else {
+    let Some(pkt) = audio_packet_from_ffmpeg(&av_packet).expect("a wrappable payload") else {
       continue;
     };
     decoder.send_packet(&pkt).expect("audio send_packet");

@@ -78,7 +78,7 @@ fn decode_one_audio_frame_through_trait() {
     if s.index() != stream_index {
       continue;
     }
-    let pkt = match audio_packet_from_ffmpeg(&av_packet) {
+    let pkt = match audio_packet_from_ffmpeg(&av_packet).expect("a wrappable payload") {
       Some(p) => p,
       None => continue,
     };
@@ -138,7 +138,7 @@ fn decode_one_subtitle_through_trait() {
     if s.index() != stream_index {
       continue;
     }
-    let pkt = match subtitle_packet_from_ffmpeg(&av_packet) {
+    let pkt = match subtitle_packet_from_ffmpeg(&av_packet).expect("a wrappable payload") {
       Some(p) => p,
       None => continue,
     };

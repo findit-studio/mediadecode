@@ -10,13 +10,13 @@
 //! integer vs. constructed from a known constant.
 
 use std::{
-  ffi::{c_char, c_int},
+  ffi::{c_char, c_int, c_uint},
   ptr,
 };
 
 use ffmpeg_next::ffi::{
-  AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX, AVCodec, AVCodecContext, AVHWDeviceType, AVPixelFormat,
-  avcodec_get_hw_config,
+  AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX, AVCodec, AVCodecContext, AVHWDeviceType, AVPacket,
+  AVPacketSideDataType, AVPixelFormat, avcodec_get_hw_config,
 };
 use smol_str::SmolStr;
 
@@ -39,6 +39,59 @@ unsafe extern "C" {
   /// and `pix_fmt_name_refuses_what_ffmpeg_cannot_name` pins it against
   /// the linked library rather than assuming it.
   fn av_get_pix_fmt_name(pix_fmt: c_int) -> *const c_char;
+}
+
+unsafe extern "C" {
+  /// `av_packet_new_side_data`, redeclared with a plain integer type
+  /// parameter instead of `AVPacketSideDataType`.
+  ///
+  /// Same reason as [`av_get_pix_fmt_name`] above: the value being
+  /// passed is a side-data type this crate carries as the raw integer
+  /// it is on the wire, and constructing the bindgen enum from it would
+  /// be undefined behaviour for any value outside this build's
+  /// discriminant set. `AVPacketSideDataType` is `#[repr(u32)]` and C
+  /// passes the enum in a register as an `unsigned int`, so the
+  /// redeclared signature is ABI-identical; only the Rust-side validity
+  /// obligation is dropped.
+  ///
+  /// Callers must still hand it a type this build names —
+  /// [`packet_new_side_data`] enforces that — because FFmpeg's own code
+  /// compares the field against its named constants.
+  #[link_name = "av_packet_new_side_data"]
+  fn av_packet_new_side_data_raw(pkt: *mut AVPacket, kind: c_uint, size: usize) -> *mut u8;
+}
+
+/// Attaches a side-data buffer of `size` bytes to `pkt`, returning a
+/// pointer to it, or `None` when the type is not one this build of
+/// FFmpeg names or the allocation failed.
+///
+/// The range check is what keeps the raw type integer honest:
+/// `AVPacketSideDataType` is a contiguous enum whose last member,
+/// `AV_PKT_DATA_NB`, is its count, so `0 <= kind < AV_PKT_DATA_NB` is
+/// exactly the set this build understands. Nothing outside it is handed
+/// to C.
+///
+/// # Safety
+///
+/// `pkt` must be a live `*mut AVPacket` for the duration of the call.
+pub(crate) unsafe fn packet_new_side_data(
+  pkt: *mut AVPacket,
+  kind: i32,
+  size: usize,
+) -> Option<*mut u8> {
+  if kind < 0 || kind >= side_data_type_count() {
+    return None;
+  }
+  // SAFETY: the caller keeps `pkt` live, and `kind` was just proved to
+  // be a type this build names.
+  let ptr = unsafe { av_packet_new_side_data_raw(pkt, kind as c_uint, size) };
+  (!ptr.is_null()).then_some(ptr)
+}
+
+/// How many side-data types this build of FFmpeg names.
+#[cfg_attr(not(tarpaulin), inline(always))]
+pub(crate) const fn side_data_type_count() -> i32 {
+  AVPacketSideDataType::AV_PKT_DATA_NB as i32
 }
 
 /// Upper bound on the NUL search in [`pix_fmt_name`]. FFmpeg's longest

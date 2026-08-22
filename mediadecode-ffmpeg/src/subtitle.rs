@@ -119,7 +119,7 @@ impl SubtitleDecoder for FfmpegSubtitleStreamDecoder {
       return Err(SubtitleDecodeError::FramePending);
     }
     let av_pkt = boundary::ffmpeg_packet_from_subtitle_packet(packet)
-      .map_err(|e| SubtitleDecodeError::Decode(Error::Ffmpeg(e)))?;
+      .map_err(|e| SubtitleDecodeError::Decode(Error::PacketBuild(e)))?;
     // Free any allocations from a previous decode before reusing the
     // scratch — avoids leaking when the previous packet produced no
     // frame (got == false, which still mutates the struct).
