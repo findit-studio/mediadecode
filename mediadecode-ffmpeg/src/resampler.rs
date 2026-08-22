@@ -27,7 +27,10 @@ use std::{
 use ffmpeg_next::{
   ChannelLayout,
   codec::Parameters,
-  ffi::{AVChannelOrder, AVSampleFormat, av_channel_layout_from_mask, av_frame_get_buffer},
+  ffi::{
+    AV_NOPTS_VALUE, AVChannelOrder, AVSampleFormat, av_channel_layout_from_mask,
+    av_frame_get_buffer,
+  },
   format::Sample,
   frame,
   software::resampling,
@@ -310,6 +313,40 @@ impl FfmpegResampler {
     Ok(())
   }
 
+  /// Where a frame's timestamp lands on the output timeline, or `None`
+  /// when it carries none.
+  ///
+  /// Rescaled with the **checked** rung, and before anything is staged.
+  /// `Timestamp::rescale_to` saturates, and both ends of that clamp are
+  /// wrong here: a positive one reaches the counted timeline's checked
+  /// addition only after `swr` has consumed the input, leaving a
+  /// session no caller can retry; a negative one lands on `i64::MIN`,
+  /// which *is* `AV_NOPTS_VALUE`, so the conversion back reads the
+  /// frame as carrying no timestamp at all and an extreme timestamp is
+  /// silently erased. A timestamp that does not fit the output timeline
+  /// is refused by name, with the resampler untouched.
+  fn anchor_of(&self, frame: &Frame) -> Result<Option<i64>, ResampleError> {
+    let Some(timestamp) = frame.pts() else {
+      return Ok(None);
+    };
+    let ticks = timestamp.pts();
+    let out_of_range = || ResampleError::TimestampOutOfRange { pts: ticks };
+    // `AV_NOPTS_VALUE` is a sentinel, not a time. A frame carrying it
+    // as a value says something contradictory, and anchoring on it
+    // would produce output frames that report no timestamp.
+    if ticks == AV_NOPTS_VALUE {
+      return Err(out_of_range());
+    }
+    let rescaled = timestamp
+      .timebase()
+      .checked_rescale(ticks, self.target_timebase)
+      .ok_or_else(out_of_range)?;
+    if rescaled == AV_NOPTS_VALUE {
+      return Err(out_of_range());
+    }
+    Ok(Some(rescaled))
+  }
+
   /// Stages a decoded frame as an `AVFrame` swr can read.
   ///
   /// Geometry is settled **before** anything is allocated. A frame's
@@ -468,9 +505,7 @@ impl AudioResampler for FfmpegResampler {
     // has succeeded. A refused frame must leave the timeline exactly
     // where it was, or the next good frame inherits the rejected one's
     // timestamp.
-    let anchor = frame
-      .pts()
-      .map(|pts| pts.rescale_to(self.target_timebase).pts());
+    let anchor = self.anchor_of(frame)?;
     let input = self.stage_input(frame)?;
     let mut out = self.alloc_output(frame.nb_samples() as i64)?;
     self
@@ -683,6 +718,18 @@ pub enum ResampleError {
     channels: i32,
     /// Plane slots a frame has.
     limit: i32,
+  },
+
+  /// A frame's timestamp does not land on the output timeline: it does
+  /// not survive the rescale as an `i64`, or it is `AV_NOPTS_VALUE`,
+  /// which is a sentinel rather than a time.
+  ///
+  /// Raised before anything is staged, so a refused frame leaves the
+  /// resampler exactly as it was.
+  #[error("the frame timestamp {pts} does not land on the output timeline")]
+  TimestampOutOfRange {
+    /// The timestamp the frame carried, in its own timebase.
+    pts: i64,
   },
 
   /// The output timeline would leave `i64`. Counted timestamps are

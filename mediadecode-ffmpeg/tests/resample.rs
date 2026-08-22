@@ -655,6 +655,58 @@ fn a_refused_frame_does_not_stamp_the_next_good_one() {
 }
 
 #[test]
+fn a_timestamp_that_cannot_be_rescaled_is_refused_before_anything_moves() {
+  support::init_ffmpeg();
+  // 48 kHz in, 192 kHz out: the anchor is multiplied by four on its way
+  // to the output timeline, so a timestamp near either end of `i64`
+  // leaves it. Saturating hid both: the positive end reached the
+  // counted timeline only after `swr` had eaten the input, and the
+  // negative end landed on `i64::MIN`, which is `AV_NOPTS_VALUE` — the
+  // timestamp was not clamped, it was erased.
+  let source = ResampleSpec::new(48_000, Sample::I16(Type::Packed), ChannelLayout::STEREO);
+  let target = ResampleSpec::new(192_000, Sample::I16(Type::Packed), ChannelLayout::MONO);
+  let mut resampler = FfmpegResampler::new(source, target).expect("open resampler");
+
+  let samples = 480;
+  let bytes = samples as usize * 2 * 2;
+  for pts in [i64::MAX - 1, i64::MIN + 1, i64::MIN] {
+    match resampler.send_frame(&stereo_frame(samples, bytes, Some(pts))) {
+      Err(ResampleError::TimestampOutOfRange { pts: reported }) => {
+        assert_eq!(reported, pts, "the refusal names the timestamp it read");
+      }
+      other => panic!("expected TimestampOutOfRange for {pts}, got {other:?}"),
+    }
+    // Nothing was staged, nothing was converted, nothing is owed: the
+    // refusal happened before `swr` saw a sample.
+    assert_eq!(
+      resampler.delay(),
+      0,
+      "a refused timestamp left input inside the filter",
+    );
+    let mut dst = empty_audio_frame();
+    assert!(
+      resampler
+        .receive_frame(&mut dst)
+        .expect_err("nothing was converted")
+        .is_again(),
+    );
+  }
+
+  // And the anchor never moved: the first frame the session accepts is
+  // still the one that fixes where the stream starts.
+  resampler
+    .send_frame(&stereo_frame(samples, bytes, Some(0)))
+    .expect("an honest frame");
+  let mut out = empty_audio_frame();
+  resampler.receive_frame(&mut out).expect("converted output");
+  assert_eq!(
+    out.pts().expect("stamped").pts(),
+    0,
+    "a refused timestamp anchored the timeline anyway",
+  );
+}
+
+#[test]
 fn the_output_timeline_refuses_to_overflow() {
   support::init_ffmpeg();
   // Equal rates, so the input timestamp reaches the output timeline

@@ -137,7 +137,13 @@ The backend-agnostic core it adapts has its own log at
   refused for its geometry does not anchor or advance the output
   timeline; timestamps are counted with checked arithmetic and an
   overflow is `ResampleError::TimestampOverflow` rather than `i64::MAX`
-  repeated; plane geometry is settled in checked arithmetic *before* any
+  repeated; the anchor itself is rescaled with the checked rung before
+  anything is staged, so a timestamp that cannot land on the output
+  timeline is `ResampleError::TimestampOutOfRange` with the resampler
+  untouched, rather than a clamp — a positive clamp used to surface only
+  after `swr` had consumed the input, and a negative one landed on
+  `i64::MIN`, which is `AV_NOPTS_VALUE`, erasing the timestamp instead
+  of reporting it; plane geometry is settled in checked arithmetic *before* any
   allocation is sized from a frame header, and every allocation is
   checked (`frame::Audio::new` dereferences `av_frame_alloc` unchecked
   and discards `av_frame_get_buffer`'s return, so this crate allocates
