@@ -369,3 +369,310 @@ fn the_needs_more_signal_is_an_error_variant() {
   resampler.flush().expect("flush");
   resampler.send_frame(&frame).expect("reusable after flush");
 }
+
+// ---------------------------------------------------------------------------
+//  Adversarial lanes. Every one of these is a shape a container, a
+//  decoder or a caller can produce and no honest file does.
+// ---------------------------------------------------------------------------
+
+/// A source frame in the 48 kHz stereo packed-s16 spec, whose header
+/// claims `samples` samples while its single plane really holds
+/// `plane_len` bytes. The two agree for an honest frame
+/// (`samples * 2 channels * 2 bytes`) and disagree for a forged one.
+fn stereo_frame(
+  samples: u32,
+  plane_len: usize,
+  pts: Option<i64>,
+) -> mediadecode_ffmpeg::AudioFrame {
+  filled_frame(
+    48_000,
+    samples,
+    2,
+    ChannelLayout::STEREO,
+    &vec![0u8; plane_len],
+    pts,
+  )
+}
+
+/// A mono packed-s16 frame at `rate` holding `samples` samples of
+/// constant amplitude — DC, which a resampler's low-pass keeps rather
+/// than smooths away, so a tail left inside the filter is visible in
+/// the next stream's output.
+fn mono_frame(
+  rate: u32,
+  samples: u32,
+  amplitude: i16,
+  pts: Option<i64>,
+) -> mediadecode_ffmpeg::AudioFrame {
+  let bytes: Vec<u8> = std::iter::repeat_n(amplitude.to_le_bytes(), samples as usize)
+    .flatten()
+    .collect();
+  filled_frame(rate, samples, 1, ChannelLayout::MONO, &bytes, pts)
+}
+
+fn filled_frame(
+  rate: u32,
+  samples: u32,
+  channels: u8,
+  layout: ChannelLayout,
+  bytes: &[u8],
+  pts: Option<i64>,
+) -> mediadecode_ffmpeg::AudioFrame {
+  let plane = mediadecode_ffmpeg::FfmpegBuffer::copy_from_slice(bytes).expect("plane allocation");
+  let planes = std::array::from_fn(|index| {
+    mediadecode::frame::Plane::new(
+      if index == 0 {
+        plane.clone()
+      } else {
+        mediadecode_ffmpeg::FfmpegBuffer::empty()
+      },
+      0,
+    )
+  });
+  mediadecode_ffmpeg::AudioFrame::new(
+    rate,
+    samples,
+    channels,
+    mediadecode_ffmpeg::SampleFormat::S16,
+    mediadecode_ffmpeg::channel_layout_description_from_ffmpeg(&layout),
+    planes,
+    1,
+    Default::default(),
+  )
+  .with_pts(pts.map(|pts| {
+    mediadecode::Timestamp::new(
+      pts,
+      mediadecode::Timebase::new(
+        1,
+        std::num::NonZeroI32::new(rate as i32).expect("a real rate"),
+      ),
+    )
+  }))
+}
+
+#[test]
+fn a_custom_layout_is_refused_by_name() {
+  support::init_ffmpeg();
+
+  // `ResampleSpec::new` is `const` and total, so this is the route that
+  // walks straight past `from_parameters` / `from_decoder` and their
+  // refusals. A CUSTOM `AVChannelLayout` owns a heap channel map that
+  // FFmpeg frees with `av_channel_layout_uninit` — which every owning
+  // `AVFrame` runs on drop — while `ffmpeg_next::ChannelLayout` copies
+  // it by assignment and has no destructor. One staged frame dropped
+  // would free the map this test still holds.
+  let mut raw: ffmpeg_next::ffi::AVChannelLayout = unsafe { std::mem::zeroed() };
+  let rc = unsafe { ffmpeg_next::ffi::av_channel_layout_custom_init(&mut raw, 2) };
+  assert_eq!(rc, 0, "av_channel_layout_custom_init");
+  assert_eq!(
+    raw.order,
+    ffmpeg_next::ffi::AVChannelOrder::AV_CHANNEL_ORDER_CUSTOM,
+    "the layout under test really is a custom one",
+  );
+  let custom = ChannelLayout(raw);
+
+  let hazardous = ResampleSpec::new(48_000, Sample::I16(Type::Packed), custom);
+  match FfmpegResampler::new(hazardous, mono_16k()) {
+    Err(ResampleError::UnsupportedLayout { end, channels, .. }) => {
+      assert_eq!(end.to_string(), "source");
+      assert_eq!(channels, 2);
+    }
+    Err(other) => panic!("expected UnsupportedLayout, got {other:?}"),
+    Ok(_) => panic!("a custom layout must not reach swr or a staged frame"),
+  }
+
+  // The same refusal from the other end.
+  let source = ResampleSpec::new(48_000, Sample::I16(Type::Packed), ChannelLayout::STEREO);
+  assert!(matches!(
+    FfmpegResampler::new(
+      source,
+      ResampleSpec::new(16_000, Sample::I16(Type::Packed), custom)
+    ),
+    Err(ResampleError::UnsupportedLayout {
+      end: mediadecode_ffmpeg::SpecEnd::Target,
+      ..
+    }),
+  ));
+
+  // The map is still ours to free: nothing took a copy of it.
+  unsafe { ffmpeg_next::ffi::av_channel_layout_uninit(&mut raw) };
+
+  // The rest of the roster the choke point owns, since the `const`
+  // constructor cannot.
+  assert!(matches!(
+    FfmpegResampler::new(
+      ResampleSpec::new(0, Sample::I16(Type::Packed), ChannelLayout::STEREO),
+      mono_16k(),
+    ),
+    Err(ResampleError::UnsupportedRate { rate: 0, .. }),
+  ));
+  assert!(matches!(
+    FfmpegResampler::new(
+      ResampleSpec::new(48_000, Sample::None, ChannelLayout::STEREO),
+      mono_16k(),
+    ),
+    Err(ResampleError::UnsupportedFormat { .. }),
+  ));
+  let mut empty: ffmpeg_next::ffi::AVChannelLayout = unsafe { std::mem::zeroed() };
+  empty.nb_channels = 0;
+  assert!(matches!(
+    FfmpegResampler::new(
+      ResampleSpec::new(48_000, Sample::I16(Type::Packed), ChannelLayout(empty)),
+      mono_16k(),
+    ),
+    Err(ResampleError::UnsupportedLayout { channels: 0, .. }),
+  ));
+}
+
+#[test]
+fn a_forged_frame_geometry_is_refused_before_it_can_allocate() {
+  support::init_ffmpeg();
+  let source = ResampleSpec::new(48_000, Sample::I16(Type::Packed), ChannelLayout::STEREO);
+  let mut resampler = FfmpegResampler::new(source, mono_16k()).expect("open resampler");
+
+  // A header claiming more samples than a `c_int` can hold, over a
+  // plane holding sixteen bytes. Sizing the staging allocation off the
+  // header first does not merely waste memory: `av_frame_get_buffer`
+  // refuses the truncated count, the failure is not checked, and the
+  // unbacked frame goes on to `swr_convert_frame` — with a negative
+  // sample count. The geometry has to be settled before any of that.
+  let forged = stereo_frame(u32::MAX, 16, None);
+  match resampler.send_frame(&forged) {
+    Err(ResampleError::PlaneCount { expected, found }) => {
+      assert_eq!(found, 16, "the plane's real length is what was compared");
+      assert!(expected > found);
+    }
+    other => panic!("expected a geometry refusal, got {other:?}"),
+  }
+
+  // A packed frame with no planes at all.
+  let planeless = mediadecode_ffmpeg::AudioFrame::new(
+    48_000,
+    128,
+    2,
+    mediadecode_ffmpeg::SampleFormat::S16,
+    mediadecode_ffmpeg::channel_layout_description_from_ffmpeg(&ChannelLayout::STEREO),
+    std::array::from_fn(|_| {
+      mediadecode::frame::Plane::new(mediadecode_ffmpeg::FfmpegBuffer::empty(), 0)
+    }),
+    0,
+    Default::default(),
+  );
+  assert!(matches!(
+    resampler.send_frame(&planeless),
+    Err(ResampleError::PlaneCount {
+      expected: 1,
+      found: 0
+    }),
+  ));
+
+  // And an honest frame still goes through afterwards: the refusals
+  // above left nothing broken behind them.
+  resampler
+    .send_frame(&stereo_frame(480, 480 * 2 * 2, Some(0)))
+    .expect("an honest frame");
+}
+
+#[test]
+fn a_refused_frame_does_not_stamp_the_next_good_one() {
+  support::init_ffmpeg();
+  let source = ResampleSpec::new(48_000, Sample::I16(Type::Packed), ChannelLayout::STEREO);
+  let mut resampler = FfmpegResampler::new(source, mono_16k()).expect("open resampler");
+
+  // The first frame the session ever sees is a forged one carrying a
+  // timestamp far down the timeline. Anchoring before staging took its
+  // word for where the stream starts.
+  let forged = stereo_frame(4_800, 16, Some(48_000 * 60));
+  assert!(matches!(
+    resampler.send_frame(&forged),
+    Err(ResampleError::PlaneCount { .. }),
+  ));
+
+  // Then the real first frame, at zero.
+  resampler
+    .send_frame(&stereo_frame(4_800, 4_800 * 2 * 2, Some(0)))
+    .expect("an honest frame");
+
+  let mut out = empty_audio_frame();
+  resampler.receive_frame(&mut out).expect("converted output");
+  assert_eq!(
+    out.pts().expect("stamped").pts(),
+    0,
+    "the rejected frame's timestamp must not have anchored the timeline",
+  );
+}
+
+#[test]
+fn the_output_timeline_refuses_to_overflow() {
+  support::init_ffmpeg();
+  // Equal rates, so the input timestamp reaches the output timeline
+  // unrescaled and the arithmetic under test is the only thing that
+  // can move it.
+  let source = ResampleSpec::new(48_000, Sample::I16(Type::Packed), ChannelLayout::STEREO);
+  let target = ResampleSpec::new(48_000, Sample::I16(Type::Packed), ChannelLayout::MONO);
+  let mut resampler = FfmpegResampler::new(source, target).expect("open resampler");
+
+  let samples = 4_800;
+  let frame = stereo_frame(samples, samples as usize * 2 * 2, Some(i64::MAX - 8));
+  match resampler.send_frame(&frame) {
+    Err(ResampleError::TimestampOverflow { pts, samples }) => {
+      assert_eq!(pts, i64::MAX - 8);
+      assert!(samples > 8, "the count that would not fit");
+    }
+    other => panic!("expected TimestampOverflow, got {other:?}"),
+  }
+}
+
+#[test]
+fn flush_leaves_nothing_of_the_previous_stream_behind() {
+  support::init_ffmpeg();
+  // A fractional ratio, so the filter really holds a tail between
+  // calls: 44100 -> 16000 is 441:160.
+  let source = ResampleSpec::new(44_100, Sample::I16(Type::Packed), ChannelLayout::MONO);
+  let mut resampler = FfmpegResampler::new(source, mono_16k()).expect("open resampler");
+
+  let mut out = empty_audio_frame();
+  for index in 0..4 {
+    let pts = index * 4_410;
+    resampler
+      .send_frame(&mono_frame(44_100, 4_410, 20_000, Some(pts)))
+      .expect("send_frame");
+    while resampler.receive_frame(&mut out).is_ok() {}
+  }
+  assert!(
+    resampler.delay() > 0,
+    "the filter has to be holding something for the reset to matter",
+  );
+
+  resampler.flush().expect("flush");
+  assert_eq!(
+    resampler.delay(),
+    0,
+    "a flush that reports success cannot leave the old delay line inside swr",
+  );
+
+  // A second stream, silent, starting at zero. Anything the first one
+  // left behind arrives here as the loud DC it was.
+  let mut loudest = 0i16;
+  let mut first_pts = None;
+  for index in 0..4 {
+    resampler
+      .send_frame(&mono_frame(44_100, 4_410, 0, Some(index * 4_410)))
+      .expect("send_frame");
+    while resampler.receive_frame(&mut out).is_ok() {
+      first_pts.get_or_insert(out.pts().expect("stamped").pts());
+      let valid = out.nb_samples() as usize * 2;
+      for chunk in out.planes()[0].data_ref().as_ref()[..valid]
+        .as_chunks::<2>()
+        .0
+      {
+        loudest = loudest.max(i16::from_le_bytes(*chunk).abs());
+      }
+    }
+  }
+  assert_eq!(first_pts, Some(0), "the new stream owns the new timeline");
+  assert!(
+    loudest < 100,
+    "silence came out at amplitude {loudest}: the previous stream's tail survived the flush",
+  );
+}

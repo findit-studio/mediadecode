@@ -27,7 +27,7 @@ use std::{
 use ffmpeg_next::{
   ChannelLayout,
   codec::Parameters,
-  ffi::{AVChannelOrder, AVSampleFormat, av_channel_layout_from_mask},
+  ffi::{AVChannelOrder, AVSampleFormat, av_channel_layout_from_mask, av_frame_get_buffer},
   format::Sample,
   frame,
   software::resampling,
@@ -62,6 +62,15 @@ pub struct ResampleSpec {
 
 impl ResampleSpec {
   /// Constructs a spec from its three parts.
+  ///
+  /// Deliberately total and `const`: a spec is a description, and
+  /// describing something `swr` cannot convert is not itself an error.
+  /// [`FfmpegResampler::new`] is the choke point every construction
+  /// route passes through, and it is what refuses a rate, a format or a
+  /// channel layout this backend cannot honour — see
+  /// [`FfmpegResampler::new`] for the roster and
+  /// [`ResampleError::UnsupportedLayout`] for why a layout can be
+  /// refused at all.
   #[inline]
   pub const fn new(rate: u32, format: Sample, layout: ChannelLayout) -> Self {
     Self {
@@ -218,18 +227,26 @@ impl FfmpegResampler {
   /// ([`ResampleSpec::from_decoder`]). The target is the caller's, and
   /// is options: 16 kHz mono for a speech model, 48 kHz for an
   /// audio-event one, both from the same track.
+  ///
+  /// # The choke point
+  ///
+  /// [`ResampleSpec::new`] is `const` and total, so this is where both
+  /// ends are checked — every construction route (`from_parameters`,
+  /// `from_decoder`, the public constructor) passes through here, and
+  /// nothing hazardous reaches `swr` or a staged `AVFrame` behind it:
+  ///
+  /// - a rate of zero, or one past `c_int`
+  ///   ([`ResampleError::UnsupportedRate`]);
+  /// - `AV_SAMPLE_FMT_NONE` ([`ResampleError::UnsupportedFormat`]);
+  /// - a channel layout that is neither native nor unspecified, or one
+  ///   naming no channels ([`ResampleError::UnsupportedLayout`]).
   pub fn new(source: ResampleSpec, target: ResampleSpec) -> Result<Self, ResampleError> {
+    check_spec(&source, SpecEnd::Source)?;
+    check_spec(&target, SpecEnd::Target)?;
+
     let staged_source_layout = initialized_layout(source.layout);
     let staged_target_layout = initialized_layout(target.layout);
-    let ctx = resampling::Context::get(
-      source.format,
-      staged_source_layout,
-      source.rate,
-      target.format,
-      staged_target_layout,
-      target.rate,
-    )
-    .map_err(|e| ResampleError::Resample(Error::Ffmpeg(e)))?;
+    let ctx = open_context(&source, &target, staged_source_layout, staged_target_layout)?;
 
     let source_format = SampleFormat::from_ffmpeg(source.format);
     // SAFETY: the layout is a live `ChannelLayout` owned by `source`
@@ -294,26 +311,68 @@ impl FfmpegResampler {
   }
 
   /// Stages a decoded frame as an `AVFrame` swr can read.
+  ///
+  /// Geometry is settled **before** anything is allocated. A frame's
+  /// header is a claim, not a fact: `nb_samples` comes from the same
+  /// foreign memory as the planes it describes, and sizing an
+  /// allocation off it first would let a forged frame with a
+  /// twelve-byte plane ask for tens of gigabytes on its way to being
+  /// refused.
   fn stage_input(&self, frame: &Frame) -> Result<frame::Audio, ResampleError> {
     let samples = frame.nb_samples() as usize;
-    let mut input = frame::Audio::new(self.source.format, samples, self.staged_source_layout);
-    input.set_rate(self.source.rate);
+    let channels = self.source.channels();
 
-    let planes = input.planes();
-    if planes > frame.plane_count() as usize {
+    // What the *format* requires, not what the allocated frame reports
+    // — the frame does not exist yet.
+    let planes = if self.source.format.is_planar() {
+      channels.max(0) as usize
+    } else {
+      1
+    };
+    let found = frame.plane_count() as usize;
+    if planes > found {
       return Err(ResampleError::PlaneCount {
         expected: planes,
-        found: frame.plane_count() as usize,
+        found,
       });
     }
-    let bytes = plane_bytes(self.source.format, samples, self.source.channels());
+    let bytes = plane_bytes(self.source.format, samples, channels)
+      .ok_or(ResampleError::SampleCount { requested: samples })?;
+    for plane in frame.planes().iter().take(planes) {
+      let src = plane.data_ref().as_ref();
+      if src.len() < bytes {
+        return Err(ResampleError::PlaneCount {
+          expected: bytes,
+          found: src.len(),
+        });
+      }
+    }
+
+    // Only now, with every plane proved long enough for the sample
+    // count that sizes this allocation.
+    let mut input = new_audio_frame(
+      self.source.format,
+      samples,
+      self.source.rate,
+      self.staged_source_layout,
+    )?;
+    // What the allocation really produced. `data_mut` panics past its
+    // own plane count, and this crate does not put a panic on a path
+    // that reads foreign geometry.
+    let staged = input.planes();
+    if staged < planes {
+      return Err(ResampleError::PlaneCount {
+        expected: planes,
+        found: staged,
+      });
+    }
     for (index, plane) in frame.planes().iter().take(planes).enumerate() {
       let src = plane.data_ref().as_ref();
       let dst = input.data_mut(index);
-      if src.len() < bytes || dst.len() < bytes {
+      if dst.len() < bytes {
         return Err(ResampleError::PlaneCount {
           expected: bytes,
-          found: src.len().min(dst.len()),
+          found: dst.len(),
         });
       }
       dst[..bytes].copy_from_slice(&src[..bytes]);
@@ -324,7 +383,7 @@ impl FfmpegResampler {
   /// Allocates an output frame large enough for everything currently
   /// convertible: the delay line's contents plus `in_samples` of new
   /// input, rescaled to the output rate and rounded up.
-  fn alloc_output(&self, in_samples: i64) -> frame::Audio {
+  fn alloc_output(&self, in_samples: i64) -> Result<frame::Audio, ResampleError> {
     let delay_in = self.ctx.delay().map_or(0, |d| d.input.max(0));
     let total = delay_in.saturating_add(in_samples).max(0) as i128;
     let scaled = (total * i128::from(self.target.rate) + i128::from(self.source.rate) - 1)
@@ -333,21 +392,47 @@ impl FfmpegResampler {
     // an output frame one short would silently push the remainder into
     // the internal FIFO where the pts accounting cannot see it until
     // the next call.
-    let samples = (scaled + 1).clamp(1, i128::from(i32::MAX)) as usize;
-    let mut out = frame::Audio::new(self.target.format, samples, self.staged_target_layout);
-    out.set_rate(self.target.rate);
-    out
+    let samples = scaled + 1;
+    // `av_frame_get_buffer` takes the count as a `c_int`. A request
+    // past that is refused by name rather than clamped: a silently
+    // shortened output frame is a stream that loses samples.
+    if samples > i128::from(i32::MAX) {
+      return Err(ResampleError::SampleCount {
+        // Saturating only for a count past `usize` itself, which no
+        // machine could hold either way.
+        requested: usize::try_from(samples).unwrap_or(usize::MAX),
+      });
+    }
+    new_audio_frame(
+      self.target.format,
+      samples.max(1) as usize,
+      self.target.rate,
+      self.staged_target_layout,
+    )
   }
 
   /// Labels a converted `AVFrame` on the counted output timeline and
   /// turns it into a `mediadecode` frame.
+  ///
+  /// The timeline moves **after** the conversion succeeds. A frame that
+  /// could not be converted has not been delivered, so the next one
+  /// that can be must carry the timestamp this one would have had —
+  /// otherwise a single conversion failure punches a permanent hole in
+  /// an otherwise continuous output stream.
   fn take_output(&mut self, mut out: frame::Audio) -> Result<Option<Frame>, ResampleError> {
     let produced = out.samples() as i64;
     if produced <= 0 {
       return Ok(None);
     }
     let pts = self.next_pts.unwrap_or(0);
-    self.next_pts = Some(pts.saturating_add(produced));
+    // Counted, not saturated: `i64::MAX` repeated for every later frame
+    // is not a timeline, it is a lie with the shape of one.
+    let next = pts
+      .checked_add(produced)
+      .ok_or(ResampleError::TimestampOverflow {
+        pts,
+        samples: produced,
+      })?;
     out.set_pts(Some(pts));
     // SAFETY: `out` is a live, just-converted `AVFrame`; the conversion
     // refcounts each plane it takes, so `out` may be dropped after.
@@ -356,6 +441,7 @@ impl FfmpegResampler {
     }
     let frame = unsafe { convert::av_frame_to_audio_frame(out.as_ptr(), self.target_timebase) }
       .map_err(ResampleError::Convert)?;
+    self.next_pts = Some(next);
     Ok(Some(frame))
   }
 }
@@ -370,23 +456,35 @@ impl AudioResampler for FfmpegResampler {
       return Err(ResampleError::AfterEof);
     }
     self.check_source(frame)?;
-
-    // Anchor the output timeline on the first input timestamp. Anchored
-    // on *input* rather than on the first output, because a first call
-    // that produces nothing but fills the delay line still fixes where
-    // the stream starts.
-    if self.next_pts.is_none()
-      && let Some(pts) = frame.pts()
-    {
-      self.next_pts = Some(pts.rescale_to(self.target_timebase).pts());
+    // A frame carrying no samples is a header and nothing else. There
+    // is nothing to convert and nothing to stage: `av_frame_get_buffer`
+    // refuses a zero-sample allocation, so staging one would hand `swr`
+    // an unbacked `AVFrame` for no gain.
+    if frame.nb_samples() == 0 {
+      return Ok(());
     }
 
+    // Nothing below touches the session's state until the conversion
+    // has succeeded. A refused frame must leave the timeline exactly
+    // where it was, or the next good frame inherits the rejected one's
+    // timestamp.
+    let anchor = frame
+      .pts()
+      .map(|pts| pts.rescale_to(self.target_timebase).pts());
     let input = self.stage_input(frame)?;
-    let mut out = self.alloc_output(frame.nb_samples() as i64);
+    let mut out = self.alloc_output(frame.nb_samples() as i64)?;
     self
       .ctx
       .run(&input, &mut out)
       .map_err(|e| ResampleError::Resample(Error::Ffmpeg(e)))?;
+
+    // The frame is inside the filter now, so the timeline may be
+    // anchored on it. Anchored on *input* rather than on the first
+    // output, because a call that produces nothing but fills the delay
+    // line still fixes where the stream starts.
+    if self.next_pts.is_none() {
+      self.next_pts = anchor;
+    }
     if let Some(converted) = self.take_output(out)? {
       self.ready.push_back(converted);
     }
@@ -407,12 +505,12 @@ impl AudioResampler for FfmpegResampler {
     if remaining <= 0 {
       return Err(ResampleError::Again);
     }
-    let mut out = frame::Audio::new(
+    let mut out = new_audio_frame(
       self.target.format,
-      remaining as usize,
+      remaining.min(i64::from(i32::MAX)) as usize,
+      self.target.rate,
       self.staged_target_layout,
-    );
-    out.set_rate(self.target.rate);
+    )?;
     self
       .ctx
       .flush(&mut out)
@@ -431,34 +529,32 @@ impl AudioResampler for FfmpegResampler {
     Ok(())
   }
 
+  /// Resets the resampler for another stream on the same two specs.
+  ///
+  /// The `swr` context is **rebuilt**, not drained. `swresample` has no
+  /// reset call, and draining it dry cannot be verified from outside: a
+  /// `swr_convert_frame` that makes no progress reports no error, so a
+  /// drain loop that gives up and a drain loop that finished are
+  /// indistinguishable — and a flush that returned `Ok` with the old
+  /// delay line still inside would let one stream's tail contaminate
+  /// the next. A fresh context is the only reset whose success is a
+  /// fact.
+  ///
+  /// The new context is built before the old one is dropped, so a
+  /// failure leaves the resampler exactly as it was: this call either
+  /// resets everything or changes nothing.
   fn flush(&mut self) -> Result<(), ResampleError> {
+    let ctx = open_context(
+      &self.source,
+      &self.target,
+      self.staged_source_layout,
+      self.staged_target_layout,
+    )?;
+    self.ctx = ctx;
     self.ready.clear();
     self.next_pts = None;
     self.eof = false;
-    // Drain and discard whatever the filter still holds, so the next
-    // stream does not inherit the previous one's tail. `swr` has no
-    // reset call; running it dry is the reset.
-    //
-    // The loop is bounded because a `flush` that yielded nothing would
-    // otherwise spin: each pass must strictly shrink the delay, and any
-    // pass that does not ends it.
-    let mut previous = i64::MAX;
-    loop {
-      let remaining = self.delay();
-      if remaining <= 0 || remaining >= previous {
-        break;
-      }
-      previous = remaining;
-      let mut out = frame::Audio::new(
-        self.target.format,
-        remaining as usize,
-        self.staged_target_layout,
-      );
-      out.set_rate(self.target.rate);
-      if self.ctx.flush(&mut out).is_err() || out.samples() == 0 {
-        break;
-      }
-    }
+    debug_assert_eq!(self.delay(), 0, "a fresh swr context holds nothing");
     Ok(())
   }
 }
@@ -516,6 +612,76 @@ pub enum ResampleError {
     found: usize,
   },
 
+  /// A sample count no frame can hold: one whose byte size overflows,
+  /// or one past the `c_int` `av_frame_get_buffer` takes.
+  #[error("{requested} samples is not a frame size")]
+  SampleCount {
+    /// The count that was asked for.
+    requested: usize,
+  },
+
+  /// One end of the conversion declares a sample rate `swr` cannot be
+  /// driven with — zero, or past `c_int`.
+  #[error("the {end} rate {rate} is not a sample rate swr can use")]
+  UnsupportedRate {
+    /// Which end of the conversion.
+    end: SpecEnd,
+    /// The rate that was declared.
+    rate: u32,
+  },
+
+  /// One end of the conversion declares no sample format
+  /// (`AV_SAMPLE_FMT_NONE`) — the state a codec context is in before
+  /// its decoder opens.
+  #[error("the {end} spec names no sample format")]
+  UnsupportedFormat {
+    /// Which end of the conversion.
+    end: SpecEnd,
+  },
+
+  /// One end of the conversion declares a channel layout this backend
+  /// will not carry.
+  ///
+  /// Native and unspecified layouts are the two it does. A **custom**
+  /// or **ambisonic** `AVChannelLayout` owns a heap-allocated channel
+  /// map, and FFmpeg documents that such a layout must be copied with
+  /// `av_channel_layout_copy` rather than assigned — while
+  /// `ffmpeg_next::ChannelLayout` is a `Copy` wrapper with no
+  /// destructor. Every `AVFrame` this type stages or allocates receives
+  /// the layout by assignment, and `av_frame_free` runs
+  /// `av_channel_layout_uninit` on it: the first staged frame to be
+  /// dropped would free a map the spec, the decoder and every later
+  /// frame still point at. Refusing at construction is what keeps that
+  /// use-after-free unreachable; a resampler over those layouts is a
+  /// separate design, not a silent approximation.
+  #[error("the {end} channel layout is not supported: order {order}, {channels} channels")]
+  UnsupportedLayout {
+    /// Which end of the conversion.
+    end: SpecEnd,
+    /// `AVChannelOrder` as the raw integer it is on the wire.
+    order: i32,
+    /// The channel count the layout declares.
+    channels: i32,
+  },
+
+  /// The output timeline would leave `i64`. Counted timestamps are
+  /// exact or they are nothing, so this is named rather than saturated.
+  #[error("the output timeline overflows: {pts} + {samples} samples")]
+  TimestampOverflow {
+    /// Where the timeline stood.
+    pts: i64,
+    /// How many samples were produced.
+    samples: i64,
+  },
+
+  /// `av_frame_alloc` returned null — the frame header itself could not
+  /// be allocated.
+  #[error("out of memory allocating an audio frame of {samples} samples")]
+  FrameAlloc {
+    /// The sample count the frame was to hold.
+    samples: usize,
+  },
+
   /// The wrapped `swresample` call reported an error.
   #[error(transparent)]
   Resample(#[from] Error),
@@ -535,15 +701,133 @@ impl ResampleError {
   }
 }
 
-/// Bytes one plane holds for `samples` samples of `format`. Packed
-/// formats keep every channel in the single plane; planar formats give
-/// each channel its own.
-fn plane_bytes(format: Sample, samples: usize, channels: i32) -> usize {
-  let per_sample = format.bytes();
+/// Which end of a conversion a refusal is about.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SpecEnd {
+  /// The spec frames must arrive in.
+  Source,
+  /// The spec frames leave in.
+  Target,
+}
+
+impl core::fmt::Display for SpecEnd {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.write_str(match self {
+      Self::Source => "source",
+      Self::Target => "target",
+    })
+  }
+}
+
+/// Refuses a spec `swr` cannot be driven with, or whose channel layout
+/// cannot be carried by value — see [`ResampleError::UnsupportedLayout`]
+/// for that one, which is the whole reason this check exists at the
+/// choke point rather than in the `const` constructor.
+fn check_spec(spec: &ResampleSpec, end: SpecEnd) -> Result<(), ResampleError> {
+  if spec.rate == 0 || spec.rate > i32::MAX as u32 {
+    return Err(ResampleError::UnsupportedRate {
+      end,
+      rate: spec.rate,
+    });
+  }
+  if spec.format == Sample::None {
+    return Err(ResampleError::UnsupportedFormat { end });
+  }
+  // The order is read as the integer it is on the wire rather than
+  // matched as an `AVChannelOrder`, the discipline this crate keeps
+  // everywhere it touches a bindgen enum.
+  //
+  // SAFETY: `spec.layout` is a live `ChannelLayout` owned by the
+  // caller's spec for the duration of this call; `addr_of!` reaches its
+  // `order` field without forming a reference to the enum.
+  let order = unsafe { read_unaligned(addr_of!(spec.layout.0.order).cast::<i32>()) };
+  let channels = spec.layout.channels();
+  let carried = order == AVChannelOrder::AV_CHANNEL_ORDER_NATIVE as i32
+    || order == AVChannelOrder::AV_CHANNEL_ORDER_UNSPEC as i32;
+  if !carried || channels <= 0 {
+    return Err(ResampleError::UnsupportedLayout {
+      end,
+      order,
+      channels,
+    });
+  }
+  Ok(())
+}
+
+/// Opens a `swr` context for the two specs. Shared by
+/// [`FfmpegResampler::new`] and the rebuild
+/// [`AudioResampler::flush`] performs.
+fn open_context(
+  source: &ResampleSpec,
+  target: &ResampleSpec,
+  staged_source_layout: ChannelLayout,
+  staged_target_layout: ChannelLayout,
+) -> Result<resampling::Context, ResampleError> {
+  resampling::Context::get(
+    source.format,
+    staged_source_layout,
+    source.rate,
+    target.format,
+    staged_target_layout,
+    target.rate,
+  )
+  .map_err(|e| ResampleError::Resample(Error::Ffmpeg(e)))
+}
+
+/// Allocates an audio `AVFrame`, checking every step the dependency's
+/// own `frame::Audio::new` does not.
+///
+/// `ffmpeg_next`'s constructor dereferences `av_frame_alloc`'s result
+/// without a null check and discards `av_frame_get_buffer`'s return
+/// value, so an allocation failure there yields a frame whose planes
+/// are not backed — which is then handed to FFI. Both are checked here;
+/// on failure the caller gets a named error and no frame at all.
+fn new_audio_frame(
+  format: Sample,
+  samples: usize,
+  rate: u32,
+  layout: ChannelLayout,
+) -> Result<frame::Audio, ResampleError> {
+  if samples == 0 || samples > i32::MAX as usize {
+    return Err(ResampleError::SampleCount { requested: samples });
+  }
+  // `Audio::empty()` owns the `av_frame_alloc` it performs and frees it
+  // on drop; `av_frame_free` tolerates the null pointer a failed
+  // allocation would leave behind, so an early return here is sound.
+  let mut out = frame::Audio::empty();
+  // SAFETY: reading the pointer the constructor stored. Every setter
+  // below dereferences it, so the null check has to come first.
+  if unsafe { out.as_ptr() }.is_null() {
+    return Err(ResampleError::FrameAlloc { samples });
+  }
+  out.set_format(format);
+  out.set_samples(samples);
+  // The layout is assigned by value, which is sound only because
+  // `check_spec` refused every layout that owns a heap channel map.
+  out.set_channel_layout(layout);
+  out.set_rate(rate);
+  // SAFETY: `out` is a live `AVFrame` whose format, sample count and
+  // layout were just set; `av_frame_get_buffer` allocates its planes
+  // and reports failure in its return value, which is checked.
+  let rc = unsafe { av_frame_get_buffer(out.as_mut_ptr(), 0) };
+  if rc < 0 {
+    return Err(ResampleError::Resample(Error::Ffmpeg(
+      ffmpeg_next::Error::from(rc),
+    )));
+  }
+  Ok(out)
+}
+
+/// Bytes one plane holds for `samples` samples of `format`, or `None`
+/// when that product does not fit a `usize`. Packed formats keep every
+/// channel in the single plane; planar formats give each channel its
+/// own.
+fn plane_bytes(format: Sample, samples: usize, channels: i32) -> Option<usize> {
+  let bytes = samples.checked_mul(format.bytes())?;
   if format.is_planar() {
-    samples * per_sample
+    Some(bytes)
   } else {
-    samples * per_sample * channels.max(1) as usize
+    bytes.checked_mul(channels.max(1) as usize)
   }
 }
 
@@ -691,11 +975,25 @@ mod tests {
     // Packed: one plane holding every channel.
     assert_eq!(
       plane_bytes(Sample::I16(Type::Packed), 1024, 2),
-      1024 * 2 * 2
+      Some(1024 * 2 * 2)
     );
     // Planar: one plane per channel, so the count does not multiply in.
-    assert_eq!(plane_bytes(Sample::I16(Type::Planar), 1024, 2), 1024 * 2);
-    assert_eq!(plane_bytes(Sample::F32(Type::Planar), 1024, 6), 1024 * 4);
+    assert_eq!(
+      plane_bytes(Sample::I16(Type::Planar), 1024, 2),
+      Some(1024 * 2)
+    );
+    assert_eq!(
+      plane_bytes(Sample::F32(Type::Planar), 1024, 6),
+      Some(1024 * 4)
+    );
+    // A sample count whose byte size does not fit is not a size. This
+    // is the arithmetic that used to run before the allocation it
+    // feeds, and it wrapped.
+    assert_eq!(
+      plane_bytes(Sample::F32(Type::Packed), usize::MAX / 2, 8),
+      None,
+      "an overflowing plane size is refused, not wrapped",
+    );
   }
 
   #[test]

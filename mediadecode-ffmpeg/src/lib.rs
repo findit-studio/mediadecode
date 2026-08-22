@@ -43,7 +43,7 @@ pub use decoder::VideoDecoder;
 pub use demuxer::{DemuxError, FfmpegDemuxer};
 pub use error::{Error, Result};
 pub use frame::Frame;
-pub use resampler::{FfmpegResampler, ResampleError, ResampleSpec};
+pub use resampler::{FfmpegResampler, ResampleError, ResampleSpec, SpecEnd};
 pub use sample_format::SampleFormat;
 pub use subtitle::{FfmpegSubtitleStreamDecoder, SubtitleDecodeError};
 pub use video::{FfmpegVideoStreamDecoder, VideoDecodeError};
