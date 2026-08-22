@@ -61,9 +61,14 @@ fn run(path: &std::path::Path, target: ResampleSpec) -> Converted {
     .position(|t| t.kind() == TrackKind::Audio)
     .expect("an audio track");
   let info = &demuxer.tracks()[track];
-  let mut decoder =
-    FfmpegAudioStreamDecoder::open(info.extra().parameters().clone(), info.timebase())
-      .expect("open decoder");
+  let mut decoder = FfmpegAudioStreamDecoder::open(
+    info
+      .extra()
+      .clone_parameters()
+      .expect("the checked handoff"),
+    info.timebase(),
+  )
+  .expect("open decoder");
 
   // The source spec comes off the opened decoder: it is exactly what
   // the frames will carry. The track's declared parameters agree here

@@ -8,7 +8,9 @@
 
 use std::vec::Vec;
 
-use ffmpeg_next::codec::Parameters;
+use ffmpeg_next::{codec::Parameters, ffi::avcodec_parameters_copy};
+
+use crate::demuxer::DemuxError;
 
 /// Per-`VideoPacket` extras.
 #[derive(Clone, Debug, Default)]
@@ -992,20 +994,63 @@ impl AttachmentPacketExtra {
   }
 }
 
+/// A deep copy of codec parameters, with both fallible steps checked.
+///
+/// `ffmpeg_next`'s `Clone` for `Parameters` checks neither.
+/// `Parameters::new` does not test `avcodec_parameters_alloc` for null
+/// and the copy dereferences the result immediately — measured under a
+/// capped allocator, that is a SIGSEGV — while
+/// `avcodec_parameters_copy`'s return value is discarded, so a copy
+/// that failed part way yields parameters that look complete and open a
+/// decoder wrong.
+///
+/// A partial copy leaves with `out`'s own destructor:
+/// `avcodec_parameters_copy` resets the destination before it starts,
+/// so whatever it managed to allocate belongs to `out`.
+pub(crate) fn clone_parameters(
+  source: &Parameters,
+  stream_index: usize,
+) -> Result<Parameters, DemuxError> {
+  let mut out = Parameters::new();
+  // SAFETY: reading the pointer the constructor stored without
+  // dereferencing it — which is exactly what the check is for.
+  if unsafe { out.as_ptr() }.is_null() {
+    return Err(DemuxError::ParametersAlloc { stream_index });
+  }
+  // SAFETY: both pointers are live `AVCodecParameters` — the
+  // destination freshly allocated and non-null, the source owned by its
+  // holder for the duration of this call.
+  let rc = unsafe { avcodec_parameters_copy(out.as_mut_ptr(), source.as_ptr()) };
+  if rc < 0 {
+    return Err(DemuxError::ParametersCopy {
+      stream_index,
+      source: ffmpeg_next::Error::from(rc),
+    });
+  }
+  Ok(out)
+}
+
 /// Per-`TrackInfo` extras — the FFmpeg side of one track-table row.
 ///
 /// Carries the stream's [`Parameters`], which is what opens a decoder
-/// for the track: `FfmpegAudioStreamDecoder::open(track.extra()
-/// .parameters().clone(), track.timebase())`. The clone is a deep
-/// `avcodec_parameters_copy` with no tie back to the format context,
-/// so a decoder outlives the demuxer that named it.
+/// for the track — through [`Self::clone_parameters`], which is a deep
+/// `avcodec_parameters_copy` with no tie back to the format context, so
+/// a decoder outlives the demuxer that named it.
+///
+/// **No `Clone`, and no `Default`.** Both would have to go through
+/// `ffmpeg_next`'s `Clone` / `Default` for [`Parameters`], which check
+/// neither the allocation nor the copy: safe public code could
+/// dereference a null destination or receive parameters that are
+/// quietly incomplete. `Clone` cannot report either, so this type does
+/// not implement it; [`Self::try_clone`] is the same copy with the
+/// answer a caller can act on, and [`Self::clone_parameters`] is the
+/// handoff a decoder actually needs.
 ///
 /// `disposition` is the raw `AV_DISPOSITION_*` bit set, not
 /// `ffmpeg_next::format::stream::Disposition`. That type's
 /// `from_bits_truncate` drops bits the linked build has no constant
 /// for, and this crate's stance on bit sets is that every pattern is a
 /// value — the same reason `PacketFlags` reaches the wire as a number.
-#[derive(Clone, Default)]
 pub struct TrackExtra {
   stream_index: i32,
   disposition: i32,
@@ -1028,6 +1073,31 @@ impl TrackExtra {
       frame_count: None,
       parameters,
     }
+  }
+
+  /// A deep copy of this row, with the codec-parameter copy checked.
+  ///
+  /// The fallible counterpart of the `Clone` this type deliberately
+  /// does not implement — see the type's own documentation for why.
+  pub fn try_clone(&self) -> Result<Self, DemuxError> {
+    Ok(Self {
+      stream_index: self.stream_index,
+      disposition: self.disposition,
+      start_time: self.start_time,
+      frame_count: self.frame_count,
+      parameters: self.clone_parameters()?,
+    })
+  }
+
+  /// An owned deep copy of the track's codec parameters — the handoff
+  /// that opens a decoder for this track.
+  ///
+  /// `FfmpegAudioStreamDecoder::open(track.extra().clone_parameters()?,
+  /// track.timebase())`. Fallible because the copy is: an allocation
+  /// failure here is the difference between a decoder that is not
+  /// opened and one opened on parameters that are not the file's.
+  pub fn clone_parameters(&self) -> Result<Parameters, DemuxError> {
+    clone_parameters(&self.parameters, self.stream_index.max(0) as usize)
   }
 
   /// Returns the source `AVStream.index`.

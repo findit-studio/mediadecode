@@ -932,9 +932,30 @@ pub fn attachment_packet_from_ffmpeg(
 /// the refusal unreachable against this build.
 fn md_flags_from_packet(packet: &Packet) -> Result<MdPacketFlags, PacketBufferError> {
   use ffmpeg_next::packet::Ref;
-  // SAFETY: `packet` keeps the `AVPacket` live; `flags` is a public
+  // SAFETY: `packet` keeps the `AVPacket` live for the call, which is
+  // all the raw reader asks.
+  unsafe { md_flags_from_av_packet(packet.as_ptr()) }
+}
+
+/// [`md_flags_from_packet`] for an `AVPacket` that has no safe wrapper
+/// — the one libavformat embeds in an `AVStream` for cover art.
+///
+/// The demuxer hoists that packet by hand, and hoisting it *without*
+/// its flags was how an attached picture arrived with none: FFmpeg
+/// marks it `AV_PKT_FLAG_KEY`, which is the one thing a still image is
+/// certain to be. One reader, so a second construction site cannot
+/// quietly disagree with the five that go through the boundary.
+///
+/// # Safety
+///
+/// `pkt` must be a live `*const AVPacket` for the duration of this
+/// call.
+pub(crate) unsafe fn md_flags_from_av_packet(
+  pkt: *const ffmpeg_next::ffi::AVPacket,
+) -> Result<MdPacketFlags, PacketBufferError> {
+  // SAFETY: `pkt` is live per the contract above; `flags` is a public
   // field and a plain `c_int`.
-  let raw = unsafe { (*packet.as_ptr()).flags };
+  let raw = unsafe { (*pkt).flags };
   let carried = i32::from(u8::MAX);
   if raw & !carried != 0 {
     return Err(PacketBufferError::UnrepresentableFlags { raw });

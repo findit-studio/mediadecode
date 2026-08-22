@@ -305,7 +305,26 @@ The backend-agnostic core it adapts has its own log at
   this build names fits the byte `PacketFlags` carries; a packet
   carrying one that does not is refused
   (`PacketBufferError::UnrepresentableFlags`) rather than delivered a
-  bit short.
+  bit short. The hoisted cover-art packet reads its flags through the
+  same reader: it is built by hand from `AVStream.attached_pic` rather
+  than through the boundary conversion, and it used to be built with
+  none at all — FFmpeg marks an attached picture `AV_PKT_FLAG_KEY`, so
+  every cover this crate delivered arrived saying it was not a
+  keyframe. A synthesized attachment still carries no flags, because
+  no packet was parked to read them from.
+
+- **`TrackExtra` no longer derives `Clone` or `Default`, and the
+  decoder handoff is checked.** Both derives went through
+  `ffmpeg_next`'s `Clone` / `Default` for `Parameters`, so copying a
+  track row from safe public code reached the same unchecked
+  allocation — measured, a SIGSEGV — and the documented handoff was
+  `parameters().clone()`, which is that same clone. `Clone` cannot
+  report a failure, so the type does not implement it:
+  `TrackExtra::try_clone` is the row copy with an answer, and
+  `TrackExtra::clone_parameters` is the handoff that opens a decoder.
+  `parameters()` still lends the parameters for inspection —
+  `ResampleSpec::from_parameters` reads them — but nothing in this crate
+  asks a caller to clone them unchecked any more.
 
 - **A track's codec parameters are copied with both fallible steps
   checked.** `ffmpeg_next`'s `Clone` for `Parameters` checks neither:

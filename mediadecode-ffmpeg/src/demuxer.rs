@@ -55,10 +55,9 @@ use std::{
 
 use ffmpeg_next::{
   Packet, Rational,
-  codec::Parameters,
   ffi::{
     AV_DISPOSITION_ATTACHED_PIC, AV_DISPOSITION_TIMED_THUMBNAILS, AV_NOPTS_VALUE, AVDictionary,
-    av_dict_get, avcodec_parameters_copy,
+    av_dict_get,
   },
   format::{self, context::Input},
   media,
@@ -487,10 +486,13 @@ fn build_tracks(input: &Input) -> Result<BuiltTracks, DemuxError> {
       }
     };
 
-    let extra = TrackExtra::new(index as i32, clone_parameters(&parameters, index)?)
-      .with_disposition(disposition)
-      .with_start_time((raw_start != AV_NOPTS_VALUE).then_some(raw_start))
-      .with_frame_count((frames > 0).then_some(frames));
+    let extra = TrackExtra::new(
+      index as i32,
+      crate::extras::clone_parameters(&parameters, index)?,
+    )
+    .with_disposition(disposition)
+    .with_start_time((raw_start != AV_NOPTS_VALUE).then_some(raw_start))
+    .with_frame_count((frames > 0).then_some(frames));
 
     // SAFETY: `stream` keeps the `AVStream` — and so its metadata
     // dictionary — live across both reads. The dictionary is read
@@ -526,42 +528,6 @@ fn build_tracks(input: &Input) -> Result<BuiltTracks, DemuxError> {
   }
 
   Ok((tracks, pending))
-}
-
-/// A deep copy of a track's codec parameters, with both fallible steps
-/// checked.
-///
-/// `ffmpeg_next`'s `Clone` for `Parameters` checks neither.
-/// `Parameters::new` does not test `avcodec_parameters_alloc` for null,
-/// and the very next thing `clone_from` does is dereference it; and
-/// `clone_from` discards `avcodec_parameters_copy`'s return, so a copy
-/// that failed part way — an extradata allocation, typically — yields
-/// parameters that look fine, open a decoder wrong, and say nothing.
-/// Every track in the table goes through this, so the failure would be
-/// a whole session built on parameters that are not the file's.
-///
-/// A partial copy is freed by `out`'s own destructor on the way out:
-/// `avcodec_parameters_copy` resets the destination before it starts,
-/// so whatever it managed to allocate belongs to `out` and goes with
-/// it.
-fn clone_parameters(source: &Parameters, stream_index: usize) -> Result<Parameters, DemuxError> {
-  let mut out = Parameters::new();
-  // SAFETY: reading the pointer the constructor stored, without
-  // dereferencing it — which is exactly what the check is for.
-  if unsafe { out.as_ptr() }.is_null() {
-    return Err(DemuxError::ParametersAlloc { stream_index });
-  }
-  // SAFETY: both pointers are live `AVCodecParameters` — the
-  // destination freshly allocated and non-null, the source owned by the
-  // stream for the duration of this call.
-  let rc = unsafe { avcodec_parameters_copy(out.as_mut_ptr(), source.as_ptr()) };
-  if rc < 0 {
-    return Err(DemuxError::ParametersCopy {
-      stream_index,
-      source: ffmpeg_next::Error::from(rc),
-    });
-  }
-  Ok(out)
 }
 
 /// Whether a stream's disposition makes it an **attachment** — a
@@ -699,7 +665,23 @@ unsafe fn attached_pic_payload(
     })?;
   let extra = AttachmentPacketExtra::new(index as i32);
   Ok(match captured {
-    Some(payload) => AttachmentPacket::new(payload, extra),
+    Some(payload) => {
+      // The hoisted packet's own flags, through the same raw reader the
+      // five boundary conversions use. FFmpeg marks an attached picture
+      // `AV_PKT_FLAG_KEY` — a still image is a keyframe if anything is
+      // — and building this one with empty flags dropped that, along
+      // with `CORRUPT` and every other bit the packet really carried.
+      // SAFETY: `pkt` points at the live embedded `AVPacket`.
+      let flags = unsafe { boundary::md_flags_from_av_packet(pkt) }.map_err(|source| {
+        DemuxError::PacketBuffer {
+          stream_index: index,
+          source,
+        }
+      })?;
+      AttachmentPacket::new(payload, extra).with_flags(flags)
+    }
+    // Nothing was parked, so there are no flags to read: an empty set
+    // is the honest answer for a packet this layer invented.
     None => AttachmentPacket::new(
       FfmpegBuffer::copy_from_slice(&[]).ok_or(DemuxError::AttachmentAlloc {
         stream_index: index,
@@ -766,7 +748,10 @@ fn rate_to_timebase(value: Rational) -> Option<Timebase> {
 mod tests {
   use ffmpeg_next::ffi::{av_dict_free, av_dict_set};
 
+  use ffmpeg_next::codec::Parameters;
+
   use super::*;
+  use crate::extras::TrackExtra;
 
   /// Builds a dictionary holding one entry whose *value* is the given
   /// raw bytes. The bytes go in as a C string, which is all
@@ -897,7 +882,7 @@ mod tests {
           "the source allocates before the cap goes on",
         );
         crate::fault_subprocess::cap_ffmpeg_allocations(1);
-        let refused = clone_parameters(&source, 4);
+        let refused = crate::extras::clone_parameters(&source, 4);
         crate::fault_subprocess::uncap_ffmpeg_allocations();
         assert!(
           matches!(
@@ -909,7 +894,45 @@ mod tests {
         );
         // And with the cap lifted the same copy succeeds, so the
         // refusal was the allocator's answer and not a broken helper.
-        clone_parameters(&source, 4).expect("an uncapped copy");
+        crate::extras::clone_parameters(&source, 4).expect("an uncapped copy");
+      },
+    );
+  }
+
+  #[test]
+  fn the_public_track_extra_copies_are_checked_too() {
+    // The helper protected `build_tracks` and nothing else: `TrackExtra`
+    // derived `Clone` and `Default` over `ffmpeg_next`'s `Parameters`,
+    // whose clone dereferences an unchecked allocation — so safe public
+    // code could still reach the SIGSEGV by copying a track row. The
+    // derives are gone; what replaces them answers.
+    crate::fault_subprocess::in_subprocess(
+      "demuxer::tests::the_public_track_extra_copies_are_checked_too",
+      || {
+        let source = Parameters::new();
+        assert!(!unsafe { source.as_ptr() }.is_null(), "allocated uncapped");
+        let extra = TrackExtra::new(
+          6,
+          crate::extras::clone_parameters(&source, 6).expect("uncapped"),
+        );
+
+        crate::fault_subprocess::cap_ffmpeg_allocations(1);
+        let cloned = extra.try_clone().map(|_| ());
+        let handed = extra.clone_parameters().map(|_| ());
+        crate::fault_subprocess::uncap_ffmpeg_allocations();
+
+        assert!(
+          matches!(cloned, Err(DemuxError::ParametersAlloc { stream_index: 6 })),
+          "TrackExtra::try_clone: {cloned:?}",
+        );
+        assert!(
+          matches!(handed, Err(DemuxError::ParametersAlloc { stream_index: 6 })),
+          "TrackExtra::clone_parameters: {handed:?}",
+        );
+
+        // And both work once the allocator does.
+        extra.try_clone().expect("an uncapped row copy");
+        extra.clone_parameters().expect("an uncapped handoff");
       },
     );
   }
@@ -939,14 +962,14 @@ mod tests {
         // Big enough for the destination `AVCodecParameters`, far too
         // small for its extradata.
         crate::fault_subprocess::cap_ffmpeg_allocations(64 * 1024);
-        let refused = clone_parameters(&source, 2);
+        let refused = crate::extras::clone_parameters(&source, 2);
         crate::fault_subprocess::uncap_ffmpeg_allocations();
         match refused {
           Err(DemuxError::ParametersCopy { stream_index, .. }) => assert_eq!(stream_index, 2),
           Err(other) => panic!("expected ParametersCopy, got {other:?}"),
           Ok(_) => panic!("a copy that could not copy the extradata must not succeed"),
         }
-        clone_parameters(&source, 2).expect("an uncapped copy");
+        crate::extras::clone_parameters(&source, 2).expect("an uncapped copy");
       },
     );
   }

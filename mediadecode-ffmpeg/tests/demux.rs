@@ -304,7 +304,10 @@ fn decoded_samples(path: &std::path::Path, strip_side_data: bool) -> u64 {
     .expect("an audio track");
   let info = &demuxer.tracks()[track];
   let mut decoder = mediadecode_ffmpeg::FfmpegAudioStreamDecoder::open(
-    info.extra().parameters().clone(),
+    info
+      .extra()
+      .clone_parameters()
+      .expect("the checked handoff"),
     info.timebase(),
   )
   .expect("open decoder");
@@ -364,6 +367,112 @@ fn side_data_survives_from_the_container_to_the_codec() {
     carried, 88_200,
     "the trim is applied but lands wrong ({stripped} untrimmed)",
   );
+}
+
+/// Re-runs one of this file's tests in a child process, alone, and
+/// asserts the child exited cleanly having really run it.
+///
+/// `av_max_alloc` is process-global, so a lane that makes every FFmpeg
+/// allocation fail cannot share a process with anything else; and a
+/// lane whose point is that the process *survives* needs a process that
+/// could have died.
+fn in_subprocess(test_name: &str, body: impl FnOnce()) {
+  const CHILD: &str = "MEDIADECODE_FFMPEG_DEMUX_FAULT_CHILD";
+  if std::env::var(CHILD).as_deref() == Ok(test_name) {
+    body();
+    return;
+  }
+  let exe = std::env::current_exe().expect("the test binary");
+  let output = std::process::Command::new(exe)
+    .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+    .env(CHILD, test_name)
+    .output()
+    .expect("spawning the child");
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  assert_eq!(
+    output.status.code(),
+    Some(0),
+    "the child running `{test_name}` did not exit cleanly ({:?})\n{stdout}\n{}",
+    output.status,
+    String::from_utf8_lossy(&output.stderr),
+  );
+  assert!(
+    stdout.contains("1 passed"),
+    "the child ran no test — is `{test_name}` still the name?\n{stdout}",
+  );
+}
+
+#[test]
+fn the_demux_to_decoder_handoff_survives_an_allocation_fault() {
+  let Some(corpus) = Corpus::new() else { return };
+  // The public path, from a real container: a caller takes a track row
+  // and asks it for the parameters that open a decoder. That handoff
+  // used to be `parameters().clone()` — `ffmpeg_next`'s unchecked
+  // clone, which dereferences a failed allocation. Under a capped
+  // allocator this lane would then have died; now it is an error with a
+  // name, and the process is still here to say so.
+  let path = corpus.cover_art_mp3();
+  in_subprocess(
+    "the_demux_to_decoder_handoff_survives_an_allocation_fault",
+    move || {
+      let demuxer = FfmpegDemuxer::open(&path).expect("open mp3");
+      let track = demuxer
+        .tracks()
+        .iter()
+        .find(|t| t.kind() == TrackKind::Audio)
+        .expect("an audio track");
+
+      // SAFETY: `av_max_alloc` stores an atomic; this child runs alone.
+      unsafe { ffmpeg_next::ffi::av_max_alloc(1) };
+      let refused = track.extra().clone_parameters().map(|_| ());
+      unsafe { ffmpeg_next::ffi::av_max_alloc(i32::MAX as usize) };
+
+      assert!(
+        matches!(refused, Err(DemuxError::ParametersAlloc { .. })),
+        "expected a named refusal, got {refused:?}",
+      );
+
+      // And the handoff really is the one that opens a decoder.
+      let parameters = track.extra().clone_parameters().expect("uncapped");
+      mediadecode_ffmpeg::FfmpegAudioStreamDecoder::open(parameters, track.timebase())
+        .expect("the handoff opens a decoder");
+    },
+  );
+}
+
+#[test]
+fn a_hoisted_cover_art_packet_keeps_its_flags() {
+  let Some(corpus) = Corpus::new() else { return };
+  // The hoisted attachment is built by hand from `AVStream.attached_pic`
+  // rather than through the boundary conversion, and it used to be
+  // built with no flags at all. FFmpeg marks an attached picture
+  // `AV_PKT_FLAG_KEY` — a still image is a keyframe if anything is —
+  // so "no flags" was visibly wrong for every cover art this crate has
+  // ever delivered.
+  let mut demuxer = FfmpegDemuxer::open(&corpus.cover_art_mp3()).expect("open mp3");
+  let first = demuxer.next_packet().expect("pull").expect("a packet");
+  let DemuxedPacket::Attachment { packet, .. } = first else {
+    panic!("the cover comes first");
+  };
+  assert!(
+    !packet.extra().synthesized(),
+    "this is the hoisted packet, not one this layer invented",
+  );
+  assert!(
+    packet.flags().contains(PacketFlags::KEY),
+    "the hoisted packet lost the flags it really carried: {:?}",
+    packet.flags(),
+  );
+
+  // The synthesized one is a different case and says so: nothing was
+  // parked, so there are no flags to carry.
+  let mut demuxer = FfmpegDemuxer::open(&corpus.multi_track_mkv()).expect("open mkv");
+  let first = demuxer.next_packet().expect("pull").expect("a packet");
+  let DemuxedPacket::Attachment { packet, .. } = first else {
+    panic!("the font comes first");
+  };
+  assert!(packet.extra().synthesized());
+  assert_eq!(packet.flags(), PacketFlags::empty());
 }
 
 #[test]
