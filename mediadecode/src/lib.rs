@@ -21,9 +21,11 @@ pub mod adapter;
 pub mod cfa;
 pub mod color;
 pub mod decoder;
+pub mod demuxer;
 pub mod frame;
 pub mod packet;
 pub mod pixel_format;
+pub mod resampler;
 pub mod subtitle;
 
 #[cfg(feature = "future")]
