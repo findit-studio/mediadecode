@@ -11,6 +11,8 @@ The backend-agnostic core it adapts has its own log at
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-08-24
+
 ### Added
 
 - **`FfmpegDemuxer` implements `Demuxer::take_tracks`**, the
