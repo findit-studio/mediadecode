@@ -21,6 +21,7 @@ mod ffi;
 mod frame;
 mod pixdesc;
 mod reader_guard;
+#[cfg(feature = "resample")]
 mod resampler;
 mod sample_format;
 mod subtitle;
@@ -45,6 +46,8 @@ pub use decoder::VideoDecoder;
 pub use demuxer::{DemuxError, FfmpegDemuxer};
 pub use error::{Error, Result};
 pub use frame::Frame;
+#[cfg(feature = "resample")]
+#[cfg_attr(docsrs, doc(cfg(feature = "resample")))]
 pub use resampler::{FfmpegResampler, ResampleError, ResampleSpec, SpecEnd};
 pub use sample_format::SampleFormat;
 pub use subtitle::{FfmpegSubtitleStreamDecoder, SubtitleDecodeError};

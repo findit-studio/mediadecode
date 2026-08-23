@@ -311,6 +311,10 @@ impl FfmpegBuffer {
   /// runs and trims them to what it produced afterwards, so no
   /// allocation and no failure is left on the far side of the
   /// conversion.
+  ///
+  /// `resampler`'s only caller — gated with it, or this is dead code
+  /// whenever the `resample` feature is off.
+  #[cfg(feature = "resample")]
   #[inline]
   pub(crate) fn shrink_to(&mut self, len: usize) {
     self.len = self.len.min(len);
