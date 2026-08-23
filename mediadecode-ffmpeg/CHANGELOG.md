@@ -11,6 +11,8 @@ The backend-agnostic core it adapts has its own log at
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-08-23
+
 ### Added
 
 - **`FfmpegDemuxer` — `mediadecode`'s demux tier over `libavformat`.**
