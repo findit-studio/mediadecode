@@ -96,7 +96,7 @@ fn decode_one_frame_through_trait() {
     if s.index() != stream_index {
       continue;
     }
-    let pkt = match video_packet_from_ffmpeg(&av_packet) {
+    let pkt = match video_packet_from_ffmpeg(&av_packet).expect("a wrappable payload") {
       Some(p) => p,
       None => continue,
     };

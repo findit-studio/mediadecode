@@ -702,7 +702,7 @@ impl VideoStreamDecoder for FfmpegVideoStreamDecoder {
     packet: &VideoPacket<VideoPacketExtra, Self::Buffer>,
   ) -> Result<(), Self::Error> {
     let av_pkt = boundary::ffmpeg_packet_from_video_packet(packet)
-      .map_err(|e| VideoDecodeError::Decode(Error::Ffmpeg(e)))?;
+      .map_err(|e| VideoDecodeError::Decode(Error::PacketBuild(e)))?;
     match &mut self.state {
       DecodeState::Hw(hw) => match hw.send_packet(&av_pkt) {
         Ok(()) => Ok(()),

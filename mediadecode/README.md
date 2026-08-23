@@ -19,9 +19,11 @@ Generic, `no_std`-friendly type-and-trait spine for media decoders.
 
 The backend-agnostic core of the [`mediadecode`](https://github.com/findit-studio/mediadecode)
 workspace. Defines the unified `Packet` / `Frame` types,
-`VideoAdapter` / `AudioAdapter` / `SubtitleAdapter` traits, and the
+`VideoAdapter` / `AudioAdapter` / `SubtitleAdapter` traits, the
 matching push-style `*StreamDecoder` traits that concrete decoder
-backends implement.
+backends implement, and the two tiers on either side of them: the
+`Demuxer` session that produces packets and the `AudioResampler` seam
+that reshapes decoded audio.
 
 This crate ships **no decoder code** and **no FFmpeg dependency**.
 It's `no_std`-clean (with optional `alloc` / `std` features) and zero
@@ -54,6 +56,15 @@ bytes. Adapter implementations live in sibling crates such as
   `SubtitleStreamDecoder`. Push-style `send_packet` /
   `receive_frame` / `send_eof` / `flush` shape; mirrors FFmpeg's
   decoder API while staying backend-agnostic.
+- **The demux tier** — `Demuxer`, the pull session over an opened
+  container (`tracks()` / `next_packet()` / `seek()`), the five-arm
+  `DemuxedPacket` envelope, the `TrackInfo` / `TrackParams` /
+  `TrackKind` table, and the `DemuxAdapter` vocabulary bundle. Opening
+  is each backend's own, so the trait covers only the opened session.
+- **The resample seam** — `AudioResampler`, the `AudioStreamDecoder`
+  push pair one tier along, converting rate, sample format and channel
+  layout between a source spec read off `TrackInfo` and a target spec
+  that is always the caller's options.
 - **Time primitives** — re-exported `Timebase` / `Timestamp` /
   `TimeRange` from [`mediatime`](https://crates.io/crates/mediatime),
   so consumers don't need a separate dep.

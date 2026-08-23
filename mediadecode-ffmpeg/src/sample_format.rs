@@ -14,7 +14,10 @@
 
 use core::fmt;
 
-use ffmpeg_next::ffi::AVSampleFormat;
+use ffmpeg_next::{
+  ffi::AVSampleFormat,
+  format::{Sample, sample::Type as SampleType},
+};
 
 /// Audio sample format identifier.
 #[repr(transparent)]
@@ -101,6 +104,46 @@ impl SampleFormat {
   pub const FLTP: Self = Self(AVSampleFormat::AV_SAMPLE_FMT_FLTP as i32);
   /// 64-bit double, planar.
   pub const DBLP: Self = Self(AVSampleFormat::AV_SAMPLE_FMT_DBLP as i32);
+
+  /// The [`ffmpeg_next::format::Sample`] this identifier names, or
+  /// `None` for [`Self::NONE`] and for any integer outside the closed
+  /// set above.
+  ///
+  /// The inverse of [`Self::from_raw`], and the direction that has to
+  /// exist for this newtype to be usable as *input* to FFmpeg's safe
+  /// API — `swr_alloc_set_opts2` and `AVFrame` allocation both take the
+  /// format, and a raw integer read out of a container cannot be cast
+  /// back into the bindgen enum to get there. Matching against
+  /// compile-time constants is the way across, exactly as
+  /// [`crate::boundary::from_av_pixel_format`] comes the other way.
+  #[inline]
+  pub const fn to_ffmpeg(self) -> Option<Sample> {
+    Some(match self {
+      Self::U8 => Sample::U8(SampleType::Packed),
+      Self::S16 => Sample::I16(SampleType::Packed),
+      Self::S32 => Sample::I32(SampleType::Packed),
+      Self::S64 => Sample::I64(SampleType::Packed),
+      Self::FLT => Sample::F32(SampleType::Packed),
+      Self::DBL => Sample::F64(SampleType::Packed),
+      Self::U8P => Sample::U8(SampleType::Planar),
+      Self::S16P => Sample::I16(SampleType::Planar),
+      Self::S32P => Sample::I32(SampleType::Planar),
+      Self::S64P => Sample::I64(SampleType::Planar),
+      Self::FLTP => Sample::F32(SampleType::Planar),
+      Self::DBLP => Sample::F64(SampleType::Planar),
+      _ => return None,
+    })
+  }
+
+  /// The identifier for an [`ffmpeg_next::format::Sample`] — the safe
+  /// direction, since `Sample` is ffmpeg-next's own Rust enum and
+  /// converting it to `AVSampleFormat` constructs the bindgen enum from
+  /// a known constant rather than from foreign memory.
+  #[inline]
+  pub fn from_ffmpeg(value: Sample) -> Self {
+    let raw: AVSampleFormat = value.into();
+    Self::from_raw(raw as i32)
+  }
 }
 
 impl fmt::Debug for SampleFormat {

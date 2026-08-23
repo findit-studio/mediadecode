@@ -8,6 +8,10 @@
 
 use std::vec::Vec;
 
+use ffmpeg_next::{codec::Parameters, ffi::avcodec_parameters_copy};
+
+use crate::demuxer::DemuxError;
+
 /// Per-`VideoPacket` extras.
 #[derive(Clone, Debug, Default)]
 pub struct VideoPacketExtra {
@@ -447,16 +451,19 @@ pub struct SubtitlePacketExtra {
   stream_index: i32,
   language: Option<[u8; 3]>,
   forced: bool,
+  side_data: Vec<SideDataEntry>,
 }
 
 impl SubtitlePacketExtra {
   /// Constructs a `SubtitlePacketExtra` with the given stream index.
+  /// `side_data` defaults to empty.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new(stream_index: i32) -> Self {
     Self {
       stream_index,
       language: None,
       forced: false,
+      side_data: Vec::new(),
     }
   }
 
@@ -475,6 +482,16 @@ impl SubtitlePacketExtra {
   pub const fn forced(&self) -> bool {
     self.forced
   }
+  /// Returns the raw side-data entries from `AVPacket.side_data`.
+  ///
+  /// A subtitle packet's side data is rare but not absent — and a
+  /// packet that carries *nothing else* is exactly the case this seat
+  /// exists for: with no seat, a side-data-only packet has nowhere to
+  /// put its only content.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn side_data(&self) -> &[SideDataEntry] {
+    self.side_data.as_slice()
+  }
 
   /// Sets the stream index (consuming builder).
   #[cfg_attr(not(tarpaulin), inline(always))]
@@ -488,6 +505,19 @@ impl SubtitlePacketExtra {
   #[must_use]
   pub const fn with_language(mut self, value: Option<[u8; 3]>) -> Self {
     self.language = value;
+    self
+  }
+  /// Sets the side-data list (consuming builder).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
+  pub fn with_side_data(mut self, value: Vec<SideDataEntry>) -> Self {
+    self.side_data = value;
+    self
+  }
+  /// Sets the side-data list in place.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn set_side_data(&mut self, value: Vec<SideDataEntry>) -> &mut Self {
+    self.side_data = value;
     self
   }
   /// Sets the forced flag (consuming builder).
@@ -805,6 +835,383 @@ impl ContentLightLevel {
   pub const fn set_max_fall(&mut self, value: u32) -> &mut Self {
     self.max_fall = value;
     self
+  }
+}
+
+// ---------------------------------------------------------------------------
+//  The demux tier's carriers.
+// ---------------------------------------------------------------------------
+
+/// Per-`DataPacket` extras — timecode, KLV, timed ID3.
+///
+/// The same three seats as [`VideoPacketExtra`]. The side-data list was
+/// left off at first — data demuxers carry their whole payload in the
+/// packet body — and then earned its place: a packet with no body and
+/// only side data is a real packet, and without this seat its only
+/// content would have nowhere to go.
+#[derive(Clone, Debug, Default)]
+pub struct DataPacketExtra {
+  stream_index: i32,
+  byte_pos: Option<i64>,
+  side_data: Vec<SideDataEntry>,
+}
+
+impl DataPacketExtra {
+  /// Constructs a `DataPacketExtra` with the given stream index.
+  /// `byte_pos` defaults to `None` and `side_data` to empty.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(stream_index: i32) -> Self {
+    Self {
+      stream_index,
+      byte_pos: None,
+      side_data: Vec::new(),
+    }
+  }
+
+  /// Returns the source `AVStream.index`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn stream_index(&self) -> i32 {
+    self.stream_index
+  }
+  /// Returns the byte position of the packet in the input file, or
+  /// `None` if unknown.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn byte_pos(&self) -> Option<i64> {
+    self.byte_pos
+  }
+  /// Returns the raw side-data entries from `AVPacket.side_data`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn side_data(&self) -> &[SideDataEntry] {
+    self.side_data.as_slice()
+  }
+
+  /// Sets the stream index (consuming builder).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
+  pub const fn with_stream_index(mut self, value: i32) -> Self {
+    self.stream_index = value;
+    self
+  }
+  /// Sets the byte position (consuming builder).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
+  pub const fn with_byte_pos(mut self, value: Option<i64>) -> Self {
+    self.byte_pos = value;
+    self
+  }
+  /// Sets the side-data list (consuming builder).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
+  pub fn with_side_data(mut self, value: Vec<SideDataEntry>) -> Self {
+    self.side_data = value;
+    self
+  }
+
+  /// Sets the stream index in place.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn set_stream_index(&mut self, value: i32) -> &mut Self {
+    self.stream_index = value;
+    self
+  }
+  /// Sets the byte position in place.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn set_byte_pos(&mut self, value: Option<i64>) -> &mut Self {
+    self.byte_pos = value;
+    self
+  }
+  /// Sets the side-data list in place.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn set_side_data(&mut self, value: Vec<SideDataEntry>) -> &mut Self {
+    self.side_data = value;
+    self
+  }
+}
+
+/// Per-`AttachmentPacket` extras — fonts, cover art.
+///
+/// `synthesized` records where the payload came from, which is not a
+/// detail: an attachment track's single packet is either a real packet
+/// the container stores (cover art, which libavformat parks in
+/// `AVStream.attached_pic`) or one this crate builds out of the
+/// track's codec extradata (fonts, whose bytes never appear in the
+/// packet stream at all). A consumer chasing a payload that looks
+/// wrong needs to know which.
+#[derive(Clone, Debug, Default)]
+pub struct AttachmentPacketExtra {
+  stream_index: i32,
+  synthesized: bool,
+}
+
+impl AttachmentPacketExtra {
+  /// Constructs an `AttachmentPacketExtra` with the given stream index.
+  /// `synthesized` defaults to `false`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(stream_index: i32) -> Self {
+    Self {
+      stream_index,
+      synthesized: false,
+    }
+  }
+
+  /// Returns the source `AVStream.index`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn stream_index(&self) -> i32 {
+    self.stream_index
+  }
+  /// `true` when the payload was built from the track's codec
+  /// extradata rather than taken from a packet the container stores.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn synthesized(&self) -> bool {
+    self.synthesized
+  }
+
+  /// Sets the stream index (consuming builder).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
+  pub const fn with_stream_index(mut self, value: i32) -> Self {
+    self.stream_index = value;
+    self
+  }
+  /// Sets the synthesized flag (consuming builder).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
+  pub const fn with_synthesized(mut self, value: bool) -> Self {
+    self.synthesized = value;
+    self
+  }
+
+  /// Sets the stream index in place.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn set_stream_index(&mut self, value: i32) -> &mut Self {
+    self.stream_index = value;
+    self
+  }
+  /// Sets the synthesized flag in place.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn set_synthesized(&mut self, value: bool) -> &mut Self {
+    self.synthesized = value;
+    self
+  }
+}
+
+/// A deep copy of codec parameters, with both fallible steps checked.
+///
+/// `ffmpeg_next`'s `Clone` for `Parameters` checks neither.
+/// `Parameters::new` does not test `avcodec_parameters_alloc` for null
+/// and the copy dereferences the result immediately — measured under a
+/// capped allocator, that is a SIGSEGV — while
+/// `avcodec_parameters_copy`'s return value is discarded, so a copy
+/// that failed part way yields parameters that look complete and open a
+/// decoder wrong.
+///
+/// A partial copy leaves with `out`'s own destructor:
+/// `avcodec_parameters_copy` resets the destination before it starts,
+/// so whatever it managed to allocate belongs to `out`.
+pub(crate) fn clone_parameters(
+  source: &Parameters,
+  stream_index: usize,
+) -> Result<Parameters, DemuxError> {
+  // The *source* first. `Parameters::new()` and `Parameters::default()`
+  // hand back a value whose pointer is null when
+  // `avcodec_parameters_alloc` failed — safe code, no error, no way to
+  // tell — and `avcodec_parameters_copy` dereferences its source. So a
+  // copier that checks only what it allocates still crashes, one
+  // allocator recovery later, on a `Parameters` that never allocated.
+  // SAFETY: reading the pointer without dereferencing it.
+  if unsafe { source.as_ptr() }.is_null() {
+    return Err(DemuxError::ParametersMissing { stream_index });
+  }
+  let mut out = Parameters::new();
+  // SAFETY: reading the pointer the constructor stored without
+  // dereferencing it — which is exactly what the check is for.
+  if unsafe { out.as_ptr() }.is_null() {
+    return Err(DemuxError::ParametersAlloc { stream_index });
+  }
+  // SAFETY: both pointers are live `AVCodecParameters` — the
+  // destination freshly allocated and non-null, the source owned by its
+  // holder for the duration of this call.
+  let rc = unsafe { avcodec_parameters_copy(out.as_mut_ptr(), source.as_ptr()) };
+  if rc < 0 {
+    return Err(DemuxError::ParametersCopy {
+      stream_index,
+      source: ffmpeg_next::Error::from(rc),
+    });
+  }
+  Ok(out)
+}
+
+/// Per-`TrackInfo` extras — the FFmpeg side of one track-table row.
+///
+/// Carries the stream's [`Parameters`], which is what opens a decoder
+/// for the track — through [`Self::clone_parameters`], which is a deep
+/// `avcodec_parameters_copy` with no tie back to the format context, so
+/// a decoder outlives the demuxer that named it.
+///
+/// **No `Clone`, and no `Default`.** Both would have to go through
+/// `ffmpeg_next`'s `Clone` / `Default` for [`Parameters`], which check
+/// neither the allocation nor the copy: safe public code could
+/// dereference a null destination or receive parameters that are
+/// quietly incomplete. `Clone` cannot report either, so this type does
+/// not implement it; [`Self::try_clone`] is the same copy with the
+/// answer a caller can act on, and [`Self::clone_parameters`] is the
+/// handoff a decoder actually needs.
+///
+/// `disposition` is the raw `AV_DISPOSITION_*` bit set, not
+/// `ffmpeg_next::format::stream::Disposition`. That type's
+/// `from_bits_truncate` drops bits the linked build has no constant
+/// for, and this crate's stance on bit sets is that every pattern is a
+/// value — the same reason `PacketFlags` reaches the wire as a number.
+pub struct TrackExtra {
+  stream_index: i32,
+  disposition: i32,
+  start_time: Option<i64>,
+  frame_count: Option<i64>,
+  parameters: Parameters,
+}
+
+impl TrackExtra {
+  /// Constructs a `TrackExtra` from the stream index and its codec
+  /// parameters. Everything else starts absent.
+  ///
+  /// **Fallible, and that is the point.** `Parameters::new()` and
+  /// `Parameters::default()` are safe constructors that hand back a
+  /// null-backed value when `avcodec_parameters_alloc` fails, saying
+  /// nothing; accepting one here would store a landmine that goes off
+  /// later, in a copy, on a thread that has forgotten the allocator
+  /// ever failed. Refusing it at the door is what lets every other
+  /// method on this type — and every reader of
+  /// [`Self::parameters`] — rely on there being parameters at all.
+  ///
+  /// Not `const fn`: [`Parameters`] owns a heap allocation.
+  pub fn new(stream_index: i32, parameters: Parameters) -> Result<Self, DemuxError> {
+    // SAFETY: reading the pointer without dereferencing it.
+    if unsafe { parameters.as_ptr() }.is_null() {
+      return Err(DemuxError::ParametersMissing {
+        stream_index: stream_index.max(0) as usize,
+      });
+    }
+    Ok(Self {
+      stream_index,
+      disposition: 0,
+      start_time: None,
+      frame_count: None,
+      parameters,
+    })
+  }
+
+  /// A deep copy of this row, with the codec-parameter copy checked.
+  ///
+  /// The fallible counterpart of the `Clone` this type deliberately
+  /// does not implement — see the type's own documentation for why.
+  pub fn try_clone(&self) -> Result<Self, DemuxError> {
+    // No re-check: `self` cannot exist over null-backed parameters, and
+    // `clone_parameters` never returns one.
+    Ok(Self {
+      stream_index: self.stream_index,
+      disposition: self.disposition,
+      start_time: self.start_time,
+      frame_count: self.frame_count,
+      parameters: self.clone_parameters()?,
+    })
+  }
+
+  /// An owned deep copy of the track's codec parameters — the handoff
+  /// that opens a decoder for this track.
+  ///
+  /// `FfmpegAudioStreamDecoder::open(track.extra().clone_parameters()?,
+  /// track.timebase())`. Fallible because the copy is: an allocation
+  /// failure here is the difference between a decoder that is not
+  /// opened and one opened on parameters that are not the file's.
+  pub fn clone_parameters(&self) -> Result<Parameters, DemuxError> {
+    clone_parameters(&self.parameters, self.stream_index.max(0) as usize)
+  }
+
+  /// Returns the source `AVStream.index`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn stream_index(&self) -> i32 {
+    self.stream_index
+  }
+  /// Returns the raw `AVStream.disposition` bit set.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn disposition(&self) -> i32 {
+    self.disposition
+  }
+  /// Returns the stream's start time in the track's timebase, or
+  /// `None` when the container does not carry one.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn start_time(&self) -> Option<i64> {
+    self.start_time
+  }
+  /// Returns `AVStream.nb_frames` when the container carries it.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn frame_count(&self) -> Option<i64> {
+    self.frame_count
+  }
+  /// Returns the stream's codec parameters — the handle a decoder is
+  /// opened from.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn parameters(&self) -> &Parameters {
+    &self.parameters
+  }
+
+  /// Sets the disposition bits (consuming builder).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
+  pub const fn with_disposition(mut self, value: i32) -> Self {
+    self.disposition = value;
+    self
+  }
+  /// Sets the start time (consuming builder).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
+  pub const fn with_start_time(mut self, value: Option<i64>) -> Self {
+    self.start_time = value;
+    self
+  }
+  /// Sets the frame count (consuming builder).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
+  pub const fn with_frame_count(mut self, value: Option<i64>) -> Self {
+    self.frame_count = value;
+    self
+  }
+
+  /// Sets the disposition bits in place.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn set_disposition(&mut self, value: i32) -> &mut Self {
+    self.disposition = value;
+    self
+  }
+  /// Sets the start time in place.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn set_start_time(&mut self, value: Option<i64>) -> &mut Self {
+    self.start_time = value;
+    self
+  }
+  /// Sets the frame count in place.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn set_frame_count(&mut self, value: Option<i64>) -> &mut Self {
+    self.frame_count = value;
+    self
+  }
+}
+
+impl std::fmt::Debug for TrackExtra {
+  /// Hand-written because [`Parameters`] does not derive `Debug`. The
+  /// medium and codec id are the two fields worth printing; the rest of
+  /// `AVCodecParameters` is per-kind detail the track row already
+  /// carries in typed form.
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("TrackExtra")
+      .field("stream_index", &self.stream_index)
+      .field("disposition", &format_args!("{:#x}", self.disposition))
+      .field("start_time", &self.start_time)
+      .field("frame_count", &self.frame_count)
+      .field(
+        "parameters",
+        &format_args!("{:?}", self.parameters.medium()),
+      )
+      .finish()
   }
 }
 

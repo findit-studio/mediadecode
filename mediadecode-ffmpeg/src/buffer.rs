@@ -155,36 +155,20 @@ impl FfmpegBuffer {
   /// whole AVBufferRef would corrupt downstream consumers that
   /// trust the buffer to be just the compressed bytes.
   ///
-  /// Returns `None` when the packet has no refcounted buffer
-  /// (`buf == NULL`) — callers needing universal coverage of stack-
-  /// or arena-allocated AVPackets can fall back to
+  /// `Ok(None)` means the packet carries no payload at all — an empty
+  /// packet, which some demuxers emit as a marker. That is a fact about
+  /// the packet, and it is kept apart from [`PacketBufferError`], which
+  /// is a failure to take a payload that *is* there: conflating the two
+  /// makes an out-of-memory look like an empty marker and drops real
+  /// compressed bytes without a word. Callers needing universal
+  /// coverage of stack- or arena-allocated AVPackets can fall back to
   /// [`Self::copy_from_slice`] over `packet.data()`.
   #[inline]
-  pub fn from_packet(packet: &ffmpeg_next::Packet) -> Option<Self> {
+  pub fn from_packet(packet: &ffmpeg_next::Packet) -> Result<Option<Self>, PacketBufferError> {
     use ffmpeg_next::packet::Ref;
     // SAFETY: `packet` keeps the AVPacket live for the duration of
-    // this call; `.buf`, `.data`, `.size` are public fields on
-    // AVPacket. `buf` may be null (stack-allocated packets).
-    let buf_ptr = unsafe { (*packet.as_ptr()).buf };
-    if buf_ptr.is_null() {
-      return None;
-    }
-    let data_ptr = unsafe { (*packet.as_ptr()).data };
-    let size_raw = unsafe { (*packet.as_ptr()).size };
-    if data_ptr.is_null() || size_raw <= 0 {
-      return None;
-    }
-    let payload_len = size_raw as usize;
-    // Compute the offset of `data` inside `buf`. AVPacket guarantees
-    // `data` lies within `buf->data .. buf->data + buf->size`, but
-    // we verify defensively with `from_ref_view` (which bounds-
-    // checks against `buf->size`).
-    let buf_data = unsafe { (*buf_ptr).data };
-    if buf_data.is_null() {
-      return None;
-    }
-    let offset = (data_ptr as usize).wrapping_sub(buf_data as usize);
-    unsafe { Self::from_ref_view(buf_ptr, offset, payload_len) }
+    // this call, which is all `payload_of` requires.
+    unsafe { payload_of(packet.as_ptr()) }
   }
 
   /// Borrows one of an `ffmpeg::Frame`'s plane buffers
@@ -317,6 +301,21 @@ impl FfmpegBuffer {
     self.offset
   }
 
+  /// Narrows this view to at most `len` bytes, keeping its start.
+  ///
+  /// Shrink-only and allocation-free: the refcount is untouched and the
+  /// end of the view can only move inward, so the constructor's
+  /// `offset + len <= size` invariant survives by construction. This is
+  /// what lets a view be taken before its final length is known — the
+  /// resampler acquires its output planes' references *before* `swr`
+  /// runs and trims them to what it produced afterwards, so no
+  /// allocation and no failure is left on the far side of the
+  /// conversion.
+  #[inline]
+  pub(crate) fn shrink_to(&mut self, len: usize) {
+    self.len = self.len.min(len);
+  }
+
   /// Fallible counterpart to [`Clone::clone`]. Returns `None` if
   /// `av_buffer_ref` fails (out-of-memory) instead of panicking.
   /// Use this in OOM-recoverable paths; the `Clone` impl panics on
@@ -335,6 +334,163 @@ impl FfmpegBuffer {
       len: self.len,
     })
   }
+}
+
+/// Why a packet could not be carried across the boundary — its payload,
+/// or the side data that comes with it.
+///
+/// Every arm means the bytes are real and this crate could not carry
+/// them — never that there were none. "No payload" is `Ok(None)` from
+/// [`FfmpegBuffer::from_packet`], and keeping the two apart is the
+/// whole point of the type: a demuxer that reads a refcount failure as
+/// an empty marker drops a video packet under memory pressure and
+/// carries on as though the file said so. The side-data arms exist for
+/// the same reason one tier along — a packet whose side data cannot be
+/// carried whole is refused, never delivered with some of it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum PacketBufferError {
+  /// `av_buffer_ref` returned null — out of memory taking a second
+  /// reference to a payload that is there.
+  #[error("out of memory referencing a {len}-byte packet payload")]
+  Refcount {
+    /// The payload's length in bytes.
+    len: usize,
+  },
+
+  /// The payload does not lie inside the packet's own buffer.
+  /// `AVPacket` guarantees it does; a packet that says otherwise is
+  /// malformed, and wrapping it would hand out a view over memory the
+  /// buffer does not own.
+  #[error("a {len}-byte payload at offset {offset} does not lie inside a {size}-byte buffer")]
+  Bounds {
+    /// Where the payload starts inside the buffer.
+    offset: usize,
+    /// The payload's length in bytes.
+    len: usize,
+    /// The buffer's own length in bytes.
+    size: usize,
+  },
+
+  /// A packet declares more side-data entries than this crate will
+  /// walk, or a negative count.
+  ///
+  /// The cap bounds the work a crafted packet can demand *before* it is
+  /// refused. It cannot trip on anything FFmpeg's own packet API
+  /// produces: both `av_packet_new_side_data` and
+  /// `av_packet_add_side_data` replace an entry of the same type, so a
+  /// packet carries at most one entry per named type — forty-three in
+  /// this build, and the cap tracks that number if it ever grows past
+  /// the floor.
+  #[error("a packet declaring {count} side-data entries cannot be carried (limit {cap})")]
+  SideDataEntries {
+    /// The count the packet declared.
+    count: i32,
+    /// The most entries this crate will walk.
+    cap: usize,
+  },
+
+  /// A packet declares side-data entries and carries no array to read
+  /// them from.
+  ///
+  /// Malformed, and named rather than read as "no side data": a null
+  /// array with a positive count is the same silent loss as a truncated
+  /// copy, reached through the pointer instead of the cap.
+  #[error("a packet declaring {count} side-data entries carries no array")]
+  SideDataArray {
+    /// The count the packet declared.
+    count: i32,
+  },
+
+  /// A side-data entry declares bytes it does not carry.
+  #[error("side-data entry {index} declares {size} bytes and carries no data")]
+  SideDataPayload {
+    /// The entry's position in the packet's array.
+    index: usize,
+    /// The length the entry declared.
+    size: usize,
+  },
+
+  /// A packet's side data is larger than this crate will copy.
+  #[error("{bytes} bytes of side data cannot be carried (limit {cap})")]
+  SideDataBytes {
+    /// The total the packet's entries reached.
+    bytes: usize,
+    /// The most bytes this crate will copy.
+    cap: usize,
+  },
+
+  /// A packet carries flag bits the portable vocabulary cannot hold.
+  ///
+  /// `mediadecode`'s `PacketFlags` is a `u8` bit set, and every packet
+  /// flag FFmpeg names today lives in that byte — so this cannot fire
+  /// against this build. It exists so that the day one does not, the
+  /// packet is refused by name instead of arriving with a bit quietly
+  /// missing: the same rule the rest of this boundary keeps.
+  #[error("packet flags {raw:#x} do not fit the portable flag set")]
+  UnrepresentableFlags {
+    /// `AVPacket.flags` as FFmpeg wrote it.
+    raw: i32,
+  },
+
+  /// Out of memory copying a side-data entry.
+  #[error("out of memory copying {size} bytes of side data")]
+  SideDataAlloc {
+    /// The entry's length in bytes.
+    size: usize,
+  },
+}
+
+/// The refcounted payload of a raw `AVPacket`.
+///
+/// Shared by [`FfmpegBuffer::from_packet`] and the demuxer's capture of
+/// `AVStream.attached_pic`, which is an `AVPacket` embedded in the
+/// stream by value and so cannot be reached through the safe wrapper.
+/// One implementation, so the empty-versus-failed distinction cannot
+/// drift between them.
+///
+/// # Safety
+///
+/// `pkt` must be a live `*const AVPacket` for the duration of this
+/// call.
+pub(crate) unsafe fn payload_of(
+  pkt: *const ffmpeg_next::ffi::AVPacket,
+) -> Result<Option<FfmpegBuffer>, PacketBufferError> {
+  // SAFETY: `pkt` is live per the contract above; `.buf`, `.data` and
+  // `.size` are public fields on `AVPacket`, and `buf` may be null
+  // (stack-allocated packets).
+  let buf_ptr = unsafe { (*pkt).buf };
+  let data_ptr = unsafe { (*pkt).data };
+  let size_raw = unsafe { (*pkt).size };
+  if buf_ptr.is_null() || data_ptr.is_null() || size_raw <= 0 {
+    return Ok(None);
+  }
+  let len = size_raw as usize;
+  // SAFETY: `buf_ptr` is a live `AVBufferRef` owned by the packet.
+  let buf_data = unsafe { (*buf_ptr).data };
+  let size = unsafe { (*buf_ptr).size };
+  if buf_data.is_null() {
+    return Err(PacketBufferError::Bounds {
+      offset: 0,
+      len,
+      size,
+    });
+  }
+  // `AVPacket` guarantees `data` lies within
+  // `buf->data .. buf->data + buf->size`. The bounds are checked here
+  // rather than left to `from_ref_view` so that a malformed packet and
+  // a failed `av_buffer_ref` do not come back as the same `None`.
+  let offset = (data_ptr as usize).wrapping_sub(buf_data as usize);
+  match offset.checked_add(len) {
+    Some(end) if end <= size => {}
+    _ => {
+      return Err(PacketBufferError::Bounds { offset, len, size });
+    }
+  }
+  // SAFETY: `buf_ptr` is a live `AVBufferRef`, and the view was just
+  // proved to lie inside it.
+  unsafe { FfmpegBuffer::from_ref_view(buf_ptr, offset, len) }
+    .map(Some)
+    .ok_or(PacketBufferError::Refcount { len })
 }
 
 impl Clone for FfmpegBuffer {

@@ -38,6 +38,10 @@ libc        = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+# The demux and resample lanes generate their own media (multi-track
+# containers, cover art, sine WAVs) with the `ffmpeg` CLI at run time —
+# see `tests/support/mod.rs`. This is where it goes.
+tempfile  = { workspace = true }
 
 [[example]]
 name = "decode"
