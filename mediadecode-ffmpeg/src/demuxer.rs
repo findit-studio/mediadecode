@@ -1005,6 +1005,7 @@ mod tests {
     );
   }
 
+  #[cfg(feature = "resample")]
   #[test]
   fn a_spec_read_from_parameters_that_never_allocated_is_absent() {
     // The same trap at another public door, found by the sweep:

@@ -208,6 +208,15 @@ The backend-agnostic core it adapts has its own log at
   reset that reports success must not leave the previous stream's tail
   inside the filter.
 
+- **`resample` feature, on by default.** `FfmpegResampler`,
+  `ResampleError`, `ResampleSpec`, `SpecEnd` and the
+  `ffmpeg-next/software-resampling` link they need move behind it, so a
+  decode-only consumer building `--no-default-features --features std`
+  drops `libswresample` from the link line entirely rather than merely
+  not calling into it. The core `mediadecode::resampler` trait module
+  stays ungated — it adds no dependency of its own, backend or
+  otherwise, over what the crate already compiles unconditionally.
+
 - **`SampleFormat::to_ffmpeg` / `SampleFormat::from_ffmpeg`** — the
   direction this newtype was missing. A raw sample-format integer read
   out of a container cannot be cast back into the bindgen enum to reach
