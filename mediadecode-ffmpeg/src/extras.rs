@@ -10,7 +10,7 @@ use std::vec::Vec;
 
 use ffmpeg_next::{codec::Parameters, ffi::avcodec_parameters_copy};
 
-use crate::demuxer::DemuxError;
+use crate::demuxer::{DemuxError, ParametersAlloc, ParametersCopy, ParametersMissing};
 
 /// Per-`VideoPacket` extras.
 #[derive(Clone, Debug, Default)]
@@ -1019,23 +1019,27 @@ pub(crate) fn clone_parameters(
   // allocator recovery later, on a `Parameters` that never allocated.
   // SAFETY: reading the pointer without dereferencing it.
   if unsafe { source.as_ptr() }.is_null() {
-    return Err(DemuxError::ParametersMissing { stream_index });
+    return Err(DemuxError::ParametersMissing(ParametersMissing::new(
+      stream_index,
+    )));
   }
   let mut out = Parameters::new();
   // SAFETY: reading the pointer the constructor stored without
   // dereferencing it — which is exactly what the check is for.
   if unsafe { out.as_ptr() }.is_null() {
-    return Err(DemuxError::ParametersAlloc { stream_index });
+    return Err(DemuxError::ParametersAlloc(ParametersAlloc::new(
+      stream_index,
+    )));
   }
   // SAFETY: both pointers are live `AVCodecParameters` — the
   // destination freshly allocated and non-null, the source owned by its
   // holder for the duration of this call.
   let rc = unsafe { avcodec_parameters_copy(out.as_mut_ptr(), source.as_ptr()) };
   if rc < 0 {
-    return Err(DemuxError::ParametersCopy {
+    return Err(DemuxError::ParametersCopy(ParametersCopy::new(
       stream_index,
-      source: ffmpeg_next::Error::from(rc),
-    });
+      ffmpeg_next::Error::from(rc),
+    )));
   }
   Ok(out)
 }
@@ -1105,9 +1109,9 @@ impl TrackExtra {
   pub fn new(stream_index: i32, parameters: Parameters) -> Result<Self, DemuxError> {
     // SAFETY: reading the pointer without dereferencing it.
     if unsafe { parameters.as_ptr() }.is_null() {
-      return Err(DemuxError::ParametersMissing {
-        stream_index: stream_index.max(0) as usize,
-      });
+      return Err(DemuxError::ParametersMissing(ParametersMissing::new(
+        stream_index.max(0) as usize,
+      )));
     }
     Ok(Self {
       stream_index,

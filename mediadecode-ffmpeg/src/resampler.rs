@@ -338,12 +338,12 @@ impl FfmpegResampler {
       || *frame.sample_format() != self.source_format
       || *frame.channel_layout() != self.source_layout
     {
-      return Err(ResampleError::SourceChanged {
-        expected_rate: self.source.rate,
-        expected_format: self.source_format,
-        found_rate: frame.sample_rate(),
-        found_format: *frame.sample_format(),
-      });
+      return Err(ResampleError::SourceChanged(SourceChanged::new(
+        self.source.rate,
+        self.source_format,
+        frame.sample_rate(),
+        *frame.sample_format(),
+      )));
     }
     Ok(())
   }
@@ -365,7 +365,7 @@ impl FfmpegResampler {
       return Ok(None);
     };
     let ticks = timestamp.pts();
-    let out_of_range = || ResampleError::TimestampOutOfRange { pts: ticks };
+    let out_of_range = || ResampleError::TimestampOutOfRange(TimestampOutOfRange::new(ticks));
     // `AV_NOPTS_VALUE` is a sentinel, not a time. A frame carrying it
     // as a value says something contradictory, and anchoring on it
     // would produce output frames that report no timestamp.
@@ -403,20 +403,14 @@ impl FfmpegResampler {
     };
     let found = frame.plane_count() as usize;
     if planes > found {
-      return Err(ResampleError::PlaneCount {
-        expected: planes,
-        found,
-      });
+      return Err(ResampleError::PlaneCount(PlaneCount::new(planes, found)));
     }
     let bytes = plane_bytes(self.source.format, samples, channels)
-      .ok_or(ResampleError::SampleCount { requested: samples })?;
+      .ok_or(ResampleError::SampleCount(SampleCount::new(samples)))?;
     for plane in frame.planes().iter().take(planes) {
       let src = plane.data_ref().as_ref();
       if src.len() < bytes {
-        return Err(ResampleError::PlaneCount {
-          expected: bytes,
-          found: src.len(),
-        });
+        return Err(ResampleError::PlaneCount(PlaneCount::new(bytes, src.len())));
       }
     }
 
@@ -433,19 +427,13 @@ impl FfmpegResampler {
     // that reads foreign geometry.
     let staged = input.planes();
     if staged < planes {
-      return Err(ResampleError::PlaneCount {
-        expected: planes,
-        found: staged,
-      });
+      return Err(ResampleError::PlaneCount(PlaneCount::new(planes, staged)));
     }
     for (index, plane) in frame.planes().iter().take(planes).enumerate() {
       let src = plane.data_ref().as_ref();
       let dst = input.data_mut(index);
       if dst.len() < bytes {
-        return Err(ResampleError::PlaneCount {
-          expected: bytes,
-          found: dst.len(),
-        });
+        return Err(ResampleError::PlaneCount(PlaneCount::new(bytes, dst.len())));
       }
       dst[..bytes].copy_from_slice(&src[..bytes]);
     }
@@ -474,11 +462,11 @@ impl FfmpegResampler {
     // past that is refused by name rather than clamped: a silently
     // shortened output frame is a stream that loses samples.
     if samples > i128::from(i32::MAX) {
-      return Err(ResampleError::SampleCount {
-        // Saturating only for a count past `usize` itself, which no
-        // machine could hold either way.
-        requested: usize::try_from(samples).unwrap_or(usize::MAX),
-      });
+      // Saturating only for a count past `usize` itself, which no
+      // machine could hold either way.
+      return Err(ResampleError::SampleCount(SampleCount::new(
+        usize::try_from(samples).unwrap_or(usize::MAX),
+      )));
     }
     Ok(samples.max(1) as usize)
   }
@@ -495,7 +483,9 @@ impl FfmpegResampler {
     let pts = self.next_pts.or(anchor).unwrap_or(0);
     let samples = capacity as i64;
     if pts.checked_add(samples).is_none() {
-      return Err(ResampleError::TimestampOverflow { pts, samples });
+      return Err(ResampleError::TimestampOverflow(TimestampOverflow::new(
+        pts, samples,
+      )));
     }
     Ok(())
   }
@@ -532,19 +522,17 @@ impl FfmpegResampler {
     } else {
       1
     };
-    let plane_len =
-      plane_bytes(self.target.format, capacity, channels).ok_or(ResampleError::SampleCount {
-        requested: capacity,
-      })?;
+    let plane_len = plane_bytes(self.target.format, capacity, channels)
+      .ok_or(ResampleError::SampleCount(SampleCount::new(capacity)))?;
     // Linear in the sample count, which is what lets the post-run
     // trim be a multiplication rather than another fallible call.
     let per_sample = plane_bytes(self.target.format, 1, channels)
-      .ok_or(ResampleError::SampleCount { requested: 1 })?;
+      .ok_or(ResampleError::SampleCount(SampleCount::new(1)))?;
     if frame.planes() < plane_count {
-      return Err(ResampleError::PlaneCount {
-        expected: plane_count,
-        found: frame.planes(),
-      });
+      return Err(ResampleError::PlaneCount(PlaneCount::new(
+        plane_count,
+        frame.planes(),
+      )));
     }
 
     let mut buffers: [Option<FfmpegBuffer>; 8] = [const { None }; 8];
@@ -555,20 +543,20 @@ impl FfmpegResampler {
         // within the eight slots `data` has.
         let data_ptr = unsafe { (*frame.as_ptr()).data[index] };
         if data_ptr.is_null() {
-          return Err(ResampleError::OutputBuffer { plane: index });
+          return Err(ResampleError::OutputBuffer(OutputBuffer::new(index)));
         }
         // SAFETY: the frame is live, and the helper only reads
         // `buf[]`'s ranges to find the one containing `data_ptr`.
         let buf =
           unsafe { crate::convert::find_audio_backing_buffer(frame.as_ptr(), data_ptr, plane_len) }
-            .ok_or(ResampleError::OutputBuffer { plane: index })?;
+            .ok_or(ResampleError::OutputBuffer(OutputBuffer::new(index)))?;
         // SAFETY: `buf` is non-null and live, and the helper proved the
         // view lies inside it.
         let offset = unsafe { (data_ptr as usize).wrapping_sub((*buf).data as usize) };
         unsafe { FfmpegBuffer::from_ref_view(buf, offset, plane_len) }
-          .ok_or(ResampleError::OutputBuffer { plane: index })?
+          .ok_or(ResampleError::OutputBuffer(OutputBuffer::new(index)))?
       } else {
-        FfmpegBuffer::try_empty().ok_or(ResampleError::OutputBuffer { plane: index })?
+        FfmpegBuffer::try_empty().ok_or(ResampleError::OutputBuffer(OutputBuffer::new(index)))?
       });
     }
 
@@ -780,6 +768,435 @@ impl AudioResampler for FfmpegResampler {
   }
 }
 
+/// Payload for [`ResampleError::SourceChanged`].
+///
+/// A frame arrived whose shape is not the source spec this resampler
+/// was built with — the mid-stream refusal.
+///
+/// The face never silently reconfigures: doing so would resample the
+/// two halves of a stream on different terms and hand back a single
+/// unbroken timeline built out of them. Build a new resampler for the
+/// new source spec.
+#[derive(thiserror::Error, Debug, Clone)]
+#[error(
+  "source format changed mid-stream: expected {expected_rate} Hz {expected_format:?}, \
+   got {found_rate} Hz {found_format:?}"
+)]
+pub struct SourceChanged {
+  expected_rate: u32,
+  expected_format: SampleFormat,
+  found_rate: u32,
+  found_format: SampleFormat,
+}
+
+impl SourceChanged {
+  /// Constructs a `SourceChanged` payload.
+  #[inline]
+  pub const fn new(
+    expected_rate: u32,
+    expected_format: SampleFormat,
+    found_rate: u32,
+    found_format: SampleFormat,
+  ) -> Self {
+    Self {
+      expected_rate,
+      expected_format,
+      found_rate,
+      found_format,
+    }
+  }
+  /// Rate the resampler was built for.
+  #[inline]
+  pub const fn expected_rate(&self) -> u32 {
+    self.expected_rate
+  }
+  /// Sample format the resampler was built for.
+  #[inline]
+  pub const fn expected_format(&self) -> SampleFormat {
+    self.expected_format
+  }
+  /// Rate the offending frame carried.
+  #[inline]
+  pub const fn found_rate(&self) -> u32 {
+    self.found_rate
+  }
+  /// Sample format the offending frame carried.
+  #[inline]
+  pub const fn found_format(&self) -> SampleFormat {
+    self.found_format
+  }
+}
+
+/// Payload for [`ResampleError::PlaneCount`].
+///
+/// A frame's planes do not hold what its header claims — too few
+/// planes for the format, or a plane shorter than its sample count
+/// requires.
+#[derive(thiserror::Error, Debug, Clone)]
+#[error("frame plane geometry mismatch: expected {expected}, found {found}")]
+pub struct PlaneCount {
+  expected: usize,
+  found: usize,
+}
+
+impl PlaneCount {
+  /// Constructs a `PlaneCount` payload.
+  #[inline]
+  pub const fn new(expected: usize, found: usize) -> Self {
+    Self { expected, found }
+  }
+  /// What the format and sample count require.
+  #[inline]
+  pub const fn expected(&self) -> usize {
+    self.expected
+  }
+  /// What the frame carries.
+  #[inline]
+  pub const fn found(&self) -> usize {
+    self.found
+  }
+}
+
+/// Payload for [`ResampleError::SampleCount`].
+///
+/// A sample count no frame can hold: one whose byte size overflows, or
+/// one past the `c_int` `av_frame_get_buffer` takes.
+#[derive(thiserror::Error, Debug, Clone)]
+#[error("{requested} samples is not a frame size")]
+pub struct SampleCount {
+  requested: usize,
+}
+
+impl SampleCount {
+  /// Constructs a `SampleCount` payload.
+  #[inline]
+  pub const fn new(requested: usize) -> Self {
+    Self { requested }
+  }
+  /// The count that was asked for.
+  #[inline]
+  pub const fn requested(&self) -> usize {
+    self.requested
+  }
+}
+
+/// Payload for [`ResampleError::UnsupportedRate`].
+///
+/// One end of the conversion declares a sample rate `swr` cannot be
+/// driven with — zero, or past `c_int`.
+#[derive(thiserror::Error, Debug, Clone)]
+#[error("the {end} rate {rate} is not a sample rate swr can use")]
+pub struct UnsupportedRate {
+  end: SpecEnd,
+  rate: u32,
+}
+
+impl UnsupportedRate {
+  /// Constructs an `UnsupportedRate` payload.
+  #[inline]
+  pub const fn new(end: SpecEnd, rate: u32) -> Self {
+    Self { end, rate }
+  }
+  /// Which end of the conversion.
+  #[inline]
+  pub const fn end(&self) -> SpecEnd {
+    self.end
+  }
+  /// The rate that was declared.
+  #[inline]
+  pub const fn rate(&self) -> u32 {
+    self.rate
+  }
+}
+
+/// Payload for [`ResampleError::UnsupportedFormat`].
+///
+/// One end of the conversion declares no sample format
+/// (`AV_SAMPLE_FMT_NONE`) — the state a codec context is in before its
+/// decoder opens.
+#[derive(thiserror::Error, Debug, Clone)]
+#[error("the {end} spec names no sample format")]
+pub struct UnsupportedFormat {
+  end: SpecEnd,
+}
+
+impl UnsupportedFormat {
+  /// Constructs an `UnsupportedFormat` payload.
+  #[inline]
+  pub const fn new(end: SpecEnd) -> Self {
+    Self { end }
+  }
+  /// Which end of the conversion.
+  #[inline]
+  pub const fn end(&self) -> SpecEnd {
+    self.end
+  }
+}
+
+/// Payload for [`ResampleError::UnsupportedLayout`].
+///
+/// One end of the conversion declares a channel layout this backend
+/// will not carry.
+///
+/// Native and unspecified layouts are the two it does. A **custom** or
+/// **ambisonic** `AVChannelLayout` owns a heap-allocated channel map,
+/// and FFmpeg documents that such a layout must be copied with
+/// `av_channel_layout_copy` rather than assigned — while
+/// `ffmpeg_next::ChannelLayout` is a `Copy` wrapper with no destructor.
+/// Every `AVFrame` this type stages or allocates receives the layout by
+/// assignment, and `av_frame_free` runs `av_channel_layout_uninit` on
+/// it: the first staged frame to be dropped would free a map the spec,
+/// the decoder and every later frame still point at. Refusing at
+/// construction is what keeps that use-after-free unreachable; a
+/// resampler over those layouts is a separate design, not a silent
+/// approximation.
+#[derive(thiserror::Error, Debug, Clone)]
+#[error("the {end} channel layout is not supported: order {order}, {channels} channels")]
+pub struct UnsupportedLayout {
+  end: SpecEnd,
+  order: i32,
+  channels: i32,
+}
+
+impl UnsupportedLayout {
+  /// Constructs an `UnsupportedLayout` payload.
+  #[inline]
+  pub const fn new(end: SpecEnd, order: i32, channels: i32) -> Self {
+    Self {
+      end,
+      order,
+      channels,
+    }
+  }
+  /// Which end of the conversion.
+  #[inline]
+  pub const fn end(&self) -> SpecEnd {
+    self.end
+  }
+  /// `AVChannelOrder` as the raw integer it is on the wire.
+  #[inline]
+  pub const fn order(&self) -> i32 {
+    self.order
+  }
+  /// The channel count the layout declares.
+  #[inline]
+  pub const fn channels(&self) -> i32 {
+    self.channels
+  }
+}
+
+/// Payload for [`ResampleError::TooManyPlanes`].
+///
+/// A planar spec with more channels than a decoded frame has plane
+/// slots.
+///
+/// `mediadecode`'s `AudioFrame` carries a fixed eight planes
+/// (`AV_NUM_DATA_POINTERS`); planar audio past that lives in
+/// `AVFrame.extended_data[]`, which this crate does not plumb through.
+/// As a **source** no valid frame could ever arrive; as a **target**
+/// `swr` would produce one this crate cannot hand back — and it would
+/// fail only after the input had been consumed, leaving a session that
+/// cannot be retried. Both are refused at construction, where nothing
+/// has happened yet.
+#[derive(thiserror::Error, Debug, Clone)]
+#[error("the {end} spec is planar with {channels} channels; a frame carries {limit} planes")]
+pub struct TooManyPlanes {
+  end: SpecEnd,
+  channels: i32,
+  limit: i32,
+}
+
+impl TooManyPlanes {
+  /// Constructs a `TooManyPlanes` payload.
+  #[inline]
+  pub const fn new(end: SpecEnd, channels: i32, limit: i32) -> Self {
+    Self {
+      end,
+      channels,
+      limit,
+    }
+  }
+  /// Which end of the conversion.
+  #[inline]
+  pub const fn end(&self) -> SpecEnd {
+    self.end
+  }
+  /// The channel count the layout declares.
+  #[inline]
+  pub const fn channels(&self) -> i32 {
+    self.channels
+  }
+  /// Plane slots a frame has.
+  #[inline]
+  pub const fn limit(&self) -> i32 {
+    self.limit
+  }
+}
+
+/// Payload for [`ResampleError::TimestampOutOfRange`].
+///
+/// A frame's timestamp does not land on the output timeline: it does
+/// not survive the rescale as an `i64`, or it is `AV_NOPTS_VALUE`,
+/// which is a sentinel rather than a time.
+///
+/// Raised before anything is staged, so a refused frame leaves the
+/// resampler exactly as it was.
+#[derive(thiserror::Error, Debug, Clone)]
+#[error("the frame timestamp {pts} does not land on the output timeline")]
+pub struct TimestampOutOfRange {
+  pts: i64,
+}
+
+impl TimestampOutOfRange {
+  /// Constructs a `TimestampOutOfRange` payload.
+  #[inline]
+  pub const fn new(pts: i64) -> Self {
+    Self { pts }
+  }
+  /// The timestamp the frame carried, in its own timebase.
+  #[inline]
+  pub const fn pts(&self) -> i64 {
+    self.pts
+  }
+}
+
+/// Payload for [`ResampleError::ChannelDropped`].
+///
+/// The conversion between these two layouts would silently drop a
+/// source channel: FFmpeg's own mixing matrix routes it to no output.
+///
+/// `swr` mixes the channel positions its rematrix table knows and
+/// processes the rest of the input as though it were absent — a log
+/// line at most. Measured against FFmpeg 9, packed 22.2 → mono loses
+/// fifteen of twenty-four channels and `cube` → stereo loses two of
+/// eight, so this is not a matter of channel count. Installing an
+/// explicit mix matrix is how such a conversion would be accepted
+/// deliberately; until this crate has a seat for one, the pair is
+/// refused.
+#[derive(thiserror::Error, Debug, Clone)]
+#[error(
+  "converting {source_channels} channels to {target_channels} would drop source channel \
+   {channel}: FFmpeg's mixing matrix routes it to no output"
+)]
+pub struct ChannelDropped {
+  source_channels: i32,
+  target_channels: i32,
+  channel: i32,
+}
+
+impl ChannelDropped {
+  /// Constructs a `ChannelDropped` payload.
+  #[inline]
+  pub const fn new(source_channels: i32, target_channels: i32, channel: i32) -> Self {
+    Self {
+      source_channels,
+      target_channels,
+      channel,
+    }
+  }
+  /// Channels the source layout declares.
+  #[inline]
+  pub const fn source_channels(&self) -> i32 {
+    self.source_channels
+  }
+  /// Channels the target layout declares.
+  #[inline]
+  pub const fn target_channels(&self) -> i32 {
+    self.target_channels
+  }
+  /// The first source channel that reaches no output channel.
+  #[inline]
+  pub const fn channel(&self) -> i32 {
+    self.channel
+  }
+}
+
+/// Payload for [`ResampleError::RematrixUnsupported`].
+///
+/// FFmpeg will not build a mixing matrix between these two layouts at
+/// all.
+#[derive(thiserror::Error, Debug, Clone)]
+#[error("FFmpeg builds no mixing matrix from {source_channels} channels to {target_channels}")]
+pub struct RematrixUnsupported {
+  source_channels: i32,
+  target_channels: i32,
+}
+
+impl RematrixUnsupported {
+  /// Constructs a `RematrixUnsupported` payload.
+  #[inline]
+  pub const fn new(source_channels: i32, target_channels: i32) -> Self {
+    Self {
+      source_channels,
+      target_channels,
+    }
+  }
+  /// Channels the source layout declares.
+  #[inline]
+  pub const fn source_channels(&self) -> i32 {
+    self.source_channels
+  }
+  /// Channels the target layout declares.
+  #[inline]
+  pub const fn target_channels(&self) -> i32 {
+    self.target_channels
+  }
+}
+
+/// Payload for [`ResampleError::TimestampOverflow`].
+///
+/// The output timeline would leave `i64`. Counted timestamps are exact
+/// or they are nothing, so this is named rather than saturated.
+#[derive(thiserror::Error, Debug, Clone)]
+#[error("the output timeline overflows: {pts} + {samples} samples")]
+pub struct TimestampOverflow {
+  pts: i64,
+  samples: i64,
+}
+
+impl TimestampOverflow {
+  /// Constructs a `TimestampOverflow` payload.
+  #[inline]
+  pub const fn new(pts: i64, samples: i64) -> Self {
+    Self { pts, samples }
+  }
+  /// Where the timeline stood.
+  #[inline]
+  pub const fn pts(&self) -> i64 {
+    self.pts
+  }
+  /// How many samples were produced.
+  #[inline]
+  pub const fn samples(&self) -> i64 {
+    self.samples
+  }
+}
+
+/// Payload for [`ResampleError::OutputBuffer`].
+///
+/// A reference to one of the output frame's planes could not be taken.
+///
+/// Raised while preparing the conversion, never after it: that is the
+/// point of preparing.
+#[derive(thiserror::Error, Debug, Clone)]
+#[error("the output frame's plane {plane} could not be referenced")]
+pub struct OutputBuffer {
+  plane: usize,
+}
+
+impl OutputBuffer {
+  /// Constructs an `OutputBuffer` payload.
+  #[inline]
+  pub const fn new(plane: usize) -> Self {
+    Self { plane }
+  }
+  /// Which plane slot.
+  #[inline]
+  pub const fn plane(&self) -> usize {
+    self.plane
+  }
+}
+
 /// Errors from [`FfmpegResampler`].
 #[derive(thiserror::Error, Debug, Clone)]
 pub enum ResampleError {
@@ -795,25 +1212,8 @@ pub enum ResampleError {
 
   /// A frame arrived whose shape is not the source spec this resampler
   /// was built with — the mid-stream refusal.
-  ///
-  /// The face never silently reconfigures: doing so would resample the
-  /// two halves of a stream on different terms and hand back a single
-  /// unbroken timeline built out of them. Build a new resampler for the
-  /// new source spec.
-  #[error(
-    "source format changed mid-stream: expected {expected_rate} Hz {expected_format:?}, \
-     got {found_rate} Hz {found_format:?}"
-  )]
-  SourceChanged {
-    /// Rate the resampler was built for.
-    expected_rate: u32,
-    /// Sample format the resampler was built for.
-    expected_format: SampleFormat,
-    /// Rate the offending frame carried.
-    found_rate: u32,
-    /// Sample format the offending frame carried.
-    found_format: SampleFormat,
-  },
+  #[error(transparent)]
+  SourceChanged(#[from] SourceChanged),
 
   /// [`send_frame`](AudioResampler::send_frame) was called after
   /// [`send_eof`](AudioResampler::send_eof). Call
@@ -825,142 +1225,53 @@ pub enum ResampleError {
   /// A frame's planes do not hold what its header claims — too few
   /// planes for the format, or a plane shorter than its sample count
   /// requires.
-  #[error("frame plane geometry mismatch: expected {expected}, found {found}")]
-  PlaneCount {
-    /// What the format and sample count require.
-    expected: usize,
-    /// What the frame carries.
-    found: usize,
-  },
+  #[error(transparent)]
+  PlaneCount(#[from] PlaneCount),
 
   /// A sample count no frame can hold: one whose byte size overflows,
   /// or one past the `c_int` `av_frame_get_buffer` takes.
-  #[error("{requested} samples is not a frame size")]
-  SampleCount {
-    /// The count that was asked for.
-    requested: usize,
-  },
+  #[error(transparent)]
+  SampleCount(#[from] SampleCount),
 
   /// One end of the conversion declares a sample rate `swr` cannot be
   /// driven with — zero, or past `c_int`.
-  #[error("the {end} rate {rate} is not a sample rate swr can use")]
-  UnsupportedRate {
-    /// Which end of the conversion.
-    end: SpecEnd,
-    /// The rate that was declared.
-    rate: u32,
-  },
+  #[error(transparent)]
+  UnsupportedRate(#[from] UnsupportedRate),
 
   /// One end of the conversion declares no sample format
   /// (`AV_SAMPLE_FMT_NONE`) — the state a codec context is in before
   /// its decoder opens.
-  #[error("the {end} spec names no sample format")]
-  UnsupportedFormat {
-    /// Which end of the conversion.
-    end: SpecEnd,
-  },
+  #[error(transparent)]
+  UnsupportedFormat(#[from] UnsupportedFormat),
 
   /// One end of the conversion declares a channel layout this backend
   /// will not carry.
-  ///
-  /// Native and unspecified layouts are the two it does. A **custom**
-  /// or **ambisonic** `AVChannelLayout` owns a heap-allocated channel
-  /// map, and FFmpeg documents that such a layout must be copied with
-  /// `av_channel_layout_copy` rather than assigned — while
-  /// `ffmpeg_next::ChannelLayout` is a `Copy` wrapper with no
-  /// destructor. Every `AVFrame` this type stages or allocates receives
-  /// the layout by assignment, and `av_frame_free` runs
-  /// `av_channel_layout_uninit` on it: the first staged frame to be
-  /// dropped would free a map the spec, the decoder and every later
-  /// frame still point at. Refusing at construction is what keeps that
-  /// use-after-free unreachable; a resampler over those layouts is a
-  /// separate design, not a silent approximation.
-  #[error("the {end} channel layout is not supported: order {order}, {channels} channels")]
-  UnsupportedLayout {
-    /// Which end of the conversion.
-    end: SpecEnd,
-    /// `AVChannelOrder` as the raw integer it is on the wire.
-    order: i32,
-    /// The channel count the layout declares.
-    channels: i32,
-  },
+  #[error(transparent)]
+  UnsupportedLayout(#[from] UnsupportedLayout),
 
   /// A planar spec with more channels than a decoded frame has plane
   /// slots.
-  ///
-  /// `mediadecode`'s `AudioFrame` carries a fixed eight planes
-  /// (`AV_NUM_DATA_POINTERS`); planar audio past that lives in
-  /// `AVFrame.extended_data[]`, which this crate does not plumb
-  /// through. As a **source** no valid frame could ever arrive; as a
-  /// **target** `swr` would produce one this crate cannot hand back —
-  /// and it would fail only after the input had been consumed, leaving
-  /// a session that cannot be retried. Both are refused at
-  /// construction, where nothing has happened yet.
-  #[error("the {end} spec is planar with {channels} channels; a frame carries {limit} planes")]
-  TooManyPlanes {
-    /// Which end of the conversion.
-    end: SpecEnd,
-    /// The channel count the layout declares.
-    channels: i32,
-    /// Plane slots a frame has.
-    limit: i32,
-  },
+  #[error(transparent)]
+  TooManyPlanes(#[from] TooManyPlanes),
 
-  /// A frame's timestamp does not land on the output timeline: it does
-  /// not survive the rescale as an `i64`, or it is `AV_NOPTS_VALUE`,
-  /// which is a sentinel rather than a time.
-  ///
-  /// Raised before anything is staged, so a refused frame leaves the
-  /// resampler exactly as it was.
-  #[error("the frame timestamp {pts} does not land on the output timeline")]
-  TimestampOutOfRange {
-    /// The timestamp the frame carried, in its own timebase.
-    pts: i64,
-  },
+  /// A frame's timestamp does not land on the output timeline.
+  #[error(transparent)]
+  TimestampOutOfRange(#[from] TimestampOutOfRange),
 
   /// The conversion between these two layouts would silently drop a
-  /// source channel: FFmpeg's own mixing matrix routes it to no output.
-  ///
-  /// `swr` mixes the channel positions its rematrix table knows and
-  /// processes the rest of the input as though it were absent — a log
-  /// line at most. Measured against FFmpeg 9, packed 22.2 → mono loses
-  /// fifteen of twenty-four channels and `cube` → stereo loses two of
-  /// eight, so this is not a matter of channel count. Installing an
-  /// explicit mix matrix is how such a conversion would be accepted
-  /// deliberately; until this crate has a seat for one, the pair is
-  /// refused.
-  #[error(
-    "converting {source_channels} channels to {target_channels} would drop source channel \
-     {channel}: FFmpeg's mixing matrix routes it to no output"
-  )]
-  ChannelDropped {
-    /// Channels the source layout declares.
-    source_channels: i32,
-    /// Channels the target layout declares.
-    target_channels: i32,
-    /// The first source channel that reaches no output channel.
-    channel: i32,
-  },
+  /// source channel.
+  #[error(transparent)]
+  ChannelDropped(#[from] ChannelDropped),
 
   /// FFmpeg will not build a mixing matrix between these two layouts at
   /// all.
-  #[error("FFmpeg builds no mixing matrix from {source_channels} channels to {target_channels}")]
-  RematrixUnsupported {
-    /// Channels the source layout declares.
-    source_channels: i32,
-    /// Channels the target layout declares.
-    target_channels: i32,
-  },
+  #[error(transparent)]
+  RematrixUnsupported(#[from] RematrixUnsupported),
 
   /// The output timeline would leave `i64`. Counted timestamps are
   /// exact or they are nothing, so this is named rather than saturated.
-  #[error("the output timeline overflows: {pts} + {samples} samples")]
-  TimestampOverflow {
-    /// Where the timeline stood.
-    pts: i64,
-    /// How many samples were produced.
-    samples: i64,
-  },
+  #[error(transparent)]
+  TimestampOverflow(#[from] TimestampOverflow),
 
   /// The wrapped `swresample` call reported an error.
   #[error(transparent)]
@@ -968,14 +1279,8 @@ pub enum ResampleError {
 
   /// A reference to one of the output frame's planes could not be
   /// taken.
-  ///
-  /// Raised while preparing the conversion, never after it: that is the
-  /// point of preparing.
-  #[error("the output frame's plane {plane} could not be referenced")]
-  OutputBuffer {
-    /// Which plane slot.
-    plane: usize,
-  },
+  #[error(transparent)]
+  OutputBuffer(#[from] OutputBuffer),
 
   /// The queue of converted frames could not be grown to hold one more.
   #[error("out of memory reserving room for a converted frame")]
@@ -1022,24 +1327,23 @@ const MAX_AUDIO_PLANES: i32 = 8;
 /// choke point rather than in the `const` constructor.
 fn check_spec(spec: &ResampleSpec, end: SpecEnd) -> Result<(), ResampleError> {
   if spec.rate == 0 || spec.rate > i32::MAX as u32 {
-    return Err(ResampleError::UnsupportedRate {
-      end,
-      rate: spec.rate,
-    });
+    return Err(ResampleError::UnsupportedRate(UnsupportedRate::new(
+      end, spec.rate,
+    )));
   }
   if spec.format == Sample::None {
-    return Err(ResampleError::UnsupportedFormat { end });
+    return Err(ResampleError::UnsupportedFormat(UnsupportedFormat::new(
+      end,
+    )));
   }
   let order = layout_order(&spec.layout);
   let channels = spec.layout.channels();
   let carried = order == AVChannelOrder::AV_CHANNEL_ORDER_NATIVE as i32
     || order == AVChannelOrder::AV_CHANNEL_ORDER_UNSPEC as i32;
   if !carried || channels <= 0 {
-    return Err(ResampleError::UnsupportedLayout {
-      end,
-      order,
-      channels,
-    });
+    return Err(ResampleError::UnsupportedLayout(UnsupportedLayout::new(
+      end, order, channels,
+    )));
   }
   // A planar spec with more channels than the frame model has plane
   // slots is a resampler that cannot work in either direction, and
@@ -1048,11 +1352,11 @@ fn check_spec(spec: &ResampleSpec, end: SpecEnd) -> Result<(), ResampleError> {
   // `swr` has already consumed the input, which is not a state a caller
   // can retry from.
   if spec.format.is_planar() && channels > MAX_AUDIO_PLANES {
-    return Err(ResampleError::TooManyPlanes {
+    return Err(ResampleError::TooManyPlanes(TooManyPlanes::new(
       end,
       channels,
-      limit: MAX_AUDIO_PLANES,
-    });
+      MAX_AUDIO_PLANES,
+    )));
   }
   Ok(())
 }
@@ -1153,21 +1457,20 @@ fn check_pair(source: &ChannelLayout, target: &ChannelLayout) -> Result<(), Resa
     )
   };
   if rc < 0 {
-    return Err(ResampleError::RematrixUnsupported {
-      source_channels,
-      target_channels,
-    });
+    return Err(ResampleError::RematrixUnsupported(
+      RematrixUnsupported::new(source_channels, target_channels),
+    ));
   }
   for channel in 0..source_channels.min(SWR_CH_MAX as i32) {
     let index = channel as usize;
     if (0..target_channels.min(SWR_CH_MAX as i32) as usize)
       .all(|out| matrix[index + SWR_CH_MAX * out] == 0.0)
     {
-      return Err(ResampleError::ChannelDropped {
+      return Err(ResampleError::ChannelDropped(ChannelDropped::new(
         source_channels,
         target_channels,
         channel,
-      });
+      )));
     }
   }
   Ok(())
@@ -1212,7 +1515,7 @@ fn new_audio_frame(
   layout: ChannelLayout,
 ) -> Result<frame::Audio, ResampleError> {
   if samples == 0 || samples > i32::MAX as usize {
-    return Err(ResampleError::SampleCount { requested: samples });
+    return Err(ResampleError::SampleCount(SampleCount::new(samples)));
   }
   let mut out = crate::frame::alloc_av_audio_frame()?;
   out.set_format(format);

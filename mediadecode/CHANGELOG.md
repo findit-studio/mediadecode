@@ -28,6 +28,57 @@ The sibling FFmpeg adapter has its own log at
   `Demuxer::tracks()` — previously borrow-only — clone a `DemuxedPacket`,
   and move either across a channel.
 
+### Changed (BREAKING)
+
+- **Every struct-shaped enum variant is now a tuple variant wrapping a
+  named payload struct** — `TrackParams`'s six arms, `DemuxedPacket`'s
+  five arms, and `SubtitlePayload`'s two arms. The house rule this
+  crate otherwise already followed everywhere else (see `FrameError`,
+  which has always shaped its variants this way): a struct variant has
+  no nameable type of its own, so it cannot answer
+  `is_<variant>`/`unwrap_<variant>`/`try_unwrap_<variant>`, and its
+  fields are trapped instead of being a reusable, documented,
+  accessor-bearing type.
+
+  - `TrackParams::Video { codec, width, height, pixel_format,
+    frame_rate }` → `TrackParams::Video(VideoTrackParams<E>)`, and the
+    same shape for `Audio` → `AudioTrackParams`, `Subtitle` →
+    `SubtitleTrackParams`, `Data` → `DataTrackParams`, `Attachment` →
+    `AttachmentTrackParams`, `Unknown` → `UnknownTrackParams`. Each
+    payload has private fields, a positional `new(...)`, and a `const`
+    accessor per field (`codec()`, `width()`, `pixel_format()`, …),
+    matching whichever of `Copy`/`Clone`-only the field's own type is.
+
+  - `DemuxedPacket::Video { track, packet }` →
+    `DemuxedPacket::Video(VideoTrackPacket<E, D>)`, and the same shape
+    for `Audio` → `AudioTrackPacket`, `Subtitle` →
+    `SubtitleTrackPacket`, `Data` → `DataTrackPacket`, `Attachment` →
+    `AttachmentTrackPacket`. Named `<Kind>TrackPacket` rather than
+    reusing `VideoPacket` etc. — those names are already taken by the
+    packet type nested *inside* the envelope. Each payload carries
+    `track()`, `packet()` (borrowed), `into_packet()` and
+    `into_parts()` (owned) — the enum's own `track()` / `kind()`
+    accessors are unchanged and now read through these.
+
+  - `SubtitlePayload::Text { text, language }` →
+    `SubtitlePayload::Text(subtitle::Text<B>)`, and `Bitmap { regions
+    }` → `SubtitlePayload::Bitmap(subtitle::Bitmap<B>)`.
+
+  A match that used to destructure the struct fields now binds the
+  payload and reads it through accessors:
+
+  ```rust
+  // Before
+  match params { TrackParams::Video { width, height, .. } => .. }
+  // After
+  match params { TrackParams::Video(p) => (p.width(), p.height()) }
+  ```
+
+  No `is_<variant>` / `unwrap_<variant>` / `try_unwrap_<variant>`
+  helpers were added on `TrackParams` or `DemuxedPacket`: nothing in
+  this workspace spends them today — `matches!`/`if let` against the
+  tuple variant already covers every existing call site.
+
 ## [0.7.0] - 2026-08-23
 
 ### Added

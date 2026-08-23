@@ -65,7 +65,10 @@ use ffmpeg_next::{
 use mediadecode::{
   Timebase, Timestamp,
   demuxer::{
-    AttachmentPacket, DemuxedPacket, Demuxer, TrackIndex, TrackInfo, TrackKind, TrackParams,
+    AttachmentPacket, AttachmentTrackPacket, AttachmentTrackParams, AudioTrackPacket,
+    AudioTrackParams, DataTrackPacket, DataTrackParams, DemuxedPacket, Demuxer,
+    SubtitleTrackPacket, SubtitleTrackParams, TrackIndex, TrackInfo, TrackKind, TrackParams,
+    UnknownTrackParams, VideoTrackPacket, VideoTrackParams,
   },
 };
 use smol_str::SmolStr;
@@ -192,17 +195,14 @@ fn on_stream<T>(
   stream_index: usize,
   result: Result<Option<T>, PacketBufferError>,
 ) -> Result<Option<T>, DemuxError> {
-  result.map_err(|source| DemuxError::PacketBuffer {
-    stream_index,
-    source,
-  })
+  result.map_err(|source| DemuxError::PacketBuffer(PacketBuffer::new(stream_index, source)))
 }
 
 /// Turns a latched reader panic into the error that names it.
 fn reader_panic(latch: &PanicLatch) -> Option<DemuxError> {
   latch
     .message()
-    .map(|message| DemuxError::ReaderPanic { message })
+    .map(|message| DemuxError::ReaderPanic(ReaderPanic::new(message)))
 }
 
 impl Demuxer for FfmpegDemuxer {
@@ -228,7 +228,9 @@ impl Demuxer for FfmpegDemuxer {
     // the whole of "exactly one packet, before any timed packet": no
     // `av_read_frame` has run yet when the last one leaves.
     if let Some((track, packet)) = self.pending.pop_front() {
-      return Ok(Some(DemuxedPacket::Attachment { track, packet }));
+      return Ok(Some(DemuxedPacket::Attachment(AttachmentTrackPacket::new(
+        track, packet,
+      ))));
     }
 
     loop {
@@ -275,22 +277,22 @@ impl Demuxer for FfmpegDemuxer {
           index,
           boundary::video_packet_from_ffmpeg_in(&packet, time_base),
         )?
-        .map(|packet| DemuxedPacket::Video { track, packet }),
+        .map(|packet| DemuxedPacket::Video(VideoTrackPacket::new(track, packet))),
         TrackKind::Audio => on_stream(
           index,
           boundary::audio_packet_from_ffmpeg_in(&packet, time_base),
         )?
-        .map(|packet| DemuxedPacket::Audio { track, packet }),
+        .map(|packet| DemuxedPacket::Audio(AudioTrackPacket::new(track, packet))),
         TrackKind::Subtitle => on_stream(
           index,
           boundary::subtitle_packet_from_ffmpeg_in(&packet, time_base),
         )?
-        .map(|packet| DemuxedPacket::Subtitle { track, packet }),
+        .map(|packet| DemuxedPacket::Subtitle(SubtitleTrackPacket::new(track, packet))),
         TrackKind::Data => on_stream(
           index,
           boundary::data_packet_from_ffmpeg_in(&packet, time_base),
         )?
-        .map(|packet| DemuxedPacket::Data { track, packet }),
+        .map(|packet| DemuxedPacket::Data(DataTrackPacket::new(track, packet))),
         // Every attachment track's one packet was queued at open time,
         // so anything arriving on one now is the duplicate some
         // demuxers emit for cover art. Drop it — the contract is
@@ -334,6 +336,178 @@ impl Demuxer for FfmpegDemuxer {
   }
 }
 
+/// Payload for [`DemuxError::AttachmentAlloc`].
+///
+/// FFmpeg refused a buffer allocation while capturing an attachment's
+/// payload at open time.
+#[derive(thiserror::Error, Debug, Clone)]
+#[error("out of memory capturing the attachment payload for stream {stream_index}")]
+pub struct AttachmentAlloc {
+  stream_index: usize,
+}
+
+impl AttachmentAlloc {
+  /// Constructs an `AttachmentAlloc` payload.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(stream_index: usize) -> Self {
+    Self { stream_index }
+  }
+  /// The `AVStream.index` whose payload could not be captured.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn stream_index(&self) -> usize {
+    self.stream_index
+  }
+}
+
+/// Payload for [`DemuxError::ParametersMissing`].
+///
+/// Codec parameters arrived that were never allocated.
+///
+/// `ffmpeg_next::codec::Parameters` has safe constructors that hand
+/// back a null-backed value when FFmpeg's allocation failed, and they
+/// report nothing. Copying from one dereferences null, so it is
+/// refused where it arrives — at construction, and again in the
+/// copier — rather than crashing later somewhere that has forgotten
+/// the allocator ever failed.
+#[derive(thiserror::Error, Debug, Clone)]
+#[error("the codec parameters for stream {stream_index} were never allocated")]
+pub struct ParametersMissing {
+  stream_index: usize,
+}
+
+impl ParametersMissing {
+  /// Constructs a `ParametersMissing` payload.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(stream_index: usize) -> Self {
+    Self { stream_index }
+  }
+  /// The `AVStream.index` the parameters were offered for.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn stream_index(&self) -> usize {
+    self.stream_index
+  }
+}
+
+/// Payload for [`DemuxError::ParametersAlloc`].
+///
+/// Codec parameters for a track could not be allocated.
+#[derive(thiserror::Error, Debug, Clone)]
+#[error("out of memory allocating the codec parameters for stream {stream_index}")]
+pub struct ParametersAlloc {
+  stream_index: usize,
+}
+
+impl ParametersAlloc {
+  /// Constructs a `ParametersAlloc` payload.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(stream_index: usize) -> Self {
+    Self { stream_index }
+  }
+  /// The `AVStream.index` whose parameters could not be copied.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn stream_index(&self) -> usize {
+    self.stream_index
+  }
+}
+
+/// Payload for [`DemuxError::ParametersCopy`].
+///
+/// Copying a track's codec parameters failed part way.
+#[derive(thiserror::Error, Debug, Clone)]
+#[error("the codec parameters for stream {stream_index} could not be copied: {source}")]
+pub struct ParametersCopy {
+  stream_index: usize,
+  #[source]
+  source: ffmpeg_next::Error,
+}
+
+impl ParametersCopy {
+  /// Constructs a `ParametersCopy` payload.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(stream_index: usize, source: ffmpeg_next::Error) -> Self {
+    Self {
+      stream_index,
+      source,
+    }
+  }
+  /// The `AVStream.index` whose parameters could not be copied.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn stream_index(&self) -> usize {
+    self.stream_index
+  }
+  /// What FFmpeg said.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn source(&self) -> &ffmpeg_next::Error {
+    &self.source
+  }
+}
+
+/// Payload for [`DemuxError::PacketBuffer`].
+///
+/// A packet's payload could not be referenced — the bytes are there
+/// and this layer could not carry them.
+///
+/// Never raised for a packet that simply has no payload: an empty
+/// packet is a marker some demuxers emit, and it is skipped in
+/// silence. Distinguishing the two is what keeps a refcount failure
+/// under memory pressure from looking like the file's own word and
+/// dropping real compressed bytes.
+#[derive(thiserror::Error, Debug, Clone)]
+#[error("stream {stream_index}: {source}")]
+pub struct PacketBuffer {
+  stream_index: usize,
+  #[source]
+  source: PacketBufferError,
+}
+
+impl PacketBuffer {
+  /// Constructs a `PacketBuffer` payload.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(stream_index: usize, source: PacketBufferError) -> Self {
+    Self {
+      stream_index,
+      source,
+    }
+  }
+  /// The `AVStream.index` the packet belongs to.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn stream_index(&self) -> usize {
+    self.stream_index
+  }
+  /// What went wrong.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn source(&self) -> &PacketBufferError {
+    &self.source
+  }
+}
+
+/// Payload for [`DemuxError::ReaderPanic`].
+///
+/// The `Read + Seek` source given to [`FfmpegDemuxer::open_reader`]
+/// panicked inside a libavformat callback.
+///
+/// The panic was caught before it could cross the `extern "C"`
+/// boundary and abort the process; this is what it said. The session
+/// is terminal — every later call reports the same panic.
+#[derive(thiserror::Error, Debug, Clone)]
+#[error("the reader panicked: {message}")]
+pub struct ReaderPanic {
+  message: SmolStr,
+}
+
+impl ReaderPanic {
+  /// Constructs a `ReaderPanic` payload.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(message: SmolStr) -> Self {
+    Self { message }
+  }
+  /// What the panic payload said.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn message(&self) -> &str {
+    self.message.as_str()
+  }
+}
+
 /// Errors from [`FfmpegDemuxer`].
 #[derive(thiserror::Error, Debug, Clone)]
 pub enum DemuxError {
@@ -344,72 +518,31 @@ pub enum DemuxError {
 
   /// FFmpeg refused a buffer allocation while capturing an
   /// attachment's payload at open time.
-  #[error("out of memory capturing the attachment payload for stream {stream_index}")]
-  AttachmentAlloc {
-    /// The `AVStream.index` whose payload could not be captured.
-    stream_index: usize,
-  },
+  #[error(transparent)]
+  AttachmentAlloc(#[from] AttachmentAlloc),
 
   /// Codec parameters arrived that were never allocated.
-  ///
-  /// `ffmpeg_next::codec::Parameters` has safe constructors that hand
-  /// back a null-backed value when FFmpeg's allocation failed, and they
-  /// report nothing. Copying from one dereferences null, so it is
-  /// refused where it arrives — at construction, and again in the
-  /// copier — rather than crashing later somewhere that has forgotten
-  /// the allocator ever failed.
-  #[error("the codec parameters for stream {stream_index} were never allocated")]
-  ParametersMissing {
-    /// The `AVStream.index` the parameters were offered for.
-    stream_index: usize,
-  },
+  #[error(transparent)]
+  ParametersMissing(#[from] ParametersMissing),
 
   /// Codec parameters for a track could not be allocated.
-  #[error("out of memory allocating the codec parameters for stream {stream_index}")]
-  ParametersAlloc {
-    /// The `AVStream.index` whose parameters could not be copied.
-    stream_index: usize,
-  },
+  #[error(transparent)]
+  ParametersAlloc(#[from] ParametersAlloc),
 
   /// Copying a track's codec parameters failed part way.
-  #[error("the codec parameters for stream {stream_index} could not be copied: {source}")]
-  ParametersCopy {
-    /// The `AVStream.index` whose parameters could not be copied.
-    stream_index: usize,
-    /// What FFmpeg said.
-    #[source]
-    source: ffmpeg_next::Error,
-  },
+  #[error(transparent)]
+  ParametersCopy(#[from] ParametersCopy),
 
   /// A packet's payload could not be referenced — the bytes are there
   /// and this layer could not carry them.
-  ///
-  /// Never raised for a packet that simply has no payload: an empty
-  /// packet is a marker some demuxers emit, and it is skipped in
-  /// silence. Distinguishing the two is what keeps a refcount failure
-  /// under memory pressure from looking like the file's own word and
-  /// dropping real compressed bytes.
-  #[error("stream {stream_index}: {source}")]
-  PacketBuffer {
-    /// The `AVStream.index` the packet belongs to.
-    stream_index: usize,
-    /// What went wrong.
-    #[source]
-    source: PacketBufferError,
-  },
+  #[error(transparent)]
+  PacketBuffer(#[from] PacketBuffer),
 
   /// The `Read + Seek` source given to
   /// [`FfmpegDemuxer::open_reader`] panicked inside a libavformat
   /// callback.
-  ///
-  /// The panic was caught before it could cross the `extern "C"`
-  /// boundary and abort the process; this is what it said. The session
-  /// is terminal — every later call reports the same panic.
-  #[error("the reader panicked: {message}")]
-  ReaderPanic {
-    /// What the panic payload said.
-    message: SmolStr,
-  },
+  #[error(transparent)]
+  ReaderPanic(#[from] ReaderPanic),
 }
 
 // ---------------------------------------------------------------------------
@@ -468,16 +601,16 @@ fn build_tracks(input: &Input) -> Result<BuiltTracks, DemuxError> {
       // Cover art. A still image in a video-shaped slot is an
       // attachment by every property that matters, and the `Video` arm
       // is reserved for motion video.
-      TrackParams::Attachment { codec }
+      TrackParams::Attachment(AttachmentTrackParams::new(codec))
     } else {
       match medium {
-        media::Type::Video => TrackParams::Video {
+        media::Type::Video => TrackParams::Video(VideoTrackParams::new(
           codec,
-          width: unsafe { (*par).width }.max(0) as u32,
-          height: unsafe { (*par).height }.max(0) as u32,
-          pixel_format: boundary::from_av_pixel_format(unsafe { (*par).format }),
-          frame_rate: rate_to_timebase(stream.avg_frame_rate()),
-        },
+          unsafe { (*par).width }.max(0) as u32,
+          unsafe { (*par).height }.max(0) as u32,
+          boundary::from_av_pixel_format(unsafe { (*par).format }),
+          rate_to_timebase(stream.avg_frame_rate()),
+        )),
         media::Type::Audio => {
           let ch_layout = unsafe { std::ptr::addr_of!((*par).ch_layout) };
           // SAFETY: `par` is a live `*const AVCodecParameters` for the
@@ -485,18 +618,18 @@ fn build_tracks(input: &Input) -> Result<BuiltTracks, DemuxError> {
           // `i32` before constructing any `AVChannelOrder`.
           let channel_layout =
             unsafe { crate::channel_layout::channel_layout_description_from_raw_ptr(ch_layout) };
-          TrackParams::Audio {
+          TrackParams::Audio(AudioTrackParams::new(
             codec,
-            sample_rate: unsafe { (*par).sample_rate }.max(0) as u32,
-            channel_count: channel_layout.channels().min(255) as u8,
-            sample_format: SampleFormat::from_raw(unsafe { (*par).format }),
+            unsafe { (*par).sample_rate }.max(0) as u32,
+            channel_layout.channels().min(255) as u8,
+            SampleFormat::from_raw(unsafe { (*par).format }),
             channel_layout,
-          }
+          ))
         }
-        media::Type::Subtitle => TrackParams::Subtitle { codec },
-        media::Type::Data => TrackParams::Data { codec },
-        media::Type::Attachment => TrackParams::Attachment { codec },
-        media::Type::Unknown => TrackParams::Unknown { codec },
+        media::Type::Subtitle => TrackParams::Subtitle(SubtitleTrackParams::new(codec)),
+        media::Type::Data => TrackParams::Data(DataTrackParams::new(codec)),
+        media::Type::Attachment => TrackParams::Attachment(AttachmentTrackParams::new(codec)),
+        media::Type::Unknown => TrackParams::Unknown(UnknownTrackParams::new(codec)),
       }
     };
 
@@ -672,11 +805,8 @@ unsafe fn attached_pic_payload(
   index: usize,
 ) -> Result<AttachmentPacket<AttachmentPacketExtra, FfmpegBuffer>, DemuxError> {
   // SAFETY: `pkt` is live per the contract above.
-  let captured =
-    unsafe { crate::buffer::payload_of(pkt) }.map_err(|source| DemuxError::PacketBuffer {
-      stream_index: index,
-      source,
-    })?;
+  let captured = unsafe { crate::buffer::payload_of(pkt) }
+    .map_err(|source| DemuxError::PacketBuffer(PacketBuffer::new(index, source)))?;
   let extra = AttachmentPacketExtra::new(index as i32);
   Ok(match captured {
     Some(payload) => {
@@ -686,20 +816,15 @@ unsafe fn attached_pic_payload(
       // — and building this one with empty flags dropped that, along
       // with `CORRUPT` and every other bit the packet really carried.
       // SAFETY: `pkt` points at the live embedded `AVPacket`.
-      let flags = unsafe { boundary::md_flags_from_av_packet(pkt) }.map_err(|source| {
-        DemuxError::PacketBuffer {
-          stream_index: index,
-          source,
-        }
-      })?;
+      let flags = unsafe { boundary::md_flags_from_av_packet(pkt) }
+        .map_err(|source| DemuxError::PacketBuffer(PacketBuffer::new(index, source)))?;
       AttachmentPacket::new(payload, extra).with_flags(flags)
     }
     // Nothing was parked, so there are no flags to read: an empty set
     // is the honest answer for a packet this layer invented.
     None => AttachmentPacket::new(
-      FfmpegBuffer::copy_from_slice(&[]).ok_or(DemuxError::AttachmentAlloc {
-        stream_index: index,
-      })?,
+      FfmpegBuffer::copy_from_slice(&[])
+        .ok_or(DemuxError::AttachmentAlloc(AttachmentAlloc::new(index)))?,
       extra.with_synthesized(true),
     ),
   })
@@ -731,9 +856,8 @@ fn extradata_payload(
     // live, and the slice is consumed before this function returns.
     unsafe { std::slice::from_raw_parts(ptr, len) }
   };
-  let payload = FfmpegBuffer::copy_from_slice(bytes).ok_or(DemuxError::AttachmentAlloc {
-    stream_index: index,
-  })?;
+  let payload = FfmpegBuffer::copy_from_slice(bytes)
+    .ok_or(DemuxError::AttachmentAlloc(AttachmentAlloc::new(index)))?;
   Ok(AttachmentPacket::new(
     payload,
     AttachmentPacketExtra::new(index as i32).with_synthesized(true),
@@ -874,7 +998,7 @@ mod tests {
         let opened = FfmpegDemuxer::open_reader(PanicsWithAHostilePayload, Some("x.mkv"));
         std::panic::set_hook(previous);
         match opened {
-          Err(DemuxError::ReaderPanic { .. }) => {}
+          Err(DemuxError::ReaderPanic(_)) => {}
           Err(other) => panic!("expected ReaderPanic, got {other:?}"),
           Ok(_) => panic!("a reader that only panics cannot open a container"),
         }
@@ -901,7 +1025,7 @@ mod tests {
         assert!(
           matches!(
             refused,
-            Err(DemuxError::ParametersAlloc { stream_index: 4 })
+            Err(DemuxError::ParametersAlloc(ref p)) if p.stream_index() == 4
           ),
           "expected ParametersAlloc, got {:?}",
           refused.map(|_| ()),
@@ -937,11 +1061,11 @@ mod tests {
         crate::fault_subprocess::uncap_ffmpeg_allocations();
 
         assert!(
-          matches!(cloned, Err(DemuxError::ParametersAlloc { stream_index: 6 })),
+          matches!(cloned, Err(DemuxError::ParametersAlloc(ref p)) if p.stream_index() == 6),
           "TrackExtra::try_clone: {cloned:?}",
         );
         assert!(
-          matches!(handed, Err(DemuxError::ParametersAlloc { stream_index: 6 })),
+          matches!(handed, Err(DemuxError::ParametersAlloc(ref p)) if p.stream_index() == 6),
           "TrackExtra::clone_parameters: {handed:?}",
         );
 
@@ -1038,10 +1162,10 @@ mod tests {
         // The door: a `TrackExtra` cannot exist over it, so the copy
         // methods have nothing to be asked on.
         let refused = TrackExtra::new(9, never_allocated);
-        let Err(DemuxError::ParametersMissing { stream_index }) = refused.map(|_| ()) else {
+        let Err(DemuxError::ParametersMissing(p)) = refused.map(|_| ()) else {
           panic!("a null-backed source must not become a track row");
         };
-        assert_eq!(stream_index, 9);
+        assert_eq!(p.stream_index(), 9);
 
         // And the copier refuses it too, so the invariant is not the
         // only thing standing between this and a null dereference.
@@ -1053,7 +1177,7 @@ mod tests {
         };
         assert!(matches!(
           crate::extras::clone_parameters(&never_allocated, 9).map(|_| ()),
-          Err(DemuxError::ParametersMissing { stream_index: 9 }),
+          Err(DemuxError::ParametersMissing(p)) if p.stream_index() == 9,
         ));
 
         // A row built over real parameters still copies both ways, so
@@ -1117,7 +1241,7 @@ mod tests {
         let refused = crate::extras::clone_parameters(&source, 2);
         crate::fault_subprocess::uncap_ffmpeg_allocations();
         match refused {
-          Err(DemuxError::ParametersCopy { stream_index, .. }) => assert_eq!(stream_index, 2),
+          Err(DemuxError::ParametersCopy(p)) => assert_eq!(p.stream_index(), 2),
           Err(other) => panic!("expected ParametersCopy, got {other:?}"),
           Ok(_) => panic!("a copy that could not copy the extradata must not succeed"),
         }

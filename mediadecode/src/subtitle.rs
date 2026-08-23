@@ -8,8 +8,6 @@
 #[cfg(any(feature = "std", feature = "alloc"))]
 extern crate alloc;
 
-use core::fmt::Debug;
-
 /// One bitmap subtitle region (rectangle of paletted pixels).
 ///
 /// Mirrors `AVSubtitleRect` for bitmap subtitles. `palette` and
@@ -93,40 +91,66 @@ impl<B> BitmapRegion<B> {
   }
 }
 
+/// Payload for [`SubtitlePayload::Text`].
+#[derive(Debug, Clone)]
+pub struct Text<B> {
+  text: B,
+  language: Option<[u8; 3]>,
+}
+
+impl<B> Text<B> {
+  /// Constructs a `Text` payload.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(text: B, language: Option<[u8; 3]>) -> Self {
+    Self { text, language }
+  }
+
+  /// Returns the UTF-8 text payload.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn text(&self) -> &B {
+    &self.text
+  }
+  /// Returns the ISO 639-2/T language tag, or `None` if unspecified.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn language(&self) -> Option<[u8; 3]> {
+    self.language
+  }
+}
+
+/// Payload for [`SubtitlePayload::Bitmap`].
+#[cfg(any(feature = "std", feature = "alloc"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
+#[derive(Debug, Clone)]
+pub struct Bitmap<B> {
+  regions: alloc::vec::Vec<BitmapRegion<B>>,
+}
+
+#[cfg(any(feature = "std", feature = "alloc"))]
+impl<B> Bitmap<B> {
+  /// Constructs a `Bitmap` payload.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(regions: alloc::vec::Vec<BitmapRegion<B>>) -> Self {
+    Self { regions }
+  }
+
+  /// Returns the bitmap's rectangles. FFmpeg subtitles often carry
+  /// several.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn regions(&self) -> &[BitmapRegion<B>] {
+    &self.regions
+  }
+}
+
 /// Decoded subtitle payload — text or bitmap regions.
+#[derive(Debug, Clone)]
 pub enum SubtitlePayload<B> {
   /// Text subtitle (UTF-8 in `text`; ISO 639-2 language tag optional).
-  Text {
-    /// UTF-8 text payload.
-    text: B,
-    /// ISO 639-2/T language tag, or `None` if unspecified.
-    language: Option<[u8; 3]>,
-  },
+  Text(Text<B>),
   /// Bitmap subtitle — one or more rectangles of paletted pixels.
   /// Available only with the `alloc` feature.
   #[cfg(any(feature = "std", feature = "alloc"))]
   #[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
-  Bitmap {
-    /// One or more rectangles. FFmpeg subtitles often carry several.
-    regions: alloc::vec::Vec<BitmapRegion<B>>,
-  },
-}
-
-impl<B: Debug> Debug for SubtitlePayload<B> {
-  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-    match self {
-      Self::Text { text, language } => f
-        .debug_struct("SubtitlePayload::Text")
-        .field("text", text)
-        .field("language", language)
-        .finish(),
-      #[cfg(any(feature = "std", feature = "alloc"))]
-      Self::Bitmap { regions } => f
-        .debug_struct("SubtitlePayload::Bitmap")
-        .field("regions", &regions.len())
-        .finish(),
-    }
-  }
+  Bitmap(Bitmap<B>),
 }
 
 #[cfg(test)]
@@ -135,14 +159,11 @@ mod tests {
 
   #[test]
   fn text_payload_constructs() {
-    let p: SubtitlePayload<&[u8]> = SubtitlePayload::Text {
-      text: b"hello",
-      language: Some(*b"eng"),
-    };
+    let p: SubtitlePayload<&[u8]> = SubtitlePayload::Text(Text::new(b"hello", Some(*b"eng")));
     match p {
-      SubtitlePayload::Text { text, language } => {
-        assert_eq!(text, b"hello");
-        assert_eq!(language, Some(*b"eng"));
+      SubtitlePayload::Text(payload) => {
+        assert_eq!(payload.text(), b"hello");
+        assert_eq!(payload.language(), Some(*b"eng"));
       }
       #[cfg(any(feature = "std", feature = "alloc"))]
       _ => panic!("unexpected variant"),
@@ -165,11 +186,12 @@ mod tests {
   fn bitmap_payload_constructs() {
     let data: &[u8] = &[0; 16];
     let pal: &[u8] = &[0; 16];
-    let p: SubtitlePayload<&[u8]> = SubtitlePayload::Bitmap {
-      regions: alloc::vec![BitmapRegion::new(0, 0, 4, 4, 4, data, pal)],
-    };
-    if let SubtitlePayload::Bitmap { regions } = p {
-      assert_eq!(regions.len(), 1);
+    let p: SubtitlePayload<&[u8]> =
+      SubtitlePayload::Bitmap(Bitmap::new(alloc::vec![BitmapRegion::new(
+        0, 0, 4, 4, 4, data, pal
+      )]));
+    if let SubtitlePayload::Bitmap(payload) = p {
+      assert_eq!(payload.regions().len(), 1);
     } else {
       panic!("unexpected variant");
     }

@@ -146,15 +146,15 @@ fn decode_one_subtitle_through_trait() {
     match decoder.receive_frame(&mut dst) {
       Ok(()) => {
         match dst.payload() {
-          SubtitlePayload::Text { text, .. } => {
-            let bytes = text.as_ref().to_vec();
+          SubtitlePayload::Text(p) => {
+            let bytes = p.text().as_ref().to_vec();
             let s = std::string::String::from_utf8_lossy(&bytes);
             eprintln!("subtitle text: {s:?}");
             assert!(!s.is_empty(), "decoded subtitle text was empty");
           }
-          SubtitlePayload::Bitmap { regions } => {
-            eprintln!("subtitle bitmap regions: {}", regions.len());
-            assert!(!regions.is_empty());
+          SubtitlePayload::Bitmap(p) => {
+            eprintln!("subtitle bitmap regions: {}", p.regions().len());
+            assert!(!p.regions().is_empty());
           }
         }
         got_frame = true;

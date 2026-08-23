@@ -807,14 +807,12 @@ mod tests {
 
   #[test]
   fn subtitle_frame_text_payload() {
-    let payload: SubtitlePayload<&[u8]> = SubtitlePayload::Text {
-      text: b"hi",
-      language: None,
-    };
+    let payload: SubtitlePayload<&[u8]> =
+      SubtitlePayload::Text(crate::subtitle::Text::new(b"hi", None));
     // SubtitleFrame<E, D>: E=SLoop, D=&[u8].
     let f: SubtitleFrame<(), &[u8]> = SubtitleFrame::new(payload, ());
     match f.payload() {
-      SubtitlePayload::Text { text, .. } => assert_eq!(text, &&b"hi"[..]),
+      SubtitlePayload::Text(p) => assert_eq!(p.text(), &&b"hi"[..]),
       #[cfg(any(feature = "std", feature = "alloc"))]
       _ => panic!("unexpected variant"),
     }
