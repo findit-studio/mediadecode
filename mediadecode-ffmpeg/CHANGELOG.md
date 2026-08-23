@@ -87,6 +87,27 @@ The backend-agnostic core it adapts has its own log at
   becomes `Err(ResampleError::PlaneCount(p))` with `p.expected()` /
   `p.found()`.
 
+  **The accessor face rides the reshape, same as `mediadecode`'s.**
+  `ResampleError`, `PacketBufferError`, `DemuxError`,
+  `boundary::PacketBuildError`, `convert::ConvertError`,
+  `video::VideoDecodeError`, `audio::AudioDecodeError`,
+  `subtitle::SubtitleDecodeError`, and `error::Error` — the crate's
+  full error taxonomy, not just the arms the reshape sweep touched —
+  now derive `derive_more::{IsVariant, Unwrap, TryUnwrap}`, with
+  `#[unwrap(ref, ref_mut)]` and `#[try_unwrap(ref, ref_mut)]` — every
+  arm answers `is_<variant>()`,
+  `unwrap_<variant>()` / `_ref()` / `_mut()`, and
+  `try_unwrap_<variant>()` / `_ref()` / `_mut()`. `Backend`,
+  `PictureType`, `resampler::SpecEnd`, and `error::FallbackOrigin` gain
+  `IsVariant` too; `FallbackOrigin`'s hand-written `is_post_commit()`
+  and `ResampleError`'s hand-written `is_again()` are gone — the
+  derive answers both now, `&self`-receiver in place of the old
+  by-value one (transparent at every call site, all of which already
+  used method-call syntax). This crate did not carry a `derive_more`
+  dependency before this entry; it does now, with the `is_variant` /
+  `unwrap` / `try_unwrap` features (no `display` — this crate's error
+  types keep `thiserror` / hand-`Display`, unchanged).
+
 ## [0.7.0] - 2026-08-23
 
 ### Added

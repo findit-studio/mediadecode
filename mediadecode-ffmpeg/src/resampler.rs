@@ -24,6 +24,7 @@ use std::{
   ptr::{addr_of, read_unaligned},
 };
 
+use derive_more::{IsVariant, TryUnwrap, Unwrap};
 use ffmpeg_next::{
   ChannelLayout,
   codec::Parameters,
@@ -1198,7 +1199,9 @@ impl OutputBuffer {
 }
 
 /// Errors from [`FfmpegResampler`].
-#[derive(thiserror::Error, Debug, Clone)]
+#[derive(thiserror::Error, Debug, Clone, IsVariant, Unwrap, TryUnwrap)]
+#[unwrap(ref, ref_mut)]
+#[try_unwrap(ref, ref_mut)]
 pub enum ResampleError {
   /// No converted frame is ready yet — send more input, or
   /// [`send_eof`](AudioResampler::send_eof) and drain the tail.
@@ -1287,17 +1290,8 @@ pub enum ResampleError {
   QueueAlloc,
 }
 
-impl ResampleError {
-  /// `true` for [`Self::Again`] — the "send more input" signal, which a
-  /// drain loop tests for rather than matching on.
-  #[inline]
-  pub const fn is_again(&self) -> bool {
-    matches!(self, Self::Again)
-  }
-}
-
 /// Which end of a conversion a refusal is about.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, IsVariant)]
 pub enum SpecEnd {
   /// The spec frames must arrive in.
   Source,
@@ -1690,6 +1684,18 @@ mod tests {
       ),
     )
     .expect("open resampler")
+  }
+
+  #[test]
+  fn resample_error_carries_the_derived_accessor_face() {
+    // `IsVariant` / `Unwrap` / `TryUnwrap` — one arm per derive family,
+    // mirroring the mediadecode-side proof for this crate's own
+    // newly-wired `derive_more` dependency.
+    let err = ResampleError::OutputBuffer(OutputBuffer::new(2));
+    assert!(err.is_output_buffer());
+    assert!(!err.is_again());
+    assert_eq!(err.unwrap_output_buffer_ref().plane(), 2);
+    assert!(err.try_unwrap_again().is_err());
   }
 
   #[test]

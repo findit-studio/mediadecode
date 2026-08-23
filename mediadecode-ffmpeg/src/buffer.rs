@@ -10,6 +10,7 @@
 
 use core::{fmt, slice};
 
+use derive_more::{IsVariant, TryUnwrap, Unwrap};
 use ffmpeg_next::ffi::{AVBufferRef, av_buffer_ref, av_buffer_unref};
 
 /// Owned, refcounted handle to a contiguous byte range inside an
@@ -586,7 +587,9 @@ impl SideDataAlloc {
 /// carries on as though the file said so. The side-data arms exist for
 /// the same reason one tier along — a packet whose side data cannot be
 /// carried whole is refused, never delivered with some of it.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, thiserror::Error, IsVariant, Unwrap, TryUnwrap)]
+#[unwrap(ref, ref_mut)]
+#[try_unwrap(ref, ref_mut)]
 pub enum PacketBufferError {
   /// `av_buffer_ref` returned null — out of memory taking a second
   /// reference to a payload that is there.

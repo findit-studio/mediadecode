@@ -11,6 +11,7 @@ use core::{
   ptr::{addr_of, read_unaligned},
 };
 
+use derive_more::{IsVariant, TryUnwrap, Unwrap};
 use ffmpeg_next::{Packet, ffi::AVPixelFormat};
 use mediadecode::{
   PixelFormat, Timestamp,
@@ -521,7 +522,9 @@ impl SideDataAlloc {
 /// The reverse direction is what feeds a decoder, so everything the
 /// forward direction captured has to survive it or the capture was
 /// theatre.
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error, IsVariant, Unwrap, TryUnwrap)]
+#[unwrap(ref, ref_mut)]
+#[try_unwrap(ref, ref_mut)]
 pub enum PacketBuildError {
   /// The packet body could not be allocated or is larger than
   /// `AVPacket.size` can hold.

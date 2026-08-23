@@ -5,6 +5,8 @@
 //! holds a `Vec<BitmapRegion>` (FFmpeg subtitles can carry many
 //! rectangles per frame, so a fixed-size array is impractical).
 
+use derive_more::{IsVariant, TryUnwrap, Unwrap};
+
 #[cfg(any(feature = "std", feature = "alloc"))]
 extern crate alloc;
 
@@ -142,7 +144,9 @@ impl<B> Bitmap<B> {
 }
 
 /// Decoded subtitle payload — text or bitmap regions.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, IsVariant, Unwrap, TryUnwrap)]
+#[unwrap(ref, ref_mut)]
+#[try_unwrap(ref, ref_mut)]
 pub enum SubtitlePayload<B> {
   /// Text subtitle (UTF-8 in `text`; ISO 639-2 language tag optional).
   Text(Text<B>),

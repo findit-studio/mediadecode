@@ -12,6 +12,7 @@
 //! `AVFrame`'s refcounted buffers; the consumer can hold the frame
 //! across decoder calls without copying.
 
+use derive_more::{IsVariant, TryUnwrap, Unwrap};
 use ffmpeg_next::{codec::Parameters, frame};
 use mediadecode::{Timebase, decoder::AudioStreamDecoder, frame::AudioFrame, packet::AudioPacket};
 use mediaframe::audio::ChannelLayoutDescription;
@@ -113,7 +114,9 @@ impl AudioStreamDecoder for FfmpegAudioStreamDecoder {
 }
 
 /// Errors from [`FfmpegAudioStreamDecoder`].
-#[derive(thiserror::Error, Debug, Clone)]
+#[derive(thiserror::Error, Debug, Clone, IsVariant, Unwrap, TryUnwrap)]
+#[unwrap(ref, ref_mut)]
+#[try_unwrap(ref, ref_mut)]
 pub enum AudioDecodeError {
   /// The wrapped `ffmpeg::decoder::Audio` reported an error.
   #[error(transparent)]

@@ -38,7 +38,7 @@ quickcheck = ["dep:quickcheck", "mediatime/quickcheck"]
 [dependencies]
 mediatime   = { workspace = true }
 bitflags    = { workspace = true }
-derive_more = { workspace = true, features = ["display", "is_variant"] }
+derive_more = { workspace = true, features = ["display", "is_variant", "try_unwrap", "unwrap"] }
 thiserror   = { workspace = true }
 mediaframe  = { workspace = true }
 

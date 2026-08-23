@@ -9,6 +9,7 @@
 //! bumps refcounts; dropping releases them.
 use core::ptr::{addr_of, read_unaligned};
 
+use derive_more::{IsVariant, TryUnwrap, Unwrap};
 use ffmpeg_next::ffi::{
   AV_NOPTS_VALUE, AVChromaLocation, AVColorPrimaries, AVColorRange, AVColorSpace,
   AVColorTransferCharacteristic, AVFrame, AVPictureType, AVSubtitleType, av_buffer_alloc,
@@ -156,8 +157,10 @@ impl core::fmt::Display for BufferAcquireFailed {
 }
 
 /// Errors from [`av_frame_to_video_frame`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, IsVariant, Unwrap, TryUnwrap)]
 #[non_exhaustive]
+#[unwrap(ref, ref_mut)]
+#[try_unwrap(ref, ref_mut)]
 pub enum ConvertError {
   /// `av_frame` was null.
   NullFrame,

@@ -84,10 +84,19 @@ The sibling FFmpeg adapter has its own log at
   match params { TrackParams::Video(p) => (p.width(), p.height()) }
   ```
 
-  No `is_<variant>` / `unwrap_<variant>` / `try_unwrap_<variant>`
-  helpers were added on `TrackParams` or `DemuxedPacket`: nothing in
-  this workspace spends them today — `matches!`/`if let` against the
-  tuple variant already covers every existing call site.
+  **The accessor face rides the reshape.** `TrackParams`,
+  `DemuxedPacket`, and `SubtitlePayload` now derive
+  `derive_more::{IsVariant, Unwrap, TryUnwrap}`, with
+  `#[unwrap(ref, ref_mut)]` and `#[try_unwrap(ref, ref_mut)]` on each
+  enum — every arm answers `is_<variant>()`,
+  `unwrap_<variant>()` / `_ref()` / `_mut()`, and
+  `try_unwrap_<variant>()` / `_ref()` / `_mut()`. This is exactly what
+  the reshape above was for: a struct variant has no nameable payload
+  type to return from `unwrap_<variant>`, so the face could not exist
+  until the fields moved into named structs. `TrackKind` gains
+  `IsVariant` too. The `derive_more` dependency row picks up the
+  `unwrap` / `try_unwrap` features alongside the existing `display` /
+  `is_variant`.
 
 ## [0.7.0] - 2026-08-23
 

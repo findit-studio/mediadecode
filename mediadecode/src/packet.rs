@@ -504,6 +504,20 @@ mod quickcheck_impls {
 mod tests {
   use super::*;
 
+  // `format!` needs an allocator, and this module carries no
+  // file-level `extern crate alloc;` (production `packet.rs` is
+  // core-only — its buffer type `B` is caller-supplied, never an
+  // owned `Vec` this crate allocates). Scoped to the test module that
+  // actually needs it; the enclosing `#[cfg(test)]` mod is not itself
+  // feature-gated, so this import (and each of its three call sites,
+  // below) carries its own gate — mirrors `serde_tests`' own
+  // `extern crate alloc;` / `use alloc::string::ToString;` a little
+  // further down, which needs the same bridge for the same reason.
+  #[cfg(any(feature = "std", feature = "alloc"))]
+  extern crate alloc;
+  #[cfg(any(feature = "std", feature = "alloc"))]
+  use alloc::format;
+
   #[test]
   fn flag_bits_are_stable() {
     assert_eq!(PacketFlags::KEY.bits(), 0b001);
@@ -557,6 +571,8 @@ mod tests {
     assert_eq!(data, &[1, 2]);
   }
 
+  // `format!` needs an allocator; see the import note above.
+  #[cfg(any(feature = "std", feature = "alloc"))]
   #[test]
   fn video_packet_clone_matches_the_original() {
     let pts = crate::Timestamp::new(1500, ms_tb());
@@ -583,6 +599,8 @@ mod tests {
     assert_eq!(recovered, data);
   }
 
+  // `format!` needs an allocator; see the import note above.
+  #[cfg(any(feature = "std", feature = "alloc"))]
   #[test]
   fn audio_packet_clone_matches_the_original() {
     let data: &[u8] = &[7, 8, 9];
@@ -600,6 +618,8 @@ mod tests {
     assert_eq!(*p.data(), data);
   }
 
+  // `format!` needs an allocator; see the import note above.
+  #[cfg(any(feature = "std", feature = "alloc"))]
   #[test]
   fn subtitle_packet_clone_matches_the_original() {
     let data: &[u8] = b"hi";

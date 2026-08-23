@@ -81,6 +81,7 @@ use std::collections::VecDeque;
 /// resource sink.
 const SW_REPLAY_FRAME_CAP: usize = 64;
 
+use derive_more::{IsVariant, TryUnwrap, Unwrap};
 use ffmpeg_next::{Packet, codec::Parameters, frame};
 use mediadecode::{Timebase, decoder::VideoStreamDecoder, frame::VideoFrame, packet::VideoPacket};
 
@@ -1007,7 +1008,9 @@ impl PostCommitNeverResynced {
 }
 
 /// Error type for [`FfmpegVideoStreamDecoder`].
-#[derive(thiserror::Error, Debug)]
+#[derive(thiserror::Error, Debug, IsVariant, Unwrap, TryUnwrap)]
+#[unwrap(ref, ref_mut)]
+#[try_unwrap(ref, ref_mut)]
 pub enum VideoDecodeError {
   /// The wrapped decoder (HW or SW) reported an error.
   #[error(transparent)]

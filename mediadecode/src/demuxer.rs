@@ -41,6 +41,8 @@
 
 use core::fmt::{self, Debug};
 
+use derive_more::{IsVariant, TryUnwrap, Unwrap};
+
 use crate::{
   Timebase, Timestamp,
   adapter::{AudioAdapter, SubtitleAdapter, VideoAdapter},
@@ -94,7 +96,7 @@ impl TrackIndex {
 /// one sample, no timeline, no motion — so the `Video` arm carries true
 /// motion video and nothing else. See [`DemuxedPacket`] for the
 /// delivery contract that follows from this.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, IsVariant)]
 pub enum TrackKind {
   /// Motion video.
   Video,
@@ -654,6 +656,9 @@ impl<E: DemuxAdapter> Debug for UnknownTrackParams<E> {
 ///
 /// No `Clone` — see [`TrackInfo`]'s own doc for the message-carrier
 /// law that keeps it off this type too.
+#[derive(IsVariant, Unwrap, TryUnwrap)]
+#[unwrap(ref, ref_mut)]
+#[try_unwrap(ref, ref_mut)]
 pub enum TrackParams<E: DemuxAdapter> {
   /// Motion video.
   Video(VideoTrackParams<E>),
@@ -1204,6 +1209,9 @@ where
 /// A track whose kind is [`TrackKind::Unknown`] has no arm, and its
 /// packets are therefore never delivered. The roster is closed at five
 /// on purpose: a kind nothing can name is a kind nothing can consume.
+#[derive(IsVariant, Unwrap, TryUnwrap)]
+#[unwrap(ref, ref_mut)]
+#[try_unwrap(ref, ref_mut)]
 pub enum DemuxedPacket<E: DemuxAdapter, D> {
   /// A compressed video packet.
   Video(VideoTrackPacket<E, D>),
@@ -1397,6 +1405,16 @@ mod tests {
 
   use super::*;
 
+  // `Vec` is not in the prelude in the alloc-without-std tier (the
+  // crate is `#![no_std]` there; the crate-root `alloc`-as-`std` alias
+  // only makes `std::`-qualified paths resolve, it does not inject
+  // prelude items) — same reason the trait's own `take_tracks` above
+  // spells its return type `alloc::vec::Vec`. `format!` needs the same
+  // bridge. Unconditional whenever this arm runs: the enclosing `alloc`
+  // binding above is gated the same way.
+  #[cfg(any(feature = "std", feature = "alloc"))]
+  use alloc::{format, vec, vec::Vec};
+
   struct VLoop;
   impl VideoAdapter for VLoop {
     type CodecId = u32;
@@ -1510,6 +1528,9 @@ mod tests {
     assert_eq!(data, b"klv");
   }
 
+  // `format!` needs an allocator; see the `Vec`/`format!` import note
+  // above `VLoop`.
+  #[cfg(any(feature = "std", feature = "alloc"))]
   #[test]
   fn data_packet_clone_matches_the_original() {
     let pts = Timestamp::new(1500, ms_tb());
@@ -1534,6 +1555,9 @@ mod tests {
     assert_eq!(p.data(), &&b"\x00\x01TTF"[..]);
   }
 
+  // `format!` needs an allocator; see the `Vec`/`format!` import note
+  // above `VLoop`.
+  #[cfg(any(feature = "std", feature = "alloc"))]
   #[test]
   fn attachment_packet_clone_matches_the_original() {
     let mut original: AttachmentPacket<(), &[u8]> = AttachmentPacket::new(&b"\x00\x01TTF"[..], ());
@@ -1581,6 +1605,9 @@ mod tests {
     }
   }
 
+  // `format!` needs an allocator; see the `Vec`/`format!` import note
+  // above `VLoop`.
+  #[cfg(any(feature = "std", feature = "alloc"))]
   #[test]
   fn demuxed_packet_clone_matches_the_original() {
     let track = TrackIndex::new(2);
@@ -1605,16 +1632,37 @@ mod tests {
     }
   }
 
+  #[test]
+  fn demuxed_packet_carries_the_derived_accessor_face() {
+    // `IsVariant` / `Unwrap` / `TryUnwrap` — one arm per derive family,
+    // proving the house accessor face rides the enum rather than
+    // asserting the shape of every variant.
+    let track = TrackIndex::new(0);
+    let video: DemuxedPacket<Loopback, &[u8]> =
+      DemuxedPacket::Video(VideoTrackPacket::new(track, VideoPacket::new(&[][..], ())));
+    assert!(video.is_video());
+    assert!(!video.is_audio());
+    assert_eq!(video.unwrap_video_ref().track(), track);
+    assert!(video.try_unwrap_audio().is_err());
+  }
+
   /// Trivial loopback session — proves the trait is implementable and
   /// that its associated types resolve through the adapter bundle.
+  ///
+  /// `Vec`-backed, so the whole mock (and the two tests that construct
+  /// it, below) is gated on the same tier `take_tracks` itself needs —
+  /// see the `Vec`/`format!` import note above `VLoop`.
+  #[cfg(any(feature = "std", feature = "alloc"))]
   struct LoopDemuxer {
     tracks: Vec<TrackInfo<Loopback>>,
     drained: bool,
   }
 
+  #[cfg(any(feature = "std", feature = "alloc"))]
   #[derive(Debug)]
   struct LoopError;
 
+  #[cfg(any(feature = "std", feature = "alloc"))]
   impl Demuxer for LoopDemuxer {
     type Adapter = Loopback;
     type Buffer = &'static [u8];
@@ -1624,7 +1672,6 @@ mod tests {
       &self.tracks
     }
 
-    #[cfg(any(feature = "std", feature = "alloc"))]
     fn take_tracks(&mut self) -> Vec<TrackInfo<Loopback>> {
       core::mem::take(&mut self.tracks)
     }
@@ -1646,6 +1693,7 @@ mod tests {
     }
   }
 
+  #[cfg(any(feature = "std", feature = "alloc"))]
   #[test]
   fn the_session_face_is_implementable_and_none_means_eof() {
     fn _accepts<D: Demuxer>() {}
@@ -1671,6 +1719,7 @@ mod tests {
     assert!(d.next_packet().expect("pull").is_some());
   }
 
+  #[cfg(any(feature = "std", feature = "alloc"))]
   #[test]
   fn take_tracks_moves_every_row_out_once_and_leaves_the_table_empty() {
     let mut d = LoopDemuxer {

@@ -8,6 +8,7 @@
 
 use std::vec::Vec;
 
+use derive_more::IsVariant;
 use ffmpeg_next::{codec::Parameters, ffi::avcodec_parameters_copy};
 
 use crate::demuxer::{DemuxError, ParametersAlloc, ParametersCopy, ParametersMissing};
@@ -606,7 +607,7 @@ impl SubtitleFrameExtra {
 }
 
 /// Picture type per `AVFrame.pict_type`.
-#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash, IsVariant)]
 #[non_exhaustive]
 pub enum PictureType {
   /// Unspecified / unset.

@@ -54,6 +54,7 @@ use std::{
   sync::Arc,
 };
 
+use derive_more::{IsVariant, TryUnwrap, Unwrap};
 use ffmpeg_next::{
   Packet, Rational,
   ffi::{
@@ -514,7 +515,9 @@ impl ReaderPanic {
 }
 
 /// Errors from [`FfmpegDemuxer`].
-#[derive(thiserror::Error, Debug, Clone)]
+#[derive(thiserror::Error, Debug, Clone, IsVariant, Unwrap, TryUnwrap)]
+#[unwrap(ref, ref_mut)]
+#[try_unwrap(ref, ref_mut)]
 pub enum DemuxError {
   /// The wrapped libavformat call reported an error — open, read or
   /// seek.
