@@ -1047,14 +1047,33 @@ pub(crate) fn clone_parameters(
 /// `avcodec_parameters_copy` with no tie back to the format context, so
 /// a decoder outlives the demuxer that named it.
 ///
-/// **No `Clone`, and no `Default`.** Both would have to go through
-/// `ffmpeg_next`'s `Clone` / `Default` for [`Parameters`], which check
-/// neither the allocation nor the copy: safe public code could
-/// dereference a null destination or receive parameters that are
-/// quietly incomplete. `Clone` cannot report either, so this type does
-/// not implement it; [`Self::try_clone`] is the same copy with the
-/// answer a caller can act on, and [`Self::clone_parameters`] is the
+/// **`Clone` is hand-written, not derived, and there is still no
+/// `Default`.** A derived `Clone` would go through `ffmpeg_next`'s own
+/// `Clone` for [`Parameters`], which checks neither the allocation nor
+/// the copy: safe public code could dereference a null destination or
+/// receive parameters that are quietly incomplete. This crate shipped
+/// exactly that bug once — `TrackExtra` derived `Clone` over the
+/// unchecked path, reachable from safe code that just copied a track
+/// row — and closed it by removing the derive (see
+/// `demuxer::tests::the_public_track_extra_copies_are_checked_too`).
+///
+/// `Clone::clone` here instead calls [`Self::try_clone`] — the checked
+/// copy — and panics on its `Err`. That `Err` is reachable only as an
+/// allocation failure in `avcodec_parameters_alloc` or a negative
+/// `avcodec_parameters_copy` return, both allocator-exhaustion cases;
+/// never from a malformed source, since a `TrackExtra` cannot exist
+/// over null-backed parameters (see [`Self::new`]). Panicking there is
+/// the same trade every allocation-backed `Clone` in `std` already
+/// makes (`Vec`, `Box`, `String`, …) — a controlled panic on
+/// exhaustion, not the silent corruption or null dereference the
+/// derive reached. A caller that must not unwind on that failure calls
+/// [`Self::try_clone`] directly; [`Self::clone_parameters`] is the
 /// handoff a decoder actually needs.
+///
+/// `Default` stays absent: there is no checked substitute for
+/// `Parameters::default()` to route through, and an empty codec
+/// parameters set is not a per-track state this crate wants to hand
+/// out.
 ///
 /// `disposition` is the raw `AV_DISPOSITION_*` bit set, not
 /// `ffmpeg_next::format::stream::Disposition`. That type's
@@ -1193,6 +1212,31 @@ impl TrackExtra {
   pub const fn set_frame_count(&mut self, value: Option<i64>) -> &mut Self {
     self.frame_count = value;
     self
+  }
+}
+
+impl Clone for TrackExtra {
+  /// Clones through [`Self::try_clone`] — the checked
+  /// `avcodec_parameters_copy` this type requires — and panics on its
+  /// `Err`. See the type's own docs for why this is hand-written
+  /// rather than derived, and why a panic is the trade this makes
+  /// rather than reintroducing the unchecked copy.
+  ///
+  /// # Panics
+  ///
+  /// Panics if the checked copy fails: allocation failure in
+  /// `avcodec_parameters_alloc`, or a negative `avcodec_parameters_copy`
+  /// return. Both are reachable only under allocator exhaustion — never
+  /// from a malformed source, since a `TrackExtra` cannot exist over
+  /// null-backed parameters (see [`Self::new`]). Callers that must not
+  /// unwind on that failure should call [`Self::try_clone`] instead.
+  fn clone(&self) -> Self {
+    self.try_clone().unwrap_or_else(|error| {
+      panic!(
+        "TrackExtra::clone: checked codec-parameter copy failed ({error}) — \
+         use TrackExtra::try_clone to handle this without panicking"
+      )
+    })
   }
 }
 

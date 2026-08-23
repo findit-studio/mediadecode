@@ -11,6 +11,20 @@ The backend-agnostic core it adapts has its own log at
 
 ## [Unreleased]
 
+### Added
+
+- **`TrackExtra` gains `Clone`.** Hand-written, through the existing
+  checked `try_clone` — never `ffmpeg_next`'s own `Clone` for
+  `Parameters`, which checks neither the allocation nor the copy and is
+  the exact SIGSEGV class this crate already closed once by removing a
+  derived `Clone` from this same type (see
+  `demuxer::tests::the_public_track_extra_copies_are_checked_too`).
+  `Clone::clone` panics on the checked copy's `Err`, reachable only
+  under allocator exhaustion and never from a malformed source; a caller
+  that must not unwind on that failure calls `try_clone` directly, which
+  this impl is built on. `Default` remains absent — there is no checked
+  substitute for `Parameters::default()` to route through.
+
 ## [0.7.0] - 2026-08-23
 
 ### Added

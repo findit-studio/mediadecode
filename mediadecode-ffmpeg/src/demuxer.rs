@@ -953,6 +953,67 @@ mod tests {
   }
 
   #[test]
+  fn track_extra_clone_matches_the_original_through_the_checked_path() {
+    let parameters = Parameters::new();
+    let extra = TrackExtra::new(3, parameters)
+      .expect("a freshly allocated Parameters is never null-backed")
+      .with_disposition(0x1)
+      .with_start_time(Some(1000))
+      .with_frame_count(Some(240));
+
+    let cloned = extra.clone();
+
+    assert_eq!(cloned.stream_index(), extra.stream_index());
+    assert_eq!(cloned.disposition(), extra.disposition());
+    assert_eq!(cloned.start_time(), extra.start_time());
+    assert_eq!(cloned.frame_count(), extra.frame_count());
+    assert_eq!(cloned.parameters().medium(), extra.parameters().medium());
+    assert_eq!(cloned.parameters().id(), extra.parameters().id());
+    assert_eq!(
+      cloned.parameters().bit_rate(),
+      extra.parameters().bit_rate()
+    );
+  }
+
+  #[test]
+  fn the_track_extra_clone_panics_instead_of_reaching_the_unchecked_copy() {
+    // `Clone::clone` cannot report a checked-copy failure the way
+    // `try_clone` can, so under allocator exhaustion it panics instead
+    // — never the SIGSEGV a derived `Clone` over `ffmpeg_next`'s own
+    // unchecked `Parameters` clone would reach (see
+    // `the_public_track_extra_copies_are_checked_too`, above).
+    crate::fault_subprocess::in_subprocess(
+      "demuxer::tests::the_track_extra_clone_panics_instead_of_reaching_the_unchecked_copy",
+      || {
+        let source = Parameters::new();
+        assert!(!unsafe { source.as_ptr() }.is_null(), "allocated uncapped");
+        let extra = TrackExtra::new(
+          7,
+          crate::extras::clone_parameters(&source, 7).expect("uncapped"),
+        )
+        .expect("real parameters");
+
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        crate::fault_subprocess::cap_ffmpeg_allocations(1);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| extra.clone()));
+        crate::fault_subprocess::uncap_ffmpeg_allocations();
+        std::panic::set_hook(previous);
+
+        assert!(
+          result.is_err(),
+          "TrackExtra::clone must panic under a capped allocator, not silently \
+           succeed over an unchecked copy",
+        );
+
+        // And it works again once the allocator does.
+        let recovered = extra.clone();
+        assert_eq!(recovered.stream_index(), extra.stream_index());
+      },
+    );
+  }
+
+  #[test]
   fn parameters_that_never_allocated_are_refused_at_the_door() {
     // The route the destination check could not see. A safe
     // `Parameters::new()` under a failed allocation hands back a

@@ -52,6 +52,13 @@ use crate::Timestamp;
 /// every backend supplies all three (WebCodecs `EncodedVideoChunk`
 /// has no DTS; vendor RAW SDKs that produce packets at all derive
 /// timestamps from frame index × fps).
+///
+/// `Clone` and `Debug` derive directly: every field is either a
+/// concrete `Copy` type or one of `E` / `D` themselves, so the
+/// derive's per-parameter bound (`E: Clone, D: Clone`) is exactly
+/// what cloning the fields requires — no associated-type indirection
+/// to route around.
+#[derive(Clone, Debug)]
 pub struct VideoPacket<E, D> {
   pts: Option<Timestamp>,
   dts: Option<Timestamp>,
@@ -178,6 +185,7 @@ impl<E, D> VideoPacket<E, D> {
 }
 
 /// A compressed audio packet.
+#[derive(Clone, Debug)]
 pub struct AudioPacket<E, D> {
   pts: Option<Timestamp>,
   dts: Option<Timestamp>,
@@ -303,6 +311,7 @@ impl<E, D> AudioPacket<E, D> {
 }
 
 /// A compressed subtitle packet.
+#[derive(Clone, Debug)]
 pub struct SubtitlePacket<E, D> {
   pts: Option<Timestamp>,
   duration: Option<Timestamp>,
@@ -549,6 +558,22 @@ mod tests {
   }
 
   #[test]
+  fn video_packet_clone_matches_the_original() {
+    let pts = crate::Timestamp::new(1500, ms_tb());
+    let original: VideoPacket<_, &[u8]> = VideoPacket::new(&[1u8, 2, 3][..], ())
+      .with_pts(Some(pts))
+      .with_dts(Some(pts))
+      .with_flags(PacketFlags::KEY);
+    let cloned = original.clone();
+    assert_eq!(cloned.pts(), original.pts());
+    assert_eq!(cloned.dts(), original.dts());
+    assert_eq!(cloned.duration(), original.duration());
+    assert_eq!(cloned.flags(), original.flags());
+    assert_eq!(cloned.data(), original.data());
+    assert!(format!("{cloned:?}").contains("VideoPacket"));
+  }
+
+  #[test]
   fn audio_packet_round_trip() {
     let data: &[u8] = &[7, 8, 9];
     let p: AudioPacket<_, &[u8]> = AudioPacket::new(data, ()).with_flags(PacketFlags::KEY);
@@ -559,10 +584,29 @@ mod tests {
   }
 
   #[test]
+  fn audio_packet_clone_matches_the_original() {
+    let data: &[u8] = &[7, 8, 9];
+    let original: AudioPacket<_, &[u8]> = AudioPacket::new(data, ()).with_flags(PacketFlags::KEY);
+    let cloned = original.clone();
+    assert_eq!(cloned.flags(), original.flags());
+    assert_eq!(cloned.data(), original.data());
+    assert!(format!("{cloned:?}").contains("AudioPacket"));
+  }
+
+  #[test]
   fn subtitle_packet_round_trip() {
     let data: &[u8] = b"hi";
     let p: SubtitlePacket<_, &[u8]> = SubtitlePacket::new(data, ());
     assert_eq!(*p.data(), data);
+  }
+
+  #[test]
+  fn subtitle_packet_clone_matches_the_original() {
+    let data: &[u8] = b"hi";
+    let original: SubtitlePacket<_, &[u8]> = SubtitlePacket::new(data, ());
+    let cloned = original.clone();
+    assert_eq!(cloned.data(), original.data());
+    assert!(format!("{cloned:?}").contains("SubtitlePacket"));
   }
 
   // -------------------------------------------------------------------

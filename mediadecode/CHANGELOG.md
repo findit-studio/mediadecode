@@ -11,6 +11,23 @@ The sibling FFmpeg adapter has its own log at
 
 ## [Unreleased]
 
+### Added
+
+- **`Clone` (and `Debug` where it was absent) across the demux tier.**
+  `VideoPacket`, `AudioPacket`, `SubtitlePacket`, `DataPacket`,
+  `AttachmentPacket`, `TrackParams`, `TrackInfo`, and `DemuxedPacket` are
+  all cloneable now. The five packet types derive both directly — their
+  fields are the generic parameters themselves, so the derive's bound is
+  already the precise one. `TrackParams`, `TrackInfo`, and `DemuxedPacket`
+  route through `DemuxAdapter`'s associated types instead, so both impls
+  are hand-written and bounded on what the fields actually need
+  (`E::TrackExtra`, `E::Text`, the five per-kind packet extras) rather
+  than on `E` itself, which `#[derive(Clone)]` cannot see past.
+
+  This is what lets a caller pull an owned `TrackInfo` off
+  `Demuxer::tracks()` — previously borrow-only — clone a `DemuxedPacket`,
+  and move either across a channel.
+
 ## [0.7.0] - 2026-08-23
 
 ### Added

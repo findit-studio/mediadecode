@@ -39,7 +39,7 @@
 //! [`next_packet`]: Demuxer::next_packet
 //! [`seek`]: Demuxer::seek
 
-use core::fmt::Debug;
+use core::fmt::{self, Debug};
 
 use crate::{
   Timebase, Timestamp,
@@ -187,6 +187,10 @@ pub type DemuxAttachmentPacket<E, D> = AttachmentPacket<<E as DemuxAdapter>::Att
 /// reordered, so — like [`SubtitlePacket`] and for the same reason —
 /// there is no DTS seat; a data packet's presentation time is its
 /// decode time.
+///
+/// `Clone` and `Debug` derive directly — see [`VideoPacket`]'s docs
+/// for why the per-parameter bound this produces is already precise.
+#[derive(Clone, Debug)]
 pub struct DataPacket<E, D> {
   pts: Option<Timestamp>,
   duration: Option<Timestamp>,
@@ -300,6 +304,10 @@ impl<E, D> DataPacket<E, D> {
 /// either: that belongs to the track, and lives on [`TrackInfo`].
 /// [`PacketFlags`] is kept because `CORRUPT` still means something for
 /// a payload that failed to read.
+///
+/// `Clone` and `Debug` derive directly — see [`VideoPacket`]'s docs
+/// for why the per-parameter bound this produces is already precise.
+#[derive(Clone, Debug)]
 pub struct AttachmentPacket<E, D> {
   flags: PacketFlags,
   data: D,
@@ -453,6 +461,97 @@ impl<E: DemuxAdapter> TrackParams<E> {
   }
 }
 
+// `Clone` / `Debug` are hand-written, not derived: every field here
+// routes through an associated type on `E` or one of its three
+// sub-adapters (`E::CodecId`, `<E::Video as VideoAdapter>::PixelFormat`,
+// …), and each of those already carries the bound it needs on the
+// trait that declares it — `VideoAdapter::PixelFormat: Clone + ...`,
+// `AudioAdapter::SampleFormat: Copy + ...`, `DemuxAdapter::CodecId:
+// Copy + ...`. `#[derive(Clone)]` cannot see that: it adds a flat
+// `E: Clone` bound over the struct's own type parameter, which this
+// body never touches (it touches `E::CodecId`, not `E`) and which
+// would either fail to compile (the field types still would not be
+// proven `Clone` from `E: Clone` alone) or, where it happened to
+// compile, demand more of `E` than any field requires. Naming the
+// associated-type bounds directly is `rust-bound-minimization`'s
+// point: the bound belongs on what the field needs, not on the
+// parameter that reaches it.
+impl<E: DemuxAdapter> Clone for TrackParams<E> {
+  fn clone(&self) -> Self {
+    match self {
+      Self::Video {
+        codec,
+        width,
+        height,
+        pixel_format,
+        frame_rate,
+      } => Self::Video {
+        codec: *codec,
+        width: *width,
+        height: *height,
+        pixel_format: pixel_format.clone(),
+        frame_rate: *frame_rate,
+      },
+      Self::Audio {
+        codec,
+        sample_rate,
+        channel_count,
+        sample_format,
+        channel_layout,
+      } => Self::Audio {
+        codec: *codec,
+        sample_rate: *sample_rate,
+        channel_count: *channel_count,
+        sample_format: *sample_format,
+        channel_layout: channel_layout.clone(),
+      },
+      Self::Subtitle { codec } => Self::Subtitle { codec: *codec },
+      Self::Data { codec } => Self::Data { codec: *codec },
+      Self::Attachment { codec } => Self::Attachment { codec: *codec },
+      Self::Unknown { codec } => Self::Unknown { codec: *codec },
+    }
+  }
+}
+
+impl<E: DemuxAdapter> Debug for TrackParams<E> {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      Self::Video {
+        codec,
+        width,
+        height,
+        pixel_format,
+        frame_rate,
+      } => f
+        .debug_struct("Video")
+        .field("codec", codec)
+        .field("width", width)
+        .field("height", height)
+        .field("pixel_format", pixel_format)
+        .field("frame_rate", frame_rate)
+        .finish(),
+      Self::Audio {
+        codec,
+        sample_rate,
+        channel_count,
+        sample_format,
+        channel_layout,
+      } => f
+        .debug_struct("Audio")
+        .field("codec", codec)
+        .field("sample_rate", sample_rate)
+        .field("channel_count", channel_count)
+        .field("sample_format", sample_format)
+        .field("channel_layout", channel_layout)
+        .finish(),
+      Self::Subtitle { codec } => f.debug_struct("Subtitle").field("codec", codec).finish(),
+      Self::Data { codec } => f.debug_struct("Data").field("codec", codec).finish(),
+      Self::Attachment { codec } => f.debug_struct("Attachment").field("codec", codec).finish(),
+      Self::Unknown { codec } => f.debug_struct("Unknown").field("codec", codec).finish(),
+    }
+  }
+}
+
 /// One row of the track table [`Demuxer::tracks`] returns.
 ///
 /// Carries what a consumer needs to decide whether it wants the track
@@ -572,6 +671,47 @@ impl<E: DemuxAdapter> TrackInfo<E> {
   }
 }
 
+// `Clone` / `Debug` are hand-written for the same reason as
+// `TrackParams`'s: `#[derive(Clone)]` would add `E: Clone`, but the
+// fields that actually need a bound are `E::TrackExtra` and `E::Text`
+// — two associated types `E: Clone` neither implies nor is implied
+// by. `TrackParams<E>` itself needs no extra bound (see its own impl,
+// just above); `E::Text: Debug` is already guaranteed by
+// `DemuxAdapter::Text`'s own trait bound, so only `E::TrackExtra`
+// needs naming for `Debug`.
+impl<E: DemuxAdapter> Clone for TrackInfo<E>
+where
+  E::TrackExtra: Clone,
+  E::Text: Clone,
+{
+  fn clone(&self) -> Self {
+    Self {
+      timebase: self.timebase,
+      duration: self.duration,
+      params: self.params.clone(),
+      filename: self.filename.clone(),
+      mime_type: self.mime_type.clone(),
+      extra: self.extra.clone(),
+    }
+  }
+}
+
+impl<E: DemuxAdapter> Debug for TrackInfo<E>
+where
+  E::TrackExtra: Debug,
+{
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("TrackInfo")
+      .field("timebase", &self.timebase)
+      .field("duration", &self.duration)
+      .field("params", &self.params)
+      .field("filename", &self.filename)
+      .field("mime_type", &self.mime_type)
+      .field("extra", &self.extra)
+      .finish()
+  }
+}
+
 // ---------------------------------------------------------------------------
 //  The delivery envelope.
 // ---------------------------------------------------------------------------
@@ -648,6 +788,91 @@ impl<E: DemuxAdapter, D> DemuxedPacket<E, D> {
       Self::Subtitle { .. } => TrackKind::Subtitle,
       Self::Data { .. } => TrackKind::Data,
       Self::Attachment { .. } => TrackKind::Attachment,
+    }
+  }
+}
+
+// `Clone` / `Debug` are hand-written for the same associated-type
+// reason as `TrackParams` and `TrackInfo` above. The five payload
+// types this enum carries route through `DemuxAdapter` and its three
+// per-kind sub-adapters — `<E::Video as VideoAdapter>::PacketExtra`,
+// `<E::Audio as AudioAdapter>::PacketExtra`, `<E::Subtitle as
+// SubtitleAdapter>::PacketExtra`, `E::DataExtra`, `E::AttachmentExtra`
+// — five independent associated types plus the buffer `D`, none of
+// which `#[derive]`'s flat `E: Clone` bound would name.
+impl<E, D> Clone for DemuxedPacket<E, D>
+where
+  E: DemuxAdapter,
+  D: Clone,
+  <E::Video as VideoAdapter>::PacketExtra: Clone,
+  <E::Audio as AudioAdapter>::PacketExtra: Clone,
+  <E::Subtitle as SubtitleAdapter>::PacketExtra: Clone,
+  E::DataExtra: Clone,
+  E::AttachmentExtra: Clone,
+{
+  fn clone(&self) -> Self {
+    match self {
+      Self::Video { track, packet } => Self::Video {
+        track: *track,
+        packet: packet.clone(),
+      },
+      Self::Audio { track, packet } => Self::Audio {
+        track: *track,
+        packet: packet.clone(),
+      },
+      Self::Subtitle { track, packet } => Self::Subtitle {
+        track: *track,
+        packet: packet.clone(),
+      },
+      Self::Data { track, packet } => Self::Data {
+        track: *track,
+        packet: packet.clone(),
+      },
+      Self::Attachment { track, packet } => Self::Attachment {
+        track: *track,
+        packet: packet.clone(),
+      },
+    }
+  }
+}
+
+impl<E, D> Debug for DemuxedPacket<E, D>
+where
+  E: DemuxAdapter,
+  D: Debug,
+  <E::Video as VideoAdapter>::PacketExtra: Debug,
+  <E::Audio as AudioAdapter>::PacketExtra: Debug,
+  <E::Subtitle as SubtitleAdapter>::PacketExtra: Debug,
+  E::DataExtra: Debug,
+  E::AttachmentExtra: Debug,
+{
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      Self::Video { track, packet } => f
+        .debug_struct("Video")
+        .field("track", track)
+        .field("packet", packet)
+        .finish(),
+      Self::Audio { track, packet } => f
+        .debug_struct("Audio")
+        .field("track", track)
+        .field("packet", packet)
+        .finish(),
+      Self::Subtitle { track, packet } => f
+        .debug_struct("Subtitle")
+        .field("track", track)
+        .field("packet", packet)
+        .finish(),
+      Self::Data { track, packet } => f
+        .debug_struct("Data")
+        .field("track", track)
+        .field("packet", packet)
+        .finish(),
+      Self::Attachment { track, packet } => f
+        .debug_struct("Attachment")
+        .field("track", track)
+        .field("packet", packet)
+        .finish(),
     }
   }
 }
@@ -821,6 +1046,48 @@ mod tests {
   }
 
   #[test]
+  fn track_params_clone_matches_the_original() {
+    let original = TrackParams::<Loopback>::Video {
+      codec: 7,
+      width: 1920,
+      height: 1080,
+      pixel_format: 3,
+      frame_rate: Some(Timebase::new(
+        30_000,
+        NonZeroI32::new(1001).expect("non-zero"),
+      )),
+    };
+    let cloned = original.clone();
+    assert_eq!(cloned.kind(), original.kind());
+    assert_eq!(cloned.codec(), original.codec());
+    match (&original, &cloned) {
+      (
+        TrackParams::Video {
+          width: w1,
+          height: h1,
+          pixel_format: p1,
+          frame_rate: f1,
+          ..
+        },
+        TrackParams::Video {
+          width: w2,
+          height: h2,
+          pixel_format: p2,
+          frame_rate: f2,
+          ..
+        },
+      ) => {
+        assert_eq!(w1, w2);
+        assert_eq!(h1, h2);
+        assert_eq!(p1, p2);
+        assert_eq!(f1, f2);
+      }
+      _ => panic!("clone changed the arm"),
+    }
+    assert!(format!("{cloned:?}").contains("Video"));
+  }
+
+  #[test]
   fn attachment_identity_lives_on_the_track() {
     let info = TrackInfo::<Loopback>::new(ms_tb(), TrackParams::Attachment { codec: 9 }, ())
       .with_filename(Some("Arial.ttf"))
@@ -831,6 +1098,22 @@ mod tests {
       Some("application/x-truetype-font")
     );
     assert_eq!(info.duration(), None);
+  }
+
+  #[test]
+  fn track_info_clone_matches_the_original() {
+    let original = TrackInfo::<Loopback>::new(ms_tb(), TrackParams::Attachment { codec: 9 }, ())
+      .with_filename(Some("Arial.ttf"))
+      .with_mime_type(Some("application/x-truetype-font"))
+      .with_duration(Some(Timestamp::new(500, ms_tb())));
+    let cloned = original.clone();
+    assert_eq!(cloned.kind(), original.kind());
+    assert_eq!(cloned.timebase(), original.timebase());
+    assert_eq!(cloned.duration(), original.duration());
+    assert_eq!(cloned.filename(), original.filename());
+    assert_eq!(cloned.mime_type(), original.mime_type());
+    assert_eq!(cloned.params().codec(), original.params().codec());
+    assert!(format!("{cloned:?}").contains("TrackInfo"));
   }
 
   #[test]
@@ -848,12 +1131,37 @@ mod tests {
   }
 
   #[test]
+  fn data_packet_clone_matches_the_original() {
+    let pts = Timestamp::new(1500, ms_tb());
+    let original: DataPacket<(), &[u8]> = DataPacket::new(&b"klv"[..], ())
+      .with_pts(Some(pts))
+      .with_duration(Some(Timestamp::new(40, ms_tb())))
+      .with_flags(PacketFlags::KEY);
+    let cloned = original.clone();
+    assert_eq!(cloned.pts(), original.pts());
+    assert_eq!(cloned.duration(), original.duration());
+    assert_eq!(cloned.flags(), original.flags());
+    assert_eq!(cloned.data(), original.data());
+    assert!(format!("{cloned:?}").contains("DataPacket"));
+  }
+
+  #[test]
   fn an_attachment_packet_has_no_timestamp_seat() {
     let mut p: AttachmentPacket<(), &[u8]> = AttachmentPacket::new(&b"\x00\x01TTF"[..], ());
     assert_eq!(p.flags(), PacketFlags::empty());
     p.set_flags(PacketFlags::CORRUPT);
     assert!(p.flags().contains(PacketFlags::CORRUPT));
     assert_eq!(p.data(), &&b"\x00\x01TTF"[..]);
+  }
+
+  #[test]
+  fn attachment_packet_clone_matches_the_original() {
+    let mut original: AttachmentPacket<(), &[u8]> = AttachmentPacket::new(&b"\x00\x01TTF"[..], ());
+    original.set_flags(PacketFlags::CORRUPT);
+    let cloned = original.clone();
+    assert_eq!(cloned.flags(), original.flags());
+    assert_eq!(cloned.data(), original.data());
+    assert!(format!("{cloned:?}").contains("AttachmentPacket"));
   }
 
   #[test]
@@ -899,6 +1207,39 @@ mod tests {
     for (packet, expected) in packets {
       assert_eq!(packet.track(), track);
       assert_eq!(packet.kind(), expected);
+    }
+  }
+
+  #[test]
+  fn demuxed_packet_clone_matches_the_original() {
+    let track = TrackIndex::new(2);
+    let packets: [DemuxedPacket<Loopback, &[u8]>; 5] = [
+      DemuxedPacket::Video {
+        track,
+        packet: VideoPacket::new(&[][..], ()),
+      },
+      DemuxedPacket::Audio {
+        track,
+        packet: AudioPacket::new(&[][..], ()),
+      },
+      DemuxedPacket::Subtitle {
+        track,
+        packet: SubtitlePacket::new(&[][..], ()),
+      },
+      DemuxedPacket::Data {
+        track,
+        packet: DataPacket::new(&[][..], ()),
+      },
+      DemuxedPacket::Attachment {
+        track,
+        packet: AttachmentPacket::new(&[][..], ()),
+      },
+    ];
+    for packet in packets {
+      let cloned = packet.clone();
+      assert_eq!(cloned.track(), packet.track());
+      assert_eq!(cloned.kind(), packet.kind());
+      assert!(!format!("{cloned:?}").is_empty());
     }
   }
 
