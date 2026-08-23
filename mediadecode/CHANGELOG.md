@@ -13,20 +13,30 @@ The sibling FFmpeg adapter has its own log at
 
 ### Added
 
-- **`Clone` (and `Debug` where it was absent) across the demux tier.**
-  `VideoPacket`, `AudioPacket`, `SubtitlePacket`, `DataPacket`,
-  `AttachmentPacket`, `TrackParams`, `TrackInfo`, and `DemuxedPacket` are
-  all cloneable now. The five packet types derive both directly — their
-  fields are the generic parameters themselves, so the derive's bound is
-  already the precise one. `TrackParams`, `TrackInfo`, and `DemuxedPacket`
-  route through `DemuxAdapter`'s associated types instead, so both impls
-  are hand-written and bounded on what the fields actually need
-  (`E::TrackExtra`, `E::Text`, the five per-kind packet extras) rather
-  than on `E` itself, which `#[derive(Clone)]` cannot see past.
+- **`Debug` across the demux tier; `Clone` where it stays cheap.**
+  `TrackParams` and `TrackInfo` gain `Debug` (previously absent),
+  hand-written and bounded on what their fields actually need
+  (`E::TrackExtra`, `E::Text`, and each per-kind payload struct's own
+  associated types) rather than on `E` itself, which `#[derive(Debug)]`
+  cannot see past. `VideoPacket`, `AudioPacket`, `SubtitlePacket`,
+  `DataPacket`, and `AttachmentPacket` derive `Clone` + `Debug` directly
+  — their fields are the generic parameters themselves, so the derive's
+  bound is already precise — and `DemuxedPacket` gets the same pair
+  hand-written, for the same associated-type reason, since its five
+  arms carry exactly those packet types.
 
-  This is what lets a caller pull an owned `TrackInfo` off
-  `Demuxer::tracks()` — previously borrow-only — clone a `DemuxedPacket`,
-  and move either across a channel.
+  `TrackParams` and `TrackInfo` do **not** get `Clone`. An interim
+  version of this entry gave them one — a real allocation-and-copy per
+  clone, minted to satisfy a channel bound — and it violated the
+  message-carrier law recovered from the frozen desktop tree: messages
+  may be `Clone`, but `Clone` is always a refcount bump, never a deep
+  copy. That impl is gone. In its place, `Demuxer` gains
+  **`take_tracks`**, the owned-tracks door: the first call moves the
+  whole track table out of the session; `tracks()` answers the empty
+  slice afterward. The intended caller takes the table once, right
+  after opening a session and before pulling any packet, and wraps
+  each row in `Arc` for fan-out — one allocation per track, ever,
+  rather than a deep copy per consumer.
 
 ### Changed (BREAKING)
 

@@ -90,7 +90,7 @@ fn the_five_kinds_map_to_the_five_arms() {
 #[test]
 fn a_track_row_carries_its_codec_parameters_and_attachment_identity() {
   let Some(corpus) = Corpus::new() else { return };
-  let demuxer = FfmpegDemuxer::open(&corpus.multi_track_mkv()).expect("open mkv");
+  let mut demuxer = FfmpegDemuxer::open(&corpus.multi_track_mkv()).expect("open mkv");
 
   let video = &demuxer.tracks()[0];
   match video.params() {
@@ -124,6 +124,21 @@ fn a_track_row_carries_its_codec_parameters_and_attachment_identity() {
     ffmpeg_next::media::Type::Audio,
   );
   assert_eq!(audio.extra().stream_index(), 1);
+
+  // The owned-tracks door: the first call moves every row out, and
+  // `tracks()` answers empty afterward — the shape a fan-out consumer
+  // relies on to wrap each row in `Arc` once, right after open.
+  let expected_kinds: Vec<_> = demuxer.tracks().iter().map(|t| t.kind()).collect();
+  let taken = demuxer.take_tracks();
+  assert_eq!(
+    taken.iter().map(|t| t.kind()).collect::<Vec<_>>(),
+    expected_kinds,
+    "take_tracks hands out every row, in table order",
+  );
+  assert!(
+    demuxer.tracks().is_empty(),
+    "the table is empty after the first take",
+  );
 }
 
 #[test]

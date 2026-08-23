@@ -13,17 +13,23 @@ The backend-agnostic core it adapts has its own log at
 
 ### Added
 
-- **`TrackExtra` gains `Clone`.** Hand-written, through the existing
-  checked `try_clone` — never `ffmpeg_next`'s own `Clone` for
-  `Parameters`, which checks neither the allocation nor the copy and is
-  the exact SIGSEGV class this crate already closed once by removing a
-  derived `Clone` from this same type (see
-  `demuxer::tests::the_public_track_extra_copies_are_checked_too`).
-  `Clone::clone` panics on the checked copy's `Err`, reachable only
-  under allocator exhaustion and never from a malformed source; a caller
-  that must not unwind on that failure calls `try_clone` directly, which
-  this impl is built on. `Default` remains absent — there is no checked
-  substitute for `Parameters::default()` to route through.
+- **`FfmpegDemuxer` implements `Demuxer::take_tracks`**, the
+  owned-tracks door `mediadecode`'s demux tier gained in place of a
+  `TrackInfo` / `TrackParams` `Clone` — see
+  [`mediadecode`'s CHANGELOG](../mediadecode/CHANGELOG.md) for the
+  message-carrier law behind that redirect. The implementation is
+  `mem::take` on the session's own `Vec<TrackInfo<Ffmpeg>>`, built once
+  at `open` and untouched until a caller takes it.
+
+  `TrackExtra` does not gain `Clone` either, for the same law. An
+  interim version of this entry hand-wrote one through the existing
+  checked `try_clone`, to satisfy the same channel bound, and it came
+  back out — a full `avcodec_parameters_copy` is not the refcount bump
+  a message's `Clone` is required to be. `try_clone` and
+  `clone_parameters` are unaffected: they remain the checked copy this
+  type offers the one caller that genuinely wants an owned duplicate,
+  and `Default` remains absent for the reason it always was — there is
+  no checked substitute for `Parameters::default()` to route through.
 
 ### Changed (BREAKING)
 

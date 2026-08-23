@@ -47,6 +47,13 @@ use crate::{
   packet::{AudioPacket, PacketFlags, SubtitlePacket, VideoPacket},
 };
 
+// `Demuxer::take_tracks` is the only item in this module that owns an
+// allocation (`Vec<TrackInfo<_>>`); everything else is `core`-only.
+// Scoped here rather than pulled in at the crate root, so a reader
+// can see exactly which module needs the heap.
+#[cfg(any(feature = "std", feature = "alloc"))]
+extern crate alloc;
+
 /// A track's position in the table [`Demuxer::tracks`] returns.
 ///
 /// `TrackIndex(i)` **is** the index of `tracks()[i]` — the coordinate
@@ -435,24 +442,16 @@ impl<E: DemuxAdapter> VideoTrackParams<E> {
   }
 }
 
-// `Clone` / `Debug` are hand-written for the same associated-type
-// reason as `TrackParams` itself (see its own impls, below): every
-// field here that is not a plain `u32` routes through an associated
-// type on `E`, and each of those already carries the bound it needs
-// on the trait that declares it. `#[derive(Clone)]` would add a flat
-// `E: Clone` bound the struct's own fields never ask for.
-impl<E: DemuxAdapter> Clone for VideoTrackParams<E> {
-  fn clone(&self) -> Self {
-    Self {
-      codec: self.codec,
-      width: self.width,
-      height: self.height,
-      pixel_format: self.pixel_format.clone(),
-      frame_rate: self.frame_rate,
-    }
-  }
-}
-
+// `Debug` is hand-written for the same associated-type reason as
+// `TrackParams` itself (see its own impl, below): every field here
+// that is not a plain `u32` routes through an associated type on
+// `E`, and each of those already carries the bound it needs on the
+// trait that declares it. `#[derive(Debug)]` would add a flat `E:
+// Debug` bound the struct's own fields never ask for.
+//
+// No `Clone` on this type, `TrackParams`, or `TrackInfo` — see
+// `TrackInfo`'s own doc, below, for the message-carrier law that
+// keeps it off the whole family.
 impl<E: DemuxAdapter> Debug for VideoTrackParams<E> {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     f.debug_struct("VideoTrackParams")
@@ -522,18 +521,6 @@ impl<E: DemuxAdapter> AudioTrackParams<E> {
   }
 }
 
-impl<E: DemuxAdapter> Clone for AudioTrackParams<E> {
-  fn clone(&self) -> Self {
-    Self {
-      codec: self.codec,
-      sample_rate: self.sample_rate,
-      channel_count: self.channel_count,
-      sample_format: self.sample_format,
-      channel_layout: self.channel_layout.clone(),
-    }
-  }
-}
-
 impl<E: DemuxAdapter> Debug for AudioTrackParams<E> {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     f.debug_struct("AudioTrackParams")
@@ -565,12 +552,6 @@ impl<E: DemuxAdapter> SubtitleTrackParams<E> {
   }
 }
 
-impl<E: DemuxAdapter> Clone for SubtitleTrackParams<E> {
-  fn clone(&self) -> Self {
-    Self { codec: self.codec }
-  }
-}
-
 impl<E: DemuxAdapter> Debug for SubtitleTrackParams<E> {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     f.debug_struct("SubtitleTrackParams")
@@ -595,12 +576,6 @@ impl<E: DemuxAdapter> DataTrackParams<E> {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn codec(&self) -> E::CodecId {
     self.codec
-  }
-}
-
-impl<E: DemuxAdapter> Clone for DataTrackParams<E> {
-  fn clone(&self) -> Self {
-    Self { codec: self.codec }
   }
 }
 
@@ -634,12 +609,6 @@ impl<E: DemuxAdapter> AttachmentTrackParams<E> {
   }
 }
 
-impl<E: DemuxAdapter> Clone for AttachmentTrackParams<E> {
-  fn clone(&self) -> Self {
-    Self { codec: self.codec }
-  }
-}
-
 impl<E: DemuxAdapter> Debug for AttachmentTrackParams<E> {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     f.debug_struct("AttachmentTrackParams")
@@ -669,12 +638,6 @@ impl<E: DemuxAdapter> UnknownTrackParams<E> {
   }
 }
 
-impl<E: DemuxAdapter> Clone for UnknownTrackParams<E> {
-  fn clone(&self) -> Self {
-    Self { codec: self.codec }
-  }
-}
-
 impl<E: DemuxAdapter> Debug for UnknownTrackParams<E> {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     f.debug_struct("UnknownTrackParams")
@@ -688,6 +651,9 @@ impl<E: DemuxAdapter> Debug for UnknownTrackParams<E> {
 /// The arm **is** the kind: [`TrackInfo::kind`] reads it off this enum
 /// rather than storing a second copy that could disagree with the
 /// payload beside it.
+///
+/// No `Clone` — see [`TrackInfo`]'s own doc for the message-carrier
+/// law that keeps it off this type too.
 pub enum TrackParams<E: DemuxAdapter> {
   /// Motion video.
   Video(VideoTrackParams<E>),
@@ -731,26 +697,15 @@ impl<E: DemuxAdapter> TrackParams<E> {
   }
 }
 
-// `Clone` / `Debug` are hand-written, not derived: a flat
-// `#[derive(Clone)]` over the enum's own type parameter `E` would
-// demand `E: Clone`, which none of the six payload structs' fields
-// need — each already carries the precise bound it requires from the
-// trait that declares its associated type. See each payload struct's
-// own `Clone` / `Debug` impl, above, for the same reasoning one level
-// down.
-impl<E: DemuxAdapter> Clone for TrackParams<E> {
-  fn clone(&self) -> Self {
-    match self {
-      Self::Video(p) => Self::Video(p.clone()),
-      Self::Audio(p) => Self::Audio(p.clone()),
-      Self::Subtitle(p) => Self::Subtitle(p.clone()),
-      Self::Data(p) => Self::Data(p.clone()),
-      Self::Attachment(p) => Self::Attachment(p.clone()),
-      Self::Unknown(p) => Self::Unknown(p.clone()),
-    }
-  }
-}
-
+// `Debug` is hand-written, not derived: a flat `#[derive(Debug)]`
+// over the enum's own type parameter `E` would demand `E: Debug`,
+// which none of the six payload structs' fields need — each already
+// carries the precise bound it requires from the trait that declares
+// its associated type. See each payload struct's own `Debug` impl,
+// above, for the same reasoning one level down.
+//
+// No `Clone`: see `TrackInfo`'s own doc, below, for the
+// message-carrier law.
 impl<E: DemuxAdapter> Debug for TrackParams<E> {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     match self {
@@ -774,6 +729,16 @@ impl<E: DemuxAdapter> Debug for TrackParams<E> {
 ///
 /// Everything a particular backend knows and this row has no seat for
 /// rides [`DemuxAdapter::TrackExtra`].
+///
+/// **No `Clone`, on this type or on [`TrackParams`].** The
+/// message-carrier law: messages may be `Clone`, but `Clone` is
+/// always a refcount bump, never a deep copy — and a track row,
+/// backend metadata down to codec parameters, is not cheap to
+/// duplicate. A consumer that needs to share a row wraps it in `Arc`
+/// once, at the door, instead of paying a deep copy per consumer.
+/// [`Demuxer::take_tracks`] is that door: it moves the whole table
+/// out in one call, meant to be taken exactly once, right after a
+/// session opens, before any row needs to be shared further.
 pub struct TrackInfo<E: DemuxAdapter> {
   timebase: Timebase,
   duration: Option<Timestamp>,
@@ -883,31 +848,13 @@ impl<E: DemuxAdapter> TrackInfo<E> {
   }
 }
 
-// `Clone` / `Debug` are hand-written for the same reason as
-// `TrackParams`'s: `#[derive(Clone)]` would add `E: Clone`, but the
-// fields that actually need a bound are `E::TrackExtra` and `E::Text`
-// — two associated types `E: Clone` neither implies nor is implied
-// by. `TrackParams<E>` itself needs no extra bound (see its own impl,
-// just above); `E::Text: Debug` is already guaranteed by
-// `DemuxAdapter::Text`'s own trait bound, so only `E::TrackExtra`
-// needs naming for `Debug`.
-impl<E: DemuxAdapter> Clone for TrackInfo<E>
-where
-  E::TrackExtra: Clone,
-  E::Text: Clone,
-{
-  fn clone(&self) -> Self {
-    Self {
-      timebase: self.timebase,
-      duration: self.duration,
-      params: self.params.clone(),
-      filename: self.filename.clone(),
-      mime_type: self.mime_type.clone(),
-      extra: self.extra.clone(),
-    }
-  }
-}
-
+// `Debug` is hand-written for the same reason as `TrackParams`'s:
+// `#[derive(Debug)]` would add `E: Debug`, but the field that
+// actually needs a bound is `E::TrackExtra` — `E::Text: Debug` is
+// already guaranteed by `DemuxAdapter::Text`'s own trait bound, and
+// `TrackParams<E>` needs no extra bound at all (see its own impl,
+// above). No `Clone`: see this type's own doc, above, for the
+// message-carrier law.
 impl<E: DemuxAdapter> Debug for TrackInfo<E>
 where
   E::TrackExtra: Debug,
@@ -1413,6 +1360,25 @@ pub trait Demuxer {
   /// the coordinate every [`DemuxedPacket`] carries.
   fn tracks(&self) -> &[TrackInfo<Self::Adapter>];
 
+  /// Moves the whole track table out, once.
+  ///
+  /// The **owned-tracks door**: [`TrackInfo`] has no `Clone` (see its
+  /// own doc), so a caller that needs to hold onto track rows beyond
+  /// a borrow of `&self` cannot clone its way to one. This is the
+  /// door instead. The **first call** moves every row out and returns
+  /// it; after that call, [`tracks`](Self::tracks) answers the empty
+  /// slice — the rows are gone, not duplicated. A second call to
+  /// `take_tracks` returns an empty `Vec` too, for the same reason.
+  ///
+  /// The intended caller takes the table exactly once, right after
+  /// opening a session and before pulling any packet, and wraps each
+  /// row in `Arc` for fan-out to whatever downstream consumers need
+  /// their own handle on it — one allocation per track, ever, and
+  /// every consumer after that shares by refcount.
+  #[cfg(any(feature = "std", feature = "alloc"))]
+  #[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
+  fn take_tracks(&mut self) -> alloc::vec::Vec<TrackInfo<Self::Adapter>>;
+
   /// Pulls the next packet in interleaved file order, or `Ok(None)` at
   /// end of file.
   fn next_packet(
@@ -1514,33 +1480,6 @@ mod tests {
   }
 
   #[test]
-  fn track_params_clone_matches_the_original() {
-    let original = TrackParams::<Loopback>::Video(VideoTrackParams::new(
-      7,
-      1920,
-      1080,
-      3,
-      Some(Timebase::new(
-        30_000,
-        NonZeroI32::new(1001).expect("non-zero"),
-      )),
-    ));
-    let cloned = original.clone();
-    assert_eq!(cloned.kind(), original.kind());
-    assert_eq!(cloned.codec(), original.codec());
-    match (&original, &cloned) {
-      (TrackParams::Video(p1), TrackParams::Video(p2)) => {
-        assert_eq!(p1.width(), p2.width());
-        assert_eq!(p1.height(), p2.height());
-        assert_eq!(p1.pixel_format(), p2.pixel_format());
-        assert_eq!(p1.frame_rate(), p2.frame_rate());
-      }
-      _ => panic!("clone changed the arm"),
-    }
-    assert!(format!("{cloned:?}").contains("Video"));
-  }
-
-  #[test]
   fn attachment_identity_lives_on_the_track() {
     let info = TrackInfo::<Loopback>::new(
       ms_tb(),
@@ -1555,26 +1494,6 @@ mod tests {
       Some("application/x-truetype-font")
     );
     assert_eq!(info.duration(), None);
-  }
-
-  #[test]
-  fn track_info_clone_matches_the_original() {
-    let original = TrackInfo::<Loopback>::new(
-      ms_tb(),
-      TrackParams::Attachment(AttachmentTrackParams::new(9)),
-      (),
-    )
-    .with_filename(Some("Arial.ttf"))
-    .with_mime_type(Some("application/x-truetype-font"))
-    .with_duration(Some(Timestamp::new(500, ms_tb())));
-    let cloned = original.clone();
-    assert_eq!(cloned.kind(), original.kind());
-    assert_eq!(cloned.timebase(), original.timebase());
-    assert_eq!(cloned.duration(), original.duration());
-    assert_eq!(cloned.filename(), original.filename());
-    assert_eq!(cloned.mime_type(), original.mime_type());
-    assert_eq!(cloned.params().codec(), original.params().codec());
-    assert!(format!("{cloned:?}").contains("TrackInfo"));
   }
 
   #[test]
@@ -1689,7 +1608,7 @@ mod tests {
   /// Trivial loopback session — proves the trait is implementable and
   /// that its associated types resolve through the adapter bundle.
   struct LoopDemuxer {
-    tracks: [TrackInfo<Loopback>; 1],
+    tracks: Vec<TrackInfo<Loopback>>,
     drained: bool,
   }
 
@@ -1703,6 +1622,11 @@ mod tests {
 
     fn tracks(&self) -> &[TrackInfo<Loopback>] {
       &self.tracks
+    }
+
+    #[cfg(any(feature = "std", feature = "alloc"))]
+    fn take_tracks(&mut self) -> Vec<TrackInfo<Loopback>> {
+      core::mem::take(&mut self.tracks)
     }
 
     fn next_packet(&mut self) -> Result<Option<DemuxedPacket<Loopback, &'static [u8]>>, LoopError> {
@@ -1728,7 +1652,7 @@ mod tests {
     _accepts::<LoopDemuxer>();
 
     let mut d = LoopDemuxer {
-      tracks: [TrackInfo::new(
+      tracks: vec![TrackInfo::new(
         ms_tb(),
         TrackParams::Audio(AudioTrackParams::new(1, 48_000, 2, 0, 0)),
         (),
@@ -1745,5 +1669,39 @@ mod tests {
     assert!(d.next_packet().expect("pull").is_none(), "EOF is sticky");
     d.seek(Timestamp::new(0, ms_tb())).expect("seek");
     assert!(d.next_packet().expect("pull").is_some());
+  }
+
+  #[test]
+  fn take_tracks_moves_every_row_out_once_and_leaves_the_table_empty() {
+    let mut d = LoopDemuxer {
+      tracks: vec![
+        TrackInfo::new(
+          ms_tb(),
+          TrackParams::Audio(AudioTrackParams::new(1, 48_000, 2, 0, 0)),
+          (),
+        ),
+        TrackInfo::new(
+          ms_tb(),
+          TrackParams::Subtitle(SubtitleTrackParams::new(2)),
+          (),
+        ),
+      ],
+      drained: false,
+    };
+    let expected: Vec<TrackKind> = d.tracks().iter().map(|t| t.kind()).collect();
+
+    let taken = d.take_tracks();
+    assert_eq!(
+      taken.iter().map(|t| t.kind()).collect::<Vec<_>>(),
+      expected,
+      "every row comes out, in table order",
+    );
+    assert!(
+      d.tracks().is_empty(),
+      "the table is empty after the first take"
+    );
+
+    // The door does not reopen: a second call has nothing left to give.
+    assert!(d.take_tracks().is_empty(), "a second take yields nothing");
   }
 }
