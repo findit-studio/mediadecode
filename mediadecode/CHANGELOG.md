@@ -11,6 +11,93 @@ The sibling FFmpeg adapter has its own log at
 
 ## [Unreleased]
 
+### Added
+
+- **`Debug` across the demux tier; `Clone` where it stays cheap.**
+  `TrackParams` and `TrackInfo` gain `Debug` (previously absent),
+  hand-written and bounded on what their fields actually need
+  (`E::TrackExtra`, `E::Text`, and each per-kind payload struct's own
+  associated types) rather than on `E` itself, which `#[derive(Debug)]`
+  cannot see past. `VideoPacket`, `AudioPacket`, `SubtitlePacket`,
+  `DataPacket`, and `AttachmentPacket` derive `Clone` + `Debug` directly
+  — their fields are the generic parameters themselves, so the derive's
+  bound is already precise — and `DemuxedPacket` gets the same pair
+  hand-written, for the same associated-type reason, since its five
+  arms carry exactly those packet types.
+
+  `TrackParams` and `TrackInfo` do **not** get `Clone`. An interim
+  version of this entry gave them one — a real allocation-and-copy per
+  clone, minted to satisfy a channel bound — and it violated the
+  message-carrier law recovered from the frozen desktop tree: messages
+  may be `Clone`, but `Clone` is always a refcount bump, never a deep
+  copy. That impl is gone. In its place, `Demuxer` gains
+  **`take_tracks`**, the owned-tracks door: the first call moves the
+  whole track table out of the session; `tracks()` answers the empty
+  slice afterward. The intended caller takes the table once, right
+  after opening a session and before pulling any packet, and wraps
+  each row in `Arc` for fan-out — one allocation per track, ever,
+  rather than a deep copy per consumer.
+
+### Changed (BREAKING)
+
+- **Every struct-shaped enum variant is now a tuple variant wrapping a
+  named payload struct** — `TrackParams`'s six arms, `DemuxedPacket`'s
+  five arms, and `SubtitlePayload`'s two arms. The house rule this
+  crate otherwise already followed everywhere else (see `FrameError`,
+  which has always shaped its variants this way): a struct variant has
+  no nameable type of its own, so it cannot answer
+  `is_<variant>`/`unwrap_<variant>`/`try_unwrap_<variant>`, and its
+  fields are trapped instead of being a reusable, documented,
+  accessor-bearing type.
+
+  - `TrackParams::Video { codec, width, height, pixel_format,
+    frame_rate }` → `TrackParams::Video(VideoTrackParams<E>)`, and the
+    same shape for `Audio` → `AudioTrackParams`, `Subtitle` →
+    `SubtitleTrackParams`, `Data` → `DataTrackParams`, `Attachment` →
+    `AttachmentTrackParams`, `Unknown` → `UnknownTrackParams`. Each
+    payload has private fields, a positional `new(...)`, and a `const`
+    accessor per field (`codec()`, `width()`, `pixel_format()`, …),
+    matching whichever of `Copy`/`Clone`-only the field's own type is.
+
+  - `DemuxedPacket::Video { track, packet }` →
+    `DemuxedPacket::Video(VideoTrackPacket<E, D>)`, and the same shape
+    for `Audio` → `AudioTrackPacket`, `Subtitle` →
+    `SubtitleTrackPacket`, `Data` → `DataTrackPacket`, `Attachment` →
+    `AttachmentTrackPacket`. Named `<Kind>TrackPacket` rather than
+    reusing `VideoPacket` etc. — those names are already taken by the
+    packet type nested *inside* the envelope. Each payload carries
+    `track()`, `packet()` (borrowed), `into_packet()` and
+    `into_parts()` (owned) — the enum's own `track()` / `kind()`
+    accessors are unchanged and now read through these.
+
+  - `SubtitlePayload::Text { text, language }` →
+    `SubtitlePayload::Text(subtitle::Text<B>)`, and `Bitmap { regions
+    }` → `SubtitlePayload::Bitmap(subtitle::Bitmap<B>)`.
+
+  A match that used to destructure the struct fields now binds the
+  payload and reads it through accessors:
+
+  ```rust
+  // Before
+  match params { TrackParams::Video { width, height, .. } => .. }
+  // After
+  match params { TrackParams::Video(p) => (p.width(), p.height()) }
+  ```
+
+  **The accessor face rides the reshape.** `TrackParams`,
+  `DemuxedPacket`, and `SubtitlePayload` now derive
+  `derive_more::{IsVariant, Unwrap, TryUnwrap}`, with
+  `#[unwrap(ref, ref_mut)]` and `#[try_unwrap(ref, ref_mut)]` on each
+  enum — every arm answers `is_<variant>()`,
+  `unwrap_<variant>()` / `_ref()` / `_mut()`, and
+  `try_unwrap_<variant>()` / `_ref()` / `_mut()`. This is exactly what
+  the reshape above was for: a struct variant has no nameable payload
+  type to return from `unwrap_<variant>`, so the face could not exist
+  until the fields moved into named structs. `TrackKind` gains
+  `IsVariant` too. The `derive_more` dependency row picks up the
+  `unwrap` / `try_unwrap` features alongside the existing `display` /
+  `is_variant`.
+
 ## [0.7.0] - 2026-08-23
 
 ### Added

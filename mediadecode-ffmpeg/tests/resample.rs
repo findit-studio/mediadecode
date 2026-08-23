@@ -114,9 +114,10 @@ fn run(path: &std::path::Path, target: ResampleSpec) -> Converted {
   };
 
   while let Some(packet) = demuxer.next_packet().expect("pull") {
-    let DemuxedPacket::Audio { track: t, packet } = packet else {
+    let DemuxedPacket::Audio(p) = packet else {
       continue;
     };
+    let (t, packet) = p.into_parts();
     if t.get() != track {
       continue;
     }
@@ -300,12 +301,8 @@ fn a_mid_stream_format_change_is_refused_by_name() {
     .send_frame(&changed)
     .expect_err("the face never silently reconfigures");
   match err {
-    ResampleError::SourceChanged {
-      expected_rate,
-      found_rate,
-      ..
-    } => {
-      assert_eq!((expected_rate, found_rate), (48_000, 44_100));
+    ResampleError::SourceChanged(p) => {
+      assert_eq!((p.expected_rate(), p.found_rate()), (48_000, 44_100));
     }
     other => panic!("expected a named refusal, got {other:?}"),
   }
@@ -325,7 +322,7 @@ fn a_mid_stream_format_change_is_refused_by_name() {
   );
   assert!(matches!(
     resampler.send_frame(&mono),
-    Err(ResampleError::SourceChanged { .. }),
+    Err(ResampleError::SourceChanged(_)),
   ));
 }
 
@@ -478,9 +475,9 @@ fn a_custom_layout_is_refused_by_name() {
 
   let hazardous = ResampleSpec::new(48_000, Sample::I16(Type::Packed), custom);
   match FfmpegResampler::new(hazardous, mono_16k()) {
-    Err(ResampleError::UnsupportedLayout { end, channels, .. }) => {
-      assert_eq!(end.to_string(), "source");
-      assert_eq!(channels, 2);
+    Err(ResampleError::UnsupportedLayout(p)) => {
+      assert_eq!(p.end().to_string(), "source");
+      assert_eq!(p.channels(), 2);
     }
     Err(other) => panic!("expected UnsupportedLayout, got {other:?}"),
     Ok(_) => panic!("a custom layout must not reach swr or a staged frame"),
@@ -493,10 +490,7 @@ fn a_custom_layout_is_refused_by_name() {
       source,
       ResampleSpec::new(16_000, Sample::I16(Type::Packed), custom)
     ),
-    Err(ResampleError::UnsupportedLayout {
-      end: mediadecode_ffmpeg::SpecEnd::Target,
-      ..
-    }),
+    Err(ResampleError::UnsupportedLayout(p)) if p.end() == mediadecode_ffmpeg::SpecEnd::Target,
   ));
 
   // The map is still ours to free: nothing took a copy of it.
@@ -509,14 +503,14 @@ fn a_custom_layout_is_refused_by_name() {
       ResampleSpec::new(0, Sample::I16(Type::Packed), ChannelLayout::STEREO),
       mono_16k(),
     ),
-    Err(ResampleError::UnsupportedRate { rate: 0, .. }),
+    Err(ResampleError::UnsupportedRate(p)) if p.rate() == 0,
   ));
   assert!(matches!(
     FfmpegResampler::new(
       ResampleSpec::new(48_000, Sample::None, ChannelLayout::STEREO),
       mono_16k(),
     ),
-    Err(ResampleError::UnsupportedFormat { .. }),
+    Err(ResampleError::UnsupportedFormat(_)),
   ));
   let mut empty: ffmpeg_next::ffi::AVChannelLayout = unsafe { std::mem::zeroed() };
   empty.nb_channels = 0;
@@ -525,7 +519,7 @@ fn a_custom_layout_is_refused_by_name() {
       ResampleSpec::new(48_000, Sample::I16(Type::Packed), ChannelLayout(empty)),
       mono_16k(),
     ),
-    Err(ResampleError::UnsupportedLayout { channels: 0, .. }),
+    Err(ResampleError::UnsupportedLayout(p)) if p.channels() == 0,
   ));
 }
 
@@ -635,13 +629,13 @@ fn a_rematrix_that_would_drop_channels_is_refused_by_name() {
   // happily — the planar-only refusal never looked at it.
   let source = ResampleSpec::new(48_000, Sample::I16(Type::Packed), ChannelLayout::_22POINT2);
   match FfmpegResampler::new(source, mono_16k()) {
-    Err(ResampleError::ChannelDropped {
-      source_channels,
-      target_channels,
-      channel,
-    }) => {
-      assert_eq!((source_channels, target_channels), (24, 1));
-      assert_eq!(channel, 9, "the first channel swr's matrix cannot route");
+    Err(ResampleError::ChannelDropped(p)) => {
+      assert_eq!((p.source_channels(), p.target_channels()), (24, 1));
+      assert_eq!(
+        p.channel(),
+        9,
+        "the first channel swr's matrix cannot route"
+      );
     }
     Err(other) => panic!("expected ChannelDropped, got {other:?}"),
     Ok(_) => panic!("a conversion that drops fifteen channels must not open"),
@@ -656,7 +650,7 @@ fn a_rematrix_that_would_drop_channels_is_refused_by_name() {
         ResampleSpec::new(16_000, Sample::I16(Type::Packed), ChannelLayout::STEREO),
       )
       .map(|_| ()),
-      Err(ResampleError::ChannelDropped { channel: 6, .. }),
+      Err(ResampleError::ChannelDropped(p)) if p.channel() == 6,
     ),
     "eight channels is not a safe count, it is just a small one",
   );
@@ -799,14 +793,11 @@ fn an_unspecified_layout_cannot_smuggle_a_lossy_conversion_past_the_pair_check()
   for target_layout in [ChannelLayout::MONO, ChannelLayout::STEREO] {
     let target = ResampleSpec::new(16_000, Sample::I16(Type::Packed), target_layout);
     match FfmpegResampler::new(source, target).map(|_| ()) {
-      Err(ResampleError::ChannelDropped {
-        source_channels,
-        channel,
-        ..
-      }) => {
-        assert_eq!(source_channels, 24);
+      Err(ResampleError::ChannelDropped(p)) => {
+        assert_eq!(p.source_channels(), 24);
         assert_eq!(
-          channel, 9,
+          p.channel(),
+          9,
           "the refusal names the channel the tone probe found silent",
         );
       }
@@ -888,13 +879,9 @@ fn a_planar_layout_past_eight_channels_is_refused_at_construction() {
   assert_eq!(planar_22_2.channels(), 24, "22.2 really is 24 channels");
 
   match FfmpegResampler::new(planar_22_2, mono_16k()) {
-    Err(ResampleError::TooManyPlanes {
-      end,
-      channels,
-      limit,
-    }) => {
-      assert_eq!(end.to_string(), "source");
-      assert_eq!((channels, limit), (24, 8));
+    Err(ResampleError::TooManyPlanes(p)) => {
+      assert_eq!(p.end().to_string(), "source");
+      assert_eq!((p.channels(), p.limit()), (24, 8));
     }
     Err(other) => panic!("expected TooManyPlanes for the source, got {other:?}"),
     Ok(_) => panic!("a source no frame can represent must not open"),
@@ -904,11 +891,8 @@ fn a_planar_layout_past_eight_channels_is_refused_at_construction() {
   assert!(
     matches!(
       FfmpegResampler::new(stereo, planar_22_2).map(|_| ()),
-      Err(ResampleError::TooManyPlanes {
-        end: mediadecode_ffmpeg::SpecEnd::Target,
-        channels: 24,
-        ..
-      }),
+      Err(ResampleError::TooManyPlanes(p))
+        if p.end() == mediadecode_ffmpeg::SpecEnd::Target && p.channels() == 24,
     ),
     "the target end is the one that used to fail mid-stream",
   );
@@ -931,7 +915,7 @@ fn a_planar_layout_past_eight_channels_is_refused_at_construction() {
         ResampleSpec::new(16_000, Sample::F32(Type::Planar), ChannelLayout::_22POINT2),
       )
       .map(|_| ()),
-      Err(ResampleError::TooManyPlanes { .. }),
+      Err(ResampleError::TooManyPlanes(_)),
     ),
     "and the same conversion planar is refused for its planes, not its pair",
   );
@@ -956,9 +940,13 @@ fn a_forged_frame_geometry_is_refused_before_it_can_allocate() {
   // sample count. The geometry has to be settled before any of that.
   let forged = stereo_frame(u32::MAX, 16, None);
   match resampler.send_frame(&forged) {
-    Err(ResampleError::PlaneCount { expected, found }) => {
-      assert_eq!(found, 16, "the plane's real length is what was compared");
-      assert!(expected > found);
+    Err(ResampleError::PlaneCount(p)) => {
+      assert_eq!(
+        p.found(),
+        16,
+        "the plane's real length is what was compared"
+      );
+      assert!(p.expected() > p.found());
     }
     other => panic!("expected a geometry refusal, got {other:?}"),
   }
@@ -978,10 +966,7 @@ fn a_forged_frame_geometry_is_refused_before_it_can_allocate() {
   );
   assert!(matches!(
     resampler.send_frame(&planeless),
-    Err(ResampleError::PlaneCount {
-      expected: 1,
-      found: 0
-    }),
+    Err(ResampleError::PlaneCount(p)) if p.expected() == 1 && p.found() == 0,
   ));
 
   // And an honest frame still goes through afterwards: the refusals
@@ -1003,7 +988,7 @@ fn a_refused_frame_does_not_stamp_the_next_good_one() {
   let forged = stereo_frame(4_800, 16, Some(48_000 * 60));
   assert!(matches!(
     resampler.send_frame(&forged),
-    Err(ResampleError::PlaneCount { .. }),
+    Err(ResampleError::PlaneCount(_)),
   ));
 
   // Then the real first frame, at zero.
@@ -1037,8 +1022,8 @@ fn a_timestamp_that_cannot_be_rescaled_is_refused_before_anything_moves() {
   let bytes = samples as usize * 2 * 2;
   for pts in [i64::MAX - 1, i64::MIN + 1, i64::MIN] {
     match resampler.send_frame(&stereo_frame(samples, bytes, Some(pts))) {
-      Err(ResampleError::TimestampOutOfRange { pts: reported }) => {
-        assert_eq!(reported, pts, "the refusal names the timestamp it read");
+      Err(ResampleError::TimestampOutOfRange(p)) => {
+        assert_eq!(p.pts(), pts, "the refusal names the timestamp it read");
       }
       other => panic!("expected TimestampOutOfRange for {pts}, got {other:?}"),
     }
@@ -1085,9 +1070,9 @@ fn the_output_timeline_refuses_to_overflow() {
   let samples = 4_800;
   let frame = stereo_frame(samples, samples as usize * 2 * 2, Some(i64::MAX - 8));
   match resampler.send_frame(&frame) {
-    Err(ResampleError::TimestampOverflow { pts, samples }) => {
-      assert_eq!(pts, i64::MAX - 8);
-      assert!(samples > 8, "the count that would not fit");
+    Err(ResampleError::TimestampOverflow(p)) => {
+      assert_eq!(p.pts(), i64::MAX - 8);
+      assert!(p.samples() > 8, "the count that would not fit");
     }
     other => panic!("expected TimestampOverflow, got {other:?}"),
   }

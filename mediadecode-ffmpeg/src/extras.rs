@@ -8,9 +8,10 @@
 
 use std::vec::Vec;
 
+use derive_more::IsVariant;
 use ffmpeg_next::{codec::Parameters, ffi::avcodec_parameters_copy};
 
-use crate::demuxer::DemuxError;
+use crate::demuxer::{DemuxError, ParametersAlloc, ParametersCopy, ParametersMissing};
 
 /// Per-`VideoPacket` extras.
 #[derive(Clone, Debug, Default)]
@@ -606,7 +607,7 @@ impl SubtitleFrameExtra {
 }
 
 /// Picture type per `AVFrame.pict_type`.
-#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash, IsVariant)]
 #[non_exhaustive]
 pub enum PictureType {
   /// Unspecified / unset.
@@ -1019,23 +1020,27 @@ pub(crate) fn clone_parameters(
   // allocator recovery later, on a `Parameters` that never allocated.
   // SAFETY: reading the pointer without dereferencing it.
   if unsafe { source.as_ptr() }.is_null() {
-    return Err(DemuxError::ParametersMissing { stream_index });
+    return Err(DemuxError::ParametersMissing(ParametersMissing::new(
+      stream_index,
+    )));
   }
   let mut out = Parameters::new();
   // SAFETY: reading the pointer the constructor stored without
   // dereferencing it — which is exactly what the check is for.
   if unsafe { out.as_ptr() }.is_null() {
-    return Err(DemuxError::ParametersAlloc { stream_index });
+    return Err(DemuxError::ParametersAlloc(ParametersAlloc::new(
+      stream_index,
+    )));
   }
   // SAFETY: both pointers are live `AVCodecParameters` — the
   // destination freshly allocated and non-null, the source owned by its
   // holder for the duration of this call.
   let rc = unsafe { avcodec_parameters_copy(out.as_mut_ptr(), source.as_ptr()) };
   if rc < 0 {
-    return Err(DemuxError::ParametersCopy {
+    return Err(DemuxError::ParametersCopy(ParametersCopy::new(
       stream_index,
-      source: ffmpeg_next::Error::from(rc),
-    });
+      ffmpeg_next::Error::from(rc),
+    )));
   }
   Ok(out)
 }
@@ -1054,7 +1059,23 @@ pub(crate) fn clone_parameters(
 /// quietly incomplete. `Clone` cannot report either, so this type does
 /// not implement it; [`Self::try_clone`] is the same copy with the
 /// answer a caller can act on, and [`Self::clone_parameters`] is the
-/// handoff a decoder actually needs.
+/// handoff a decoder actually needs. This crate shipped a derived
+/// `Clone` over the unchecked path once, reachable from safe code
+/// that just copied a track row, and closed it by removing the
+/// derive (see
+/// `demuxer::tests::the_public_track_extra_copies_are_checked_too`).
+///
+/// The message-carrier law is the second, independent reason `Clone`
+/// stays off: messages may be `Clone`, but `Clone` is always a
+/// refcount bump, never a deep copy, and `avcodec_parameters_copy` is
+/// not that. This crate shipped a *hand-written*, checked `Clone`
+/// here once too — through [`Self::try_clone`], to satisfy a channel
+/// bound — and it came back out for the same reason: a consumer that
+/// needs to share the [`TrackInfo`](mediadecode::demuxer::TrackInfo)
+/// this type lives inside wraps it in `Arc` once, at the door,
+/// instead of paying a deep copy per consumer. [`Self::try_clone`]
+/// remains for the one caller that genuinely wants an owned duplicate
+/// of the codec parameters, which sharing a message is not.
 ///
 /// `disposition` is the raw `AV_DISPOSITION_*` bit set, not
 /// `ffmpeg_next::format::stream::Disposition`. That type's
@@ -1086,9 +1107,9 @@ impl TrackExtra {
   pub fn new(stream_index: i32, parameters: Parameters) -> Result<Self, DemuxError> {
     // SAFETY: reading the pointer without dereferencing it.
     if unsafe { parameters.as_ptr() }.is_null() {
-      return Err(DemuxError::ParametersMissing {
-        stream_index: stream_index.max(0) as usize,
-      });
+      return Err(DemuxError::ParametersMissing(ParametersMissing::new(
+        stream_index.max(0) as usize,
+      )));
     }
     Ok(Self {
       stream_index,

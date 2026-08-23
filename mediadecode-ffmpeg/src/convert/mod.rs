@@ -9,6 +9,7 @@
 //! bumps refcounts; dropping releases them.
 use core::ptr::{addr_of, read_unaligned};
 
+use derive_more::{IsVariant, TryUnwrap, Unwrap};
 use ffmpeg_next::ffi::{
   AV_NOPTS_VALUE, AVChromaLocation, AVColorPrimaries, AVColorRange, AVColorSpace,
   AVColorTransferCharacteristic, AVFrame, AVPictureType, AVSubtitleType, av_buffer_alloc,
@@ -17,7 +18,7 @@ use mediadecode::{
   PixelFormat, Timebase, Timestamp,
   color::{ChromaLocation, ColorInfo, ColorMatrix, ColorPrimaries, ColorRange, ColorTransfer},
   frame::{AudioFrame, Dimensions, Plane, Rect, SubtitleFrame, VideoFrame},
-  subtitle::SubtitlePayload,
+  subtitle::{Bitmap as SubtitleBitmap, SubtitlePayload, Text as SubtitleText},
 };
 use mediaframe::audio::ChannelLayoutDescription;
 use smol_str::SmolStr;
@@ -29,70 +30,157 @@ use crate::{
   sample_format::SampleFormat,
 };
 
-/// Errors from [`av_frame_to_video_frame`].
+/// Payload for [`ConvertError::UnsupportedPixelFormat`].
+///
+/// The frame's pixel format isn't in the closed CPU-format set this
+/// crate supports for safe per-plane access.
 #[derive(Debug, Clone)]
+pub struct UnsupportedPixelFormat {
+  format: PixelFormat,
+  raw: i32,
+  name: Option<SmolStr>,
+}
+
+impl UnsupportedPixelFormat {
+  /// Constructs an `UnsupportedPixelFormat` payload.
+  #[inline]
+  pub const fn new(format: PixelFormat, raw: i32, name: Option<SmolStr>) -> Self {
+    Self { format, raw, name }
+  }
+
+  /// The unified vocabulary's answer for [`Self::raw`].
+  ///
+  /// [`PixelFormat::None`] whenever the raw integer has no mapping — a
+  /// hardware surface, a Bayer mosaic, a format FFmpeg gained after
+  /// this build. That is a *value*, not a failed lookup, and it is
+  /// deliberately not made to carry the integer: [`Self::raw`] and
+  /// [`Self::name`] are where the identity survives.
+  #[inline]
+  pub const fn format(&self) -> &PixelFormat {
+    &self.format
+  }
+  /// The raw `AVFrame.format` integer, exactly as FFmpeg wrote it.
+  ///
+  /// Present at every tier — it costs one `i32` — because it is the
+  /// only field that is always available and always precise. Without
+  /// it the message for the fall-through case says `None` and names
+  /// nothing at all.
+  #[inline]
+  pub const fn raw(&self) -> i32 {
+    self.raw
+  }
+  /// FFmpeg's own name for [`Self::raw`] (`av_get_pix_fmt_name`), when
+  /// libavutil has one.
+  ///
+  /// `None` for an integer libavutil does not describe — a corrupt
+  /// read, or a format from a newer library than the one linked.
+  #[inline]
+  pub fn name(&self) -> Option<&str> {
+    self.name.as_deref()
+  }
+}
+
+impl core::fmt::Display for UnsupportedPixelFormat {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    match &self.name {
+      Some(name) => write!(
+        f,
+        "convert: unsupported pixel format {:?} (AVPixelFormat {} = {name:?})",
+        self.format, self.raw
+      ),
+      None => write!(
+        f,
+        "convert: unsupported pixel format {:?} (AVPixelFormat {}, unnamed by libavutil)",
+        self.format, self.raw
+      ),
+    }
+  }
+}
+
+/// Payload for [`ConvertError::InvalidPlaneLayout`].
+///
+/// A plane reported `linesize <= 0` or otherwise inconsistent layout.
+#[derive(Debug, Clone, Copy)]
+pub struct InvalidPlaneLayout {
+  plane: usize,
+}
+
+impl InvalidPlaneLayout {
+  /// Constructs an `InvalidPlaneLayout` payload.
+  #[inline]
+  pub const fn new(plane: usize) -> Self {
+    Self { plane }
+  }
+  /// Plane index.
+  #[inline]
+  pub const fn plane(&self) -> usize {
+    self.plane
+  }
+}
+
+impl core::fmt::Display for InvalidPlaneLayout {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    write!(f, "convert: invalid layout on plane {}", self.plane)
+  }
+}
+
+/// Payload for [`ConvertError::BufferAcquireFailed`].
+///
+/// Failed to acquire an `AVBufferRef` for a plane (out of memory, or
+/// the frame's `data[i]` pointer doesn't lie inside any of `buf[]`).
+#[derive(Debug, Clone, Copy)]
+pub struct BufferAcquireFailed {
+  plane: usize,
+}
+
+impl BufferAcquireFailed {
+  /// Constructs a `BufferAcquireFailed` payload.
+  #[inline]
+  pub const fn new(plane: usize) -> Self {
+    Self { plane }
+  }
+  /// Plane index whose buffer couldn't be acquired.
+  #[inline]
+  pub const fn plane(&self) -> usize {
+    self.plane
+  }
+}
+
+impl core::fmt::Display for BufferAcquireFailed {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    write!(
+      f,
+      "convert: could not acquire buffer ref for plane {}",
+      self.plane
+    )
+  }
+}
+
+/// Errors from [`av_frame_to_video_frame`].
+#[derive(Debug, Clone, IsVariant, Unwrap, TryUnwrap)]
 #[non_exhaustive]
+#[unwrap(ref, ref_mut)]
+#[try_unwrap(ref, ref_mut)]
 pub enum ConvertError {
   /// `av_frame` was null.
   NullFrame,
   /// The frame's pixel format isn't in the closed CPU-format set this
   /// crate supports for safe per-plane access.
-  UnsupportedPixelFormat {
-    /// The unified vocabulary's answer for [`raw`](Self::UnsupportedPixelFormat::raw).
-    ///
-    /// [`PixelFormat::None`] whenever the raw integer has no mapping —
-    /// a hardware surface, a Bayer mosaic, a format FFmpeg gained after
-    /// this build. That is a *value*, not a failed lookup, and it is
-    /// deliberately not made to carry the integer: the two fields below
-    /// are where the identity survives.
-    format: PixelFormat,
-    /// The raw `AVFrame.format` integer, exactly as FFmpeg wrote it.
-    ///
-    /// Present at every tier — it costs one `i32` — because it is the
-    /// only field that is always available and always precise. Without
-    /// it the message for the fall-through case says `None` and names
-    /// nothing at all.
-    raw: i32,
-    /// FFmpeg's own name for [`raw`](Self::UnsupportedPixelFormat::raw)
-    /// (`av_get_pix_fmt_name`), when libavutil has one.
-    ///
-    /// `None` for an integer libavutil does not describe — a corrupt
-    /// read, or a format from a newer library than the one linked.
-    name: Option<SmolStr>,
-  },
+  UnsupportedPixelFormat(UnsupportedPixelFormat),
   /// A plane reported `linesize <= 0` or otherwise inconsistent layout.
-  InvalidPlaneLayout {
-    /// Plane index.
-    plane: usize,
-  },
+  InvalidPlaneLayout(InvalidPlaneLayout),
   /// Failed to acquire an `AVBufferRef` for a plane (out of memory, or
   /// the frame's `data[i]` pointer doesn't lie inside any of `buf[]`).
-  BufferAcquireFailed {
-    /// Plane index whose buffer couldn't be acquired.
-    plane: usize,
-  },
+  BufferAcquireFailed(BufferAcquireFailed),
 }
 
 impl core::fmt::Display for ConvertError {
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
     match self {
       Self::NullFrame => write!(f, "convert: AVFrame pointer was null"),
-      Self::UnsupportedPixelFormat { format, raw, name } => match name {
-        Some(name) => write!(
-          f,
-          "convert: unsupported pixel format {format:?} (AVPixelFormat {raw} = {name:?})"
-        ),
-        None => write!(
-          f,
-          "convert: unsupported pixel format {format:?} (AVPixelFormat {raw}, unnamed by libavutil)"
-        ),
-      },
-      Self::InvalidPlaneLayout { plane } => {
-        write!(f, "convert: invalid layout on plane {plane}")
-      }
-      Self::BufferAcquireFailed { plane } => {
-        write!(f, "convert: could not acquire buffer ref for plane {plane}")
-      }
+      Self::UnsupportedPixelFormat(p) => core::fmt::Display::fmt(p, f),
+      Self::InvalidPlaneLayout(p) => core::fmt::Display::fmt(p, f),
+      Self::BufferAcquireFailed(p) => core::fmt::Display::fmt(p, f),
     }
   }
 }
@@ -105,11 +193,11 @@ impl core::error::Error for ConvertError {}
 /// Both refusal sites go through here so the raw id and the name are
 /// never gathered at one of them and forgotten at the other.
 fn unsupported_pixel_format(format: PixelFormat, raw: i32) -> ConvertError {
-  ConvertError::UnsupportedPixelFormat {
+  ConvertError::UnsupportedPixelFormat(UnsupportedPixelFormat::new(
     format,
     raw,
-    name: crate::ffi::pix_fmt_name(raw),
-  }
+    crate::ffi::pix_fmt_name(raw),
+  ))
 }
 
 /// Safe wrapper around [`av_frame_to_video_frame`] taking a borrowed
@@ -241,16 +329,22 @@ pub unsafe fn av_frame_to_video_frame(
       // and a negative linesize is FFmpeg's vertical-flip convention
       // (which our safe accessors refuse). Either way the layout is
       // unusable.
-      return Err(ConvertError::InvalidPlaneLayout { plane: plane_idx });
+      return Err(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(
+        plane_idx,
+      )));
     }
     let data_ptr = unsafe { (*av_frame).data[plane_idx] };
     if data_ptr.is_null() {
-      return Err(ConvertError::InvalidPlaneLayout { plane: plane_idx });
+      return Err(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(
+        plane_idx,
+      )));
     }
     let plane_h = geom.height[plane_idx];
     let row_bytes = geom.row_bytes[plane_idx];
     if row_bytes > linesize as usize {
-      return Err(ConvertError::InvalidPlaneLayout { plane: plane_idx });
+      return Err(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(
+        plane_idx,
+      )));
     }
     // Safe-API stance for stride padding:
     //
@@ -268,24 +362,31 @@ pub unsafe fn av_frame_to_video_frame(
     //   `row_bytes` and the buffer's length is `row_bytes * plane_h`
     //   with every byte initialized.
     let (view, exported_stride) = if (linesize as usize) == row_bytes {
-      let plane_bytes = (plane_h)
-        .checked_mul(linesize as usize)
-        .ok_or(ConvertError::InvalidPlaneLayout { plane: plane_idx })?;
-      let buf = unsafe { find_backing_buffer(av_frame, data_ptr, plane_bytes) }
-        .ok_or(ConvertError::BufferAcquireFailed { plane: plane_idx })?;
+      let plane_bytes =
+        (plane_h)
+          .checked_mul(linesize as usize)
+          .ok_or(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(
+            plane_idx,
+          )))?;
+      let buf = unsafe { find_backing_buffer(av_frame, data_ptr, plane_bytes) }.ok_or(
+        ConvertError::BufferAcquireFailed(BufferAcquireFailed::new(plane_idx)),
+      )?;
       // Plain address subtraction (avoids `offset_from`'s
       // strict-provenance requirement; the pointers are independent
       // C-side casts).
       let offset = unsafe { (data_ptr as usize).wrapping_sub((*buf).data as usize) };
       // SAFETY: `buf` is non-null and live; offset + plane_bytes <= buf.size
       // by find_backing_buffer's check.
-      let view = unsafe { FfmpegBuffer::from_ref_view(buf, offset, plane_bytes) }
-        .ok_or(ConvertError::BufferAcquireFailed { plane: plane_idx })?;
+      let view = unsafe { FfmpegBuffer::from_ref_view(buf, offset, plane_bytes) }.ok_or(
+        ConvertError::BufferAcquireFailed(BufferAcquireFailed::new(plane_idx)),
+      )?;
       (view, linesize as u32)
     } else {
       let total_bytes = row_bytes
         .checked_mul(plane_h)
-        .ok_or(ConvertError::InvalidPlaneLayout { plane: plane_idx })?;
+        .ok_or(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(
+          plane_idx,
+        )))?;
       // Bound-check the readable extent in the source AVBufferRef
       // BEFORE we start dereferencing per-row offsets. The zero-copy
       // branch above did this implicitly by passing `plane_bytes` to
@@ -297,24 +398,33 @@ pub unsafe fn av_frame_to_video_frame(
       // before any read).
       let last_row_offset = (plane_h.saturating_sub(1))
         .checked_mul(linesize as usize)
-        .ok_or(ConvertError::InvalidPlaneLayout { plane: plane_idx })?;
-      let readable_extent = last_row_offset
-        .checked_add(row_bytes)
-        .ok_or(ConvertError::InvalidPlaneLayout { plane: plane_idx })?;
+        .ok_or(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(
+          plane_idx,
+        )))?;
+      let readable_extent =
+        last_row_offset
+          .checked_add(row_bytes)
+          .ok_or(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(
+            plane_idx,
+          )))?;
       // `find_backing_buffer` confirms the AVBufferRef in `(*av_frame).buf[]`
       // that contains `data_ptr` covers at least `readable_extent`
       // bytes from the data pointer. We don't need the returned ptr;
       // we just need the existence guarantee.
-      unsafe { find_backing_buffer(av_frame, data_ptr, readable_extent) }
-        .ok_or(ConvertError::BufferAcquireFailed { plane: plane_idx })?;
+      unsafe { find_backing_buffer(av_frame, data_ptr, readable_extent) }.ok_or(
+        ConvertError::BufferAcquireFailed(BufferAcquireFailed::new(plane_idx)),
+      )?;
       let mut packed: std::vec::Vec<u8> = std::vec::Vec::new();
       packed
         .try_reserve_exact(total_bytes)
-        .map_err(|_| ConvertError::BufferAcquireFailed { plane: plane_idx })?;
+        .map_err(|_| ConvertError::BufferAcquireFailed(BufferAcquireFailed::new(plane_idx)))?;
       for row_idx in 0..plane_h {
-        let row_offset = (row_idx)
-          .checked_mul(linesize as usize)
-          .ok_or(ConvertError::InvalidPlaneLayout { plane: plane_idx })?;
+        let row_offset =
+          (row_idx)
+            .checked_mul(linesize as usize)
+            .ok_or(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(
+              plane_idx,
+            )))?;
         // SAFETY: bounds-checked above via `find_backing_buffer`;
         // `row_offset + row_bytes <= readable_extent <= buf.size`.
         // Each per-row slice is the part the decoder writes
@@ -323,8 +433,9 @@ pub unsafe fn av_frame_to_video_frame(
           unsafe { core::slice::from_raw_parts(data_ptr.add(row_offset) as *const u8, row_bytes) };
         packed.extend_from_slice(row_slice);
       }
-      let buf = FfmpegBuffer::copy_from_slice(&packed)
-        .ok_or(ConvertError::BufferAcquireFailed { plane: plane_idx })?;
+      let buf = FfmpegBuffer::copy_from_slice(&packed).ok_or(ConvertError::BufferAcquireFailed(
+        BufferAcquireFailed::new(plane_idx),
+      ))?;
       (buf, row_bytes as u32)
     };
 
@@ -407,10 +518,13 @@ fn plane_placeholder() -> Result<Plane<FfmpegBuffer>, ConvertError> {
   };
   if raw.is_null() {
     // Truly OOM. Return an error by way of a poisoned plane.
-    return Err(ConvertError::BufferAcquireFailed { plane: 4 });
+    return Err(ConvertError::BufferAcquireFailed(BufferAcquireFailed::new(
+      4,
+    )));
   }
-  let buf =
-    unsafe { FfmpegBuffer::take(raw) }.ok_or(ConvertError::BufferAcquireFailed { plane: 4 })?;
+  let buf = unsafe { FfmpegBuffer::take(raw) }.ok_or(ConvertError::BufferAcquireFailed(
+    BufferAcquireFailed::new(4),
+  ))?;
   Ok(Plane::new(buf, 0))
 }
 
@@ -847,7 +961,7 @@ pub unsafe fn av_frame_to_audio_frame(
   // `AudioFrame` whose advertised `channel_count` exceeds its
   // populated plane count.
   if plane_count_full > 8 {
-    return Err(ConvertError::InvalidPlaneLayout { plane: 8 });
+    return Err(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(8)));
   }
   let plane_count = plane_count_full as u8;
 
@@ -859,27 +973,28 @@ pub unsafe fn av_frame_to_audio_frame(
   // valid bytes when they trust `nb_samples`).
   let linesize0 = unsafe { (*av_frame).linesize[0] };
   if nb_samples > 0 && linesize0 <= 0 {
-    return Err(ConvertError::InvalidPlaneLayout { plane: 0 });
+    return Err(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(0)));
   }
   let plane_bytes = linesize0.max(0) as usize;
   if nb_samples > 0 {
     let bytes_per_sample = sample_format
       .bytes_per_sample()
-      .ok_or(ConvertError::InvalidPlaneLayout { plane: 0 })? as usize;
+      .ok_or(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(0)))?
+      as usize;
     let expected_per_plane = if is_planar {
       // Planar: each plane carries `nb_samples * bytes_per_sample`.
       (nb_samples as usize)
         .checked_mul(bytes_per_sample)
-        .ok_or(ConvertError::InvalidPlaneLayout { plane: 0 })?
+        .ok_or(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(0)))?
     } else {
       // Packed: the single plane interleaves all channels.
       (nb_samples as usize)
         .checked_mul(bytes_per_sample)
         .and_then(|x| x.checked_mul(channel_count.max(1) as usize))
-        .ok_or(ConvertError::InvalidPlaneLayout { plane: 0 })?
+        .ok_or(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(0)))?
     };
     if plane_bytes < expected_per_plane {
-      return Err(ConvertError::InvalidPlaneLayout { plane: 0 });
+      return Err(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(0)));
     }
   }
 
@@ -906,17 +1021,21 @@ pub unsafe fn av_frame_to_audio_frame(
       // frame — surface as an error rather than returning a frame
       // whose `planes()` exposes empty placeholder channels for
       // the missing data.
-      return Err(ConvertError::InvalidPlaneLayout { plane: plane_idx });
+      return Err(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(
+        plane_idx,
+      )));
     }
-    let buf = unsafe { find_audio_backing_buffer(av_frame, data_ptr, plane_bytes) }
-      .ok_or(ConvertError::BufferAcquireFailed { plane: plane_idx })?;
+    let buf = unsafe { find_audio_backing_buffer(av_frame, data_ptr, plane_bytes) }.ok_or(
+      ConvertError::BufferAcquireFailed(BufferAcquireFailed::new(plane_idx)),
+    )?;
     // See `av_frame_to_video_frame` for the rationale on plain
     // address subtraction over `offset_from`.
     let offset = unsafe { (data_ptr as usize).wrapping_sub((*buf).data as usize) };
     // SAFETY: `buf` is non-null and live; offset + plane_bytes <= buf.size
     // by find_audio_backing_buffer's bounds check.
-    let view = unsafe { FfmpegBuffer::from_ref_view(buf, offset, plane_bytes) }
-      .ok_or(ConvertError::BufferAcquireFailed { plane: plane_idx })?;
+    let view = unsafe { FfmpegBuffer::from_ref_view(buf, offset, plane_bytes) }.ok_or(
+      ConvertError::BufferAcquireFailed(BufferAcquireFailed::new(plane_idx)),
+    )?;
     planes_out[plane_idx] = Plane::new(view, plane_bytes as u32);
   }
 
@@ -959,10 +1078,13 @@ pub unsafe fn av_frame_to_audio_frame(
 fn audio_plane_placeholder() -> Result<Plane<FfmpegBuffer>, ConvertError> {
   let raw = unsafe { av_buffer_alloc(1) };
   if raw.is_null() {
-    return Err(ConvertError::BufferAcquireFailed { plane: 8 });
+    return Err(ConvertError::BufferAcquireFailed(BufferAcquireFailed::new(
+      8,
+    )));
   }
-  let buf =
-    unsafe { FfmpegBuffer::take(raw) }.ok_or(ConvertError::BufferAcquireFailed { plane: 8 })?;
+  let buf = unsafe { FfmpegBuffer::take(raw) }.ok_or(ConvertError::BufferAcquireFailed(
+    BufferAcquireFailed::new(8),
+  ))?;
   Ok(Plane::new(buf, 0))
 }
 
@@ -1112,19 +1234,19 @@ pub unsafe fn av_subtitle_to_subtitle_frame(
         // `SUBTITLE_MAX_TEXT_BYTES_PER_RECT + 1` bytes; if no NUL
         // is found inside that window the rect is rejected.
         let bytes = unsafe { bounded_cstr_bytes(rect_text_ptr, SUBTITLE_MAX_TEXT_BYTES_PER_RECT) }
-          .ok_or(ConvertError::InvalidPlaneLayout { plane: 0 })?;
+          .ok_or(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(0)))?;
         // The cap is now enforced inside `bounded_cstr_bytes` (no
         // NUL within `cap + 1` ⇒ rejection); a redundant length
         // check is unnecessary but kept as documentation.
         if bytes.len() > SUBTITLE_MAX_TEXT_BYTES_PER_RECT {
-          return Err(ConvertError::InvalidPlaneLayout { plane: 0 });
+          return Err(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(0)));
         }
         let separator = if text_chunks.is_empty() { 0 } else { 1 };
         let projected = text_total_bytes
           .saturating_add(bytes.len())
           .saturating_add(separator);
         if projected > SUBTITLE_MAX_TEXT_TOTAL_BYTES {
-          return Err(ConvertError::InvalidPlaneLayout { plane: 0 });
+          return Err(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(0)));
         }
         if separator == 1 {
           text_chunks.push(b'\n');
@@ -1136,16 +1258,16 @@ pub unsafe fn av_subtitle_to_subtitle_frame(
         // SAFETY: `ass` is documented as 0-terminated UTF-8.
         // Same bounded-scan rationale as the TEXT branch above.
         let bytes = unsafe { bounded_cstr_bytes(rect_ass_ptr, SUBTITLE_MAX_TEXT_BYTES_PER_RECT) }
-          .ok_or(ConvertError::InvalidPlaneLayout { plane: 0 })?;
+          .ok_or(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(0)))?;
         if bytes.len() > SUBTITLE_MAX_TEXT_BYTES_PER_RECT {
-          return Err(ConvertError::InvalidPlaneLayout { plane: 0 });
+          return Err(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(0)));
         }
         let separator = if text_chunks.is_empty() { 0 } else { 1 };
         let projected = text_total_bytes
           .saturating_add(bytes.len())
           .saturating_add(separator);
         if projected > SUBTITLE_MAX_TEXT_TOTAL_BYTES {
-          return Err(ConvertError::InvalidPlaneLayout { plane: 0 });
+          return Err(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(0)));
         }
         if separator == 1 {
           text_chunks.push(b'\n');
@@ -1168,30 +1290,34 @@ pub unsafe fn av_subtitle_to_subtitle_frame(
         // even before any deref).
         let data_len = (stride as usize)
           .checked_mul(h as usize)
-          .ok_or(ConvertError::InvalidPlaneLayout { plane: 0 })?;
+          .ok_or(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(0)))?;
         // Per-rect bitmap byte cap (defends against a single
         // attacker rect larger than realistic DVB / PGS subtitles
         // by a wide margin).
         if data_len > SUBTITLE_MAX_BITMAP_BYTES_PER_RECT {
-          return Err(ConvertError::InvalidPlaneLayout { plane: 0 });
+          return Err(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(0)));
         }
         let projected_total = bitmap_total_bytes.saturating_add(data_len);
         if projected_total > SUBTITLE_MAX_BITMAP_TOTAL_BYTES {
-          return Err(ConvertError::InvalidPlaneLayout { plane: 0 });
+          return Err(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(0)));
         }
         // SAFETY: data[0] is valid for `linesize[0] * h` bytes per
         // FFmpeg's contract; the multiplication is checked above.
         let data_slice = unsafe { core::slice::from_raw_parts(rect_data0_ptr, data_len) };
-        let data_buf = FfmpegBuffer::copy_from_slice(data_slice)
-          .ok_or(ConvertError::BufferAcquireFailed { plane: 0 })?;
+        let data_buf = FfmpegBuffer::copy_from_slice(data_slice).ok_or(
+          ConvertError::BufferAcquireFailed(BufferAcquireFailed::new(0)),
+        )?;
         let palette_len = 256 * 4;
         let palette_buf = if rect_data1_ptr.is_null() {
-          FfmpegBuffer::copy_from_slice(&[])
-            .ok_or(ConvertError::BufferAcquireFailed { plane: 1 })?
+          FfmpegBuffer::copy_from_slice(&[]).ok_or(ConvertError::BufferAcquireFailed(
+            BufferAcquireFailed::new(1),
+          ))?
         } else {
           // SAFETY: palette buffer is 256*4 bytes per FFmpeg's contract.
           let p = unsafe { core::slice::from_raw_parts(rect_data1_ptr, palette_len) };
-          FfmpegBuffer::copy_from_slice(p).ok_or(ConvertError::BufferAcquireFailed { plane: 1 })?
+          FfmpegBuffer::copy_from_slice(p).ok_or(ConvertError::BufferAcquireFailed(
+            BufferAcquireFailed::new(1),
+          ))?
         };
         bitmap_regions.push(mediadecode::subtitle::BitmapRegion::new(
           rect_x.max(0) as u32,
@@ -1209,24 +1335,18 @@ pub unsafe fn av_subtitle_to_subtitle_frame(
   }
 
   let payload = if !text_chunks.is_empty() {
-    let buf = FfmpegBuffer::copy_from_slice(&text_chunks)
-      .ok_or(ConvertError::BufferAcquireFailed { plane: 0 })?;
-    SubtitlePayload::Text {
-      text: buf,
-      language: None,
-    }
+    let buf = FfmpegBuffer::copy_from_slice(&text_chunks).ok_or(
+      ConvertError::BufferAcquireFailed(BufferAcquireFailed::new(0)),
+    )?;
+    SubtitlePayload::Text(SubtitleText::new(buf, None))
   } else if !bitmap_regions.is_empty() {
-    SubtitlePayload::Bitmap {
-      regions: bitmap_regions,
-    }
+    SubtitlePayload::Bitmap(SubtitleBitmap::new(bitmap_regions))
   } else {
     // No rects (or only `None`-typed) — empty text payload.
-    let buf =
-      FfmpegBuffer::copy_from_slice(&[]).ok_or(ConvertError::BufferAcquireFailed { plane: 0 })?;
-    SubtitlePayload::Text {
-      text: buf,
-      language: None,
-    }
+    let buf = FfmpegBuffer::copy_from_slice(&[]).ok_or(ConvertError::BufferAcquireFailed(
+      BufferAcquireFailed::new(0),
+    ))?;
+    SubtitlePayload::Text(SubtitleText::new(buf, None))
   };
 
   let sub_pts = unsafe { (*av_subtitle).pts };

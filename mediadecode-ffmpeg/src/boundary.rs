@@ -11,19 +11,30 @@ use core::{
   ptr::{addr_of, read_unaligned},
 };
 
+use derive_more::{IsVariant, TryUnwrap, Unwrap};
 use ffmpeg_next::{Packet, ffi::AVPixelFormat};
 use mediadecode::{
   PixelFormat, Timestamp,
   demuxer::{AttachmentPacket, DataPacket},
   frame::{AudioFrame, Dimensions, Plane, SubtitleFrame, VideoFrame},
   packet::{AudioPacket, PacketFlags as MdPacketFlags, SubtitlePacket, VideoPacket},
-  subtitle::SubtitlePayload,
+  subtitle::{SubtitlePayload, Text as SubtitleText},
 };
 use mediaframe::audio::ChannelLayoutDescription;
 
 use crate::{
   FfmpegBuffer,
-  buffer::PacketBufferError,
+  // `buffer::SideDataAlloc` is aliased: this module also defines its own
+  // `PacketBuildError::SideDataAlloc` payload (the write-side failure —
+  // FFmpeg refusing an allocation while rebuilding an `AVPacket`'s side
+  // data), which keeps the bare name since it is native to this file.
+  // `BufferSideDataAlloc` is `PacketBufferError`'s read-side counterpart
+  // (out of memory copying a side-data entry *out of* an `AVPacket`) —
+  // same short name, different struct, different direction.
+  buffer::{
+    PacketBufferError, Refcount, SideDataAlloc as BufferSideDataAlloc, SideDataArray,
+    SideDataBytes, SideDataEntries, SideDataPayload, UnrepresentableFlags,
+  },
   convert::{SIDE_DATA_MAX_ENTRIES, SIDE_DATA_MAX_TOTAL_BYTES},
   extras::{
     AttachmentPacketExtra, AudioFrameExtra, AudioPacketExtra, DataPacketExtra, SideDataEntry,
@@ -443,12 +454,77 @@ unsafe fn write_md_flags(packet: &mut Packet, flags: MdPacketFlags) {
   }
 }
 
+/// Payload for [`PacketBuildError::UnknownSideData`].
+///
+/// A side-data entry whose type this build of FFmpeg does not name.
+///
+/// Refused rather than dropped: this crate carries side-data types as
+/// the raw integers they are on the wire, and handing an unknown one
+/// to C would either form an invalid enum discriminant or attach a
+/// type nothing downstream can read. Everything the demuxer captured
+/// came from this same build and is in range, so this only answers a
+/// hand-built entry.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("side-data type {kind} is not one this FFmpeg build names (0..{limit})")]
+pub struct UnknownSideData {
+  kind: i32,
+  limit: i32,
+}
+
+impl UnknownSideData {
+  /// Constructs an `UnknownSideData` payload.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(kind: i32, limit: i32) -> Self {
+    Self { kind, limit }
+  }
+  /// The type integer the entry carried.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn kind(&self) -> i32 {
+    self.kind
+  }
+  /// How many side-data types this build names.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn limit(&self) -> i32 {
+    self.limit
+  }
+}
+
+/// Payload for [`PacketBuildError::SideDataAlloc`].
+///
+/// FFmpeg refused the side-data allocation.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("out of memory attaching {size} bytes of side data of type {kind}")]
+pub struct SideDataAlloc {
+  kind: i32,
+  size: usize,
+}
+
+impl SideDataAlloc {
+  /// Constructs a `SideDataAlloc` payload.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(kind: i32, size: usize) -> Self {
+    Self { kind, size }
+  }
+  /// The entry's type integer.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn kind(&self) -> i32 {
+    self.kind
+  }
+  /// The entry's payload length.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn size(&self) -> usize {
+    self.size
+  }
+}
+
 /// Why a portable packet could not be rebuilt as an `AVPacket`.
 ///
 /// The reverse direction is what feeds a decoder, so everything the
 /// forward direction captured has to survive it or the capture was
 /// theatre.
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error, IsVariant, Unwrap, TryUnwrap)]
+#[unwrap(ref, ref_mut)]
+#[try_unwrap(ref, ref_mut)]
 pub enum PacketBuildError {
   /// The packet body could not be allocated or is larger than
   /// `AVPacket.size` can hold.
@@ -456,29 +532,12 @@ pub enum PacketBuildError {
   Ffmpeg(#[from] ffmpeg_next::Error),
 
   /// A side-data entry whose type this build of FFmpeg does not name.
-  ///
-  /// Refused rather than dropped: this crate carries side-data types as
-  /// the raw integers they are on the wire, and handing an unknown one
-  /// to C would either form an invalid enum discriminant or attach a
-  /// type nothing downstream can read. Everything the demuxer captured
-  /// came from this same build and is in range, so this only answers a
-  /// hand-built entry.
-  #[error("side-data type {kind} is not one this FFmpeg build names (0..{limit})")]
-  UnknownSideData {
-    /// The type integer the entry carried.
-    kind: i32,
-    /// How many side-data types this build names.
-    limit: i32,
-  },
+  #[error(transparent)]
+  UnknownSideData(#[from] UnknownSideData),
 
   /// FFmpeg refused the side-data allocation.
-  #[error("out of memory attaching {size} bytes of side data of type {kind}")]
-  SideDataAlloc {
-    /// The entry's type integer.
-    kind: i32,
-    /// The entry's payload length.
-    size: usize,
-  },
+  #[error(transparent)]
+  SideDataAlloc(#[from] SideDataAlloc),
 }
 
 /// Copies `entries` onto an `AVPacket` under construction.
@@ -500,9 +559,9 @@ fn attach_side_data(out: &mut Packet, entries: &[SideDataEntry]) -> Result<(), P
     let Some(slot) = slot else {
       let limit = crate::ffi::side_data_type_count();
       return Err(if kind < 0 || kind >= limit {
-        PacketBuildError::UnknownSideData { kind, limit }
+        PacketBuildError::UnknownSideData(UnknownSideData::new(kind, limit))
       } else {
-        PacketBuildError::SideDataAlloc { kind, size }
+        PacketBuildError::SideDataAlloc(SideDataAlloc::new(kind, size))
       });
     };
     if size > 0 {
@@ -697,20 +756,21 @@ fn packet_side_data(packet: &Packet) -> Result<Vec<SideDataEntry>, PacketBufferE
   }
   let cap = side_data_entry_cap();
   if count_raw < 0 || count_raw as usize > cap {
-    return Err(PacketBufferError::SideDataEntries {
-      count: count_raw,
-      cap,
-    });
+    return Err(PacketBufferError::SideDataEntries(SideDataEntries::new(
+      count_raw, cap,
+    )));
   }
   if entries.is_null() {
-    return Err(PacketBufferError::SideDataArray { count: count_raw });
+    return Err(PacketBufferError::SideDataArray(SideDataArray::new(
+      count_raw,
+    )));
   }
   let count = count_raw as usize;
   let mut out: Vec<SideDataEntry> = Vec::new();
   if out.try_reserve_exact(count).is_err() {
-    return Err(PacketBufferError::SideDataAlloc {
-      size: count * core::mem::size_of::<SideDataEntry>(),
-    });
+    return Err(PacketBufferError::SideDataAlloc(BufferSideDataAlloc::new(
+      count * core::mem::size_of::<SideDataEntry>(),
+    )));
   }
   let mut total_bytes: usize = 0;
   for index in 0..count {
@@ -729,18 +789,22 @@ fn packet_side_data(packet: &Packet) -> Result<Vec<SideDataEntry>, PacketBufferE
       // Bytes declared and not carried. Reading this as an empty entry
       // delivered a packet whose side data was a lie, and charged the
       // budget nothing for it.
-      return Err(PacketBufferError::SideDataPayload { index, size });
+      return Err(PacketBufferError::SideDataPayload(SideDataPayload::new(
+        index, size,
+      )));
     } else {
       total_bytes = total_bytes.saturating_add(size);
       if total_bytes > SIDE_DATA_MAX_TOTAL_BYTES {
-        return Err(PacketBufferError::SideDataBytes {
-          bytes: total_bytes,
-          cap: SIDE_DATA_MAX_TOTAL_BYTES,
-        });
+        return Err(PacketBufferError::SideDataBytes(SideDataBytes::new(
+          total_bytes,
+          SIDE_DATA_MAX_TOTAL_BYTES,
+        )));
       }
       let mut buf: Vec<u8> = Vec::new();
       if buf.try_reserve_exact(size).is_err() {
-        return Err(PacketBufferError::SideDataAlloc { size });
+        return Err(PacketBufferError::SideDataAlloc(BufferSideDataAlloc::new(
+          size,
+        )));
       }
       // SAFETY: `data` is valid for `size` bytes per FFmpeg's
       // `AVPacketSideData` contract.
@@ -777,7 +841,7 @@ fn delivered_payload(
   }
   FfmpegBuffer::copy_from_slice(&[])
     .map(Some)
-    .ok_or(PacketBufferError::Refcount { len: 0 })
+    .ok_or(PacketBufferError::Refcount(Refcount::new(0)))
 }
 
 // ---------------------------------------------------------------------------
@@ -958,7 +1022,9 @@ pub(crate) unsafe fn md_flags_from_av_packet(
   let raw = unsafe { (*pkt).flags };
   let carried = i32::from(u8::MAX);
   if raw & !carried != 0 {
-    return Err(PacketBufferError::UnrepresentableFlags { raw });
+    return Err(PacketBufferError::UnrepresentableFlags(
+      UnrepresentableFlags::new(raw),
+    ));
   }
   Ok(MdPacketFlags::from_bits_retain(raw as u8))
 }
@@ -1082,10 +1148,7 @@ pub fn empty_subtitle_frame() -> SubtitleFrame<SubtitleFrameExtra, FfmpegBuffer>
 pub fn try_empty_subtitle_frame() -> Option<SubtitleFrame<SubtitleFrameExtra, FfmpegBuffer>> {
   let buf = FfmpegBuffer::copy_from_slice(&[]).or_else(FfmpegBuffer::try_empty)?;
   Some(SubtitleFrame::new(
-    SubtitlePayload::Text {
-      text: buf,
-      language: None,
-    },
+    SubtitlePayload::Text(SubtitleText::new(buf, None)),
     SubtitleFrameExtra::default(),
   ))
 }
@@ -1119,23 +1182,23 @@ mod tests {
     let tb = mediadecode::Timebase::default();
     assert!(matches!(
       video_packet_from_ffmpeg_in(&forged, tb),
-      Err(PacketBufferError::Bounds { .. }),
+      Err(PacketBufferError::Bounds(_)),
     ));
     assert!(matches!(
       audio_packet_from_ffmpeg_in(&forged, tb),
-      Err(PacketBufferError::Bounds { .. }),
+      Err(PacketBufferError::Bounds(_)),
     ));
     assert!(matches!(
       subtitle_packet_from_ffmpeg_in(&forged, tb),
-      Err(PacketBufferError::Bounds { .. }),
+      Err(PacketBufferError::Bounds(_)),
     ));
     assert!(matches!(
       data_packet_from_ffmpeg_in(&forged, tb),
-      Err(PacketBufferError::Bounds { .. }),
+      Err(PacketBufferError::Bounds(_)),
     ));
     assert!(matches!(
       attachment_packet_from_ffmpeg(&forged),
-      Err(PacketBufferError::Bounds { .. }),
+      Err(PacketBufferError::Bounds(_)),
     ));
   }
 
@@ -1353,7 +1416,7 @@ mod tests {
       let forged = Forged::null_array(3, body);
       for (arm, result) in every_timed_arm(&forged.packet) {
         match result {
-          Err(PacketBufferError::SideDataArray { count }) => assert_eq!(count, 3, "{arm}"),
+          Err(PacketBufferError::SideDataArray(p)) => assert_eq!(p.count(), 3, "{arm}"),
           other => panic!("{arm} (body={body}): expected SideDataArray, got {other:?}"),
         }
       }
@@ -1361,8 +1424,8 @@ mod tests {
       let forged = Forged::null_entry_data(64, body);
       for (arm, result) in every_timed_arm(&forged.packet) {
         match result {
-          Err(PacketBufferError::SideDataPayload { index, size }) => {
-            assert_eq!((index, size), (0, 64), "{arm}");
+          Err(PacketBufferError::SideDataPayload(p)) => {
+            assert_eq!((p.index(), p.size()), (0, 64), "{arm}");
           }
           other => panic!("{arm} (body={body}): expected SideDataPayload, got {other:?}"),
         }
@@ -1376,7 +1439,7 @@ mod tests {
         assert!(
           matches!(
             result,
-            Err(PacketBufferError::SideDataEntries { count: -3, .. })
+            Err(PacketBufferError::SideDataEntries(p)) if p.count() == -3
           ),
           "{arm} (body={body}): {result:?}",
         );
@@ -1384,7 +1447,7 @@ mod tests {
       let forged = Forged::null_array(i32::MAX, body);
       for (arm, result) in every_timed_arm(&forged.packet) {
         assert!(
-          matches!(result, Err(PacketBufferError::SideDataEntries { .. })),
+          matches!(result, Err(PacketBufferError::SideDataEntries(_))),
           "{arm} (body={body}): {result:?}",
         );
       }
@@ -1429,9 +1492,9 @@ mod tests {
       ),
     ] {
       match result {
-        Err(PacketBufferError::SideDataBytes { bytes, cap }) => {
-          assert_eq!(cap, SIDE_DATA_MAX_TOTAL_BYTES);
-          assert!(bytes > cap, "{arm}");
+        Err(PacketBufferError::SideDataBytes(p)) => {
+          assert_eq!(p.cap(), SIDE_DATA_MAX_TOTAL_BYTES);
+          assert!(p.bytes() > p.cap(), "{arm}");
         }
         other => panic!("{arm}: expected SideDataBytes, got {other:?}"),
       }
@@ -1443,7 +1506,7 @@ mod tests {
     let oversized = packet_with_side_data(SIDE_DATA_MAX_TOTAL_BYTES + 1, false);
     assert!(matches!(
       video_packet_from_ffmpeg_in(&oversized, tb).map(|p| p.is_some()),
-      Err(PacketBufferError::SideDataBytes { .. }),
+      Err(PacketBufferError::SideDataBytes(_)),
     ));
   }
 
@@ -1466,7 +1529,7 @@ mod tests {
     let past = packet_with_side_data(SIDE_DATA_MAX_TOTAL_BYTES + 1, true);
     assert!(matches!(
       video_packet_from_ffmpeg_in(&past, tb).map(|p| p.is_some()),
-      Err(PacketBufferError::SideDataBytes { .. }),
+      Err(PacketBufferError::SideDataBytes(_)),
     ));
 
     // The entry cap, both sides of it. FFmpeg names fewer types than
@@ -1484,9 +1547,9 @@ mod tests {
 
     let past = Forged::entries(cap + 1, true);
     match video_packet_from_ffmpeg_in(&past.packet, tb).map(|p| p.is_some()) {
-      Err(PacketBufferError::SideDataEntries { count, cap: named }) => {
-        assert_eq!(count as usize, cap + 1);
-        assert_eq!(named, cap);
+      Err(PacketBufferError::SideDataEntries(p)) => {
+        assert_eq!(p.count() as usize, cap + 1);
+        assert_eq!(p.cap(), cap);
       }
       other => panic!("expected SideDataEntries, got {other:?}"),
     }
@@ -1496,7 +1559,7 @@ mod tests {
     let corrupt = Forged::entries(1, true).with_declared_count(-3);
     assert!(matches!(
       video_packet_from_ffmpeg_in(&corrupt.packet, tb).map(|p| p.is_some()),
-      Err(PacketBufferError::SideDataEntries { count: -3, .. }),
+      Err(PacketBufferError::SideDataEntries(p)) if p.count() == -3,
     ));
   }
 
@@ -1588,14 +1651,14 @@ mod tests {
       assert!(
         matches!(
           result,
-          Err(PacketBufferError::UnrepresentableFlags { raw: 0x1_00 })
+          Err(PacketBufferError::UnrepresentableFlags(p)) if p.raw() == 0x1_00
         ),
         "{arm}: {result:?}",
       );
     }
     assert!(matches!(
       attachment_packet_from_ffmpeg(&packet).map(|p| p.is_some()),
-      Err(PacketBufferError::UnrepresentableFlags { .. }),
+      Err(PacketBufferError::UnrepresentableFlags(_)),
     ));
     let _ = tb;
   }
@@ -1676,9 +1739,9 @@ mod tests {
       VideoPacketExtra::new(0).with_side_data(vec![SideDataEntry::new(limit, vec![9u8])]),
     );
     match ffmpeg_packet_from_video_packet(&packet).map(|_| ()) {
-      Err(PacketBuildError::UnknownSideData { kind, limit: named }) => {
-        assert_eq!(kind, limit);
-        assert_eq!(named, limit);
+      Err(PacketBuildError::UnknownSideData(p)) => {
+        assert_eq!(p.kind(), limit);
+        assert_eq!(p.limit(), limit);
       }
       other => panic!("expected UnknownSideData, got {other:?}"),
     }
@@ -1688,7 +1751,7 @@ mod tests {
         VideoPacketExtra::new(0).with_side_data(vec![SideDataEntry::new(-1, vec![9u8])]),
       ))
       .map(|_| ()),
-      Err(PacketBuildError::UnknownSideData { kind: -1, .. }),
+      Err(PacketBuildError::UnknownSideData(p)) if p.kind() == -1,
     ));
   }
 

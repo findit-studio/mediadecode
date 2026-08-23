@@ -1,3 +1,4 @@
+use derive_more::{IsVariant, TryUnwrap, Unwrap};
 use ffmpeg_next::Packet;
 
 use crate::backend::Backend;
@@ -16,7 +17,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// `Debug`. Those payloads summarize the packet count rather
 /// than dumping each packet's fields, which would be both noisy
 /// and useless for triage.
-#[derive(Debug, Clone, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error, IsVariant, Unwrap, TryUnwrap)]
+#[unwrap(ref, ref_mut)]
+#[try_unwrap(ref, ref_mut)]
 pub enum Error {
   /// An underlying FFmpeg error.
   #[error("ffmpeg error: {0}")]
@@ -114,7 +117,7 @@ impl HwDeviceInitFailed {
 /// clone of the borrowed current packet to an empty replay set and skip the
 /// post-fallback `send_packet`, silently dropping that packet if the clone
 /// failed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, IsVariant)]
 pub enum FallbackOrigin {
   /// Raised while the inner decoder's probe was still active (before the first
   /// frame). `unconsumed_packets` is the probe's buffered history (possibly
@@ -128,14 +131,6 @@ pub enum FallbackOrigin {
   /// forwards only the failing call's current packet (or EOF), and resyncs at
   /// the next keyframe, accepting a bounded, logged gap (degrade-and-continue).
   PostCommit,
-}
-
-impl FallbackOrigin {
-  /// `true` for [`FallbackOrigin::PostCommit`].
-  #[inline]
-  pub const fn is_post_commit(self) -> bool {
-    matches!(self, FallbackOrigin::PostCommit)
-  }
 }
 
 /// Payload for [`Error::AllBackendsFailed`].

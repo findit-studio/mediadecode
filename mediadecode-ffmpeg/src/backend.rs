@@ -1,3 +1,4 @@
+use derive_more::IsVariant;
 use ffmpeg_next::ffi::{AVHWDeviceType, AVPixelFormat};
 
 /// Hardware decoding backend.
@@ -7,7 +8,7 @@ use ffmpeg_next::ffi::{AVHWDeviceType, AVPixelFormat};
 /// can decode a stream, [`crate::VideoDecoder::open`] returns
 /// [`crate::Error::AllBackendsFailed`] and the caller decides how to fall
 /// back (e.g. by opening an `ffmpeg::decoder::Video` directly).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, IsVariant)]
 pub enum Backend {
   /// Apple VideoToolbox (macOS, iOS, iPadOS, tvOS, visionOS).
   VideoToolbox,

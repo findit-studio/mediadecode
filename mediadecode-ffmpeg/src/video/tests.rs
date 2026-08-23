@@ -975,7 +975,7 @@ fn post_commit_fallback_never_resyncing_escalates_at_eof() {
           break;
         }
         Err(VideoDecodeError::Decode(Error::Ffmpeg(ffmpeg_next::Error::Eof))) => break,
-        Err(e @ VideoDecodeError::PostCommitNeverResynced { .. }) => {
+        Err(e @ VideoDecodeError::PostCommitNeverResynced(_)) => {
           *escalation = Some(e);
           break;
         }
@@ -1024,9 +1024,10 @@ fn post_commit_fallback_never_resyncing_escalates_at_eof() {
     "a post-commit fallback whose SW decoder reaches EOF without resyncing must \
      ESCALATE, not silently swallow the tail as a clean end-of-stream",
   );
-  let VideoDecodeError::PostCommitNeverResynced { packets_lost } = esc else {
+  let VideoDecodeError::PostCommitNeverResynced(p) = esc else {
     panic!("expected PostCommitNeverResynced, got {esc:?}");
   };
+  let packets_lost = p.packets_lost();
   assert_eq!(
     packets_lost, 0,
     "no packets crossed to SW on the EOF-entry path; the lost tail was HW-side"
@@ -1267,7 +1268,7 @@ fn post_commit_concealed_p_frame_does_not_clear_resync_escalates_at_eof() {
         break;
       }
       Err(VideoDecodeError::Decode(Error::Ffmpeg(ffmpeg_next::Error::Eof))) => break,
-      Err(e @ VideoDecodeError::PostCommitNeverResynced { .. }) => {
+      Err(e @ VideoDecodeError::PostCommitNeverResynced(_)) => {
         *escalation = Some(e);
         break;
       }
@@ -1322,9 +1323,10 @@ fn post_commit_concealed_p_frame_does_not_clear_resync_escalates_at_eof() {
     "concealed P-frames must NOT have cleared the guard, so reaching EOF without a \
      keyframe must ESCALATE with PostCommitNeverResynced",
   );
-  let VideoDecodeError::PostCommitNeverResynced { packets_lost } = esc else {
+  let VideoDecodeError::PostCommitNeverResynced(p) = esc else {
     panic!("expected PostCommitNeverResynced, got {esc:?}");
   };
+  let packets_lost = p.packets_lost();
   assert!(
     packets_lost >= 1,
     "every forwarded gap packet (current P-frame + the GOP-2 tail) must be \
@@ -1590,8 +1592,8 @@ fn fx3_high_422_10bit_falls_back_to_software_and_decodes_whole_stream() {
           obs.abort = Some(format!("during post-EOF drain: {err}"));
         }
       }
-      Err(VideoDecodeError::PostCommitNeverResynced { packets_lost }) => {
-        obs.escalated_never_resynced = Some(packets_lost);
+      Err(VideoDecodeError::PostCommitNeverResynced(p)) => {
+        obs.escalated_never_resynced = Some(p.packets_lost());
       }
       Err(e) => obs.abort = Some(format!("send_eof errored: {e:?}")),
     }
@@ -1766,7 +1768,8 @@ impl Fx3Observation {
           break;
         }
         Err(VideoDecodeError::Decode(Error::Ffmpeg(ffmpeg_next::Error::Eof))) => break,
-        Err(VideoDecodeError::PostCommitNeverResynced { packets_lost }) => {
+        Err(VideoDecodeError::PostCommitNeverResynced(p)) => {
+          let packets_lost = p.packets_lost();
           self.escalated_never_resynced = Some(packets_lost);
           eprintln!(
             "  -> PostCommitNeverResynced at EOF: {packets_lost} packets fed to SW produced no \

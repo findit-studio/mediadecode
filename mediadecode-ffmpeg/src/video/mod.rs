@@ -81,6 +81,7 @@ use std::collections::VecDeque;
 /// resource sink.
 const SW_REPLAY_FRAME_CAP: usize = 64;
 
+use derive_more::{IsVariant, TryUnwrap, Unwrap};
 use ffmpeg_next::{Packet, codec::Parameters, frame};
 use mediadecode::{Timebase, decoder::VideoStreamDecoder, frame::VideoFrame, packet::VideoPacket};
 
@@ -877,7 +878,9 @@ impl VideoStreamDecoder for FfmpegVideoStreamDecoder {
               // Clear so a subsequent `receive_frame` poll (callers often drain
               // to EOF) sees plain EOF, not a repeated escalation.
               self.clear_degraded_resync();
-              return Err(VideoDecodeError::PostCommitNeverResynced { packets_lost });
+              return Err(VideoDecodeError::PostCommitNeverResynced(
+                PostCommitNeverResynced::new(packets_lost),
+              ));
             }
             Err(e) => return Err(VideoDecodeError::Decode(Error::Ffmpeg(e))),
           }
@@ -971,8 +974,43 @@ fn open_sw_decoder(parameters: &Parameters) -> Result<ffmpeg_next::decoder::Vide
   ctx.decoder().video().map_err(Error::Ffmpeg)
 }
 
-/// Error type for [`FfmpegVideoStreamDecoder`].
+/// Payload for [`VideoDecodeError::PostCommitNeverResynced`].
+///
+/// A **post-commit** HW->SW fallback degraded the stream (dropping the
+/// bounded span up to the next keyframe) but the software decoder
+/// reached EOF without ever producing a frame — it never resynced, so
+/// the entire tail from the failure point was lost. The "bounded,
+/// logged gap" the post-commit path promises did not materialise (no
+/// keyframe arrived before EOF), so the loss is surfaced loudly here
+/// instead of being silently swallowed as a clean end-of-stream.
 #[derive(thiserror::Error, Debug)]
+#[error(
+  "post-commit HW->SW fallback never resynced before EOF: {packets_lost} packets fed to the \
+   software decoder produced no frame (no keyframe found across the gap) — the stream tail \
+   from the fallback point was lost"
+)]
+pub struct PostCommitNeverResynced {
+  packets_lost: u64,
+}
+
+impl PostCommitNeverResynced {
+  /// Constructs a `PostCommitNeverResynced` payload.
+  #[inline]
+  pub const fn new(packets_lost: u64) -> Self {
+    Self { packets_lost }
+  }
+  /// Packets fed to the software decoder across the unresolved resync
+  /// gap.
+  #[inline]
+  pub const fn packets_lost(&self) -> u64 {
+    self.packets_lost
+  }
+}
+
+/// Error type for [`FfmpegVideoStreamDecoder`].
+#[derive(thiserror::Error, Debug, IsVariant, Unwrap, TryUnwrap)]
+#[unwrap(ref, ref_mut)]
+#[try_unwrap(ref, ref_mut)]
 pub enum VideoDecodeError {
   /// The wrapped decoder (HW or SW) reported an error.
   #[error(transparent)]
@@ -981,23 +1019,10 @@ pub enum VideoDecodeError {
   /// types failed.
   #[error(transparent)]
   Convert(#[from] ConvertError),
-  /// A **post-commit** HW->SW fallback degraded the stream (dropping the
-  /// bounded span up to the next keyframe) but the software decoder reached
-  /// EOF without ever producing a frame — it never resynced, so the entire
-  /// tail from the failure point was lost. The "bounded, logged gap" the
-  /// post-commit path promises did not materialise (no keyframe arrived before
-  /// EOF), so the loss is surfaced loudly here instead of being silently
-  /// swallowed as a clean end-of-stream. `packets_lost` is the number of
-  /// packets fed to SW across the unresolved gap.
-  #[error(
-    "post-commit HW->SW fallback never resynced before EOF: {packets_lost} packets fed to the \
-     software decoder produced no frame (no keyframe found across the gap) — the stream tail \
-     from the fallback point was lost"
-  )]
-  PostCommitNeverResynced {
-    /// Packets fed to the software decoder across the unresolved resync gap.
-    packets_lost: u64,
-  },
+  /// A **post-commit** HW->SW fallback degraded the stream but the
+  /// software decoder reached EOF without ever producing a frame.
+  #[error(transparent)]
+  PostCommitNeverResynced(#[from] PostCommitNeverResynced),
 }
 
 #[cfg(test)]

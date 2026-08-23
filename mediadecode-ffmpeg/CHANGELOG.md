@@ -11,6 +11,103 @@ The backend-agnostic core it adapts has its own log at
 
 ## [Unreleased]
 
+### Added
+
+- **`FfmpegDemuxer` implements `Demuxer::take_tracks`**, the
+  owned-tracks door `mediadecode`'s demux tier gained in place of a
+  `TrackInfo` / `TrackParams` `Clone` — see
+  [`mediadecode`'s CHANGELOG](../mediadecode/CHANGELOG.md) for the
+  message-carrier law behind that redirect. The implementation is
+  `mem::take` on the session's own `Vec<TrackInfo<Ffmpeg>>`, built once
+  at `open` and untouched until a caller takes it.
+
+  `TrackExtra` does not gain `Clone` either, for the same law. An
+  interim version of this entry hand-wrote one through the existing
+  checked `try_clone`, to satisfy the same channel bound, and it came
+  back out — a full `avcodec_parameters_copy` is not the refcount bump
+  a message's `Clone` is required to be. `try_clone` and
+  `clone_parameters` are unaffected: they remain the checked copy this
+  type offers the one caller that genuinely wants an owned duplicate,
+  and `Default` remains absent for the reason it always was — there is
+  no checked substitute for `Parameters::default()` to route through.
+
+### Changed (BREAKING)
+
+- **Every struct-shaped enum variant across this crate's errors is now
+  a tuple variant wrapping a named payload struct**, following
+  `mediadecode`'s own `TrackParams` / `DemuxedPacket` /
+  `SubtitlePayload` sweep and the shape this crate's own `Error`
+  (`HwDeviceInitFailed`, `AllBackendsFailed`, `FallbackFailed`) and
+  `FrameError` already used. A struct variant has no nameable type of
+  its own to return from `is_<variant>` / `unwrap_<variant>` /
+  `try_unwrap_<variant>`, and traps its fields instead of giving them a
+  reusable, documented, accessor-bearing home.
+
+  - **`ResampleError`** — all twelve struct arms (`SourceChanged`,
+    `PlaneCount`, `SampleCount`, `UnsupportedRate`,
+    `UnsupportedFormat`, `UnsupportedLayout`, `TooManyPlanes`,
+    `TimestampOutOfRange`, `ChannelDropped`, `RematrixUnsupported`,
+    `TimestampOverflow`, `OutputBuffer`) move to `Variant(Payload)`.
+    `Again`, `AfterEof`, `Resample(Error)` and `QueueAlloc` are
+    unchanged (already unit or newtype).
+  - **`PacketBufferError`** — all eight arms (`Refcount`, `Bounds`,
+    `SideDataEntries`, `SideDataArray`, `SideDataPayload`,
+    `SideDataBytes`, `UnrepresentableFlags`, `SideDataAlloc`) move the
+    same way; every payload keeps the enum's own `Copy + Clone + Debug
+    + PartialEq + Eq`.
+  - **`DemuxError`** — `AttachmentAlloc`, `ParametersMissing`,
+    `ParametersAlloc`, `ParametersCopy`, `PacketBuffer`, `ReaderPanic`
+    move; `Ffmpeg(#[from] ffmpeg_next::Error)` is unchanged.
+  - **`boundary::PacketBuildError`** — `UnknownSideData` and
+    `SideDataAlloc` move. This crate already had *two* same-named
+    `SideDataAlloc` payloads in scope at this file (the read-side one
+    on `PacketBufferError`, imported here, and this write-side one,
+    native to this module) — the import is aliased
+    `SideDataAlloc as BufferSideDataAlloc`; the native struct keeps the
+    bare name.
+  - **`convert::ConvertError`** — `UnsupportedPixelFormat`,
+    `InvalidPlaneLayout`, `BufferAcquireFailed` move (found during the
+    sweep, not in the original census — this enum already violated the
+    same rule). This enum hand-writes `Display` rather than using
+    `thiserror`; the extracted payloads keep that idiom (their own
+    `impl Display`), and the enum's `Display` delegates to it per
+    variant.
+  - **`video::VideoDecodeError::PostCommitNeverResynced`** — also
+    found during the sweep — moves to
+    `PostCommitNeverResynced(PostCommitNeverResynced)`. `Decode` and
+    `Convert` were already newtype variants.
+
+  Every extracted payload is `thiserror`-derived where the enum already
+  was (`#[error(transparent)]` on the wrapper, `#[from]`, the original
+  message moved verbatim onto the payload's own `#[error("...")]`) or
+  hand-`Display` where the enum already was (`ConvertError`) — no
+  crate's error idiom changed, only the variant shape. A match that
+  used to destructure fields now binds the payload and reads it through
+  accessors, e.g. `Err(ResampleError::PlaneCount { expected, found })`
+  becomes `Err(ResampleError::PlaneCount(p))` with `p.expected()` /
+  `p.found()`.
+
+  **The accessor face rides the reshape, same as `mediadecode`'s.**
+  `ResampleError`, `PacketBufferError`, `DemuxError`,
+  `boundary::PacketBuildError`, `convert::ConvertError`,
+  `video::VideoDecodeError`, `audio::AudioDecodeError`,
+  `subtitle::SubtitleDecodeError`, and `error::Error` — the crate's
+  full error taxonomy, not just the arms the reshape sweep touched —
+  now derive `derive_more::{IsVariant, Unwrap, TryUnwrap}`, with
+  `#[unwrap(ref, ref_mut)]` and `#[try_unwrap(ref, ref_mut)]` — every
+  arm answers `is_<variant>()`,
+  `unwrap_<variant>()` / `_ref()` / `_mut()`, and
+  `try_unwrap_<variant>()` / `_ref()` / `_mut()`. `Backend`,
+  `PictureType`, `resampler::SpecEnd`, and `error::FallbackOrigin` gain
+  `IsVariant` too; `FallbackOrigin`'s hand-written `is_post_commit()`
+  and `ResampleError`'s hand-written `is_again()` are gone — the
+  derive answers both now, `&self`-receiver in place of the old
+  by-value one (transparent at every call site, all of which already
+  used method-call syntax). This crate did not carry a `derive_more`
+  dependency before this entry; it does now, with the `is_variant` /
+  `unwrap` / `try_unwrap` features (no `display` — this crate's error
+  types keep `thiserror` / hand-`Display`, unchanged).
+
 ## [0.7.0] - 2026-08-23
 
 ### Added

@@ -39,6 +39,7 @@ mediadecode = { workspace = true, features = ["alloc"] }
 # `mediadecode` pin above.
 mediaframe  = { workspace = true, features = ["alloc"] }
 ffmpeg-next = { workspace = true }
+derive_more = { workspace = true, features = ["is_variant", "try_unwrap", "unwrap"] }
 smol_str    = { workspace = true }
 thiserror   = { workspace = true }
 tracing     = { workspace = true }

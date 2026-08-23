@@ -39,13 +39,22 @@
 //! [`next_packet`]: Demuxer::next_packet
 //! [`seek`]: Demuxer::seek
 
-use core::fmt::Debug;
+use core::fmt::{self, Debug};
+
+use derive_more::{IsVariant, TryUnwrap, Unwrap};
 
 use crate::{
   Timebase, Timestamp,
   adapter::{AudioAdapter, SubtitleAdapter, VideoAdapter},
   packet::{AudioPacket, PacketFlags, SubtitlePacket, VideoPacket},
 };
+
+// `Demuxer::take_tracks` is the only item in this module that owns an
+// allocation (`Vec<TrackInfo<_>>`); everything else is `core`-only.
+// Scoped here rather than pulled in at the crate root, so a reader
+// can see exactly which module needs the heap.
+#[cfg(any(feature = "std", feature = "alloc"))]
+extern crate alloc;
 
 /// A track's position in the table [`Demuxer::tracks`] returns.
 ///
@@ -87,7 +96,7 @@ impl TrackIndex {
 /// one sample, no timeline, no motion — so the `Video` arm carries true
 /// motion video and nothing else. See [`DemuxedPacket`] for the
 /// delivery contract that follows from this.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, IsVariant)]
 pub enum TrackKind {
   /// Motion video.
   Video,
@@ -187,6 +196,10 @@ pub type DemuxAttachmentPacket<E, D> = AttachmentPacket<<E as DemuxAdapter>::Att
 /// reordered, so — like [`SubtitlePacket`] and for the same reason —
 /// there is no DTS seat; a data packet's presentation time is its
 /// decode time.
+///
+/// `Clone` and `Debug` derive directly — see [`VideoPacket`]'s docs
+/// for why the per-parameter bound this produces is already precise.
+#[derive(Clone, Debug)]
 pub struct DataPacket<E, D> {
   pts: Option<Timestamp>,
   duration: Option<Timestamp>,
@@ -300,6 +313,10 @@ impl<E, D> DataPacket<E, D> {
 /// either: that belongs to the track, and lives on [`TrackInfo`].
 /// [`PacketFlags`] is kept because `CORRUPT` still means something for
 /// a payload that failed to read.
+///
+/// `Clone` and `Debug` derive directly — see [`VideoPacket`]'s docs
+/// for why the per-parameter bound this produces is already precise.
+#[derive(Clone, Debug)]
 pub struct AttachmentPacket<E, D> {
   flags: PacketFlags,
   data: D,
@@ -369,60 +386,292 @@ impl<E, D> AttachmentPacket<E, D> {
 //  The track table.
 // ---------------------------------------------------------------------------
 
+/// Payload for [`TrackParams::Video`].
+pub struct VideoTrackParams<E: DemuxAdapter> {
+  codec: E::CodecId,
+  width: u32,
+  height: u32,
+  pixel_format: <E::Video as VideoAdapter>::PixelFormat,
+  frame_rate: Option<Timebase>,
+}
+
+impl<E: DemuxAdapter> VideoTrackParams<E> {
+  /// Constructs a `VideoTrackParams`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(
+    codec: E::CodecId,
+    width: u32,
+    height: u32,
+    pixel_format: <E::Video as VideoAdapter>::PixelFormat,
+    frame_rate: Option<Timebase>,
+  ) -> Self {
+    Self {
+      codec,
+      width,
+      height,
+      pixel_format,
+      frame_rate,
+    }
+  }
+
+  /// Returns the codec identifier.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn codec(&self) -> E::CodecId {
+    self.codec
+  }
+  /// Returns the coded width in pixels.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn width(&self) -> u32 {
+    self.width
+  }
+  /// Returns the coded height in pixels.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn height(&self) -> u32 {
+    self.height
+  }
+  /// Returns the pixel format the track declares, in the backend's
+  /// vocabulary.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn pixel_format(&self) -> &<E::Video as VideoAdapter>::PixelFormat {
+    &self.pixel_format
+  }
+  /// Returns the average frame rate, as a rate-shaped [`Timebase`]
+  /// (`30000/1001` for 29.97 fps), or `None` when the container does
+  /// not say.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn frame_rate(&self) -> Option<Timebase> {
+    self.frame_rate
+  }
+}
+
+// `Debug` is hand-written for the same associated-type reason as
+// `TrackParams` itself (see its own impl, below): every field here
+// that is not a plain `u32` routes through an associated type on
+// `E`, and each of those already carries the bound it needs on the
+// trait that declares it. `#[derive(Debug)]` would add a flat `E:
+// Debug` bound the struct's own fields never ask for.
+//
+// No `Clone` on this type, `TrackParams`, or `TrackInfo` — see
+// `TrackInfo`'s own doc, below, for the message-carrier law that
+// keeps it off the whole family.
+impl<E: DemuxAdapter> Debug for VideoTrackParams<E> {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("VideoTrackParams")
+      .field("codec", &self.codec)
+      .field("width", &self.width)
+      .field("height", &self.height)
+      .field("pixel_format", &self.pixel_format)
+      .field("frame_rate", &self.frame_rate)
+      .finish()
+  }
+}
+
+/// Payload for [`TrackParams::Audio`].
+pub struct AudioTrackParams<E: DemuxAdapter> {
+  codec: E::CodecId,
+  sample_rate: u32,
+  channel_count: u8,
+  sample_format: <E::Audio as AudioAdapter>::SampleFormat,
+  channel_layout: <E::Audio as AudioAdapter>::ChannelLayout,
+}
+
+impl<E: DemuxAdapter> AudioTrackParams<E> {
+  /// Constructs an `AudioTrackParams`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(
+    codec: E::CodecId,
+    sample_rate: u32,
+    channel_count: u8,
+    sample_format: <E::Audio as AudioAdapter>::SampleFormat,
+    channel_layout: <E::Audio as AudioAdapter>::ChannelLayout,
+  ) -> Self {
+    Self {
+      codec,
+      sample_rate,
+      channel_count,
+      sample_format,
+      channel_layout,
+    }
+  }
+
+  /// Returns the codec identifier.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn codec(&self) -> E::CodecId {
+    self.codec
+  }
+  /// Returns the sample rate in Hz.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn sample_rate(&self) -> u32 {
+    self.sample_rate
+  }
+  /// Returns the channel count.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn channel_count(&self) -> u8 {
+    self.channel_count
+  }
+  /// Returns the sample format the track declares, in the backend's
+  /// vocabulary.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn sample_format(&self) -> <E::Audio as AudioAdapter>::SampleFormat {
+    self.sample_format
+  }
+  /// Returns the channel layout the track declares, in the backend's
+  /// vocabulary.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn channel_layout(&self) -> &<E::Audio as AudioAdapter>::ChannelLayout {
+    &self.channel_layout
+  }
+}
+
+impl<E: DemuxAdapter> Debug for AudioTrackParams<E> {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("AudioTrackParams")
+      .field("codec", &self.codec)
+      .field("sample_rate", &self.sample_rate)
+      .field("channel_count", &self.channel_count)
+      .field("sample_format", &self.sample_format)
+      .field("channel_layout", &self.channel_layout)
+      .finish()
+  }
+}
+
+/// Payload for [`TrackParams::Subtitle`].
+pub struct SubtitleTrackParams<E: DemuxAdapter> {
+  codec: E::CodecId,
+}
+
+impl<E: DemuxAdapter> SubtitleTrackParams<E> {
+  /// Constructs a `SubtitleTrackParams`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(codec: E::CodecId) -> Self {
+    Self { codec }
+  }
+
+  /// Returns the codec identifier.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn codec(&self) -> E::CodecId {
+    self.codec
+  }
+}
+
+impl<E: DemuxAdapter> Debug for SubtitleTrackParams<E> {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("SubtitleTrackParams")
+      .field("codec", &self.codec)
+      .finish()
+  }
+}
+
+/// Payload for [`TrackParams::Data`].
+pub struct DataTrackParams<E: DemuxAdapter> {
+  codec: E::CodecId,
+}
+
+impl<E: DemuxAdapter> DataTrackParams<E> {
+  /// Constructs a `DataTrackParams`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(codec: E::CodecId) -> Self {
+    Self { codec }
+  }
+
+  /// Returns the codec identifier.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn codec(&self) -> E::CodecId {
+    self.codec
+  }
+}
+
+impl<E: DemuxAdapter> Debug for DataTrackParams<E> {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("DataTrackParams")
+      .field("codec", &self.codec)
+      .finish()
+  }
+}
+
+/// Payload for [`TrackParams::Attachment`].
+pub struct AttachmentTrackParams<E: DemuxAdapter> {
+  /// Codec identifier — the font format, or the still image's codec
+  /// for cover art.
+  codec: E::CodecId,
+}
+
+impl<E: DemuxAdapter> AttachmentTrackParams<E> {
+  /// Constructs an `AttachmentTrackParams`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(codec: E::CodecId) -> Self {
+    Self { codec }
+  }
+
+  /// Returns the codec identifier — the font format, or the still
+  /// image's codec for cover art.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn codec(&self) -> E::CodecId {
+    self.codec
+  }
+}
+
+impl<E: DemuxAdapter> Debug for AttachmentTrackParams<E> {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("AttachmentTrackParams")
+      .field("codec", &self.codec)
+      .finish()
+  }
+}
+
+/// Payload for [`TrackParams::Unknown`].
+pub struct UnknownTrackParams<E: DemuxAdapter> {
+  /// Codec identifier, which may itself be the backend's "none".
+  codec: E::CodecId,
+}
+
+impl<E: DemuxAdapter> UnknownTrackParams<E> {
+  /// Constructs an `UnknownTrackParams`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(codec: E::CodecId) -> Self {
+    Self { codec }
+  }
+
+  /// Returns the codec identifier, which may itself be the backend's
+  /// "none".
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn codec(&self) -> E::CodecId {
+    self.codec
+  }
+}
+
+impl<E: DemuxAdapter> Debug for UnknownTrackParams<E> {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("UnknownTrackParams")
+      .field("codec", &self.codec)
+      .finish()
+  }
+}
+
 /// A track's codec and per-kind parameters.
 ///
 /// The arm **is** the kind: [`TrackInfo::kind`] reads it off this enum
 /// rather than storing a second copy that could disagree with the
 /// payload beside it.
+///
+/// No `Clone` — see [`TrackInfo`]'s own doc for the message-carrier
+/// law that keeps it off this type too.
+#[derive(IsVariant, Unwrap, TryUnwrap)]
+#[unwrap(ref, ref_mut)]
+#[try_unwrap(ref, ref_mut)]
 pub enum TrackParams<E: DemuxAdapter> {
   /// Motion video.
-  Video {
-    /// Codec identifier.
-    codec: E::CodecId,
-    /// Coded width in pixels.
-    width: u32,
-    /// Coded height in pixels.
-    height: u32,
-    /// Pixel format the track declares, in the backend's vocabulary.
-    pixel_format: <E::Video as VideoAdapter>::PixelFormat,
-    /// Average frame rate, as a rate-shaped [`Timebase`] (`30000/1001`
-    /// for 29.97 fps), or `None` when the container does not say.
-    frame_rate: Option<Timebase>,
-  },
+  Video(VideoTrackParams<E>),
   /// Audio.
-  Audio {
-    /// Codec identifier.
-    codec: E::CodecId,
-    /// Sample rate in Hz.
-    sample_rate: u32,
-    /// Channel count.
-    channel_count: u8,
-    /// Sample format the track declares, in the backend's vocabulary.
-    sample_format: <E::Audio as AudioAdapter>::SampleFormat,
-    /// Channel layout the track declares, in the backend's vocabulary.
-    channel_layout: <E::Audio as AudioAdapter>::ChannelLayout,
-  },
+  Audio(AudioTrackParams<E>),
   /// Subtitles / captions.
-  Subtitle {
-    /// Codec identifier.
-    codec: E::CodecId,
-  },
+  Subtitle(SubtitleTrackParams<E>),
   /// Timed opaque data.
-  Data {
-    /// Codec identifier.
-    codec: E::CodecId,
-  },
+  Data(DataTrackParams<E>),
   /// An attached file — a font, cover art.
-  Attachment {
-    /// Codec identifier — the font format, or the still image's codec
-    /// for cover art.
-    codec: E::CodecId,
-  },
+  Attachment(AttachmentTrackParams<E>),
   /// A track the backend could not classify.
-  Unknown {
-    /// Codec identifier, which may itself be the backend's "none".
-    codec: E::CodecId,
-  },
+  Unknown(UnknownTrackParams<E>),
 }
 
 impl<E: DemuxAdapter> TrackParams<E> {
@@ -430,12 +679,12 @@ impl<E: DemuxAdapter> TrackParams<E> {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn kind(&self) -> TrackKind {
     match self {
-      Self::Video { .. } => TrackKind::Video,
-      Self::Audio { .. } => TrackKind::Audio,
-      Self::Subtitle { .. } => TrackKind::Subtitle,
-      Self::Data { .. } => TrackKind::Data,
-      Self::Attachment { .. } => TrackKind::Attachment,
-      Self::Unknown { .. } => TrackKind::Unknown,
+      Self::Video(_) => TrackKind::Video,
+      Self::Audio(_) => TrackKind::Audio,
+      Self::Subtitle(_) => TrackKind::Subtitle,
+      Self::Data(_) => TrackKind::Data,
+      Self::Attachment(_) => TrackKind::Attachment,
+      Self::Unknown(_) => TrackKind::Unknown,
     }
   }
 
@@ -443,12 +692,34 @@ impl<E: DemuxAdapter> TrackParams<E> {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn codec(&self) -> E::CodecId {
     match self {
-      Self::Video { codec, .. }
-      | Self::Audio { codec, .. }
-      | Self::Subtitle { codec }
-      | Self::Data { codec }
-      | Self::Attachment { codec }
-      | Self::Unknown { codec } => *codec,
+      Self::Video(p) => p.codec(),
+      Self::Audio(p) => p.codec(),
+      Self::Subtitle(p) => p.codec(),
+      Self::Data(p) => p.codec(),
+      Self::Attachment(p) => p.codec(),
+      Self::Unknown(p) => p.codec(),
+    }
+  }
+}
+
+// `Debug` is hand-written, not derived: a flat `#[derive(Debug)]`
+// over the enum's own type parameter `E` would demand `E: Debug`,
+// which none of the six payload structs' fields need — each already
+// carries the precise bound it requires from the trait that declares
+// its associated type. See each payload struct's own `Debug` impl,
+// above, for the same reasoning one level down.
+//
+// No `Clone`: see `TrackInfo`'s own doc, below, for the
+// message-carrier law.
+impl<E: DemuxAdapter> Debug for TrackParams<E> {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      Self::Video(p) => f.debug_tuple("Video").field(p).finish(),
+      Self::Audio(p) => f.debug_tuple("Audio").field(p).finish(),
+      Self::Subtitle(p) => f.debug_tuple("Subtitle").field(p).finish(),
+      Self::Data(p) => f.debug_tuple("Data").field(p).finish(),
+      Self::Attachment(p) => f.debug_tuple("Attachment").field(p).finish(),
+      Self::Unknown(p) => f.debug_tuple("Unknown").field(p).finish(),
     }
   }
 }
@@ -463,6 +734,16 @@ impl<E: DemuxAdapter> TrackParams<E> {
 ///
 /// Everything a particular backend knows and this row has no seat for
 /// rides [`DemuxAdapter::TrackExtra`].
+///
+/// **No `Clone`, on this type or on [`TrackParams`].** The
+/// message-carrier law: messages may be `Clone`, but `Clone` is
+/// always a refcount bump, never a deep copy — and a track row,
+/// backend metadata down to codec parameters, is not cheap to
+/// duplicate. A consumer that needs to share a row wraps it in `Arc`
+/// once, at the door, instead of paying a deep copy per consumer.
+/// [`Demuxer::take_tracks`] is that door: it moves the whole table
+/// out in one call, meant to be taken exactly once, right after a
+/// session opens, before any row needs to be shared further.
 pub struct TrackInfo<E: DemuxAdapter> {
   timebase: Timebase,
   duration: Option<Timestamp>,
@@ -572,9 +853,351 @@ impl<E: DemuxAdapter> TrackInfo<E> {
   }
 }
 
+// `Debug` is hand-written for the same reason as `TrackParams`'s:
+// `#[derive(Debug)]` would add `E: Debug`, but the field that
+// actually needs a bound is `E::TrackExtra` — `E::Text: Debug` is
+// already guaranteed by `DemuxAdapter::Text`'s own trait bound, and
+// `TrackParams<E>` needs no extra bound at all (see its own impl,
+// above). No `Clone`: see this type's own doc, above, for the
+// message-carrier law.
+impl<E: DemuxAdapter> Debug for TrackInfo<E>
+where
+  E::TrackExtra: Debug,
+{
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("TrackInfo")
+      .field("timebase", &self.timebase)
+      .field("duration", &self.duration)
+      .field("params", &self.params)
+      .field("filename", &self.filename)
+      .field("mime_type", &self.mime_type)
+      .field("extra", &self.extra)
+      .finish()
+  }
+}
+
 // ---------------------------------------------------------------------------
 //  The delivery envelope.
 // ---------------------------------------------------------------------------
+
+/// Payload for [`DemuxedPacket::Video`].
+pub struct VideoTrackPacket<E: DemuxAdapter, D> {
+  track: TrackIndex,
+  packet: DemuxVideoPacket<E, D>,
+}
+
+impl<E: DemuxAdapter, D> VideoTrackPacket<E, D> {
+  /// Constructs a `VideoTrackPacket`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(track: TrackIndex, packet: DemuxVideoPacket<E, D>) -> Self {
+    Self { track, packet }
+  }
+
+  /// Returns the track this packet belongs to.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn track(&self) -> TrackIndex {
+    self.track
+  }
+  /// Returns the packet.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn packet(&self) -> &DemuxVideoPacket<E, D> {
+    &self.packet
+  }
+  /// Consumes the envelope and returns the packet.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn into_packet(self) -> DemuxVideoPacket<E, D> {
+    self.packet
+  }
+  /// Consumes the envelope and returns `(track, packet)`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn into_parts(self) -> (TrackIndex, DemuxVideoPacket<E, D>) {
+    (self.track, self.packet)
+  }
+}
+
+// `Clone` / `Debug` are hand-written for the same associated-type
+// reason as `TrackParams`'s payload structs, above: the bound belongs
+// on `<E::Video as VideoAdapter>::PacketExtra`, not on `E` itself,
+// which `#[derive]` cannot see.
+impl<E, D> Clone for VideoTrackPacket<E, D>
+where
+  E: DemuxAdapter,
+  D: Clone,
+  <E::Video as VideoAdapter>::PacketExtra: Clone,
+{
+  fn clone(&self) -> Self {
+    Self {
+      track: self.track,
+      packet: self.packet.clone(),
+    }
+  }
+}
+
+impl<E, D> Debug for VideoTrackPacket<E, D>
+where
+  E: DemuxAdapter,
+  D: Debug,
+  <E::Video as VideoAdapter>::PacketExtra: Debug,
+{
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("VideoTrackPacket")
+      .field("track", &self.track)
+      .field("packet", &self.packet)
+      .finish()
+  }
+}
+
+/// Payload for [`DemuxedPacket::Audio`].
+pub struct AudioTrackPacket<E: DemuxAdapter, D> {
+  track: TrackIndex,
+  packet: DemuxAudioPacket<E, D>,
+}
+
+impl<E: DemuxAdapter, D> AudioTrackPacket<E, D> {
+  /// Constructs an `AudioTrackPacket`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(track: TrackIndex, packet: DemuxAudioPacket<E, D>) -> Self {
+    Self { track, packet }
+  }
+
+  /// Returns the track this packet belongs to.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn track(&self) -> TrackIndex {
+    self.track
+  }
+  /// Returns the packet.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn packet(&self) -> &DemuxAudioPacket<E, D> {
+    &self.packet
+  }
+  /// Consumes the envelope and returns the packet.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn into_packet(self) -> DemuxAudioPacket<E, D> {
+    self.packet
+  }
+  /// Consumes the envelope and returns `(track, packet)`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn into_parts(self) -> (TrackIndex, DemuxAudioPacket<E, D>) {
+    (self.track, self.packet)
+  }
+}
+
+impl<E, D> Clone for AudioTrackPacket<E, D>
+where
+  E: DemuxAdapter,
+  D: Clone,
+  <E::Audio as AudioAdapter>::PacketExtra: Clone,
+{
+  fn clone(&self) -> Self {
+    Self {
+      track: self.track,
+      packet: self.packet.clone(),
+    }
+  }
+}
+
+impl<E, D> Debug for AudioTrackPacket<E, D>
+where
+  E: DemuxAdapter,
+  D: Debug,
+  <E::Audio as AudioAdapter>::PacketExtra: Debug,
+{
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("AudioTrackPacket")
+      .field("track", &self.track)
+      .field("packet", &self.packet)
+      .finish()
+  }
+}
+
+/// Payload for [`DemuxedPacket::Subtitle`].
+pub struct SubtitleTrackPacket<E: DemuxAdapter, D> {
+  track: TrackIndex,
+  packet: DemuxSubtitlePacket<E, D>,
+}
+
+impl<E: DemuxAdapter, D> SubtitleTrackPacket<E, D> {
+  /// Constructs a `SubtitleTrackPacket`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(track: TrackIndex, packet: DemuxSubtitlePacket<E, D>) -> Self {
+    Self { track, packet }
+  }
+
+  /// Returns the track this packet belongs to.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn track(&self) -> TrackIndex {
+    self.track
+  }
+  /// Returns the packet.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn packet(&self) -> &DemuxSubtitlePacket<E, D> {
+    &self.packet
+  }
+  /// Consumes the envelope and returns the packet.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn into_packet(self) -> DemuxSubtitlePacket<E, D> {
+    self.packet
+  }
+  /// Consumes the envelope and returns `(track, packet)`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn into_parts(self) -> (TrackIndex, DemuxSubtitlePacket<E, D>) {
+    (self.track, self.packet)
+  }
+}
+
+impl<E, D> Clone for SubtitleTrackPacket<E, D>
+where
+  E: DemuxAdapter,
+  D: Clone,
+  <E::Subtitle as SubtitleAdapter>::PacketExtra: Clone,
+{
+  fn clone(&self) -> Self {
+    Self {
+      track: self.track,
+      packet: self.packet.clone(),
+    }
+  }
+}
+
+impl<E, D> Debug for SubtitleTrackPacket<E, D>
+where
+  E: DemuxAdapter,
+  D: Debug,
+  <E::Subtitle as SubtitleAdapter>::PacketExtra: Debug,
+{
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("SubtitleTrackPacket")
+      .field("track", &self.track)
+      .field("packet", &self.packet)
+      .finish()
+  }
+}
+
+/// Payload for [`DemuxedPacket::Data`].
+pub struct DataTrackPacket<E: DemuxAdapter, D> {
+  track: TrackIndex,
+  packet: DemuxDataPacket<E, D>,
+}
+
+impl<E: DemuxAdapter, D> DataTrackPacket<E, D> {
+  /// Constructs a `DataTrackPacket`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(track: TrackIndex, packet: DemuxDataPacket<E, D>) -> Self {
+    Self { track, packet }
+  }
+
+  /// Returns the track this packet belongs to.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn track(&self) -> TrackIndex {
+    self.track
+  }
+  /// Returns the packet.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn packet(&self) -> &DemuxDataPacket<E, D> {
+    &self.packet
+  }
+  /// Consumes the envelope and returns the packet.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn into_packet(self) -> DemuxDataPacket<E, D> {
+    self.packet
+  }
+  /// Consumes the envelope and returns `(track, packet)`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn into_parts(self) -> (TrackIndex, DemuxDataPacket<E, D>) {
+    (self.track, self.packet)
+  }
+}
+
+impl<E, D> Clone for DataTrackPacket<E, D>
+where
+  E: DemuxAdapter,
+  D: Clone,
+  E::DataExtra: Clone,
+{
+  fn clone(&self) -> Self {
+    Self {
+      track: self.track,
+      packet: self.packet.clone(),
+    }
+  }
+}
+
+impl<E, D> Debug for DataTrackPacket<E, D>
+where
+  E: DemuxAdapter,
+  D: Debug,
+  E::DataExtra: Debug,
+{
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("DataTrackPacket")
+      .field("track", &self.track)
+      .field("packet", &self.packet)
+      .finish()
+  }
+}
+
+/// Payload for [`DemuxedPacket::Attachment`].
+pub struct AttachmentTrackPacket<E: DemuxAdapter, D> {
+  track: TrackIndex,
+  packet: DemuxAttachmentPacket<E, D>,
+}
+
+impl<E: DemuxAdapter, D> AttachmentTrackPacket<E, D> {
+  /// Constructs an `AttachmentTrackPacket`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(track: TrackIndex, packet: DemuxAttachmentPacket<E, D>) -> Self {
+    Self { track, packet }
+  }
+
+  /// Returns the track this packet belongs to.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn track(&self) -> TrackIndex {
+    self.track
+  }
+  /// Returns the packet.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn packet(&self) -> &DemuxAttachmentPacket<E, D> {
+    &self.packet
+  }
+  /// Consumes the envelope and returns the packet.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn into_packet(self) -> DemuxAttachmentPacket<E, D> {
+    self.packet
+  }
+  /// Consumes the envelope and returns `(track, packet)`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn into_parts(self) -> (TrackIndex, DemuxAttachmentPacket<E, D>) {
+    (self.track, self.packet)
+  }
+}
+
+impl<E, D> Clone for AttachmentTrackPacket<E, D>
+where
+  E: DemuxAdapter,
+  D: Clone,
+  E::AttachmentExtra: Clone,
+{
+  fn clone(&self) -> Self {
+    Self {
+      track: self.track,
+      packet: self.packet.clone(),
+    }
+  }
+}
+
+impl<E, D> Debug for AttachmentTrackPacket<E, D>
+where
+  E: DemuxAdapter,
+  D: Debug,
+  E::AttachmentExtra: Debug,
+{
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("AttachmentTrackPacket")
+      .field("track", &self.track)
+      .field("packet", &self.packet)
+      .finish()
+  }
+}
 
 /// One demuxed packet, with the track it came from.
 ///
@@ -586,42 +1209,20 @@ impl<E: DemuxAdapter> TrackInfo<E> {
 /// A track whose kind is [`TrackKind::Unknown`] has no arm, and its
 /// packets are therefore never delivered. The roster is closed at five
 /// on purpose: a kind nothing can name is a kind nothing can consume.
+#[derive(IsVariant, Unwrap, TryUnwrap)]
+#[unwrap(ref, ref_mut)]
+#[try_unwrap(ref, ref_mut)]
 pub enum DemuxedPacket<E: DemuxAdapter, D> {
   /// A compressed video packet.
-  Video {
-    /// The track it belongs to.
-    track: TrackIndex,
-    /// The packet.
-    packet: DemuxVideoPacket<E, D>,
-  },
+  Video(VideoTrackPacket<E, D>),
   /// A compressed audio packet.
-  Audio {
-    /// The track it belongs to.
-    track: TrackIndex,
-    /// The packet.
-    packet: DemuxAudioPacket<E, D>,
-  },
+  Audio(AudioTrackPacket<E, D>),
   /// A compressed subtitle packet.
-  Subtitle {
-    /// The track it belongs to.
-    track: TrackIndex,
-    /// The packet.
-    packet: DemuxSubtitlePacket<E, D>,
-  },
+  Subtitle(SubtitleTrackPacket<E, D>),
   /// A timed opaque-data packet.
-  Data {
-    /// The track it belongs to.
-    track: TrackIndex,
-    /// The packet.
-    packet: DemuxDataPacket<E, D>,
-  },
+  Data(DataTrackPacket<E, D>),
   /// An attachment payload.
-  Attachment {
-    /// The track it belongs to.
-    track: TrackIndex,
-    /// The packet.
-    packet: DemuxAttachmentPacket<E, D>,
-  },
+  Attachment(AttachmentTrackPacket<E, D>),
 }
 
 impl<E: DemuxAdapter, D> DemuxedPacket<E, D> {
@@ -629,11 +1230,11 @@ impl<E: DemuxAdapter, D> DemuxedPacket<E, D> {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn track(&self) -> TrackIndex {
     match self {
-      Self::Video { track, .. }
-      | Self::Audio { track, .. }
-      | Self::Subtitle { track, .. }
-      | Self::Data { track, .. }
-      | Self::Attachment { track, .. } => *track,
+      Self::Video(p) => p.track(),
+      Self::Audio(p) => p.track(),
+      Self::Subtitle(p) => p.track(),
+      Self::Data(p) => p.track(),
+      Self::Attachment(p) => p.track(),
     }
   }
 
@@ -643,11 +1244,61 @@ impl<E: DemuxAdapter, D> DemuxedPacket<E, D> {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn kind(&self) -> TrackKind {
     match self {
-      Self::Video { .. } => TrackKind::Video,
-      Self::Audio { .. } => TrackKind::Audio,
-      Self::Subtitle { .. } => TrackKind::Subtitle,
-      Self::Data { .. } => TrackKind::Data,
-      Self::Attachment { .. } => TrackKind::Attachment,
+      Self::Video(_) => TrackKind::Video,
+      Self::Audio(_) => TrackKind::Audio,
+      Self::Subtitle(_) => TrackKind::Subtitle,
+      Self::Data(_) => TrackKind::Data,
+      Self::Attachment(_) => TrackKind::Attachment,
+    }
+  }
+}
+
+// `Clone` / `Debug` are hand-written for the same associated-type
+// reason as `TrackParams` and `TrackInfo` above. The five payload
+// types this enum carries route through `DemuxAdapter` and its three
+// per-kind sub-adapters — `<E::Video as VideoAdapter>::PacketExtra`,
+// `<E::Audio as AudioAdapter>::PacketExtra`, `<E::Subtitle as
+// SubtitleAdapter>::PacketExtra`, `E::DataExtra`, `E::AttachmentExtra`
+// — five independent associated types plus the buffer `D`, none of
+// which `#[derive]`'s flat `E: Clone` bound would name.
+impl<E, D> Clone for DemuxedPacket<E, D>
+where
+  E: DemuxAdapter,
+  D: Clone,
+  <E::Video as VideoAdapter>::PacketExtra: Clone,
+  <E::Audio as AudioAdapter>::PacketExtra: Clone,
+  <E::Subtitle as SubtitleAdapter>::PacketExtra: Clone,
+  E::DataExtra: Clone,
+  E::AttachmentExtra: Clone,
+{
+  fn clone(&self) -> Self {
+    match self {
+      Self::Video(p) => Self::Video(p.clone()),
+      Self::Audio(p) => Self::Audio(p.clone()),
+      Self::Subtitle(p) => Self::Subtitle(p.clone()),
+      Self::Data(p) => Self::Data(p.clone()),
+      Self::Attachment(p) => Self::Attachment(p.clone()),
+    }
+  }
+}
+
+impl<E, D> Debug for DemuxedPacket<E, D>
+where
+  E: DemuxAdapter,
+  D: Debug,
+  <E::Video as VideoAdapter>::PacketExtra: Debug,
+  <E::Audio as AudioAdapter>::PacketExtra: Debug,
+  <E::Subtitle as SubtitleAdapter>::PacketExtra: Debug,
+  E::DataExtra: Debug,
+  E::AttachmentExtra: Debug,
+{
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      Self::Video(p) => f.debug_tuple("Video").field(p).finish(),
+      Self::Audio(p) => f.debug_tuple("Audio").field(p).finish(),
+      Self::Subtitle(p) => f.debug_tuple("Subtitle").field(p).finish(),
+      Self::Data(p) => f.debug_tuple("Data").field(p).finish(),
+      Self::Attachment(p) => f.debug_tuple("Attachment").field(p).finish(),
     }
   }
 }
@@ -717,6 +1368,25 @@ pub trait Demuxer {
   /// the coordinate every [`DemuxedPacket`] carries.
   fn tracks(&self) -> &[TrackInfo<Self::Adapter>];
 
+  /// Moves the whole track table out, once.
+  ///
+  /// The **owned-tracks door**: [`TrackInfo`] has no `Clone` (see its
+  /// own doc), so a caller that needs to hold onto track rows beyond
+  /// a borrow of `&self` cannot clone its way to one. This is the
+  /// door instead. The **first call** moves every row out and returns
+  /// it; after that call, [`tracks`](Self::tracks) answers the empty
+  /// slice — the rows are gone, not duplicated. A second call to
+  /// `take_tracks` returns an empty `Vec` too, for the same reason.
+  ///
+  /// The intended caller takes the table exactly once, right after
+  /// opening a session and before pulling any packet, and wraps each
+  /// row in `Arc` for fan-out to whatever downstream consumers need
+  /// their own handle on it — one allocation per track, ever, and
+  /// every consumer after that shares by refcount.
+  #[cfg(any(feature = "std", feature = "alloc"))]
+  #[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
+  fn take_tracks(&mut self) -> alloc::vec::Vec<TrackInfo<Self::Adapter>>;
+
   /// Pulls the next packet in interleaved file order, or `Ok(None)` at
   /// end of file.
   fn next_packet(
@@ -734,6 +1404,16 @@ mod tests {
   use core::num::NonZeroI32;
 
   use super::*;
+
+  // `Vec` is not in the prelude in the alloc-without-std tier (the
+  // crate is `#![no_std]` there; the crate-root `alloc`-as-`std` alias
+  // only makes `std::`-qualified paths resolve, it does not inject
+  // prelude items) — same reason the trait's own `take_tracks` above
+  // spells its return type `alloc::vec::Vec`. `format!` needs the same
+  // bridge. Unconditional whenever this arm runs: the enclosing `alloc`
+  // binding above is gated the same way.
+  #[cfg(any(feature = "std", feature = "alloc"))]
+  use alloc::{format, vec, vec::Vec};
 
   struct VLoop;
   impl VideoAdapter for VLoop {
@@ -787,29 +1467,26 @@ mod tests {
     // `TrackInfo` whose advertised kind disagrees with its payload.
     let rows: [(TrackParams<Loopback>, TrackKind); 6] = [
       (
-        TrackParams::Video {
-          codec: 1,
-          width: 1920,
-          height: 1080,
-          pixel_format: 7,
-          frame_rate: None,
-        },
+        TrackParams::Video(VideoTrackParams::new(1, 1920, 1080, 7, None)),
         TrackKind::Video,
       ),
       (
-        TrackParams::Audio {
-          codec: 2,
-          sample_rate: 48_000,
-          channel_count: 2,
-          sample_format: 3,
-          channel_layout: 4,
-        },
+        TrackParams::Audio(AudioTrackParams::new(2, 48_000, 2, 3, 4)),
         TrackKind::Audio,
       ),
-      (TrackParams::Subtitle { codec: 3 }, TrackKind::Subtitle),
-      (TrackParams::Data { codec: 4 }, TrackKind::Data),
-      (TrackParams::Attachment { codec: 5 }, TrackKind::Attachment),
-      (TrackParams::Unknown { codec: 0 }, TrackKind::Unknown),
+      (
+        TrackParams::Subtitle(SubtitleTrackParams::new(3)),
+        TrackKind::Subtitle,
+      ),
+      (TrackParams::Data(DataTrackParams::new(4)), TrackKind::Data),
+      (
+        TrackParams::Attachment(AttachmentTrackParams::new(5)),
+        TrackKind::Attachment,
+      ),
+      (
+        TrackParams::Unknown(UnknownTrackParams::new(0)),
+        TrackKind::Unknown,
+      ),
     ];
     for (params, expected) in rows {
       let codec = params.codec();
@@ -822,9 +1499,13 @@ mod tests {
 
   #[test]
   fn attachment_identity_lives_on_the_track() {
-    let info = TrackInfo::<Loopback>::new(ms_tb(), TrackParams::Attachment { codec: 9 }, ())
-      .with_filename(Some("Arial.ttf"))
-      .with_mime_type(Some("application/x-truetype-font"));
+    let info = TrackInfo::<Loopback>::new(
+      ms_tb(),
+      TrackParams::Attachment(AttachmentTrackParams::new(9)),
+      (),
+    )
+    .with_filename(Some("Arial.ttf"))
+    .with_mime_type(Some("application/x-truetype-font"));
     assert_eq!(info.filename().copied(), Some("Arial.ttf"));
     assert_eq!(
       info.mime_type().copied(),
@@ -847,6 +1528,24 @@ mod tests {
     assert_eq!(data, b"klv");
   }
 
+  // `format!` needs an allocator; see the `Vec`/`format!` import note
+  // above `VLoop`.
+  #[cfg(any(feature = "std", feature = "alloc"))]
+  #[test]
+  fn data_packet_clone_matches_the_original() {
+    let pts = Timestamp::new(1500, ms_tb());
+    let original: DataPacket<(), &[u8]> = DataPacket::new(&b"klv"[..], ())
+      .with_pts(Some(pts))
+      .with_duration(Some(Timestamp::new(40, ms_tb())))
+      .with_flags(PacketFlags::KEY);
+    let cloned = original.clone();
+    assert_eq!(cloned.pts(), original.pts());
+    assert_eq!(cloned.duration(), original.duration());
+    assert_eq!(cloned.flags(), original.flags());
+    assert_eq!(cloned.data(), original.data());
+    assert!(format!("{cloned:?}").contains("DataPacket"));
+  }
+
   #[test]
   fn an_attachment_packet_has_no_timestamp_seat() {
     let mut p: AttachmentPacket<(), &[u8]> = AttachmentPacket::new(&b"\x00\x01TTF"[..], ());
@@ -856,43 +1555,47 @@ mod tests {
     assert_eq!(p.data(), &&b"\x00\x01TTF"[..]);
   }
 
+  // `format!` needs an allocator; see the `Vec`/`format!` import note
+  // above `VLoop`.
+  #[cfg(any(feature = "std", feature = "alloc"))]
+  #[test]
+  fn attachment_packet_clone_matches_the_original() {
+    let mut original: AttachmentPacket<(), &[u8]> = AttachmentPacket::new(&b"\x00\x01TTF"[..], ());
+    original.set_flags(PacketFlags::CORRUPT);
+    let cloned = original.clone();
+    assert_eq!(cloned.flags(), original.flags());
+    assert_eq!(cloned.data(), original.data());
+    assert!(format!("{cloned:?}").contains("AttachmentPacket"));
+  }
+
   #[test]
   fn the_envelope_carries_the_coordinate_and_the_kind() {
     let track = TrackIndex::new(2);
     let packets: [(DemuxedPacket<Loopback, &[u8]>, TrackKind); 5] = [
       (
-        DemuxedPacket::Video {
-          track,
-          packet: VideoPacket::new(&[][..], ()),
-        },
+        DemuxedPacket::Video(VideoTrackPacket::new(track, VideoPacket::new(&[][..], ()))),
         TrackKind::Video,
       ),
       (
-        DemuxedPacket::Audio {
-          track,
-          packet: AudioPacket::new(&[][..], ()),
-        },
+        DemuxedPacket::Audio(AudioTrackPacket::new(track, AudioPacket::new(&[][..], ()))),
         TrackKind::Audio,
       ),
       (
-        DemuxedPacket::Subtitle {
+        DemuxedPacket::Subtitle(SubtitleTrackPacket::new(
           track,
-          packet: SubtitlePacket::new(&[][..], ()),
-        },
+          SubtitlePacket::new(&[][..], ()),
+        )),
         TrackKind::Subtitle,
       ),
       (
-        DemuxedPacket::Data {
-          track,
-          packet: DataPacket::new(&[][..], ()),
-        },
+        DemuxedPacket::Data(DataTrackPacket::new(track, DataPacket::new(&[][..], ()))),
         TrackKind::Data,
       ),
       (
-        DemuxedPacket::Attachment {
+        DemuxedPacket::Attachment(AttachmentTrackPacket::new(
           track,
-          packet: AttachmentPacket::new(&[][..], ()),
-        },
+          AttachmentPacket::new(&[][..], ()),
+        )),
         TrackKind::Attachment,
       ),
     ];
@@ -902,16 +1605,64 @@ mod tests {
     }
   }
 
+  // `format!` needs an allocator; see the `Vec`/`format!` import note
+  // above `VLoop`.
+  #[cfg(any(feature = "std", feature = "alloc"))]
+  #[test]
+  fn demuxed_packet_clone_matches_the_original() {
+    let track = TrackIndex::new(2);
+    let packets: [DemuxedPacket<Loopback, &[u8]>; 5] = [
+      DemuxedPacket::Video(VideoTrackPacket::new(track, VideoPacket::new(&[][..], ()))),
+      DemuxedPacket::Audio(AudioTrackPacket::new(track, AudioPacket::new(&[][..], ()))),
+      DemuxedPacket::Subtitle(SubtitleTrackPacket::new(
+        track,
+        SubtitlePacket::new(&[][..], ()),
+      )),
+      DemuxedPacket::Data(DataTrackPacket::new(track, DataPacket::new(&[][..], ()))),
+      DemuxedPacket::Attachment(AttachmentTrackPacket::new(
+        track,
+        AttachmentPacket::new(&[][..], ()),
+      )),
+    ];
+    for packet in packets {
+      let cloned = packet.clone();
+      assert_eq!(cloned.track(), packet.track());
+      assert_eq!(cloned.kind(), packet.kind());
+      assert!(!format!("{cloned:?}").is_empty());
+    }
+  }
+
+  #[test]
+  fn demuxed_packet_carries_the_derived_accessor_face() {
+    // `IsVariant` / `Unwrap` / `TryUnwrap` — one arm per derive family,
+    // proving the house accessor face rides the enum rather than
+    // asserting the shape of every variant.
+    let track = TrackIndex::new(0);
+    let video: DemuxedPacket<Loopback, &[u8]> =
+      DemuxedPacket::Video(VideoTrackPacket::new(track, VideoPacket::new(&[][..], ())));
+    assert!(video.is_video());
+    assert!(!video.is_audio());
+    assert_eq!(video.unwrap_video_ref().track(), track);
+    assert!(video.try_unwrap_audio().is_err());
+  }
+
   /// Trivial loopback session — proves the trait is implementable and
   /// that its associated types resolve through the adapter bundle.
+  ///
+  /// `Vec`-backed, so the whole mock (and the two tests that construct
+  /// it, below) is gated on the same tier `take_tracks` itself needs —
+  /// see the `Vec`/`format!` import note above `VLoop`.
+  #[cfg(any(feature = "std", feature = "alloc"))]
   struct LoopDemuxer {
-    tracks: [TrackInfo<Loopback>; 1],
+    tracks: Vec<TrackInfo<Loopback>>,
     drained: bool,
   }
 
+  #[cfg(any(feature = "std", feature = "alloc"))]
   #[derive(Debug)]
   struct LoopError;
 
+  #[cfg(any(feature = "std", feature = "alloc"))]
   impl Demuxer for LoopDemuxer {
     type Adapter = Loopback;
     type Buffer = &'static [u8];
@@ -921,15 +1672,19 @@ mod tests {
       &self.tracks
     }
 
+    fn take_tracks(&mut self) -> Vec<TrackInfo<Loopback>> {
+      core::mem::take(&mut self.tracks)
+    }
+
     fn next_packet(&mut self) -> Result<Option<DemuxedPacket<Loopback, &'static [u8]>>, LoopError> {
       if self.drained {
         return Ok(None);
       }
       self.drained = true;
-      Ok(Some(DemuxedPacket::Audio {
-        track: TrackIndex::new(0),
-        packet: AudioPacket::new(&[][..], ()),
-      }))
+      Ok(Some(DemuxedPacket::Audio(AudioTrackPacket::new(
+        TrackIndex::new(0),
+        AudioPacket::new(&[][..], ()),
+      ))))
     }
 
     fn seek(&mut self, _target: Timestamp) -> Result<(), LoopError> {
@@ -938,21 +1693,16 @@ mod tests {
     }
   }
 
+  #[cfg(any(feature = "std", feature = "alloc"))]
   #[test]
   fn the_session_face_is_implementable_and_none_means_eof() {
     fn _accepts<D: Demuxer>() {}
     _accepts::<LoopDemuxer>();
 
     let mut d = LoopDemuxer {
-      tracks: [TrackInfo::new(
+      tracks: vec![TrackInfo::new(
         ms_tb(),
-        TrackParams::Audio {
-          codec: 1,
-          sample_rate: 48_000,
-          channel_count: 2,
-          sample_format: 0,
-          channel_layout: 0,
-        },
+        TrackParams::Audio(AudioTrackParams::new(1, 48_000, 2, 0, 0)),
         (),
       )],
       drained: false,
@@ -961,11 +1711,46 @@ mod tests {
     assert_eq!(d.tracks()[0].kind(), TrackKind::Audio);
     assert!(matches!(
       d.next_packet().expect("pull"),
-      Some(DemuxedPacket::Audio { .. })
+      Some(DemuxedPacket::Audio(_))
     ));
     assert!(d.next_packet().expect("pull").is_none());
     assert!(d.next_packet().expect("pull").is_none(), "EOF is sticky");
     d.seek(Timestamp::new(0, ms_tb())).expect("seek");
     assert!(d.next_packet().expect("pull").is_some());
+  }
+
+  #[cfg(any(feature = "std", feature = "alloc"))]
+  #[test]
+  fn take_tracks_moves_every_row_out_once_and_leaves_the_table_empty() {
+    let mut d = LoopDemuxer {
+      tracks: vec![
+        TrackInfo::new(
+          ms_tb(),
+          TrackParams::Audio(AudioTrackParams::new(1, 48_000, 2, 0, 0)),
+          (),
+        ),
+        TrackInfo::new(
+          ms_tb(),
+          TrackParams::Subtitle(SubtitleTrackParams::new(2)),
+          (),
+        ),
+      ],
+      drained: false,
+    };
+    let expected: Vec<TrackKind> = d.tracks().iter().map(|t| t.kind()).collect();
+
+    let taken = d.take_tracks();
+    assert_eq!(
+      taken.iter().map(|t| t.kind()).collect::<Vec<_>>(),
+      expected,
+      "every row comes out, in table order",
+    );
+    assert!(
+      d.tracks().is_empty(),
+      "the table is empty after the first take"
+    );
+
+    // The door does not reopen: a second call has nothing left to give.
+    assert!(d.take_tracks().is_empty(), "a second take yields nothing");
   }
 }

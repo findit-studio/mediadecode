@@ -10,6 +10,7 @@
 
 use core::{fmt, slice};
 
+use derive_more::{IsVariant, TryUnwrap, Unwrap};
 use ffmpeg_next::ffi::{AVBufferRef, av_buffer_ref, av_buffer_unref};
 
 /// Owned, refcounted handle to a contiguous byte range inside an
@@ -340,6 +341,241 @@ impl FfmpegBuffer {
   }
 }
 
+/// Payload for [`PacketBufferError::Refcount`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("out of memory referencing a {len}-byte packet payload")]
+pub struct Refcount {
+  len: usize,
+}
+
+impl Refcount {
+  /// Constructs a `Refcount` payload.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(len: usize) -> Self {
+    Self { len }
+  }
+  /// The payload's length in bytes.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn len(&self) -> usize {
+    self.len
+  }
+  /// `true` when the payload is zero bytes long.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn is_empty(&self) -> bool {
+    self.len == 0
+  }
+}
+
+/// Payload for [`PacketBufferError::Bounds`].
+///
+/// The payload does not lie inside the packet's own buffer.
+/// `AVPacket` guarantees it does; a packet that says otherwise is
+/// malformed, and wrapping it would hand out a view over memory the
+/// buffer does not own.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("a {len}-byte payload at offset {offset} does not lie inside a {size}-byte buffer")]
+pub struct Bounds {
+  offset: usize,
+  len: usize,
+  size: usize,
+}
+
+impl Bounds {
+  /// Constructs a `Bounds` payload.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(offset: usize, len: usize, size: usize) -> Self {
+    Self { offset, len, size }
+  }
+  /// Where the payload starts inside the buffer.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn offset(&self) -> usize {
+    self.offset
+  }
+  /// The payload's length in bytes.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn len(&self) -> usize {
+    self.len
+  }
+  /// `true` when the payload is zero bytes long.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn is_empty(&self) -> bool {
+    self.len == 0
+  }
+  /// The buffer's own length in bytes.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn size(&self) -> usize {
+    self.size
+  }
+}
+
+/// Payload for [`PacketBufferError::SideDataEntries`].
+///
+/// A packet declares more side-data entries than this crate will
+/// walk, or a negative count.
+///
+/// The cap bounds the work a crafted packet can demand *before* it is
+/// refused. It cannot trip on anything FFmpeg's own packet API
+/// produces: both `av_packet_new_side_data` and
+/// `av_packet_add_side_data` replace an entry of the same type, so a
+/// packet carries at most one entry per named type — forty-three in
+/// this build, and the cap tracks that number if it ever grows past
+/// the floor.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("a packet declaring {count} side-data entries cannot be carried (limit {cap})")]
+pub struct SideDataEntries {
+  count: i32,
+  cap: usize,
+}
+
+impl SideDataEntries {
+  /// Constructs a `SideDataEntries` payload.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(count: i32, cap: usize) -> Self {
+    Self { count, cap }
+  }
+  /// The count the packet declared.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn count(&self) -> i32 {
+    self.count
+  }
+  /// The most entries this crate will walk.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn cap(&self) -> usize {
+    self.cap
+  }
+}
+
+/// Payload for [`PacketBufferError::SideDataArray`].
+///
+/// A packet declares side-data entries and carries no array to read
+/// them from.
+///
+/// Malformed, and named rather than read as "no side data": a null
+/// array with a positive count is the same silent loss as a truncated
+/// copy, reached through the pointer instead of the cap.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("a packet declaring {count} side-data entries carries no array")]
+pub struct SideDataArray {
+  count: i32,
+}
+
+impl SideDataArray {
+  /// Constructs a `SideDataArray` payload.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(count: i32) -> Self {
+    Self { count }
+  }
+  /// The count the packet declared.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn count(&self) -> i32 {
+    self.count
+  }
+}
+
+/// Payload for [`PacketBufferError::SideDataPayload`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("side-data entry {index} declares {size} bytes and carries no data")]
+pub struct SideDataPayload {
+  index: usize,
+  size: usize,
+}
+
+impl SideDataPayload {
+  /// Constructs a `SideDataPayload` payload.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(index: usize, size: usize) -> Self {
+    Self { index, size }
+  }
+  /// The entry's position in the packet's array.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn index(&self) -> usize {
+    self.index
+  }
+  /// The length the entry declared.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn size(&self) -> usize {
+    self.size
+  }
+}
+
+/// Payload for [`PacketBufferError::SideDataBytes`].
+///
+/// A packet's side data is larger than this crate will copy.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{bytes} bytes of side data cannot be carried (limit {cap})")]
+pub struct SideDataBytes {
+  bytes: usize,
+  cap: usize,
+}
+
+impl SideDataBytes {
+  /// Constructs a `SideDataBytes` payload.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(bytes: usize, cap: usize) -> Self {
+    Self { bytes, cap }
+  }
+  /// The total the packet's entries reached.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn bytes(&self) -> usize {
+    self.bytes
+  }
+  /// The most bytes this crate will copy.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn cap(&self) -> usize {
+    self.cap
+  }
+}
+
+/// Payload for [`PacketBufferError::UnrepresentableFlags`].
+///
+/// A packet carries flag bits the portable vocabulary cannot hold.
+///
+/// `mediadecode`'s `PacketFlags` is a `u8` bit set, and every packet
+/// flag FFmpeg names today lives in that byte — so this cannot fire
+/// against this build. It exists so that the day one does not, the
+/// packet is refused by name instead of arriving with a bit quietly
+/// missing: the same rule the rest of this boundary keeps.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("packet flags {raw:#x} do not fit the portable flag set")]
+pub struct UnrepresentableFlags {
+  raw: i32,
+}
+
+impl UnrepresentableFlags {
+  /// Constructs an `UnrepresentableFlags` payload.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(raw: i32) -> Self {
+    Self { raw }
+  }
+  /// `AVPacket.flags` as FFmpeg wrote it.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn raw(&self) -> i32 {
+    self.raw
+  }
+}
+
+/// Payload for [`PacketBufferError::SideDataAlloc`].
+///
+/// Out of memory copying a side-data entry.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("out of memory copying {size} bytes of side data")]
+pub struct SideDataAlloc {
+  size: usize,
+}
+
+impl SideDataAlloc {
+  /// Constructs a `SideDataAlloc` payload.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(size: usize) -> Self {
+    Self { size }
+  }
+  /// The entry's length in bytes.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn size(&self) -> usize {
+    self.size
+  }
+}
+
 /// Why a packet could not be carried across the boundary — its payload,
 /// or the side data that comes with it.
 ///
@@ -351,97 +587,44 @@ impl FfmpegBuffer {
 /// carries on as though the file said so. The side-data arms exist for
 /// the same reason one tier along — a packet whose side data cannot be
 /// carried whole is refused, never delivered with some of it.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, thiserror::Error, IsVariant, Unwrap, TryUnwrap)]
+#[unwrap(ref, ref_mut)]
+#[try_unwrap(ref, ref_mut)]
 pub enum PacketBufferError {
   /// `av_buffer_ref` returned null — out of memory taking a second
   /// reference to a payload that is there.
-  #[error("out of memory referencing a {len}-byte packet payload")]
-  Refcount {
-    /// The payload's length in bytes.
-    len: usize,
-  },
+  #[error(transparent)]
+  Refcount(#[from] Refcount),
 
   /// The payload does not lie inside the packet's own buffer.
-  /// `AVPacket` guarantees it does; a packet that says otherwise is
-  /// malformed, and wrapping it would hand out a view over memory the
-  /// buffer does not own.
-  #[error("a {len}-byte payload at offset {offset} does not lie inside a {size}-byte buffer")]
-  Bounds {
-    /// Where the payload starts inside the buffer.
-    offset: usize,
-    /// The payload's length in bytes.
-    len: usize,
-    /// The buffer's own length in bytes.
-    size: usize,
-  },
+  #[error(transparent)]
+  Bounds(#[from] Bounds),
 
   /// A packet declares more side-data entries than this crate will
   /// walk, or a negative count.
-  ///
-  /// The cap bounds the work a crafted packet can demand *before* it is
-  /// refused. It cannot trip on anything FFmpeg's own packet API
-  /// produces: both `av_packet_new_side_data` and
-  /// `av_packet_add_side_data` replace an entry of the same type, so a
-  /// packet carries at most one entry per named type — forty-three in
-  /// this build, and the cap tracks that number if it ever grows past
-  /// the floor.
-  #[error("a packet declaring {count} side-data entries cannot be carried (limit {cap})")]
-  SideDataEntries {
-    /// The count the packet declared.
-    count: i32,
-    /// The most entries this crate will walk.
-    cap: usize,
-  },
+  #[error(transparent)]
+  SideDataEntries(#[from] SideDataEntries),
 
   /// A packet declares side-data entries and carries no array to read
   /// them from.
-  ///
-  /// Malformed, and named rather than read as "no side data": a null
-  /// array with a positive count is the same silent loss as a truncated
-  /// copy, reached through the pointer instead of the cap.
-  #[error("a packet declaring {count} side-data entries carries no array")]
-  SideDataArray {
-    /// The count the packet declared.
-    count: i32,
-  },
+  #[error(transparent)]
+  SideDataArray(#[from] SideDataArray),
 
   /// A side-data entry declares bytes it does not carry.
-  #[error("side-data entry {index} declares {size} bytes and carries no data")]
-  SideDataPayload {
-    /// The entry's position in the packet's array.
-    index: usize,
-    /// The length the entry declared.
-    size: usize,
-  },
+  #[error(transparent)]
+  SideDataPayload(#[from] SideDataPayload),
 
   /// A packet's side data is larger than this crate will copy.
-  #[error("{bytes} bytes of side data cannot be carried (limit {cap})")]
-  SideDataBytes {
-    /// The total the packet's entries reached.
-    bytes: usize,
-    /// The most bytes this crate will copy.
-    cap: usize,
-  },
+  #[error(transparent)]
+  SideDataBytes(#[from] SideDataBytes),
 
   /// A packet carries flag bits the portable vocabulary cannot hold.
-  ///
-  /// `mediadecode`'s `PacketFlags` is a `u8` bit set, and every packet
-  /// flag FFmpeg names today lives in that byte — so this cannot fire
-  /// against this build. It exists so that the day one does not, the
-  /// packet is refused by name instead of arriving with a bit quietly
-  /// missing: the same rule the rest of this boundary keeps.
-  #[error("packet flags {raw:#x} do not fit the portable flag set")]
-  UnrepresentableFlags {
-    /// `AVPacket.flags` as FFmpeg wrote it.
-    raw: i32,
-  },
+  #[error(transparent)]
+  UnrepresentableFlags(#[from] UnrepresentableFlags),
 
   /// Out of memory copying a side-data entry.
-  #[error("out of memory copying {size} bytes of side data")]
-  SideDataAlloc {
-    /// The entry's length in bytes.
-    size: usize,
-  },
+  #[error(transparent)]
+  SideDataAlloc(#[from] SideDataAlloc),
 }
 
 /// The refcounted payload of a raw `AVPacket`.
@@ -473,11 +656,7 @@ pub(crate) unsafe fn payload_of(
   let buf_data = unsafe { (*buf_ptr).data };
   let size = unsafe { (*buf_ptr).size };
   if buf_data.is_null() {
-    return Err(PacketBufferError::Bounds {
-      offset: 0,
-      len,
-      size,
-    });
+    return Err(PacketBufferError::Bounds(Bounds::new(0, len, size)));
   }
   // `AVPacket` guarantees `data` lies within
   // `buf->data .. buf->data + buf->size`. The bounds are checked here
@@ -487,14 +666,14 @@ pub(crate) unsafe fn payload_of(
   match offset.checked_add(len) {
     Some(end) if end <= size => {}
     _ => {
-      return Err(PacketBufferError::Bounds { offset, len, size });
+      return Err(PacketBufferError::Bounds(Bounds::new(offset, len, size)));
     }
   }
   // SAFETY: `buf_ptr` is a live `AVBufferRef`, and the view was just
   // proved to lie inside it.
   unsafe { FfmpegBuffer::from_ref_view(buf_ptr, offset, len) }
     .map(Some)
-    .ok_or(PacketBufferError::Refcount { len })
+    .ok_or(PacketBufferError::Refcount(Refcount::new(len)))
 }
 
 impl Clone for FfmpegBuffer {

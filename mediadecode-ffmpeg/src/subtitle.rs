@@ -12,6 +12,7 @@
 
 use std::option::Option;
 
+use derive_more::{IsVariant, TryUnwrap, Unwrap};
 use ffmpeg_next::{codec::Parameters, ffi::avsubtitle_free};
 use mediadecode::{
   Timebase, decoder::SubtitleDecoder, frame::SubtitleFrame, packet::SubtitlePacket,
@@ -179,7 +180,9 @@ impl SubtitleDecoder for FfmpegSubtitleStreamDecoder {
 }
 
 /// Errors from [`FfmpegSubtitleStreamDecoder`].
-#[derive(thiserror::Error, Debug)]
+#[derive(thiserror::Error, Debug, IsVariant, Unwrap, TryUnwrap)]
+#[unwrap(ref, ref_mut)]
+#[try_unwrap(ref, ref_mut)]
 pub enum SubtitleDecodeError {
   /// The wrapped `ffmpeg::decoder::Subtitle` reported an error.
   #[error(transparent)]

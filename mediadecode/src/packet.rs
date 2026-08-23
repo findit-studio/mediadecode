@@ -52,6 +52,13 @@ use crate::Timestamp;
 /// every backend supplies all three (WebCodecs `EncodedVideoChunk`
 /// has no DTS; vendor RAW SDKs that produce packets at all derive
 /// timestamps from frame index × fps).
+///
+/// `Clone` and `Debug` derive directly: every field is either a
+/// concrete `Copy` type or one of `E` / `D` themselves, so the
+/// derive's per-parameter bound (`E: Clone, D: Clone`) is exactly
+/// what cloning the fields requires — no associated-type indirection
+/// to route around.
+#[derive(Clone, Debug)]
 pub struct VideoPacket<E, D> {
   pts: Option<Timestamp>,
   dts: Option<Timestamp>,
@@ -178,6 +185,7 @@ impl<E, D> VideoPacket<E, D> {
 }
 
 /// A compressed audio packet.
+#[derive(Clone, Debug)]
 pub struct AudioPacket<E, D> {
   pts: Option<Timestamp>,
   dts: Option<Timestamp>,
@@ -303,6 +311,7 @@ impl<E, D> AudioPacket<E, D> {
 }
 
 /// A compressed subtitle packet.
+#[derive(Clone, Debug)]
 pub struct SubtitlePacket<E, D> {
   pts: Option<Timestamp>,
   duration: Option<Timestamp>,
@@ -495,6 +504,20 @@ mod quickcheck_impls {
 mod tests {
   use super::*;
 
+  // `format!` needs an allocator, and this module carries no
+  // file-level `extern crate alloc;` (production `packet.rs` is
+  // core-only — its buffer type `B` is caller-supplied, never an
+  // owned `Vec` this crate allocates). Scoped to the test module that
+  // actually needs it; the enclosing `#[cfg(test)]` mod is not itself
+  // feature-gated, so this import (and each of its three call sites,
+  // below) carries its own gate — mirrors `serde_tests`' own
+  // `extern crate alloc;` / `use alloc::string::ToString;` a little
+  // further down, which needs the same bridge for the same reason.
+  #[cfg(any(feature = "std", feature = "alloc"))]
+  extern crate alloc;
+  #[cfg(any(feature = "std", feature = "alloc"))]
+  use alloc::format;
+
   #[test]
   fn flag_bits_are_stable() {
     assert_eq!(PacketFlags::KEY.bits(), 0b001);
@@ -548,6 +571,24 @@ mod tests {
     assert_eq!(data, &[1, 2]);
   }
 
+  // `format!` needs an allocator; see the import note above.
+  #[cfg(any(feature = "std", feature = "alloc"))]
+  #[test]
+  fn video_packet_clone_matches_the_original() {
+    let pts = crate::Timestamp::new(1500, ms_tb());
+    let original: VideoPacket<_, &[u8]> = VideoPacket::new(&[1u8, 2, 3][..], ())
+      .with_pts(Some(pts))
+      .with_dts(Some(pts))
+      .with_flags(PacketFlags::KEY);
+    let cloned = original.clone();
+    assert_eq!(cloned.pts(), original.pts());
+    assert_eq!(cloned.dts(), original.dts());
+    assert_eq!(cloned.duration(), original.duration());
+    assert_eq!(cloned.flags(), original.flags());
+    assert_eq!(cloned.data(), original.data());
+    assert!(format!("{cloned:?}").contains("VideoPacket"));
+  }
+
   #[test]
   fn audio_packet_round_trip() {
     let data: &[u8] = &[7, 8, 9];
@@ -558,11 +599,34 @@ mod tests {
     assert_eq!(recovered, data);
   }
 
+  // `format!` needs an allocator; see the import note above.
+  #[cfg(any(feature = "std", feature = "alloc"))]
+  #[test]
+  fn audio_packet_clone_matches_the_original() {
+    let data: &[u8] = &[7, 8, 9];
+    let original: AudioPacket<_, &[u8]> = AudioPacket::new(data, ()).with_flags(PacketFlags::KEY);
+    let cloned = original.clone();
+    assert_eq!(cloned.flags(), original.flags());
+    assert_eq!(cloned.data(), original.data());
+    assert!(format!("{cloned:?}").contains("AudioPacket"));
+  }
+
   #[test]
   fn subtitle_packet_round_trip() {
     let data: &[u8] = b"hi";
     let p: SubtitlePacket<_, &[u8]> = SubtitlePacket::new(data, ());
     assert_eq!(*p.data(), data);
+  }
+
+  // `format!` needs an allocator; see the import note above.
+  #[cfg(any(feature = "std", feature = "alloc"))]
+  #[test]
+  fn subtitle_packet_clone_matches_the_original() {
+    let data: &[u8] = b"hi";
+    let original: SubtitlePacket<_, &[u8]> = SubtitlePacket::new(data, ());
+    let cloned = original.clone();
+    assert_eq!(cloned.data(), original.data());
+    assert!(format!("{cloned:?}").contains("SubtitlePacket"));
   }
 
   // -------------------------------------------------------------------

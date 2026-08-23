@@ -19,7 +19,7 @@ use mediadecode::{
   },
   frame::{AudioFrame, Dimensions, Plane, Rect, SubtitleFrame, VideoFrame},
   packet::{AudioPacket, PacketFlags, SubtitlePacket, VideoPacket},
-  subtitle::SubtitlePayload,
+  subtitle::{SubtitlePayload, Text as SubtitleText},
 };
 
 /// Loopback "backend" — a zero-sized type that implements the three
@@ -276,10 +276,8 @@ fn subtitle_stream_round_trip() {
   let pkt: SubtitlePacket<(), &'static [u8]> = SubtitlePacket::new(b"hi" as &[u8], ());
   assert!(s.send_packet(&pkt).is_ok());
 
-  let payload: SubtitlePayload<&'static [u8]> = SubtitlePayload::Text {
-    text: b"hi",
-    language: Some(*b"eng"),
-  };
+  let payload: SubtitlePayload<&'static [u8]> =
+    SubtitlePayload::Text(SubtitleText::new(b"hi", Some(*b"eng")));
   let mut dst: SubtitleFrame<(), &'static [u8]> = SubtitleFrame::new(payload, ());
   assert!(s.receive_frame(&mut dst).is_err());
 }

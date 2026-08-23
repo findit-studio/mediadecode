@@ -43,11 +43,11 @@ fn drain(demuxer: &mut FfmpegDemuxer) -> Vec<(usize, TrackKind, Option<Timestamp
   let mut out = Vec::new();
   while let Some(packet) = demuxer.next_packet().expect("pull") {
     let pts = match &packet {
-      DemuxedPacket::Video { packet, .. } => packet.pts(),
-      DemuxedPacket::Audio { packet, .. } => packet.pts(),
-      DemuxedPacket::Subtitle { packet, .. } => packet.pts(),
-      DemuxedPacket::Data { packet, .. } => packet.pts(),
-      DemuxedPacket::Attachment { .. } => None,
+      DemuxedPacket::Video(p) => p.packet().pts(),
+      DemuxedPacket::Audio(p) => p.packet().pts(),
+      DemuxedPacket::Subtitle(p) => p.packet().pts(),
+      DemuxedPacket::Data(p) => p.packet().pts(),
+      DemuxedPacket::Attachment(_) => None,
     };
     out.push((packet.track().get(), packet.kind(), pts));
   }
@@ -90,27 +90,22 @@ fn the_five_kinds_map_to_the_five_arms() {
 #[test]
 fn a_track_row_carries_its_codec_parameters_and_attachment_identity() {
   let Some(corpus) = Corpus::new() else { return };
-  let demuxer = FfmpegDemuxer::open(&corpus.multi_track_mkv()).expect("open mkv");
+  let mut demuxer = FfmpegDemuxer::open(&corpus.multi_track_mkv()).expect("open mkv");
 
   let video = &demuxer.tracks()[0];
   match video.params() {
-    mediadecode::demuxer::TrackParams::Video { width, height, .. } => {
-      assert_eq!((*width, *height), (160, 120));
+    mediadecode::demuxer::TrackParams::Video(p) => {
+      assert_eq!((p.width(), p.height()), (160, 120));
     }
     other => panic!("expected video params, got {:?}", other.kind()),
   }
 
   let audio = &demuxer.tracks()[1];
   match audio.params() {
-    mediadecode::demuxer::TrackParams::Audio {
-      sample_rate,
-      channel_count,
-      channel_layout,
-      ..
-    } => {
-      assert_eq!(*sample_rate, 48_000);
-      assert_eq!(*channel_count, 2);
-      assert_eq!(channel_layout.channels(), 2);
+    mediadecode::demuxer::TrackParams::Audio(p) => {
+      assert_eq!(p.sample_rate(), 48_000);
+      assert_eq!(p.channel_count(), 2);
+      assert_eq!(p.channel_layout().channels(), 2);
     }
     other => panic!("expected audio params, got {:?}", other.kind()),
   }
@@ -129,6 +124,21 @@ fn a_track_row_carries_its_codec_parameters_and_attachment_identity() {
     ffmpeg_next::media::Type::Audio,
   );
   assert_eq!(audio.extra().stream_index(), 1);
+
+  // The owned-tracks door: the first call moves every row out, and
+  // `tracks()` answers empty afterward — the shape a fan-out consumer
+  // relies on to wrap each row in `Arc` once, right after open.
+  let expected_kinds: Vec<_> = demuxer.tracks().iter().map(|t| t.kind()).collect();
+  let taken = demuxer.take_tracks();
+  assert_eq!(
+    taken.iter().map(|t| t.kind()).collect::<Vec<_>>(),
+    expected_kinds,
+    "take_tracks hands out every row, in table order",
+  );
+  assert!(
+    demuxer.tracks().is_empty(),
+    "the table is empty after the first take",
+  );
 }
 
 #[test]
@@ -165,13 +175,13 @@ fn an_attachment_is_delivered_exactly_once_and_before_any_timed_packet() {
   let mut demuxer = FfmpegDemuxer::open(&corpus.multi_track_mkv()).expect("open mkv");
   let first = demuxer.next_packet().expect("pull").expect("a packet");
   match first {
-    DemuxedPacket::Attachment { track, packet } => {
-      assert_eq!(track.get(), 3);
+    DemuxedPacket::Attachment(p) => {
+      assert_eq!(p.track().get(), 3);
       assert!(
-        packet.extra().synthesized(),
+        p.packet().extra().synthesized(),
         "a font's bytes never appear in the packet stream",
       );
-      assert_eq!(packet.data().as_ref(), support::FONT_PAYLOAD);
+      assert_eq!(p.packet().data().as_ref(), support::FONT_PAYLOAD);
     }
     other => panic!(
       "the attachment must precede every timed packet, got {:?}",
@@ -193,14 +203,14 @@ fn an_attachment_is_delivered_exactly_once_and_before_any_timed_packet() {
   let mut demuxer = FfmpegDemuxer::open(&corpus.cover_art_mp3()).expect("open mp3");
   let first = demuxer.next_packet().expect("pull").expect("a packet");
   let cover_len = match first {
-    DemuxedPacket::Attachment { track, packet } => {
-      assert_eq!(track.get(), 1);
+    DemuxedPacket::Attachment(p) => {
+      assert_eq!(p.track().get(), 1);
       assert!(
-        !packet.extra().synthesized(),
+        !p.packet().extra().synthesized(),
         "cover art is hoisted from AVStream.attached_pic, not synthesized",
       );
-      assert!(!packet.data().as_ref().is_empty());
-      packet.data().as_ref().len()
+      assert!(!p.packet().data().as_ref().is_empty());
+      p.packet().data().as_ref().len()
     }
     other => panic!("expected the cover first, got {:?}", other.kind()),
   };
@@ -274,8 +284,9 @@ fn a_packets_side_data_arrives_with_it() {
   let mut demuxer = FfmpegDemuxer::open(&corpus.cover_art_mp3()).expect("open mp3");
   let mut seen = 0;
   while let Some(packet) = demuxer.next_packet().expect("pull") {
-    if let DemuxedPacket::Audio { packet, .. } = packet {
-      seen += packet
+    if let DemuxedPacket::Audio(p) = packet {
+      seen += p
+        .packet()
         .extra()
         .side_data()
         .iter()
@@ -315,9 +326,10 @@ fn decoded_samples(path: &std::path::Path, strip_side_data: bool) -> u64 {
   let mut frame = mediadecode_ffmpeg::empty_audio_frame();
   let mut total = 0u64;
   while let Some(packet) = demuxer.next_packet().expect("pull") {
-    let DemuxedPacket::Audio { packet, .. } = packet else {
+    let DemuxedPacket::Audio(p) = packet else {
       continue;
     };
+    let packet = p.into_packet();
     let packet = if strip_side_data {
       mediadecode_ffmpeg::AudioPacket::new(
         packet.data().clone(),
@@ -428,7 +440,7 @@ fn the_demux_to_decoder_handoff_survives_an_allocation_fault() {
       unsafe { ffmpeg_next::ffi::av_max_alloc(i32::MAX as usize) };
 
       assert!(
-        matches!(refused, Err(DemuxError::ParametersAlloc { .. })),
+        matches!(refused, Err(DemuxError::ParametersAlloc(_))),
         "expected a named refusal, got {refused:?}",
       );
 
@@ -451,28 +463,28 @@ fn a_hoisted_cover_art_packet_keeps_its_flags() {
   // ever delivered.
   let mut demuxer = FfmpegDemuxer::open(&corpus.cover_art_mp3()).expect("open mp3");
   let first = demuxer.next_packet().expect("pull").expect("a packet");
-  let DemuxedPacket::Attachment { packet, .. } = first else {
+  let DemuxedPacket::Attachment(p) = first else {
     panic!("the cover comes first");
   };
   assert!(
-    !packet.extra().synthesized(),
+    !p.packet().extra().synthesized(),
     "this is the hoisted packet, not one this layer invented",
   );
   assert!(
-    packet.flags().contains(PacketFlags::KEY),
+    p.packet().flags().contains(PacketFlags::KEY),
     "the hoisted packet lost the flags it really carried: {:?}",
-    packet.flags(),
+    p.packet().flags(),
   );
 
   // The synthesized one is a different case and says so: nothing was
   // parked, so there are no flags to carry.
   let mut demuxer = FfmpegDemuxer::open(&corpus.multi_track_mkv()).expect("open mkv");
   let first = demuxer.next_packet().expect("pull").expect("a packet");
-  let DemuxedPacket::Attachment { packet, .. } = first else {
+  let DemuxedPacket::Attachment(p) = first else {
     panic!("the font comes first");
   };
-  assert!(packet.extra().synthesized());
-  assert_eq!(packet.flags(), PacketFlags::empty());
+  assert!(p.packet().extra().synthesized());
+  assert_eq!(p.packet().flags(), PacketFlags::empty());
 }
 
 #[test]
@@ -499,11 +511,11 @@ fn timestamps_carry_their_own_track_timebase() {
   while let Some(packet) = demuxer.next_packet().expect("pull") {
     let track = packet.track().get();
     let pts = match &packet {
-      DemuxedPacket::Video { packet, .. } => packet.pts(),
-      DemuxedPacket::Audio { packet, .. } => packet.pts(),
-      DemuxedPacket::Subtitle { packet, .. } => packet.pts(),
-      DemuxedPacket::Data { packet, .. } => packet.pts(),
-      DemuxedPacket::Attachment { .. } => continue,
+      DemuxedPacket::Video(p) => p.packet().pts(),
+      DemuxedPacket::Audio(p) => p.packet().pts(),
+      DemuxedPacket::Subtitle(p) => p.packet().pts(),
+      DemuxedPacket::Data(p) => p.packet().pts(),
+      DemuxedPacket::Attachment(_) => continue,
     };
     if let Some(pts) = pts {
       assert_eq!(
@@ -531,8 +543,8 @@ fn a_seek_lands_on_a_keyframe_at_or_before_the_target() {
 
   let mut first_video = None;
   while let Some(packet) = demuxer.next_packet().expect("pull") {
-    if let DemuxedPacket::Video { packet, .. } = packet {
-      first_video = Some(packet);
+    if let DemuxedPacket::Video(p) = packet {
+      first_video = Some(p.into_packet());
       break;
     }
   }
@@ -694,7 +706,8 @@ fn a_panicking_reader_is_an_error_not_an_abort() {
     panic!("a panicking reader cannot open a container");
   };
   match err {
-    DemuxError::ReaderPanic { ref message } => {
+    DemuxError::ReaderPanic(ref p) => {
+      let message = p.message();
       assert!(
         message.contains("out of patience"),
         "the panic's own words are carried: {message}",
@@ -731,18 +744,18 @@ fn a_panicking_reader_is_an_error_not_an_abort() {
   }
   let failure = failure.expect("the pull loop must fail, not end");
   assert!(
-    matches!(failure, DemuxError::ReaderPanic { .. }),
+    matches!(failure, DemuxError::ReaderPanic(_)),
     "a panic mid-demux is named, not mistaken for EOF: {failure:?}",
   );
 
   // 3. And the session stays terminal: the same cause, every time.
   assert!(matches!(
     demuxer.next_packet(),
-    Err(DemuxError::ReaderPanic { .. })
+    Err(DemuxError::ReaderPanic(_))
   ));
   assert!(matches!(
     demuxer.seek(Timestamp::new(0, Timebase::SECONDS)),
-    Err(DemuxError::ReaderPanic { .. })
+    Err(DemuxError::ReaderPanic(_))
   ));
 }
 
@@ -787,7 +800,7 @@ fn a_latched_panic_outranks_a_queued_attachment() {
   assert!(
     matches!(
       demuxer.seek(Timestamp::new(1, Timebase::SECONDS)),
-      Err(DemuxError::ReaderPanic { .. })
+      Err(DemuxError::ReaderPanic(_))
     ),
     "the seek must report the panic it caused",
   );
@@ -796,7 +809,7 @@ fn a_latched_panic_outranks_a_queued_attachment() {
   // is exactly why draining it here would tell the caller the session
   // is still alive after it has been told otherwise.
   match demuxer.next_packet() {
-    Err(DemuxError::ReaderPanic { .. }) => {}
+    Err(DemuxError::ReaderPanic(_)) => {}
     Err(other) => panic!("expected ReaderPanic, got {other:?}"),
     Ok(Some(packet)) => panic!("a terminal session delivered a {:?} packet", packet.kind()),
     Ok(None) => panic!("a terminal session answered EOF"),

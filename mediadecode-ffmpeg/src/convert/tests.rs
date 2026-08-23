@@ -172,19 +172,14 @@ fn an_unsupported_format_is_named_in_the_error() {
     panic!("a hardware surface carries no deliverable CPU layout");
   };
 
-  let ConvertError::UnsupportedPixelFormat {
-    format,
-    raw: got,
-    name,
-  } = &err
-  else {
+  let ConvertError::UnsupportedPixelFormat(p) = &err else {
     panic!("expected UnsupportedPixelFormat, got {err:?}");
   };
   // The *value* is unchanged — this restores the diagnostic, not the
   // struck `Unknown(u32)` variant.
-  assert_eq!(*format, PixelFormat::None);
-  assert_eq!(*got, raw);
-  assert_eq!(name.as_deref(), Some("videotoolbox_vld"));
+  assert_eq!(*p.format(), PixelFormat::None);
+  assert_eq!(p.raw(), raw);
+  assert_eq!(p.name(), Some("videotoolbox_vld"));
 
   let rendered = err.to_string();
   assert!(
@@ -210,17 +205,12 @@ fn an_unnameable_format_still_reports_its_raw_id() {
     panic!("an unmappable format integer has no deliverable layout");
   };
 
-  let ConvertError::UnsupportedPixelFormat {
-    format,
-    raw: got,
-    name,
-  } = &err
-  else {
+  let ConvertError::UnsupportedPixelFormat(p) = &err else {
     panic!("expected UnsupportedPixelFormat, got {err:?}");
   };
-  assert_eq!(*format, PixelFormat::None);
-  assert_eq!(*got, raw);
-  assert_eq!(*name, None);
+  assert_eq!(*p.format(), PixelFormat::None);
+  assert_eq!(p.raw(), raw);
+  assert_eq!(p.name(), None);
 
   let rendered = err.to_string();
   assert!(
