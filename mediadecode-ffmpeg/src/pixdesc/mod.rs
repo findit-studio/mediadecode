@@ -85,6 +85,14 @@ pub(crate) struct PlaneGeometry {
   pub(crate) row_bytes: [usize; MAX_PLANES],
   /// Row count per plane.
   pub(crate) height: [usize; MAX_PLANES],
+  /// The index of the palette plane, when this format has one.
+  ///
+  /// A palette is **not a strided plane**: FFmpeg leaves its
+  /// `linesize` at zero and points `data[1]` at a flat
+  /// `AVPALETTE_SIZE` run. A copier that treated it like an image
+  /// plane would read a zero row width and refuse the frame, which is
+  /// exactly what happened first.
+  pub(crate) palette_plane: Option<usize>,
 }
 
 /// Whether `pix_fmt` is a CPU pixel format whose planes this crate can
@@ -116,6 +124,35 @@ pub(crate) fn is_deliverable(pix_fmt: &PixelFormat) -> bool {
 /// descriptor describes a plain CPU layout; returns the constant on
 /// success so callers don't repeat the mapping.
 fn geometry_descriptor(pix_fmt: &PixelFormat) -> Option<AVPixelFormat> {
+  descriptor_for(
+    pix_fmt,
+    AV_PIX_FMT_FLAG_HWACCEL
+      | AV_PIX_FMT_FLAG_BAYER
+      | AV_PIX_FMT_FLAG_PAL
+      | AV_PIX_FMT_FLAG_BITSTREAM,
+  )
+}
+
+/// [`geometry_descriptor`], for the **still** road, which accepts two
+/// layouts the video road refuses.
+///
+/// A cover image is routinely an indexed PNG (`pal8`) or a 1-bit one
+/// (`monob`), and refusing those left a real picture undecodable. The
+/// video road keeps refusing them: motion video in these formats
+/// essentially does not exist, and widening it would change what every
+/// existing video consumer can be handed.
+///
+/// **Nothing is converted.** mediadecode delivers what FFmpeg decoded —
+/// pixel conversion is colconv's job downstream — so a `pal8` still
+/// arrives as its indices plus its palette, and a `monob` still arrives
+/// as packed bits. Both are *format*-bounded, not budget-bounded: the
+/// palette is structurally 1024 bytes and a 1-bit row is
+/// `ceil(width / 8)`, and libavutil computes both.
+fn still_descriptor(pix_fmt: &PixelFormat) -> Option<AVPixelFormat> {
+  descriptor_for(pix_fmt, AV_PIX_FMT_FLAG_HWACCEL | AV_PIX_FMT_FLAG_BAYER)
+}
+
+fn descriptor_for(pix_fmt: &PixelFormat, rejected: i32) -> Option<AVPixelFormat> {
   let av = to_av_pixel_format(pix_fmt)?;
   // SAFETY: `av` is a known `AV_PIX_FMT_*` constant (never an integer cast
   // into the enum). `av_pix_fmt_desc_get` returns a pointer to a static
@@ -129,10 +166,6 @@ fn geometry_descriptor(pix_fmt: &PixelFormat) -> Option<AVPixelFormat> {
   // integer fields.
   let flags = unsafe { (*desc).flags };
   let nb_components = unsafe { (*desc).nb_components };
-  let rejected = AV_PIX_FMT_FLAG_HWACCEL
-    | AV_PIX_FMT_FLAG_BAYER
-    | AV_PIX_FMT_FLAG_PAL
-    | AV_PIX_FMT_FLAG_BITSTREAM;
   if flags & (rejected as u64) != 0 {
     return None;
   }
@@ -161,7 +194,46 @@ pub(crate) fn plane_geometry(
   width: usize,
   height: usize,
 ) -> Option<PlaneGeometry> {
-  let av = geometry_descriptor(pix_fmt)?;
+  geometry_from(geometry_descriptor(pix_fmt)?, width, height, false)
+}
+
+/// Whether the **still** road can deliver `pix_fmt` — everything
+/// [`is_deliverable`] accepts, plus paletted and sub-byte bitstream
+/// layouts. See [`still_descriptor`].
+pub(crate) fn is_still_deliverable(pix_fmt: &PixelFormat) -> bool {
+  still_descriptor(pix_fmt).is_some()
+}
+
+/// [`plane_geometry`] for the still road.
+///
+/// One extra fact over the shared road: a paletted format carries its
+/// palette in `data[1]`, which `av_pix_fmt_count_planes` does not count
+/// as a plane but `av_image_fill_plane_sizes` does size — at
+/// `AVPALETTE_SIZE`, a fixed 1024 bytes, always. Measured on this
+/// build: `PAL8` at 30×20 reports `count_planes = 1`,
+/// `linesize = [30, …]`, `sizes = [600, 1024, …]`.
+pub(crate) fn still_plane_geometry(
+  pix_fmt: &PixelFormat,
+  width: usize,
+  height: usize,
+) -> Option<PlaneGeometry> {
+  let av = still_descriptor(pix_fmt)?;
+  // SAFETY: `av` is a known `AV_PIX_FMT_*` constant.
+  let desc = unsafe { av_pix_fmt_desc_get(av) };
+  if desc.is_null() {
+    return None;
+  }
+  // SAFETY: non-null per the check above; `flags` is a plain field.
+  let paletted = unsafe { (*desc).flags } & (AV_PIX_FMT_FLAG_PAL as u64) != 0;
+  geometry_from(av, width, height, paletted)
+}
+
+fn geometry_from(
+  av: AVPixelFormat,
+  width: usize,
+  height: usize,
+  paletted: bool,
+) -> Option<PlaneGeometry> {
   let width_i = i32::try_from(width).ok()?;
   let height_i = i32::try_from(height).ok()?;
   if width_i <= 0 || height_i <= 0 {
@@ -176,7 +248,7 @@ pub(crate) fn plane_geometry(
   if count_raw <= 0 || count_raw as usize > MAX_PLANES {
     return None;
   }
-  let count = count_raw as usize;
+  let mut count = count_raw as usize;
 
   // Tight linesizes (visible row bytes) per plane. `av_image_fill_linesizes`
   // fills `[c_int; 4]` and returns < 0 on error.
@@ -232,12 +304,32 @@ pub(crate) fn plane_geometry(
     }
   }
 
+  let mut palette_plane = None;
+  if paletted {
+    // The palette rides `data[1]` as a flat `AVPALETTE_SIZE` run: 256
+    // entries of `AV_PIX_FMT_RGB32`, one row, never any other size.
+    // A format bound, not a budget seat — there is no number here a
+    // file gets to choose.
+    if count >= MAX_PLANES {
+      return None;
+    }
+    row_bytes[count] = PALETTE_BYTES;
+    plane_height[count] = 1;
+    palette_plane = Some(count);
+    count += 1;
+  }
+
   Some(PlaneGeometry {
     count,
     row_bytes,
     height: plane_height,
+    palette_plane,
   })
 }
+
+/// `AVPALETTE_SIZE` — 256 `AV_PIX_FMT_RGB32` entries. Fixed by the
+/// format, which is why the palette plane needs no budget of its own.
+pub(crate) const PALETTE_BYTES: usize = 256 * 4;
 
 /// Maps a recognised [`PixelFormat`] onto the matching compile-time
 /// `AVPixelFormat::AV_PIX_FMT_*` constant.

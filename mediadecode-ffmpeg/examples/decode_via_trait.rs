@@ -3,7 +3,7 @@
 //!
 //! Demonstrates:
 //! - **Backend-neutral consumer code** — `decode_one_video` is generic
-//!   over `VideoStreamDecoder<Adapter = Ffmpeg, Buffer = FfmpegBuffer>`.
+//!   over `VideoStreamDecoder<Adapter = Ffmpeg, Buffer = FfmpegBytes>`.
 //!   Same shape would work for any future mediadecode adapter.
 //! - **Transparent SW fallback** — `FfmpegVideoStreamDecoder::open`
 //!   handles HW probe + SW fallback under the hood.
@@ -23,7 +23,7 @@ use ffmpeg::{format, media};
 use ffmpeg_next as ffmpeg;
 use mediadecode::{Timebase, decoder::VideoStreamDecoder};
 use mediadecode_ffmpeg::{
-  Ffmpeg, FfmpegBuffer, FfmpegVideoStreamDecoder, VideoFrame, empty_video_frame,
+  DecoderLimits, Ffmpeg, FfmpegBytes, FfmpegVideoStreamDecoder, VideoFrame, empty_video_frame,
   video_packet_from_ffmpeg,
 };
 use std::num::NonZeroI32;
@@ -47,7 +47,8 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     NonZeroI32::new(stream_tb.denominator().max(1)).ok_or("bad time base")?,
   );
 
-  let mut decoder = FfmpegVideoStreamDecoder::open(stream.parameters(), time_base)?;
+  let mut decoder =
+    FfmpegVideoStreamDecoder::open(stream.parameters(), time_base, DecoderLimits::default())?;
   println!(
     "decoder opened on the {} path",
     if decoder.is_hardware() {
@@ -71,7 +72,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
 /// Generic helper bounded purely on the `mediadecode` trait. Any
 /// decoder satisfying `VideoStreamDecoder<Adapter = Ffmpeg, Buffer =
-/// FfmpegBuffer>` works here — `FfmpegVideoStreamDecoder` is just one
+/// FfmpegBytes>` works here — `FfmpegVideoStreamDecoder` is just one
 /// instance.
 fn decode_one_video<D>(
   decoder: &mut D,
@@ -79,7 +80,7 @@ fn decode_one_video<D>(
   stream_index: usize,
 ) -> std::result::Result<u64, Box<dyn std::error::Error>>
 where
-  D: VideoStreamDecoder<Adapter = Ffmpeg, Buffer = FfmpegBuffer>,
+  D: VideoStreamDecoder<Adapter = Ffmpeg, Buffer = FfmpegBytes>,
   D::Error: std::error::Error + Send + Sync + 'static,
 {
   let mut dst = empty_video_frame();

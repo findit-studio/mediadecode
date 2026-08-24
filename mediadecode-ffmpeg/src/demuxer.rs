@@ -62,7 +62,6 @@ use ffmpeg_next::{
     av_dict_get,
   },
   format::{self, context::Input},
-  media,
 };
 use mediadecode::{
   Timebase, Timestamp,
@@ -76,10 +75,11 @@ use mediadecode::{
 use smol_str::SmolStr;
 
 use crate::{
-  Ffmpeg, FfmpegBuffer, boundary,
-  buffer::PacketBufferError,
+  Ffmpeg, boundary,
+  buffer::{FfmpegBytes, PacketBufferError},
   codec_id::CodecId,
   extras::{AttachmentPacketExtra, TrackExtra},
+  limits::DemuxLimits,
   reader_guard::{GuardedReader, PanicLatch},
   sample_format::SampleFormat,
 };
@@ -99,7 +99,7 @@ pub struct FfmpegDemuxer {
   tracks: Vec<TrackInfo<Ffmpeg>>,
   pending: VecDeque<(
     TrackIndex,
-    AttachmentPacket<AttachmentPacketExtra, FfmpegBuffer>,
+    AttachmentPacket<AttachmentPacketExtra, FfmpegBytes>,
   )>,
   /// `true` once this session has answered `Ok(None)`. Only then does
   /// [`Self::seek`] clear the `AVIOContext`'s EOF latch — clearing it
@@ -110,6 +110,9 @@ pub struct FfmpegDemuxer {
   /// raised inside that reader is recorded. `None` for a path-opened
   /// session, which runs no caller code.
   reader_panic: Option<Arc<PanicLatch>>,
+  /// The budgets this session spends: on any one timed packet, and —
+  /// already spent, at open — on the file's attachments.
+  limits: DemuxLimits,
 }
 
 impl FfmpegDemuxer {
@@ -123,7 +126,42 @@ impl FfmpegDemuxer {
   /// FFmpeg's logging and network protocols configured; probing a local
   /// container does not require it.
   pub fn open<P: AsRef<Path> + ?Sized>(path: &P) -> Result<Self, DemuxError> {
-    Self::from_input(format::input(path)?)
+    Self::open_with(path, DemuxLimits::default())
+  }
+
+  /// [`Self::open`], with the session's resource budgets named.
+  ///
+  /// The budgets are taken **at open** rather than through a `with_*`
+  /// builder because the attachment half of them is spent here: every
+  /// attachment payload in the file is captured before this call
+  /// returns, which is what makes the demux tier's "exactly one packet,
+  /// before any timed packet" contract true by construction. A budget
+  /// set afterwards would arrive after the spending.
+  ///
+  /// A file whose attachments exceed the budget **fails to open**, with
+  /// [`DemuxError::AttachmentTooLarge`] or
+  /// [`DemuxError::AttachmentBudgetExhausted`] naming the track that
+  /// crossed the line.
+  pub fn open_with<P: AsRef<Path> + ?Sized>(
+    path: &P,
+    limits: DemuxLimits,
+  ) -> Result<Self, DemuxError> {
+    // **The probe knobs, set before libavformat reads a byte.** See
+    // [`DemuxLimits::max_probe_bytes`]: `avformat_open_input` and
+    // `avformat_find_stream_info` build the attachment, extradata and
+    // coded-side-data buffers themselves, so every budget that measures
+    // *this crate's* copies arrives after the original allocation. The
+    // instrument that reaches behind that is the one bounding what the
+    // parser is handed in the first place.
+    //
+    // On this entrypoint that is `probesize` / `formatprobesize` /
+    // `max_streams` only: the hard byte meter needs an `AVIOContext`
+    // this crate owns, and a path is opened by libavformat's own
+    // protocol layer. The reader entrypoint gets both.
+    Self::from_input(
+      format::input_with_dictionary(path, probe_options(limits))?,
+      limits,
+    )
   }
 
   /// Opens a container from any `Read + Seek` byte source, through a
@@ -152,16 +190,53 @@ impl FfmpegDemuxer {
     reader: R,
     filename: Option<&str>,
   ) -> Result<Self, DemuxError> {
-    let (guarded, latch) = GuardedReader::new(reader);
+    Self::open_reader_with(reader, filename, DemuxLimits::default())
+  }
+
+  /// [`Self::open_reader`], with the session's resource budgets named.
+  /// See [`Self::open_with`] for why they are taken at open.
+  pub fn open_reader_with<R: Read + Seek + Send + 'static>(
+    reader: R,
+    filename: Option<&str>,
+    limits: DemuxLimits,
+  ) -> Result<Self, DemuxError> {
+    let (guarded, latch, meter) = GuardedReader::new(reader, limits.max_probe_bytes());
     let io = format::context::StreamIo::from_read_seek(guarded)?;
-    let input = format::input_from_stream(io, filename, None)
-      .map_err(|e| reader_panic(&latch).unwrap_or(DemuxError::Ffmpeg(e)))?;
+    let input =
+      format::input_from_stream(io, filename, Some(probe_options(limits))).map_err(|e| {
+        // Three ways this can fail, and they must not be confused: a
+        // panicked reader, a probe budget reached, or libavformat's own
+        // verdict. The meter is consulted before the errno because
+        // libavformat folds the reader's I/O error into whatever it was
+        // doing at the time — usually "invalid data" — which would
+        // report a refusal this crate made as a malformed file.
+        reader_panic(&latch)
+          .or_else(|| {
+            meter.tripped().then(|| {
+              DemuxError::ProbeBudgetExhausted(ProbeBudgetExhausted::new(
+                meter.read(),
+                meter.budget(),
+              ))
+            })
+          })
+          .unwrap_or(DemuxError::Ffmpeg(e))
+      })?;
+    if meter.tripped() {
+      return Err(DemuxError::ProbeBudgetExhausted(ProbeBudgetExhausted::new(
+        meter.read(),
+        meter.budget(),
+      )));
+    }
+    // Open and analysed: the seat bounds *probing*, and reading the
+    // media itself afterwards is the caller's business, packet by
+    // packet, already bounded by the packet seats.
+    meter.release();
     // A panic libavformat tolerated (a failed probe it recovered from)
     // still poisoned the reader; the session must not open over it.
     if let Some(panicked) = reader_panic(&latch) {
       return Err(panicked);
     }
-    let mut demuxer = Self::from_input(input)?;
+    let mut demuxer = Self::from_input(input, limits)?;
     demuxer.reader_panic = Some(latch);
     Ok(demuxer)
   }
@@ -174,20 +249,94 @@ impl FfmpegDemuxer {
     &self.input
   }
 
-  fn from_input(input: Input) -> Result<Self, DemuxError> {
-    let (tracks, pending) = build_tracks(&input)?;
+  /// The budgets this session was opened with.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn limits(&self) -> DemuxLimits {
+    self.limits
+  }
+
+  fn from_input(input: Input, limits: DemuxLimits) -> Result<Self, DemuxError> {
+    let (tracks, pending) = build_tracks(&input, limits)?;
     Ok(Self {
       input,
       tracks,
       pending,
       eof: false,
       reader_panic: None,
+      limits,
     })
   }
 
   /// The error a panicked reader owes this session, if one panicked.
   fn panicked(&self) -> Option<DemuxError> {
     self.reader_panic.as_deref().and_then(reader_panic)
+  }
+}
+
+/// The libavformat options this crate sets before a container is
+/// opened.
+///
+/// Passed as an `AVDictionary` because that is the only route to these
+/// fields that works for both entrypoints: `avformat_open_input`
+/// applies the dictionary to the context it allocates itself, and the
+/// same names reach the context behind a custom `AVIOContext`.
+///
+/// * `probesize` / `formatprobesize` bound what the format probe and
+///   the stream analysis are allowed to consume;
+/// * `max_streams` bounds the `AVStream` array a header can conjure —
+///   a container claiming a hundred thousand streams is an allocation
+///   this crate's per-track budgets are downstream of.
+fn probe_options(limits: DemuxLimits) -> ffmpeg_next::Dictionary<'static> {
+  let mut options = ffmpeg_next::Dictionary::new();
+  let probe = limits.max_probe_bytes().to_string();
+  options.set("probesize", &probe);
+  options.set("formatprobesize", &probe);
+  options.set("max_streams", &limits.max_streams().to_string());
+  options
+}
+
+/// Payload for [`DemuxError::ProbeBudgetExhausted`].
+///
+/// libavformat wanted more of the file than the probe budget allows.
+///
+/// # What this bounds
+///
+/// This is the only seat in the crate that reaches *behind*
+/// libavformat: `avformat_open_input` and `avformat_find_stream_info`
+/// build the attached picture, the extradata and the coded side data
+/// out of the file themselves, so every budget measuring this crate's
+/// own copies necessarily arrives after those allocations happened.
+///
+/// A parser cannot allocate from bytes it was never handed, so the
+/// input is bounded instead. What is **not** bounded is amplification
+/// inside a parser — a container can describe, in a few bytes, a
+/// structure whose in-memory form is far larger, and nothing outside
+/// libavformat can observe that. Bounding the output of that is the
+/// substrate's own hardening territory; FFmpeg keeps `max_streams`,
+/// `max_index_size` and `max_picture_buffer` for it, and this crate
+/// sets the first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("libavformat read {read} bytes probing the container, over a budget of {budget}")]
+pub struct ProbeBudgetExhausted {
+  read: u64,
+  budget: u64,
+}
+
+impl ProbeBudgetExhausted {
+  /// Constructs a `ProbeBudgetExhausted` payload.
+  #[inline]
+  pub const fn new(read: u64, budget: u64) -> Self {
+    Self { read, budget }
+  }
+  /// Bytes libavformat was handed before the budget was reached.
+  #[inline]
+  pub const fn read(&self) -> u64 {
+    self.read
+  }
+  /// The budget in force.
+  #[inline]
+  pub const fn budget(&self) -> u64 {
+    self.budget
   }
 }
 
@@ -209,7 +358,7 @@ fn reader_panic(latch: &PanicLatch) -> Option<DemuxError> {
 
 impl Demuxer for FfmpegDemuxer {
   type Adapter = Ffmpeg;
-  type Buffer = FfmpegBuffer;
+  type Buffer = FfmpegBytes;
   type Error = DemuxError;
 
   fn tracks(&self) -> &[TrackInfo<Ffmpeg>] {
@@ -220,7 +369,7 @@ impl Demuxer for FfmpegDemuxer {
     mem::take(&mut self.tracks)
   }
 
-  fn next_packet(&mut self) -> Result<Option<DemuxedPacket<Ffmpeg, FfmpegBuffer>>, DemuxError> {
+  fn next_packet(&mut self) -> Result<Option<DemuxedPacket<Ffmpeg, FfmpegBytes>>, DemuxError> {
     // A latched reader panic is terminal, and terminal starts here. The
     // queue is filled at open and owes nothing to the reader, so a pull
     // that drained it would answer `Ok` to a caller the session has
@@ -281,22 +430,22 @@ impl Demuxer for FfmpegDemuxer {
       let built = match info.kind() {
         TrackKind::Video => on_stream(
           index,
-          boundary::video_packet_from_ffmpeg_in(&packet, time_base),
+          boundary::video_packet_from_ffmpeg_in(&packet, time_base, self.limits.packet()),
         )?
         .map(|packet| DemuxedPacket::Video(VideoTrackPacket::new(track, packet))),
         TrackKind::Audio => on_stream(
           index,
-          boundary::audio_packet_from_ffmpeg_in(&packet, time_base),
+          boundary::audio_packet_from_ffmpeg_in(&packet, time_base, self.limits.packet()),
         )?
         .map(|packet| DemuxedPacket::Audio(AudioTrackPacket::new(track, packet))),
         TrackKind::Subtitle => on_stream(
           index,
-          boundary::subtitle_packet_from_ffmpeg_in(&packet, time_base),
+          boundary::subtitle_packet_from_ffmpeg_in(&packet, time_base, self.limits.packet()),
         )?
         .map(|packet| DemuxedPacket::Subtitle(SubtitleTrackPacket::new(track, packet))),
         TrackKind::Data => on_stream(
           index,
-          boundary::data_packet_from_ffmpeg_in(&packet, time_base),
+          boundary::data_packet_from_ffmpeg_in(&packet, time_base, self.limits.packet()),
         )?
         .map(|packet| DemuxedPacket::Data(DataTrackPacket::new(track, packet))),
         // Every attachment track's one packet was queued at open time,
@@ -342,26 +491,185 @@ impl Demuxer for FfmpegDemuxer {
   }
 }
 
-/// Payload for [`DemuxError::AttachmentAlloc`].
+/// Payload for [`DemuxError::AttachmentTooLarge`].
 ///
-/// FFmpeg refused a buffer allocation while capturing an attachment's
-/// payload at open time.
-#[derive(thiserror::Error, Debug, Clone)]
-#[error("out of memory capturing the attachment payload for stream {stream_index}")]
-pub struct AttachmentAlloc {
+/// One attachment's payload exceeds
+/// [`DemuxLimits::max_attachment_bytes`].
+#[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
+#[error(
+  "the attachment on stream {stream_index} is {bytes} bytes, over the {limit}-byte per-attachment budget"
+)]
+pub struct AttachmentTooLarge {
   stream_index: usize,
+  bytes: usize,
+  limit: usize,
 }
 
-impl AttachmentAlloc {
-  /// Constructs an `AttachmentAlloc` payload.
+impl AttachmentTooLarge {
+  /// Constructs an `AttachmentTooLarge` payload.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn new(stream_index: usize) -> Self {
-    Self { stream_index }
+  pub const fn new(stream_index: usize, bytes: usize, limit: usize) -> Self {
+    Self {
+      stream_index,
+      bytes,
+      limit,
+    }
   }
-  /// The `AVStream.index` whose payload could not be captured.
+  /// The `AVStream.index` carrying the oversized attachment.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn stream_index(&self) -> usize {
     self.stream_index
+  }
+  /// The attachment's payload length.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn bytes(&self) -> usize {
+    self.bytes
+  }
+  /// The per-attachment budget in force.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn limit(&self) -> usize {
+    self.limit
+  }
+}
+
+/// Payload for [`DemuxError::AttachmentBudgetExhausted`].
+///
+/// The file's attachments, together, exceed
+/// [`DemuxLimits::max_total_attachment_bytes`].
+///
+/// Separate from [`AttachmentTooLarge`] because it is a different
+/// attack: every attachment can be modest and there can still be four
+/// hundred of them. This arm names the track that ran the total past
+/// the line, not the track that was individually at fault — there
+/// need not be one.
+#[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
+#[error(
+  "the attachment on stream {stream_index} brings the file's attachments to {total} bytes, over the {limit}-byte budget"
+)]
+pub struct AttachmentBudgetExhausted {
+  stream_index: usize,
+  total: usize,
+  limit: usize,
+}
+
+impl AttachmentBudgetExhausted {
+  /// Constructs an `AttachmentBudgetExhausted` payload.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(stream_index: usize, total: usize, limit: usize) -> Self {
+    Self {
+      stream_index,
+      total,
+      limit,
+    }
+  }
+  /// The `AVStream.index` whose attachment crossed the line.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn stream_index(&self) -> usize {
+    self.stream_index
+  }
+  /// The running total, including this attachment.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn total(&self) -> usize {
+    self.total
+  }
+  /// The whole-file budget in force.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn limit(&self) -> usize {
+    self.limit
+  }
+}
+
+/// Payload for [`DemuxError::ParametersTooLarge`].
+///
+/// One stream's codec parameters hold more heap bytes than
+/// [`DemuxLimits::max_codec_parameter_bytes`] allows.
+///
+/// The bytes are `extradata` plus every `coded_side_data` entry plus a
+/// custom channel map — the three seats `AVCodecParameters` reaches the
+/// heap through. A MOV `prof` atom lands in the second of those as an
+/// ICC profile, which is where the honest large values live and where
+/// the forged ones do too.
+#[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
+#[error(
+  "the codec parameters on stream {stream_index} hold {bytes} heap bytes, over the {limit}-byte budget"
+)]
+pub struct ParametersTooLarge {
+  stream_index: usize,
+  bytes: usize,
+  limit: usize,
+}
+
+impl ParametersTooLarge {
+  /// Constructs a `ParametersTooLarge` payload.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(stream_index: usize, bytes: usize, limit: usize) -> Self {
+    Self {
+      stream_index,
+      bytes,
+      limit,
+    }
+  }
+  /// The `AVStream.index` whose parameters were refused.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn stream_index(&self) -> usize {
+    self.stream_index
+  }
+  /// The heap bytes the parameters declared.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn bytes(&self) -> usize {
+    self.bytes
+  }
+  /// The budget in force.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn limit(&self) -> usize {
+    self.limit
+  }
+}
+
+/// Payload for [`DemuxError::ParametersBudgetExhausted`].
+///
+/// Every stream's codec parameters, together, hold more heap bytes than
+/// [`DemuxLimits::max_total_codec_parameter_bytes`] allows.
+///
+/// A separate attack from [`ParametersTooLarge`], and separate for the
+/// same reason the attachment pair are: each stream's parameters can be
+/// individually modest and a container can still declare two hundred
+/// streams. The arm names the stream that ran the total past the line,
+/// which need not be one that was individually at fault.
+#[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
+#[error(
+  "the codec parameters on stream {stream_index} bring the file's to {total} heap bytes, over the {limit}-byte budget"
+)]
+pub struct ParametersBudgetExhausted {
+  stream_index: usize,
+  total: usize,
+  limit: usize,
+}
+
+impl ParametersBudgetExhausted {
+  /// Constructs a `ParametersBudgetExhausted` payload.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(stream_index: usize, total: usize, limit: usize) -> Self {
+    Self {
+      stream_index,
+      total,
+      limit,
+    }
+  }
+  /// The `AVStream.index` whose parameters crossed the line.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn stream_index(&self) -> usize {
+    self.stream_index
+  }
+  /// The running total, including this stream.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn total(&self) -> usize {
+    self.total
+  }
+  /// The whole-file budget in force.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn limit(&self) -> usize {
+    self.limit
   }
 }
 
@@ -524,10 +832,32 @@ pub enum DemuxError {
   #[error(transparent)]
   Ffmpeg(#[from] ffmpeg_next::Error),
 
-  /// FFmpeg refused a buffer allocation while capturing an
-  /// attachment's payload at open time.
+  /// libavformat asked for more bytes than the probe budget allows
+  /// while opening and analysing the container. See
+  /// [`ProbeBudgetExhausted`].
   #[error(transparent)]
-  AttachmentAlloc(#[from] AttachmentAlloc),
+  ProbeBudgetExhausted(#[from] ProbeBudgetExhausted),
+
+  /// One attachment's payload is over the per-attachment budget.
+  /// Refused at open, before the copy.
+  #[error(transparent)]
+  AttachmentTooLarge(#[from] AttachmentTooLarge),
+
+  /// The file's attachments, together, are over the whole-file budget.
+  /// Refused at open, before the copy that would have crossed it.
+  #[error(transparent)]
+  AttachmentBudgetExhausted(#[from] AttachmentBudgetExhausted),
+
+  /// One stream's codec parameters hold more heap bytes than the
+  /// budget allows. Refused at open, before the clone.
+  #[error(transparent)]
+  ParametersTooLarge(#[from] ParametersTooLarge),
+
+  /// Every stream's codec parameters together are over the whole-file
+  /// budget. Refused at open, before the clone that would have crossed
+  /// it.
+  #[error(transparent)]
+  ParametersBudgetExhausted(#[from] ParametersBudgetExhausted),
 
   /// Codec parameters arrived that were never allocated.
   #[error(transparent)]
@@ -561,11 +891,17 @@ type BuiltTracks = (
   Vec<TrackInfo<Ffmpeg>>,
   VecDeque<(
     TrackIndex,
-    AttachmentPacket<AttachmentPacketExtra, FfmpegBuffer>,
+    AttachmentPacket<AttachmentPacketExtra, FfmpegBytes>,
   )>,
 );
 
-fn build_tracks(input: &Input) -> Result<BuiltTracks, DemuxError> {
+fn build_tracks(input: &Input, limits: DemuxLimits) -> Result<BuiltTracks, DemuxError> {
+  // **Admission before allocation.** Every attachment in the file is
+  // judged here, in full, before the loop below allocates anything at
+  // all — see [`admit_streams`] for why the charge cannot live
+  // inside the capture.
+  admit_streams(input, limits)?;
+
   let count = input.streams().len();
   let mut tracks = Vec::with_capacity(count);
   let mut pending = VecDeque::new();
@@ -587,11 +923,16 @@ fn build_tracks(input: &Input) -> Result<BuiltTracks, DemuxError> {
     let par = unsafe { parameters.as_ptr() };
     // Never read `AVCodecParameters.codec_type` / `.codec_id` as their
     // bindgen enums: a value outside this build's discriminant set is
-    // UB the moment it exists. The medium goes through `Parameters`
-    // (which does construct the enum, but only from
-    // `AVMediaType`'s tiny, stable set) and the codec id is read as the
-    // raw integer it is on the wire.
-    let medium = parameters.medium();
+    // UB the moment it exists. Both are read as the raw integers they
+    // are on the wire — the medium through [`boundary::media_kind_of`],
+    // which folds anything unnamed into `Unknown`.
+    //
+    // The medium used to go through `Parameters::medium()` on the
+    // argument that `AVMediaType`'s set is tiny and stable. It is; that
+    // made the read unlikely to bite, not sound. The exception is gone
+    // rather than defended, so no attacker-reachable path in this crate
+    // forms a bindgen enum out of FFmpeg memory.
+    let medium = boundary::media_kind_of(&parameters);
     let codec =
       CodecId::from_raw(unsafe { read_unaligned(addr_of!((*par).codec_id).cast::<i32>()) });
 
@@ -612,14 +953,14 @@ fn build_tracks(input: &Input) -> Result<BuiltTracks, DemuxError> {
       TrackParams::Attachment(AttachmentTrackParams::new(codec))
     } else {
       match medium {
-        media::Type::Video => TrackParams::Video(VideoTrackParams::new(
+        boundary::MediaKind::Video => TrackParams::Video(VideoTrackParams::new(
           codec,
           unsafe { (*par).width }.max(0) as u32,
           unsafe { (*par).height }.max(0) as u32,
           boundary::from_av_pixel_format(unsafe { (*par).format }),
           rate_to_timebase(stream.avg_frame_rate()),
         )),
-        media::Type::Audio => {
+        boundary::MediaKind::Audio => {
           let ch_layout = unsafe { std::ptr::addr_of!((*par).ch_layout) };
           // SAFETY: `par` is a live `*const AVCodecParameters` for the
           // life of `parameters`; the helper validates `order` as an
@@ -634,20 +975,51 @@ fn build_tracks(input: &Input) -> Result<BuiltTracks, DemuxError> {
             channel_layout,
           ))
         }
-        media::Type::Subtitle => TrackParams::Subtitle(SubtitleTrackParams::new(codec)),
-        media::Type::Data => TrackParams::Data(DataTrackParams::new(codec)),
-        media::Type::Attachment => TrackParams::Attachment(AttachmentTrackParams::new(codec)),
-        media::Type::Unknown => TrackParams::Unknown(UnknownTrackParams::new(codec)),
+        boundary::MediaKind::Subtitle => TrackParams::Subtitle(SubtitleTrackParams::new(codec)),
+        boundary::MediaKind::Data => TrackParams::Data(DataTrackParams::new(codec)),
+        boundary::MediaKind::Attachment => {
+          TrackParams::Attachment(AttachmentTrackParams::new(codec))
+        }
+        boundary::MediaKind::Unknown => TrackParams::Unknown(UnknownTrackParams::new(codec)),
       }
     };
 
-    let extra = TrackExtra::new(
-      index as i32,
-      crate::extras::clone_parameters(&parameters, index)?,
-    )?
-    .with_disposition(disposition)
-    .with_start_time((raw_start != AV_NOPTS_VALUE).then_some(raw_start))
-    .with_frame_count((frames > 0).then_some(frames));
+    // The parameter copy. For an `AVMEDIA_TYPE_ATTACHMENT` stream its
+    // `extradata` **is** the attachment's payload — the same bytes the
+    // carrier below already holds — so it is left behind rather than
+    // copied. Censused before it was: nothing can use it. libavcodec
+    // has no decoder for a font (`avcodec_find_decoder` answers null
+    // for `AV_CODEC_ID_TTF` and its siblings), so no road in this crate
+    // or downstream of it opens a codec context from these parameters;
+    // the payload reaches a consumer as the attachment packet, which is
+    // the delivery the demux tier promises.
+    //
+    // **Omitted, not stripped.** An earlier shape copied the extradata
+    // and freed it immediately afterwards, which allocated the payload
+    // for no reason and — worse — charged it against the *parameter*
+    // ceiling on the way past. A font between the two ceilings passed
+    // the admission pass and then failed inside the clone. See
+    // [`ExtradataPolicy`](crate::extras::ExtradataPolicy).
+    //
+    // Cover art keeps its extradata: there the payload is the parked
+    // `AVPacket`, extradata is *not* a copy of it, and a still codec
+    // can legitimately need it (MJPEG with an external Huffman table).
+    // Measured on this build: a cover-art stream carries none anyway.
+    let extradata_policy = if medium.is_attachment() {
+      crate::extras::ExtradataPolicy::Omit
+    } else {
+      crate::extras::ExtradataPolicy::Copy
+    };
+    let parameters_copy = crate::extras::bounded_clone_parameters_with(
+      &parameters,
+      index,
+      limits.max_codec_parameter_bytes(),
+      extradata_policy,
+    )?;
+    let extra = TrackExtra::new(index as i32, parameters_copy)?
+      .with_disposition(disposition)
+      .with_start_time((raw_start != AV_NOPTS_VALUE).then_some(raw_start))
+      .with_frame_count((frames > 0).then_some(frames));
 
     // SAFETY: `stream` keeps the `AVStream` — and so its metadata
     // dictionary — live across both reads. The dictionary is read
@@ -672,9 +1044,9 @@ fn build_tracks(input: &Input) -> Result<BuiltTracks, DemuxError> {
         // value, and `addr_of!` reaches it without forming a reference
         // to the stream.
         let pkt = unsafe { std::ptr::addr_of!((*stream.as_ptr()).attached_pic) };
-        unsafe { attached_pic_payload(pkt, index) }?
+        unsafe { attached_pic_payload(pkt, index, limits) }?
       } else {
-        extradata_payload(&stream)?
+        extradata_payload(&stream, limits)?
       };
       pending.push_back((TrackIndex::new(index), packet));
     }
@@ -811,9 +1183,16 @@ unsafe fn metadata_text(dict: *const AVDictionary, key: &CStr) -> Option<SmolStr
 unsafe fn attached_pic_payload(
   pkt: *const ffmpeg_next::ffi::AVPacket,
   index: usize,
-) -> Result<AttachmentPacket<AttachmentPacketExtra, FfmpegBuffer>, DemuxError> {
+  limits: DemuxLimits,
+) -> Result<AttachmentPacket<AttachmentPacketExtra, FfmpegBytes>, DemuxError> {
+  // Already admitted: [`admit_streams`] charged this payload — and
+  // every other attachment in the file — before `build_tracks`
+  // allocated anything. The per-attachment budget is passed down as
+  // this packet's own ceiling anyway, so the funnel is guarded even if
+  // a future caller reaches it without the admission pass.
+  //
   // SAFETY: `pkt` is live per the contract above.
-  let captured = unsafe { crate::buffer::payload_of(pkt) }
+  let captured = unsafe { crate::buffer::payload_of(pkt, limits.max_attachment_bytes()) }
     .map_err(|source| DemuxError::PacketBuffer(PacketBuffer::new(index, source)))?;
   let extra = AttachmentPacketExtra::new(index as i32);
   Ok(match captured {
@@ -830,11 +1209,7 @@ unsafe fn attached_pic_payload(
     }
     // Nothing was parked, so there are no flags to read: an empty set
     // is the honest answer for a packet this layer invented.
-    None => AttachmentPacket::new(
-      FfmpegBuffer::copy_from_slice(&[])
-        .ok_or(DemuxError::AttachmentAlloc(AttachmentAlloc::new(index)))?,
-      extra.with_synthesized(true),
-    ),
+    None => AttachmentPacket::new(FfmpegBytes::empty(), extra.with_synthesized(true)),
   })
 }
 
@@ -848,7 +1223,8 @@ unsafe fn attached_pic_payload(
 /// file. Only an allocation failure is an error.
 fn extradata_payload(
   stream: &ffmpeg_next::format::stream::Stream<'_>,
-) -> Result<AttachmentPacket<AttachmentPacketExtra, FfmpegBuffer>, DemuxError> {
+  limits: DemuxLimits,
+) -> Result<AttachmentPacket<AttachmentPacketExtra, FfmpegBytes>, DemuxError> {
   let index = stream.index();
   let parameters = stream.parameters();
   // SAFETY: `parameters` keeps the `AVCodecParameters` live;
@@ -856,6 +1232,16 @@ fn extradata_payload(
   let par = unsafe { parameters.as_ptr() };
   let ptr = unsafe { (*par).extradata };
   let len = unsafe { (*par).extradata_size }.max(0) as usize;
+  // Already admitted, exactly as on the hoisted cover-art path — see
+  // [`admit_streams`]. Re-judged here against the per-attachment
+  // ceiling alone, so the helper is safe to call on its own.
+  if len > limits.max_attachment_bytes() {
+    return Err(DemuxError::AttachmentTooLarge(AttachmentTooLarge::new(
+      index,
+      len,
+      limits.max_attachment_bytes(),
+    )));
+  }
   let bytes: &[u8] = if ptr.is_null() || len == 0 {
     &[]
   } else {
@@ -864,12 +1250,188 @@ fn extradata_payload(
     // live, and the slice is consumed before this function returns.
     unsafe { std::slice::from_raw_parts(ptr, len) }
   };
-  let payload = FfmpegBuffer::copy_from_slice(bytes)
-    .ok_or(DemuxError::AttachmentAlloc(AttachmentAlloc::new(index)))?;
   Ok(AttachmentPacket::new(
-    payload,
+    FfmpegBytes::copy_from_slice(bytes),
     AttachmentPacketExtra::new(index as i32).with_synthesized(true),
   ))
+}
+
+/// **The admission pass**: judges every stream in the file before the
+/// track table allocates anything at all.
+///
+/// # Why this cannot live inside the capture
+///
+/// It used to, and that was a bypass. `build_tracks` deep-copies each
+/// stream's `AVCodecParameters` on its way to building a `TrackExtra`,
+/// and for an `AVMEDIA_TYPE_ATTACHMENT` stream **the extradata inside
+/// those parameters is the attachment's payload**. So the loop paid for
+/// the payload — a full `avcodec_parameters_copy` — one statement
+/// before asking whether it was allowed to. A file declaring a gigabyte
+/// of "font" allocated the gigabyte and then reported that a gigabyte
+/// was too much.
+///
+/// The fix is not a check moved a few lines earlier: any per-track
+/// interleaving of judging and paying has the same shape, because the
+/// aggregate budget is only knowable once every track has been *seen*.
+/// So the whole file is admitted here, in a pass that allocates
+/// nothing — it reads two integers per stream — and only a container
+/// that passes in full reaches the loop that builds carriers and
+/// parameter copies.
+///
+/// # Why it is every stream, not every attachment
+///
+/// Because the track table copies **every** stream's codec parameters,
+/// and `AVCodecParameters` reaches the heap three ways — `extradata`,
+/// every `coded_side_data` entry, a custom channel map — all of them
+/// sized by the file. A pass that walked only attachment streams left
+/// the other road wide open: a MOV puts an ICC profile in
+/// `coded_side_data`, on an ordinary video track, and the wholesale
+/// copy took it before anything asked how big it was. That was the same
+/// class of defect three review rounds running, which is why the copy
+/// itself is gone (see
+/// [`bounded_clone_parameters`](crate::extras::bounded_clone_parameters))
+/// and why this pass sees everything.
+///
+/// # What is charged
+///
+/// The bytes this session will **retain**, which is not always the
+/// declared size:
+///
+/// - every stream is charged its parameter clone's footprint against
+///   the per-stream and whole-file codec-parameter budgets;
+/// - a synthesized attachment's `extradata` is charged to the
+///   *attachment* budget and left out of the parameter one, because the
+///   clone strips it and the carrier holds it — one set of bytes, one
+///   charge;
+/// - the attachment budgets then see:
+///
+/// - a hoisted cover-art track retains its parked `AVPacket`'s payload
+///   *and* the extradata in its parameter copy, which the still decoder
+///   may need and which is not a duplicate of the payload;
+/// - a synthesized `AVMEDIA_TYPE_ATTACHMENT` track retains only the
+///   carrier, because `build_tracks` strips the duplicate extradata out
+///   of the parameter copy (see the comment there for the census).
+///
+/// Charging residency rather than payload is what keeps the budget an
+/// honest statement about memory instead of about file structure.
+///
+/// The per-attachment ceiling is judged first for each track: when a
+/// single payload is itself over the line, that is the more specific
+/// fact, and naming the aggregate instead would send a reader looking
+/// for four hundred attachments that are not there.
+fn admit_streams(input: &Input, limits: DemuxLimits) -> Result<(), DemuxError> {
+  let mut attachment_spent: usize = 0;
+  let mut parameter_spent: usize = 0;
+
+  for stream in input.streams() {
+    let index = stream.index();
+    let parameters = stream.parameters();
+    // SAFETY: `parameters` keeps the `AVCodecParameters` live for this
+    // measurement, which allocates nothing and dereferences only what
+    // it counts.
+    let par = unsafe { parameters.as_ptr() };
+    if par.is_null() {
+      return Err(DemuxError::ParametersMissing(ParametersMissing::new(index)));
+    }
+    let footprint =
+      unsafe { crate::extras::measure_parameters(par) }.ok_or(DemuxError::ParametersTooLarge(
+        ParametersTooLarge::new(index, usize::MAX, limits.max_codec_parameter_bytes()),
+      ))?;
+
+    // SAFETY: `stream` keeps the `AVStream` live; `disposition` is a
+    // public field.
+    let disposition = unsafe { (*stream.as_ptr()).disposition };
+    let cover_art = is_attachment_disposition(disposition);
+    let synthesized = !cover_art && boundary::media_kind_of(&parameters).is_attachment();
+
+    // What the *parameter clone* will retain for this stream. The
+    // synthesized-attachment road strips `extradata` — the font's
+    // payload rides the carrier instead — so counting it here would
+    // charge the same bytes twice and make the budget a statement about
+    // the file rather than about memory.
+    let retained_parameters = if synthesized {
+      footprint.total_without_extradata()
+    } else {
+      footprint.total()
+    }
+    .ok_or(DemuxError::ParametersTooLarge(ParametersTooLarge::new(
+      index,
+      usize::MAX,
+      limits.max_codec_parameter_bytes(),
+    )))?;
+
+    if retained_parameters > limits.max_codec_parameter_bytes() {
+      return Err(DemuxError::ParametersTooLarge(ParametersTooLarge::new(
+        index,
+        retained_parameters,
+        limits.max_codec_parameter_bytes(),
+      )));
+    }
+    parameter_spent = parameter_spent.saturating_add(retained_parameters);
+    if parameter_spent > limits.max_total_codec_parameter_bytes() {
+      return Err(DemuxError::ParametersBudgetExhausted(
+        ParametersBudgetExhausted::new(
+          index,
+          parameter_spent,
+          limits.max_total_codec_parameter_bytes(),
+        ),
+      ));
+    }
+
+    // And what the *carrier* will hold, for the two attachment roads.
+    let carrier = if cover_art {
+      // SAFETY: `attached_pic` is an `AVPacket` embedded in the
+      // `AVStream` by value; `addr_of!` reaches its `size` without
+      // forming a reference to the stream.
+      unsafe {
+        let pkt = std::ptr::addr_of!((*stream.as_ptr()).attached_pic);
+        (*pkt).size
+      }
+      .max(0) as usize
+    } else if synthesized {
+      // The **payload**, not the padded clone figure. The carrier is
+      // an `FfmpegBytes` over exactly these bytes and the clone omits
+      // extradata entirely on this road, so nothing here allocates the
+      // padding — charging it would bill sixty-four bytes that are
+      // never spent, reject a payload in the last sixty-four below the
+      // ceiling, and disagree with the image road about the same file
+      // at exactly the cap.
+      footprint.extradata_payload()
+    } else {
+      // Not an attachment: nothing is captured eagerly for it, so
+      // nothing more is charged.
+      continue;
+    };
+
+    charge_attachment(index, carrier, limits, &mut attachment_spent)?;
+  }
+  Ok(())
+}
+
+/// Charges `declared` bytes against both attachment budgets, refusing
+/// before anything is copied. The one place a file's attachment
+/// spending is decided; see [`admit_streams`] for when it runs.
+fn charge_attachment(
+  index: usize,
+  declared: usize,
+  limits: DemuxLimits,
+  spent: &mut usize,
+) -> Result<(), DemuxError> {
+  if declared > limits.max_attachment_bytes() {
+    return Err(DemuxError::AttachmentTooLarge(AttachmentTooLarge::new(
+      index,
+      declared,
+      limits.max_attachment_bytes(),
+    )));
+  }
+  let total = spent.saturating_add(declared);
+  if total > limits.max_total_attachment_bytes() {
+    return Err(DemuxError::AttachmentBudgetExhausted(
+      AttachmentBudgetExhausted::new(index, total, limits.max_total_attachment_bytes()),
+    ));
+  }
+  *spent = total;
+  Ok(())
 }
 
 /// A stream's `AVRational` timebase as a [`Timebase`]. A zero or
@@ -1028,7 +1590,7 @@ mod tests {
           "the source allocates before the cap goes on",
         );
         crate::fault_subprocess::cap_ffmpeg_allocations(1);
-        let refused = crate::extras::clone_parameters(&source, 4);
+        let refused = crate::extras::bounded_clone_parameters(&source, 4, usize::MAX);
         crate::fault_subprocess::uncap_ffmpeg_allocations();
         assert!(
           matches!(
@@ -1040,7 +1602,7 @@ mod tests {
         );
         // And with the cap lifted the same copy succeeds, so the
         // refusal was the allocator's answer and not a broken helper.
-        crate::extras::clone_parameters(&source, 4).expect("an uncapped copy");
+        crate::extras::bounded_clone_parameters(&source, 4, usize::MAX).expect("an uncapped copy");
       },
     );
   }
@@ -1059,7 +1621,7 @@ mod tests {
         assert!(!unsafe { source.as_ptr() }.is_null(), "allocated uncapped");
         let extra = TrackExtra::new(
           6,
-          crate::extras::clone_parameters(&source, 6).expect("uncapped"),
+          crate::extras::bounded_clone_parameters(&source, 6, usize::MAX).expect("uncapped"),
         )
         .expect("real parameters");
 
@@ -1123,7 +1685,7 @@ mod tests {
           p
         };
         assert!(matches!(
-          crate::extras::clone_parameters(&never_allocated, 9).map(|_| ()),
+          crate::extras::bounded_clone_parameters(&never_allocated, 9, usize::MAX).map(|_| ()),
           Err(DemuxError::ParametersMissing(p)) if p.stream_index() == 9,
         ));
 
@@ -1185,14 +1747,14 @@ mod tests {
         // Big enough for the destination `AVCodecParameters`, far too
         // small for its extradata.
         crate::fault_subprocess::cap_ffmpeg_allocations(64 * 1024);
-        let refused = crate::extras::clone_parameters(&source, 2);
+        let refused = crate::extras::bounded_clone_parameters(&source, 2, usize::MAX);
         crate::fault_subprocess::uncap_ffmpeg_allocations();
         match refused {
           Err(DemuxError::ParametersCopy(p)) => assert_eq!(p.stream_index(), 2),
           Err(other) => panic!("expected ParametersCopy, got {other:?}"),
           Ok(_) => panic!("a copy that could not copy the extradata must not succeed"),
         }
-        crate::extras::clone_parameters(&source, 2).expect("an uncapped copy");
+        crate::extras::bounded_clone_parameters(&source, 2, usize::MAX).expect("an uncapped copy");
       },
     );
   }
@@ -1242,7 +1804,7 @@ mod tests {
     // fills it in the same call. A zeroed `AVPacket` is exactly what
     // `attached_pic` would hold if one ever did not.
     let empty: ffmpeg_next::ffi::AVPacket = unsafe { std::mem::zeroed() };
-    let packet = unsafe { attached_pic_payload(&empty, 7) }
+    let packet = unsafe { attached_pic_payload(&empty, 7, DemuxLimits::default()) }
       .expect("an unparked cover is a degenerate track, not an unreadable file");
     assert!(packet.data().as_ref().is_empty());
     assert!(

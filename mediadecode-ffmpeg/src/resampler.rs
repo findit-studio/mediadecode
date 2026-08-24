@@ -43,10 +43,13 @@ use mediadecode::{
 };
 use mediaframe::audio::ChannelLayoutDescription;
 
-use crate::{Error, Ffmpeg, FfmpegBuffer, extras::AudioFrameExtra, sample_format::SampleFormat};
+use crate::{
+  Error, Ffmpeg, buffer::FfmpegBytes, extras::AudioFrameExtra, limits::FrameLimits,
+  sample_format::SampleFormat,
+};
 
 /// The frame type [`FfmpegResampler`] accepts and produces.
-type Frame = AudioFrame<SampleFormat, ChannelLayoutDescription, AudioFrameExtra, FfmpegBuffer>;
+type Frame = AudioFrame<SampleFormat, ChannelLayoutDescription, AudioFrameExtra, FfmpegBytes>;
 
 /// One end of a conversion: sample rate, sample format, channel layout.
 ///
@@ -104,7 +107,7 @@ impl ResampleSpec {
     if unsafe { parameters.as_ptr() }.is_null() {
       return None;
     }
-    if parameters.medium() != ffmpeg_next::media::Type::Audio {
+    if !crate::boundary::media_kind_of(parameters).is_audio() {
       return None;
     }
     // SAFETY: `parameters` keeps the `AVCodecParameters` live; every
@@ -241,6 +244,10 @@ pub struct FfmpegResampler {
   /// first input frame anchors it.
   next_pts: Option<i64>,
   eof: bool,
+  /// What one converted frame may cost. See
+  /// [`Self::check_output_bytes`] for why a resampler needs a ceiling
+  /// of its own even when its input already had one.
+  limits: FrameLimits,
 }
 
 impl FfmpegResampler {
@@ -265,7 +272,21 @@ impl FfmpegResampler {
   /// - `AV_SAMPLE_FMT_NONE` ([`ResampleError::UnsupportedFormat`]);
   /// - a channel layout that is neither native nor unspecified, or one
   ///   naming no channels ([`ResampleError::UnsupportedLayout`]).
-  pub fn new(source: ResampleSpec, target: ResampleSpec) -> Result<Self, ResampleError> {
+  ///
+  /// `limits` bounds what one **converted** frame may cost.
+  ///
+  /// [`FrameLimits`] rather than a seat of this seam's own: the
+  /// quantity is bytes of one produced audio frame, which is exactly
+  /// what [`FrameLimits::max_frame_bytes`] means everywhere else in
+  /// this crate, and one number for "what a frame may cost" is worth
+  /// more than a second vocabulary. [`FrameLimits::max_pixels`] is
+  /// unused here, as it is on the audio decode path, and for the same
+  /// reason: audio has no pixels.
+  pub fn new(
+    source: ResampleSpec,
+    target: ResampleSpec,
+    limits: FrameLimits,
+  ) -> Result<Self, ResampleError> {
     check_spec(&source, SpecEnd::Source)?;
     check_spec(&target, SpecEnd::Target)?;
 
@@ -306,6 +327,7 @@ impl FfmpegResampler {
       ready: VecDeque::new(),
       next_pts: None,
       eof: false,
+      limits,
     })
   }
 
@@ -398,7 +420,8 @@ impl FfmpegResampler {
     // What the *format* requires, not what the allocated frame reports
     // — the frame does not exist yet.
     let planes = if self.source.format.is_planar() {
-      channels.max(0) as usize
+      // `check_spec` proved this positive at construction.
+      channels as usize
     } else {
       1
     };
@@ -472,6 +495,56 @@ impl FfmpegResampler {
     Ok(samples.max(1) as usize)
   }
 
+  /// Refuses a conversion whose output would not fit the frame ceiling.
+  ///
+  /// # Why a resampler needs one even though its input had one
+  ///
+  /// [`Self::output_capacity`] bounds the output **sample count**, and
+  /// only at `i32::MAX` — the structural limit of
+  /// `av_frame_get_buffer`. Nothing in it bounds the *bytes*, and the
+  /// two are related by a ratio the caller does not control: the
+  /// capacity is `input_samples × target_rate / source_rate`, and a
+  /// source spec read off an untrusted container can say 1 Hz. One
+  /// second of 1 Hz mono input converted to 48 kHz stereo `f32` is
+  /// 384 KiB from 4 bytes — and the same input against a 1 Hz source
+  /// claim and a 192 kHz target is multi-gigabyte. The frame that
+  /// arrived was within *its* ceiling; the frame that leaves need not
+  /// be, so it gets its own judgement.
+  ///
+  /// Both allocations are covered: `av_frame_get_buffer`'s, and the
+  /// [`FfmpegBytes`] copy [`Self::finish_output`] makes from it.
+  fn check_output_bytes(&self, capacity: usize, channels: i32) -> Result<(), ResampleError> {
+    // **Priced as the allocator prices it, not as the samples weigh.**
+    // This used to multiply the tight plane length by the plane count,
+    // which is the payload's arithmetic and not
+    // `av_frame_get_buffer`'s: a one-sample eight-channel planar `s16`
+    // frame is 16 bytes of samples and a **768-byte** allocation,
+    // because every plane is aligned and padded on its own. A 16-byte
+    // ceiling admitted it.
+    //
+    // The overhead is under one percent on any frame big enough to
+    // care about, which is exactly why this went unseen — see
+    // [`crate::footprint`] for the measured table and for the rule the
+    // whole crate now keeps: a judge must dominate the allocator's
+    // arithmetic, not the payload's.
+    let bytes = crate::footprint::audio_frame_bytes(
+      ffmpeg_next::ffi::AVSampleFormat::from(self.target.format) as libc::c_int,
+      capacity,
+      channels.max(0) as usize,
+    )
+    .ok_or(ResampleError::OutputTooLarge(OutputTooLarge::new(
+      usize::MAX,
+      self.limits.max_frame_bytes(),
+    )))?;
+    if bytes > self.limits.max_frame_bytes() {
+      return Err(ResampleError::OutputTooLarge(OutputTooLarge::new(
+        bytes,
+        self.limits.max_frame_bytes(),
+      )));
+    }
+    Ok(())
+  }
+
   /// Refuses a conversion whose output could not be labelled: the
   /// timeline plus everything this call might produce has to stay
   /// inside `i64`.
@@ -491,8 +564,8 @@ impl FfmpegResampler {
     Ok(())
   }
 
-  /// Allocates the output frame **and acquires every reference the
-  /// converted frame will need**, before `swr` is allowed to touch a
+  /// Allocates the output frame **and proves every plane the converted
+  /// frame will be read out of**, before `swr` is allowed to touch a
   /// sample.
   ///
   /// This is the shape the whole seam is built around. Anything
@@ -502,24 +575,26 @@ impl FfmpegResampler {
   /// either way. The failure kept relocating — the timestamp addition,
   /// the tail drain, then the output wrapping — so the fix is not
   /// another check in another place but an ordering that leaves nothing
-  /// on the far side: the frame, one refcounted view per plane, a
-  /// placeholder for every unused slot, and the queue slot are all
-  /// taken here, where failing costs nothing but an error.
+  /// on the far side: the frame, every plane pointer it will be read
+  /// through, and the queue slot are all taken here, where failing
+  /// costs nothing but an error.
   ///
-  /// The views are taken at the frame's **full capacity** and trimmed
-  /// afterwards to what `swr` produced ([`FfmpegBuffer::shrink_to`],
-  /// which only ever narrows), so the trimming needs no allocation and
-  /// cannot fail either.
+  /// **What 0.9 changed, and what it did not.** Through 0.8 this
+  /// function also *acquired* one `AVBufferRef` view per plane, because
+  /// wrapping a plane could fail and so had to happen on this side of
+  /// the conversion; [`Self::finish_output`] then narrowed each view to
+  /// what `swr` produced. The amputation removes the views — the output
+  /// planes are copied out afterwards instead — and with them the
+  /// failure that forced the acquisition to be early. What stays early
+  /// is the *proof*: every plane pointer is checked non-null and
+  /// checked to address `plane_len` bytes inside one of the frame's own
+  /// buffers here, so the copy on the far side has nothing left to
+  /// judge and [`Self::finish_output`] remains infallible.
   fn prepare_output(&self, capacity: usize) -> Result<PreparedOutput, ResampleError> {
-    let frame = new_audio_frame(
-      self.target.format,
-      capacity,
-      self.target.rate,
-      self.staged_target_layout,
-    )?;
     let channels = self.target.channels();
     let plane_count = if self.target.format.is_planar() {
-      channels.max(0) as usize
+      // `check_spec` proved this positive at construction.
+      channels as usize
     } else {
       1
     };
@@ -529,6 +604,20 @@ impl FfmpegResampler {
     // trim be a multiplication rather than another fallible call.
     let per_sample = plane_bytes(self.target.format, 1, channels)
       .ok_or(ResampleError::SampleCount(SampleCount::new(1)))?;
+
+    // **The byte ceiling, before `av_frame_get_buffer` and before the
+    // carrier copy that follows it.** Measured first, allocated second:
+    // the three quantities above are arithmetic over the target spec
+    // and cost nothing, so there is no reason for the frame to exist
+    // before the answer does.
+    self.check_output_bytes(capacity, channels)?;
+
+    let frame = new_audio_frame(
+      self.target.format,
+      capacity,
+      self.target.rate,
+      self.staged_target_layout,
+    )?;
     if frame.planes() < plane_count {
       return Err(ResampleError::PlaneCount(PlaneCount::new(
         plane_count,
@@ -536,34 +625,27 @@ impl FfmpegResampler {
       )));
     }
 
-    let mut buffers: [Option<FfmpegBuffer>; 8] = [const { None }; 8];
-    for (index, slot) in buffers.iter_mut().enumerate() {
-      *slot = Some(if index < plane_count {
-        // SAFETY: `frame` owns a live `AVFrame` this call just
-        // allocated; `data` is a public field and `plane_count` is
-        // within the eight slots `data` has.
-        let data_ptr = unsafe { (*frame.as_ptr()).data[index] };
-        if data_ptr.is_null() {
-          return Err(ResampleError::OutputBuffer(OutputBuffer::new(index)));
-        }
-        // SAFETY: the frame is live, and the helper only reads
-        // `buf[]`'s ranges to find the one containing `data_ptr`.
-        let buf =
-          unsafe { crate::convert::find_audio_backing_buffer(frame.as_ptr(), data_ptr, plane_len) }
-            .ok_or(ResampleError::OutputBuffer(OutputBuffer::new(index)))?;
-        // SAFETY: `buf` is non-null and live, and the helper proved the
-        // view lies inside it.
-        let offset = unsafe { (data_ptr as usize).wrapping_sub((*buf).data as usize) };
-        unsafe { FfmpegBuffer::from_ref_view(buf, offset, plane_len) }
-          .ok_or(ResampleError::OutputBuffer(OutputBuffer::new(index)))?
-      } else {
-        FfmpegBuffer::try_empty().ok_or(ResampleError::OutputBuffer(OutputBuffer::new(index)))?
-      });
+    let mut planes: [*const u8; 8] = [core::ptr::null(); 8];
+    for (index, slot) in planes.iter_mut().enumerate().take(plane_count) {
+      // SAFETY: `frame` owns a live `AVFrame` this call just
+      // allocated; `data` is a public field and `plane_count` is
+      // within the eight slots `data` has.
+      let data_ptr = unsafe { (*frame.as_ptr()).data[index] };
+      if data_ptr.is_null() {
+        return Err(ResampleError::OutputBuffer(OutputBuffer::new(index)));
+      }
+      // SAFETY: the frame is live, and the helper only reads `buf[]`'s
+      // ranges to find the one containing `data_ptr`. Proving it here
+      // is what lets the copy on the far side of the conversion be
+      // unconditional.
+      unsafe { crate::convert::find_audio_backing_buffer(frame.as_ptr(), data_ptr, plane_len) }
+        .ok_or(ResampleError::OutputBuffer(OutputBuffer::new(index)))?;
+      *slot = data_ptr as *const u8;
     }
 
     Ok(PreparedOutput {
       frame,
-      buffers,
+      planes,
       plane_count,
       plane_len,
       per_sample,
@@ -571,13 +653,13 @@ impl FfmpegResampler {
   }
 
   /// Turns a converted frame into a `mediadecode` one. **Infallible**,
-  /// by construction: every allocation and every reference it needs was
-  /// taken in [`Self::prepare_output`], and everything left here is
-  /// arithmetic over values this type owns.
+  /// by construction: every check it could have made was made in
+  /// [`Self::prepare_output`], and everything left here is arithmetic
+  /// over values this type owns plus a copy that cannot be refused.
   ///
   /// `None` when the conversion produced nothing — the delay line
   /// swallowed the input, which is ordinary and not a failure.
-  fn finish_output(&mut self, mut prepared: PreparedOutput) -> Option<Frame> {
+  fn finish_output(&mut self, prepared: PreparedOutput) -> Option<Frame> {
     let produced = prepared.frame.samples();
     if produced == 0 {
       return None;
@@ -600,22 +682,27 @@ impl FfmpegResampler {
       .min(prepared.plane_len);
     let plane_count = prepared.plane_count;
     let planes = std::array::from_fn(|index| {
-      let mut buffer = prepared.buffers[index]
-        .take()
-        .expect("prepare_output fills every slot");
-      if index < plane_count {
-        buffer.shrink_to(bytes);
-        Plane::new(buffer, bytes as u32)
-      } else {
-        Plane::new(buffer, 0)
+      if index >= plane_count {
+        return Plane::new(FfmpegBytes::empty(), 0);
       }
+      let data_ptr = prepared.planes[index];
+      // SAFETY: `prepare_output` proved this pointer non-null and
+      // proved it addresses `plane_len` bytes inside one of `frame`'s
+      // own buffers; `bytes <= plane_len` by the `min` above.
+      // `swr_convert_frame` writes into those buffers and does not
+      // replace them, and `frame` has been owned by `prepared` — and so
+      // kept alive — across the whole conversion.
+      let produced_bytes = unsafe { core::slice::from_raw_parts(data_ptr, bytes) };
+      Plane::new(FfmpegBytes::copy_from_slice(produced_bytes), bytes as u32)
     });
 
     Some(
       AudioFrame::new(
         self.target.rate,
         produced as u32,
-        self.target.channels().clamp(0, 255) as u8,
+        // Exact, not clipped: `check_spec` refused every spec outside
+        // `1..=MAX_FRAME_CHANNELS` before this resampler existed.
+        self.target.channels() as u8,
         self.target_format,
         self.target_layout.clone(),
         planes,
@@ -631,10 +718,15 @@ impl FfmpegResampler {
 /// Everything a converted frame needs, acquired before the conversion
 /// runs. See [`FfmpegResampler::prepare_output`].
 struct PreparedOutput {
+  /// The output `AVFrame`. Owning it here is what keeps the plane
+  /// pointers below valid across the conversion — moving this struct
+  /// moves a pointer to the `AVFrame`, never the `AVFrame` or the
+  /// buffers it addresses.
   frame: frame::Audio,
-  /// One refcounted view per populated plane, a placeholder for every
-  /// other slot. Taken at full capacity; trimmed after the conversion.
-  buffers: [Option<FfmpegBuffer>; 8],
+  /// One proved plane pointer per populated plane, null for every other
+  /// slot. Checked non-null and in-range before the conversion; read
+  /// after it.
+  planes: [*const u8; 8],
   plane_count: usize,
   /// Bytes one plane holds at full capacity — the ceiling every trim
   /// stays under.
@@ -645,7 +737,7 @@ struct PreparedOutput {
 
 impl AudioResampler for FfmpegResampler {
   type Adapter = Ffmpeg;
-  type Buffer = FfmpegBuffer;
+  type Buffer = FfmpegBytes;
   type Error = ResampleError;
 
   fn send_frame(&mut self, frame: &Frame) -> Result<(), ResampleError> {
@@ -858,6 +950,41 @@ impl PlaneCount {
   }
 }
 
+/// Payload for [`ResampleError::OutputTooLarge`].
+///
+/// The converted frame would be larger than
+/// [`FrameLimits::max_frame_bytes`] allows.
+///
+/// Distinct from [`SampleCount`], which is about a count no `AVFrame`
+/// can express at all. This one is about a frame FFmpeg would happily
+/// allocate and the caller has said it does not want: the amplification
+/// a hostile source rate buys — one second at a declared 1 Hz becomes
+/// gigabytes at 192 kHz — lands here.
+#[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
+#[error("a converted frame of {bytes} bytes exceeds the {limit}-byte ceiling")]
+pub struct OutputTooLarge {
+  bytes: usize,
+  limit: usize,
+}
+
+impl OutputTooLarge {
+  /// Constructs an `OutputTooLarge` payload.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(bytes: usize, limit: usize) -> Self {
+    Self { bytes, limit }
+  }
+  /// The bytes the conversion would have produced.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn bytes(&self) -> usize {
+    self.bytes
+  }
+  /// The ceiling in force.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn limit(&self) -> usize {
+    self.limit
+  }
+}
+
 /// Payload for [`ResampleError::SampleCount`].
 ///
 /// A sample count no frame can hold: one whose byte size overflows, or
@@ -1034,6 +1161,53 @@ impl TooManyPlanes {
   }
 }
 
+/// Payload for [`ResampleError::UnsupportedChannelCount`].
+///
+/// A spec declaring more channels than a frame's channel seat can
+/// carry. `mediadecode`'s `AudioFrame` states its channel count in a
+/// `u8`, so 255 is the ceiling in both directions.
+///
+/// This is the **packed** sibling of [`TooManyPlanes`], which only ever
+/// caught planar specs: packed audio declares one plane whatever its
+/// channel count, so a 256-channel packed spec sailed past that check
+/// and had its count clipped on the way into the frame — a frame whose
+/// bytes were computed from 256 channels while advertising 255. Refused
+/// here, at the same choke point, for both ends.
+#[derive(thiserror::Error, Debug, Clone)]
+#[error("the {end} spec declares {channels} channels; a frame carries at most {limit}")]
+pub struct UnsupportedChannelCount {
+  end: SpecEnd,
+  channels: i32,
+  limit: i32,
+}
+
+impl UnsupportedChannelCount {
+  /// Constructs an `UnsupportedChannelCount` payload.
+  #[inline]
+  pub const fn new(end: SpecEnd, channels: i32, limit: i32) -> Self {
+    Self {
+      end,
+      channels,
+      limit,
+    }
+  }
+  /// Which end of the conversion.
+  #[inline]
+  pub const fn end(&self) -> SpecEnd {
+    self.end
+  }
+  /// The channel count the layout declares.
+  #[inline]
+  pub const fn channels(&self) -> i32 {
+    self.channels
+  }
+  /// Channels a frame can state.
+  #[inline]
+  pub const fn limit(&self) -> i32 {
+    self.limit
+  }
+}
+
 /// Payload for [`ResampleError::TimestampOutOfRange`].
 ///
 /// A frame's timestamp does not land on the output timeline: it does
@@ -1203,6 +1377,11 @@ impl OutputBuffer {
 #[unwrap(ref, ref_mut)]
 #[try_unwrap(ref, ref_mut)]
 pub enum ResampleError {
+  /// The conversion would produce a frame larger than the ceiling
+  /// allows. Refused **before** the output frame is allocated.
+  #[error(transparent)]
+  OutputTooLarge(#[from] OutputTooLarge),
+
   /// No converted frame is ready yet — send more input, or
   /// [`send_eof`](AudioResampler::send_eof) and drain the tail.
   ///
@@ -1256,6 +1435,10 @@ pub enum ResampleError {
   /// slots.
   #[error(transparent)]
   TooManyPlanes(#[from] TooManyPlanes),
+
+  /// A spec with more channels than a frame's channel seat can state.
+  #[error(transparent)]
+  UnsupportedChannelCount(#[from] UnsupportedChannelCount),
 
   /// A frame's timestamp does not land on the output timeline.
   #[error(transparent)]
@@ -1315,6 +1498,10 @@ impl core::fmt::Display for SpecEnd {
 /// frame and `AudioFrame::new` will not build one.
 const MAX_AUDIO_PLANES: i32 = 8;
 
+/// Channels a `mediadecode::frame::AudioFrame` can state — its channel
+/// seat is a `u8`. A spec past this is refused rather than clipped.
+const MAX_FRAME_CHANNELS: i32 = u8::MAX as i32;
+
 /// Refuses a spec `swr` cannot be driven with, or whose channel layout
 /// cannot be carried by value — see [`ResampleError::UnsupportedLayout`]
 /// for that one, which is the whole reason this check exists at the
@@ -1351,6 +1538,17 @@ fn check_spec(spec: &ResampleSpec, end: SpecEnd) -> Result<(), ResampleError> {
       channels,
       MAX_AUDIO_PLANES,
     )));
+  }
+  // And the packed sibling, which the plane check above cannot see: a
+  // packed spec declares one plane at any channel count, so it reached
+  // the frame with its count clipped to 255 instead of refused. That is
+  // the same silent truncation the decode path was carrying, on the
+  // other audio road — closed here, at the same choke point, so that
+  // every channel count downstream is exact by construction.
+  if channels > MAX_FRAME_CHANNELS {
+    return Err(ResampleError::UnsupportedChannelCount(
+      UnsupportedChannelCount::new(end, channels, MAX_FRAME_CHANNELS),
+    ));
   }
   Ok(())
 }
@@ -1535,11 +1733,18 @@ fn new_audio_frame(
 /// channel in the single plane; planar formats give each channel its
 /// own.
 fn plane_bytes(format: Sample, samples: usize, channels: i32) -> Option<usize> {
+  // Refused, not floored. `check_spec` already proves the count is in
+  // `1..=MAX_FRAME_CHANNELS` before any resampler exists, so this is a
+  // restatement of an invariant rather than a live branch — but it is
+  // stated as a refusal because the alternative was a substituted `1`,
+  // which invents a channel the caller never declared and makes the
+  // byte product disagree with the frame it sizes.
+  let channels = usize::try_from(channels).ok().filter(|count| *count > 0)?;
   let bytes = samples.checked_mul(format.bytes())?;
   if format.is_planar() {
     Some(bytes)
   } else {
-    bytes.checked_mul(channels.max(1) as usize)
+    bytes.checked_mul(channels)
   }
 }
 
@@ -1643,13 +1848,13 @@ mod tests {
   /// A 48 kHz packed-s16 stereo frame of silence, with the plane its
   /// header claims.
   fn stereo_frame(samples: u32) -> Frame {
-    let plane = FfmpegBuffer::copy_from_slice(&vec![0u8; samples as usize * 2 * 2]).expect("plane");
+    let plane = FfmpegBytes::copy_from_slice(&vec![0u8; samples as usize * 2 * 2]);
     let planes = std::array::from_fn(|index| {
       Plane::new(
         if index == 0 {
           plane.clone()
         } else {
-          FfmpegBuffer::empty()
+          FfmpegBytes::empty()
         },
         0,
       )
@@ -1682,6 +1887,7 @@ mod tests {
         Sample::I16(ffmpeg_next::format::sample::Type::Packed),
         ChannelLayout::MONO,
       ),
+      FrameLimits::default(),
     )
     .expect("open resampler")
   }

@@ -123,7 +123,7 @@ fn yuvj420p_unspecified_range_delivers_full() {
     (*frame.as_mut_ptr()).color_range = AVColorRange::AVCOL_RANGE_UNSPECIFIED;
   }
 
-  let out = video_frame_from(&frame, Timebase::default())
+  let out = video_frame_from(&frame, Timebase::default(), FrameLimits::default())
     .expect("YUVJ420P frame should convert to a VideoFrame");
 
   assert_eq!(*out.pixel_format(), PixelFormat::Yuvj420p);
@@ -168,7 +168,7 @@ fn an_unsupported_format_is_named_in_the_error() {
   let frame = frame_with_raw_format(raw);
 
   // `VideoFrame` has no `Debug`, so `expect_err` is unavailable.
-  let Err(err) = video_frame_from(&frame, Timebase::default()) else {
+  let Err(err) = video_frame_from(&frame, Timebase::default(), FrameLimits::default()) else {
     panic!("a hardware surface carries no deliverable CPU layout");
   };
 
@@ -201,7 +201,7 @@ fn an_unnameable_format_still_reports_its_raw_id() {
   let raw = 99_999;
   let frame = frame_with_raw_format(raw);
 
-  let Err(err) = video_frame_from(&frame, Timebase::default()) else {
+  let Err(err) = video_frame_from(&frame, Timebase::default(), FrameLimits::default()) else {
     panic!("an unmappable format integer has no deliverable layout");
   };
 

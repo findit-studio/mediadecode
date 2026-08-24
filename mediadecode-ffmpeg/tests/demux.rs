@@ -320,6 +320,7 @@ fn decoded_samples(path: &std::path::Path, strip_side_data: bool) -> u64 {
       .clone_parameters()
       .expect("the checked handoff"),
     info.timebase(),
+    mediadecode_ffmpeg::DecoderLimits::default(),
   )
   .expect("open decoder");
 
@@ -446,8 +447,12 @@ fn the_demux_to_decoder_handoff_survives_an_allocation_fault() {
 
       // And the handoff really is the one that opens a decoder.
       let parameters = track.extra().clone_parameters().expect("uncapped");
-      mediadecode_ffmpeg::FfmpegAudioStreamDecoder::open(parameters, track.timebase())
-        .expect("the handoff opens a decoder");
+      mediadecode_ffmpeg::FfmpegAudioStreamDecoder::open(
+        parameters,
+        track.timebase(),
+        mediadecode_ffmpeg::DecoderLimits::default(),
+      )
+      .expect("the handoff opens a decoder");
     },
   );
 }
@@ -835,4 +840,155 @@ fn a_reader_opens_the_same_container_as_a_path() {
   let delivered = drain(&mut from_reader);
   assert!(delivered.len() > 100, "got {} packets", delivered.len());
   assert_eq!(delivered[0].1, TrackKind::Attachment);
+}
+
+#[test]
+fn the_probe_budget_refuses_an_open_before_libavformat_builds_the_container() {
+  use mediadecode_ffmpeg::{DemuxError, DemuxLimits};
+  let Some(corpus) = Corpus::new() else { return };
+
+  // **The one seat that reaches behind libavformat.** Every other
+  // budget here measures a copy *this crate* makes, and on the demux
+  // road that is always after `avformat_open_input` and
+  // `avformat_find_stream_info` have already built the attached
+  // picture, the extradata and the coded side data out of the file. A
+  // parser cannot allocate from bytes it was never handed, so the read
+  // is what gets bounded.
+  let path = corpus.cover_art_mp3();
+  let bytes = std::fs::read(&path).expect("read the fixture");
+  assert!(
+    bytes.len() > 4096,
+    "the fixture must exceed the tight budget"
+  );
+
+  // Far too little to probe with: the open is refused by name, and the
+  // name says what happened rather than "invalid data" — which is what
+  // libavformat folds the reader's I/O error into, and would report a
+  // refusal this crate made as a malformed file.
+  // 4 KiB: enough for libavformat to accept the `probesize` option —
+  // it refuses absurdly small values outright, which is a refusal too,
+  // just spelled `EINVAL` — and far less than this file needs, so the
+  // meter is the instrument that speaks.
+  let starved = DemuxLimits::new().with_max_probe_bytes(4096);
+  match FfmpegDemuxer::open_reader_with(std::io::Cursor::new(bytes.clone()), Some("x.mp3"), starved)
+  {
+    Err(DemuxError::ProbeBudgetExhausted(p)) => {
+      assert_eq!(p.budget(), 4096);
+      // **Exactly the budget, never more.** The meter used to read the
+      // caller's whole buffer and then discover it had overspent — so
+      // it consumed bytes libavformat never received and reported
+      // having read them. Requests are capped now, so the count is what
+      // was actually handed over.
+      assert_eq!(
+        p.read(),
+        p.budget(),
+        "the refusal must report bytes libavformat really received",
+      );
+    }
+    Err(other) => panic!("expected ProbeBudgetExhausted, got {other:?}"),
+    Ok(_) => panic!("a 1 KiB probe budget opened a whole container"),
+  }
+
+  // And the defaults open the same file, so the seat is a seat and not
+  // a wall. The budget is released once the container is analysed:
+  // reading the media afterwards is the caller's own business, packet
+  // by packet, already bounded by the packet seats.
+  let mut demuxer = FfmpegDemuxer::open_reader_with(
+    std::io::Cursor::new(bytes),
+    Some("x.mp3"),
+    DemuxLimits::new(),
+  )
+  .expect("the defaults must open an ordinary file");
+  assert!(!demuxer.tracks().is_empty());
+  while demuxer
+    .next_packet()
+    .expect("read past the probe budget")
+    .is_some()
+  {}
+}
+
+#[test]
+fn the_path_entrypoint_carries_the_probe_knobs_too() {
+  use mediadecode_ffmpeg::DemuxLimits;
+  let Some(corpus) = Corpus::new() else { return };
+  let path = corpus.cover_art_mp3();
+
+  // The path road cannot carry the hard byte meter — that needs an
+  // `AVIOContext` this crate owns, and a path is opened by
+  // libavformat's own protocol layer — but `probesize` /
+  // `formatprobesize` / `max_streams` reach it through the options
+  // dictionary, and that is the residual stated in the accounting.
+  //
+  // What this lane pins is that the knobs are actually set: a
+  // `max_streams` of zero is a value libavformat itself refuses to
+  // open under, so reaching it proves the dictionary arrived.
+  assert!(
+    FfmpegDemuxer::open_with(&path, DemuxLimits::new().with_max_streams(0)).is_err(),
+    "the probe options did not reach the path entrypoint",
+  );
+
+  // And the defaults still open it.
+  assert!(FfmpegDemuxer::open_with(&path, DemuxLimits::new()).is_ok());
+}
+
+#[test]
+fn the_probe_meter_caps_the_read_rather_than_refusing_the_answer() {
+  use mediadecode_ffmpeg::{DemuxError, DemuxLimits};
+  let Some(corpus) = Corpus::new() else { return };
+  let bytes = std::fs::read(corpus.cover_art_mp3()).expect("read the fixture");
+
+  /// The smallest budget this container opens under, found by bisection
+  /// rather than assumed — it is a property of the fixture and of
+  /// libavformat's appetite, not a number worth hard-coding.
+  fn opens_under(bytes: &[u8], probe: u64) -> bool {
+    FfmpegDemuxer::open_reader_with(
+      std::io::Cursor::new(bytes.to_vec()),
+      Some("x.mp3"),
+      DemuxLimits::new().with_max_probe_bytes(probe),
+    )
+    .is_ok()
+  }
+
+  // libavformat refuses `probesize` below its own floor outright, so
+  // start the search above it.
+  let (mut lo, mut hi) = (8_192u64, 1_048_576u64);
+  assert!(opens_under(&bytes, hi), "the fixture must open somewhere");
+  while lo + 1 < hi {
+    let mid = lo + (hi - lo) / 2;
+    if opens_under(&bytes, mid) {
+      hi = mid;
+    } else {
+      lo = mid;
+    }
+  }
+  let exact = hi;
+
+  // **The exact tail.** At precisely the allowance the container needs,
+  // the open succeeds: a read landing exactly on zero remaining is
+  // served in full and does not trip, because a budget is a ceiling on
+  // what is spent rather than on asking.
+  //
+  // Before the cap this was not reliable — whether a container opened
+  // depended on the *shape* of libavformat's requests, since a 32 KiB
+  // ask against a 1 KiB allowance consumed everything and returned
+  // nothing. A container that fitted its budget could still be refused.
+  assert!(
+    opens_under(&bytes, exact),
+    "a container finishing inside its allowance must open",
+  );
+
+  // And one byte short of it, the next read is the one refused — with
+  // an accurate count.
+  match FfmpegDemuxer::open_reader_with(
+    std::io::Cursor::new(bytes.clone()),
+    Some("x.mp3"),
+    DemuxLimits::new().with_max_probe_bytes(exact - 1),
+  ) {
+    Err(DemuxError::ProbeBudgetExhausted(p)) => {
+      assert_eq!(p.budget(), exact - 1);
+      assert_eq!(p.read(), p.budget(), "the count must be what was delivered");
+    }
+    Err(other) => panic!("expected ProbeBudgetExhausted, got {other:?}"),
+    Ok(_) => panic!("the bisection is wrong: {exact} is not the boundary"),
+  }
 }

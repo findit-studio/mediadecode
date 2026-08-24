@@ -1507,7 +1507,11 @@ fn fx3_high_422_10bit_falls_back_to_software_and_decodes_whole_stream() {
   // coverage/ordering of the resulting PTS, not its real-time scale.
   let tb = Timebase::new(1, NonZeroI32::new(24).expect("nonzero"));
 
-  let mut dec = match FfmpegVideoStreamDecoder::open(stream.parameters(), tb) {
+  let mut dec = match FfmpegVideoStreamDecoder::open(
+    stream.parameters(),
+    tb,
+    crate::DecoderLimits::default(),
+  ) {
     Ok(d) => d,
     Err(Error::AllBackendsFailed(p)) => {
       // No HW backend opened at all → the wrapper went straight to SW at
@@ -1752,7 +1756,7 @@ impl Fx3Observation {
   fn drain(
     &mut self,
     dec: &mut FfmpegVideoStreamDecoder,
-    dst: &mut VideoFrame<mediadecode::PixelFormat, VideoFrameExtra, FfmpegBuffer>,
+    dst: &mut VideoFrame<mediadecode::PixelFormat, VideoFrameExtra, FfmpegBytes>,
   ) -> Result<(), String> {
     loop {
       match dec.receive_frame(dst) {
@@ -1782,4 +1786,82 @@ impl Fx3Observation {
     }
     Ok(())
   }
+}
+
+/// The cold software fallback's two forwarding calls must not lose an
+/// allocator refusal.
+///
+/// `degrade_to_sw_inner` opens a **temporary** software decoder,
+/// forwards the failure arm's input into it, and drops it on any error.
+/// That decoder owns the callback state, so a `judge_buffer` refusal
+/// recorded during either forward dies with it unless the reason is
+/// collected first — which is why the state is captured before the
+/// forward rather than reached for after it.
+///
+/// # Reachability, stated
+///
+/// The post-commit fallback itself cannot be driven end to end on this
+/// platform: it needs a hardware backend to commit and then fail
+/// mid-stream, and VideoToolbox is the only backend here. So the seam
+/// is driven directly — a real `SwDecoder` opened through the same
+/// `open_sw_decoder`, with the same two calls routed the same way.
+///
+/// The **EOF arm** carries a further honesty note: production reaches
+/// it only on a *cold* decoder, which has no buffered output and so
+/// allocates nothing, meaning no budget refusal is reachable through it
+/// in practice. The routing is there for uniformity — one funnel, every
+/// exit — and what this lane proves is that the routing works when the
+/// call does refuse, not that production can make it refuse.
+#[test]
+fn the_cold_fallback_forwards_keep_the_allocator_refusal() {
+  use crate::{DecoderLimits, FrameLimits, error::FrameMedium};
+
+  // 640x480 `yuv420p` costs about 460 KB once allocated; 64 KiB refuses
+  // it, and the refusal has to arrive named rather than as the `EINVAL`
+  // libavcodec also uses for corrupt input.
+  let clip = encode_synthetic_clip(640, 480, 12, 3);
+  let limits = DecoderLimits::new().with_frame(FrameLimits::new().with_max_frame_bytes(64 * 1024));
+
+  let named = |e: &Error| match e {
+    Error::FrameBudgetExceeded(p) => Some(*p),
+    _ => None,
+  };
+
+  // **The packet arm**, exactly as `degrade_to_sw_inner` drives it:
+  // capture the state, forward, route the error.
+  let mut sw = super::open_sw_decoder(&clip.parameters, limits).expect("open sw");
+  let state = sw.state();
+  let refusal = sw
+    .send_packet(&clip.packets[0])
+    .map_err(|e| crate::decoder::software_exit(state, e))
+    .expect_err("a 460 KB frame passed a 64 KiB ceiling");
+  let payload = named(&refusal).expect("the packet arm lost the allocator refusal");
+  assert_eq!(payload.medium(), FrameMedium::Video);
+  assert_eq!(payload.limit(), 64 * 1024);
+  assert!(payload.bytes() > payload.limit());
+
+  // **The EOF arm**, driven on a decoder that has something to flush so
+  // the call can actually refuse — see the reachability note above.
+  let mut sw = super::open_sw_decoder(&clip.parameters, limits).expect("open sw");
+  let state = sw.state();
+  // Feed without collecting, so whatever the decoder buffers is still
+  // pending when EOF arrives.
+  let _ = sw.send_packet(&clip.packets[0]);
+  if let Err(e) = sw
+    .send_eof()
+    .map_err(|e| crate::decoder::software_exit(state, e))
+  {
+    let payload = named(&e).expect("the EOF arm lost the allocator refusal");
+    assert_eq!(payload.limit(), 64 * 1024);
+  }
+
+  // And under a budget that fits, the same forward succeeds — the seat
+  // refuses cost, not fallbacks.
+  let generous = DecoderLimits::new()
+    .with_frame(FrameLimits::new().with_max_frame_bytes(crate::DEFAULT_MAX_FRAME_BYTES));
+  let mut sw = super::open_sw_decoder(&clip.parameters, generous).expect("open sw");
+  let state = sw.state();
+  sw.send_packet(&clip.packets[0])
+    .map_err(|e| crate::decoder::software_exit(state, e))
+    .expect("an affordable frame must be accepted");
 }

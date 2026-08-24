@@ -11,6 +11,122 @@ The sibling FFmpeg adapter has its own log at
 
 ## [Unreleased]
 
+### Added
+
+- **The resource governance contract** (user-ruled 2026-08-25), written
+  into the `adapter` module's docs beside the amputation contract. It
+  states, in three tiers, what a decoding backend owes a caller who asks
+  "how much can this cost?":
+
+  - **Tier one — what the backend allocates itself.** Every byte a
+    backend copies or allocates is bounded, by a named seat or by a
+    format; there is no third kind. Provable, and proved by enumeration
+    rather than assertion — a backend keeps an accounting of its own
+    allocation sites and what bounds each. Two rules folded in that this
+    release paid for: *a judge must dominate the allocator's arithmetic,
+    not the payload's*, and *everything a conversion can refuse is
+    refused before anything it can allocate is allocated*.
+  - **Tier two — the substrate's own knobs.** A backend sets every
+    resource knob its substrate offers, at every interposition point the
+    substrate exposes. Explicitly **defense in depth, not a proof**: the
+    union of those knobs is whatever the substrate's authors chose to
+    make interruptible.
+  - **Tier three — the boundary.** Allocations internal to a substrate,
+    past its knob surface, are the substrate's territory. A deployment
+    needing a hard memory bound puts the decode behind an OS-level
+    instrument — an rlimit, a cgroup, a memory-limited worker — and the
+    seats compose with it rather than replacing it. Stated without
+    hedging: **this crate does not promise to be a hypervisor for its
+    substrates.**
+
+  The principle is homed here because it binds every backend, not only
+  the FFmpeg one; the concrete knob enumeration belongs to whichever
+  crate owns the substrate.
+
+
+## [0.9.0] - 2026-08-24
+
+### Added (BREAKING)
+
+- **The D-seat amputation contract**, written into the `adapter`
+  module's docs as the one law a backend's buffer type `B` must obey:
+  *owned, `Send + Sync`, cheap to clone (a refcount bump), with its
+  lifetime fully decoupled from the backend's internal buffers at the
+  exit — no FFI pointer, pooled buffer or JavaScript handle crosses
+  the seam.*
+
+  It is a law about backends, not a change to this crate's signatures.
+  `VideoFrame<P, E, D>`, `AudioFrame<S, C, E, D>`,
+  `SubtitleFrame<E, D>`, the five `*Packet<E, D>` and `Plane<B>` keep
+  every parameter they had, `AsRef<[u8]>` remains the only bound, and
+  no concrete carrier is named anywhere in the crate. What the law
+  states is what a *consumer* may rely on when a backend hands it a
+  frame: that holding one does not hold a decoder open, that it can
+  cross a channel, and that fanning it out to two consumers costs a
+  refcount rather than a copy of the picture. The rationale — including
+  why one copy at the boundary is cheaper than the copy each consumer
+  would otherwise have to make later — is on the module.
+
+- **`ImageFrame<P, E, D>` — a fourth frame household.** A decoded
+  still: cover art, an embedded thumbnail, a poster frame. It carries
+  `dimensions`, `visible_rect`, `pixel_format`, up to four `Plane<D>`,
+  `ColorInfo` and backend `extra` — and **no `pts`, no `duration`**.
+  Not `None`-valued seats: absent ones. A still is not on the
+  timeline, which is the same fact `AttachmentPacket` has always
+  stated on the packet side, and a field that can only ever be empty
+  is an invitation to a consumer to sort by it.
+
+  `visible_rect` earns its place here more than anywhere: a JPEG's
+  coded dimensions are rounded up to its MCU grid (8 or 16 pixels), so
+  a 30×30 photograph is coded 32×32 and only the visible rect says
+  which of those pixels are the picture. Construction mirrors the
+  video household exactly — a panicking `new`, a fallible `try_new`,
+  and a new `FrameError::TooManyImagePlanes` arm with a
+  `TooManyImagePlanes` payload, over the same 4-slot cap (packed RGB
+  = 1, MJPEG's YUV = 3, either plus alpha = 4).
+
+- **`ImageAdapter`** — the fourth per-kind vocabulary: `CodecId`,
+  `PixelFormat`, `PacketExtra`, `FrameExtra`. Minted rather than
+  folded into `VideoAdapter` because the two disagree about the one
+  thing an adapter exists to name: a still's extras are EXIF, an ICC
+  profile, an orientation — not a picture type, a field order or a
+  best-effort timestamp. Its `PacketExtra` is the *attachment's*
+  extras, so a backend that also implements `DemuxAdapter` normally
+  binds one type in both seats and a cover-art payload goes from
+  `next_packet` into `decode` with nothing to convert.
+
+- **`ImageDecoder`** — a one-shot decoder seam. `decode(&packet)`
+  takes an `AttachmentPacket` and answers an `ImageFrame`; there is no
+  `send_packet` / `receive_frame` split and no `send_eof`, because an
+  attachment track's contract is exactly one packet and a still
+  codec's answer to it is exactly one picture.
+
+  **No `Stream` in the name, and the register now says something.**
+  `VideoStreamDecoder` and `AudioStreamDecoder` carry it because they
+  have a rhythm — packets in over time, frames out over time, the two
+  not in step. `SubtitleDecoder` and `ImageDecoder` do not.
+
+  Mirrored under `future::local::ImageDecoder` and
+  `future::send::ImageDecoder`, on the same `trait_variant` machinery
+  as the other four faces there, so the register is complete rather
+  than four-fifths complete. One `async fn`, because the sync trait
+  has one method: what the `async` buys is a backend whose *decode* is
+  asynchronous — a browser's `createImageBitmap`, a GPU submission —
+  not a rhythm the sync trait was hiding. It is also the face the
+  WebCodecs adapter will implement when it implements one at all.
+
+- **`Clone` on `VideoFrame` and `SubtitleFrame`** (`AudioFrame` had it
+  already), derived, so the per-parameter bound is exactly what
+  cloning the fields requires. All four households are now cloneable —
+  the consumer-side half of the amputation contract, whose backend-side
+  half is what makes the clone a refcount bump.
+
+### Changed
+
+- `decoder`'s module docs now state what the trait names mean, what
+  may be bound in the `Buffer` seat, and why construction is off the
+  traits. `adapter`'s carry the contract itself.
+
 ## [0.8.0] - 2026-08-24
 
 ### Added

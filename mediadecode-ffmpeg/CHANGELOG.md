@@ -11,6 +11,1694 @@ The backend-agnostic core it adapts has its own log at
 
 ## [Unreleased]
 
+### Fixed
+
+- **The cold software fallback still lost allocator refusals.**
+  `degrade_to_sw_inner` opens a *temporary* software decoder, forwards
+  the failure arm's packet or EOF into it, and drops it on any error.
+  That decoder owns the callback state, so a `judge_buffer` refusal
+  recorded during either forward died with it — and the caller received
+  an ambiguous FFmpeg error inside a `FallbackFailed` envelope. It was
+  the last software road still wrapping libavcodec's `EINVAL` raw.
+
+  The state is captured before the forward, and both calls route
+  through `software_exit`.
+
+- **And the wrapping was renamed, because the envelope was the wrong
+  one.** A budget refusal during fallback now travels **unwrapped**, as
+  `FrameBudgetExceeded`, instead of arriving as
+  `FallbackFailed(FrameBudgetExceeded)`:
+
+  - `FallbackFailed` means the fallback *machinery* could not complete,
+    and its contract is to hand back the unconsumed packets so a caller
+    can re-drive them. On the post-commit road that set is empty by
+    construction — the probe buffer is gone and no replay frames are
+    retained — so the envelope carries no recovery affordance, only a
+    label.
+  - And the label invites the wrong action. Re-driving is the natural
+    response to a fallback failure, and re-driving a budget refusal
+    under the same limits refuses identically. `FrameBudgetExceeded`
+    names the action that can succeed: raise the ceiling, or accept the
+    refusal.
+
+  Genuine machinery failures keep the envelope. One fact, one name.
+
+- **The hardware-pool fallbacks underpriced, in both directions.** When
+  `avcodec_get_hw_frames_parameters` could not answer, the judge fell
+  back to codec-aligned dimensions — a fallback whose own comment
+  admitted it could be *smaller* than the pool, since D3D11 HEVC and
+  AV1 round both dimensions to 128 while the codec may round to less.
+  And when the pool declared dimensions in a layout libavutil would not
+  size, the stand-in was a bare `w * h * 16`, omitting the dimension
+  alignment and per-plane slack every accurate estimate carries.
+
+  Both are closed. A pool that will not declare its dimensions and
+  format is now **refused** — the rule the transfer judge already kept:
+  an unprovable extent is not a small one, and declining the hardware
+  format falls the decode back to software where the same budget
+  applies. A declared-but-unpriceable layout is charged
+  `footprint::video_frame_bytes_upper_bound`, built from the footprint's
+  own machinery so it dominates every layout the build could have
+  priced at that extent — and its per-pixel rate comes from the live
+  census, not a literal, so a build with a wider format is charged for
+  it.
+
+  A context with no hardware device attached is passed through rather
+  than refused: that is *no pool*, not a pool declining to describe
+  itself, and this crate's hardware road always attaches a device before
+  opening.
+
+- **The transfer judge ignored unpriceable candidates in mixed lists.**
+  FFmpeg picks the destination format from
+  `av_hwframe_transfer_get_formats`; this crate does not. The fold
+  updated its maximum only on priceable members and reached for a
+  fallback only when *nothing* priced — so a list holding one cheap
+  priceable format beside one unpriceable format was judged at the cheap
+  price, while FFmpeg stayed free to select the member that had been
+  skipped. Every candidate is folded in now, at the conservative bound
+  when it cannot be priced, with an immediate refusal if even that
+  cannot be formed.
+
+- **The software-video road never consumed `FrameBudgetExceeded`.**
+  `SwDecoder` owned the callback state but only `Deref`d the decoder
+  underneath, so every call site kept wrapping libavcodec's error raw —
+  ordinary send, receive and EOF, the replay drain, and the
+  cold-fallback forward, the last of which drops the state when it
+  finishes. A budget refusal on that whole road surfaced as the bare
+  `EINVAL` libavcodec also uses for corrupt input.
+
+  `SwDecoder` exposes its state now, and all nine decode-failure sites
+  route through `software_exit` before wrapping. The three remaining
+  `Error::Ffmpeg` constructions on that road are caps this crate mints
+  itself — a replay-queue `ENOMEM`, two retry-exhaustion `EAGAIN`s — and
+  have no libavcodec verdict to reinterpret.
+
+- **The byte-derived coarse gates over-refused cheap formats.**
+  `max_pixels` was written as `min(the caller's pixel limit,
+  max_frame_bytes / worst-bytes-per-pixel)` and `max_samples` as
+  `max_frame_bytes / worst-bytes-per-sample`, so that the byte ceiling
+  could bite before libavcodec allocated. Both translations charged
+  every stream the widest format in existence, and both refused
+  ordinary media: a 1920x1080 `yuv420p` frame costs 3.14 MiB and was
+  refused under a 4 MiB budget at `ff_set_dimensions`; a 6-channel
+  `s16` frame fitting 64 KiB was refused by a ruler pricing it at `f64`
+  rates.
+
+  Both are gone. `max_pixels` carries the caller's number verbatim, and
+  `max_samples` is left alone. Nothing is traded away, because the seat
+  that enforces bytes — `judge_buffer` — is *itself* pre-allocation:
+  `get_buffer2` **is** the allocation, and it prices the frame's real
+  format at its real dimensions through the allocator-parity footprint.
+  An exact judge at the allocation beats an approximate one before it.
+
+- **The hardware pool judge carried its own bound, as it had to.** It
+  compared the pool's pixel count against `AVCodecContext.max_pixels`,
+  which only worked while that field held a byte-derived number. It now
+  prices the pool's declared dimensions — and its `sw_format`, read as
+  the integer it is — through the same footprint, against the
+  `max_frame_bytes` its callback state already holds, falling back to
+  the worst per-pixel rate where a layout cannot be priced.
+
+  That is strictly more accurate than the scalar it replaces, and the
+  cropped-h264 lane shows it: a 1920x1088 NV12 pool costs 3,135,488
+  bytes and was refused under a 16 MiB budget it fits five times over.
+  The lane now refuses it at 1 MiB, where it genuinely does not fit,
+  and asserts that 16 MiB decodes.
+
+- **Software byte refusals surfaced as bare `EINVAL`.** A `get_buffer2`
+  callback can only answer libavcodec with an errno, and `EINVAL` is
+  also what libavcodec reports for corrupt input — so a caller could not
+  tell a budget refusal this crate made from a broken file, and only one
+  of those is worth retrying with a larger ceiling.
+
+  The refusal is recorded in the callback state, clear-on-read, and
+  collected by a `software_exit` funnel that every software decoder road
+  routes through — video, audio, still and subtitle. It surfaces as
+  `Error::FrameBudgetExceeded`, carrying the bytes, the limit and
+  whether the frame was a picture or audio.
+
+- **The allocator judge restated a logical limit as an arithmetic one.**
+  It compared the **aligned** dimensions against `AVCodecContext.max_pixels`,
+  which is `min(the caller's pixel limit, byte ceiling /
+  worst-bytes-per-pixel)` — so when the pixel limit was the tighter
+  seat, alignment inflation alone refused frames that satisfied *both*
+  requested limits. A 65536x1 `gray8` frame under `max_pixels = 65536`
+  meets the pixel limit exactly on its raw dimensions and costs about
+  2 MiB; against a generous byte budget it was refused anyway, for
+  arithmetic the caller never asked about.
+
+  That comparison was R11's instrument against degenerate-shape bypass,
+  added when the callback had no accurate byte check and a 65536x1 frame
+  could slip thirty-two times its raw pixel count past a raw gate. Once
+  the caller's `max_frame_bytes` was threaded into the callback, the
+  footprint — which prices the aligned dimensions itself — subsumed it.
+  So the comparison is **removed**: it was redundant against the shape
+  it was built for, and wrong against every frame whose pixel limit was
+  the tighter of the two.
+
+  The seats now ask one question each. **Logical extent** is
+  `max_pixels`, enforced by libavcodec in `ff_set_dimensions` against
+  the **raw** dimensions — the semantics that field has and that FFmpeg
+  documents. **Allocation cost** is the footprint against
+  `max_frame_bytes`. The `get_format` hardware judge is untouched: it is
+  a separate seat, judging the pool's own declared extent.
+
+- **The probe meter consumed bytes it then refused to hand over.** It
+  read libavformat's whole request and only afterwards discovered the
+  budget was exceeded, so a 32 KiB request against a 1 KiB allowance
+  took all 32 KiB from the reader, returned none of them, and reported
+  having read bytes nobody received. A container that would have
+  finished probing inside its allowance was refused for the shape of
+  libavformat's buffer rather than for its own size.
+
+  Requests are capped to the remaining allowance now — a short read is
+  ordinary, and every `Read` may return fewer bytes than asked — and
+  only bytes actually delivered are charged, so
+  `ProbeBudgetExhausted::read` reports what libavformat really got.
+
+  The boundary is defined rather than incidental: a read landing
+  **exactly** on zero remaining is served in full and does not trip,
+  because a budget is a ceiling on what is spent and not on asking; the
+  **next** nonempty read is the one refused. A zero-length request asks
+  for nothing and is passed through whatever the budget says.
+
+- **The allocator judge invented a smaller ceiling when the pixel seat
+  was the tighter one.** It recovered a byte ceiling from
+  `AVCodecContext.max_pixels`, which is `min(pixel ceiling, byte ceiling
+  / worst-bytes-per-pixel)` — so when the pixel seat won, `max_pixels`
+  no longer encoded the byte ceiling at all. A 256x256 frame at 16 bytes
+  a pixel under `max_pixels = 65536` with a 2 MiB byte budget satisfies
+  **both** of the caller's limits, costs 1,050,624 bytes, and was judged
+  against 1,048,576 and refused — by exactly the 2,048 bytes of
+  alignment and slack the recovery could not see. The claim that the
+  conflation was harmless in one direction is withdrawn; it was wrong.
+
+  `CallbackState` carries the caller's `max_frame_bytes` verbatim now.
+  That seat already existed for the `get_format` declination, and
+  `build_codec_context` — the single point every decoder in the crate is
+  built through — allocates and installs it for every road, so the five
+  callers and the software-decoder variant each keep the box alive
+  beside their context. Both media read that one number; the audio
+  road's `max_samples` recovery, though exact, is gone, because two
+  sources of truth for one ceiling is how the first one went wrong.
+
+### Added
+
+- **Tier two of the [resource governance contract][gov] enumerated** in
+  the `buffer` module's accounting, beside the tier-one table it already
+  kept (user ruling of 2026-08-25). Every FFmpeg resource knob this
+  crate sets, and what each one bounds:
+
+  | knob | where | bounds |
+  |---|---|---|
+  | `AVCodecContext.max_pixels` | every opened decoder | the coded extent, in `ff_set_dimensions`, before any frame or pool exists |
+  | the `get_format` coded-dims judge | the hardware road | the pool's own declared extent, from `avcodec_get_hw_frames_parameters` |
+  | `AVCodecContext.max_samples` | every opened decoder | `nb_samples * channels`, in `ff_get_buffer` |
+  | the `get_buffer2` byte judge | every software decode | what the allocator will actually take, pictures and audio alike |
+  | the pre-transfer judge | every `av_hwframe_transfer_data` | the CPU destination, at the frames-context pool dims |
+  | `probesize` / `formatprobesize` | both demux entrypoints | what probe and analysis may consume |
+  | `max_streams` | both demux entrypoints | the `AVStream` array a header can conjure |
+  | the `AVIOContext` byte meter | the reader demux entrypoint | total bytes libavformat is handed, hard |
+
+  Recorded as **defense in depth, not a proof**: together they cover
+  every interposition point FFmpeg exposes, which is not the same as
+  covering FFmpeg. The demux residual — libavformat builds the attached
+  picture, extradata and coded side data itself, so those seats measure
+  this crate's copies of allocations that already happened — is folded
+  into that section rather than stated twice, and the part that cannot
+  be reached (a parser's amplification, and the path entrypoint's want
+  of a meter) is named as tier three with a pointer to the contract.
+
+  [gov]: https://docs.rs/mediadecode/latest/mediadecode/adapter/index.html
+
+
+## [0.9.0] - 2026-08-24
+
+### Changed (BREAKING)
+
+- **`FfmpegBuffer` is deleted, and every byte leaving FFmpeg is copied
+  once into an `FfmpegBytes`.** This is the release, and everything
+  else below follows from it.
+
+  Through 0.8 a decoded frame's planes and a demuxed packet's payload
+  were refcounted *views* into libavcodec's own `AVBufferRef`s, wrapped
+  in an `FfmpegBuffer` whose `AsRef<[u8]>` pointed straight at FFmpeg
+  memory. It was zero-copy and it was a lie of omission: a consumer
+  holding a `VideoFrame` was holding libavcodec's allocation open
+  without being told, `FfmpegBuffer` was `Send` and deliberately **not**
+  `Sync`, so a frame could be moved to another thread but never read
+  from two, and fanning one message out to two consumers was therefore
+  impossible without the backend's permission. `mediadecode` 0.9 names
+  that rule — the
+  [D-seat amputation contract](../mediadecode/CHANGELOG.md) — and this
+  crate now keeps it.
+
+  The eight exits that changed carrier, all `FfmpegBuffer` →
+  `FfmpegBytes`: the planes of `VideoFrame`, `AudioFrame` and (via its
+  payload) `SubtitleFrame`, and the data of `VideoPacket`,
+  `AudioPacket`, `SubtitlePacket`, `DataPacket` and `AttachmentPacket`.
+  A delivered frame is now owned, `Send + Sync`, `'static`, and clones
+  by refcount — see `tests/owned_carriers.rs`, which pins all nine
+  forms (the four frame households and the five packet ones) from
+  outside the crate.
+
+  **What did not change is the geometry.** A video plane whose
+  `linesize` is tight still arrives with the decoder's own stride and
+  its full `linesize × height` bytes; a padded one still arrives
+  compacted to `row_bytes`. 0.8 already copied the padded case; 0.9
+  copies both. Nothing was relaid out, and the existing suites — which
+  assert those strides and lengths — are unchanged.
+
+- **`FfmpegBytes` is opaque, and that is deliberate.** It wraps an
+  `Arc<[u8]>` today, through a **private** single-arm enum, and exposes
+  `AsRef<[u8]>` / `as_slice` / `len` / `is_empty` / `ptr_eq` /
+  `copy_from_slice` / `empty` plus `Clone`, `Debug`, `Default`, `Eq`
+  and `Hash`. `Send + Sync` fall out of the arm; nothing is
+  hand-asserted.
+
+  Why not the bare `Arc<[u8]>` an earlier cut of this release used:
+  the storage is going to gain a second strategy. Every exit now
+  allocates, copies and frees per frame, and a 4K decode loop is
+  asking the global allocator for eight megabytes sixty times a second
+  and handing it back; the recorded answer is a plane pool
+  ([#35](https://github.com/findit-studio/mediadecode/issues/35)),
+  whose slabs satisfy the same contract — owned, `Send + Sync`,
+  refcount-cloned, no FFmpeg lifetime. With a bare `Arc<[u8]>` in the
+  aliases, adding the pool would change the type of every frame and
+  every packet in the crate: a breaking release for a change a
+  consumer cannot observe. Behind the newtype it is one new arm of a
+  private enum. The enum has exactly one arm today and gains the
+  second when the pool is built — this crate does not carry members
+  nothing can produce.
+
+  It is emphatically **not** 0.8's `FfmpegBuffer` under a new name.
+  That type was opaque over *libavcodec's* memory, and the opacity is
+  what hid the lifetime. This one is opaque over Rust-owned bytes, and
+  the `AsRef<[u8]>` a consumer programs against says everything the
+  consumer needs.
+
+- **`SideDataEntry`'s payload is `FfmpegBytes`**, not `Vec<u8>`.
+  `new`, `with_data` and `set_data` take one; `data()` still answers
+  `&[u8]`, and a new `data_ref()` hands out the carrier for a consumer
+  that wants to keep the bytes without copying them again. The reason
+  is the contract one tier in: side data rides on packets and frames
+  that a graph fans out, and a frame whose *pixels* clone by refcount
+  and whose *metadata* deep-copies is the kind of asymmetry nobody
+  remembers while profiling. `VideoFrameExtra::smpte_timecode` stays a
+  `Vec<u32>` — those are parsed values, a handful of words, not bytes
+  crossing a boundary.
+
+- **`try_empty_video_frame`, `try_empty_audio_frame` and
+  `try_empty_subtitle_frame` are gone; their `empty_*` siblings are
+  infallible and no longer panic.** Those `Option`-returning
+  constructors existed because building a placeholder meant four (or
+  eight) one-byte `av_buffer_alloc` calls that could fail. The
+  amputation removes the allocations — the empty carrier is made once
+  for the process and cloned by refcount — and a constructor with no
+  failure mode does not get to keep a `Result`-shaped door.
+
+- **`PacketBufferError::Refcount` and `DemuxError::AttachmentAlloc`
+  are gone**, with their payload structs. Both named an
+  `av_buffer_ref` / `av_buffer_alloc` failure; neither call exists any
+  more, so both arms were unreachable. An error variant nothing can
+  produce is a claim about failure modes that is no longer true.
+
+  `PacketBufferError::Bounds` stays, and matters **more** than it did:
+  0.8 formed a view over a packet's claimed payload range and a
+  malformed `size` handed out a slice nobody read; 0.9 reads every byte
+  of it. Every side-data cap and every plane-geometry check is
+  likewise unchanged and still runs before any allocation.
+
+### Added
+
+- **`FfmpegImageDecoder`** — `mediadecode`'s new one-shot
+  `ImageDecoder`, backed by `libavcodec`, and with it the cover-art
+  road end to end. Opened from an attachment track's codec parameters
+  (`FfmpegImageDecoder::open`), fed the track's one
+  `AttachmentPacket`, and answering an `ImageFrame`. The
+  `AVCodecContext` is reset between pictures rather than reopened, so
+  a container with a dozen attachments decodes them through one
+  decoder.
+
+  **Censused before it was written: the cover-art reclassification
+  never dropped the codec identity.** This crate maps a video-shaped
+  stream carrying `AV_DISPOSITION_ATTACHED_PIC` to
+  `TrackKind::Attachment`, and that mapping reads
+  `AVCodecParameters.codec_id` and puts it on
+  `AttachmentTrackParams`, while `TrackExtra` carries a checked deep
+  copy of the whole `AVCodecParameters` — width, height, pixel format
+  and extradata included. Nothing had to be restored; the road from a
+  track row to a decoded picture has no gap in it, and
+  `tests/owned_carriers.rs` now pins that.
+
+  Two refusals are named rather than surfacing as a bare FFmpeg
+  errno: `ImageDecodeError::EmptyPayload` for an attachment carrying
+  no bytes (which the demuxer really does synthesize — a cover-art
+  stream that parks no payload, an attachment track with empty
+  extradata), and `ImageDecodeError::NoImage` for bytes that were
+  accepted and produced no picture.
+
+- **`ImageFrameExtra`** and the `ImageAdapter` impl for `Ffmpeg`. Two
+  seats: `orientation` and `side_data`.
+
+- **EXIF orientation takes a typed seat — and the census that put it
+  there corrected an earlier reading of libavcodec.** An interim
+  version of this entry said orientation arrives in `AVFrame.metadata`
+  as a string and therefore could not be given a seat cheaply. It was
+  measured instead of reasoned about, and it does not.
+
+  Feeding mjpeg a JPEG whose EXIF IFD carries each orientation in
+  turn: for a **recognised** tag (1..=8) the decoder emits an
+  `AV_FRAME_DATA_DISPLAYMATRIX` frame side-data entry and puts
+  *nothing* in the metadata dictionary. Only an **out-of-range** tag
+  (0, 9, …) falls through to the dictionary — as the string
+  `"      9"` — and produces no matrix at all, with libavcodec logging
+  `unable to attach displaymatrix from EXIF` on the way past. So the
+  road was the display matrix all along, this crate was already
+  carrying that entry raw, and the seat is a typed *reading* of bytes
+  it already had rather than a new FFI mechanism.
+
+  The seat is **`ImageOrientation`**, an eight-valued vocabulary
+  (`TopLeft` … `LeftBottom`, EXIF tags 1–8) plus an `Other([i32; 4])`
+  escape carrying the linear part of a display matrix none of the
+  eight names — reachable, since the matrix is a general affine
+  transform and a MOV `tkhd` can hold an arbitrary one. It offers
+  `from_display_matrix`, `to_exif_code` / `from_exif_code`,
+  `is_mirrored`, `linear`, and `rotation`, which answers in this
+  workspace's existing `mediaframe::frame::Rotation`.
+
+  **Why eight values and not that `Rotation` alone.** `Rotation` names
+  four, and four of the eight EXIF orientations are *mirrored*; a
+  rotation vocabulary cannot hold a reflection. FFmpeg's own API has
+  the same gap: `av_display_rotation_get` answers `-180` for both tag
+  2 and tag 3, `-90` for both 5 and 6, and `90` for both 7 and 8, so
+  reading the angle alone loses the mirror on half the vocabulary.
+  `rotation()` reuses `Rotation` for the half it can carry and
+  `is_mirrored()` supplies the half it cannot.
+
+  `orientation()` is `None` when the frame carried no display matrix
+  — the ordinary case, and also what an out-of-range tag produces —
+  which a consumer can tell apart from "the file said upright". That
+  is the difference between leaving a picture alone and having decided
+  to.
+
+  This flows on the **image road only**. `VideoFrameExtra` is
+  untouched: a video's rotation rides the same display-matrix side
+  data and is already carried raw there, and typing it for motion
+  video is a separate question with separate consumers.
+
+- **An ICC profile deliberately gets no seat**, though it arrives as
+  side data too (`AV_FRAME_DATA_ICC_PROFILE`). It is a payload, not a
+  fact — kilobytes of colour transform this crate has no vocabulary
+  for and no business parsing — and `side_data()` carries it unparsed
+  and whole for a consumer that does. That is the line the image
+  household draws: a fact a picture cannot be displayed correctly
+  without is typed; a payload only a specialist reads rides raw.
+
+- **`ImageFrame` type alias**, beside the eight that were already
+  there, and `convert::image_frame_from` /
+  `convert::av_frame_to_image_frame`. The image and video paths share
+  one plane-extraction rule (`copy_out_planes`) rather than two that
+  could drift.
+
+### Added — resource ceilings
+
+- **Every copy across the boundary is now checked against a finite
+  budget, before it allocates.** 0.9 made every exit copy, and a copy
+  is a decision to allocate whatever an untrusted container asks for: a
+  header claiming 100000×100000 pixels, a packet claiming a gigabyte, a
+  Matroska with four hundred attached "fonts". Through 0.8 those claims
+  cost a refcount. They now cost memory, so they are judged first. The
+  new `limits` module is the one home for them — `DEFAULT_*` consts and
+  `Copy` options structs with `new` / getters / `with_*` / `set_*`, the
+  shape `VideoDecoder::with_max_probe_pending_bytes` and
+  `DEFAULT_MAX_PROBE_PENDING_BYTES` already established.
+
+  Every seat is a **finite default**, never an `Option`. There is no
+  "unlimited" spelling on purpose: that is the shape a caller reaches
+  for once, in a hurry, and never revisits.
+
+  | seat | default | why that number |
+  |---|---|---|
+  | `FrameLimits::max_pixels` | 256 Mpx | 8K UHD is 33 Mpx and 16K×16K is 268 Mpx; every real frame passes and the forged header does not. FFmpeg's own default for this is `INT_MAX`. |
+  | `FrameLimits::max_frame_bytes` | 512 MiB | 8K 4:4:4 16-bit with alpha is ~253 MiB, 8K P010 ~96 MiB. Pixels alone do not bound the copy — depth, plane count and stride padding multiply it. |
+  | `PacketLimits::max_packet_bytes` | 1 GiB | Deliberately ceiling-class. `AVPacket.size` is a `c_int`, so 2 GiB is the structural maximum and this halves it; an 8K ProRes 4444 XQ frame is ~10 MB. The job is to refuse a forged `size`, not to second-guess a codec. |
+  | `DemuxLimits::max_attachment_bytes` | 64 MiB | An attachment is a whole file. A generous cover is a 4000×4000 PNG at ~20 MB; the largest CJK fonts are ~30 MB. Two orders under the packet ceiling, which is right — attachments are captured *eagerly*, at open. |
+  | `DemuxLimits::max_total_attachment_bytes` | 256 MiB | Nothing in the per-attachment ceiling bounds a container that attaches four hundred modest ones. A full ASS font set is ~100 MB at the high end. |
+
+- **Two layers, one number.** `FrameLimits::max_pixels` is also written
+  into `AVCodecContext.max_pixels` for every decoder this crate opens —
+  HW probe candidates, the SW fallback, the subtitle and image
+  decoders. That is the layer that matters most: libavcodec refuses an
+  oversized picture *before allocating it*, where checking only on this
+  side would mean FFmpeg had already paid for the frame by the time we
+  declined to copy it.
+
+- **New typed refusals**, all naming both the ask and the line, all
+  raised before the copy: `ConvertError::TooManyPixels`,
+  `ConvertError::FrameTooLarge`, `PacketBufferError::PacketTooLarge`,
+  `DemuxError::AttachmentTooLarge` and
+  `DemuxError::AttachmentBudgetExhausted`. The two attachment arms are
+  separate because they are separate attacks — every payload can be
+  individually fine and the file can still be an attachment table — and
+  the aggregate arm names the track that crossed the line, not a track
+  that was individually at fault, because there need not be one.
+
+- **Where the seats sit.** `FrameLimits` is taken by
+  `FfmpegVideoStreamDecoder::open`, `FfmpegAudioStreamDecoder::open`,
+  `FfmpegSubtitleStreamDecoder::open` and `FfmpegImageDecoder::open`;
+  `DemuxLimits` by the new `FfmpegDemuxer::open_with` /
+  `open_reader_with` (the existing `open` / `open_reader` delegate with
+  defaults). Taken *at open*, not through a `with_*` builder on the
+  session, and for a reason in each case: half of `FrameLimits` is
+  written into an `AVCodecContext` whose ceiling cannot move after
+  `avcodec_open2`, and the attachment half of `DemuxLimits` is *spent*
+  during the open — every attachment payload is captured before the
+  call returns, which is what makes the demux tier's "exactly one
+  packet, before any timed packet" contract true by construction. A
+  budget set afterwards would arrive after the spending.
+
+  A file whose attachments exceed either budget **fails to open**.
+
+- **A cover-art bomb is the same attack as a video bomb**, so the image
+  road carries the identical ceilings — and it is the more exposed of
+  the two, being what a thumbnailer reaches for without ever asking for
+  video.
+
+### Fixed — a payload that carries pointers is refused, not copied
+
+- **`AV_PKT_FLAG_TRUSTED` was a use-after-free reachable through safe
+  API.** The copy-out leg duplicated a packet's bytes without retaining
+  its `AVBufferRef`, and the boundary faithfully preserved every flag
+  including `TRUSTED` — which FFmpeg's wrapped-`AVFrame` producers set
+  on packets whose body is not media at all but a **structure of
+  pointers to other live objects**. Copying that body produced a carrier
+  that satisfied every property the amputation contract states — owned,
+  `Send + Sync + 'static`, clone-is-a-refcount-bump — and dangled the
+  moment the source pipeline dropped. Handing it back through a reverse
+  builder, flag restored, gave a wrapped-frame decoder `av_frame_ref` on
+  freed memory.
+
+  The copy moved the pointer; it could not move what the pointer named.
+  There is no depth of copying that fixes this, because there is no
+  bound on what such a payload's pointers reach — so the contract gains
+  a corollary, written into the adapter docs: **a payload that carries
+  addresses instead of bytes is uncarriable**, and must be refused by
+  name on *both* legs. It is refused on all five copy-out conversions
+  and all four rebuild roads, as `TrustedPayload`.
+
+  The lane that asserted `TRUSTED` survived a round trip was itself the
+  bug, and now asserts the refusal.
+
+### Fixed — the byte ceiling was only enforced after the allocation
+
+- **A compressible frame could make libavcodec allocate ~800 MB under a
+  512 MiB ceiling.** `max_pixels` was pushed into the decoder but
+  `max_frame_bytes` was not, and a pixel is not a fixed price:
+  10000x10000 is 100 Mpx — comfortably under the 256 Mpx default — and
+  800 MB in `rgba64`. Such a frame is a few KB on disk, so nothing
+  upstream sees it coming, and the byte ceiling only spoke after
+  libavcodec had already paid for the frame this crate then declined to
+  copy.
+
+  The byte ceiling is now converted into the pixel ceiling that enforces
+  it, for the stream's own pixel format, and the tighter of the two is
+  what the decoder is opened with. `av_image_check_size2` — reached from
+  `ff_set_dimensions`, which every decoder calls when it learns its
+  dimensions and *before* it allocates — is the pre-allocation judge, so
+  this bites on the declared shape and on a container that lies about it
+  alike. The per-pixel cost is measured through this crate's own plane
+  geometry on a 256x256 probe rather than from a table; a stream that
+  declares no usable format is charged the widest CPU layout FFmpeg has,
+  which over-refuses only above roughly 67 Mpx at the default ceilings.
+
+  **On `get_buffer2`:** the standard custom-allocator hook was censused
+  and rejected for this release. It is the more precise instrument — it
+  sees the real strides — but it needs per-context side state, and
+  `AVCodecContext.opaque`, the only user pointer FFmpeg offers, is
+  already owned by the hardware path's callback state. Sharing it means
+  one state type threaded through the shared context builder and both
+  decoder families, with an FFI callback whose lifetime bugs are
+  use-after-free rather than test failures. The pixel-ceiling road
+  reaches the same allocation, one layer earlier, with no callback and
+  no state. Recorded here so the choice is a decision rather than an
+  omission.
+
+  The post-conversion `FrameTooLarge` stays as the backstop for frames
+  that arrive without a decoder to have pushed anything down.
+
+### Fixed — the callback reads the frame's layout, not the context's
+
+- FFmpeg's `get_buffer2` contract says the callback uses the values on
+  the **frame**, and `avcodec_default_get_buffer2` sizes from them. This
+  crate priced audio from the *context's* channel layout, which is
+  whatever was last negotiated and can differ outright: a context
+  claiming mono against a frame carrying 255 `dblp` channels at 130,000
+  samples priced about a megabyte and allocated about 265 MB. The count
+  is read raw and signed now, and a non-positive one is refused rather
+  than floored.
+
+  **The lesson, recorded at the lane.** R15's exhaustive footprint
+  matrix could not have caught this and never could: it feeds one
+  channel count into both the estimate and the measurement, so a seam
+  that reads one side where the allocator reads the other is invisible
+  to it. **A matrix proves a formula; only a lane that lets the two
+  sides disagree proves the seam that joins them.** The new lane drives
+  `judge_buffer` with the context and the frame described
+  independently.
+
+### Fixed — the byte ceiling is recovered per medium, and a zero budget refuses
+
+- The callback derived one byte ceiling for both media from
+  `max_pixels`, and that was wrong at both edges. A caller setting
+  `max_pixels = 1` gave every **audio** frame a 16-byte budget — a pixel
+  ceiling has no business bounding audio, and ordinary sound was
+  refused. And a `max_frame_bytes` below one worst-case pixel floors the
+  pushed-down `max_pixels` to zero, where the guard was written as
+  `max_pixels > 0`: the tightest ceiling a caller can ask for **turned
+  the judge off**, which is the one direction a ceiling must never fail
+  in.
+
+  Audio now recovers from `max_samples`, which `build_codec_context`
+  sets from `max_frame_bytes` alone — no `min` with anything else, so it
+  is the caller's own number back. Video keeps the `max_pixels`
+  recovery, where the conflation is provably harmless in the direction
+  that matters: when the byte road was tighter it is exact, and when the
+  pixel road was tighter every frame passing the pixel gate has
+  `aligned_pixels <= max_pixels` and so costs at most `max_pixels *
+  worst` — it can under-state the caller's byte ceiling, never refuse a
+  frame the caller allowed. A zero budget refuses every nonempty
+  software frame.
+
+### Added — the demux open is bounded before libavformat builds anything
+
+- **The one seat that reaches behind libavformat.** Every other budget
+  in this crate measures a copy it makes itself, and on the demux road
+  that is always after `avformat_open_input` and
+  `avformat_find_stream_info` have already built the attached picture,
+  the extradata and the coded side data out of the file. The attachment
+  and parameter seats were measuring this crate's copies of allocations
+  that had already happened.
+
+  A parser cannot allocate from bytes it was never handed, so the input
+  is bounded. `DemuxLimits` gains `max_probe_bytes` (5 MiB, FFmpeg's own
+  `probesize` default) and `max_streams` (1000, FFmpeg's own), and they
+  reach libavformat two ways:
+
+  | instrument | reaches | bounds |
+  |---|---|---|
+  | `probesize` / `formatprobesize` | both entrypoints | what the probe and analysis may consume |
+  | `max_streams` | both entrypoints | the `AVStream` array a header can conjure |
+  | the `AVIOContext` byte meter | the **reader** entrypoint | total bytes handed over, hard — past the budget the reader stops answering |
+
+  Over-budget is `DemuxError::ProbeBudgetExhausted`, and the meter is
+  consulted **before** the errno: libavformat folds a reader's I/O error
+  into whatever it was doing at the time — usually "invalid data" —
+  which would report a refusal this crate made as a malformed file. The
+  budget is released once the container is analysed; reading the media
+  afterwards is the caller's own business, already bounded by the packet
+  seats.
+
+  **The residual, stated rather than implied.** Allocation
+  *amplification* inside a parser is not bounded: a container can
+  describe, in a handful of bytes, a structure whose in-memory form is
+  far larger, and nothing outside libavformat can observe that. Bounding
+  the output of that is the substrate's own hardening territory —
+  FFmpeg keeps `max_streams`, `max_index_size` and `max_picture_buffer`
+  for it, and this crate now sets the first. And the hard meter does not
+  reach the **path** entrypoint at all, because it needs an
+  `AVIOContext` this crate owns and a path is opened by libavformat's
+  own protocol layer; the probe knobs still apply there, and a caller
+  who wants the meter on a file opens it as a reader.
+
+### Fixed — a candidate's refusal is read before the candidate dies
+
+- Replay classified the failure through `self.state` — the backend still
+  active — while the error being recorded belonged to `candidate_state`,
+  whose `get_format` callback is the one that may have declined. The
+  right state was then dropped, so the reason was gone: the attempt log
+  recorded FFmpeg's `Invalid data found when processing input` for a
+  coded surface this crate refused. The candidate's declination is read
+  first now, and the ordering is the whole fix.
+
+### Fixed — the allocator callback prices bytes, for pictures and for audio
+
+- **The software video road still compared pixels.** `judge_buffer`
+  bounded the aligned *extent* against `max_pixels` and then delegated —
+  but an extent costs whatever its format costs. A 65536x1 `gbrap32le`
+  frame is 65,536 pixels, inside a 1 MiB ceiling by that ruler, and
+  33.5 MB once allocated: thirty-two times over.
+
+- **Audio passed it unpriced entirely.** `max_samples` bounds the sample
+  *count*, so one sample across eight packed `f64` channels is 64 valid
+  bytes under a 64-byte ceiling and a 2,080-byte allocation — and it was
+  delivered, because the copy-out only ever rechecks the valid bytes.
+
+  Both are now priced through `crate::footprint` before the delegation,
+  and an unpriceable format fails closed. The pixel check stays as the
+  coarse first gate.
+
+  **The seat, without new state.** The callback can see `max_pixels`,
+  and `build_codec_context` sets it to
+  `min(caller's pixel ceiling, max_frame_bytes / worst-bytes-per-pixel)`
+  — so `max_pixels * worst` is never above `max_frame_bytes`: equal when
+  the byte road was the tighter of the two, below it otherwise.
+  Recovering the byte ceiling that way is conservative in the safe
+  direction and threads nothing through a C callback. Hardware frames
+  are delegated rather than failed closed: their pool is judged where it
+  is declared, in `get_format`.
+
+### Fixed — the packed-audio formula had the allocator's steps in the wrong order
+
+- **It aligned the channel-multiplied payload once; the allocator rounds
+  the sample extent and *then* multiplies by channels.** For packed
+  `dbl` at eight channels that priced 576 bytes against a real 2,080; at
+  255 channels, 2,560 against 65,312. Twenty-five times under, from a
+  formula that looked right.
+
+  The arithmetic is no longer restated. `av_samples_get_buffer_size`
+  with `align = 0` **is** the ruler `av_frame_get_buffer` measures with,
+  so the pricer asks it through a new `c_int` shim. Measured across
+  every sample format this build names, the relation is exact:
+  `allocated = av_samples_get_buffer_size(..., 0) + 32 * planes`, with
+  planes being the channel count for planar layouts and one for packed.
+  The per-plane term is charged at 512 rather than the measured 32.
+
+- **The verification law is now a matrix, and that is the real fix.**
+  The R14 lanes were a *curated list* — the shapes the findings happened
+  to name — and they passed while the formula was twenty-five times
+  under: they priced `s16` at eight channels (dominated) and never asked
+  about `dbl` at eight channels (not). The bug lived in the order of the
+  arithmetic, so it only appeared once the per-sample width grew, and no
+  curated row grew it.
+
+  The sweeps are exhaustive now: every sample format the build names
+  crossed with channel counts {1, 2, 8, 32, 255} and sample counts
+  {1, 1024, 65535}, and every CPU pixel format crossed with degenerate,
+  odd and ordinary shapes — over 950 cells, each compared against a real
+  `av_frame_get_buffer` allocation. Reinstating the old formula fails
+  the sweep immediately, at `u8` with 32 channels: a cell no curated row
+  had. **A curated row proves the case it names and nothing else.**
+
+### Fixed — one funnel for every hardware exit
+
+- **The declination had one consumer in production, not four.** R14
+  reported an exits map covering the post-commit classifier, the
+  `open_as` failure path and the codec-type mismatch alongside
+  `advance_probe`. Only `advance_probe` was wired: the other three were
+  written and then lost when the surrounding code was restructured, and
+  every gate passed — because the tests exercised the *helper*, which
+  was correct, rather than the *roads*, which were not.
+
+  Every exit now goes through one `hw_exit` funnel that reads the
+  declination before anything wraps or tears down state, and the
+  open-time paths call its free-standing half before the guard releases
+  the callback state. Five consumers, and each reachable road has a lane
+  that drives it end to end.
+
+  This also closes the quietest of the failure modes: the
+  explicit-backend road took the EOF exit, which `is_hw_decode_failure`
+  deliberately excludes so a genuinely drained stream is not trapped in
+  a fallback loop — so a declined format reported as "stream over", with
+  nothing said at all. The funnel tells the two apart, and the new lane
+  fails if it stops doing so.
+
+### Fixed — judges now price the allocator, not the payload
+
+The rule the whole series arrives at, now written at the head of both
+accounting tables: **a judge must dominate the allocator's arithmetic,
+not the payload's.** Two ceilings were comparing what the bytes weigh
+against what would be spent, and the gap is not small on the shapes that
+matter:
+
+| shape | tight payload | `av_frame_get_buffer(0)` |
+|---|---|---|
+| `nv12` 16x16 | 384 | **1,792** |
+| `yuv420p` 1x1 | 3 | **2,304** |
+| `gray8` 65536x1 | 65,536 | **2,097,408** |
+| `s16p`, 1 sample, 8ch | 16 | **768** |
+| `dblp`, 1 sample, 255ch | 2,040 | **73,440** |
+| `yuv420p` 1920x1080 | 3,110,400 | 3,133,696 |
+
+That last row is why this survived so long: on an ordinary frame the
+allocator's overhead is under one percent, so every under-pricing defect
+hid behind a shape big enough for the slack not to show.
+
+- **The hardware transfer judge** priced `av_image_get_buffer_size` at a
+  fixed alignment — 768 bytes for a 16x16 NV12 destination that really
+  costs 1,792.
+- **The resampler's output preflight** multiplied the tight plane length
+  by the plane count, so a 16-byte ceiling admitted a 768-byte
+  allocation for one sample across eight planar channels.
+
+Both now go through one shared pricer, `crate::footprint`, modelling
+`av_frame_get_buffer` for video *and* audio: both dimensions aligned up
+(the allocator aligns the linesize *and* the plane heights, which is
+what turns a 65536x1 frame into 2 MiB), per-plane slack for the padding
+term, and planar audio charged per plane.
+
+**The estimates are verified, not argued.** `libavutil/frame.c` aligns
+width in a loop, aligns plane heights and adds a padding term whose
+constants differ by build and CPU; transcribing that is a fragile way to
+be exactly right. So the pricer is deliberately a conservative upper
+bound and the tests price every shape in the table above against the
+real summed `AVBufferRef.size`, asserting the estimate dominates each
+one. A build whose allocator grows hungrier fails those tests instead of
+quietly outgrowing a ceiling.
+
+### Fixed — the hardware pool is asked, not calculated
+
+- **The coded-surface judge used the codec's alignment; a hardware pool
+  aligns by its own API's rules.** `avcodec_align_dimensions2` is what
+  the *codec* wants, and D3D11 HEVC and AV1 round both dimensions to
+  128 — a 129x129 stream priced 144x160 by codec arithmetic can be
+  allocated as 256x256.
+
+  The judge now calls `avcodec_get_hw_frames_parameters` to obtain the
+  `AVHWFramesContext` the decoder is about to initialise — populated and
+  not yet allocated — and reads the pool's own declared extent, unrefing
+  it before returning. Measured on the VideoToolbox road: the pool
+  declares 1920x1088 for the cropped fixture, where codec arithmetic
+  said 1920x1090. The lane asserts the pool's figure *and* that it is
+  not the codec's, so a lost ask is caught rather than approximated.
+
+  One trap found by measuring: the query must be asked about the
+  **format being negotiated**, not `ctx->pix_fmt`, which at
+  `get_format` time still holds the software format and answers
+  `ENOENT` — silently falling back to the arithmetic the call exists to
+  replace. The codec-alignment path remains as the recorded fallback for
+  accelerators that will not declare.
+
+### Fixed — the coded-surface reason survived only the probe road
+
+- `take_ceiling_declination` ran in `advance_probe` and nowhere else, so
+  a decoder opened for one explicit backend — which has no probe —
+  classified the refusal as a post-commit hardware failure carrying
+  FFmpeg's `Invalid data found when processing input`: the callback's
+  own declination reported as though the file were corrupt. `open_as`
+  also frees the callback state on its way out, so the open-time path
+  lost the reason entirely.
+
+  The reader is free-standing now and consulted at every hardware
+  classification exit — the `open_as` failure mapping, the codec-type
+  mismatch, and the post-commit classifier — reading the reason before
+  the state is released. It clears on read, so a refusal cannot be
+  reported a second time against a backend that never declined
+  anything.
+
+### Fixed — send-side side data had no ceiling at all
+
+- **The read side has capped side data at 64 entries and 256 KiB since
+  it was written; the send side capped nothing.** The preflight looked
+  at `body.len()` and then `attach_side_data` allocated every entry the
+  caller handed over, one `av_packet_new_side_data` at a time, with
+  nothing counting or weighing them — so annotations the demux boundary
+  would have refused coming *out* of a container went straight into
+  libavcodec going *in*. The same asymmetry `PacketLimits` was
+  introduced to close for the packet body, one field along.
+
+  The whole list is now judged before anything is allocated — including
+  the body, because a list that cannot be carried should not cost a
+  packet first — against the read side's own caps, one seat in both
+  directions. Over-count and over-bytes are distinguished by name
+  (`SendSideDataTooLarge`), so a caller can tell "too many annotations"
+  from "too much annotation".
+
+### Fixed — two dimension vocabularies, and judges reading the wrong one
+
+- **`max_pixels` bounds the display extent; the allocation is the coded
+  one.** `ff_set_dimensions` applies `av_image_check_size2` to the dims
+  the decoder passes it, and for a cropped stream those are the
+  *display* dims. Minted and measured: an h264 clip with SPS cropping of
+  32x32 out of a 1920x1088 macroblock grid — a 2040x divergence —
+  is admitted by `max_pixels = 5000`, because 32x32 is 1024 pixels.
+
+  On the software road that gap was already closed, and this was
+  measured rather than assumed: `get_buffer2` receives the frame at
+  **coded** dims (1920x1088, aligned to 1920x1090, a 2,092,831-byte
+  allocation), so `judge_buffer` bounds the real extent. The hardware
+  road never reaches `get_buffer2` at all, which left the coded surface
+  unjudged there.
+
+  The `get_format` callback this crate already owns is the seat: it is
+  the last moment before the hardware pool is built and the first at
+  which the coded extent is known. It now applies the same `max_pixels`
+  the context carries to the aligned coded dims.
+
+  **The refusal mode, censused rather than chosen.** A `get_format`
+  callback cannot return a reason — declining means `AV_PIX_FMT_NONE`,
+  which libavcodec reports as `Invalid data found when processing
+  input`: true about what it saw, false about what happened, since the
+  data was fine and this crate declined it. So the reason is left in the
+  callback's own state (already owned, already in `opaque`) and the
+  probe funnel turns it back into `Error::HwSurfaceTooLarge` before
+  recording the attempt. The caller gets the aligned coded pixel count
+  and the ceiling, not FFmpeg's misnomer.
+
+- **`judge_hw_transfer` priced the display extent too.** What
+  `av_hwframe_transfer_data` allocates is sized from the frames context,
+  not from `AVFrame.width`. This crate already had
+  `hw_frames_ctx_dimensions`, whose doc comment names this exact trap
+  and whose own test uses an 8192-pool-over-100-display fixture — and
+  the first cut of this judge reached past it for the display dims
+  anyway. It now prices every transfer candidate at the pool dims and
+  takes the worst.
+
+  It also **fails closed**: a hardware frame whose pool extent cannot be
+  read is charged as unbounded, because an unprovable extent is not a
+  small one. A frame that is not a hardware frame at all is passed
+  through instead — `av_hwframe_transfer_data` refuses such a source
+  and allocates nothing, so answering "too large" there would put a
+  ceiling's name on a different fault.
+
+- **The sweep.** Every site reading a dimension is now tabulated in the
+  `convert` module docs with the vocabulary it needs. Two more reads in
+  `drain_into_pending` turned out to be log fields, sizing nothing;
+  `copy_out_planes` and the public `width`/`height` accessors are
+  correct as they stand. The rule the table states: *the extent to judge
+  is the one the allocator will use, and it is read from whatever
+  structure the allocation is sized from, never assumed.*
+
+### Fixed — a side-data allocation failure no longer publishes a partial frame
+
+- **OOM mid-copy was absorbed.** `av_frame_new_side_data` returning null
+  logged a warning, stopped copying, and returned `Ok(())` — publishing
+  a frame carrying whatever side data happened to fit before the
+  allocator gave out. What sits in that list is the HDR mastering
+  metadata, the ICC profile and the display matrix: a picture that comes
+  back with its colours or its orientation quietly missing is worse than
+  one that does not come back, because nothing downstream can tell.
+
+  The failure is returned now. The caller already knew what to do with
+  it — it unrefs the partial destination and either advances to the next
+  backend or surfaces the failure for a software retry — so this is a
+  `break` becoming a `return`, against machinery that was already in
+  place. Covered by fault injection through the crate's existing
+  `av_max_alloc` subprocess harness, which forces the null for real
+  rather than testing the propagation shape by hand.
+
+### Fixed — the hardware road gets the seat the allocator hook cannot reach
+
+- **`judge_buffer` is not a universal choke point.** `ff_get_buffer`
+  calls `hwaccel->alloc_frame` directly and never reaches `get_buffer2`
+  at all, and `av_hwframe_transfer_data` allocates its CPU destination
+  outside both hooks. Censused on this machine: VideoToolbox is the only
+  hardware config h264, hevc and vp9 advertise, the device opens, and a
+  VideoToolbox h264 decode of a 160x120 clip records **zero**
+  `get_buffer2` calls while producing a hardware frame.
+
+  **What the census settled about the surface itself:** `max_pixels`
+  *does* bite before `alloc_frame`, measured rather than assumed. With
+  `max_pixels = 100` the same decode fails at `avcodec_open2` with
+  `Picture size 160x120 exceeds specified max pixel count 100` from
+  `av_image_check_size2` — zero `get_buffer2` calls, no frame. The check
+  is in `ff_set_dimensions`, which every decoder runs when it learns its
+  dimensions and before any surface pool exists, so the seat
+  `max_pixels` already occupies covers the hardware surface too. The
+  residual there is the aligned-dimensions gap, and it applies to
+  **driver-owned GPU memory** rather than to anything this crate
+  carries.
+
+  **What this crate does carry off that road is the CPU frame**, and it
+  now has an exact judge: `judge_hw_transfer` runs before *every*
+  `av_hwframe_transfer_data` call. The destination format is not this
+  crate's to choose — `dst.format` is `AV_PIX_FMT_NONE` on entry and
+  FFmpeg picks from `av_hwframe_transfer_get_formats` — so the whole
+  candidate list is priced at the transfer's own alignment and the worst
+  taken, walked as `*const c_int` through a new shim because a driver
+  may offer a format this build does not name. Over-ceiling is
+  `Error::HwTransferTooLarge`.
+
+  It is judged at the call site rather than inside `transfer_hw_frame`
+  on purpose: errors from that function are FFmpeg's, and the arms
+  around it reclassify them into "the hardware failed, fall back to
+  software". A byte ceiling is not a hardware failure — software would
+  decode the same oversized frame and be refused again — so the named
+  refusal returns straight to the caller instead. On the probe-replay
+  road the same judge reports through that path's existing error
+  channel, where every failure is collapsed into "try the next
+  backend"; the reason is logged rather than named, because a name
+  there has no consumer.
+
+  This is also what closes the degenerate-shape residual on the
+  hardware road. The pixel ruler bounds `w * h * 16`, but a transfer
+  pads every row: a one-pixel-wide frame of N rows costs 64N bytes for
+  N pixels in NV12 at 32-byte alignment, which is four times the ceiling
+  the pixel ruler would have allowed. The shape is not producible with
+  any encoder available here — h264 and hevc will not encode a
+  one-pixel-wide stream — so the guard is stated and reasoned rather
+  than driven by a lane. What *is* pinned is its accepting path: a real
+  decode through `VideoDecoder`'s auto-probe still delivers frames.
+
+### Fixed — the sample ceiling counted channels twice
+
+- **`max_samples` was over-divided, and it refused valid media.**
+  FFmpeg compares `nb_samples * ch_layout.nb_channels` — the
+  channel-sample count — against the field, which is already the
+  per-channel accounting the ruler wanted. Dividing by the channel count
+  as well charged it twice: at the 512 MiB default the ceiling was
+  263,172 channel-samples instead of 67,108,864, and a **valid**
+  6-channel FLAC block of 65,535 samples (393,210 channel-samples, about
+  1.5 MiB of `s32`) was refused as a bomb.
+
+  What made this easy to get wrong is that FFmpeg's own log message
+  prints only `nb_samples` — "samples per frame 4096, exceeds
+  max_samples 10000" — while having compared 4096 x 6 = 24576 against
+  10000. Measured on this build to the unit: a 6-channel 4096-sample
+  frame is accepted at exactly 24576 and refused at 24575.
+
+  The ruler is now `max_frame_bytes / worst_bytes_per_sample`, and
+  FFmpeg supplies the channel count itself.
+
+  **The lesson, recorded in the test rather than only in prose.** The
+  pin that was supposed to catch this asserted the same arithmetic the
+  production code used, so when that arithmetic was wrong the pin agreed
+  with it — a pin that restates the implementation tests nothing. It now
+  pins the *consumer's* semantics: the exact channel-sample boundary,
+  driven through a real 6-channel decode at 24576 and at 24575, plus the
+  6-channel FLAC block that the old ruler refused.
+
+### Fixed — the enum discipline, re-applied to the code that enforces it
+
+- **The pixel-format census was undefined behaviour on its own reason
+  for existing.** It walks this build's descriptor table to price the
+  most expensive format libavcodec can emit — the point being to be
+  correct about formats the bindings may not name — and the generated
+  `av_pix_fmt_desc_get_id` hands those ids back as a closed
+  `AVPixelFormat`. Every future format would have become an invalid Rust
+  enum value on the way *into* the pricing meant to handle it.
+
+  Local ABI-compatible shims now declare `av_pix_fmt_desc_get_id`,
+  `av_image_get_buffer_size` and `av_get_bytes_per_sample` with `c_int`,
+  joining `avcodec_find_decoder`. Both Rust declarations resolve to the
+  same C symbol; an unknown id never becomes an enum on the Rust side.
+
+  The sweep table in the `convert` module docs gains these rows, marked
+  as what they are: the open-C-enum class **inside this crate's own new
+  code**. Writing the discipline down was not enough — it had to be
+  re-applied to the code that enforces it.
+
+### Fixed — the ceiling now follows the allocator, not the header
+
+- **Dimension alignment walked straight past the pixel ceiling.**
+  `max_pixels` is checked against the frame's *raw* `width * height`;
+  what libavcodec then allocates is the shape
+  `avcodec_align_dimensions2` rounds that up to. For degenerate aspect
+  ratios those are not the same number. Measured on this build:
+
+  | shape | raw | aligned | inflation |
+  |---|---|---|---|
+  | `gray8` 65536x1 | 65,536 px / 64 KiB | 65536x32 = 2,097,152 px / 2 MiB | **32x** |
+  | `gray8` 1x65536 | 65,536 px / 64 KiB | 16x65536 = 1,048,576 px / 2 MiB | 16x |
+  | `yuv420p` 7680x4320 | 33,177,600 px | unchanged | 1.00x |
+  | `gray8` 1024x1024 | 1,048,576 px | unchanged | 1.00x |
+
+  So a one-pixel-tall frame slipped 32 times its declared cost past a
+  1 MiB ceiling — and no value of that scalar could have fixed it,
+  because bounding a product cannot bound a product whose factors are
+  then rounded up independently. Real pictures inflate by nothing at
+  all, which is exactly why the ceiling looked sound.
+
+  **The road, chosen by measurement.** `get_format` was censused first,
+  being the smaller instrument: it receives the context, needs no
+  allocation decision, and could apply the same scalar to aligned
+  dimensions. It **does not fire on every road** — on this build a
+  one-shot `mjpeg` decode calls it once and a `png` decode calls it
+  *zero* times, and cover art is overwhelmingly one or the other, so
+  half the guarded road would have been unguarded. `get_buffer2` fired
+  on both, sees the frame's real format rather than a negotiated
+  candidate, and is the allocator itself.
+
+  **The `opaque` conflict was dissolved rather than solved.** No state
+  is needed: the callback reads the ceiling from
+  `AVCodecContext.max_pixels`, the field this crate set itself, and
+  applies it to the aligned dimensions. Same scalar, same meaning,
+  applied where alignment is knowable. `opaque` is untouched, so the
+  hardware path keeps it, and there is no allocation whose lifetime has
+  to outlive a C callback. Panic discipline is structural rather than
+  asserted: the body allocates nothing, indexes nothing, unwraps
+  nothing, and calls three FFmpeg functions — and an `extern "C"` fn
+  aborts rather than unwinding into C regardless.
+
+- **Audio had no pre-allocation guard at all.**
+  `AVCodecContext.max_samples` — FFmpeg's audio `max_pixels`, compared
+  against a frame's `nb_samples` in `ff_get_buffer` before the planes
+  are allocated — was left at `INT64_MAX`, so the audio family leaned
+  entirely on this crate's post-decode byte check: refusing after
+  libavcodec had already paid.
+
+  The ruler is `max_frame_bytes` divided by the worst cost of one
+  sample: the widest sample format this build can emit (`s64`/`dbl` and
+  their planar twins at 8 bytes — censused through the new shim, not
+  assumed) times the most channels this crate will carry (255, where
+  the conversion refuses by name). At the 512 MiB default that is
+  **263,172 samples per frame**, which clears everything real by a wide
+  margin — FLAC's largest block is 65,535, Opus tops out at 5,760, AAC
+  at 2,048, and a full second of 192 kHz audio would be 192,000.
+
+  Planar alignment padding sits outside the ruler (at most
+  `align x channels`, about 8 KiB at 255 channels) and is left to the
+  post-decode check, which stays as the backstop.
+
+  Both rulers are pinned by a unit test, because both are censuses of
+  the build rather than constants: a ceiling whose documented
+  derivation no longer matches its arithmetic is worse than one with no
+  documentation at all.
+
+### Fixed — the pre-allocation ceiling stops negotiating with the file
+
+- **The byte-derived pixel ceiling was priced from the container's
+  declared format, and a declaration is not an upper bound.** It may be
+  unset, it may be wrong, and it may be narrower than what the decoder
+  actually emits — a stream declaring `yuv420p` at 1.5 bytes per pixel
+  whose decoder outputs `rgbaf32` at 16 got a ceiling more than ten
+  times too generous. The undeclared-format fallback charged 8 bytes per
+  pixel while this crate delivers 16-byte layouts, so 512 MiB admitted
+  ~67 Mpx, which at 16 bytes is ~1 GiB inside libavcodec before the
+  post-decode backstop said anything. The hole was one layer below the
+  one the ceiling had just been added to close.
+
+  The rate is no longer negotiated with the file at all: **every stream
+  is charged the worst per-pixel cost any format this build can emit**,
+  and that worst case is measured rather than tabulated. The descriptor
+  table is walked once per process and each format priced through
+  `av_image_get_buffer_size` — the same function
+  `avcodec_default_get_buffer2` sizes from — so a future FFmpeg that
+  adds a wider format is priced correctly without this crate learning
+  its name.
+
+  **The census:** 267 descriptors, 251 of them CPU formats that price
+  (the rest are hardware surfaces carrying no CPU bytes). The maximum is
+  **16.000 bytes per pixel**, reached by eight formats — `gbrapf32be/le`,
+  `rgbaf32be/le`, `rgba128be/le`, `gbrap32be/le` — with the 12-byte
+  `gbrpf32`/`rgbf32` family next below. Measured on a 256x256 probe,
+  which divides every chroma subsampling and every alignment libavcodec
+  uses, so the figure is the rate and not a rounding artefact; the same
+  census at 257 reads 16.934, and that 5.8% is per-*row* padding, a term
+  linear in height rather than in pixels.
+
+  **The trade, stated:** over-refusal for cheap formats. At the 512 MiB
+  default the effective ceiling is ~33.55 Mpx, so 8K (33.18 Mpx) still
+  decodes in *any* format — including the 16-byte ones, where it really
+  does cost 506 MiB — but a 16K `yuv420p` frame that would only have
+  cost 199 MB is refused with it. That is the honest shape of a bound
+  that has to hold before the format is known, and the deployment answer
+  is `max_frame_bytes`, which is exactly the knob for how much memory
+  one frame may cost. A compile-time assertion now pins 8K-at-16-bytes
+  under the default, so lowering the default or meeting a wider format
+  fails the build rather than quietly refusing 8K at run time.
+
+  **`get_buffer2` was reconsidered and again not taken.** The blocking
+  problem is unchanged and was not solved: it needs per-context side
+  state, `AVCodecContext.opaque` is already owned by the hardware path's
+  callback state, and composing the two means one state struct threaded
+  through the shared context builder and both decoder families behind an
+  FFI callback whose lifetime and panic discipline would have to be
+  proved rather than asserted. The measured worst-case rate reaches the
+  same allocation, one layer earlier, with no callback and no state.
+
+### Fixed — a still bought its planes before judging its annotations
+
+- **The side-data budget ran after `copy_out_planes`.** The refusal was
+  correct and it arrived after the expensive half of the work: an
+  over-budget still had already paid for up to `max_frame_bytes` of
+  plane copies before its annotations were so much as totalled.
+
+  The measuring pass — which reads only the entry count and each entry's
+  declared `size`, dereferences no payload and allocates nothing — is
+  hoisted to run with the other free judgements, before a single plane
+  is bought. The copying pass re-runs it: repeating two comparisons that
+  guard an allocation is defence in depth, and it keeps that function
+  correct on its own terms rather than only in the order it happens to
+  be called in.
+
+  The rule this settles, now in the `convert` module docs: **everything
+  a conversion can refuse is refused before anything it can allocate is
+  allocated.**
+
+### Fixed — the open-C-enum discipline extends to the dependency's API
+
+- **The image decoder opened through `Decoder::video()`.** That resolves
+  the codec by reading `AVCodecParameters.codec_id` as the bindgen
+  `AVCodecID` and then reads `AVCodecContext.codec_type` as
+  `AVMediaType`. Both are open C enums FFmpeg extends in
+  ABI-compatible releases, and forming a Rust enum from a value outside
+  this build's discriminant set is undefined behaviour before any
+  comparison can run. The hardware path has bypassed that API since it
+  was written — the image road, which is the one a *file* chooses the
+  codec id on, was still going through it.
+
+  The sweep that followed found the same call on three more roads (the
+  software video, audio and subtitle decoders) and
+  `Parameters::medium()` on four (track building, attachment
+  classification, the resampler's spec check, and a `Debug` impl). All
+  are closed: the codec is resolved off a raw `u32`, the medium is
+  proved off a raw `i32` through a shared `ensure_codec_type`, and
+  `medium()` is replaced by a total fold into a `MediaKind` this crate
+  owns.
+
+  The `medium()` calls had a recorded defence — `AVMediaType`'s set is
+  tiny and stable — and it was true enough to have never bitten. That
+  is a reason it was unlikely, not a reason it was sound, so the
+  exception is gone rather than re-argued. No attacker-reachable path in
+  this crate now forms a bindgen enum out of FFmpeg memory.
+
+### Fixed — three numbers judged after they were spent
+
+- **The corruption gate read the loud field and not the quiet one.**
+  `AV_FRAME_FLAG_CORRUPT` is set rarely; `AVFrame.decode_error_flags` is
+  what h264 actually writes for a frame it concealed its way through,
+  with the frame flag left clear. The gate now treats any nonzero value
+  as corruption — not an enumeration of the members this build names,
+  which would re-open the door on the next release.
+
+- **Crop arithmetic was unchecked and accepted a zero-extent rect.**
+  The crops are `size_t`, so `left + right` is a real overflow: a panic
+  in debug, a wrap in release, and a wrapped sum passes the extent test
+  and narrows into a rect pointing outside the picture. Each pair is
+  `checked_add`ed now, sums are refused at `>=` the extent as FFmpeg's
+  own `av_frame_apply_cropping` does, and the narrowing happens only
+  after both proofs.
+
+- **An undersized stride was consumed as if it were a padded one.** A
+  `linesize` *below* the format's row width fell into the branch for
+  strides that are larger, so the ceiling was charged for bytes the
+  plane did not have and the real refusal was left to the copy loop —
+  by which time every earlier plane had been allocated and copied and
+  thrown away, and the error reported was whichever ceiling the inflated
+  total tripped rather than the layout fault underneath it.
+
+  The pass structure changed with the fix: the byte ceiling is judged
+  from the **geometry alone**, which no number the frame chose can
+  influence, so it runs first and reads nothing; then every stride is
+  judged in its own pass; only then does the copy loop allocate. The
+  copy loop keeps its own form of the check, one comparison guarding a
+  `from_raw_parts`.
+
+### Fixed — a still's ICC profile no longer takes its orientation with it
+
+- **The shared 256 KiB side-data cap silently swallowed legitimate
+  profiles.** On a video stream that cap is defensible: side data there
+  is small, repeated and per-frame. On a decoded still it was wrong
+  twice. A still *is* its annotations — the ICC profile that decides its
+  colours and the display matrix that decides its orientation both live
+  there, both carried by exactly one frame — and the parameter road next
+  door already admits ICC profiles up to 16 MiB, so the same profile was
+  accepted as a track parameter and dropped as a frame annotation. The
+  drop was also positional: entries past the cap were skipped, so a
+  large profile pushed the display matrix off the end and the picture
+  came back silently rotated wrong.
+
+  The still road gets its own configurable seat,
+  `FrameLimits::max_image_side_data_bytes`, defaulting to the same 16
+  MiB as `DEFAULT_MAX_CODEC_PARAMETER_BYTES` — with a compile-time
+  assertion that the two stay aligned, because a ceiling that admits a
+  profile on one road and drops it on the other is not a policy but an
+  accident of which road the file took. Over-budget is a named refusal
+  (`ImageSideDataTooLarge`, `ImageSideDataEntries`), judged whole before
+  anything is copied, never a truncated list. The shared stream road
+  keeps its caps and its behaviour.
+
+### Fixed — a validator that runs after its own field's first consumer
+
+- **The channel ceiling was reading a laundered number.** The refusal
+  added for 256-channel packed audio took its count off the materialised
+  `ChannelLayoutDescription` — which stores `nb_channels.max(0)`. So the
+  guard against a bad count was reading a value the layout helper had
+  already floored: a declared `-1` arrived as a legitimate-looking `0`
+  and, on a zero-sample frame, produced a frame instead of a refusal.
+
+  Worse in the other direction, materialising *runs first*. For an
+  `AV_CHANNEL_ORDER_CUSTOM` layout that means rendering the layout name
+  through FFmpeg and walking `nb_channels` map entries into a
+  `Vec::with_capacity(nb_channels)` — work proportional to the number
+  the ceiling exists to bound, performed before the bound is applied.
+
+  The count is now read straight off `AVChannelLayout.nb_channels` as
+  the signed integer it is, every refusal is stated against that raw
+  value, and only a count already proved to be in `0..=255` is allowed
+  to drive the description. `UnsupportedChannelCount` carries an `i32`
+  accordingly.
+
+- **The same inversion on the picture roads, found by auditing for it
+  rather than by being told.** `width` and `height` were floored with
+  `.max(0)` before anything judged them, so a declared `-1` became `0`
+  — and zero pixels is under every ceiling, so a `VideoFrame` (or
+  `ImageFrame`) of zero extent was built and returned. Negative
+  dimensions are now refused by name as `InvalidDimensions`, on both
+  roads. Zero is deliberately not refused: it is what an unset dimension
+  reads as, and inventing a refusal for it would be policy this audit
+  has no evidence for.
+
+  Two more on the same sweep: the byte-ceiling pass consumed
+  `linesize[i]` with a `.max(0)` while the copy loop below did the
+  judging, and `crop_*` — a `size_t` — was truncated with `as u32`, so a
+  crop of `2^32 + 5` became a perfectly plausible `5` and produced a
+  visible rect that was wrong in a way nothing could see. The stride
+  refusal is hoisted into the pass that first reads it; the crops are
+  kept in `u64` and checked for coherence against the frame's own
+  extent, and an incoherent one now withholds the annotation instead of
+  fabricating a zero-extent rect.
+
+  The whole census — every raw header field on the audio, video and
+  image paths, with its validator and its first consumer — is recorded
+  as a table in the `convert` module docs, because the answer to "is
+  this ordered correctly" should not have to be re-derived by reading.
+
+### Fixed — the image seam stopped dropping packet flags
+
+- **Every attachment reached libavcodec with a zeroed `flags` field.**
+  The one-shot image road rebuilt its `AVPacket` from the payload bytes
+  alone, so everything the portable packet said about itself stopped at
+  the seam. The three stream families have always rebuilt through
+  `write_md_flags`; the image road now does too, rather than growing a
+  second copy of it.
+
+  `AV_PKT_FLAG_DISCARD` is the flag this recovers: measured on this
+  build, libavcodec genuinely obeys it and produces no frame, so
+  forwarding it is both necessary and sufficient. Before this, a packet
+  the caller had marked as one to drop was decoded anyway.
+
+- **`CORRUPT` is refused at the seam, and the census is why.** Measured
+  with a real cover-art payload: the flag reaches libavcodec and
+  libavcodec does nothing with it — mjpeg returns a full picture and
+  leaves `AV_FRAME_FLAG_CORRUPT` clear. Forwarding it would therefore
+  not preserve the fact, only move where it is dropped, and `ImageFrame`
+  has no flag seat to land it in.
+
+  So a payload marked corrupt is refused by name (`ImageDecodeError::Corrupt`)
+  rather than decoded into a picture whose only warning has been deleted
+  en route. The sibling road is closed with it: a decoder that hands
+  back a picture and marks the *frame* corrupt is refused the same way,
+  because that fact has exactly as little room to live in an
+  `ImageFrame`. A caller who wants the bytes decoded regardless can
+  clear the flag it set.
+
+### Fixed — the audio header is judged, never clipped
+
+- **A malformed audio header could arrive as a well-formed frame.** Two
+  numbers on the decode path were floored instead of refused, and both
+  turned a bad frame into a plausible one — which is worse than an
+  error, because nothing downstream has a reason to doubt it.
+
+  `nb_samples` was clamped with `.max(0)`, so a negative count became
+  the *empty frame* shape: a refusal delivered as a successful decode of
+  nothing. And the sample format was only checked inside the non-zero
+  arm, so a zero-sample frame with `AV_SAMPLE_FMT_NONE` — the state a
+  codec context is in before its decoder opens — or an unknown format
+  came back as an `AudioFrame` advertising a format nothing can
+  interpret. A frame carrying no samples still has to say what it is.
+
+  Every header field is now judged before a byte of geometry is
+  computed: `InvalidSampleCount` names a negative count,
+  `UnsupportedSampleFormat` names a format with no byte width, and the
+  zero-sample shortcut is taken only for a count that is *exactly*
+  zero. `linesize[0]` is refused when negative at any sample count
+  rather than floored.
+
+- **Packed audio above 255 channels was silently truncated.** The
+  channel count was clipped to `u8::MAX`, and only *planar* layouts
+  refused the excess — via the plane ceiling, which packed audio never
+  reaches, because packed declares one plane at any channel count. So a
+  256-channel one-sample S16 frame computed its byte product from 255,
+  copied 510 of its 512 valid bytes, and handed back a frame advertising
+  a channel count the file never declared. Two lies, neither reported.
+
+  `UnsupportedChannelCount` now refuses the count before any plane
+  geometry exists, and the packed byte product uses the declared count
+  with no substituted `1`. A frame claiming samples across zero channels
+  is refused as incoherent rather than treated as mono.
+
+- **The same clip on the resampler, closed at the same choke point.**
+  `check_spec` refused planar specs past eight planes but let a packed
+  256-channel spec through, and every output frame then took
+  `.clamp(0, 255)` on the way into its channel seat. It is refused at
+  construction now, for both ends, as `ResampleError::UnsupportedChannelCount`
+  — construction being the only place a *target* refusal can be acted
+  on, since the later one arrives after `swr` has consumed the input.
+
+  With the ceiling stated once, the three defensive floors it hid behind
+  (`channels.max(0)` twice, `channels.max(1)` in the byte product) are
+  gone: `plane_bytes` refuses a non-positive count through the `Option`
+  it already returns instead of inventing a channel.
+
+  The audio path now carries **no lossy numeric clamp**. The one
+  surviving floor, `sample_rate.max(0)`, was censused and kept with the
+  reason recorded at the site: it feeds no geometry, no allocation and
+  no copy length, and zero is already this crate's "rate unspecified".
+
+### Fixed — a zero-sample audio frame is a frame
+
+- **An empty audio frame was refused as a layout error.** FFmpeg's
+  canonical zero-sample frame carries a format, a layout and a rate with
+  `data[i] == NULL`, `linesize == 0` and no `AVBufferRef` — nothing is
+  allocated because there is nothing to hold. The plane loop still
+  demanded every pointer be non-null and buffer-backed, so a header
+  frame mid-stream came back as `InvalidPlaneLayout` and interrupted a
+  decode that was going fine.
+
+  The loop now does not run when there are no valid bytes. The declared
+  layout is still reported — `plane_count` stays packed's 1 or planar's
+  channel count — and those slots hold the shared empty carrier at
+  stride 0, so a consumer sees the shape it expects carrying no samples,
+  which is what the frame says. No allocation: the empty carrier is one
+  refcount bump, and six declared planes share it.
+
+  The non-zero path is untouched. The whole change removes one line —
+  the loop header — and the body is byte-identical.
+
+### Fixed — valid bytes, the send leg, and two exact caps
+
+- **An audio plane exported its alignment padding.** The copy took
+  `linesize[0]`, which is what `av_samples_get_buffer_size` *allocated*
+  — rounded up for alignment — rather than
+  `nb_samples * bytes_per_sample` (times the channel count when
+  packed), which is what the decoder actually wrote. That formed a
+  `&[u8]` over bytes nothing initialises, which is undefined behaviour
+  before anything reads them, and handed that stale heap to a consumer
+  inside a safe `FfmpegBytes`. `linesize` is now used for exactly one
+  thing: proving the source allocation is as large as it claims. What
+  is copied is the valid product, and the plane's stride agrees with
+  it.
+
+  **Class sweep of every exit**, and the distinction that matters:
+
+  | exit | exports | verdict |
+  |---|---|---|
+  | audio planes | was `linesize`, now the valid sample product | **fixed** |
+  | video/image planes, tight stride | `plane_h × linesize` where `linesize == row_bytes` | correct — no padding exists by definition of the branch |
+  | video/image planes, padded stride | `row_bytes × plane_h`, copied row-wise | correct — the per-row padding is stepped over, never read |
+  | subtitle bitmap | `linesize[0] × h` from the rect | correct — FFmpeg's documented valid extent for `AVSubtitleRect` |
+  | palette | a fixed `AVPALETTE_SIZE` | correct — the format's own size |
+  | packet payloads | `AVPacket.size` | correct — the declared payload, not the buffer |
+  | resampler output | `per_sample × produced` | correct, and always was — the decode path now agrees with it |
+
+  Video's stride-including rows are *initialised decoder output
+  geometry*: a consumer reads them through the stride the plane
+  carries. Audio has no such geometry — the padding past the samples is
+  not part of any layout, which is why the two cases resolve
+  differently.
+
+- **The reverse packet builders enforced no budget.**
+  `ffmpeg_packet_from_{video,audio,subtitle}_packet` rebuild a packet
+  into an `AVPacket` through `try_packet_copy`, which checked only
+  `c_int::MAX` — so a configured `max_packet_bytes` was dead on the road
+  a caller feeds a decoder directly, and bytes the demux boundary would
+  have refused went straight into libavcodec. All three now take
+  `PacketLimits` and judge before the allocation, with a new
+  `PacketBuildError::SendPayloadTooLarge` named for the direction. This
+  is the **into-FFmpeg packet road** of the budget class and it is in
+  the accounting table under the same rule.
+
+  The subtitle session **discarded `DecoderLimits` after open**; it
+  retains them now, like the other two, and exposes them through
+  `limits()`.
+
+- **`try_clone_parameters` hardcoded the crate default.** The active
+  `max_codec_parameter_bytes` is threaded through every clone on the
+  decoder tier — the initial ownership clone, the probe state's copy,
+  every probe advance and the software fallback — so a lowered ceiling
+  binds before `build_codec_context` and a raised one is actually
+  usable between 16 MiB and the configured value.
+
+- **Synthesized-attachment admission charged padding the clone never
+  allocates.** The carrier is an `FfmpegBytes` over the payload alone
+  and the clone omits extradata entirely on that road, so the padded
+  figure billed 64 bytes nobody spends — rejecting a payload in the
+  last 64 bytes below the ceiling that the image road, judging the same
+  bytes, accepts. `ParameterFootprint` now reports the raw
+  `extradata_payload` alongside the padded clone cost, and the
+  admission pass charges carriers the former. Both attachment tiers are
+  exact, and the demux and image roads agree at the cap.
+
+### Fixed — the roads into FFmpeg, and two still layouts
+
+- **Every decoder entry point now measures its parameters.**
+  `avcodec_parameters_to_context` is a wholesale copy *into* libavcodec
+  — it duplicates `extradata`, every `coded_side_data` entry and the
+  channel map into the context — and `VideoDecoder::open_with_limits`
+  and `FfmpegImageDecoder::open` reached it with whatever the caller
+  declared. The outbound clone had been closed; this was the inbound
+  one. **Choke point**: `build_codec_context` measures and admits
+  before the call, and every decoder in this crate opens through that
+  one function (the four session `open`s, the HW probe's `build_state`,
+  its per-backend advances, the software fallback), so there is no
+  second road to guard.
+
+- **The image decoder's compressed input has a ceiling.** `decode`
+  duplicates its payload into an `AVPacket`, capped by nothing but
+  `c_int::MAX` on the road that skips the demuxer. New
+  `DecoderLimits::max_image_input_bytes`, defaulting to
+  `DEFAULT_MAX_ATTACHMENT_BYTES` (64 MiB) — the attachment family,
+  because what this seam decodes *is* an attachment, and a packet-family
+  default would have made the direct road a gigabyte more permissive
+  than the demuxed one for the same bytes. New
+  `ImageDecodeError::InputTooLarge`.
+
+  Both seats ride a new `DecoderLimits`, which composes `FrameLimits`
+  with the two things a decoder spends before it has produced anything.
+  The four session `open`s take it in place of `FrameLimits`; the
+  resampler keeps `FrameLimits`, having no parameters to copy.
+
+- **Open C enums are no longer read as closed Rust ones.**
+  `measure_parameters` formed `&AVPacketSideData` and loaded
+  `AVChannelOrder` directly. Both are *open* enums: an ABI-compatible
+  FFmpeg newer than the bindings emits values these do not name, and a
+  typed reference asserts every field inhabits its declared type —
+  undefined behaviour before a field is read. Descriptor fields now go
+  through `addr_of!` and integer reads, side-data type ids are copied
+  as **raw bits** (a kind this build cannot name is still a kind the
+  file carries), and an unrecognised channel order **fails closed**,
+  because its union arm is unknown and both "owns nothing" and "owns
+  `nb_channels` of something" would be guesses. Swept the diff for
+  siblings: the remaining bindgen-enum reads in this crate already went
+  through raw `i32` windows (`from_av_pixel_format`,
+  `collect_side_data`, `packet_side_data`, `channel_layout`,
+  `build_tracks`' codec id).
+
+- **A synthesized attachment is cloned with `extradata` omitted from
+  the outset**, not copied and stripped afterwards. The old shape
+  allocated the payload for no reason and — worse — charged it against
+  the *parameter* ceiling on the way past, so a font between the two
+  ceilings (over the 16 MiB parameter one, under the 64 MiB attachment
+  one) passed the admission pass and then failed deterministically
+  inside the clone. New `ExtradataPolicy` makes the clone's accounting
+  the same accounting the admission did.
+
+- **Indexed and 1-bit stills decode.** Cover art is routinely an
+  indexed PNG (`pal8`) and sometimes a 1-bit one (`monob`); both were
+  refused outright. **Nothing is converted** — mediadecode delivers
+  what FFmpeg decoded, and turning `pal8` into RGB is colconv's job one
+  tier along — so a paletted still arrives as its indices plus its
+  palette and a 1-bit still as packed rows.
+
+  **The still road was widened, not the shared one.** Measured choice:
+  widening the shared road would change what every existing video
+  consumer can be handed (`is_supported_cpu_pix_fmt`, the HW-transfer
+  validation and the video suites all key off the same deliverability
+  answer) to serve formats motion video does not occur in. The still
+  road is one `PlaneRoad` enum away. Both layouts are **format**-bounded
+  rather than budget-bounded: libavutil already computes a 1-bit row as
+  `ceil(width / 8)`, and the palette is a flat `AVPALETTE_SIZE` run —
+  256 × `AV_PIX_FMT_RGB32`, always. The palette needed its own copier
+  arm because FFmpeg leaves its `linesize` at zero, which the strided
+  path reads as an unusable layout.
+
+- **The footprint counts the extradata padding.**
+  `AV_INPUT_BUFFER_PADDING_SIZE` is allocated by every copy, so a
+  ceiling that measured only the payload admitted 64 bytes per stream
+  more than it agreed to. Counted now, and the omit policy removes
+  payload *and* padding together, which makes the ceilings exact.
+
+### Fixed — the wholesale codec-parameter copy is gone
+
+- **`avcodec_parameters_copy` no longer runs on attacker data
+  anywhere.** It deep-copies every heap field an `AVCodecParameters`
+  has, and it did so before anything asked how big they were. Two
+  rounds patched the field that had been noticed; the third found
+  another — `coded_side_data`, where a MOV `prof` atom puts an **ICC
+  profile**, on an ordinary video track that no attachment-shaped check
+  ever looked at. Three findings of one class is not three bugs, so the
+  copy itself was replaced rather than guarded again.
+
+  **The inventory it was replaced against** (FFmpeg n9.0, 33 fields, 3
+  of them heap): `extradata`; `coded_side_data`, meaning the descriptor
+  array *and* each entry's payload; and `ch_layout`'s custom channel
+  map. Everything else is scalar.
+
+  `extras::bounded_clone_parameters` enumerates those three **by hand**.
+  Scalars travel by a bytewise struct copy — so a scalar field a future
+  FFmpeg adds is carried for free — and the three pointer seats are
+  then nulled on the destination and rebuilt one at a time, each
+  measured before it is copied and the whole footprint admitted against
+  a budget first. A heap field nobody enumerated is a field that is
+  **not copied**, which loses data rather than allocating it, and a
+  compile-time size tripwire on `AVCodecParameters` fires when the
+  struct changes shape so the omission cannot go unnoticed.
+
+  The rule is stated where the clone lives: *no code path in this crate
+  hands attacker-sized parameter data to a wholesale FFI copy.* Every
+  parameter copy in the crate now goes through this one function,
+  including `TrackExtra::clone_parameters` and `try_clone`, which are
+  judged against the footprint their row was admitted at.
+
+  Decode-capability parity is the oracle and it holds with **zero
+  assertion edits**: `extradata` keeps its `AV_INPUT_BUFFER_PADDING_SIZE`
+  trailing zeroes, every `coded_side_data` entry keeps its type and
+  payload, and `ch_layout` is copied through `av_channel_layout_copy` —
+  the one FFmpeg call left on the path, over a single field whose size
+  was measured first. The decode, resample and image suites pass
+  unchanged.
+
+- **The preflight now sees every stream, not every attachment.**
+  `admit_streams` (was `admit_attachments`) measures each stream's
+  parameter footprint — allocation-free, checked arithmetic — and
+  charges it against two new seats before the track loop clones
+  anything.
+
+  | seat | default | why |
+  |---|---|---|
+  | `DemuxLimits::max_codec_parameter_bytes` | 16 MiB | SPS/PPS is tens of bytes and FLAC headers are kilobytes; what sets the ceiling is the ICC profile in `coded_side_data`, legitimately 0.5–2 MB for a camera or display profile and up to ~10 MB for a device link. |
+  | `DemuxLimits::max_total_codec_parameter_bytes` | 64 MiB | Four tracks with a large profile apiece is the realistic high end; nothing in the per-stream ceiling bounds a two-hundred-stream table. |
+
+  New arms: `DemuxError::ParametersTooLarge` and
+  `DemuxError::ParametersBudgetExhausted`, separate for the same reason
+  the attachment pair are.
+
+- **Residency accounting closed the undercharge.** A synthesized
+  attachment's `extradata` is charged to the *attachment* budget, where
+  the carrier holds it, and left out of the *parameter* budget, because
+  the clone strips it — one set of bytes, one charge. Cover art is
+  charged its parked packet to the attachment budget and its retained
+  parameter heap (including any `coded_side_data`) to the parameter
+  budget. `TrackExtra::parameter_bytes()` reports what a row actually
+  retains.
+
+### Fixed — two sibling paths walked around the ceilings
+
+- **An attachment's payload was copied before its budget was charged.**
+  `build_tracks` deep-copies each stream's `AVCodecParameters` on its
+  way to a `TrackExtra`, and for an `AVMEDIA_TYPE_ATTACHMENT` stream
+  **the extradata inside those parameters is the attachment's payload**
+  (measured: a 27-byte font fixture reports `extradata_size=27`). So the
+  loop paid for the payload — a full `avcodec_parameters_copy` — one
+  statement before asking whether it was allowed to. A file declaring a
+  gigabyte of "font" allocated the gigabyte and then reported that a
+  gigabyte was too much.
+
+  The fix is not a check moved a few lines earlier, because any
+  per-track interleaving of judging and paying has the same shape: the
+  aggregate budget is only knowable once every track has been *seen*.
+  The new `admit_attachments` pass judges the whole file first, reading
+  two integers per stream and allocating nothing, and only a container
+  that passes in full reaches the loop that builds carriers and
+  parameter copies.
+
+- **An accepted attachment retained two copies of itself.** The
+  synthesized road kept the payload in its carrier *and* in the
+  parameter copy's extradata, behind a budget that counted one of them.
+  Censused before it was changed: nothing can use that extradata —
+  libavcodec has no decoder for a font, so no road opens a codec
+  context from those parameters, and the payload reaches a consumer as
+  the attachment packet, which is the delivery the demux tier promises.
+  `build_tracks` now strips it. Cover art keeps its extradata: there the
+  payload is the parked `AVPacket`, the extradata is not a copy of it, a
+  still codec can legitimately need it (MJPEG with an external Huffman
+  table), and the measurement says a cover-art stream carries none
+  anyway.
+
+  What the budget charges is now **residency**, not payload: a hoisted
+  cover-art track is charged its parked packet *plus* the extradata it
+  retains, a synthesized one only its carrier. That is what makes the
+  budget an honest statement about memory rather than about file
+  structure.
+
+- **The resampler's output had no byte ceiling.** `output_capacity`
+  bounds the output *sample count*, and only at `i32::MAX` — the
+  structural limit of `av_frame_get_buffer`. Nothing bounded the bytes,
+  and the two are related by a ratio the caller does not control: the
+  capacity is `input_samples × target_rate / source_rate`, and a source
+  spec read off an untrusted container can say 1 Hz. 1000 samples at a
+  declared 1 Hz against a 48 kHz target is 48,000,001 output samples —
+  comfortably inside the existing guard — and 384 MB of `f32` stereo,
+  allocated twice counting the carrier copy, from an 8 KB input.
+
+  `FfmpegResampler::new` now takes `FrameLimits` and
+  `check_output_bytes` refuses over-budget conversions **before**
+  `av_frame_get_buffer` and before any session state moves, with a new
+  `ResampleError::OutputTooLarge`. `FrameLimits` rather than a seat of
+  the resampler's own: the quantity is bytes of one produced audio
+  frame, which is what `max_frame_bytes` means everywhere else, and one
+  number for "what a frame may cost" beats a second vocabulary.
+
+- **Terminal closure for the class.** Every `FfmpegBytes` construction
+  site in the crate is now enumerated in `buffer.rs`'s module docs,
+  each row naming what bounds it — a `limits` seat for a size that comes
+  from a file, a format constant for a size that is a property of the
+  format, and structurally-zero for the placeholder sites. The table
+  lives beside the constructors so a new exit has to answer the question
+  the existing ones already answered. Both rounds' findings were rows
+  nobody had written down, not exceptions to a rule.
+
+### Changed — the padded-plane copy allocates once
+
+- A plane whose stride is padded is now written **row by row straight
+  into the carrier's allocation** (`Arc::new_uninit_slice`, stabilised
+  in Rust 1.82 and well under this workspace's 1.95 MSRV), through a
+  new crate-internal `FfmpegBytes::from_rows`. The previous spelling
+  staged the plane in a `Vec` and then copied it into an `Arc`:
+  **two allocations and two copies**, so a 250 MiB frame peaked at
+  750 MiB counting FFmpeg's own. It now peaks at the unavoidable 2×.
+
+  The staging `Vec`'s `try_reserve_exact` went with it; the ceiling
+  above took its place, and refuses earlier and by name. The side-data
+  collectors keep their staging `Vec`, because side data is capped at
+  256 KiB and a reportable first allocation is worth the doubling
+  there; the plane paths are not small and are not.
+
+### Fixed — the orientation escape lost the words that made it unnameable
+
+- `ImageOrientation::Other` carries **all nine** display-matrix words,
+  not the four of the linear part, and a matrix is read as a *named*
+  orientation only when the other five are canonical — no translation
+  in `x`/`y`, no perspective in `u`/`v`, and unity (`1 << 30`, 2.30
+  fixed point per `libavutil/display.h`) in `w`.
+
+  As shipped a moment ago it matched on the linear four alone, so a
+  matrix that turned the picture **and** shifted or projected it was
+  read as the plain turn and the extra words were dropped. That is
+  precisely the collapse this crate's escape-carries-never-collapses
+  law exists to prevent, one level in from where the law is usually
+  applied. `linear()` remains, now documented as the four-word
+  *projection* it always was, and a new `matrix()` answers the whole
+  nine — reconstructing the canonical form for a named variant and
+  returning what it was handed, unchanged, for the escape.
+
+### Notes
+
+- **The copy is infallible where the view was fallible.** `Arc<[u8]>`
+  has no fallible constructor on stable Rust, so an exhausted
+  allocator aborts at a copy site rather than returning
+  `ConvertError::BufferAcquireFailed`. Everything that bounds *how
+  much* can be asked for is unchanged and still runs first — the
+  side-data entry and byte caps, the plane-geometry checks, the
+  `find_backing_buffer` extent proof — so a hostile stream cannot
+  reach that abort by demanding memory. Where a staging `Vec` was
+  already in the path (the padded-plane copy, the side-data payload
+  copies) its `try_reserve_exact` is kept, so the large allocation
+  stays a named refusal and only the carrier copy that follows,
+  asked for a size the allocator has just granted, is infallible.
+
+- **The resampler's ordering law is intact.** `prepare_output` used to
+  acquire one `AVBufferRef` view per output plane before
+  `swr_convert_frame` ran, because wrapping a plane could fail and
+  nothing fallible may run after the conversion has consumed input.
+  The views are gone; the *proof* is not — every plane pointer is
+  still checked non-null and checked to address `plane_len` bytes
+  inside one of the frame's own buffers on the near side, so
+  `finish_output` copies without anything left to judge and remains
+  infallible.
+
 ## [0.8.0] - 2026-08-24
 
 ### Added

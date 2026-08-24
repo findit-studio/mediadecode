@@ -383,6 +383,9 @@ fn oracle_geometry(pf: &PixelFormat, w: usize, h: usize) -> Option<PlaneGeometry
     count,
     row_bytes,
     height,
+    // This reference implementation models the video road, which has
+    // no palette plane.
+    palette_plane: None,
   })
 }
 

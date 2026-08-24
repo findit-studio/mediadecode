@@ -67,7 +67,7 @@
 //! Frames produced by either path are converted via
 //! [`crate::convert::av_frame_to_video_frame`] so the consumer sees
 //! the same `mediadecode::VideoFrame<PixelFormat, VideoFrameExtra,
-//! FfmpegBuffer>` shape regardless of which backend produced it.
+//! FfmpegBytes>` shape regardless of which backend produced it.
 
 use std::collections::VecDeque;
 
@@ -86,7 +86,7 @@ use ffmpeg_next::{Packet, codec::Parameters, frame};
 use mediadecode::{Timebase, decoder::VideoStreamDecoder, frame::VideoFrame, packet::VideoPacket};
 
 use crate::{
-  Error, Ffmpeg, FfmpegBuffer, Frame, VideoDecoder, boundary,
+  DecoderLimits, Error, Ffmpeg, FfmpegBytes, Frame, VideoDecoder, boundary,
   convert::{self, ConvertError},
   decoder::{build_codec_context, try_clone_parameters},
   error::FallbackFailed,
@@ -110,6 +110,10 @@ pub struct FfmpegVideoStreamDecoder {
   /// `receive_frame` delivers from this queue before pulling new
   /// frames from the SW decoder. Empty in steady-state operation.
   sw_replay_frames: VecDeque<frame::Video>,
+  /// Resource ceilings for the frames this decoder exports, and for the
+  /// `AVCodecContext`s it opens — HW candidates, the SW fallback, and
+  /// any decoder a later probe advance builds all get the same number.
+  limits: DecoderLimits,
   /// `true` once `send_eof` has been called on the active decoder.
   /// Used to propagate EOF to the SW decoder when fallback fires
   /// during the drain phase — without this, codecs that hold tail
@@ -198,7 +202,57 @@ enum DecodeState {
   /// fake HW decoder.
   Hw(Box<dyn HwInner>),
   /// Software decoder. Terminal state.
-  Sw(ffmpeg_next::decoder::Video),
+  Sw(SwDecoder),
+}
+
+/// A software decoder and the callback state its codec context points
+/// at.
+///
+/// The state carries the allocator judge's byte budget and the
+/// `get_format` declination; it has to outlive the `AVCodecContext`
+/// that references it, which is why it is a field here rather than a
+/// value dropped at the end of `open_sw_decoder`.
+///
+/// `Deref` so that every call site keeps talking to the decoder and
+/// only the construction changed — this pairing is a lifetime fact, not
+/// a new abstraction.
+pub(crate) struct SwDecoder {
+  decoder: ffmpeg_next::decoder::Video,
+  /// Declared **after** the decoder: fields drop in declaration order,
+  /// so the codec context is freed before the state it points at.
+  _callback_state: Box<crate::ffi::CallbackState>,
+}
+
+impl SwDecoder {
+  /// The callback state this decoder's codec context points at.
+  ///
+  /// Handed out as a raw pointer so an error closure can consult it
+  /// while the decoder itself is mutably borrowed — every software send
+  /// / receive / EOF failure on this road goes through
+  /// [`crate::decoder::software_exit`] with it, so a frame the
+  /// allocator judge refused surfaces named instead of as the `EINVAL`
+  /// libavcodec also uses for corrupt input.
+  ///
+  /// `Deref` alone was not enough: it exposes the decoder and hides the
+  /// state, so every call site kept wrapping raw and the budget refusal
+  /// had no way out on the whole software road — including the replay
+  /// and cold-fallback helpers, which drop the state when they finish.
+  pub(crate) fn state(&self) -> *const crate::ffi::CallbackState {
+    &*self._callback_state
+  }
+}
+
+impl core::ops::Deref for SwDecoder {
+  type Target = ffmpeg_next::decoder::Video;
+  fn deref(&self) -> &Self::Target {
+    &self.decoder
+  }
+}
+
+impl core::ops::DerefMut for SwDecoder {
+  fn deref_mut(&mut self) -> &mut Self::Target {
+    &mut self.decoder
+  }
 }
 
 /// What the cold SW decoder is fed on a **post-commit** degrade transition,
@@ -226,7 +280,19 @@ impl FfmpegVideoStreamDecoder {
   ///
   /// Subsequent mid-stream `AllBackendsFailed` from the HW path
   /// triggers the same SW fallback (with rescued packets replayed).
-  pub fn open(parameters: Parameters, time_base: Timebase) -> Result<Self, Error> {
+  ///
+  /// `limits` bounds what one decoded frame may cost. It is taken here
+  /// rather than through a builder because half of it —
+  /// [`DecoderLimits::max_pixels`] — is written into every
+  /// `AVCodecContext` this decoder opens, and a context's ceiling
+  /// cannot be moved after `avcodec_open2`. That includes the contexts
+  /// opened later, by a mid-stream fallback or a probe advance: the
+  /// limits are retained for exactly that reason.
+  pub fn open(
+    parameters: Parameters,
+    time_base: Timebase,
+    limits: DecoderLimits,
+  ) -> Result<Self, Error> {
     // ffmpeg-next's `Parameters` carries an optional `owner: Rc<dyn Any>`
     // (when constructed from `stream.parameters()` it points back at
     // the demuxer's `AVStream`). Upstream marks the type `Send`
@@ -244,20 +310,22 @@ impl FfmpegVideoStreamDecoder {
     // the subsequent `avcodec_parameters_copy` against that null
     // destination is C UB. Our checked helper surfaces the OOM as
     // an error instead.
-    let owned_parameters = try_clone_parameters(&parameters).map_err(Error::Ffmpeg)?;
+    let owned_parameters = try_clone_parameters(&parameters, limits.max_codec_parameter_bytes())?;
     let hw_scratch = Frame::empty()?;
     let sw_scratch = alloc_av_video_frame()?;
-    let state =
-      match VideoDecoder::open(try_clone_parameters(&owned_parameters).map_err(Error::Ffmpeg)?) {
-        Ok(hw) => DecodeState::Hw(Box::new(hw)),
-        Err(Error::AllBackendsFailed(_)) => {
-          // Open-time HW exhaustion: no rescued packets (open didn't
-          // see any). Just open SW directly from our owned copy.
-          let sw = open_sw_decoder(&owned_parameters)?;
-          DecodeState::Sw(sw)
-        }
-        Err(other) => return Err(other),
-      };
+    let state = match VideoDecoder::open_with_frame_limits(
+      try_clone_parameters(&owned_parameters, limits.max_codec_parameter_bytes())?,
+      limits,
+    ) {
+      Ok(hw) => DecodeState::Hw(Box::new(hw)),
+      Err(Error::AllBackendsFailed(_)) => {
+        // Open-time HW exhaustion: no rescued packets (open didn't
+        // see any). Just open SW directly from our owned copy.
+        let sw = open_sw_decoder(&owned_parameters, limits)?;
+        DecodeState::Sw(sw)
+      }
+      Err(other) => return Err(other),
+    };
     Ok(Self {
       state,
       parameters: owned_parameters,
@@ -269,6 +337,7 @@ impl FfmpegVideoStreamDecoder {
       degraded_keyframe_seen: false,
       degraded_packets_since_fallback: 0,
       time_base,
+      limits,
     })
   }
 
@@ -368,7 +437,10 @@ impl FfmpegVideoStreamDecoder {
     unconsumed_packets: &[ffmpeg_next::Packet],
     eof_pending: bool,
   ) -> Result<(), Error> {
-    let mut sw = open_sw_decoder(&self.parameters)?;
+    let mut sw = open_sw_decoder(&self.parameters, self.limits)?;
+    // Bound before the decoder is mutably borrowed, so the error
+    // closures below can still consult it.
+    let sw_state = sw.state();
     let mut local_replay: VecDeque<frame::Video> = VecDeque::new();
     // Helper: drain SW into the local replay queue, capped at
     // `SW_REPLAY_FRAME_CAP`.
@@ -382,6 +454,7 @@ impl FfmpegVideoStreamDecoder {
     // committed over corruption.
     fn drain_into(
       sw: &mut ffmpeg_next::decoder::Video,
+      state: *const crate::ffi::CallbackState,
       local_replay: &mut VecDeque<frame::Video>,
     ) -> std::result::Result<(), Error> {
       loop {
@@ -409,7 +482,7 @@ impl FfmpegVideoStreamDecoder {
           Err(ffmpeg_next::Error::Eof) => break,
           // Any other error is a genuine decode failure on a replayed
           // packet — surface it so it is not masked as a clean fallback.
-          Err(other) => return Err(Error::Ffmpeg(other)),
+          Err(other) => return Err(crate::decoder::software_exit(state, other)),
         }
       }
       Ok(())
@@ -421,7 +494,7 @@ impl FfmpegVideoStreamDecoder {
         match sw.send_packet(pkt) {
           Ok(()) => break,
           Err(ffmpeg_next::Error::Other { errno }) if errno == ffmpeg_next::error::EAGAIN => {
-            drain_into(&mut sw, &mut local_replay)?;
+            drain_into(&mut sw, sw_state, &mut local_replay)?;
             attempts += 1;
             if attempts > 16 {
               return Err(Error::Ffmpeg(ffmpeg_next::Error::Other {
@@ -429,7 +502,7 @@ impl FfmpegVideoStreamDecoder {
               }));
             }
           }
-          Err(other) => return Err(Error::Ffmpeg(other)),
+          Err(other) => return Err(crate::decoder::software_exit(sw_state, other)),
         }
       }
     }
@@ -442,7 +515,7 @@ impl FfmpegVideoStreamDecoder {
         match sw.send_eof() {
           Ok(()) => break,
           Err(ffmpeg_next::Error::Other { errno }) if errno == ffmpeg_next::error::EAGAIN => {
-            drain_into(&mut sw, &mut local_replay)?;
+            drain_into(&mut sw, sw_state, &mut local_replay)?;
             attempts += 1;
             if attempts > 16 {
               return Err(Error::Ffmpeg(ffmpeg_next::Error::Other {
@@ -450,7 +523,7 @@ impl FfmpegVideoStreamDecoder {
               }));
             }
           }
-          Err(other) => return Err(Error::Ffmpeg(other)),
+          Err(other) => return Err(crate::decoder::software_exit(sw_state, other)),
         }
       }
     }
@@ -468,7 +541,7 @@ impl FfmpegVideoStreamDecoder {
     // decoder stays on HW — nothing is committed. (Only the probe-era path
     // reaches this; the post-commit path degrades via `degrade_to_sw` and never
     // replays, so it has no drained frames to commit or convert.)
-    drain_into(&mut sw, &mut local_replay)?;
+    drain_into(&mut sw, sw_state, &mut local_replay)?;
     // Commit: only after replay, any EOF forwarding, AND the final drain
     // succeeded do we move the new SW decoder and queue into `self`.
     self.sw_replay_frames.append(&mut local_replay);
@@ -499,8 +572,28 @@ impl FfmpegVideoStreamDecoder {
   fn degrade_to_sw(&mut self, input: PostCommitInput<'_>) -> Result<(), Error> {
     match self.degrade_to_sw_inner(input) {
       Ok(()) => Ok(()),
-      // Post-commit rescue is always empty: the probe buffer is gone, and we
-      // retain no replay frames, so there are no packets to hand back.
+      // **A budget refusal is not a fallback failure.** It travels
+      // unwrapped, and the spelling was chosen rather than inherited:
+      //
+      // * `FallbackFailed` means the fallback *machinery* could not
+      //   complete, and its contract is to hand back the unconsumed
+      //   packets so a caller can re-drive them. On this road that set
+      //   is empty by construction — the probe buffer is gone and no
+      //   replay frames are retained — so the envelope carries no
+      //   recovery affordance at all, only a label.
+      // * And the label is the wrong one. Re-driving is the natural
+      //   response to a fallback failure, and re-driving a budget
+      //   refusal under the same limits refuses identically. Naming it
+      //   a fallback failure invites an action that cannot succeed,
+      //   while `FrameBudgetExceeded` names the one that can: raise
+      //   the ceiling, or accept the refusal.
+      //
+      // So it keeps the same spelling here as on every other road. One
+      // fact, one name.
+      Err(budget @ Error::FrameBudgetExceeded(_)) => Err(budget),
+      // Everything else really is the machinery failing, and keeps the
+      // envelope — empty rescue set and all, which is what a
+      // post-commit failure has to hand back.
       Err(source) => Err(Error::FallbackFailed(FallbackFailed::new(
         Box::new(source),
         std::vec::Vec::new(),
@@ -512,7 +605,14 @@ impl FfmpegVideoStreamDecoder {
   /// and on success commits + enters degraded-resync mode. Returns `Err` (and
   /// commits nothing) if SW cannot open or the forward fails.
   fn degrade_to_sw_inner(&mut self, input: PostCommitInput<'_>) -> Result<(), Error> {
-    let mut sw = open_sw_decoder(&self.parameters)?;
+    let mut sw = open_sw_decoder(&self.parameters, self.limits)?;
+    // Captured before the decoder is borrowed for the forward, and
+    // before it can be dropped on the error road: this temporary
+    // decoder owns the callback state, so a `judge_buffer` refusal
+    // recorded during either forward below dies with it unless the
+    // reason is collected here. That was the last software road still
+    // wrapping libavcodec's `EINVAL` raw.
+    let state = sw.state();
     let mut forwarded_keyframe = false;
     let mut forwarded_packet = false;
     match input {
@@ -520,7 +620,8 @@ impl FfmpegVideoStreamDecoder {
         // The HW decoder REFUSED this packet, so it was never decoded; forward
         // it to the cold SW. A failure here surfaces (it is not silently
         // dropped) and rolls back to HW.
-        sw.send_packet(pkt).map_err(Error::Ffmpeg)?;
+        sw.send_packet(pkt)
+          .map_err(|e| crate::decoder::software_exit(state, e))?;
         forwarded_keyframe = pkt.is_key();
         forwarded_packet = true;
       }
@@ -530,7 +631,8 @@ impl FfmpegVideoStreamDecoder {
         // EOF was pending on the HW path; the cold SW must also see it so codecs
         // that delay tail frames don't hang. A cold decoder (no packets sent)
         // has no buffered output, so this cannot return EAGAIN.
-        sw.send_eof().map_err(Error::Ffmpeg)?;
+        sw.send_eof()
+          .map_err(|e| crate::decoder::software_exit(state, e))?;
       }
     }
     // Commit: only after a clean open + forward.
@@ -614,18 +716,19 @@ impl FfmpegVideoStreamDecoder {
   /// `mediadecode::VideoFrame` and write into `dst`.
   fn deliver_frame(
     &mut self,
-    dst: &mut VideoFrame<mediadecode::PixelFormat, VideoFrameExtra, FfmpegBuffer>,
+    dst: &mut VideoFrame<mediadecode::PixelFormat, VideoFrameExtra, FfmpegBytes>,
   ) -> Result<(), VideoDecodeError> {
     let av_frame = match &mut self.state {
       DecodeState::Hw(_) => unsafe { self.hw_scratch.as_inner_mut().as_ptr() },
       DecodeState::Sw(_) => unsafe { self.sw_scratch.as_ptr() },
     };
     // SAFETY: the scratch frame is live (just filled by the inner
-    // decoder's `receive_frame`); convert bumps refcounts on each
-    // plane buffer it pulls into the produced VideoFrame so the
-    // scratch can be reused on the next call.
-    let new_frame = unsafe { convert::av_frame_to_video_frame(av_frame, self.time_base) }
-      .map_err(VideoDecodeError::Convert)?;
+    // decoder's `receive_frame`); convert copies every plane it takes
+    // into the produced VideoFrame, so the scratch can be reused on
+    // the next call and the frame keeps nothing of it.
+    let new_frame =
+      unsafe { convert::av_frame_to_video_frame(av_frame, self.time_base, self.limits.frame()) }
+        .map_err(VideoDecodeError::Convert)?;
     *dst = new_frame;
     Ok(())
   }
@@ -643,7 +746,8 @@ impl FfmpegVideoStreamDecoder {
     parameters: Parameters,
     time_base: Timebase,
   ) -> Result<Self, Error> {
-    let owned_parameters = try_clone_parameters(&parameters).map_err(Error::Ffmpeg)?;
+    let limits = DecoderLimits::default();
+    let owned_parameters = try_clone_parameters(&parameters, limits.max_codec_parameter_bytes())?;
     Ok(Self {
       state: DecodeState::Hw(hw),
       parameters: owned_parameters,
@@ -655,6 +759,7 @@ impl FfmpegVideoStreamDecoder {
       degraded_keyframe_seen: false,
       degraded_packets_since_fallback: 0,
       time_base,
+      limits,
     })
   }
 
@@ -695,14 +800,14 @@ impl FfmpegVideoStreamDecoder {
 
 impl VideoStreamDecoder for FfmpegVideoStreamDecoder {
   type Adapter = Ffmpeg;
-  type Buffer = FfmpegBuffer;
+  type Buffer = FfmpegBytes;
   type Error = VideoDecodeError;
 
   fn send_packet(
     &mut self,
     packet: &VideoPacket<VideoPacketExtra, Self::Buffer>,
   ) -> Result<(), Self::Error> {
-    let av_pkt = boundary::ffmpeg_packet_from_video_packet(packet)
+    let av_pkt = boundary::ffmpeg_packet_from_video_packet(packet, self.limits.packet_limits())
       .map_err(|e| VideoDecodeError::Decode(Error::PacketBuild(e)))?;
     match &mut self.state {
       DecodeState::Hw(hw) => match hw.send_packet(&av_pkt) {
@@ -746,16 +851,18 @@ impl VideoStreamDecoder for FfmpegVideoStreamDecoder {
           // in the replay set. A failure here surfaces (it is not silently
           // dropped).
           if let DecodeState::Sw(sw) = &mut self.state {
+            let st = sw.state();
             sw.send_packet(&av_pkt)
-              .map_err(|e| VideoDecodeError::Decode(Error::Ffmpeg(e)))?;
+              .map_err(|e| VideoDecodeError::Decode(crate::decoder::software_exit(st, e)))?;
           }
           Ok(())
         }
         Err(other) => Err(VideoDecodeError::Decode(other)),
       },
       DecodeState::Sw(sw) => {
+        let st = sw.state();
         sw.send_packet(&av_pkt)
-          .map_err(|e| VideoDecodeError::Decode(Error::Ffmpeg(e)))?;
+          .map_err(|e| VideoDecodeError::Decode(crate::decoder::software_exit(st, e)))?;
         // A keyframe fed across an unresolved post-commit gap is the resync
         // anchor; record it so the next delivered frame can clear the guard.
         self.note_degraded_keyframe(av_pkt.is_key());
@@ -779,10 +886,11 @@ impl VideoStreamDecoder for FfmpegVideoStreamDecoder {
     // enters degraded mode).
     if let Some(replayed) = self.sw_replay_frames.pop_front() {
       // SAFETY: `replayed` is a live AVFrame owned by us; convert
-      // bumps refcounts on each plane buffer.
-      let new_frame =
-        unsafe { convert::av_frame_to_video_frame(replayed.as_ptr(), self.time_base) }
-          .map_err(VideoDecodeError::Convert)?;
+      // copies every plane it takes.
+      let new_frame = unsafe {
+        convert::av_frame_to_video_frame(replayed.as_ptr(), self.time_base, self.limits.frame())
+      }
+      .map_err(VideoDecodeError::Convert)?;
       self.resync_on_frame();
       *dst = new_frame;
       return Ok(());
@@ -824,11 +932,16 @@ impl VideoStreamDecoder for FfmpegVideoStreamDecoder {
             // immediately — preserves stream order vs. whatever the
             // SW decoder will produce next.
             if let Some(replayed) = self.sw_replay_frames.pop_front() {
-              // SAFETY: `replayed` is a live AVFrame owned by us; convert bumps
-              // refcounts on each plane buffer.
-              let new_frame =
-                unsafe { convert::av_frame_to_video_frame(replayed.as_ptr(), self.time_base) }
-                  .map_err(VideoDecodeError::Convert)?;
+              // SAFETY: `replayed` is a live AVFrame owned by us; convert
+              // copies every plane it takes.
+              let new_frame = unsafe {
+                convert::av_frame_to_video_frame(
+                  replayed.as_ptr(),
+                  self.time_base,
+                  self.limits.frame(),
+                )
+              }
+              .map_err(VideoDecodeError::Convert)?;
               self.resync_on_frame();
               *dst = new_frame;
               return Ok(());
@@ -841,13 +954,18 @@ impl VideoStreamDecoder for FfmpegVideoStreamDecoder {
           // Convert inline (rather than via `deliver_frame`, which borrows all
           // of `self`) so only the disjoint fields `sw_scratch` / `time_base`
           // are touched alongside the `self.state` borrow `sw` holds.
+          let st = sw.state();
           match sw.receive_frame(&mut self.sw_scratch) {
             Ok(()) => {
               // SAFETY: the scratch frame is live (just filled by
-              // `receive_frame`); convert bumps plane refcounts so the
-              // scratch can be reused on the next call.
+              // `receive_frame`); convert copies every plane it takes,
+              // so the scratch can be reused on the next call.
               let new_frame = unsafe {
-                convert::av_frame_to_video_frame(self.sw_scratch.as_ptr(), self.time_base)
+                convert::av_frame_to_video_frame(
+                  self.sw_scratch.as_ptr(),
+                  self.time_base,
+                  self.limits.frame(),
+                )
               }
               .map_err(VideoDecodeError::Convert)?;
               // SW produced a frame. Clear degraded mode only if a keyframe was
@@ -882,7 +1000,11 @@ impl VideoStreamDecoder for FfmpegVideoStreamDecoder {
                 PostCommitNeverResynced::new(packets_lost),
               ));
             }
-            Err(e) => return Err(VideoDecodeError::Decode(Error::Ffmpeg(e))),
+            Err(e) => {
+              return Err(VideoDecodeError::Decode(crate::decoder::software_exit(
+                st, e,
+              )));
+            }
           }
         }
       }
@@ -928,9 +1050,11 @@ impl VideoStreamDecoder for FfmpegVideoStreamDecoder {
         }
         Err(other) => Err(VideoDecodeError::Decode(other)),
       },
-      DecodeState::Sw(sw) => sw
-        .send_eof()
-        .map_err(|e| VideoDecodeError::Decode(Error::Ffmpeg(e))),
+      DecodeState::Sw(sw) => {
+        let st = sw.state();
+        sw.send_eof()
+          .map_err(|e| VideoDecodeError::Decode(crate::decoder::software_exit(st, e)))
+      }
     };
     // Commit EOF state only on success — a failed fallback left `self.eof_sent`
     // untouched (restored-by-construction: we never mutated it), so HW stays
@@ -963,15 +1087,24 @@ impl VideoStreamDecoder for FfmpegVideoStreamDecoder {
   }
 }
 
-fn open_sw_decoder(parameters: &Parameters) -> Result<ffmpeg_next::decoder::Video, Error> {
+fn open_sw_decoder(parameters: &Parameters, limits: DecoderLimits) -> Result<SwDecoder, Error> {
   // Use the checked codec-context builder — ffmpeg-next's
   // `Context::from_parameters` calls `Context::new()` which doesn't
   // null-check `avcodec_alloc_context3`'s return value before
   // running `avcodec_parameters_to_context` against it. Under
   // memory pressure that's C-level UB; `build_codec_context`
   // surfaces the OOM as an error instead.
-  let ctx = build_codec_context(parameters)?;
-  ctx.decoder().video().map_err(Error::Ffmpeg)
+  let (ctx, callback_state) = build_codec_context(parameters, limits)?;
+  // Opened without forming a bindgen enum from FFmpeg memory: the codec
+  // is resolved off a raw `codec_id`, and the medium is proved off a raw
+  // `codec_type`. See `crate::decoder::ensure_codec_type`.
+  let codec = crate::decoder::find_decoder(parameters)?;
+  let opened = ctx.decoder().open_as(codec).map_err(Error::Ffmpeg)?;
+  crate::decoder::ensure_video_codec_type(&opened)?;
+  Ok(SwDecoder {
+    decoder: ffmpeg_next::decoder::Video(opened),
+    _callback_state: callback_state,
+  })
 }
 
 /// Payload for [`VideoDecodeError::PostCommitNeverResynced`].

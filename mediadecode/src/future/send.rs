@@ -11,8 +11,8 @@
 
 pub use super::local::{
   SendAudioFrameSource as AudioFrameSource, SendAudioStreamDecoder as AudioStreamDecoder,
-  SendSubtitleDecoder as SubtitleDecoder, SendVideoFrameSource as VideoFrameSource,
-  SendVideoStreamDecoder as VideoStreamDecoder,
+  SendImageDecoder as ImageDecoder, SendSubtitleDecoder as SubtitleDecoder,
+  SendVideoFrameSource as VideoFrameSource, SendVideoStreamDecoder as VideoStreamDecoder,
 };
 
 #[cfg(test)]
@@ -20,8 +20,9 @@ mod tests {
   use super::*;
   use crate::{
     Timebase, Timestamp,
-    adapter::{AudioAdapter, SubtitleAdapter, VideoAdapter},
-    frame::{AudioFrame, SubtitleFrame, VideoFrame},
+    adapter::{AudioAdapter, ImageAdapter, SubtitleAdapter, VideoAdapter},
+    demuxer::AttachmentPacket,
+    frame::{AudioFrame, ImageFrame, SubtitleFrame, VideoFrame},
     packet::{AudioPacket, SubtitlePacket, VideoPacket},
   };
   use core::num::NonZeroI32;
@@ -46,6 +47,14 @@ mod tests {
   struct SLoop;
   impl SubtitleAdapter for SLoop {
     type CodecId = u32;
+    type PacketExtra = ();
+    type FrameExtra = ();
+  }
+
+  struct ILoop;
+  impl ImageAdapter for ILoop {
+    type CodecId = u32;
+    type PixelFormat = u32;
     type PacketExtra = ();
     type FrameExtra = ();
   }
@@ -179,6 +188,19 @@ mod tests {
     }
   }
 
+  struct SendImage;
+  impl ImageDecoder for SendImage {
+    type Adapter = ILoop;
+    type Buffer = &'static [u8];
+    type Error = LoopError;
+    async fn decode(
+      &mut self,
+      _: &AttachmentPacket<(), &'static [u8]>,
+    ) -> Result<ImageFrame<u32, (), &'static [u8]>, LoopError> {
+      Err(LoopError)
+    }
+  }
+
   #[test]
   fn send_traits_are_implementable() {
     fn _v<D: VideoStreamDecoder>() {}
@@ -186,11 +208,13 @@ mod tests {
     fn _a<D: AudioStreamDecoder>() {}
     fn _as<D: AudioFrameSource>() {}
     fn _s<D: SubtitleDecoder>() {}
+    fn _i<D: ImageDecoder>() {}
     _v::<SendVideo>();
     _vs::<SendVideoSrc>();
     _a::<SendAudio>();
     _as::<SendAudioSrc>();
     _s::<SendSubtitle>();
+    _i::<SendImage>();
   }
 
   /// Locks in that the `Send`-bound is enforced — the trait
@@ -200,5 +224,8 @@ mod tests {
   fn send_bounds_propagate() {
     fn _spawnable<D: VideoStreamDecoder + Send>() {}
     _spawnable::<SendVideo>();
+    // And the newest face is spawnable on the same terms.
+    fn _spawnable_image<D: ImageDecoder + Send>() {}
+    _spawnable_image::<SendImage>();
   }
 }
