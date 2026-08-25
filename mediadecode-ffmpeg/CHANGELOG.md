@@ -234,6 +234,448 @@ The backend-agnostic core it adapts has its own log at
 
 ## [0.9.0] - 2026-08-24
 
+### Added — the second carrier lane
+
+*User-ruled 2026-08-25, and folded into 0.9.0 because the release is
+unpublished: the bare names change meaning, and nothing outside this
+workspace has seen them yet.*
+
+- **`FfmpegBuffer` returns**, with 0.8's name and semantics: an
+  `av_buffer_ref`-refcounted view onto FFmpeg's own allocation, `Send`
+  and **not** `Sync`, `Clone` a refcount bump, `AsRef<[u8]>`. It is not
+  0.8 restored unchanged — every lesson from the amputation round that
+  lands on this type has been re-applied:
+
+  - the **extent is proved before a view exists**. 0.8 formed a view
+    over a packet's claimed range and let a malformed `size` hand out a
+    slice nobody had checked; the proof now runs in `payload_of`, which
+    **both lanes share**, so the view lane cannot regress it
+    independently;
+  - `AV_PKT_FLAG_TRUSTED` is refused on both legs, and for a sharper
+    reason here — sharing an allocation does not make its pointers own
+    what they name;
+  - the budgets are unchanged, because they judge sizes and not copies:
+    a ceiling bounds what a caller is handed and asked to hold, and on
+    this lane also how long a pool slot stays out.
+
+- **A sealed carrier seam, whose operations are not reachable at all.**
+  `FfmpegCarrier` names a lane and says what it carries; every operation
+  lives on `CarrierOps`, a crate-private trait that is deliberately
+  **not** a supertrait of it.
+
+  Two walls were tried before that one held. Sealing closed the seam to
+  outside *implementations* and left every operation callable. Moving
+  the operations onto the seal — a `pub trait` in a private module —
+  looked airtight and was not: associated items resolve through a
+  **bound**, not through a path, so `fn f<C: FfmpegCarrier>()` written
+  in a downstream crate type-checked `C::from_rows(1, 64, |_| &[0])`
+  (safe, and an out-of-bounds read) and `C::capture_packet_payload(..)`
+  (which mints the padding claim the send leg trusts). Only a trait no
+  writable bound reaches actually stops a call. Six `compile_fail`
+  doctests — rustdoc compiles each as a separate downstream crate — pin
+  that, each against the exact error code.
+
+  In the same spirit, `FfmpegBuffer`'s extent-taking constructors are
+  crate-private, and the row gather **checks** each row's length rather
+  than asserting it: a `debug_assert` is a note to the author, not a
+  bounds check, and it is absent from the profile that matters.
+
+  **The public faces are written per lane** so that no signature a
+  consumer reads names a trait they cannot: `CarrierDemuxer`, the four
+  decoders and `CarrierResampler` carry only `C: FfmpegCarrier` on their
+  declarations, and their inherent and trait impls are macro-generated
+  once per lane over crate-private generic bodies. A consumer can
+  therefore hold and name `CarrierDemuxer<C>` in their own generic code
+  and be generic over `C::Buffer`. What they cannot do is *drive* a lane
+  generically — that needs the operations — so lane-generic helpers take
+  `C::Buffer` and the doors are instantiated at the two concrete lanes.
+  Compile-**pass** doctests pin the first, the six compile-fail ones pin
+  the second.
+
+- **A refusal that another attempt could survive costs no packet.**
+  `av_read_frame` advances the container: once it returns, that packet
+  is off the wire and nothing brings it back. A conversion that then
+  failed on an *allocation* — a refcount the view lane could not take,
+  a copy the shared road could not make — dropped it, leaving a live
+  session that answered the next pull with the **following** packet.
+  Compressed data and subtitle cues went missing under memory pressure,
+  quietly, and a caller who retried could not tell.
+
+  The read and the conversion are now one transaction with a seat
+  between them: a transient refusal parks the packet, and the next pull
+  re-attempts *that* packet before reading another. It is the same
+  park-then-replay the decode household already runs — the video
+  decoder holds `sw_replay_frames`, the probe holds its rescue history —
+  for the same reason: a byte C has already given up is not re-askable.
+  The provenance is parked with the packet rather than re-probed, since
+  it is an observation about the moment of delivery.
+
+  Only *transient* refusals park, decided by a crate-private
+  `parks_in_demux`: an allocation
+  that failed says nothing about the packet, while a payload outside its
+  own buffer or a body past the ceiling is a fact about it, and parking
+  those would answer every later pull with the same error instead of
+  letting the session make progress.
+
+  That predicate was briefly public as `is_transient` and should not
+  have been: whether retrying helps depends on *what was retried*.
+  `SharedPayload` is permanent for a caller who keeps their other
+  reference and retryable the moment they drop it; `CaptureFailed` is
+  worth another attempt only if the packet still exists to attempt,
+  which on a consuming conversion it does not. Only the demux loop knows
+  both halves. A public retry signal would have to be operation-aware —
+  a door left open, not a thing approximated now.
+
+  The arms, censused: the four timed roads need the seat and have it;
+  the duplicate-attachment road converts nothing, so there is nothing to
+  park; and the hoisted attachment happens during `open`, where a
+  failure fails the open and no session exists to lose anything. Two
+  fault lanes drive it under a capped FFmpeg allocator — one on the
+  unique road where `av_buffer_ref` fails, one on the shared road where
+  the copy fails — each asserting that the retry re-attempts the same
+  packet and that the recovered stream equals the reference exactly.
+
+  **The seat is cleared by a seek that happened, not by one that was
+  attempted.** A successful seek discards the parked packet, which
+  belongs to the position being left. A *failed* seek does not: the
+  session stays where it was, and that packet is off the wire, so
+  discarding it would be the same silent loss with nothing able to
+  re-read it. FFmpeg does not specify where a container sits after a
+  seek that errored, and this crate does not guess — it keeps a packet
+  the container really did deliver, and a caller who saw the seek fail
+  knows the position is not the one they asked for.
+
+- **Decoded frames get the same transaction.** `receive_frame` advances
+  libavcodec exactly as `av_read_frame` advances a container: the frame
+  it fills the scratch with is out of the codec's queue and nothing
+  re-offers it. A conversion that then failed on an allocation left it
+  in a scratch the next call overwrote. Both timed decoders now hold the
+  scratch until a carrier exists for it, and the video decoder's replay
+  queue is **peeked, not popped** — that queue is the rescue history's
+  only copy, so popping before the conversion committed lost the very
+  frames it exists to preserve.
+
+  Every receive road, censused:
+
+  | road | seat | why |
+  |---|---|---|
+  | audio | yes | scratch held until the conversion commits |
+  | video, direct (HW and SW) | yes | same, on whichever scratch the state uses — **and the sends refuse while it is taken**, see below |
+  | video, replay queue (both entries) | yes | peeked; popped only on success |
+  | subtitle | yes | the decoded `AVSubtitle` is held and the conversion moved to `receive_frame` |
+  | image, one-shot | **not needed** | the packet is *borrowed*, so a failure leaves the caller everything needed to call again — and the decoder is now flushed on that road so the retry starts where the first attempt did |
+  | resampler output | **not needed** | its queue holds frames already built: the carrier's claim is taken in `prepare_output`, before `swr` consumes anything, and `finish_output` is infallible by construction. That is what the reserve-then-commit seam was for |
+
+  `ConvertError` gained the split this needed: `BufferAcquireFailed` was
+  one arm for two facts — a plane outside the frame's own buffers, which
+  is permanent, and an allocation that failed, which is not. The second
+  is now `CarrierAllocFailed`, and only it parks; the subtitle bitmap's
+  data copy was reclassified onto it too. Fault lanes on audio, video,
+  the replay queue and subtitle drive a capped allocator at the moment
+  of conversion and assert the retry yields the *same* output.
+
+  The replay queue has **two** delivery entries, not one: the peek at
+  the top of `receive_frame`, and the branch that runs when the probe is
+  exhausted at *frame* time, where `fall_back_to_sw` fills the queue and
+  the head is converted in that same call. The second popped before
+  converting. Both peek now, and every access to that queue is
+  accounted for — two entries, one `append`, one `clear`, one test
+  predicate.
+
+  **A parked video frame pins the state that parked it.** That decoder
+  has two scratches and can change which one is current, so a seat that
+  merely recorded "something is parked" was not enough: a
+  hardware-to-software fallback committed while a hardware frame was
+  parked sent the retry to the *software* scratch — a stale frame, or a
+  permanent refusal that stranded a decoded one. Both send roads can
+  commit that fallback, so both now refuse by name
+  (`VideoDecodeError::FramePending`) while the seat is taken.
+
+  Two shapes were weighed. Recording the producing road in the seat is
+  more permissive but adds state that every future delivery road must
+  remember to keep in step — which is precisely what had just gone
+  wrong. Refusing instead makes the retry's state the state that parked
+  it **by construction**, is smaller, and is the discipline this crate
+  already keeps one seat over (`SubtitleDecodeError::FramePending`). The
+  deadlock census came out clean: while parked, `receive_frame` is
+  always callable and always makes progress or repeats the same
+  parkable refusal, and a caller who would rather abandon the frame
+  calls `flush` — the same two answers the subtitle seat has always
+  given. A caller who ignores the refusal and pushes on gets named
+  errors rather than silent loss, which is the contract, not a
+  regression of it.
+
+  And every delivery now passes one **commit point**. The bookkeeping a
+  delivery owes — clearing the seat, and clearing a keyframe-anchored
+  resync guard — was attached to some roads and not others, so a parked
+  software recovery frame delivered on the retry road skipped
+  `resync_on_frame` and let a clean EOF escalate with a false
+  `PostCommitNeverResynced`. All five roads (both scratches, both replay
+  entries, the retry) funnel through `commit_delivery`, and a regression
+  drives a parked post-keyframe recovery frame to a clean EOF.
+
+  The subtitle road needed the seat most of all, and had the least: its
+  conversion ran inside `send_packet`, so an allocation that failed
+  freed the scratch and returned — and the cue, which
+  `avcodec_decode_subtitle2` had already consumed the packet to make,
+  was simply gone. The decoded `AVSubtitle` is now held until
+  `receive_frame` has a carrier for it. Unlike the image road there is
+  no resubmit to fall back on: the caller's packet is spent.
+
+- **A view is never taken from a buffer somebody else still references.**
+  Consuming the source proves no other handle survives only if the
+  source's buffer was the caller's alone to give — and
+  `ffmpeg_next::Packet::clone` calls `av_packet_ref` followed by
+  `av_packet_make_writable` and **ignores both return codes**, so under
+  allocation failure it returns a "clone" that silently still shares.
+  Feeding one to a consuming conversion produced a view of a buffer the
+  caller kept, and could still write through.
+
+  The payload road now asks the buffer directly, before any byte of it
+  is read, and **refuses by name** — `PacketBufferError::SharedPayload`,
+  carrying the count — when the answer is anything but one.
+
+  It first answered with a silent copy, on the argument that a copy is
+  always sound and keeps the API total. **That was overturned, and the
+  correction is worth stating**: a copy needs a *read*, and a refcount
+  above one is exactly the state in which another safe `data_mut`
+  handle may exist and may be writing — on another thread, since
+  `Packet` is `Send`. The read *is* the race. Totality was traded for
+  soundness the wrong way round; the refusal now happens with the
+  ordering visible in one function, nothing between the bounds proof and
+  the refusal touching the payload.
+
+  The rule is about **who** holds the other reference, not the count.
+  `PayloadProvenance` distinguishes a delivered packet — where the
+  second reference is another `Packet` and `data_mut` is one call away —
+  from a container's `attached_pic`, which libavformat holds for the
+  lifetime of the format context and never writes again. A blanket
+  "refcount must be one" looked right and refused every embedded cover
+  picture in the corpus; the distinction is now a parameter with its
+  reason attached, and a test that fails without it.
+
+  The dichotomy that survived is **delivered by libavformat** versus
+  **handed over by a caller**, and it took two counterexamples to find.
+  A parked cover picture is one. The other is a whole family: every
+  demuxer built on `FFDemuxSubtitlesQueue` — SubRip, SubViewer,
+  MicroDVD, WebVTT — parses its cues at open, keeps the packets, and
+  answers each read with an `av_packet_ref` of one, so **every** packet
+  it delivers has two references. A rule demanding a lone reference
+  refused all of them, on both lanes.
+
+  What separates the two sides is who can *write*, not how many
+  references exist. Every secondary reference to a demux-delivered
+  packet is libavformat's own: no `ffmpeg_next::Packet` wraps one, so
+  there is no safe `data_mut` to race, and while this crate reads it
+  holds the `AVFormatContext` exclusively. A caller's packet may share
+  with another `Packet`, whose `data_mut` writes in place from safe code
+  without consulting writability — that is the writer the rule exists
+  for.
+
+  Three rows, each with its argument recorded next to it:
+
+  | provenance | unique | shared | why |
+  |---|---|---|---|
+  | caller-supplied | capture | **refuse** | a second `Packet`'s `data_mut` writes in place, possibly on another thread |
+  | demux-delivered | capture | **copy** | the read is race-free, but a *window* would outlive the exclusivity that makes it so |
+  | attached picture | capture | **capture** | written once while the container opened and never again, so a window is as stable as one onto a private buffer |
+
+  The middle row is the deliberate one. Sharing there would have rested
+  on "libavformat honours its own copy-on-write rules for as long as the
+  carrier lives"; copying rests on "nothing can be writing while we hold
+  the context", which is a fact about the call rather than a promise
+  about anyone's future behaviour. Subtitle cues are measured in bytes,
+  so the copy is not a cost worth an argument.
+
+  The attached-picture row reaches one road more than the hoist:
+  libavformat queues a stream's parked picture as that stream's **first
+  packet**, and a stream carrying `ATTACHED_PIC | TIMED_THUMBNAILS` —
+  chapter thumbnails — is deliberately classified here as **video**, so
+  its first pull arrives through the ordinary read path.
+
+  The identity is a **proof, not a heuristic**: `av_buffer_ref` copies
+  the source's `buffer` field, so two `AVBufferRef`s name one allocation
+  exactly when their `buffer` pointers match — comparing the references
+  themselves would answer "no" to the very case this is for. Disposition
+  bits say a stream *has* a parked picture, not that this packet is it,
+  and "the first packet" is an ordering assumption libavformat's
+  contract does not fix; neither is used.
+
+  Two fault lanes prove the refusal: a deterministic shared packet built
+  with `av_packet_ref`, and a subprocess lane that caps FFmpeg's
+  allocator to reproduce the silently-shared clone itself.
+
+  The lesson, recorded because it cost a round: **a dependency's happy
+  path is not its contract.** The verification that missed this read
+  `Clone` and confirmed it deep-copies. It did not read what happens
+  when the copy fails.
+
+- **A submission that can be recorded is not shared.** The scoped
+  submission's proof — built, lent, dropped, so nothing that could take
+  a `&mut` into the shared bytes ever exists — is a claim about the
+  function, and the hardware probe made it false. While probing, the
+  video decoder `av_packet_ref`s every accepted packet into a rescue
+  history so a caller can replay it after a failed fallback, and
+  `FallbackFailed::unconsumed_packets` hands those recordings back as
+  owned, **mutable** `Packet`s: a live mutable alias of a carrier the
+  caller may still be reading.
+
+  The route is now chosen per submission. Inside the recording window
+  the body is copied; once the probe commits — and on every software
+  road, which records nothing — the send is zero-copy as before. The
+  regression drives a probe-era failure on the view lane with every
+  carrier retained, and checks that no rescued packet addresses any of
+  them and that writing through all of them changes none. Flipping the
+  route back to sharing makes it fail, which is how the lane was shown
+  to be live.
+
+- **The default is the view lane.** `FfmpegDemuxer` and the bare alias
+  family (`VideoPacket`, `AudioPacket`, `SubtitlePacket`, `DataPacket`,
+  `AttachmentPacket`, `DemuxedPacket`) now mean **View**; the owned
+  family is explicit — `FfmpegOwnedDemuxer`, `OwnedVideoPacket`, and so
+  on. Both aliases point at one generic `CarrierDemuxer<C>` with one set
+  of constructors, so `FfmpegDemuxer::open` and
+  `FfmpegOwnedDemuxer::open` both resolve and read the same.
+
+  **This is a semantic shift in the bare names**, recorded here rather
+  than in a migration note: what `VideoPacket` denotes changed from a
+  copied payload to a viewed one. Nothing outside this workspace can
+  have depended on it.
+
+- **The send leg shares too, where it can prove it may — and only
+  inside a scoped submission.** A packet a caller is *handed* is an
+  `ffmpeg_next::Packet`, which lends `&mut [u8]` through `data_mut`
+  while the carrier it was built from still lends `&[u8]`: a shared body
+  there is an aliasing `&mut` out of entirely safe code, and `!Sync`
+  does not help because one thread suffices. So the public reverse
+  builders copy on **both** lanes, and the zero-copy send lives on a
+  crate-private road that builds the packet, submits it to the decoder,
+  and drops it inside one call — no value that could produce a `&mut`
+  into the shared bytes ever exists.
+
+  Sharing there needs two facts, not one. **Provenance**: only a payload
+  captured out of an `AVPacket`'s own buffer may be shared, because that
+  is the one place libavformat's zeroed-padding contract applies.
+  Trailing *capacity* is not that contract — a decoded plane has more
+  pixels behind it and a resampled one has more samples, and a bitstream
+  reader running past the payload eats them as bitstream. Provenance is
+  recorded at capture, where it is known, and narrowing a payload drops
+  it. **Extent**: the view must still leave
+  `AV_INPUT_BUFFER_PADDING_SIZE` between its end and the buffer's.
+  Where either fails, the packet is copied.
+
+  The empty carrier is handled before any of it: it is backed by no
+  `AVBufferRef` at all, so a side-data-only packet — an ordinary thing —
+  reaches the send road with nothing to dereference, and gets a
+  payload-less `AVPacket` its side data attaches to.
+
+  Worth recording: the census found 0.8 **did not have this**. Its
+  reverse builders called the same copy the owned lane uses, so the
+  zero-copy chain 0.8 shipped ran demux-to-consumer and stopped. This is
+  new, not restored.
+
+- **A conversion that borrows its source copies; one that shares
+  consumes.** `ffmpeg_next`'s `Packet`, `frame::Video` and `frame::Audio`
+  all lend `&mut [u8]` from safe code and share their buffers by
+  refcount with no copy-on-write. A conversion taking `&Packet` and
+  returning a view therefore left the caller holding a mutable alias of
+  every byte the carrier read — and both sides are `Send`, so the two
+  halves need not even be on one thread. No lifetime on the carrier
+  would have helped; the carrier is `'static` by design.
+
+  So the roads split by ownership, and the compiler enforces it:
+
+  | road | source | lane |
+  |---|---|---|
+  | `{kind}_packet_from_ffmpeg_as::<C>` | **by value** | either |
+  | `{kind}_packet_from_ffmpeg_in` | **by value** | view |
+  | `{kind}_packet_from_ffmpeg` | borrowed | owned |
+  | `owned_{kind}_packet_from_ffmpeg_in` (new) | borrowed | owned, with budgets |
+  | `convert::{video,audio,image,subtitle}_frame_from` | borrowed | **owned only** |
+  | `convert::av_frame_to_*::<C>` (`unsafe`) | raw pointer | either, contract states the obligation |
+
+  The crate's own roads were unaffected in substance: the demuxer owns
+  the packet it just read (it now hands it over), the decoders own the
+  frames they decode into and reach the conversion through the `unsafe`
+  entry, and the resampler owns its output. The zero-copy chain is
+  intact end to end. What a *caller* can no longer do is ask for a view
+  of something they are still holding — `compile_fail` doctests pin both
+  refusals, including the exact aliasing program (`E0382`: the source is
+  moved, so `data_mut` cannot be written).
+
+- **Decoded frames carry view planes.** The frame road is lane-generic
+  end to end: `VideoFrame`, `AudioFrame`, `SubtitleFrame` and
+  `ImageFrame` mean the view lane, `OwnedVideoFrame` and its three
+  siblings mean the other, and `empty_video_frame` /
+  `empty_owned_video_frame` (with `*_as::<C>()` workers) build the
+  destination each one needs. Every plane capture runs through the seam
+  **after** the extent proofs that were already there, so the view lane
+  inherits the bounds checks rather than restating them.
+
+  Two rules decide what is shared, per medium:
+
+  - a **tight** video or image plane (`linesize == row_bytes`) is a
+    window at the decoder's own stride; a **padded** one is copied and
+    compacted to `row_bytes` on *both* lanes, because only the first
+    `row_bytes` of each row are the decoder's output and the rest is
+    allocator scratch nothing wrote. Sharing that span would form a
+    slice over uninitialised memory — undefined before a consumer reads
+    a byte of it, and the same information leak the owned lane refused
+    when it stopped exporting `linesize`;
+  - an **audio** plane is a window over exactly
+    `nb_samples × bytes_per_sample`, never the alignment padding
+    `av_samples_get_buffer_size` allocated past it. `linesize` is used
+    for one thing: proving the allocation really is as large as it
+    claims.
+
+  A palette plane — a flat `AVPALETTE_SIZE` run inside the frame's own
+  buffer — is shared. A subtitle rect is not: `AVSubtitleRect` has no
+  `buf[]`, its `data[]` are plain allocations `avsubtitle_free`
+  releases, so both lanes copy.
+
+- **The resampler produces view frames too**, through a
+  reserve-then-commit pair on the seam. `FfmpegResampler` means the view
+  lane, `FfmpegOwnedResampler` the other. The carrier's claim on each
+  output plane is taken **before** `swr_convert_frame` runs and settled
+  at the produced length after it — which keeps this type's founding
+  rule intact on the new lane: `swr` consumes its input as it runs, so a
+  failure after it has run would leave a session no caller can retry,
+  and there is now no fallible step on that side of the conversion. The
+  committed plane is the produced samples, never the capacity that was
+  allocated for them.
+
+  The hardware road needed no separate work: `av_hwframe_transfer_data`
+  fills a refcounted destination `AVFrame`, which reaches the same
+  lane-generic conversion the software road does.
+
+- **The copy roads are fallible on both lanes.** `from_bytes` and
+  `from_rows` return `Option`, so an allocation failure is a named
+  refusal instead of a silently empty plane — a frame whose header says
+  samples and whose planes say nothing is worse than an error. The
+  **empty** carrier, by contrast, now allocates nothing on either lane:
+  the view lane's is a null-backed zero-length view, which is what lets
+  `empty_video_frame` stay infallible rather than reintroducing 0.8's
+  four-allocations-that-could-fail placeholder under a new name.
+
+- **What is deliberately not doubled.** The `*Extra` types and
+  `SideDataEntry` stay monomorphic. Side data has no `AVBufferRef` to
+  share — `AVPacketSideData` and `AVFrameSideData` payloads are plain
+  allocations — so **both** lanes copy it, and a second family of extras
+  would have been two names for one representation. The carrier
+  parameter reaches the payload, not the annotations.
+
+- **The parity lane compares content, not buffers.** Owned compacts a
+  padded plane while View carries the tight one at the decoder's stride,
+  so the spans are not comparable and asserting on them would have been
+  a test of the lanes' plumbing rather than of their agreement.
+  `tests/view_carriers.rs` compares row-wise for video and valid-prefix
+  for audio, and proves the sharing itself by address: a tight plane's
+  pointer lies inside the `AVFrame`'s own buffer, a padded plane's does
+  not, an audio plane's lies inside its buffer while its span stops
+  short of the padding, and a resampled plane looks into an allocation
+  larger than the samples it exposes.
+
+
 ### Changed (BREAKING)
 
 - **`FfmpegBuffer` is deleted, and every byte leaving FFmpeg is copied

@@ -21,7 +21,7 @@ use mediadecode::{Timebase, decoder::AudioStreamDecoder, frame::AudioFrame, pack
 use mediaframe::audio::ChannelLayoutDescription;
 
 use crate::{
-  DecoderLimits, Error, Ffmpeg, FfmpegBytes, boundary,
+  DecoderLimits, Error, Ffmpeg, boundary,
   convert::{self, ConvertError},
   decoder::build_codec_context,
   extras::{AudioFrameExtra, AudioPacketExtra},
@@ -30,7 +30,7 @@ use crate::{
 };
 
 /// `mediadecode::AudioStreamDecoder` impl wrapping `ffmpeg::decoder::Audio`.
-pub struct FfmpegAudioStreamDecoder {
+pub struct CarrierAudioStreamDecoder<C: crate::FfmpegCarrier> {
   decoder: ffmpeg_next::decoder::Audio,
   scratch: frame::Audio,
   time_base: Timebase,
@@ -42,16 +42,34 @@ pub struct FfmpegAudioStreamDecoder {
   /// declaration order, so the `AVCodecContext` is freed first and the
   /// state it references outlives it.
   _callback_state: Box<crate::ffi::CallbackState>,
+  /// The lane this decoder captures into. A marker: the carrier
+  /// appears in the frames it produces, not in its own state.
+  /// `true` when [`Self::scratch`] holds a decoded frame whose
+  /// conversion has **not committed**.
+  ///
+  /// `receive_frame` advances libavcodec: the frame it fills the
+  /// scratch with is out of the codec's queue and nothing re-offers it.
+  /// A conversion that then failed on an *allocation* used to leave
+  /// that frame in a scratch the next call overwrites — a decoded frame
+  /// lost to memory pressure, silently. So the receive and the
+  /// conversion are one transaction: while this is set, the next call
+  /// converts the scratch it already has instead of asking libavcodec
+  /// for another.
+  ///
+  /// The same seat the demux session keeps for a packet, and the same
+  /// discipline `flush` clears.
+  scratch_pending: bool,
+  _carrier: core::marker::PhantomData<C>,
 }
 
-impl FfmpegAudioStreamDecoder {
+impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierAudioStreamDecoder<C> {
   /// Opens an audio decoder for the given codec parameters.
   ///
   /// `limits` bounds what one decoded frame may cost and is taken here
   /// rather than through a builder: half of it is written straight into
   /// the `AVCodecContext` this call opens, and a context's ceiling
   /// cannot be moved after `avcodec_open2`. See [`DecoderLimits`].
-  pub fn open(
+  pub(crate) fn open_impl(
     parameters: Parameters,
     time_base: Timebase,
     limits: DecoderLimits,
@@ -78,71 +96,101 @@ impl FfmpegAudioStreamDecoder {
       time_base,
       limits,
       _callback_state: callback_state,
+      scratch_pending: false,
+      _carrier: core::marker::PhantomData,
     })
   }
 
   /// Returns the time base associated with the source stream.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn time_base(&self) -> Timebase {
+  pub(crate) const fn time_base_impl(&self) -> Timebase {
     self.time_base
   }
 
   /// The frame ceilings this decoder was opened with.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn limits(&self) -> DecoderLimits {
+  pub(crate) const fn limits_impl(&self) -> DecoderLimits {
     self.limits
   }
 
   /// Borrow the wrapped `ffmpeg::decoder::Audio` (e.g. to query
   /// `channels()` / `rate()` / `format()`).
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn inner(&self) -> &ffmpeg_next::decoder::Audio {
+  pub(crate) const fn inner_impl(&self) -> &ffmpeg_next::decoder::Audio {
     &self.decoder
   }
 }
 
-impl AudioStreamDecoder for FfmpegAudioStreamDecoder {
-  type Adapter = Ffmpeg;
-  type Buffer = FfmpegBytes;
-  type Error = AudioDecodeError;
-
-  fn send_packet(
+impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierAudioStreamDecoder<C> {
+  pub(crate) fn send_packet_impl(
     &mut self,
-    packet: &AudioPacket<AudioPacketExtra, Self::Buffer>,
-  ) -> Result<(), Self::Error> {
-    let av_pkt = boundary::ffmpeg_packet_from_audio_packet(packet, self.limits.packet_limits())
-      .map_err(|e| AudioDecodeError::Decode(Error::PacketBuild(e)))?;
-    // Through the software funnel: a frame the allocator judge refused
-    // surfaces named, not as the `EINVAL` a corrupt file also produces.
+    packet: &AudioPacket<AudioPacketExtra, C::Buffer>,
+  ) -> Result<(), AudioDecodeError> {
+    // Scoped submission: the rebuilt `AVPacket` lives only inside this
+    // call, which is what lets the view lane hand libavcodec its own
+    // buffer instead of a copy. See `boundary::with_ffmpeg_audio_packet`.
     let state: *const crate::ffi::CallbackState = &*self._callback_state;
-    self
-      .decoder
-      .send_packet(&av_pkt)
-      .map_err(|e| AudioDecodeError::Decode(crate::decoder::software_exit(state, e)))
+    let decoder = &mut self.decoder;
+    boundary::with_ffmpeg_audio_packet::<C, _>(
+      packet,
+      self.limits.packet_limits(),
+      // Nothing on this road records what it is sent, so the
+      // packet really does die inside the call and its body may
+      // be shared.
+      crate::carrier::BodyRoute::Submission,
+      |av_pkt| {
+        // Through the software funnel: a frame the allocator judge
+        // refused surfaces named, not as the `EINVAL` a corrupt file
+        // also produces.
+        decoder
+          .send_packet(av_pkt)
+          .map_err(|e| AudioDecodeError::Decode(crate::decoder::software_exit(state, e)))
+      },
+    )
+    .map_err(|e| AudioDecodeError::Decode(Error::PacketBuild(e)))?
   }
 
-  fn receive_frame(
+  pub(crate) fn receive_frame_impl(
     &mut self,
-    dst: &mut AudioFrame<SampleFormat, ChannelLayoutDescription, AudioFrameExtra, Self::Buffer>,
-  ) -> Result<(), Self::Error> {
+    dst: &mut AudioFrame<SampleFormat, ChannelLayoutDescription, AudioFrameExtra, C::Buffer>,
+  ) -> Result<(), AudioDecodeError> {
     let state: *const crate::ffi::CallbackState = &*self._callback_state;
-    self
-      .decoder
-      .receive_frame(&mut self.scratch)
-      .map_err(|e| AudioDecodeError::Decode(crate::decoder::software_exit(state, e)))?;
-    // SAFETY: scratch was just filled by receive_frame; convert
-    // copies every plane it takes into the produced AudioFrame, so the
-    // scratch can be reused on the next call and the frame keeps
-    // nothing of it.
-    let new_frame = unsafe {
-      convert::av_frame_to_audio_frame(self.scratch.as_ptr(), self.time_base, self.limits.frame())
+    // A frame whose conversion did not commit is converted again before
+    // another is asked for — see [`Self::scratch_pending`].
+    if !self.scratch_pending {
+      self
+        .decoder
+        .receive_frame(&mut self.scratch)
+        .map_err(|e| AudioDecodeError::Decode(crate::decoder::software_exit(state, e)))?;
     }
-    .map_err(AudioDecodeError::Convert)?;
-    *dst = new_frame;
-    Ok(())
+    // SAFETY: the scratch holds a frame — either one `receive_frame`
+    // just filled it with, or one it was left holding by a conversion
+    // that did not commit. Convert takes what it needs out of it, so
+    // the scratch can be reused once this has committed.
+    let converted = unsafe {
+      convert::av_frame_to_audio_frame_as::<C>(
+        self.scratch.as_ptr(),
+        self.time_base,
+        self.limits.frame(),
+      )
+    };
+    match converted {
+      Ok(new_frame) => {
+        self.scratch_pending = false;
+        *dst = new_frame;
+        Ok(())
+      }
+      Err(e) => {
+        // Park only what another attempt could survive; a frame nothing
+        // can carry is let go, or every later receive answers with the
+        // same error.
+        self.scratch_pending = e.parks_in_decode();
+        Err(AudioDecodeError::Convert(e))
+      }
+    }
   }
 
-  fn send_eof(&mut self) -> Result<(), Self::Error> {
+  pub(crate) fn send_eof_impl(&mut self) -> Result<(), AudioDecodeError> {
     let state: *const crate::ffi::CallbackState = &*self._callback_state;
     self
       .decoder
@@ -150,11 +198,78 @@ impl AudioStreamDecoder for FfmpegAudioStreamDecoder {
       .map_err(|e| AudioDecodeError::Decode(crate::decoder::software_exit(state, e)))
   }
 
-  fn flush(&mut self) -> Result<(), Self::Error> {
+  pub(crate) fn flush_impl(&mut self) -> Result<(), AudioDecodeError> {
+    // A parked frame belongs to the stream position being abandoned.
+    self.scratch_pending = false;
     self.decoder.flush();
     Ok(())
   }
 }
+
+macro_rules! audio_lane_face {
+  ($($lane:ty),+ $(,)?) => { $(
+    impl CarrierAudioStreamDecoder<$lane> {
+      /// Opens an audio decoder for `parameters`.
+      pub fn open(
+        parameters: Parameters,
+        time_base: Timebase,
+        limits: DecoderLimits,
+      ) -> Result<Self, AudioDecodeError> {
+        Self::open_impl(parameters, time_base, limits)
+      }
+
+      /// The stream timebase every produced timestamp is stamped with.
+      pub const fn time_base(&self) -> Timebase {
+        self.time_base_impl()
+      }
+
+      /// The budgets this decoder was opened with.
+      pub const fn limits(&self) -> DecoderLimits {
+        self.limits_impl()
+      }
+
+      /// The wrapped decoder context.
+      pub const fn inner(&self) -> &ffmpeg_next::decoder::Audio {
+        self.inner_impl()
+      }
+    }
+
+    impl AudioStreamDecoder for CarrierAudioStreamDecoder<$lane> {
+      type Adapter = Ffmpeg;
+      type Buffer = <$lane as crate::FfmpegCarrier>::Buffer;
+      type Error = AudioDecodeError;
+
+      fn send_packet(
+        &mut self,
+        packet: &AudioPacket<AudioPacketExtra, Self::Buffer>,
+      ) -> Result<(), Self::Error> {
+        self.send_packet_impl(packet)
+      }
+
+      fn receive_frame(
+        &mut self,
+        dst: &mut AudioFrame<
+          SampleFormat,
+          ChannelLayoutDescription,
+          AudioFrameExtra,
+          Self::Buffer,
+        >,
+      ) -> Result<(), Self::Error> {
+        self.receive_frame_impl(dst)
+      }
+
+      fn send_eof(&mut self) -> Result<(), Self::Error> {
+        self.send_eof_impl()
+      }
+
+      fn flush(&mut self) -> Result<(), Self::Error> {
+        self.flush_impl()
+      }
+    }
+  )+ };
+}
+
+audio_lane_face!(crate::View, crate::Owned);
 
 /// Errors from [`FfmpegAudioStreamDecoder`].
 #[derive(thiserror::Error, Debug, Clone, IsVariant, Unwrap, TryUnwrap)]

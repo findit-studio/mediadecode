@@ -126,6 +126,63 @@ impl Corpus {
     out
   }
 
+  /// A SubRip file, written by hand.
+  ///
+  /// **The queue-backed demuxer family.** `srtdec` — like SubViewer,
+  /// MicroDVD, WebVTT and the rest built on `FFDemuxSubtitlesQueue` —
+  /// parses every cue at open, keeps the packets in its own queue, and
+  /// answers each `av_read_frame` with an `av_packet_ref` of one. Every
+  /// packet it delivers therefore arrives with **two** references
+  /// through nobody's fault, which is the shape that has to keep
+  /// working on both lanes.
+  ///
+  /// Written rather than transcoded because SubRip is a text format:
+  /// the cheapest possible fixture for the shape, and one that needs no
+  /// encoder to exist.
+  pub fn subrip(&self) -> PathBuf {
+    let out = self.path("cues.srt");
+    if out.exists() {
+      return out;
+    }
+    std::fs::write(
+      &out,
+      "1\n00:00:01,000 --> 00:00:02,000\nfirst cue\n\n\
+       2\n00:00:03,000 --> 00:00:04,500\nsecond cue\n\n\
+       3\n00:00:06,000 --> 00:00:07,000\nthird cue\n\n",
+    )
+    .expect("writing the subrip fixture");
+    out
+  }
+
+  /// [`Self::subrip`] with cues too big to fit a capped allocator.
+  ///
+  /// The queue-backed road delivers by `av_packet_ref`, which allocates
+  /// only a reference struct however large the cue is — so a cap set
+  /// between "a reference" and "a cue" lets `av_read_frame` through and
+  /// stops the copy this crate makes afterwards. That separation is
+  /// what the middle-row fault lane needs, and small cues cannot
+  /// provide it.
+  pub fn subrip_bulky(&self) -> PathBuf {
+    let out = self.path("bulky.srt");
+    if out.exists() {
+      return out;
+    }
+    let mut text = String::new();
+    for (index, marker) in ["alpha", "beta", "gamma"].iter().enumerate() {
+      let start = index * 3;
+      text.push_str(&format!(
+        "{}\n00:00:{:02},000 --> 00:00:{:02},000\n{}{}\n\n",
+        index + 1,
+        start + 1,
+        start + 2,
+        marker,
+        "x".repeat(8192),
+      ));
+    }
+    std::fs::write(&out, text).expect("writing the bulky subrip fixture");
+    out
+  }
+
   /// A QuickTime file whose `-timecode` flag adds a `tmcd` track —
   /// `AVMEDIA_TYPE_DATA`, one packet for the whole file. The only
   /// commonly-generated container shape that exercises the `Data` arm.

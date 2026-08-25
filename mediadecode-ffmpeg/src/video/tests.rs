@@ -3,6 +3,16 @@ use super::*;
 use mediadecode::decoder::VideoStreamDecoder;
 use std::num::NonZeroI32;
 
+// The hardware-fallback suite runs on the **owned** lane, because it
+// replays one `Vec<Packet>` through several decoders: a borrowed source
+// can only be copied, which is exactly what that lane is. Nothing the
+// suite proves is lane-specific — probe order, keyframe gating, pool
+// defence and the exit funnels are all decisions about contexts and
+// formats, taken before a carrier exists. The view lane's end-to-end
+// decoder coverage lives in `tests/view_carriers.rs`, where the packets
+// come from a demuxer that hands them over.
+use crate::{FfmpegBytes, FfmpegOwnedVideoStreamDecoder as FfmpegVideoStreamDecoder};
+
 // ---------------------------------------------------------------------------
 //  Fake-HW fallback seam: synthetic clip + driver
 // ---------------------------------------------------------------------------
@@ -125,10 +135,25 @@ struct FakeHw {
   sends: usize,
   /// CPU frames queued by accepted pre-doom `send_packet`s, delivered FIFO by
   /// `receive_frame`. Each carries the accepted packet's PTS.
-  queued: VecDeque<i64>,
+  ///
+  /// **Built at send time, not at receive time.** A real hardware seam
+  /// has the frame in hand by the time it is asked for; allocating it
+  /// inside `receive_frame` made the fake's own allocation the first
+  /// thing an allocator ceiling hit, which is not the thing under test
+  /// when a lane caps the ceiling to refuse a *carrier*.
+  queued: VecDeque<frame::Video>,
   /// Refcounted clones of every packet accepted so far — the probe-era
   /// `unconsumed_packets` history surfaced on a [`FailShape::ProbeEra`] failure.
   history: Vec<Packet>,
+  /// When set, raise a **probe-era** exhaustion from `receive_frame`
+  /// rather than from `send_packet`.
+  ///
+  /// That is the decoder's *second* delivery path onto the replay
+  /// queue: `fall_back_to_sw` fills it inside the `receive_frame` call
+  /// and the head is converted there and then. Reaching it needs a
+  /// hardware seam that fails at frame time, which nothing else here
+  /// does.
+  fail_at_receive: bool,
 }
 
 impl FakeHw {
@@ -142,6 +167,7 @@ impl FakeHw {
       sends: 0,
       queued: VecDeque::new(),
       history: Vec::new(),
+      fail_at_receive: false,
     }
   }
 
@@ -161,7 +187,16 @@ impl FakeHw {
       sends: 0,
       queued: VecDeque::new(),
       history: Vec::new(),
+      fail_at_receive: false,
     }
+  }
+
+  /// Accepts every packet, then raises probe-era exhaustion the first
+  /// time a frame is asked for — the receive-time fallback road.
+  fn failing_at_receive(width: u32, height: u32) -> Self {
+    let mut hw = Self::failing(width, height, 0, usize::MAX, FailShape::ProbeEra);
+    hw.fail_at_receive = true;
+    hw
   }
 
   /// Never fails — stays on the HW path for the whole clip, delivering 1:1.
@@ -171,6 +206,16 @@ impl FakeHw {
 }
 
 impl HwInner for FakeHw {
+  fn records_submissions(&self) -> bool {
+    // **This fake records exactly like the real probe does** — see
+    // `send_packet` below, which `try_clone_packet`s (an
+    // `av_packet_ref`) every accepted packet into `history` and hands
+    // that history out through `AllBackendsFailed`. Saying so is what
+    // makes the view lane copy into it, and what
+    // `a_rescued_packet_never_aliases_a_view_carrier` checks.
+    true
+  }
+
   fn send_packet(&mut self, packet: &Packet) -> Result<(), Error> {
     let idx = self.sends;
     self.sends += 1;
@@ -191,17 +236,23 @@ impl HwInner for FakeHw {
       self.history.push(cloned);
     }
     if idx < self.doom_from_send {
-      self.queued.push_back(packet.pts().unwrap_or(0));
+      let mut av = frame::Video::new(ffmpeg_next::format::Pixel::YUV420P, self.width, self.height);
+      av.set_pts(packet.pts());
+      self.queued.push_back(av);
     }
     Ok(())
   }
 
   fn receive_frame(&mut self, frame: &mut Frame) -> Result<(), Error> {
+    if self.fail_at_receive {
+      // Once: the decoder falls back and never asks this seam again.
+      self.fail_at_receive = false;
+      return Err(Error::AllBackendsFailed(
+        crate::error::AllBackendsFailed::new(Vec::new(), std::mem::take(&mut self.history)),
+      ));
+    }
     match self.queued.pop_front() {
-      Some(pts) => {
-        let mut av =
-          frame::Video::new(ffmpeg_next::format::Pixel::YUV420P, self.width, self.height);
-        av.set_pts(Some(pts));
+      Some(av) => {
         *frame.as_inner_mut() = av;
         Ok(())
       }
@@ -250,6 +301,12 @@ impl FakeHwEofFails {
 }
 
 impl HwInner for FakeHwEofFails {
+  fn records_submissions(&self) -> bool {
+    // This one keeps no history: it fails at `send_eof`, post-commit,
+    // with an empty rescue set.
+    false
+  }
+
   fn send_packet(&mut self, packet: &Packet) -> Result<(), Error> {
     self.queued.push_back(packet.pts().unwrap_or(0));
     Ok(())
@@ -291,7 +348,7 @@ impl HwInner for FakeHwEofFails {
 /// order. A `None` PTS surfaces as `i64::MIN` so a hole is visible.
 fn drive(dec: &mut FfmpegVideoStreamDecoder, clip: &SyntheticClip) -> Vec<i64> {
   let mut out: Vec<i64> = Vec::new();
-  let mut dst = crate::empty_video_frame();
+  let mut dst = crate::empty_owned_video_frame();
 
   let mut drain_frames = |dec: &mut FfmpegVideoStreamDecoder, out: &mut Vec<i64>| {
     loop {
@@ -388,7 +445,7 @@ fn post_commit_failure_degrades_and_resyncs_at_next_keyframe() {
   assert!(dec.is_hardware(), "must start on the HW seam");
 
   let mut pts_out: Vec<i64> = Vec::new();
-  let mut dst = crate::empty_video_frame();
+  let mut dst = crate::empty_owned_video_frame();
   let mut drain = |dec: &mut FfmpegVideoStreamDecoder, out: &mut Vec<i64>| loop {
     match dec.receive_frame(&mut dst) {
       Ok(()) => out.push(dst.pts().map(|t| t.pts()).unwrap_or(i64::MIN)),
@@ -697,7 +754,7 @@ fn sw_replay_drain_surfaces_non_transient_decode_error() {
   )
   .expect("build test decoder");
 
-  let mut dst = crate::empty_video_frame();
+  let mut dst = crate::empty_owned_video_frame();
   let mut err = None;
   for av_pkt in &clip.packets {
     let vpkt = boundary::video_packet_from_ffmpeg(av_pkt)
@@ -803,7 +860,7 @@ fn sw_replay_deferred_error_surfaces_fallback_failed_at_commit() {
   // Send exactly the history-then-failing packets; the failing send triggers
   // the fallback whose commit-time drain must surface the deferred error.
   let mut surfaced = None;
-  let mut dst = crate::empty_video_frame();
+  let mut dst = crate::empty_owned_video_frame();
   for av_pkt in clip.packets.iter().take(fail_at + 1) {
     let vpkt = boundary::video_packet_from_ffmpeg(av_pkt)
       .expect("a wrappable payload")
@@ -960,7 +1017,7 @@ fn post_commit_fallback_never_resyncing_escalates_at_eof() {
   )
   .expect("build test decoder");
 
-  let mut dst = crate::empty_video_frame();
+  let mut dst = crate::empty_owned_video_frame();
   let mut delivered = 0usize;
   let mut escalation = None;
   let mut drain = |dec: &mut FfmpegVideoStreamDecoder,
@@ -1042,7 +1099,7 @@ fn post_commit_fallback_never_resyncing_escalates_at_eof() {
     !dec.degraded_resync_pending_for_test(),
     "the degraded-resync flag must be cleared after the escalation fires"
   );
-  let mut after = crate::empty_video_frame();
+  let mut after = crate::empty_owned_video_frame();
   match dec.receive_frame(&mut after) {
     Err(VideoDecodeError::Decode(Error::Ffmpeg(ffmpeg_next::Error::Eof))) => {}
     other => panic!("a poll after the escalation must be plain EOF, got {other:?}"),
@@ -1088,7 +1145,7 @@ fn post_commit_gap_counter_tallies_then_clears_on_resync() {
   // decoder. We do NOT drain here: a single forwarded packet won't trip SW
   // backpressure, and not draining keeps the gap open so the tally is
   // observable before any resync frame clears it.
-  let mut dst = crate::empty_video_frame();
+  let mut dst = crate::empty_owned_video_frame();
   for av_pkt in clip.packets.iter().take(fail_at + 1) {
     let vpkt = boundary::video_packet_from_ffmpeg(av_pkt)
       .expect("a wrappable payload")
@@ -1253,7 +1310,7 @@ fn post_commit_concealed_p_frame_does_not_clear_resync_escalates_at_eof() {
   )
   .expect("build test decoder");
 
-  let mut dst = crate::empty_video_frame();
+  let mut dst = crate::empty_owned_video_frame();
   let mut concealed_frames = 0usize;
   let mut escalation: Option<VideoDecodeError> = None;
   // Drain available frames; route a `PostCommitNeverResynced` to `escalation`.
@@ -1405,7 +1462,7 @@ fn post_commit_retains_no_replay_frames() {
 
   // Drive the rest of the stream; the replay queue must remain empty throughout
   // — the SW decoder delivers directly from itself, never from a replay buffer.
-  let mut dst = crate::empty_video_frame();
+  let mut dst = crate::empty_owned_video_frame();
   for av_pkt in clip.packets.iter().skip(fail_at + 1) {
     let vpkt = boundary::video_packet_from_ffmpeg(av_pkt)
       .expect("a wrappable payload")
@@ -1534,7 +1591,7 @@ fn fx3_high_422_10bit_falls_back_to_software_and_decodes_whole_stream() {
     dec.is_software()
   );
 
-  let mut dst = crate::empty_video_frame();
+  let mut dst = crate::empty_owned_video_frame();
 
   'feed: for (s, packet) in input.packets() {
     if s.index() != stream_index {
@@ -1864,4 +1921,462 @@ fn the_cold_fallback_forwards_keep_the_allocator_refusal() {
   sw.send_packet(&clip.packets[0])
     .map_err(|e| crate::decoder::software_exit(state, e))
     .expect("an affordable frame must be accepted");
+}
+
+#[test]
+fn a_rescued_packet_never_aliases_a_view_carrier() {
+  use crate::{CarrierVideoStreamDecoder, View, boundary::video_packet_from_ffmpeg_in};
+  use ffmpeg_next::packet::Ref;
+  use mediadecode::decoder::VideoStreamDecoder;
+
+  // **The scoped submission's proof has a hole on one road.** "Built,
+  // lent, dropped inside this call" is true of the function — and false
+  // of the probe, which `av_packet_ref`s every accepted packet into a
+  // rescue history that `FallbackFailed::unconsumed_packets` hands back
+  // to the caller as owned, **mutable** `Packet`s. A shared body would
+  // leave that call as a live mutable alias of bytes a view carrier is
+  // still lending.
+  //
+  // So while the history is being recorded, the body is copied. This
+  // pins it from the outside, on the one road where the history is
+  // observable: a probe-era failure whose SW replay also fails.
+  let (w, h) = (128u32, 96u32);
+  let mut clip = encode_synthetic_clip(w, h, 12, 100);
+  let p1 = clip
+    .packets
+    .iter()
+    .position(|p| !p.is_key())
+    .expect("clip has P-frames");
+  assert!(
+    p1 + 2 < clip.packets.len(),
+    "need packets after the corrupt one"
+  );
+  corrupt_packet_payload(&mut clip.packets[p1]);
+
+  let fail_at = p1 + 3;
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let mut dec = CarrierVideoStreamDecoder::<View>::from_hw_inner_for_test(
+    Box::new(FakeHw::failing(w, h, 0, fail_at, FailShape::ProbeEra)),
+    clip.parameters.clone(),
+    tb,
+  )
+  .expect("build test decoder");
+
+  // Retain every carrier — which is exactly what a consumer parking
+  // view packets would do, and what makes an alias observable.
+  let mut retained: Vec<crate::VideoPacket> = Vec::new();
+  let mut dst = crate::boundary::empty_video_frame();
+  let mut rescued: Vec<ffmpeg_next::Packet> = Vec::new();
+  for av_pkt in &clip.packets {
+    let Some(vpkt) =
+      video_packet_from_ffmpeg_in(av_pkt.clone(), tb, crate::PacketLimits::default())
+        .expect("a wrappable payload")
+    else {
+      continue;
+    };
+    match dec.send_packet(&vpkt) {
+      Ok(()) => {}
+      Err(VideoDecodeError::Decode(Error::FallbackFailed(f))) => {
+        retained.push(vpkt);
+        rescued = f.into_unconsumed_packets();
+        break;
+      }
+      Err(e) => panic!("send_packet: {e:?}"),
+    }
+    retained.push(vpkt);
+    while dec.receive_frame(&mut dst).is_ok() {}
+  }
+
+  assert!(
+    !rescued.is_empty(),
+    "the failed fallback must surface a rescue history to check",
+  );
+  let carriers: Vec<usize> = retained
+    .iter()
+    .map(|p| p.data().as_ref().as_ptr() as usize)
+    .collect();
+  for packet in &rescued {
+    // SAFETY: the packet is live; `data` is a public field.
+    let address = unsafe { (*packet.as_ptr()).data as usize };
+    assert!(
+      !carriers.contains(&address),
+      "a rescued packet addresses a retained view carrier's storage — \
+       `data_mut` on it would be an aliasing write",
+    );
+  }
+
+  // And the rescued packets really are writable, which is what makes
+  // the aliasing question live rather than theoretical. Writing through
+  // every one of them must leave every carrier's bytes alone.
+  let before: Vec<Vec<u8>> = retained
+    .iter()
+    .map(|p| p.data().as_ref().to_vec())
+    .collect();
+  {
+    for packet in &mut rescued {
+      if let Some(slot) = packet.data_mut() {
+        for byte in slot.iter_mut() {
+          *byte ^= 0xFF;
+        }
+      }
+    }
+  }
+  for (packet, expected) in retained.iter().zip(before) {
+    assert_eq!(
+      packet.data().as_ref(),
+      expected.as_slice(),
+      "writing a rescued packet reached a retained view carrier",
+    );
+  }
+}
+
+#[test]
+fn the_receive_time_fallback_queue_survives_a_failed_carrier() {
+  use crate::{CarrierVideoStreamDecoder, View, boundary::video_packet_from_ffmpeg_in};
+  use mediadecode::decoder::VideoStreamDecoder;
+
+  // **The replay queue's second delivery path.** `fall_back_to_sw`
+  // fills `sw_replay_frames` from inside `receive_frame` when the probe
+  // is exhausted at *frame* time, and that branch converts the head
+  // then and there. It used to `pop_front` first, so an allocation that
+  // failed advanced past a frame the rescue history holds the only copy
+  // of — the very loss the queue exists to prevent. It peeks now, like
+  // the entry at the top of `receive_frame`.
+  //
+  // The ceiling is process-global, so this runs alone.
+  crate::fault_subprocess::in_subprocess(
+    "video::tests::the_receive_time_fallback_queue_survives_a_failed_carrier",
+    || {
+      let (w, h) = (64u32, 48u32);
+      let clip = encode_synthetic_clip(w, h, 8, 100);
+      let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+
+      // `cap_when_queued`: lower the ceiling on the first receive that
+      // provably comes off the replay queue — checked with the queue's
+      // own emptiness, so the lane cannot drift onto the scratch road
+      // and quietly assert nothing.
+      let drive = |cap_when_queued: bool| -> (Vec<Vec<u8>>, bool) {
+        let mut dec = CarrierVideoStreamDecoder::<View>::from_hw_inner_for_test(
+          Box::new(FakeHw::failing_at_receive(w, h)),
+          clip.parameters.clone(),
+          tb,
+        )
+        .expect("build test decoder");
+
+        let mut frame = crate::boundary::empty_video_frame();
+        let mut planes = Vec::new();
+        let mut queue_was_hit = false;
+        let mut armed = false;
+
+        // **Send first, drain second.** The fake keeps every accepted
+        // packet as rescue history and queues no frames of its own, so
+        // the history is as deep as the clip by the time a frame is
+        // asked for — which is what makes `fall_back_to_sw` replay more
+        // than one packet and leave more than one frame on the queue.
+        // Interleaving send and receive would fail the seam on the
+        // first packet and give the queue a single frame, consumed in
+        // the same call, leaving this lane nothing to cap.
+        for av_pkt in &clip.packets {
+          let Some(vpkt) =
+            video_packet_from_ffmpeg_in(av_pkt.clone(), tb, crate::PacketLimits::default())
+              .expect("a wrappable payload")
+          else {
+            continue;
+          };
+          if dec.send_packet(&vpkt).is_err() {
+            break;
+          }
+        }
+
+        loop {
+          let capped = armed;
+          if capped {
+            armed = false;
+            queue_was_hit = true;
+            crate::fault_subprocess::cap_ffmpeg_allocations(16);
+          }
+          let got = dec.receive_frame(&mut frame);
+          if capped {
+            crate::fault_subprocess::uncap_ffmpeg_allocations();
+          }
+          match got {
+            Ok(()) => {
+              planes.push(frame.planes()[0].data_ref().as_ref().to_vec());
+              // The next receive will come off the queue, which is the
+              // road this lane is for.
+              if cap_when_queued && !queue_was_hit && !dec.sw_replay_frames_is_empty_for_test() {
+                armed = true;
+              }
+            }
+            Err(VideoDecodeError::Convert(e)) => {
+              assert!(capped, "no refusal was asked for here, got {e:?}");
+              assert!(
+                e.parks_in_decode(),
+                "the ceiling must produce a parkable refusal, got {e:?}",
+              );
+              // Retry immediately, uncapped: the same frame must come
+              // back rather than the one after it.
+              continue;
+            }
+            Err(_) => break,
+          }
+        }
+        (planes, queue_was_hit)
+      };
+
+      let (reference, _) = drive(false);
+      assert!(
+        reference.len() >= 2,
+        "the receive-time fallback must deliver replayed frames to test with",
+      );
+      // **Where the ceiling can go, and where it cannot.** The very
+      // first delivery on this road happens in the same call that runs
+      // `fall_back_to_sw` — which opens a software decoder and replays
+      // packets through it — so a ceiling there refuses the fallback
+      // rather than the carrier, and nothing outside can lower it
+      // between the two. What *is* reachable is the queue that
+      // fallback filled: a carrier failing on a later delivery must
+      // leave its frame at the head.
+      let (recovered, queue_was_hit) = drive(true);
+      assert!(
+        queue_was_hit,
+        "the ceiling never reached the replay queue — this lane would \
+         assert nothing",
+      );
+      assert_eq!(
+        recovered, reference,
+        "a transient refusal must cost no replayed frame at all",
+      );
+    },
+  );
+}
+
+#[test]
+fn a_parked_hardware_frame_is_delivered_before_any_fallback() {
+  use crate::{CarrierVideoStreamDecoder, View, boundary::video_packet_from_ffmpeg_in};
+  use mediadecode::decoder::VideoStreamDecoder;
+
+  // **A parked frame pins the state that parked it.** The scratch a
+  // retry reads is chosen by the *current* `DecodeState`, so a
+  // hardware-to-software fallback committed while a hardware frame was
+  // parked would send the retry to the software scratch — delivering a
+  // stale frame, or refusing permanently and stranding a decoded one.
+  // Both send roads can commit that fallback, so both refuse while the
+  // seat is taken.
+  crate::fault_subprocess::in_subprocess(
+    "video::tests::a_parked_hardware_frame_is_delivered_before_any_fallback",
+    || {
+      let (w, h) = (64u32, 48u32);
+      let clip = encode_synthetic_clip(w, h, 8, 100);
+      let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+      let mut dec = CarrierVideoStreamDecoder::<View>::from_hw_inner_for_test(
+        // The second send is the one that would commit a post-commit
+        // fallback — which is exactly the transition that must not
+        // happen underneath a parked frame.
+        Box::new(FakeHw::failing(w, h, usize::MAX, 1, FailShape::PostCommit)),
+        clip.parameters.clone(),
+        tb,
+      )
+      .expect("build test decoder");
+
+      let packet = |index: usize| {
+        video_packet_from_ffmpeg_in(
+          clip.packets[index].clone(),
+          tb,
+          crate::PacketLimits::default(),
+        )
+        .expect("a wrappable payload")
+        .expect("packet has a buffer")
+      };
+
+      dec.send_packet(&packet(0)).expect("send_packet");
+      assert!(dec.is_hardware(), "the seam under test is the hardware one");
+
+      // Park the hardware frame.
+      let mut frame = crate::boundary::empty_video_frame();
+      crate::fault_subprocess::cap_ffmpeg_allocations(16);
+      let refused = dec.receive_frame(&mut frame);
+      crate::fault_subprocess::uncap_ffmpeg_allocations();
+      match refused {
+        Err(VideoDecodeError::Convert(e)) => assert!(
+          e.parks_in_decode(),
+          "the ceiling must produce a parkable refusal, got {e:?}",
+        ),
+        other => panic!("expected a parkable refusal, got {other:?}"),
+      }
+
+      // **Nothing may be sent while it is parked** — this is the send
+      // that could otherwise have committed a fallback underneath it.
+      assert!(
+        matches!(
+          dec.send_packet(&packet(1)),
+          Err(VideoDecodeError::FramePending)
+        ),
+        "a send under a parked frame must be refused by name",
+      );
+      assert!(
+        matches!(dec.send_eof(), Err(VideoDecodeError::FramePending)),
+        "EOF under a parked frame must be refused by name too",
+      );
+
+      // The parked frame is still the hardware one, and it arrives.
+      dec.receive_frame(&mut frame).expect("the parked frame");
+      assert!(
+        dec.is_hardware(),
+        "no fallback can have happened while the frame was parked",
+      );
+      assert!(
+        !frame.planes()[0].data_ref().as_ref().is_empty(),
+        "the delivered frame must carry the decoded planes",
+      );
+
+      // And once the seat is free the send reaches the seam — this is
+      // the one that would have committed the fallback underneath the
+      // parked frame. Whether the cold software decoder then accepts a
+      // lone P-frame is not this lane's business; that it is no longer
+      // *refused* is.
+      let after = dec.send_packet(&packet(1));
+      assert!(
+        !matches!(after, Err(VideoDecodeError::FramePending)),
+        "with the seat free the send must reach the seam, got {after:?}",
+      );
+    },
+  );
+}
+
+#[test]
+fn a_parked_recovery_frame_still_clears_the_resync_guard() {
+  use crate::{CarrierVideoStreamDecoder, View, boundary::video_packet_from_ffmpeg_in};
+  use mediadecode::decoder::VideoStreamDecoder;
+
+  // **The bookkeeping a delivery owes must survive the retry road.**
+  // A post-commit degrade leaves a keyframe-anchored resync guard
+  // standing until a frame arrives after the keyframe. That frame's
+  // delivery is what clears it — and a delivery that had been parked
+  // and was re-attempted used to reach the caller through a road that
+  // skipped `resync_on_frame`, so the guard survived the very frame
+  // that should have cleared it and EOF escalated with a false
+  // `PostCommitNeverResynced`.
+  crate::fault_subprocess::in_subprocess(
+    "video::tests::a_parked_recovery_frame_still_clears_the_resync_guard",
+    || {
+      let (w, h) = (128u32, 96u32);
+      let clip = encode_synthetic_clip(w, h, 24, 6);
+      let second_key = nth_keyframe(&clip, 2);
+      let third_key = nth_keyframe(&clip, 3);
+      let fail_at = second_key + 2;
+      assert!(fail_at < third_key && !clip.packets[fail_at].is_key());
+
+      let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+      let mut dec = CarrierVideoStreamDecoder::<View>::from_hw_inner_for_test(
+        Box::new(FakeHw::failing(
+          w,
+          h,
+          fail_at,
+          fail_at,
+          FailShape::PostCommit,
+        )),
+        clip.parameters.clone(),
+        tb,
+      )
+      .expect("build test decoder");
+
+      let packet = |index: usize| {
+        video_packet_from_ffmpeg_in(
+          clip.packets[index].clone(),
+          tb,
+          crate::PacketLimits::default(),
+        )
+        .expect("a wrappable payload")
+        .expect("packet has a buffer")
+      };
+      let mut dst = crate::boundary::empty_video_frame();
+
+      // Degrade post-commit, then walk to the resync keyframe.
+      for index in 0..=fail_at {
+        dec.send_packet(&packet(index)).expect("send_packet");
+      }
+      assert!(
+        dec.is_software(),
+        "the mid-GOP failure fell back to software"
+      );
+      assert!(dec.degraded_resync_pending_for_test(), "the gap is open");
+
+      let drain = |dec: &mut CarrierVideoStreamDecoder<View>,
+                   dst: &mut crate::VideoFrame|
+       -> bool { dec.receive_frame(dst).is_ok() };
+      while drain(&mut dec, &mut dst) {}
+      for index in (fail_at + 1)..third_key {
+        dec.send_packet(&packet(index)).expect("send_packet");
+        while drain(&mut dec, &mut dst) {}
+      }
+      dec
+        .send_packet(&packet(third_key))
+        .expect("send the keyframe");
+      assert!(
+        dec.degraded_keyframe_seen_for_test(),
+        "the keyframe crossed the gap and is the resync anchor",
+      );
+      assert!(
+        dec.degraded_resync_pending_for_test(),
+        "no post-keyframe frame has been delivered yet",
+      );
+
+      // **Park the recovery frame.** This is the delivery that clears
+      // the guard, and it is going to fail its carrier first.
+      let mut parked = false;
+      for attempt in 0..64 {
+        crate::fault_subprocess::cap_ffmpeg_allocations(16);
+        let got = dec.receive_frame(&mut dst);
+        crate::fault_subprocess::uncap_ffmpeg_allocations();
+        match got {
+          Err(VideoDecodeError::Convert(e)) if e.parks_in_decode() => {
+            parked = true;
+            break;
+          }
+          Ok(()) => {
+            assert!(
+              dec.degraded_resync_pending_for_test(),
+              "the guard cleared before the parked delivery — nothing left to test",
+            );
+          }
+          Err(_) => {
+            // No frame ready under this packet; feed the next one.
+            let index = third_key + 1 + attempt;
+            if index >= clip.packets.len() {
+              break;
+            }
+            dec.send_packet(&packet(index)).expect("send_packet");
+          }
+        }
+      }
+      assert!(parked, "the ceiling must park the recovery frame");
+      assert!(
+        dec.degraded_resync_pending_for_test(),
+        "a parked frame has not been delivered, so the guard still stands",
+      );
+
+      // The retry delivers it — and the bookkeeping runs on that road.
+      dec
+        .receive_frame(&mut dst)
+        .expect("the parked recovery frame");
+      assert!(
+        !dec.degraded_resync_pending_for_test(),
+        "the retried delivery must clear the keyframe-anchored resync guard",
+      );
+
+      // And EOF is clean: no false escalation over a gap that did
+      // resync.
+      dec.send_eof().expect("send_eof");
+      loop {
+        match dec.receive_frame(&mut dst) {
+          Ok(()) => {}
+          Err(VideoDecodeError::PostCommitNeverResynced(p)) => {
+            panic!("false escalation after a resync that did happen: {p:?}");
+          }
+          Err(_) => break,
+        }
+      }
+    },
+  );
 }

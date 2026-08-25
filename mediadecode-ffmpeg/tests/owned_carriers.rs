@@ -31,10 +31,20 @@ use mediadecode::{
   decoder::ImageDecoder,
   demuxer::{DemuxedPacket, Demuxer, TrackKind},
 };
+// **The owned family, imported under the names #33 wrote.**
+//
+// The bare aliases mean the *view* lane now — the ordinary road for a
+// direct consumer — so this suite names the owned lane explicitly. It
+// does so in the import block alone: every assertion below is byte for
+// byte what #33 shipped, which is the point. A rename that needed the
+// tests rewritten would not have been a rename.
 use mediadecode_ffmpeg::{
-  AttachmentPacket, AudioFrame, AudioPacket, DataPacket, DecoderLimits, FfmpegBytes, FfmpegDemuxer,
-  FfmpegImageDecoder, ImageDecodeError, ImageFrame, SubtitleFrame, SubtitlePacket, VideoFrame,
-  VideoPacket,
+  DecoderLimits, FfmpegBytes, FfmpegOwnedDemuxer as FfmpegDemuxer,
+  FfmpegOwnedImageDecoder as FfmpegImageDecoder, ImageDecodeError,
+  OwnedAttachmentPacket as AttachmentPacket, OwnedAudioFrame as AudioFrame,
+  OwnedAudioPacket as AudioPacket, OwnedDataPacket as DataPacket, OwnedImageFrame as ImageFrame,
+  OwnedSubtitleFrame as SubtitleFrame, OwnedSubtitlePacket as SubtitlePacket,
+  OwnedVideoFrame as VideoFrame, OwnedVideoPacket as VideoPacket,
   extras::{ImageOrientation, SideDataEntry},
 };
 
@@ -368,7 +378,9 @@ fn a_still_with_no_orientation_tag_says_so_rather_than_guessing() {
 /// would answer `Ok` — which is exactly what must not happen.
 #[test]
 fn a_packet_over_budget_is_refused_before_the_copy() {
-  use mediadecode_ffmpeg::{PacketBufferError, PacketLimits, video_packet_from_ffmpeg_in};
+  use mediadecode_ffmpeg::{
+    PacketBufferError, PacketLimits, boundary::owned_video_packet_from_ffmpeg_in,
+  };
   support::init_ffmpeg();
 
   let body = vec![7u8; 4096];
@@ -376,14 +388,14 @@ fn a_packet_over_budget_is_refused_before_the_copy() {
   let tb = mediadecode::Timebase::default();
 
   // Under the default budget this is an ordinary packet.
-  let carried = video_packet_from_ffmpeg_in(&packet, tb, PacketLimits::default())
+  let carried = owned_video_packet_from_ffmpeg_in(&packet, tb, PacketLimits::default())
     .expect("4 KiB is nothing")
     .expect("present");
   assert_eq!(carried.data().len(), 4096);
 
   // One byte under what it needs: refused, by name, with both numbers.
   let tight = PacketLimits::new().with_max_packet_bytes(4095);
-  match video_packet_from_ffmpeg_in(&packet, tb, tight) {
+  match owned_video_packet_from_ffmpeg_in(&packet, tb, tight) {
     Err(PacketBufferError::PacketTooLarge(p)) => {
       assert_eq!(p.bytes(), 4096);
       assert_eq!(p.limit(), 4095);
@@ -393,7 +405,7 @@ fn a_packet_over_budget_is_refused_before_the_copy() {
 
   // Exactly at the line is not over it.
   assert!(
-    video_packet_from_ffmpeg_in(&packet, tb, PacketLimits::new().with_max_packet_bytes(4096))
+    owned_video_packet_from_ffmpeg_in(&packet, tb, PacketLimits::new().with_max_packet_bytes(4096))
       .expect("exactly at the cap is not over it")
       .is_some()
   );
@@ -405,8 +417,12 @@ fn a_packet_over_budget_is_refused_before_the_copy() {
 #[test]
 fn the_packet_budget_fires_on_every_arm() {
   use mediadecode_ffmpeg::{
-    PacketBufferError, PacketLimits, attachment_packet_from_ffmpeg, audio_packet_from_ffmpeg_in,
-    data_packet_from_ffmpeg_in, subtitle_packet_from_ffmpeg_in, video_packet_from_ffmpeg_in,
+    PacketBufferError, PacketLimits,
+    boundary::{
+      owned_attachment_packet_from_ffmpeg, owned_audio_packet_from_ffmpeg_in,
+      owned_data_packet_from_ffmpeg_in, owned_subtitle_packet_from_ffmpeg_in,
+      owned_video_packet_from_ffmpeg_in,
+    },
   };
   support::init_ffmpeg();
 
@@ -416,19 +432,19 @@ fn the_packet_budget_fires_on_every_arm() {
 
   let over = |r: Result<Option<bool>, PacketBufferError>| matches!(r, Err(PacketBufferError::PacketTooLarge(p)) if p.bytes() == 512 && p.limit() == 8);
   assert!(over(
-    video_packet_from_ffmpeg_in(&packet, tb, tight).map(|p| p.map(|_| true))
+    owned_video_packet_from_ffmpeg_in(&packet, tb, tight).map(|p| p.map(|_| true))
   ));
   assert!(over(
-    audio_packet_from_ffmpeg_in(&packet, tb, tight).map(|p| p.map(|_| true))
+    owned_audio_packet_from_ffmpeg_in(&packet, tb, tight).map(|p| p.map(|_| true))
   ));
   assert!(over(
-    subtitle_packet_from_ffmpeg_in(&packet, tb, tight).map(|p| p.map(|_| true))
+    owned_subtitle_packet_from_ffmpeg_in(&packet, tb, tight).map(|p| p.map(|_| true))
   ));
   assert!(over(
-    data_packet_from_ffmpeg_in(&packet, tb, tight).map(|p| p.map(|_| true))
+    owned_data_packet_from_ffmpeg_in(&packet, tb, tight).map(|p| p.map(|_| true))
   ));
   assert!(over(
-    attachment_packet_from_ffmpeg(&packet, tight).map(|p| p.map(|_| true))
+    owned_attachment_packet_from_ffmpeg(&packet, tight).map(|p| p.map(|_| true))
   ));
 }
 
@@ -798,9 +814,14 @@ fn an_accepted_extradata_attachment_retains_one_copy_not_two() {
 #[cfg(feature = "resample")]
 #[test]
 fn an_amplifying_conversion_is_refused_before_the_output_frame_exists() {
-  use ffmpeg_next::{ChannelLayout, format::Sample, format::sample::Type};
+  use ffmpeg_next::{
+    ChannelLayout,
+    format::{Sample, sample::Type},
+  };
   use mediadecode::resampler::AudioResampler;
-  use mediadecode_ffmpeg::{FfmpegResampler, FrameLimits, ResampleError, ResampleSpec};
+  use mediadecode_ffmpeg::{
+    FfmpegOwnedResampler as FfmpegResampler, FrameLimits, ResampleError, ResampleSpec,
+  };
   support::init_ffmpeg();
 
   let packed =
@@ -848,7 +869,7 @@ fn an_amplifying_conversion_is_refused_before_the_output_frame_exists() {
     FfmpegResampler::new(packed(8_000), packed(48_000), FrameLimits::default()).expect("open");
   up.send_frame(&stereo_f32_frame(8_000, 8_000))
     .expect("a 6x upsample of one second is ordinary work");
-  let mut converted = mediadecode_ffmpeg::empty_audio_frame();
+  let mut converted = mediadecode_ffmpeg::empty_owned_audio_frame();
   up.receive_frame(&mut converted)
     .expect("the conversion produced a frame");
   assert_eq!(converted.sample_rate(), 48_000);
@@ -1027,7 +1048,9 @@ fn a_stripped_attachment_payload_is_charged_once_not_twice() {
 #[test]
 fn oversized_parameters_are_refused_at_every_decoder_entry_point() {
   use ffmpeg_next::codec::Parameters;
-  use mediadecode_ffmpeg::{Backend, DecoderLimits, Error, FfmpegImageDecoder, VideoDecoder};
+  use mediadecode_ffmpeg::{
+    Backend, DecoderLimits, Error, FfmpegOwnedImageDecoder as FfmpegImageDecoder, VideoDecoder,
+  };
   support::init_ffmpeg();
 
   // An `AVCodecParameters` carrying an 8 MiB ICC profile in
@@ -1229,7 +1252,9 @@ fn indexed_and_one_bit_stills_decode_as_what_ffmpeg_produced() {
 #[test]
 fn an_audio_plane_exports_valid_samples_not_alignment_padding() {
   use mediadecode::decoder::AudioStreamDecoder;
-  use mediadecode_ffmpeg::{DecoderLimits, FfmpegAudioStreamDecoder};
+  use mediadecode_ffmpeg::{
+    DecoderLimits, FfmpegOwnedAudioStreamDecoder as FfmpegAudioStreamDecoder,
+  };
   let Some(corpus) = Corpus::new() else {
     return;
   };
@@ -1264,7 +1289,7 @@ fn an_audio_plane_exports_valid_samples_not_alignment_padding() {
     if decoder.send_packet(&portable).is_err() {
       continue;
     }
-    let mut frame = mediadecode_ffmpeg::empty_audio_frame();
+    let mut frame = mediadecode_ffmpeg::empty_owned_audio_frame();
     while decoder.receive_frame(&mut frame).is_ok() {
       let samples = frame.nb_samples() as usize;
       if samples == 0 {
@@ -1304,12 +1329,13 @@ fn an_audio_plane_exports_valid_samples_not_alignment_padding() {
 /// All three packet families, equality-at-cap and over-limit.
 #[test]
 fn the_send_leg_judges_the_packet_budget_on_all_three_families() {
-  use mediadecode_ffmpeg::boundary::{
-    ffmpeg_packet_from_audio_packet, ffmpeg_packet_from_subtitle_packet,
-    ffmpeg_packet_from_video_packet,
-  };
   use mediadecode_ffmpeg::{
-    AudioPacket, PacketBuildError, PacketLimits, SubtitlePacket, VideoPacket,
+    OwnedAudioPacket as AudioPacket, OwnedSubtitlePacket as SubtitlePacket,
+    OwnedVideoPacket as VideoPacket, PacketBuildError, PacketLimits,
+    boundary::{
+      ffmpeg_packet_from_owned_audio_packet, ffmpeg_packet_from_owned_subtitle_packet,
+      ffmpeg_packet_from_owned_video_packet,
+    },
   };
   support::init_ffmpeg();
 
@@ -1323,23 +1349,23 @@ fn the_send_leg_judges_the_packet_budget_on_all_three_families() {
   let subtitle = SubtitlePacket::new(bytes.clone(), Default::default());
 
   // Exactly at the cap is not over it — on every family.
-  assert!(ffmpeg_packet_from_video_packet(&video, at_cap).is_ok());
-  assert!(ffmpeg_packet_from_audio_packet(&audio, at_cap).is_ok());
-  assert!(ffmpeg_packet_from_subtitle_packet(&subtitle, at_cap).is_ok());
+  assert!(ffmpeg_packet_from_owned_video_packet(&video, at_cap).is_ok());
+  assert!(ffmpeg_packet_from_owned_audio_packet(&audio, at_cap).is_ok());
+  assert!(ffmpeg_packet_from_owned_subtitle_packet(&subtitle, at_cap).is_ok());
 
   // One byte under: refused, by name, with both numbers.
   for (family, result) in [
     (
       "video",
-      ffmpeg_packet_from_video_packet(&video, under).map(|_| ()),
+      ffmpeg_packet_from_owned_video_packet(&video, under).map(|_| ()),
     ),
     (
       "audio",
-      ffmpeg_packet_from_audio_packet(&audio, under).map(|_| ()),
+      ffmpeg_packet_from_owned_audio_packet(&audio, under).map(|_| ()),
     ),
     (
       "subtitle",
-      ffmpeg_packet_from_subtitle_packet(&subtitle, under).map(|_| ()),
+      ffmpeg_packet_from_owned_subtitle_packet(&subtitle, under).map(|_| ()),
     ),
   ] {
     match result {
@@ -1356,7 +1382,9 @@ fn the_send_leg_judges_the_packet_budget_on_all_three_families() {
 /// at open, so its send path judges the same seat the other two do.
 #[test]
 fn the_subtitle_session_keeps_its_limits() {
-  use mediadecode_ffmpeg::{DecoderLimits, FfmpegSubtitleStreamDecoder};
+  use mediadecode_ffmpeg::{
+    DecoderLimits, FfmpegOwnedSubtitleStreamDecoder as FfmpegSubtitleStreamDecoder,
+  };
   let Some(corpus) = Corpus::new() else {
     return;
   };
@@ -1389,7 +1417,8 @@ fn the_subtitle_session_keeps_its_limits() {
 fn the_active_parameter_ceiling_binds_both_ways() {
   use ffmpeg_next::codec::Parameters;
   use mediadecode_ffmpeg::{
-    DEFAULT_MAX_CODEC_PARAMETER_BYTES, DecoderLimits, Error, FfmpegImageDecoder,
+    DEFAULT_MAX_CODEC_PARAMETER_BYTES, DecoderLimits, Error,
+    FfmpegOwnedImageDecoder as FfmpegImageDecoder,
   };
   support::init_ffmpeg();
 
@@ -2102,8 +2131,9 @@ fn an_undersized_stride_is_refused_before_any_plane_is_copied() {
 
 #[test]
 fn a_still_refuses_oversized_side_data_rather_than_dropping_the_orientation() {
-  use mediadecode_ffmpeg::convert::ConvertError;
-  use mediadecode_ffmpeg::{DEFAULT_MAX_IMAGE_SIDE_DATA_BYTES, FrameLimits, convert};
+  use mediadecode_ffmpeg::{
+    DEFAULT_MAX_IMAGE_SIDE_DATA_BYTES, FrameLimits, convert, convert::ConvertError,
+  };
   support::init_ffmpeg();
 
   const ICC: ffmpeg_next::ffi::AVFrameSideDataType =
@@ -2165,8 +2195,9 @@ fn a_still_refuses_oversized_side_data_rather_than_dropping_the_orientation() {
 
 #[test]
 fn a_still_judges_its_side_data_before_it_buys_a_single_plane() {
-  use mediadecode_ffmpeg::convert::ConvertError;
-  use mediadecode_ffmpeg::{DEFAULT_MAX_IMAGE_SIDE_DATA_BYTES, FrameLimits, convert};
+  use mediadecode_ffmpeg::{
+    DEFAULT_MAX_IMAGE_SIDE_DATA_BYTES, FrameLimits, convert, convert::ConvertError,
+  };
   support::init_ffmpeg();
 
   // **Proof by construction.** The frame declares side data past the
@@ -2301,7 +2332,9 @@ fn open_still_and_decode(path: &std::path::Path, bytes: usize) -> Result<(), Ima
 #[test]
 fn audio_gets_a_pre_allocation_ceiling_too() {
   use mediadecode::decoder::AudioStreamDecoder;
-  use mediadecode_ffmpeg::{AudioDecodeError, FfmpegAudioStreamDecoder, FrameLimits};
+  use mediadecode_ffmpeg::{
+    AudioDecodeError, FfmpegOwnedAudioStreamDecoder as FfmpegAudioStreamDecoder, FrameLimits,
+  };
   let Some(corpus) = Corpus::new() else {
     return;
   };
@@ -2348,7 +2381,7 @@ fn audio_gets_a_pre_allocation_ceiling_too() {
     }
     drop(input);
 
-    let mut frame = mediadecode_ffmpeg::empty_audio_frame();
+    let mut frame = mediadecode_ffmpeg::empty_owned_audio_frame();
     for body in bodies {
       let audio = AudioPacket::new(
         FfmpegBytes::copy_from_slice(&body),
@@ -2401,7 +2434,9 @@ fn decode_first_audio(
   bytes: usize,
 ) -> Result<AudioFrame, mediadecode_ffmpeg::AudioDecodeError> {
   use mediadecode::decoder::AudioStreamDecoder;
-  use mediadecode_ffmpeg::{FfmpegAudioStreamDecoder, FrameLimits};
+  use mediadecode_ffmpeg::{
+    FfmpegOwnedAudioStreamDecoder as FfmpegAudioStreamDecoder, FrameLimits,
+  };
 
   let mut input = ffmpeg_next::format::input(&path).expect("open");
   let stream = input
@@ -2417,7 +2452,7 @@ fn decode_first_audio(
   )
   .expect("open the audio decoder");
 
-  let mut frame = mediadecode_ffmpeg::empty_audio_frame();
+  let mut frame = mediadecode_ffmpeg::empty_owned_audio_frame();
   loop {
     let mut packet = ffmpeg_next::Packet::empty();
     match packet.read(&mut input) {
@@ -2638,7 +2673,7 @@ fn the_send_side_side_data_list_is_capped_in_both_directions() {
       VideoPacketExtra::new(0).with_side_data(entries),
     )
     .with_flags(PacketFlags::KEY);
-    boundary::ffmpeg_packet_from_video_packet(&packet, PacketLimits::default())
+    boundary::ffmpeg_packet_from_owned_video_packet(&packet, PacketLimits::default())
   };
 
   let entry = |bytes: usize| {
@@ -2954,8 +2989,8 @@ fn a_byte_refused_frame_is_named_on_every_software_road() {
 fn the_software_video_road_names_its_budget_refusals() {
   use mediadecode::decoder::VideoStreamDecoder;
   use mediadecode_ffmpeg::{
-    DecoderLimits, Error, FfmpegVideoStreamDecoder, FrameBudgetExceeded, FrameLimits, FrameMedium,
-    VideoDecodeError,
+    DecoderLimits, Error, FfmpegOwnedVideoStreamDecoder as FfmpegVideoStreamDecoder,
+    FrameBudgetExceeded, FrameLimits, FrameMedium, VideoDecodeError,
   };
   let Some(corpus) = Corpus::new() else {
     return;
@@ -2990,7 +3025,7 @@ fn the_software_video_road_names_its_budget_refusals() {
       DecoderLimits::new().with_frame(FrameLimits::new().with_max_frame_bytes(bytes)),
     )
     .map_err(VideoDecodeError::Decode)?;
-    let mut frame = mediadecode_ffmpeg::empty_video_frame();
+    let mut frame = mediadecode_ffmpeg::empty_owned_video_frame();
     loop {
       let mut packet = ffmpeg_next::Packet::empty();
       match packet.read(&mut input) {

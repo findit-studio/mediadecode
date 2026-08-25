@@ -265,8 +265,14 @@ impl core::fmt::Display for InvalidPlaneLayout {
 
 /// Payload for [`ConvertError::BufferAcquireFailed`].
 ///
-/// Failed to acquire an `AVBufferRef` for a plane (out of memory, or
-/// the frame's `data[i]` pointer doesn't lie inside any of `buf[]`).
+/// A plane's `data[i]` does not lie inside any of the frame's own
+/// `buf[]` allocations, so its extent cannot be proved and nothing may
+/// be read from it.
+///
+/// **A fact about the frame, not about the moment.** An exhausted
+/// allocator is [`CarrierAllocFailed`] — the two were one arm once, and
+/// telling them apart is what lets a decoder park a frame worth
+/// re-attempting without parking one that will never convert.
 #[derive(Debug, Clone, Copy)]
 pub struct BufferAcquireFailed {
   plane: usize,
@@ -284,6 +290,48 @@ impl BufferAcquireFailed {
     self.plane
   }
 }
+
+/// Payload for [`ConvertError::CarrierAllocFailed`].
+///
+/// The plane's extent was proved and the carrier still could not be
+/// made: a refcount the view lane could not take, a gather or copy the
+/// allocator refused.
+///
+/// **A fact about the moment, not about the frame.** The same frame may
+/// convert perfectly a moment later, which is why the decode roads park
+/// it and re-attempt rather than letting it go.
+#[derive(Debug, Clone, Copy)]
+pub struct CarrierAllocFailed {
+  plane: usize,
+}
+
+impl CarrierAllocFailed {
+  /// Constructs a `CarrierAllocFailed` payload.
+  #[inline]
+  #[must_use]
+  pub const fn new(plane: usize) -> Self {
+    Self { plane }
+  }
+
+  /// Plane index whose carrier could not be allocated.
+  #[inline]
+  #[must_use]
+  pub const fn plane(&self) -> usize {
+    self.plane
+  }
+}
+
+impl core::fmt::Display for CarrierAllocFailed {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    write!(
+      f,
+      "convert: could not allocate a carrier for plane {}",
+      self.plane
+    )
+  }
+}
+
+impl std::error::Error for CarrierAllocFailed {}
 
 impl core::fmt::Display for BufferAcquireFailed {
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -657,9 +705,29 @@ pub enum ConvertError {
   UnsupportedPixelFormat(UnsupportedPixelFormat),
   /// A plane reported `linesize <= 0` or otherwise inconsistent layout.
   InvalidPlaneLayout(InvalidPlaneLayout),
-  /// Failed to acquire an `AVBufferRef` for a plane (out of memory, or
-  /// the frame's `data[i]` pointer doesn't lie inside any of `buf[]`).
+  /// A plane's `data[i]` does not lie inside any of the frame's own
+  /// `buf[]` allocations, so its extent cannot be proved.
   BufferAcquireFailed(BufferAcquireFailed),
+  /// The plane's extent was proved and the carrier still could not be
+  /// made. See [`CarrierAllocFailed`].
+  CarrierAllocFailed(CarrierAllocFailed),
+}
+
+impl ConvertError {
+  /// Whether a decode session should **park** the frame this refusal
+  /// came from and re-attempt it before receiving another.
+  ///
+  /// The same shape as the demux seat, for the same reason: a decoder's
+  /// `receive_frame` advances libavcodec, so a conversion that then
+  /// fails on an allocation would lose a frame nothing can ask for
+  /// again. Only an allocation qualifies — every other arm here is a
+  /// fact about the frame (a format nothing can carry, a layout that
+  /// does not add up, a plane outside its own buffers), and re-offering
+  /// one of those would answer every later receive with the same error.
+  #[inline]
+  pub(crate) const fn parks_in_decode(&self) -> bool {
+    matches!(self, Self::CarrierAllocFailed(_))
+  }
 }
 
 impl core::fmt::Display for ConvertError {
@@ -677,6 +745,7 @@ impl core::fmt::Display for ConvertError {
       Self::UnsupportedPixelFormat(p) => core::fmt::Display::fmt(p, f),
       Self::InvalidPlaneLayout(p) => core::fmt::Display::fmt(p, f),
       Self::BufferAcquireFailed(p) => core::fmt::Display::fmt(p, f),
+      Self::CarrierAllocFailed(p) => core::fmt::Display::fmt(p, f),
     }
   }
 }
@@ -702,18 +771,56 @@ fn unsupported_pixel_format(format: PixelFormat, raw: i32) -> ConvertError {
 /// unsafe variant, but the FFmpeg side keeps the frame alive for the
 /// duration of the call so the safety contract is satisfied
 /// internally.
+///
+/// **Borrowed source, owned lane.** This road copies, on purpose and
+/// without a lane to choose. `ffmpeg_next`'s frame wrappers lend
+/// `&mut [u8]` through `data_mut` and share their buffers by refcount
+/// with no copy-on-write, so a caller who still holds the frame holds a
+/// mutable alias of every byte a view would read — and both sides are
+/// `Send`, so the two halves need not even be on one thread. No safe
+/// signature that borrows a frame can hand out a window onto it.
+///
+/// The view lane reaches frames the way it is meant to: through a
+/// decoder, which owns the `AVFrame` it decoded into and never lends it
+/// out. A caller holding an `AVFrame` of their own can use the `unsafe`
+/// entry point below, whose contract names the obligation this
+/// signature cannot express.
+/// The lane is not a parameter here, and asking for one does not
+/// compile:
+///
+/// ```compile_fail,E0107
+/// use mediadecode_ffmpeg::{FrameLimits, View, convert::video_frame_from};
+/// let frame = ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::GRAY8, 64, 4);
+/// let _ = video_frame_from::<View>(&frame, mediadecode::Timebase::default(), FrameLimits::default());
+/// ```
 pub fn video_frame_from(
   frame: &ffmpeg_next::Frame,
   time_base: Timebase,
   limits: FrameLimits,
 ) -> Result<VideoFrame<mediadecode::PixelFormat, VideoFrameExtra, FfmpegBytes>, ConvertError> {
   // SAFETY: `&frame` keeps the AVFrame alive for the duration of this
-  // call; the unsafe convert just reads through the pointer.
-  unsafe { av_frame_to_video_frame(frame.as_ptr(), time_base, limits) }
+  // call; the unsafe convert just reads through the pointer, and the
+  // owned lane copies every byte it reads, so nothing outlives the
+  // borrow.
+  unsafe { av_frame_to_video_frame_as::<crate::Owned>(frame.as_ptr(), time_base, limits) }
 }
 
 /// Safe wrapper around [`av_frame_to_audio_frame`] taking a borrowed
 /// [`ffmpeg::frame::Audio`](ffmpeg_next::frame::Audio).
+///
+/// **Borrowed source, owned lane.** This road copies, on purpose and
+/// without a lane to choose. `ffmpeg_next`'s frame wrappers lend
+/// `&mut [u8]` through `data_mut` and share their buffers by refcount
+/// with no copy-on-write, so a caller who still holds the frame holds a
+/// mutable alias of every byte a view would read — and both sides are
+/// `Send`, so the two halves need not even be on one thread. No safe
+/// signature that borrows a frame can hand out a window onto it.
+///
+/// The view lane reaches frames the way it is meant to: through a
+/// decoder, which owns the `AVFrame` it decoded into and never lends it
+/// out. A caller holding an `AVFrame` of their own can use the `unsafe`
+/// entry point below, whose contract names the obligation this
+/// signature cannot express.
 pub fn audio_frame_from(
   frame: &ffmpeg_next::frame::Audio,
   time_base: Timebase,
@@ -723,19 +830,23 @@ pub fn audio_frame_from(
   ConvertError,
 > {
   // SAFETY: `&frame` keeps the AVFrame alive for the duration of this
-  // call.
-  unsafe { av_frame_to_audio_frame(frame.as_ptr(), time_base, limits) }
+  // call, and the owned lane copies what it reads.
+  unsafe { av_frame_to_audio_frame_as::<crate::Owned>(frame.as_ptr(), time_base, limits) }
 }
 
 /// Safe wrapper around [`av_subtitle_to_subtitle_frame`] taking a
 /// borrowed [`ffmpeg::Subtitle`](ffmpeg_next::Subtitle).
+///
+/// Owned-lane, like its siblings — though a subtitle rect is copied on
+/// both lanes anyway (`AVSubtitleRect` has no refcounted buffer), so
+/// here the restriction costs a caller nothing at all.
 pub fn subtitle_frame_from(
   subtitle: &ffmpeg_next::Subtitle,
   time_base: Timebase,
 ) -> Result<SubtitleFrame<SubtitleFrameExtra, FfmpegBytes>, ConvertError> {
   // SAFETY: `&subtitle` keeps the AVSubtitle alive for the duration
   // of this call.
-  unsafe { av_subtitle_to_subtitle_frame(subtitle.as_ptr(), time_base) }
+  unsafe { av_subtitle_to_subtitle_frame_as::<crate::Owned>(subtitle.as_ptr(), time_base) }
 }
 
 /// Converts an FFmpeg `AVFrame` (CPU-side, post-`av_hwframe_transfer_data`
@@ -752,11 +863,19 @@ pub fn subtitle_frame_from(
 /// every byte the produced `VideoFrame` carries is a copy, so the
 /// source frame may be unreffed, reused or dropped the moment this
 /// returns.
-pub unsafe fn av_frame_to_video_frame(
+/// * no handle capable of **mutating** the frame's buffers may
+///   outlive this call while the returned carriers do. On the view
+///   lane a plane is a window into `frame`'s own allocation, and
+///   `ffmpeg_next`'s wrappers lend `&mut [u8]` by refcount with no
+///   copy-on-write — so keeping the source frame and writing through
+///   it would race a carrier a consumer is reading. Consume the
+///   frame, or use the owned lane, or use the safe borrowed wrapper
+///   (which is the owned lane for exactly this reason).
+pub(crate) unsafe fn av_frame_to_video_frame_as<C: crate::FfmpegCarrier + crate::CarrierOps>(
   av_frame: *const AVFrame,
   time_base: Timebase,
   limits: FrameLimits,
-) -> Result<VideoFrame<mediadecode::PixelFormat, VideoFrameExtra, FfmpegBytes>, ConvertError> {
+) -> Result<VideoFrame<mediadecode::PixelFormat, VideoFrameExtra, C::Buffer>, ConvertError> {
   if av_frame.is_null() {
     return Err(ConvertError::NullFrame);
   }
@@ -795,7 +914,7 @@ pub unsafe fn av_frame_to_video_frame(
 
   // SAFETY: caller upholds `av_frame`'s liveness for the whole call.
   let (planes_out, plane_count) = unsafe {
-    copy_out_planes(
+    copy_out_planes::<C>(
       av_frame,
       &pix_fmt,
       format_raw,
@@ -869,13 +988,16 @@ pub unsafe fn av_frame_to_video_frame(
 
 /// Safe wrapper around [`av_frame_to_image_frame`] taking a borrowed
 /// [`ffmpeg::Frame`](ffmpeg_next::Frame).
+///
+/// Owned-lane, for the reason [`video_frame_from`] states: a borrowed
+/// frame cannot be safely viewed.
 pub fn image_frame_from(
   frame: &ffmpeg_next::Frame,
   limits: FrameLimits,
 ) -> Result<ImageFrame<mediadecode::PixelFormat, ImageFrameExtra, FfmpegBytes>, ConvertError> {
   // SAFETY: `&frame` keeps the AVFrame alive for the duration of this
-  // call; the unsafe convert just reads through the pointer.
-  unsafe { av_frame_to_image_frame(frame.as_ptr(), limits) }
+  // call, and the owned lane copies what it reads.
+  unsafe { av_frame_to_image_frame_as::<crate::Owned>(frame.as_ptr(), limits) }
 }
 
 /// Converts an FFmpeg `AVFrame` holding a decoded **still** into a
@@ -901,10 +1023,18 @@ pub fn image_frame_from(
 /// `av_frame` must be a live `*const AVFrame` for the duration of this
 /// call. The frame's buffers are not consumed — every byte the
 /// produced [`ImageFrame`] carries is a copy.
-pub unsafe fn av_frame_to_image_frame(
+/// * no handle capable of **mutating** the frame's buffers may
+///   outlive this call while the returned carriers do. On the view
+///   lane a plane is a window into `frame`'s own allocation, and
+///   `ffmpeg_next`'s wrappers lend `&mut [u8]` by refcount with no
+///   copy-on-write — so keeping the source frame and writing through
+///   it would race a carrier a consumer is reading. Consume the
+///   frame, or use the owned lane, or use the safe borrowed wrapper
+///   (which is the owned lane for exactly this reason).
+pub(crate) unsafe fn av_frame_to_image_frame_as<C: crate::FfmpegCarrier + crate::CarrierOps>(
   av_frame: *const AVFrame,
   limits: FrameLimits,
-) -> Result<ImageFrame<mediadecode::PixelFormat, ImageFrameExtra, FfmpegBytes>, ConvertError> {
+) -> Result<ImageFrame<mediadecode::PixelFormat, ImageFrameExtra, C::Buffer>, ConvertError> {
   if av_frame.is_null() {
     return Err(ConvertError::NullFrame);
   }
@@ -944,7 +1074,7 @@ pub unsafe fn av_frame_to_image_frame(
 
   // SAFETY: caller upholds `av_frame`'s liveness for the whole call.
   let (planes_out, plane_count) = unsafe {
-    copy_out_planes(
+    copy_out_planes::<C>(
       av_frame,
       &pix_fmt,
       format_raw,
@@ -1088,7 +1218,7 @@ impl PlaneRoad {
 /// `av_frame` must be a live `*const AVFrame` for the duration of this
 /// call, and `format_raw` / `pix_fmt` / `width` / `height` must be the
 /// values read from it.
-unsafe fn copy_out_planes(
+unsafe fn copy_out_planes<C: crate::FfmpegCarrier + crate::CarrierOps>(
   av_frame: *const AVFrame,
   pix_fmt: &PixelFormat,
   format_raw: i32,
@@ -1096,7 +1226,7 @@ unsafe fn copy_out_planes(
   height: u32,
   limits: FrameLimits,
   road: PlaneRoad,
-) -> Result<([Plane<FfmpegBytes>; 4], u8), ConvertError> {
+) -> Result<([Plane<C::Buffer>; 4], u8), ConvertError> {
   // The pixel ceiling, first of all — before the format is even looked
   // up, because a forged `width` / `height` costs nothing to write and
   // everything to honour. libavcodec has normally refused such a frame
@@ -1198,7 +1328,7 @@ unsafe fn copy_out_planes(
     }
   }
 
-  let mut planes_out: [Plane<FfmpegBytes>; 4] = std::array::from_fn(|_| plane_placeholder());
+  let mut planes_out: [Plane<C::Buffer>; 4] = std::array::from_fn(|_| plane_placeholder::<C>());
   let mut plane_count: u8 = 0;
 
   // The loop body indexes `planes_out`, the AVFrame's `linesize`, and
@@ -1226,13 +1356,13 @@ unsafe fn copy_out_planes(
       let bytes = geom.row_bytes[plane_idx];
       // SAFETY: `find_backing_buffer` proves the run lies inside one of
       // the frame's own live buffers before it is read.
-      unsafe { find_backing_buffer(av_frame, data_ptr, bytes) }.ok_or(
-        ConvertError::BufferAcquireFailed(BufferAcquireFailed::new(plane_idx)),
-      )?;
-      // SAFETY: non-null and just proved to address `bytes` initialised
-      // bytes inside a live buffer.
-      let palette = unsafe { core::slice::from_raw_parts(data_ptr as *const u8, bytes) };
-      planes_out[plane_idx] = Plane::new(FfmpegBytes::copy_from_slice(palette), bytes as u32);
+      // The palette is a flat `AVPALETTE_SIZE` run whose length is the
+      // format's, not the file's — fully written, so shareable whole.
+      //
+      // SAFETY: non-null and addressing this plane.
+      let carried =
+        unsafe { capture_from_backing::<C>(av_frame, data_ptr as *const u8, bytes, plane_idx) }?;
+      planes_out[plane_idx] = Plane::new(carried, bytes as u32);
       plane_count = (plane_idx + 1) as u8;
       continue;
     }
@@ -1290,14 +1420,17 @@ unsafe fn copy_out_planes(
       // contains `data_ptr` covers at least `plane_bytes` from it. The
       // returned pointer is not needed — 0.8 used it to compute a view
       // offset; 0.9 only needs the guarantee that the read is in range.
-      unsafe { find_backing_buffer(av_frame, data_ptr, plane_bytes) }.ok_or(
-        ConvertError::BufferAcquireFailed(BufferAcquireFailed::new(plane_idx)),
-      )?;
-      // SAFETY: `data_ptr` is non-null and was just proved to address
-      // `plane_bytes` initialized bytes inside one of the frame's own
-      // live buffers.
-      let bytes = unsafe { core::slice::from_raw_parts(data_ptr as *const u8, plane_bytes) };
-      (FfmpegBytes::copy_from_slice(bytes), linesize as u32)
+      // **The tight plane is the shareable one.** `linesize ==
+      // row_bytes` means the whole `plane_bytes` run is the decoder's
+      // own output with nothing between the rows, so a view over it
+      // exposes no byte that was not written. The owned lane copies it;
+      // the view lane takes a reference to exactly this range.
+      //
+      // SAFETY: `data_ptr` is non-null and addresses this plane.
+      let carried = unsafe {
+        capture_from_backing::<C>(av_frame, data_ptr as *const u8, plane_bytes, plane_idx)
+      }?;
+      (carried, linesize as u32)
     } else {
       let total_bytes = row_bytes
         .checked_mul(plane_h)
@@ -1327,6 +1460,21 @@ unsafe fn copy_out_planes(
       unsafe { find_backing_buffer(av_frame, data_ptr, readable_extent) }.ok_or(
         ConvertError::BufferAcquireFailed(BufferAcquireFailed::new(plane_idx)),
       )?;
+      // **A padded plane is copied on both lanes**, and the view lane
+      // does not get an exception here. Only the first `row_bytes` of
+      // each `linesize`-wide row are the decoder's output; the rest is
+      // allocator scratch nothing wrote. A carrier is an `AsRef<[u8]>`,
+      // so sharing the padded span would form a slice over
+      // uninitialised memory — undefined before a consumer reads a byte
+      // of it, and the same leak the owned lane refused when it stopped
+      // exporting `linesize`. Stopping at the last row's `row_bytes`
+      // does not help either: the gaps *between* rows are in the span
+      // too.
+      //
+      // So this is the conditional-sharing rule again, in its second
+      // place: share where the extent is provably all output, copy
+      // where it is not.
+      //
       // Written straight into the carrier's allocation, one row at a
       // time — **not** staged through a `Vec` first. The staged
       // spelling allocated the whole plane twice and copied it twice,
@@ -1336,7 +1484,7 @@ unsafe fn copy_out_planes(
       // which is what took the place of the staging `Vec`'s
       // `try_reserve_exact`.
       debug_assert_eq!(total_bytes, row_bytes * plane_h);
-      let packed = FfmpegBytes::from_rows(plane_h, row_bytes, |row_idx| {
+      let packed = C::from_rows(plane_h, row_bytes, |row_idx| {
         // `row_offset` cannot overflow: `readable_extent` above already
         // added `(plane_h - 1) * linesize` to `row_bytes` without
         // overflowing, and `row_idx < plane_h`.
@@ -1346,7 +1494,10 @@ unsafe fn copy_out_planes(
         // Each per-row slice is the part the decoder writes
         // (initialized).
         unsafe { core::slice::from_raw_parts(data_ptr.add(row_offset) as *const u8, row_bytes) }
-      });
+      })
+      .ok_or(ConvertError::CarrierAllocFailed(CarrierAllocFailed::new(
+        plane_idx,
+      )))?;
       (packed, row_bytes as u32)
     };
 
@@ -1363,8 +1514,8 @@ unsafe fn copy_out_planes(
 /// `plane_count` of them are exposed through `planes()`. 0.8 gave each
 /// slot its own one-byte `AVBufferRef` and could fail doing it; the
 /// shared empty carrier costs one allocation for the process.
-fn plane_placeholder() -> Plane<FfmpegBytes> {
-  Plane::new(FfmpegBytes::empty(), 0)
+fn plane_placeholder<C: crate::FfmpegCarrier + crate::CarrierOps>() -> Plane<C::Buffer> {
+  Plane::new(C::empty(), 0)
 }
 
 /// # Safety
@@ -1756,6 +1907,44 @@ unsafe fn collect_image_side_data(
 /// # Safety
 /// `av_frame` must be a live `*const AVFrame`. Reads `buf[]` (an
 /// array of pointers — no bindgen-enum validity hazards).
+/// Captures `len` bytes at `data_ptr` out of whichever of the frame's
+/// own buffers backs it.
+///
+/// **The proof runs before the capture, on both lanes.**
+/// [`find_backing_buffer`] establishes that `data_ptr .. +len` lies
+/// inside one of `(*av_frame).buf[]`; only then is the seam asked for a
+/// carrier. The owned lane copies those bytes out; the view lane takes
+/// a reference to the same range. Neither gets to skip the proof,
+/// because it is written once, here.
+///
+/// The `len` a caller passes is therefore a claim about **what is
+/// initialised**, and each medium computes it differently — see the
+/// call sites for the per-medium rules.
+///
+/// # Safety
+///
+/// `av_frame` must be a live `*const AVFrame` and `data_ptr` must point
+/// into one of its planes.
+unsafe fn capture_from_backing<C: crate::FfmpegCarrier + crate::CarrierOps>(
+  av_frame: *const AVFrame,
+  data_ptr: *const u8,
+  len: usize,
+  plane_idx: usize,
+) -> Result<C::Buffer, ConvertError> {
+  // SAFETY: the caller upholds `av_frame`'s liveness and `data_ptr`'s
+  // provenance.
+  let backing = unsafe { find_backing_buffer(av_frame, data_ptr, len) }.ok_or(
+    ConvertError::BufferAcquireFailed(BufferAcquireFailed::new(plane_idx)),
+  )?;
+  // SAFETY: `backing` is one of the frame's live buffers and was just
+  // proved to cover `len` bytes from `data_ptr`.
+  let offset = unsafe { (data_ptr as usize).wrapping_sub((*backing).data as usize) };
+  // SAFETY: the offset and length were proved to lie inside `backing`.
+  unsafe { C::capture(backing, offset, len) }.ok_or(ConvertError::CarrierAllocFailed(
+    CarrierAllocFailed::new(plane_idx),
+  ))
+}
+
 unsafe fn find_backing_buffer(
   av_frame: *const AVFrame,
   data_ptr: *const u8,
@@ -1927,12 +2116,20 @@ fn map_chroma_loc(raw: i32) -> ChromaLocation {
 /// `AVSampleFormat`, `nb_samples > 0`, and `data[]` / `buf[]`
 /// populated). The frame's buffers are neither consumed nor
 /// referenced; every byte the produced `AudioFrame` carries is a copy.
-pub unsafe fn av_frame_to_audio_frame(
+/// * no handle capable of **mutating** the frame's buffers may
+///   outlive this call while the returned carriers do. On the view
+///   lane a plane is a window into `frame`'s own allocation, and
+///   `ffmpeg_next`'s wrappers lend `&mut [u8]` by refcount with no
+///   copy-on-write — so keeping the source frame and writing through
+///   it would race a carrier a consumer is reading. Consume the
+///   frame, or use the owned lane, or use the safe borrowed wrapper
+///   (which is the owned lane for exactly this reason).
+pub(crate) unsafe fn av_frame_to_audio_frame_as<C: crate::FfmpegCarrier + crate::CarrierOps>(
   av_frame: *const AVFrame,
   time_base: Timebase,
   limits: FrameLimits,
 ) -> Result<
-  AudioFrame<SampleFormat, ChannelLayoutDescription, AudioFrameExtra, FfmpegBytes>,
+  AudioFrame<SampleFormat, ChannelLayoutDescription, AudioFrameExtra, C::Buffer>,
   ConvertError,
 > {
   if av_frame.is_null() {
@@ -2149,7 +2346,7 @@ pub unsafe fn av_frame_to_audio_frame(
 
   // Every slot starts as the shared empty carrier at stride zero, which
   // is already exactly what a zero-sample frame's planes should be.
-  let mut planes_out: [Plane<FfmpegBytes>; 8] = std::array::from_fn(|_| plane_placeholder());
+  let mut planes_out: [Plane<C::Buffer>; 8] = std::array::from_fn(|_| plane_placeholder::<C>());
 
   // **A zero-sample frame has no planes to validate.** FFmpeg's
   // canonical empty audio frame carries a format, a layout and a rate
@@ -2193,21 +2390,39 @@ pub unsafe fn av_frame_to_audio_frame(
     // as large as its `linesize` claims, and lies inside one of the
     // frame's own buffers. This is the only thing `linesize` is used
     // for.
-    unsafe { find_audio_backing_buffer(av_frame, data_ptr, allocated_per_plane) }.ok_or(
-      ConvertError::BufferAcquireFailed(BufferAcquireFailed::new(plane_idx)),
-    )?;
-    // SAFETY: `data_ptr` is non-null and was just proved to address
-    // `allocated_per_plane` bytes inside one of the frame's own live
-    // buffers, and `valid_per_plane <= allocated_per_plane`. The slice
-    // covers only the samples the decoder wrote — never the alignment
-    // padding past them, which nothing initialises.
-    let bytes = unsafe { core::slice::from_raw_parts(data_ptr as *const u8, valid_per_plane) };
+    let backing = unsafe { find_audio_backing_buffer(av_frame, data_ptr, allocated_per_plane) }
+      .ok_or(ConvertError::BufferAcquireFailed(BufferAcquireFailed::new(
+        plane_idx,
+      )))?;
     // Lossless, and provably so rather than by ceiling: this branch runs
     // only when `valid_per_plane <= allocated_per_plane`, which is an
     // `i32` read from `linesize[0]` proved non-negative above. No plane
     // can exceed `i32::MAX` bytes, so nothing here is truncated even if
     // a caller raises `max_frame_bytes` past `u32::MAX`.
-    planes_out[plane_idx] = Plane::new(FfmpegBytes::copy_from_slice(bytes), valid_per_plane as u32);
+    // **Audio stops at exactly the valid bytes, on both lanes.**
+    // `linesize[0]` is what `av_samples_get_buffer_size` *allocated*,
+    // rounded up for alignment; what the decoder wrote is
+    // `nb_samples * bytes_per_sample` (times the channels when packed).
+    // The difference is untouched allocator memory — the R5 finding —
+    // and it is no more exportable through a view than it was through a
+    // copy: a carrier is an `AsRef<[u8]>`, so the span it names is the
+    // span a consumer may read, and padding in that span is the same
+    // information leak whoever formed it.
+    //
+    // So the view lane shares the **prefix**, not the plane. Which is
+    // also why `linesize` is used for exactly one thing here: proving
+    // the allocation really is as large as it claims.
+    //
+    // SAFETY: `backing` is one of the frame's live buffers, proved above
+    // to cover `allocated_per_plane` bytes from `data_ptr`, and
+    // `valid_per_plane <= allocated_per_plane`.
+    let offset = unsafe { (data_ptr as usize).wrapping_sub((*backing).data as usize) };
+    // SAFETY: the offset and length lie inside `backing` by the proof
+    // above.
+    let carried = unsafe { C::capture(backing, offset, valid_per_plane) }.ok_or(
+      ConvertError::CarrierAllocFailed(CarrierAllocFailed::new(plane_idx)),
+    )?;
+    planes_out[plane_idx] = Plane::new(carried, valid_per_plane as u32);
   }
 
   let pts = if pts_raw != AV_NOPTS_VALUE {
@@ -2309,10 +2524,20 @@ pub(crate) unsafe fn find_audio_backing_buffer(
 /// `av_subtitle` must be a live `*const AVSubtitle` for the duration
 /// of this call; the rect array (`av_subtitle.rects`) must be valid
 /// for `av_subtitle.num_rects` entries.
-pub unsafe fn av_subtitle_to_subtitle_frame(
+/// * no handle capable of **mutating** the frame's buffers may
+///   outlive this call while the returned carriers do. On the view
+///   lane a plane is a window into `frame`'s own allocation, and
+///   `ffmpeg_next`'s wrappers lend `&mut [u8]` by refcount with no
+///   copy-on-write — so keeping the source frame and writing through
+///   it would race a carrier a consumer is reading. Consume the
+///   frame, or use the owned lane, or use the safe borrowed wrapper
+///   (which is the owned lane for exactly this reason).
+pub(crate) unsafe fn av_subtitle_to_subtitle_frame_as<
+  C: crate::FfmpegCarrier + crate::CarrierOps,
+>(
   av_subtitle: *const ffmpeg_next::ffi::AVSubtitle,
   time_base: Timebase,
-) -> Result<SubtitleFrame<SubtitleFrameExtra, FfmpegBytes>, ConvertError> {
+) -> Result<SubtitleFrame<SubtitleFrameExtra, C::Buffer>, ConvertError> {
   if av_subtitle.is_null() {
     return Err(ConvertError::NullFrame);
   }
@@ -2321,7 +2546,7 @@ pub unsafe fn av_subtitle_to_subtitle_frame(
   // fields). Read every field through the raw pointer.
 
   let mut text_chunks: std::vec::Vec<u8> = std::vec::Vec::new();
-  let mut bitmap_regions: std::vec::Vec<mediadecode::subtitle::BitmapRegion<FfmpegBytes>> =
+  let mut bitmap_regions: std::vec::Vec<mediadecode::subtitle::BitmapRegion<C::Buffer>> =
     std::vec::Vec::new();
 
   let count_raw = unsafe { (*av_subtitle).num_rects } as usize;
@@ -2462,14 +2687,20 @@ pub unsafe fn av_subtitle_to_subtitle_frame(
         // SAFETY: data[0] is valid for `linesize[0] * h` bytes per
         // FFmpeg's contract; the multiplication is checked above.
         let data_slice = unsafe { core::slice::from_raw_parts(rect_data0_ptr, data_len) };
-        let data_buf = FfmpegBytes::copy_from_slice(data_slice);
+        // **A rect is copied on both lanes.** `AVSubtitleRect` has no
+        // `buf[]`: its `data[]` are plain `av_malloc` allocations owned
+        // by the `AVSubtitle`, which `avsubtitle_free` releases when
+        // this call returns. There is no refcount to take, so the view
+        // lane has nothing to view and says so.
+        let data_buf = C::from_bytes(data_slice)
+          .ok_or(ConvertError::CarrierAllocFailed(CarrierAllocFailed::new(0)))?;
         let palette_len = 256 * 4;
         let palette_buf = if rect_data1_ptr.is_null() {
-          FfmpegBytes::empty()
+          C::empty()
         } else {
           // SAFETY: palette buffer is 256*4 bytes per FFmpeg's contract.
           let p = unsafe { core::slice::from_raw_parts(rect_data1_ptr, palette_len) };
-          FfmpegBytes::copy_from_slice(p)
+          C::from_bytes(p).ok_or(ConvertError::CarrierAllocFailed(CarrierAllocFailed::new(1)))?
         };
         bitmap_regions.push(mediadecode::subtitle::BitmapRegion::new(
           rect_x.max(0) as u32,
@@ -2488,14 +2719,15 @@ pub unsafe fn av_subtitle_to_subtitle_frame(
 
   let payload = if !text_chunks.is_empty() {
     SubtitlePayload::Text(SubtitleText::new(
-      FfmpegBytes::copy_from_slice(&text_chunks),
+      C::from_bytes(&text_chunks)
+        .ok_or(ConvertError::CarrierAllocFailed(CarrierAllocFailed::new(0)))?,
       None,
     ))
   } else if !bitmap_regions.is_empty() {
     SubtitlePayload::Bitmap(SubtitleBitmap::new(bitmap_regions))
   } else {
     // No rects (or only `None`-typed) — empty text payload.
-    SubtitlePayload::Text(SubtitleText::new(FfmpegBytes::empty(), None))
+    SubtitlePayload::Text(SubtitleText::new(C::empty(), None))
   };
 
   let sub_pts = unsafe { (*av_subtitle).pts };
@@ -2527,3 +2759,135 @@ fn map_picture_type_raw(raw: i32) -> PictureType {
 
 #[cfg(test)]
 mod tests;
+
+/// [`av_frame_to_video_frame_as`] on the **view** lane.
+///
+/// # Safety
+///
+/// As the crate-private worker: a live source for the duration of the
+/// call, and — on this lane — no handle capable of mutating its buffers
+/// may outlive the returned carriers.
+pub unsafe fn av_frame_to_video_frame(
+  av_frame: *const AVFrame,
+  time_base: Timebase,
+  limits: FrameLimits,
+) -> Result<VideoFrame<mediadecode::PixelFormat, VideoFrameExtra, crate::FfmpegBuffer>, ConvertError>
+{
+  // SAFETY: forwarded verbatim; the caller's obligations are the
+  // worker's.
+  unsafe { av_frame_to_video_frame_as::<crate::View>(av_frame, time_base, limits) }
+}
+
+/// [`av_frame_to_video_frame`] on the **owned** lane, which copies every byte it
+/// reads and therefore has no aliasing obligation.
+///
+/// # Safety
+///
+/// The source must be live for the duration of the call.
+pub unsafe fn av_frame_to_owned_video_frame(
+  av_frame: *const AVFrame,
+  time_base: Timebase,
+  limits: FrameLimits,
+) -> Result<VideoFrame<mediadecode::PixelFormat, VideoFrameExtra, FfmpegBytes>, ConvertError> {
+  // SAFETY: forwarded verbatim.
+  unsafe { av_frame_to_video_frame_as::<crate::Owned>(av_frame, time_base, limits) }
+}
+
+/// [`av_frame_to_image_frame_as`] on the **view** lane.
+///
+/// # Safety
+///
+/// As the crate-private worker: a live source for the duration of the
+/// call, and — on this lane — no handle capable of mutating its buffers
+/// may outlive the returned carriers.
+pub unsafe fn av_frame_to_image_frame(
+  av_frame: *const AVFrame,
+  limits: FrameLimits,
+) -> Result<ImageFrame<mediadecode::PixelFormat, ImageFrameExtra, crate::FfmpegBuffer>, ConvertError>
+{
+  // SAFETY: forwarded verbatim; the caller's obligations are the
+  // worker's.
+  unsafe { av_frame_to_image_frame_as::<crate::View>(av_frame, limits) }
+}
+
+/// [`av_frame_to_image_frame`] on the **owned** lane, which copies every byte it
+/// reads and therefore has no aliasing obligation.
+///
+/// # Safety
+///
+/// The source must be live for the duration of the call.
+pub unsafe fn av_frame_to_owned_image_frame(
+  av_frame: *const AVFrame,
+  limits: FrameLimits,
+) -> Result<ImageFrame<mediadecode::PixelFormat, ImageFrameExtra, FfmpegBytes>, ConvertError> {
+  // SAFETY: forwarded verbatim.
+  unsafe { av_frame_to_image_frame_as::<crate::Owned>(av_frame, limits) }
+}
+
+/// [`av_frame_to_audio_frame_as`] on the **view** lane.
+///
+/// # Safety
+///
+/// As the crate-private worker: a live source for the duration of the
+/// call, and — on this lane — no handle capable of mutating its buffers
+/// may outlive the returned carriers.
+pub unsafe fn av_frame_to_audio_frame(
+  av_frame: *const AVFrame,
+  time_base: Timebase,
+  limits: FrameLimits,
+) -> Result<
+  AudioFrame<SampleFormat, ChannelLayoutDescription, AudioFrameExtra, crate::FfmpegBuffer>,
+  ConvertError,
+> {
+  // SAFETY: forwarded verbatim; the caller's obligations are the
+  // worker's.
+  unsafe { av_frame_to_audio_frame_as::<crate::View>(av_frame, time_base, limits) }
+}
+
+/// [`av_frame_to_audio_frame`] on the **owned** lane, which copies every byte it
+/// reads and therefore has no aliasing obligation.
+///
+/// # Safety
+///
+/// The source must be live for the duration of the call.
+pub unsafe fn av_frame_to_owned_audio_frame(
+  av_frame: *const AVFrame,
+  time_base: Timebase,
+  limits: FrameLimits,
+) -> Result<
+  AudioFrame<SampleFormat, ChannelLayoutDescription, AudioFrameExtra, FfmpegBytes>,
+  ConvertError,
+> {
+  // SAFETY: forwarded verbatim.
+  unsafe { av_frame_to_audio_frame_as::<crate::Owned>(av_frame, time_base, limits) }
+}
+
+/// [`av_subtitle_to_subtitle_frame_as`] on the **view** lane.
+///
+/// # Safety
+///
+/// As the crate-private worker: a live source for the duration of the
+/// call, and — on this lane — no handle capable of mutating its buffers
+/// may outlive the returned carriers.
+pub unsafe fn av_subtitle_to_subtitle_frame(
+  av_subtitle: *const ffmpeg_next::ffi::AVSubtitle,
+  time_base: Timebase,
+) -> Result<SubtitleFrame<SubtitleFrameExtra, crate::FfmpegBuffer>, ConvertError> {
+  // SAFETY: forwarded verbatim; the caller's obligations are the
+  // worker's.
+  unsafe { av_subtitle_to_subtitle_frame_as::<crate::View>(av_subtitle, time_base) }
+}
+
+/// [`av_subtitle_to_subtitle_frame`] on the **owned** lane, which copies every byte it
+/// reads and therefore has no aliasing obligation.
+///
+/// # Safety
+///
+/// The source must be live for the duration of the call.
+pub unsafe fn av_subtitle_to_owned_subtitle_frame(
+  av_subtitle: *const ffmpeg_next::ffi::AVSubtitle,
+  time_base: Timebase,
+) -> Result<SubtitleFrame<SubtitleFrameExtra, FfmpegBytes>, ConvertError> {
+  // SAFETY: forwarded verbatim.
+  unsafe { av_subtitle_to_subtitle_frame_as::<crate::Owned>(av_subtitle, time_base) }
+}

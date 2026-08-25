@@ -34,7 +34,10 @@ use mediadecode::{
   demuxer::{DemuxedPacket, Demuxer, TrackKind},
   packet::PacketFlags,
 };
-use mediadecode_ffmpeg::{DemuxError, FfmpegDemuxer};
+// The owned family under the names this suite was written with — the
+// bare aliases mean the view lane now. Import block only; the
+// assertions below are unchanged.
+use mediadecode_ffmpeg::{DemuxError, FfmpegOwnedDemuxer as FfmpegDemuxer};
 use support::Corpus;
 
 /// Drains a session, returning `(track, kind, pts)` for every delivered
@@ -314,7 +317,7 @@ fn decoded_samples(path: &std::path::Path, strip_side_data: bool) -> u64 {
     .position(|t| t.kind() == TrackKind::Audio)
     .expect("an audio track");
   let info = &demuxer.tracks()[track];
-  let mut decoder = mediadecode_ffmpeg::FfmpegAudioStreamDecoder::open(
+  let mut decoder = mediadecode_ffmpeg::FfmpegOwnedAudioStreamDecoder::open(
     info
       .extra()
       .clone_parameters()
@@ -324,7 +327,7 @@ fn decoded_samples(path: &std::path::Path, strip_side_data: bool) -> u64 {
   )
   .expect("open decoder");
 
-  let mut frame = mediadecode_ffmpeg::empty_audio_frame();
+  let mut frame = mediadecode_ffmpeg::empty_owned_audio_frame();
   let mut total = 0u64;
   while let Some(packet) = demuxer.next_packet().expect("pull") {
     let DemuxedPacket::Audio(p) = packet else {
@@ -332,7 +335,7 @@ fn decoded_samples(path: &std::path::Path, strip_side_data: bool) -> u64 {
     };
     let packet = p.into_packet();
     let packet = if strip_side_data {
-      mediadecode_ffmpeg::AudioPacket::new(
+      mediadecode_ffmpeg::OwnedAudioPacket::new(
         packet.data().clone(),
         mediadecode_ffmpeg::extras::AudioPacketExtra::new(packet.extra().stream_index()),
       )
@@ -447,7 +450,7 @@ fn the_demux_to_decoder_handoff_survives_an_allocation_fault() {
 
       // And the handoff really is the one that opens a decoder.
       let parameters = track.extra().clone_parameters().expect("uncapped");
-      mediadecode_ffmpeg::FfmpegAudioStreamDecoder::open(
+      mediadecode_ffmpeg::FfmpegOwnedAudioStreamDecoder::open(
         parameters,
         track.timebase(),
         mediadecode_ffmpeg::DecoderLimits::default(),

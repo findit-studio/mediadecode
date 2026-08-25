@@ -351,12 +351,10 @@ impl FfmpegBytes {
     rows: usize,
     row_bytes: usize,
     mut row: impl FnMut(usize) -> &'a [u8],
-  ) -> Self {
-    let len = rows
-      .checked_mul(row_bytes)
-      .expect("the caller checked this total against its frame ceiling");
+  ) -> Option<Self> {
+    let len = rows.checked_mul(row_bytes)?;
     if len == 0 {
-      return Self::empty();
+      return Some(Self::empty());
     }
     let mut uninit = Arc::<[u8]>::new_uninit_slice(len);
     {
@@ -364,12 +362,13 @@ impl FfmpegBytes {
         Arc::get_mut(&mut uninit).expect("the allocation was made here and has not been shared");
       for index in 0..rows {
         let source = row(index);
-        assert_eq!(
-          source.len(),
-          row_bytes,
-          "row {index} is {} bytes, not the {row_bytes} the geometry promised",
-          source.len(),
-        );
+        if source.len() != row_bytes {
+          // A length that arrives from a caller is an input, not a
+          // promise: refuse rather than copy `row_bytes` out of a
+          // shorter slice. The half-built `Arc` drops with this
+          // return, and every byte of it is still `MaybeUninit`.
+          return None;
+        }
         let start = index * row_bytes;
         // `MaybeUninit<u8>` has the same layout as `u8`, so the source
         // slice can be viewed as one and copied wholesale.
@@ -388,9 +387,10 @@ impl FfmpegBytes {
     // SAFETY: the loop above wrote every one of the `rows * row_bytes`
     // slots — `rows` iterations, each filling exactly `row_bytes`
     // consecutive bytes starting at `index * row_bytes`, with the
-    // length of each source row asserted. Nothing in the allocation is
-    // left uninitialised.
-    Self(Inner::Shared(unsafe { uninit.assume_init() }))
+    // length of each source row checked before the copy and the whole
+    // gather abandoned if one disagreed. Nothing in the allocation is
+    // left uninitialised on this road.
+    Some(Self(Inner::Shared(unsafe { uninit.assume_init() })))
   }
 
   /// The bytes, as a slice.
@@ -752,9 +752,50 @@ pub enum PacketBufferError {
   #[error(transparent)]
   TrustedPayload(#[from] TrustedPayload),
 
+  /// The capture itself failed — an allocation on the owned lane, a
+  /// refcount on the view lane. See [`CaptureFailed`].
+  #[error(transparent)]
+  CaptureFailed(#[from] CaptureFailed),
+
+  /// The payload's buffer is referenced by something other than the
+  /// packet it came from. See [`SharedPayload`].
+  #[error(transparent)]
+  SharedPayload(#[from] SharedPayload),
+
   /// Out of memory copying a side-data entry.
   #[error(transparent)]
   SideDataAlloc(#[from] SideDataAlloc),
+}
+
+impl PacketBufferError {
+  /// Whether the demux session should **park** the packet this refusal
+  /// came from and re-attempt it on the next pull.
+  ///
+  /// Deliberately not public, and deliberately named for the decision
+  /// rather than for a property of the error. It was briefly public as
+  /// `is_transient`, which promised more than an error enum can know:
+  /// whether retrying helps depends on *what was retried*.
+  /// `SharedPayload` is permanent for a caller who keeps their other
+  /// reference and retryable the moment they drop it;
+  /// `CaptureFailed` is worth another attempt only if the packet still
+  /// exists to attempt, which on a **consuming** conversion it does
+  /// not. Only the demux loop knows both halves — it still holds the
+  /// packet, and it knows nobody else does.
+  ///
+  /// So this answers one question for one caller. An allocation that
+  /// failed says nothing about the packet, and the demux loop is
+  /// holding the bytes; everything else is a fact about the packet
+  /// itself, and parking it would answer every later pull with the same
+  /// error instead of letting the session make progress.
+  ///
+  /// **The door left open:** a public retry signal would have to know
+  /// which operation produced the error and what the caller still
+  /// holds — an operation-aware answer, not a property of this enum.
+  /// If one is ever wanted it is designed then, not approximated now.
+  #[inline]
+  pub(crate) const fn parks_in_demux(&self) -> bool {
+    matches!(self, Self::CaptureFailed(_) | Self::SideDataAlloc(_))
+  }
 }
 
 /// `AV_PKT_FLAG_TRUSTED` as the bit the portable `PacketFlags` byte
@@ -869,10 +910,11 @@ impl std::error::Error for TrustedPayload {}
 ///
 /// `pkt` must be a live `*const AVPacket` for the duration of this
 /// call.
-pub(crate) unsafe fn payload_of(
+pub(crate) unsafe fn payload_of<C: crate::FfmpegCarrier + crate::CarrierOps>(
   pkt: *const ffmpeg_next::ffi::AVPacket,
   budget: usize,
-) -> Result<Option<FfmpegBytes>, PacketBufferError> {
+  provenance: PayloadProvenance,
+) -> Result<Option<C::Buffer>, PacketBufferError> {
   // SAFETY: `pkt` is live per the contract above; `.buf`, `.data` and
   // `.size` are public fields on `AVPacket`, and `buf` may be null
   // (stack-allocated packets).
@@ -930,10 +972,63 @@ pub(crate) unsafe fn payload_of(
       return Err(PacketBufferError::Bounds(Bounds::new(offset, len, size)));
     }
   }
-  // SAFETY: `data_ptr` is non-null and was just proved to address
-  // `len` bytes inside the packet's own live `AVBufferRef`.
-  let bytes = unsafe { core::slice::from_raw_parts(data_ptr, len) };
-  Ok(Some(FfmpegBytes::copy_from_slice(bytes)))
+  // **The sharing question, asked before any byte is read.**
+  //
+  // Everything below reads the payload — the view lane by handing out a
+  // span over it, the owned lane by copying it — so a buffer somebody
+  // else references has to be classified before it is touched. What
+  // matters is not the count but **who** the other holder is, and only
+  // the caller of this function knows that: see [`PayloadProvenance`]
+  // for the dichotomy and [`PayloadProvenance::route`] for the table.
+  //
+  // Placed here rather than inside the capture so the ordering is a
+  // property of this function rather than of two lane impls: nothing
+  // between the bounds proof and this decision touches the payload.
+  //
+  // SAFETY: `buf_ptr` is a live `AVBufferRef` owned by the packet;
+  // `av_buffer_get_ref_count` only reads its atomic.
+  let references = unsafe { ffmpeg_next::ffi::av_buffer_get_ref_count(buf_ptr.cast_const()) };
+  let route = provenance.route(references != 1);
+  if route == CaptureRoute::Refuse {
+    return Err(PacketBufferError::SharedPayload(SharedPayload::new(
+      references,
+    )));
+  }
+
+  // **The capture, and the only step the two lanes spell differently.**
+  // Everything above — the `TRUSTED` refusal, the empty answer, the
+  // budget, the extent proof — is shared, which is what keeps the view
+  // lane from having to re-earn a single one of them.
+  //
+  // The **packet-payload** capture, not the general one: this range is
+  // an `AVPacket`'s payload inside that packet's own buffer, which is
+  // the one place libavformat's trailing-padding contract applies. The
+  // view lane records that, and the send leg is the only thing that
+  // reads it back — see `boundary::share_or_copy`.
+  //
+  // SAFETY: `offset + len` was just proved to lie inside `buf_ptr`'s
+  // own `size`, and `buf_ptr` is a live `AVBufferRef` the packet owns.
+  let carried = match route {
+    CaptureRoute::Capture => unsafe { C::capture_packet_payload(buf_ptr, offset, len) },
+    CaptureRoute::Copy => {
+      // A demux-delivered packet whose buffer libavformat also holds.
+      // Reading it here is race-free — every other reference is
+      // C-owned, no `ffmpeg_next::Packet` wraps one, and this crate
+      // holds the `AVFormatContext` exclusively for the duration of
+      // the call — but the copy is what keeps that argument confined
+      // to *this* call instead of to the carrier's whole life.
+      //
+      // SAFETY: the extent was proved above and `buf_data` is
+      // non-null.
+      let bytes = unsafe { core::slice::from_raw_parts(buf_data.add(offset).cast_const(), len) };
+      C::from_bytes(bytes)
+    }
+    // Answered before the payload was touched.
+    CaptureRoute::Refuse => unreachable!("a refusal returns above"),
+  };
+  carried
+    .map(Some)
+    .ok_or(PacketBufferError::CaptureFailed(CaptureFailed::new(len)))
 }
 
 #[cfg(test)]
@@ -946,9 +1041,15 @@ mod tests {
   fn a_real_payload_is_copied_out_whole() {
     let packet = Packet::copy(&[1u8, 2, 3, 4]);
     // SAFETY: `packet` owns a live `AVPacket` for the call.
-    let payload = unsafe { payload_of(packet.as_ptr(), DEFAULT_MAX_PACKET_BYTES) }
-      .expect("a well-formed packet is carriable")
-      .expect("present");
+    let payload = unsafe {
+      payload_of::<crate::Owned>(
+        packet.as_ptr(),
+        DEFAULT_MAX_PACKET_BYTES,
+        PayloadProvenance::CallerSupplied,
+      )
+    }
+    .expect("a well-formed packet is carriable")
+    .expect("present");
     assert_eq!(payload.as_ref(), &[1, 2, 3, 4]);
   }
 
@@ -958,9 +1059,15 @@ mod tests {
     // and the bytes are still here.
     let packet = Packet::copy(&[9u8, 8, 7]);
     // SAFETY: `packet` owns a live `AVPacket` for the call.
-    let payload = unsafe { payload_of(packet.as_ptr(), DEFAULT_MAX_PACKET_BYTES) }
-      .expect("carriable")
-      .expect("present");
+    let payload = unsafe {
+      payload_of::<crate::Owned>(
+        packet.as_ptr(),
+        DEFAULT_MAX_PACKET_BYTES,
+        PayloadProvenance::CallerSupplied,
+      )
+    }
+    .expect("carriable")
+    .expect("present");
     let shared = payload.clone();
     assert!(shared.ptr_eq(&payload), "the clone copied the bytes");
     drop(packet);
@@ -973,9 +1080,15 @@ mod tests {
     let packet = Packet::empty();
     // SAFETY: `packet` owns a live `AVPacket` for the call.
     assert!(
-      unsafe { payload_of(packet.as_ptr(), DEFAULT_MAX_PACKET_BYTES) }
-        .expect("not a failure")
-        .is_none()
+      unsafe {
+        payload_of::<crate::Owned>(
+          packet.as_ptr(),
+          DEFAULT_MAX_PACKET_BYTES,
+          PayloadProvenance::CallerSupplied,
+        )
+      }
+      .expect("not a failure")
+      .is_none()
     );
   }
 
@@ -990,7 +1103,13 @@ mod tests {
     }
     // SAFETY: `packet` owns a live `AVPacket` for the call.
     assert!(matches!(
-      unsafe { payload_of(packet.as_ptr(), DEFAULT_MAX_PACKET_BYTES) },
+      unsafe {
+        payload_of::<crate::Owned>(
+          packet.as_ptr(),
+          DEFAULT_MAX_PACKET_BYTES,
+          PayloadProvenance::CallerSupplied,
+        )
+      },
       Err(PacketBufferError::Bounds(_)),
     ));
   }
@@ -1017,5 +1136,169 @@ mod tests {
     let rendered = format!("{carrier:?}");
     assert!(rendered.contains("len: 3"), "got {rendered}");
     assert!(!rendered.contains('4'), "got {rendered}");
+  }
+}
+
+/// Where the packet a payload is taken from came from — and therefore
+/// what a second reference to its buffer can do.
+///
+/// The dichotomy is **delivered by libavformat** versus **handed over
+/// by a caller**, and it is about who can *write*, not how many
+/// references there are.
+///
+/// * A packet this crate's own read loop just took from
+///   `av_read_frame` — or hoisted out of `AVStream.attached_pic` — may
+///   well share its buffer, and every other reference to it is
+///   libavformat's. FFmpeg writes through a buffer only after
+///   `av_buffer_make_writable`, which *copies* when the buffer is
+///   shared; and while this crate is reading, it holds the
+///   `AVFormatContext` exclusively, so no libavformat code is running
+///   at all. There is no safe-Rust `data_mut` on any of those
+///   references, because no `ffmpeg_next::Packet` wraps them.
+/// * A packet a **caller** hands over may share its buffer with
+///   another `ffmpeg_next::Packet` — and that type's `data_mut` writes
+///   in place from safe code, without consulting writability. That is
+///   the writer the uniqueness rule exists for, and it may be on
+///   another thread.
+///
+/// Spelled out as a parameter rather than assumed at the call sites,
+/// because a blanket "refcount must be one" looked right and was twice
+/// wrong: it refused every embedded cover picture, and then every
+/// packet from a queue-backed subtitle demuxer, which delivers
+/// `av_packet_ref`s of originals it keeps in its own queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PayloadProvenance {
+  /// A packet a caller handed to a public conversion. A second
+  /// reference may be a `Packet` with a safe `data_mut`; shared is
+  /// refused by name.
+  CallerSupplied,
+  /// A packet this crate's demux loop just received from
+  /// `av_read_frame`. Secondary references are libavformat's own.
+  DemuxDelivered,
+  /// The container's parked picture, whether hoisted at open or queued
+  /// as a stream's first packet. Written once while the container was
+  /// opened and never again.
+  AttachedPicture,
+}
+
+/// How a payload of a given provenance may be captured once its extent
+/// is proved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CaptureRoute {
+  /// The ordinary road: the view lane takes a window, the owned lane
+  /// copies.
+  Capture,
+  /// Both lanes copy. The bytes are safe to *read* — no safe-Rust
+  /// writer exists — but no long-lived window may be opened onto a
+  /// buffer somebody else also holds unless something stronger than
+  /// "nobody is writing right now" is true of it.
+  Copy,
+  /// Refuse without reading a byte.
+  Refuse,
+}
+
+impl PayloadProvenance {
+  /// What to do with a payload whose buffer has `shared` other
+  /// references.
+  ///
+  /// | provenance | unique | shared | the argument |
+  /// |---|---|---|---|
+  /// | [`Self::CallerSupplied`] | capture | **refuse** | a second `Packet`'s `data_mut` writes in place from safe code, possibly on another thread |
+  /// | [`Self::DemuxDelivered`] | capture | **copy** | the read is race-free — every other reference is C-owned and the context is held exclusively — but a *window* would outlive that exclusivity, and FFmpeg's copy-on-write discipline is a weaker guarantee than this crate wants under a long-lived span |
+  /// | [`Self::AttachedPicture`] | capture | **capture** | `AVStream.attached_pic` is written once while the container opens and never again, so a window onto it is as stable as one onto a private buffer |
+  ///
+  /// The middle row is the deliberate one. Sharing there would have
+  /// rested on "libavformat honours its own writability rules
+  /// forever"; copying rests on "nothing can be writing while we hold
+  /// the context", which is a fact about *this* call and needs no
+  /// promise about anyone's future behaviour. Subtitle queues — the
+  /// shape that produced this row — carry payloads measured in bytes,
+  /// so the copy is not a cost worth an argument.
+  #[inline]
+  pub(crate) const fn route(self, shared: bool) -> CaptureRoute {
+    match (self, shared) {
+      (_, false) | (Self::AttachedPicture, true) => CaptureRoute::Capture,
+      (Self::DemuxDelivered, true) => CaptureRoute::Copy,
+      (Self::CallerSupplied, true) => CaptureRoute::Refuse,
+    }
+  }
+}
+
+/// A packet whose payload buffer somebody else still references.
+///
+/// **Refused without reading a byte of it, and that is the whole
+/// point.** A refcount above one is exactly the state in which another
+/// handle to the same allocation may exist — `ffmpeg_next::Packet`
+/// hands out `&mut [u8]` through `data_mut` from entirely safe code,
+/// and a `Packet` is `Send`, so that handle may be on another thread
+/// writing right now. Forming a `&[u8]` over those bytes is a data race
+/// whether the bytes are then viewed *or copied*: the copy needs the
+/// read, and the read is the race.
+///
+/// An earlier round answered this shape with a silent copy, reasoning
+/// that a copy is always sound and keeps the API total. That was wrong
+/// in the direction that matters — it traded soundness for totality.
+/// The refcount protects the allocation's *lifetime*; it says nothing
+/// about who may be writing into it.
+///
+/// The ordinary roads never see this: a packet from `av_read_frame` is
+/// uniquely referenced, and so is one the caller cloned successfully.
+/// What produces it is a second reference the caller may not know they
+/// have — see `ffmpeg_next::Packet::clone`, which ignores
+/// `av_packet_make_writable`'s return code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+  "packet payload buffer is shared ({references} references): its bytes cannot be read \
+   without racing whoever else holds it"
+)]
+pub struct SharedPayload {
+  references: i32,
+}
+
+impl SharedPayload {
+  /// Constructs a `SharedPayload` payload.
+  #[inline]
+  #[must_use]
+  pub const fn new(references: i32) -> Self {
+    Self { references }
+  }
+
+  /// References the payload's buffer had when it was refused.
+  #[inline]
+  #[must_use]
+  pub const fn references(&self) -> i32 {
+    self.references
+  }
+}
+
+/// Payload for [`PacketBufferError::CaptureFailed`].
+///
+/// The proofs all passed and the carrier still could not be formed:
+/// `av_buffer_alloc` returned null on the owned lane, or
+/// `av_buffer_ref` did on the view lane. Distinct from
+/// [`Bounds`] on purpose — a malformed packet and an exhausted
+/// allocator are different facts, and 0.8 reported both as an absent
+/// payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("could not capture a {len}-byte payload: the allocator or the refcount refused")]
+pub struct CaptureFailed {
+  len: usize,
+}
+
+impl CaptureFailed {
+  /// Constructs a `CaptureFailed` payload.
+  #[inline]
+  pub const fn new(len: usize) -> Self {
+    Self { len }
+  }
+  /// Bytes the capture was for.
+  #[inline]
+  pub const fn len(&self) -> usize {
+    self.len
+  }
+  /// Whether the refused capture was of no bytes.
+  #[inline]
+  pub const fn is_empty(&self) -> bool {
+    self.len == 0
   }
 }

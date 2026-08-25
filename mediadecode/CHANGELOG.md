@@ -46,6 +46,28 @@ The sibling FFmpeg adapter has its own log at
 
 ## [0.9.0] - 2026-08-24
 
+### Added
+
+- **The two-carrier-lanes contract** (user-ruled 2026-08-25), written
+  into the `adapter` module's docs beside the amputation contract. A
+  backend may offer more than one carrier, and the contract states what
+  each owes:
+
+  - the **view** lane hands out a refcounted handle onto the
+    allocation the substrate already made — nothing copied — and is the
+    **default**, because the ordinary consumer decodes in place and
+    paying to copy bytes it will discard is a cost with nothing on the
+    other side of it;
+  - the **owned** lane is the amputation contract as written: one copy
+    at the boundary, `Send + Sync`, a lifetime answerable to nobody.
+
+  With a tradeoff table, the **pool-hostage warning** — a frame held is
+  a pool slot held, so a consumer that queues view frames stalls its own
+  decoder — and the rule that follows from it: read in place, drop,
+  decode on. Graph traffic, fan-out and anything needing `Sync` is
+  steered to the owned lane explicitly; `mediagraph` belongs there.
+
+
 ### Added (BREAKING)
 
 - **The D-seat amputation contract**, written into the `adapter`

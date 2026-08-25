@@ -17,6 +17,7 @@ mod audio;
 mod backend;
 pub mod boundary;
 mod buffer;
+mod carrier;
 pub mod channel_layout;
 mod codec_id;
 pub mod convert;
@@ -38,30 +39,84 @@ mod resampler;
 mod sample_format;
 mod subtitle;
 mod video;
+mod view;
 
 pub use adapter::Ffmpeg;
-pub use audio::{AudioDecodeError, FfmpegAudioStreamDecoder};
+pub use audio::{AudioDecodeError, CarrierAudioStreamDecoder};
 pub use backend::Backend;
-pub use boundary::MediaKind;
-pub use boundary::SendSideDataTooLarge;
 pub use boundary::{
-  PacketBuildError, SendPayloadTooLarge, attachment_packet_from_ffmpeg, audio_packet_from_ffmpeg,
-  audio_packet_from_ffmpeg_in, data_packet_from_ffmpeg_in, empty_audio_frame, empty_subtitle_frame,
-  empty_video_frame, from_av_pixel_format, is_hardware_pix_fmt, subtitle_packet_from_ffmpeg,
-  subtitle_packet_from_ffmpeg_in, video_packet_from_ffmpeg, video_packet_from_ffmpeg_in,
+  MediaKind, PacketBuildError, SendPayloadTooLarge, SendSideDataTooLarge,
+  attachment_packet_from_ffmpeg, audio_packet_from_ffmpeg, audio_packet_from_ffmpeg_in,
+  data_packet_from_ffmpeg_in, empty_audio_frame, empty_owned_audio_frame,
+  empty_owned_subtitle_frame, empty_owned_video_frame, empty_subtitle_frame, empty_video_frame,
+  ffmpeg_packet_from_audio_packet, ffmpeg_packet_from_owned_audio_packet,
+  ffmpeg_packet_from_owned_subtitle_packet, ffmpeg_packet_from_owned_video_packet,
+  ffmpeg_packet_from_subtitle_packet, ffmpeg_packet_from_video_packet, from_av_pixel_format,
+  is_hardware_pix_fmt, owned_attachment_packet_from_ffmpeg, owned_audio_packet_from_ffmpeg_in,
+  owned_data_packet_from_ffmpeg_in, owned_subtitle_packet_from_ffmpeg_in,
+  owned_video_packet_from_ffmpeg_in, subtitle_packet_from_ffmpeg, subtitle_packet_from_ffmpeg_in,
+  video_packet_from_ffmpeg, video_packet_from_ffmpeg_in,
 };
-pub use buffer::TrustedPayload;
-pub use buffer::{FfmpegBytes, PacketBufferError};
+
+pub use buffer::{FfmpegBytes, PacketBufferError, TrustedPayload};
+pub(crate) use carrier::CarrierOps;
+pub use carrier::{FfmpegCarrier, Owned, View};
+pub use view::FfmpegBuffer;
+
+/// The demuxer, on the **view** lane — the ordinary road.
+///
+/// Packets carry [`FfmpegBuffer`] views onto libavformat's own
+/// allocations: nothing is copied, and a consumer that reads a packet
+/// and drops it never pays for bytes it did not keep. This is what a
+/// direct consumer wants, which is why it is what the bare name means.
+///
+/// Reach for [`FfmpegOwnedDemuxer`] when a packet has to **travel** —
+/// across a graph, between threads that both read it, into a cache
+/// that outlives the decoder. See [the carrier lanes][lanes] for the
+/// tradeoff table.
+///
+/// [lanes]: mediadecode::adapter#the-two-carrier-lanes
+pub type FfmpegDemuxer = demuxer::CarrierDemuxer<View>;
+
+/// The demuxer on the **owned** lane: every byte copied once at the
+/// boundary into memory Rust owns.
+///
+/// The same type as [`FfmpegDemuxer`] on the other carrier, with the
+/// same constructors — `FfmpegOwnedDemuxer::open(&path)`. Packets are
+/// `Send + Sync + 'static` and owe nothing to the session that produced
+/// them, which is what a graph needs and what a view cannot give.
+pub type FfmpegOwnedDemuxer = demuxer::CarrierDemuxer<Owned>;
+
+/// The audio decoder on the **view** lane.
+pub type FfmpegAudioStreamDecoder = audio::CarrierAudioStreamDecoder<View>;
+/// The audio decoder on the **owned** lane.
+pub type FfmpegOwnedAudioStreamDecoder = audio::CarrierAudioStreamDecoder<Owned>;
+
+/// The subtitle decoder on the **view** lane.
+pub type FfmpegSubtitleStreamDecoder = subtitle::CarrierSubtitleStreamDecoder<View>;
+/// The subtitle decoder on the **owned** lane.
+pub type FfmpegOwnedSubtitleStreamDecoder = subtitle::CarrierSubtitleStreamDecoder<Owned>;
+
+/// The still-image decoder on the **view** lane.
+pub type FfmpegImageDecoder = image::CarrierImageDecoder<View>;
+/// The still-image decoder on the **owned** lane.
+pub type FfmpegOwnedImageDecoder = image::CarrierImageDecoder<Owned>;
+
+/// The video stream decoder on the **view** lane.
+pub type FfmpegVideoStreamDecoder = video::CarrierVideoStreamDecoder<View>;
+/// The video stream decoder on the **owned** lane.
+pub type FfmpegOwnedVideoStreamDecoder = video::CarrierVideoStreamDecoder<Owned>;
 pub use channel_layout::{
   channel_layout_description_from_ffmpeg, channel_layout_from_ffmpeg, channel_order_from_ffmpeg,
 };
 pub use codec_id::CodecId;
 pub use decoder::VideoDecoder;
-pub use demuxer::{DemuxError, FfmpegDemuxer, ProbeBudgetExhausted};
-pub use error::{Error, Result};
-pub use error::{FrameBudgetExceeded, FrameMedium, HwSurfaceTooLarge, HwTransferTooLarge};
+pub use demuxer::{CarrierDemuxer, DemuxError, ProbeBudgetExhausted};
+pub use error::{
+  Error, FrameBudgetExceeded, FrameMedium, HwSurfaceTooLarge, HwTransferTooLarge, Result,
+};
 pub use frame::Frame;
-pub use image::{Corrupt, CorruptSource, FfmpegImageDecoder, ImageDecodeError, InputTooLarge};
+pub use image::{CarrierImageDecoder, Corrupt, CorruptSource, ImageDecodeError, InputTooLarge};
 pub use limits::{
   DEFAULT_MAX_ATTACHMENT_BYTES, DEFAULT_MAX_CODEC_PARAMETER_BYTES, DEFAULT_MAX_FRAME_BYTES,
   DEFAULT_MAX_IMAGE_INPUT_BYTES, DEFAULT_MAX_IMAGE_SIDE_DATA_BYTES, DEFAULT_MAX_PACKET_BYTES,
@@ -72,74 +127,165 @@ pub use limits::{
 #[cfg(feature = "resample")]
 #[cfg_attr(docsrs, doc(cfg(feature = "resample")))]
 pub use resampler::{
-  FfmpegResampler, OutputTooLarge, ResampleError, ResampleSpec, SpecEnd,
+  CarrierResampler, OutputTooLarge, ResampleError, ResampleSpec, SpecEnd,
   UnsupportedChannelCount as UnsupportedSpecChannelCount,
 };
-pub use sample_format::SampleFormat;
-pub use subtitle::{FfmpegSubtitleStreamDecoder, SubtitleDecodeError};
-pub use video::{FfmpegVideoStreamDecoder, VideoDecodeError};
+/// The resampler, on the **view** lane — planes shared out of its own
+/// output frame.
+///
+/// Its output frames are the resampler's, not a decoder's: it allocates
+/// one per conversion and never writes into a buffer it has handed out,
+/// so the pool-hostage warning that applies to decoder frames does not
+/// apply here. What does apply is `!Sync` and the amputation contract —
+/// use [`FfmpegOwnedResampler`] for a frame that has to travel.
+#[cfg(feature = "resample")]
+#[cfg_attr(docsrs, doc(cfg(feature = "resample")))]
+pub type FfmpegResampler = resampler::CarrierResampler<View>;
 
-// Every alias below binds `FfmpegBytes` in the `D` seat, and
-// each spells it out rather than hiding it behind an alias of this
-// crate's own. That is deliberate: 0.8 had such an alias, it was
-// called `FfmpegBuffer`, and the name was the problem — a consumer
-// reading `VideoFrame` saw a type belonging to this crate and could
-// not tell whether holding one held libavcodec's memory open. It did.
-// `FfmpegBytes` answers the question by being nothing of ours: owned,
-// `Send + Sync`, clone-is-a-refcount-bump, no FFmpeg lifetime
-// attached — the core's D-seat amputation contract, satisfied by a
-// type out of `alloc`.
+/// The resampler, on the **owned** lane — every produced plane copied
+/// out of the output frame.
+#[cfg(feature = "resample")]
+#[cfg_attr(docsrs, doc(cfg(feature = "resample")))]
+pub type FfmpegOwnedResampler = resampler::CarrierResampler<Owned>;
+
+pub use sample_format::SampleFormat;
+pub use subtitle::{CarrierSubtitleStreamDecoder, SubtitleDecodeError};
+pub use video::{CarrierVideoStreamDecoder, VideoDecodeError};
+
+// Every bare alias below binds [`FfmpegBuffer`] in the `D` seat — the
+// view lane, the ordinary road: a decoder's output read where it lands
+// and dropped. The `Owned*` family binds [`FfmpegBytes`] and is what a
+// payload takes when it has to **travel** — outlive the decoder, cross
+// into a graph, be shared across threads.
+//
+// Each spells its carrier out rather than hiding it behind a neutral
+// name. That is deliberate, and it is the one lesson 0.8's version of
+// this block failed to teach: 0.8 also called this type `FfmpegBuffer`,
+// but the D seat was *only* ever that type, so a consumer reading
+// `VideoFrame` could not tell that holding one held libavcodec's memory
+// open. It did. Naming both carriers in both families is what makes the
+// question answerable at the use site — and [`FfmpegBytes`] answers it
+// by being nothing of ours: owned, `Send + Sync`, no FFmpeg lifetime
+// attached, the core's D-seat amputation contract satisfied by a type
+// out of `alloc`.
 
 /// Compressed video packet pre-parameterized with this crate's extras
-/// and owned carrier — the type [`FfmpegVideoStreamDecoder`] consumes
+/// and view carrier — the type [`FfmpegVideoStreamDecoder`] consumes
 /// via [`mediadecode::decoder::VideoStreamDecoder::send_packet`].
-pub type VideoPacket = mediadecode::packet::VideoPacket<extras::VideoPacketExtra, FfmpegBytes>;
+pub type VideoPacket = mediadecode::packet::VideoPacket<extras::VideoPacketExtra, FfmpegBuffer>;
 
 /// Compressed audio packet pre-parameterized with this crate's extras
-/// and owned carrier.
-pub type AudioPacket = mediadecode::packet::AudioPacket<extras::AudioPacketExtra, FfmpegBytes>;
+/// and view carrier.
+pub type AudioPacket = mediadecode::packet::AudioPacket<extras::AudioPacketExtra, FfmpegBuffer>;
 
 /// Compressed subtitle packet pre-parameterized with this crate's
-/// extras and owned carrier.
+/// extras and view carrier.
 pub type SubtitlePacket =
-  mediadecode::packet::SubtitlePacket<extras::SubtitlePacketExtra, FfmpegBytes>;
+  mediadecode::packet::SubtitlePacket<extras::SubtitlePacketExtra, FfmpegBuffer>;
 
 /// Decoded video frame pre-parameterized with this crate's pixel
-/// format / extras / owned carrier.
+/// format / extras / view carrier.
+///
+/// Its planes are windows into the decoder's own frame buffer wherever
+/// the geometry proves they may be — see the frame row of the lane
+/// table in [`mediadecode::adapter`]. **A frame held is a pool slot
+/// held**: on a hardware or fixed-pool decoder, retaining these past
+/// the next `receive_frame` starves the decoder. Use [`OwnedVideoFrame`]
+/// when a frame has to outlive the decode loop.
 pub type VideoFrame =
-  mediadecode::frame::VideoFrame<mediadecode::PixelFormat, extras::VideoFrameExtra, FfmpegBytes>;
+  mediadecode::frame::VideoFrame<mediadecode::PixelFormat, extras::VideoFrameExtra, FfmpegBuffer>;
 
 /// Decoded audio frame pre-parameterized with this crate's sample
-/// format / channel layout / extras / owned carrier.
+/// format / channel layout / extras / view carrier.
+///
+/// Each plane is a window over exactly the samples the decoder wrote —
+/// never the allocator's alignment padding past them.
 pub type AudioFrame = mediadecode::frame::AudioFrame<
+  SampleFormat,
+  mediaframe::audio::ChannelLayoutDescription,
+  extras::AudioFrameExtra,
+  FfmpegBuffer,
+>;
+
+/// Decoded subtitle frame pre-parameterized with this crate's
+/// extras / view carrier.
+pub type SubtitleFrame =
+  mediadecode::frame::SubtitleFrame<extras::SubtitleFrameExtra, FfmpegBuffer>;
+
+/// Decoded still image pre-parameterized with this crate's pixel
+/// format / extras / view carrier — what [`FfmpegImageDecoder`]
+/// produces.
+pub type ImageFrame =
+  mediadecode::frame::ImageFrame<mediadecode::PixelFormat, extras::ImageFrameExtra, FfmpegBuffer>;
+
+/// Timed opaque-data packet pre-parameterized with this crate's extras
+/// and view carrier.
+pub type DataPacket = mediadecode::demuxer::DataPacket<extras::DataPacketExtra, FfmpegBuffer>;
+
+/// Attachment payload pre-parameterized with this crate's extras and
+/// view carrier — a font, or the cover art [`FfmpegImageDecoder`]
+/// decodes.
+pub type AttachmentPacket =
+  mediadecode::demuxer::AttachmentPacket<extras::AttachmentPacketExtra, FfmpegBuffer>;
+
+/// The five-arm demux envelope [`FfmpegDemuxer`] delivers.
+pub type DemuxedPacket = mediadecode::demuxer::DemuxedPacket<Ffmpeg, FfmpegBuffer>;
+
+// --- The owned lane's alias family -----------------------------------
+//
+// The same shapes on the copying carrier, named explicitly because the
+// bare names mean the view lane — the ordinary road for a direct
+// consumer. Reach for these when a packet has to travel.
+//
+// Note what is **not** doubled: the `*Extra` types and `SideDataEntry`
+// stay monomorphic on both lanes. Side data has no `AVBufferRef` to
+// share — `AVPacketSideData` and `AVFrameSideData` payloads are plain
+// allocations — so both lanes copy it, and a second family of extras
+// would have been two names for one representation. The carrier
+// parameter reaches the **payload**, not the annotations.
+
+/// [`VideoPacket`] on the owned lane.
+pub type OwnedVideoPacket = mediadecode::packet::VideoPacket<extras::VideoPacketExtra, FfmpegBytes>;
+
+/// [`AudioPacket`] on the owned lane.
+pub type OwnedAudioPacket = mediadecode::packet::AudioPacket<extras::AudioPacketExtra, FfmpegBytes>;
+
+/// [`SubtitlePacket`] on the owned lane.
+pub type OwnedSubtitlePacket =
+  mediadecode::packet::SubtitlePacket<extras::SubtitlePacketExtra, FfmpegBytes>;
+
+/// [`DataPacket`] on the owned lane.
+pub type OwnedDataPacket = mediadecode::demuxer::DataPacket<extras::DataPacketExtra, FfmpegBytes>;
+
+/// [`AttachmentPacket`] on the owned lane.
+pub type OwnedAttachmentPacket =
+  mediadecode::demuxer::AttachmentPacket<extras::AttachmentPacketExtra, FfmpegBytes>;
+
+/// [`DemuxedPacket`] on the owned lane.
+pub type OwnedDemuxedPacket = mediadecode::demuxer::DemuxedPacket<Ffmpeg, FfmpegBytes>;
+
+/// [`VideoFrame`] on the owned lane — planes copied out of the
+/// decoder's buffer, so the frame outlives it and the pool slot goes
+/// straight back.
+pub type OwnedVideoFrame =
+  mediadecode::frame::VideoFrame<mediadecode::PixelFormat, extras::VideoFrameExtra, FfmpegBytes>;
+
+/// [`AudioFrame`] on the owned lane.
+pub type OwnedAudioFrame = mediadecode::frame::AudioFrame<
   SampleFormat,
   mediaframe::audio::ChannelLayoutDescription,
   extras::AudioFrameExtra,
   FfmpegBytes,
 >;
 
-/// Decoded subtitle frame pre-parameterized with this crate's
-/// extras / owned carrier.
-pub type SubtitleFrame = mediadecode::frame::SubtitleFrame<extras::SubtitleFrameExtra, FfmpegBytes>;
+/// [`SubtitleFrame`] on the owned lane.
+pub type OwnedSubtitleFrame =
+  mediadecode::frame::SubtitleFrame<extras::SubtitleFrameExtra, FfmpegBytes>;
 
-/// Decoded still image pre-parameterized with this crate's pixel
-/// format / extras / owned carrier — what [`FfmpegImageDecoder`]
+/// [`ImageFrame`] on the owned lane — what [`FfmpegOwnedImageDecoder`]
 /// produces.
-pub type ImageFrame =
+pub type OwnedImageFrame =
   mediadecode::frame::ImageFrame<mediadecode::PixelFormat, extras::ImageFrameExtra, FfmpegBytes>;
-
-/// Timed opaque-data packet pre-parameterized with this crate's extras
-/// and owned carrier.
-pub type DataPacket = mediadecode::demuxer::DataPacket<extras::DataPacketExtra, FfmpegBytes>;
-
-/// Attachment payload pre-parameterized with this crate's extras and
-/// owned carrier — a font, or the cover art [`FfmpegImageDecoder`]
-/// decodes.
-pub type AttachmentPacket =
-  mediadecode::demuxer::AttachmentPacket<extras::AttachmentPacketExtra, FfmpegBytes>;
-
-/// The five-arm demux envelope [`FfmpegDemuxer`] delivers.
-pub type DemuxedPacket = mediadecode::demuxer::DemuxedPacket<Ffmpeg, FfmpegBytes>;
 
 /// One row of the track table [`FfmpegDemuxer::tracks`] returns.
 ///

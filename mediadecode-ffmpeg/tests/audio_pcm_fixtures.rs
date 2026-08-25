@@ -25,7 +25,13 @@ use std::{num::NonZeroI32, path::PathBuf};
 
 use ffmpeg_next as ffmpeg;
 use mediadecode::{Timebase, decoder::AudioStreamDecoder};
-use mediadecode_ffmpeg::{FfmpegAudioStreamDecoder, audio_packet_from_ffmpeg, empty_audio_frame};
+// The owned family under the names this suite was written with — the
+// bare aliases mean the view lane now. Import block only; the
+// assertions below are unchanged.
+use mediadecode_ffmpeg::{
+  FfmpegOwnedAudioStreamDecoder as FfmpegAudioStreamDecoder,
+  empty_owned_audio_frame as empty_audio_frame,
+};
 
 /// One row per fixture: `(directory, file, sample_rate, channels,
 /// expected_samples)`. Kept hard-coded rather than parsed at runtime
@@ -132,7 +138,12 @@ fn decode_clip(path: &std::path::Path, expected: (u32, u8, u64)) {
     if s.index() != stream_index {
       continue;
     }
-    let Some(pkt) = audio_packet_from_ffmpeg(&av_packet).expect("a wrappable payload") else {
+    let Some(pkt) = mediadecode_ffmpeg::boundary::owned_audio_packet_from_ffmpeg_in(
+      &av_packet,
+      mediadecode::Timebase::default(),
+      mediadecode_ffmpeg::PacketLimits::default(),
+    )
+    .expect("a wrappable payload") else {
       continue;
     };
     decoder.send_packet(&pkt).expect("audio send_packet");

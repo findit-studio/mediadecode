@@ -587,6 +587,21 @@ impl VideoDecoder {
     )]))
   }
 
+  /// Whether the probe rescue history is still being recorded.
+  ///
+  /// While this is true, [`Self::send_packet`] `av_packet_ref`s every
+  /// accepted packet into `buffered_packets`, and a later
+  /// [`Error::AllBackendsFailed`] hands those recordings to the caller
+  /// as owned, mutable `Packet`s. A submission built to be dropped
+  /// inside one call therefore does **not** stay inside that call on
+  /// this road — which is what the view lane's send-side sharing
+  /// assumed. The window closes at commit, when the first frame
+  /// arrives and `probe` is taken.
+  #[inline]
+  pub(crate) const fn is_probing(&self) -> bool {
+    self.probe.is_some()
+  }
+
   /// Submit a packet to the decoder.
   ///
   /// On success — and only on success — the packet is buffered for potential
