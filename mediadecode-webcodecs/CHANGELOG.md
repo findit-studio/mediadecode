@@ -11,6 +11,8 @@ The backend-agnostic core it adapts has its own log at
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-08-26
+
 ## [0.9.0] - 2026-08-24
 
 ### Changed

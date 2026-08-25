@@ -11,6 +11,8 @@ The backend-agnostic core it adapts has its own log at
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-08-26
+
 ### Fixed
 
 - **The cold software fallback still lost allocator refusals.**

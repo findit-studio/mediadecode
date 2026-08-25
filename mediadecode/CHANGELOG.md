@@ -11,6 +11,8 @@ The sibling FFmpeg adapter has its own log at
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-08-26
+
 ### Added
 
 - **The resource governance contract** (user-ruled 2026-08-25), written
