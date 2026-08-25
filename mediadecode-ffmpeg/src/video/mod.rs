@@ -86,7 +86,7 @@ use ffmpeg_next::{Packet, codec::Parameters, frame};
 use mediadecode::{Timebase, decoder::VideoStreamDecoder, frame::VideoFrame, packet::VideoPacket};
 
 use crate::{
-  DecoderLimits, Error, Ffmpeg, FfmpegBytes, Frame, VideoDecoder, boundary,
+  DecoderLimits, Error, Ffmpeg, Frame, VideoDecoder, boundary,
   convert::{self, ConvertError},
   decoder::{build_codec_context, try_clone_parameters},
   error::FallbackFailed,
@@ -96,7 +96,7 @@ use crate::{
 
 /// `mediadecode::VideoStreamDecoder` impl with transparent HW → SW
 /// fallback.
-pub struct FfmpegVideoStreamDecoder {
+pub struct CarrierVideoStreamDecoder<C: crate::FfmpegCarrier> {
   state: DecodeState,
   /// Codec parameters retained so we can open a software
   /// `ffmpeg::decoder::Video` if the HW probe exhausts.
@@ -149,6 +149,28 @@ pub struct FfmpegVideoStreamDecoder {
   degraded_packets_since_fallback: u64,
   /// Source-stream time base, used to label produced frames.
   time_base: Timebase,
+  /// The lane this decoder captures into. A marker: the carrier
+  /// appears in the frames it produces, not in its own state.
+  /// `true` when the scratch frame holds a decoded frame whose
+  /// conversion has **not committed** — see
+  /// [`CarrierAudioStreamDecoder::scratch_pending`](crate::audio::CarrierAudioStreamDecoder)
+  /// for the reasoning, which is the same on both roads.
+  ///
+  /// **This decoder has two scratches and can change which one is
+  /// current, so the seat is enforced rather than merely recorded.**
+  /// While it is set, `send_packet` and `send_eof` refuse by name: both
+  /// are the roads that commit a hardware-to-software fallback, and a
+  /// fallback under a parked frame would leave the retry reading the
+  /// *other* scratch — delivering a stale frame, or refusing
+  /// permanently and stranding a decoded one. Refusing makes the
+  /// retry's state the state that parked it **by construction**, which
+  /// is a stronger guarantee than remembering which road produced it.
+  ///
+  /// It is the discipline the subtitle decoder already keeps one seat
+  /// over (`SubtitleDecodeError::FramePending`), and the escape is the
+  /// same: `receive_frame` to re-attempt, `flush` to abandon.
+  scratch_pending: bool,
+  _carrier: core::marker::PhantomData<C>,
 }
 
 /// Hardware-decode seam behind [`DecodeState::Hw`]. In production this is
@@ -169,9 +191,26 @@ pub(crate) trait HwInner: Send {
   /// HW decoder, so [`FfmpegVideoStreamDecoder::hardware_inner`] can keep
   /// exposing it. Returns `None` for a test fake.
   fn as_video_decoder(&self) -> Option<&VideoDecoder>;
+
+  /// Whether a packet submitted **now** would be recorded for replay.
+  ///
+  /// The probe keeps a rescue history so that a decoder which exhausts
+  /// every backend can hand the caller everything FFmpeg consumed since
+  /// open. It records by `av_packet_ref`, and
+  /// [`AllBackendsFailed::into_unconsumed_packets`] hands those
+  /// recordings out as owned, **mutable** `Packet`s — which is why the
+  /// view lane must not share its carrier's storage into a submission
+  /// that could be recorded. See
+  /// [`CarrierVideoStreamDecoder::send_packet_impl`].
+  fn records_submissions(&self) -> bool;
 }
 
 impl HwInner for VideoDecoder {
+  #[inline]
+  fn records_submissions(&self) -> bool {
+    self.is_probing()
+  }
+
   #[inline]
   fn send_packet(&mut self, packet: &Packet) -> Result<(), Error> {
     VideoDecoder::send_packet(self, packet)
@@ -272,7 +311,7 @@ enum PostCommitInput<'a> {
   Eof,
 }
 
-impl FfmpegVideoStreamDecoder {
+impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// Opens a decoder for the given codec parameters with the default
   /// HW backend probe order. If the HW probe can't open any backend,
   /// falls back to a software `ffmpeg::decoder::Video` immediately —
@@ -288,7 +327,7 @@ impl FfmpegVideoStreamDecoder {
   /// cannot be moved after `avcodec_open2`. That includes the contexts
   /// opened later, by a mid-stream fallback or a probe advance: the
   /// limits are retained for exactly that reason.
-  pub fn open(
+  pub(crate) fn open_impl(
     parameters: Parameters,
     time_base: Timebase,
     limits: DecoderLimits,
@@ -338,19 +377,21 @@ impl FfmpegVideoStreamDecoder {
       degraded_packets_since_fallback: 0,
       time_base,
       limits,
+      scratch_pending: false,
+      _carrier: core::marker::PhantomData,
     })
   }
 
   /// Returns `true` when this decoder has fallen back to the software
   /// path. `false` while still on the HW probe (the initial state).
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn is_software(&self) -> bool {
+  pub(crate) const fn is_software_impl(&self) -> bool {
     matches!(self.state, DecodeState::Sw(_))
   }
 
   /// Returns `true` while the HW probe is still active.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn is_hardware(&self) -> bool {
+  pub(crate) const fn is_hardware_impl(&self) -> bool {
     matches!(self.state, DecodeState::Hw(_))
   }
 
@@ -358,7 +399,7 @@ impl FfmpegVideoStreamDecoder {
   /// real HW path. Returns `None` after the SW fallback has fired (or, in
   /// tests, when the HW seam is a fake rather than a real decoder).
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn hardware_inner(&self) -> Option<&VideoDecoder> {
+  pub(crate) fn hardware_inner_impl(&self) -> Option<&VideoDecoder> {
     match &self.state {
       DecodeState::Hw(hw) => hw.as_video_decoder(),
       DecodeState::Sw(_) => None,
@@ -367,7 +408,7 @@ impl FfmpegVideoStreamDecoder {
 
   /// Returns the time base associated with the source stream.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn time_base(&self) -> Timebase {
+  pub(crate) const fn time_base_impl(&self) -> Timebase {
     self.time_base
   }
 
@@ -712,30 +753,64 @@ impl FfmpegVideoStreamDecoder {
     self.degraded_packets_since_fallback = 0;
   }
 
+  /// The one place a delivered frame is committed.
+  ///
+  /// Every road that hands a frame to the caller passes through here —
+  /// the hardware scratch, the software scratch, both replay-queue
+  /// entries, and the retry of a parked frame — so the bookkeeping a
+  /// delivery owes cannot be attached to some of them and forgotten on
+  /// others. It was: a parked software frame delivered on the retry
+  /// road skipped [`Self::resync_on_frame`], so the last recovered
+  /// frame of a degraded stream could leave the resync guard standing
+  /// and turn a clean EOF into a false
+  /// [`PostCommitNeverResynced`].
+  fn commit_delivery(
+    &mut self,
+    frame: VideoFrame<mediadecode::PixelFormat, VideoFrameExtra, C::Buffer>,
+    dst: &mut VideoFrame<mediadecode::PixelFormat, VideoFrameExtra, C::Buffer>,
+  ) {
+    // The seat is free once a carrier exists for what it held.
+    self.scratch_pending = false;
+    // A delivered frame is what clears a keyframe-anchored resync. A
+    // no-op on every road that never entered degraded mode, which is
+    // why it can be unconditional here.
+    self.resync_on_frame();
+    *dst = frame;
+  }
+
   /// Internal: convert the active scratch frame into a
   /// `mediadecode::VideoFrame` and write into `dst`.
   fn deliver_frame(
     &mut self,
-    dst: &mut VideoFrame<mediadecode::PixelFormat, VideoFrameExtra, FfmpegBytes>,
+    dst: &mut VideoFrame<mediadecode::PixelFormat, VideoFrameExtra, C::Buffer>,
   ) -> Result<(), VideoDecodeError> {
     let av_frame = match &mut self.state {
       DecodeState::Hw(_) => unsafe { self.hw_scratch.as_inner_mut().as_ptr() },
       DecodeState::Sw(_) => unsafe { self.sw_scratch.as_ptr() },
     };
-    // SAFETY: the scratch frame is live (just filled by the inner
-    // decoder's `receive_frame`); convert copies every plane it takes
-    // into the produced VideoFrame, so the scratch can be reused on
-    // the next call and the frame keeps nothing of it.
-    let new_frame =
-      unsafe { convert::av_frame_to_video_frame(av_frame, self.time_base, self.limits.frame()) }
-        .map_err(VideoDecodeError::Convert)?;
-    *dst = new_frame;
-    Ok(())
+    // SAFETY: the scratch frame is live — either just filled by the
+    // inner decoder's `receive_frame`, or left holding a frame whose
+    // conversion did not commit. Convert takes what it needs out of it,
+    // so the scratch can be reused once this has committed.
+    let converted = unsafe {
+      convert::av_frame_to_video_frame_as::<C>(av_frame, self.time_base, self.limits.frame())
+    };
+    match converted {
+      Ok(new_frame) => {
+        self.commit_delivery(new_frame, dst);
+        Ok(())
+      }
+      Err(e) => {
+        // Park only what another attempt could survive.
+        self.scratch_pending = e.parks_in_decode();
+        Err(VideoDecodeError::Convert(e))
+      }
+    }
   }
 }
 
 #[cfg(test)]
-impl FfmpegVideoStreamDecoder {
+impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// Build a decoder around an injected HW seam, bypassing the real probe.
   /// Lets tests drive the post-commit fallback path with a [`HwInner`] fake
   /// instead of a live GPU. The SW fallback still opens the **real**
@@ -760,6 +835,8 @@ impl FfmpegVideoStreamDecoder {
       degraded_packets_since_fallback: 0,
       time_base,
       limits,
+      scratch_pending: false,
+      _carrier: core::marker::PhantomData,
     })
   }
 
@@ -798,107 +875,157 @@ impl FfmpegVideoStreamDecoder {
   }
 }
 
-impl VideoStreamDecoder for FfmpegVideoStreamDecoder {
-  type Adapter = Ffmpeg;
-  type Buffer = FfmpegBytes;
-  type Error = VideoDecodeError;
-
-  fn send_packet(
+impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
+  pub(crate) fn send_packet_impl(
     &mut self,
-    packet: &VideoPacket<VideoPacketExtra, Self::Buffer>,
-  ) -> Result<(), Self::Error> {
-    let av_pkt = boundary::ffmpeg_packet_from_video_packet(packet, self.limits.packet_limits())
-      .map_err(|e| VideoDecodeError::Decode(Error::PacketBuild(e)))?;
-    match &mut self.state {
-      DecodeState::Hw(hw) => match hw.send_packet(&av_pkt) {
-        Ok(()) => Ok(()),
-        Err(Error::AllBackendsFailed(p)) => {
-          // Route on the EXPLICIT origin, never on whether `rescued` is empty (a
-          // probe-era first-packet cap trip is *also* empty).
-          if p.origin().is_post_commit() {
-            // Post-commit: DEGRADE AND CONTINUE. No lossless mid-stream
-            // reconstruction — the SW decoder opens cold, retains zero replay
-            // frames, and resyncs at the next keyframe. The current packet (the
-            // one HW REFUSED) is forwarded to that cold SW: if it is the resync
-            // keyframe SW decodes from it, otherwise SW drops it until a keyframe
-            // arrives. The bounded span from here to that keyframe is dropped — a
-            // loudly logged gap (see the `warn!`), not a silent one.
-            tracing::warn!(
-              backend = ?p.attempts().last().map(|(b, _)| *b),
-              pts = ?av_pkt.pts(),
-              "mediadecode-ffmpeg: HW decode failed post-commit; falling back to \
-               software, resyncing at next keyframe — a bounded span of frames \
-               may be dropped at this boundary",
-            );
-            // Transactional SW-open + current-packet forward; degrade-tracking
-            // (incl. keyframe-anchor recording) happens inside on a clean commit.
-            // A failure surfaces `FallbackFailed` and stays on HW.
-            return self
-              .degrade_to_sw(PostCommitInput::Packet(&av_pkt))
-              .map_err(VideoDecodeError::Decode);
+    packet: &VideoPacket<VideoPacketExtra, C::Buffer>,
+  ) -> Result<(), VideoDecodeError> {
+    // **Nothing is sent while a frame is parked.** Both send roads can
+    // commit a hardware-to-software fallback, and a fallback under a
+    // parked frame would leave the retry reading the other scratch. See
+    // [`Self::scratch_pending`].
+    if self.scratch_pending {
+      return Err(VideoDecodeError::FramePending);
+    }
+    // Scoped submission: the rebuilt `AVPacket` never leaves this call,
+    // which is what lets the view lane share its buffer with libavcodec
+    // rather than copy into it. See `boundary::with_ffmpeg_video_packet`.
+    let limits = self.limits.packet_limits();
+    // **The route depends on what this decoder does with what it is
+    // sent.** While the hardware probe is open it `av_packet_ref`s
+    // every accepted packet into a rescue history, and
+    // `AllBackendsFailed::into_unconsumed_packets` hands those out as
+    // owned, mutable `Packet`s — so a shared body would escape this
+    // call as a live mutable alias of a carrier the caller may still be
+    // reading. Inside that window the body is copied; once the probe
+    // has committed, nothing is recorded and the send is zero-copy
+    // again. The software road never records.
+    let route = match &self.state {
+      DecodeState::Hw(hw) if hw.records_submissions() => crate::carrier::BodyRoute::Copy,
+      _ => crate::carrier::BodyRoute::Submission,
+    };
+    boundary::with_ffmpeg_video_packet::<C, _>(packet, limits, route, |av_pkt| {
+      match &mut self.state {
+        DecodeState::Hw(hw) => match hw.send_packet(av_pkt) {
+          Ok(()) => Ok(()),
+          Err(Error::AllBackendsFailed(p)) => {
+            // Route on the EXPLICIT origin, never on whether `rescued` is empty (a
+            // probe-era first-packet cap trip is *also* empty).
+            if p.origin().is_post_commit() {
+              // Post-commit: DEGRADE AND CONTINUE. No lossless mid-stream
+              // reconstruction — the SW decoder opens cold, retains zero replay
+              // frames, and resyncs at the next keyframe. The current packet (the
+              // one HW REFUSED) is forwarded to that cold SW: if it is the resync
+              // keyframe SW decodes from it, otherwise SW drops it until a keyframe
+              // arrives. The bounded span from here to that keyframe is dropped — a
+              // loudly logged gap (see the `warn!`), not a silent one.
+              tracing::warn!(
+                backend = ?p.attempts().last().map(|(b, _)| *b),
+                pts = ?av_pkt.pts(),
+                "mediadecode-ffmpeg: HW decode failed post-commit; falling back to \
+                 software, resyncing at next keyframe — a bounded span of frames \
+                 may be dropped at this boundary",
+              );
+              // Transactional SW-open + current-packet forward; degrade-tracking
+              // (incl. keyframe-anchor recording) happens inside on a clean commit.
+              // A failure surfaces `FallbackFailed` and stays on HW.
+              return self
+                .degrade_to_sw(PostCommitInput::Packet(av_pkt))
+                .map_err(VideoDecodeError::Decode);
+            }
+            // Probe-era: replay the inner decoder's buffered history (lossless —
+            // no frame was delivered yet), then forward the still-unconsumed
+            // current packet to SW.
+            let rescued = p.into_unconsumed_packets();
+            // `eof_pending` is the committed EOF state — never pre-mutated here.
+            let eof_pending = self.eof_sent;
+            self
+              .fall_back_to_sw(rescued, eof_pending)
+              .map_err(VideoDecodeError::Decode)?;
+            // Forward the new (still-unconsumed) current packet to the
+            // freshly-opened SW decoder — the HW decoder REFUSED it, so it was not
+            // in the replay set. A failure here surfaces (it is not silently
+            // dropped).
+            if let DecodeState::Sw(sw) = &mut self.state {
+              let st = sw.state();
+              sw.send_packet(av_pkt)
+                .map_err(|e| VideoDecodeError::Decode(crate::decoder::software_exit(st, e)))?;
+            }
+            Ok(())
           }
-          // Probe-era: replay the inner decoder's buffered history (lossless —
-          // no frame was delivered yet), then forward the still-unconsumed
-          // current packet to SW.
-          let rescued = p.into_unconsumed_packets();
-          // `eof_pending` is the committed EOF state — never pre-mutated here.
-          let eof_pending = self.eof_sent;
-          self
-            .fall_back_to_sw(rescued, eof_pending)
-            .map_err(VideoDecodeError::Decode)?;
-          // Forward the new (still-unconsumed) current packet to the
-          // freshly-opened SW decoder — the HW decoder REFUSED it, so it was not
-          // in the replay set. A failure here surfaces (it is not silently
-          // dropped).
-          if let DecodeState::Sw(sw) = &mut self.state {
-            let st = sw.state();
-            sw.send_packet(&av_pkt)
-              .map_err(|e| VideoDecodeError::Decode(crate::decoder::software_exit(st, e)))?;
-          }
+          Err(other) => Err(VideoDecodeError::Decode(other)),
+        },
+        DecodeState::Sw(sw) => {
+          let st = sw.state();
+          sw.send_packet(av_pkt)
+            .map_err(|e| VideoDecodeError::Decode(crate::decoder::software_exit(st, e)))?;
+          // A keyframe fed across an unresolved post-commit gap is the resync
+          // anchor; record it so the next delivered frame can clear the guard.
+          self.note_degraded_keyframe(av_pkt.is_key());
+          // Count packets crossing an unresolved post-commit resync gap so the
+          // escalation at EOF can report how much tail was lost.
+          self.count_degraded_packet();
           Ok(())
         }
-        Err(other) => Err(VideoDecodeError::Decode(other)),
-      },
-      DecodeState::Sw(sw) => {
-        let st = sw.state();
-        sw.send_packet(&av_pkt)
-          .map_err(|e| VideoDecodeError::Decode(crate::decoder::software_exit(st, e)))?;
-        // A keyframe fed across an unresolved post-commit gap is the resync
-        // anchor; record it so the next delivered frame can clear the guard.
-        self.note_degraded_keyframe(av_pkt.is_key());
-        // Count packets crossing an unresolved post-commit resync gap so the
-        // escalation at EOF can report how much tail was lost.
-        self.count_degraded_packet();
-        Ok(())
       }
-    }
+    })
+    .map_err(|e| VideoDecodeError::Decode(Error::PacketBuild(e)))?
   }
 
-  fn receive_frame(
+  pub(crate) fn receive_frame_impl(
     &mut self,
-    dst: &mut VideoFrame<mediadecode::PixelFormat, VideoFrameExtra, Self::Buffer>,
-  ) -> Result<(), Self::Error> {
+    dst: &mut VideoFrame<mediadecode::PixelFormat, VideoFrameExtra, C::Buffer>,
+  ) -> Result<(), VideoDecodeError> {
     // Deliver any frames produced during SW fallback replay before
     // pulling new ones from the SW decoder. This is the queue
     // populated by `fall_back_to_sw` when SW returned EAGAIN during
     // packet replay — a **probe-era** path only (the post-commit path retains
     // no replay frames), so `resync_on_frame` here is a no-op (probe-era never
     // enters degraded mode).
-    if let Some(replayed) = self.sw_replay_frames.pop_front() {
-      // SAFETY: `replayed` is a live AVFrame owned by us; convert
-      // copies every plane it takes.
-      let new_frame = unsafe {
-        convert::av_frame_to_video_frame(replayed.as_ptr(), self.time_base, self.limits.frame())
-      }
-      .map_err(VideoDecodeError::Convert)?;
-      self.resync_on_frame();
-      *dst = new_frame;
+    // **Peeked, not popped.** A replayed frame is the rescue history's
+    // only copy: popping it before the conversion committed lost it to
+    // any allocation failure, which is the one thing this queue exists
+    // to prevent. It leaves the queue when a carrier exists for it.
+    if let Some(replayed) = self.sw_replay_frames.front() {
+      // SAFETY: `replayed` is a live AVFrame owned by this queue;
+      // convert takes what it needs out of it.
+      let converted = unsafe {
+        convert::av_frame_to_video_frame_as::<C>(
+          replayed.as_ptr(),
+          self.time_base,
+          self.limits.frame(),
+        )
+      };
+      let new_frame = match converted {
+        Ok(new_frame) => new_frame,
+        Err(e) if e.parks_in_decode() => return Err(VideoDecodeError::Convert(e)),
+        // A frame nothing can carry is dropped rather than re-offered
+        // forever — the same rule the scratch seat follows.
+        Err(e) => {
+          self.sw_replay_frames.pop_front();
+          return Err(VideoDecodeError::Convert(e));
+        }
+      };
+      self.sw_replay_frames.pop_front();
+      self.commit_delivery(new_frame, dst);
       return Ok(());
+    }
+    // A frame whose conversion did not commit is converted again before
+    // the decoder is asked for another — see [`Self::scratch_pending`].
+    // The scratch still holds it, and `deliver_frame` reads whichever
+    // scratch the current state uses.
+    if self.scratch_pending {
+      return self.deliver_frame(dst);
     }
     loop {
       match &mut self.state {
         DecodeState::Hw(hw) => match hw.receive_frame(&mut self.hw_scratch) {
-          Ok(()) => return self.deliver_frame(dst),
+          Ok(()) => {
+            // The frame is out of the decoder's queue from here; the
+            // seat is what keeps it if the conversion cannot commit.
+            self.scratch_pending = true;
+            return self.deliver_frame(dst);
+          }
           Err(Error::AllBackendsFailed(p)) => {
             // HW exhausted at frame-time. There is no current packet here.
             // Route on the explicit origin.
@@ -931,19 +1058,34 @@ impl VideoStreamDecoder for FfmpegVideoStreamDecoder {
             // If the replay produced any drained frames, return one
             // immediately — preserves stream order vs. whatever the
             // SW decoder will produce next.
-            if let Some(replayed) = self.sw_replay_frames.pop_front() {
-              // SAFETY: `replayed` is a live AVFrame owned by us; convert
-              // copies every plane it takes.
-              let new_frame = unsafe {
-                convert::av_frame_to_video_frame(
+            // **Peeked, not popped** — the second delivery path onto
+            // this queue, and it owes the same discipline as the first
+            // (see the head of `receive_frame_impl`). The replay queue
+            // is the rescue history's only copy of these frames, so a
+            // conversion that cannot commit must leave the head where
+            // it is rather than advance past it.
+            if let Some(replayed) = self.sw_replay_frames.front() {
+              // SAFETY: `replayed` is a live AVFrame owned by this
+              // queue; convert takes what it needs out of it.
+              let converted = unsafe {
+                convert::av_frame_to_video_frame_as::<C>(
                   replayed.as_ptr(),
                   self.time_base,
                   self.limits.frame(),
                 )
-              }
-              .map_err(VideoDecodeError::Convert)?;
-              self.resync_on_frame();
-              *dst = new_frame;
+              };
+              let new_frame = match converted {
+                Ok(new_frame) => new_frame,
+                Err(e) if e.parks_in_decode() => return Err(VideoDecodeError::Convert(e)),
+                // A frame nothing can carry is dropped rather than
+                // re-offered forever.
+                Err(e) => {
+                  self.sw_replay_frames.pop_front();
+                  return Err(VideoDecodeError::Convert(e));
+                }
+              };
+              self.sw_replay_frames.pop_front();
+              self.commit_delivery(new_frame, dst);
               return Ok(());
             }
             // Fall through to the loop; next iteration takes the Sw arm.
@@ -957,23 +1099,32 @@ impl VideoStreamDecoder for FfmpegVideoStreamDecoder {
           let st = sw.state();
           match sw.receive_frame(&mut self.sw_scratch) {
             Ok(()) => {
+              // The frame is out of the decoder's queue from here; the
+              // seat is what keeps it if the conversion cannot commit.
+              self.scratch_pending = true;
               // SAFETY: the scratch frame is live (just filled by
-              // `receive_frame`); convert copies every plane it takes,
-              // so the scratch can be reused on the next call.
-              let new_frame = unsafe {
-                convert::av_frame_to_video_frame(
+              // `receive_frame`); convert takes what it needs out of
+              // it, so the scratch can be reused once this commits.
+              let converted = unsafe {
+                convert::av_frame_to_video_frame_as::<C>(
                   self.sw_scratch.as_ptr(),
                   self.time_base,
                   self.limits.frame(),
                 )
-              }
-              .map_err(VideoDecodeError::Convert)?;
-              // SW produced a frame. Clear degraded mode only if a keyframe was
-              // fed across the gap — a real keyframe-anchored resync, so the
-              // dropped span is the promised bounded gap. A concealed P-frame
-              // (no keyframe yet) does not clear it (see `resync_on_frame`).
-              self.resync_on_frame();
-              *dst = new_frame;
+              };
+              let new_frame = match converted {
+                Ok(new_frame) => new_frame,
+                Err(e) => {
+                  self.scratch_pending = e.parks_in_decode();
+                  return Err(VideoDecodeError::Convert(e));
+                }
+              };
+              // SW produced a frame. The commit point clears degraded mode only
+              // if a keyframe was fed across the gap — a real keyframe-anchored
+              // resync, so the dropped span is the promised bounded gap. A
+              // concealed P-frame (no keyframe yet) does not clear it (see
+              // `resync_on_frame`).
+              self.commit_delivery(new_frame, dst);
               return Ok(());
             }
             // EOF while a post-commit resync is still unproven: SW never emitted
@@ -1011,7 +1162,13 @@ impl VideoStreamDecoder for FfmpegVideoStreamDecoder {
     }
   }
 
-  fn send_eof(&mut self) -> Result<(), Self::Error> {
+  pub(crate) fn send_eof_impl(&mut self) -> Result<(), VideoDecodeError> {
+    // As `send_packet`: EOF can commit a fallback too, and the escalation
+    // it may raise reads the resync standing a parked frame has not yet
+    // had the chance to clear.
+    if self.scratch_pending {
+      return Err(VideoDecodeError::FramePending);
+    }
     let outcome = match &mut self.state {
       DecodeState::Hw(hw) => match hw.send_eof() {
         Ok(()) => Ok(()),
@@ -1065,11 +1222,13 @@ impl VideoStreamDecoder for FfmpegVideoStreamDecoder {
     outcome
   }
 
-  fn flush(&mut self) -> Result<(), Self::Error> {
+  pub(crate) fn flush_impl(&mut self) -> Result<(), VideoDecodeError> {
     // Drop any frames buffered during SW fallback replay before
     // flushing the inner decoder — otherwise a seek/reset would
     // surface stale pre-flush frames on the next `receive_frame`.
     self.sw_replay_frames.clear();
+    // And a parked frame belongs to the position being abandoned.
+    self.scratch_pending = false;
     // Flush ends the drain phase; the decoder accepts new packets
     // after this, so reset EOF tracking.
     self.eof_sent = false;
@@ -1086,6 +1245,72 @@ impl VideoStreamDecoder for FfmpegVideoStreamDecoder {
     Ok(())
   }
 }
+
+macro_rules! video_lane_face {
+  ($($lane:ty),+ $(,)?) => { $(
+    impl CarrierVideoStreamDecoder<$lane> {
+      /// Opens a video decoder for `parameters`, probing hardware
+      /// backends in order and falling back to software.
+      pub fn open(
+        parameters: Parameters,
+        time_base: Timebase,
+        limits: DecoderLimits,
+      ) -> Result<Self, Error> {
+        Self::open_impl(parameters, time_base, limits)
+      }
+
+      /// Whether this decoder is currently running on software.
+      pub const fn is_software(&self) -> bool {
+        self.is_software_impl()
+      }
+
+      /// Whether this decoder is currently running on hardware.
+      pub const fn is_hardware(&self) -> bool {
+        self.is_hardware_impl()
+      }
+
+      /// The hardware wrapper, when one is in use.
+      pub fn hardware_inner(&self) -> Option<&VideoDecoder> {
+        self.hardware_inner_impl()
+      }
+
+      /// The stream timebase every produced timestamp is stamped with.
+      pub const fn time_base(&self) -> Timebase {
+        self.time_base_impl()
+      }
+    }
+
+    impl VideoStreamDecoder for CarrierVideoStreamDecoder<$lane> {
+      type Adapter = Ffmpeg;
+      type Buffer = <$lane as crate::FfmpegCarrier>::Buffer;
+      type Error = VideoDecodeError;
+
+      fn send_packet(
+        &mut self,
+        packet: &VideoPacket<VideoPacketExtra, Self::Buffer>,
+      ) -> Result<(), Self::Error> {
+        self.send_packet_impl(packet)
+      }
+
+      fn receive_frame(
+        &mut self,
+        dst: &mut VideoFrame<mediadecode::PixelFormat, VideoFrameExtra, Self::Buffer>,
+      ) -> Result<(), Self::Error> {
+        self.receive_frame_impl(dst)
+      }
+
+      fn send_eof(&mut self) -> Result<(), Self::Error> {
+        self.send_eof_impl()
+      }
+
+      fn flush(&mut self) -> Result<(), Self::Error> {
+        self.flush_impl()
+      }
+    }
+  )+ };
+}
+
+video_lane_face!(crate::View, crate::Owned);
 
 fn open_sw_decoder(parameters: &Parameters, limits: DecoderLimits) -> Result<SwDecoder, Error> {
   // Use the checked codec-context builder — ffmpeg-next's
@@ -1156,6 +1381,21 @@ pub enum VideoDecodeError {
   /// software decoder reached EOF without ever producing a frame.
   #[error(transparent)]
   PostCommitNeverResynced(#[from] PostCommitNeverResynced),
+  /// A decoded frame is parked, waiting for a conversion that can
+  /// commit, and nothing may be sent until it has been delivered.
+  ///
+  /// The answer is [`VideoStreamDecoder::receive_frame`]: it re-attempts
+  /// the parked frame. A caller who would rather abandon it calls
+  /// `flush`, which clears the seat with the rest of the decoder's
+  /// position.
+  ///
+  /// [`VideoStreamDecoder::receive_frame`]:
+  ///   mediadecode::decoder::VideoStreamDecoder::receive_frame
+  #[error(
+    "a decoded frame is parked and must be delivered before another packet is sent \
+     (call `receive_frame`, or `flush` to abandon it)"
+  )]
+  FramePending,
 }
 
 #[cfg(test)]

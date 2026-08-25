@@ -72,8 +72,8 @@ use ffmpeg_next as ffmpeg;
 use ffmpeg::{format, media};
 use mediadecode::{Timebase, decoder::VideoStreamDecoder};
 use mediadecode_ffmpeg::{
-  DecoderLimits, Error as FfmpegError, FfmpegVideoStreamDecoder, VideoDecodeError,
-  empty_video_frame, video_packet_from_ffmpeg,
+  DecoderLimits, Error as FfmpegError, FfmpegVideoStreamDecoder, PacketLimits,
+  VideoDecodeError, empty_video_frame, video_packet_from_ffmpeg_in,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -108,7 +108,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `Ok(None)` is an empty packet; an `Err` is a payload that is
     // there and could not be referenced, which is never silently
     // skipped.
-    let Some(pkt) = video_packet_from_ffmpeg(&av_packet)? else { continue };
+    // **By value.** The bare names are the view lane, where a packet's
+    // payload is a window into libavformat's own buffer — so the source
+    // is handed over rather than lent. (The borrowing doors,
+    // `owned_*`, are the owned lane: they copy, so the packet stays
+    // yours.)
+    let Some(pkt) =
+      video_packet_from_ffmpeg_in(av_packet, time_base, PacketLimits::default())?
+    else { continue };
 
     match decoder.send_packet(&pkt) {
       Ok(()) => {}
@@ -124,7 +131,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     while decoder.receive_frame(&mut frame).is_ok() {
       // frame.pixel_format(), frame.width(), frame.height(),
-      // frame.planes() — owned `FfmpegBytes`, safe to keep.
+      // frame.planes() — view carriers: read them here and drop. A
+      // frame held is a pool slot held. Use the `Owned*` family when a
+      // frame has to outlive the loop.
     }
   }
   decoder.send_eof()?;

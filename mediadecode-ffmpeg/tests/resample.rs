@@ -30,9 +30,13 @@ use mediadecode::{
   demuxer::{DemuxedPacket, Demuxer, TrackKind},
   resampler::AudioResampler,
 };
+// The owned family under the names this suite was written with — the
+// bare aliases mean the view lane now. Import block only; the
+// assertions below are unchanged.
 use mediadecode_ffmpeg::{
-  FfmpegAudioStreamDecoder, FfmpegDemuxer, FfmpegResampler, ResampleError, ResampleSpec,
-  empty_audio_frame,
+  FfmpegOwnedAudioStreamDecoder as FfmpegAudioStreamDecoder, FfmpegOwnedDemuxer as FfmpegDemuxer,
+  FfmpegOwnedResampler as FfmpegResampler, ResampleError, ResampleSpec,
+  empty_owned_audio_frame as empty_audio_frame,
 };
 use support::Corpus;
 
@@ -94,7 +98,7 @@ fn run(path: &std::path::Path, target: ResampleSpec) -> Converted {
     planes: 0,
   };
 
-  let collect = |converted: &mut Converted, frame: &mediadecode_ffmpeg::AudioFrame| {
+  let collect = |converted: &mut Converted, frame: &mediadecode_ffmpeg::OwnedAudioFrame| {
     converted.channels = frame.channel_count();
     converted.planes = frame.plane_count();
     converted.frames.push((
@@ -276,7 +280,7 @@ fn a_mid_stream_format_change_is_refused_by_name() {
   )
   .expect("open resampler");
 
-  let good = mediadecode_ffmpeg::AudioFrame::new(
+  let good = mediadecode_ffmpeg::OwnedAudioFrame::new(
     48_000,
     0,
     2,
@@ -293,7 +297,7 @@ fn a_mid_stream_format_change_is_refused_by_name() {
     .expect("the declared source spec");
 
   // Same everything but the rate.
-  let changed = mediadecode_ffmpeg::AudioFrame::new(
+  let changed = mediadecode_ffmpeg::OwnedAudioFrame::new(
     44_100,
     0,
     2,
@@ -316,7 +320,7 @@ fn a_mid_stream_format_change_is_refused_by_name() {
   }
 
   // And the same for a layout change at the same rate.
-  let mono = mediadecode_ffmpeg::AudioFrame::new(
+  let mono = mediadecode_ffmpeg::OwnedAudioFrame::new(
     48_000,
     0,
     1,
@@ -362,7 +366,7 @@ fn the_needs_more_signal_is_an_error_variant() {
   );
 
   // `send_frame` after EOF is refused rather than silently accepted.
-  let frame = mediadecode_ffmpeg::AudioFrame::new(
+  let frame = mediadecode_ffmpeg::OwnedAudioFrame::new(
     48_000,
     0,
     2,
@@ -398,7 +402,7 @@ fn stereo_frame(
   samples: u32,
   plane_len: usize,
   pts: Option<i64>,
-) -> mediadecode_ffmpeg::AudioFrame {
+) -> mediadecode_ffmpeg::OwnedAudioFrame {
   filled_frame(
     48_000,
     samples,
@@ -418,7 +422,7 @@ fn mono_frame(
   samples: u32,
   amplitude: i16,
   pts: Option<i64>,
-) -> mediadecode_ffmpeg::AudioFrame {
+) -> mediadecode_ffmpeg::OwnedAudioFrame {
   let bytes: Vec<u8> = std::iter::repeat_n(amplitude.to_le_bytes(), samples as usize)
     .flatten()
     .collect();
@@ -432,7 +436,7 @@ fn filled_frame(
   layout: ChannelLayout,
   bytes: &[u8],
   pts: Option<i64>,
-) -> mediadecode_ffmpeg::AudioFrame {
+) -> mediadecode_ffmpeg::OwnedAudioFrame {
   let plane = mediadecode_ffmpeg::FfmpegBytes::copy_from_slice(bytes);
   let planes = std::array::from_fn(|index| {
     mediadecode::frame::Plane::new(
@@ -444,7 +448,7 @@ fn filled_frame(
       0,
     )
   });
-  mediadecode_ffmpeg::AudioFrame::new(
+  mediadecode_ffmpeg::OwnedAudioFrame::new(
     rate,
     samples,
     channels,
@@ -547,7 +551,7 @@ fn tone_in_one_channel(
   samples: u32,
   layout: ChannelLayout,
   channel: usize,
-) -> mediadecode_ffmpeg::AudioFrame {
+) -> mediadecode_ffmpeg::OwnedAudioFrame {
   let channels = layout.channels() as usize;
   let mut bytes = Vec::with_capacity(samples as usize * channels * 2);
   for n in 0..samples {
@@ -562,7 +566,10 @@ fn tone_in_one_channel(
 
 /// Root-mean-square of everything a conversion produced for that frame.
 /// Zero means the channel the tone was in reached nothing.
-fn converted_rms(resampler: &mut FfmpegResampler, frame: &mediadecode_ffmpeg::AudioFrame) -> f64 {
+fn converted_rms(
+  resampler: &mut FfmpegResampler,
+  frame: &mediadecode_ffmpeg::OwnedAudioFrame,
+) -> f64 {
   let mut out = empty_audio_frame();
   let mut energy = 0f64;
   let mut count = 0usize;
@@ -999,7 +1006,7 @@ fn a_forged_frame_geometry_is_refused_before_it_can_allocate() {
   }
 
   // A packed frame with no planes at all.
-  let planeless = mediadecode_ffmpeg::AudioFrame::new(
+  let planeless = mediadecode_ffmpeg::OwnedAudioFrame::new(
     48_000,
     128,
     2,

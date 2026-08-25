@@ -17,9 +17,13 @@
 use ffmpeg::{format, media};
 use ffmpeg_next as ffmpeg;
 use mediadecode::{Timebase, decoder::VideoStreamDecoder};
+// The owned family under the names this suite was written with — the
+// bare aliases mean the view lane now. Import block only; the
+// assertions below are unchanged.
 use mediadecode_ffmpeg::{
-  DecoderLimits, Ffmpeg, FfmpegBytes, FfmpegVideoStreamDecoder, VideoFrame, VideoPacket,
-  empty_video_frame, video_packet_from_ffmpeg,
+  DecoderLimits, Ffmpeg, FfmpegBytes, FfmpegOwnedVideoStreamDecoder as FfmpegVideoStreamDecoder,
+  OwnedVideoFrame as VideoFrame, OwnedVideoPacket as VideoPacket,
+  empty_owned_video_frame as empty_video_frame,
 };
 use std::num::NonZeroI32;
 
@@ -97,7 +101,13 @@ fn decode_one_frame_through_trait() {
     if s.index() != stream_index {
       continue;
     }
-    let pkt = match video_packet_from_ffmpeg(&av_packet).expect("a wrappable payload") {
+    let pkt = match mediadecode_ffmpeg::boundary::owned_video_packet_from_ffmpeg_in(
+      &av_packet,
+      mediadecode::Timebase::default(),
+      mediadecode_ffmpeg::PacketLimits::default(),
+    )
+    .expect("a wrappable payload")
+    {
       Some(p) => p,
       None => continue,
     };

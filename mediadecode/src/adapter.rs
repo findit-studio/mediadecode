@@ -86,6 +86,184 @@
 //! also what lets a backend change its storage without changing its
 //! frames.
 //!
+//! # The two carrier lanes
+//!
+//! *User-ruled 2026-08-25.*
+//!
+//! The amputation contract above governs one lane. A backend may offer
+//! a second, and `mediadecode-ffmpeg` does — both first-class, neither
+//! a feature flag on the other:
+//!
+//! * the **view** lane hands out a refcounted handle onto the
+//!   allocation the substrate already made. Nothing is copied. It is
+//!   the **default**, because the ordinary consumer decodes in place:
+//!   read the frame, use it, drop it, decode on. Paying for a copy of
+//!   bytes you were going to discard is a cost with nothing on the
+//!   other side of it.
+//! * the **owned** lane is the amputation contract: every byte copied
+//!   once at the boundary into memory the caller's language owns.
+//!
+//! ## Which lane, and why
+//!
+//! | | view (default) | owned |
+//! |---|---|---|
+//! | cost per frame | none | one copy |
+//! | `Send` | yes | yes |
+//! | `Sync` | **no** | yes |
+//! | `Clone` | refcount bump | refcount bump |
+//! | lifetime | pinned to the backend's pools | answerable to nobody |
+//! | fan-out to N consumers | no | yes |
+//! | outlives the decoder | the buffer does; the **pool slot** stays out | freely |
+//! | pool recycling | native — it *is* the substrate's pool | needs one built (see the FFmpeg backend's issue #35) |
+//!
+//! And per payload shape, which is where a lane stops being a slogan:
+//!
+//! | payload | view | owned |
+//! |---|---|---|
+//! | compressed packet | window onto the demuxer's buffer | copy |
+//! | packet **submitted** to a decoder | shared when the payload's provenance and extent both prove the substrate may read past it, else copied | copy |
+//! | packet **handed back to the caller** | copy | copy |
+//! | tight video/image plane | window, at the decoder's own stride | copy, at the decoder's own stride |
+//! | padded video/image plane | **copy**, compacted to `row_bytes` | copy, compacted to `row_bytes` |
+//! | audio plane | window over **exactly** the valid samples | copy of exactly the valid samples |
+//! | resampled plane | window onto the resampler's output frame | copy |
+//! | subtitle rect, side data, extradata | **copy** — no refcount exists to share | copy |
+//!
+//! ## The two rules those rows come from
+//!
+//! **A view stops where the writing stopped.** A carrier is an
+//! `AsRef<[u8]>`, so the span it names is a span a consumer may read —
+//! and a span is only nameable if every byte in it was written. An
+//! audio plane is allocated with alignment padding past its samples and
+//! a view stops at the samples, because exposing the rest through a
+//! window is the same information leak it would have been through a
+//! copy. The lanes differ in who owns the bytes, never in which bytes
+//! exist.
+//!
+//! **Sharing is conditional, and the condition is a proof.** Where the
+//! extent is provably all output, the view lane takes a reference;
+//! where it is not, the view lane copies and says so. A padded video
+//! plane is the standing example: only the first `row_bytes` of each
+//! `linesize`-wide row are the decoder's, so *no* lane can hand out the
+//! padded span, and both compact it. Which is why the two lanes carry
+//! identical **content** while their strides and spans may differ — a
+//! parity check between them compares pixels, not buffers.
+//!
+//! ## The rule that decides which conversions may exist
+//!
+//! **A conversion that borrows its source can only copy.** Substrate
+//! packet and frame types share their buffers by refcount and hand out
+//! mutable slices with no copy-on-write, so a caller who still holds
+//! the source holds a mutable alias of every byte a view would read —
+//! from entirely safe code, on either thread, `!Sync` notwithstanding.
+//! There is no signature that borrows a source and returns a shared
+//! view soundly.
+//!
+//! So the view lane's conversions **consume**: hand the packet or frame
+//! over, and the carrier that comes back is the only thing left
+//! pointing at those bytes. The borrowing conversions are the owned
+//! lane, where copying makes the source's fate irrelevant. Two shapes,
+//! one law, and the compiler enforces the difference — a program that
+//! keeps the source and mutates it no longer type-checks.
+//!
+//! This falls out naturally for a backend's own roads: a demuxer owns
+//! the packet it just read, a decoder owns the frame it just decoded,
+//! and a resampler owns its output. The zero-copy chain is intact
+//! end to end; what changed is that a *caller* cannot ask for a view of
+//! something they are still holding.
+//!
+//! ## Two rules that came from being wrong once
+//!
+//! **A shared buffer is refused, not copied.** When a payload's buffer
+//! is referenced by a handle other than the packet it came from, this
+//! backend declines to carry it *by name* — and the reason is sharper
+//! than it first looks. The obvious answer is to copy: a copy is
+//! always sound, and it keeps the API total. But a copy needs a
+//! **read**, and a second reference held by safe code is exactly the
+//! state in which somebody may be writing those bytes right now, from
+//! another thread. The read is the race. Totality is not worth that,
+//! and a refcount protects an allocation's lifetime while saying
+//! nothing about its contents.
+//!
+//! The rule is about *who* holds the other reference, not about the
+//! count. A substrate that keeps its own reference to a container-held
+//! payload — cover art is the standing example — is not the hazard a
+//! caller's second, mutable handle is, and refusing it would have
+//! refused every embedded picture there is.
+//!
+//! **A submission that can be recorded cannot be shared.** "Built,
+//! submitted and dropped inside one call" is a claim about a function,
+//! and it stops being true when the thing you submit to *keeps* what it
+//! is given. A hardware probe that records packets so it can replay
+//! them after a fallback, and then hands that history to the caller as
+//! owned mutable packets, turns a scoped submission into an escape.
+//! Where such a history is being recorded, the body is copied; where
+//! nothing records — every software road, and the hardware road after
+//! it commits — the send stays zero-copy.
+//!
+//! ## Two more rules the send direction adds
+//!
+//! **A payload a caller holds owns its bytes.** Going *into* a decoder
+//! is the one direction where a backend could hand the substrate its
+//! own buffer — but a substrate's packet type is usually mutable, and a
+//! value a caller holds can be asked for that mutable view while the
+//! carrier it came from is still readable. That is an aliasing `&mut`
+//! out of entirely safe code, and being `!Sync` does not prevent it:
+//! one thread suffices. So the zero-copy send is **scoped** — built,
+//! submitted and dropped inside the backend, never surfacing as a value
+//! anyone can hold — and every packet a public API returns is a copy on
+//! both lanes.
+//!
+//! **Trailing capacity is not padding.** Decoders read a fixed number
+//! of bytes past a packet's payload, and a container's own packets
+//! carry exactly that much zeroed slack behind them. Bytes merely
+//! *existing* after a view is not the same fact: a video plane has more
+//! pixels after it and a resampled plane has more samples, and a
+//! bitstream reader running past the payload would consume either as
+//! though it were bitstream. So a carrier records **where it came
+//! from**, at capture, and only a payload captured out of a packet may
+//! be shared back into a decoder — everything else is copied into a
+//! properly padded one.
+//!
+//! **Take the view lane** when a consumer reads a frame and is done
+//! with it — a thumbnailer, a probe, a transcode step, an analysis pass
+//! that reduces each frame to numbers. This is most consumers, which is
+//! why it is the default.
+//!
+//! **Take the owned lane** when a frame has to *travel*: into a graph
+//! that fans it out to several consumers, across a channel to threads
+//! that will both read it, into a cache that outlives the session, or
+//! anywhere `Sync` is required. `mediagraph` is on the owned lane and
+//! belongs there — a graph node cannot hold a pool slot for as long as
+//! a graph might hold a message.
+//!
+//! ## The pool-hostage warning
+//!
+//! A view carrier keeps the substrate's buffer alive. That is the
+//! point, and it is also the catch: **a frame held is a pool slot
+//! held.** Decoders allocate from a fixed pool, and one that runs out
+//! blocks or fails. A consumer that parks view frames in a queue is a
+//! consumer that stalls its own decoder, and the symptom — a decode
+//! that mysteriously stops making progress — points nowhere near the
+//! queue that caused it.
+//!
+//! So the view lane's rule is: **read in place, drop, decode on.** If a
+//! frame needs to outlive the loop that produced it, that is the
+//! question the owned lane answers.
+//!
+//! ## The symmetry worth noticing
+//!
+//! The two lanes converge from opposite directions. The view lane rides
+//! the substrate's own buffer recycling natively, because its carrier
+//! *is* a reference into that pool. The owned lane copies, and copying
+//! per frame is an allocator call per frame — which is why an owned
+//! backend eventually wants a pool of its own to recycle its copies
+//! into.
+//!
+//! One lane gets pooling for free and pays in lifetime; the other gets
+//! lifetime for free and pays for pooling. Neither is the better
+//! answer, which is why both are first-class.
+//!
 //! # The resource governance contract
 //!
 //! *User-ruled 2026-08-25.*

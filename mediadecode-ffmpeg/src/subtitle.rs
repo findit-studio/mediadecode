@@ -10,8 +10,6 @@
 //! work, `receive_frame` drains one decoded frame at a time, and
 //! `NoFrameReady` is signalled via [`SubtitleDecodeError::NoFrameReady`].
 
-use std::option::Option;
-
 use derive_more::{IsVariant, TryUnwrap, Unwrap};
 use ffmpeg_next::{codec::Parameters, ffi::avsubtitle_free};
 use mediadecode::{
@@ -19,7 +17,7 @@ use mediadecode::{
 };
 
 use crate::{
-  DecoderLimits, Error, Ffmpeg, FfmpegBytes, boundary,
+  DecoderLimits, Error, Ffmpeg, boundary,
   convert::{self, ConvertError},
   decoder::build_codec_context,
   extras::{SubtitleFrameExtra, SubtitlePacketExtra},
@@ -65,10 +63,25 @@ impl Drop for ScratchSubtitle {
 /// `decode()` call consumes one packet and produces zero-or-one
 /// `AVSubtitle`. The pending-frame buffer here is a one-slot queue
 /// so the trait's `send_packet` / `receive_frame` split works.
-pub struct FfmpegSubtitleStreamDecoder {
+pub struct CarrierSubtitleStreamDecoder<C: crate::FfmpegCarrier> {
   decoder: ffmpeg_next::decoder::Subtitle,
   scratch: ScratchSubtitle,
-  pending: Option<SubtitleFrame<SubtitleFrameExtra, FfmpegBytes>>,
+  /// `true` when [`Self::scratch`] holds a decoded `AVSubtitle` that
+  /// has not been converted and delivered.
+  ///
+  /// **The conversion happens on the receive side, and that is the
+  /// point.** `avcodec_decode_subtitle2` consumes the packet: once it
+  /// has answered, the cue exists only in this scratch, and nothing
+  /// re-offers it. Converting inside `send_packet` meant an allocation
+  /// that failed took the cue with it — the scratch was freed, the
+  /// error returned, and the caller's next packet decoded the *next*
+  /// cue. Deferring the conversion to `receive_frame` gives it a seat
+  /// to fail into: the scratch is cleared when a carrier exists for it,
+  /// not before.
+  ///
+  /// The same shape the audio and video decoders keep for a decoded
+  /// `AVFrame`, and the same discipline `flush` clears.
+  scratch_pending: bool,
   time_base: Timebase,
   /// Retained, not discarded at open: the send path judges
   /// [`DecoderLimits::max_packet_bytes`] against every packet it
@@ -81,9 +94,12 @@ pub struct FfmpegSubtitleStreamDecoder {
   /// declaration order, so the `AVCodecContext` is freed first and the
   /// state it references outlives it.
   _callback_state: Box<crate::ffi::CallbackState>,
+  /// The lane this decoder captures into. A marker: the carrier
+  /// appears in the frames it produces, not in its own state.
+  _carrier: core::marker::PhantomData<C>,
 }
 
-impl FfmpegSubtitleStreamDecoder {
+impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierSubtitleStreamDecoder<C> {
   /// Opens a subtitle decoder for the given codec parameters.
   ///
   /// `limits` reaches the `AVCodecContext` this call opens. A subtitle
@@ -91,7 +107,7 @@ impl FfmpegSubtitleStreamDecoder {
   /// it is passed for one reason: every decoder this crate opens gets
   /// the same ceiling written into it, and a seam that skipped one
   /// would be a seam somebody has to remember.
-  pub fn open(
+  pub(crate) fn open_impl(
     parameters: Parameters,
     time_base: Timebase,
     limits: DecoderLimits,
@@ -117,109 +133,186 @@ impl FfmpegSubtitleStreamDecoder {
     Ok(Self {
       decoder,
       scratch: ScratchSubtitle::new(),
-      pending: None,
+      scratch_pending: false,
       time_base,
       limits,
       _callback_state: callback_state,
+      _carrier: core::marker::PhantomData,
     })
   }
 
   /// Returns the time base associated with the source stream.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn time_base(&self) -> Timebase {
+  pub(crate) const fn time_base_impl(&self) -> Timebase {
     self.time_base
   }
 
   /// The ceilings this decoder was opened with.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn limits(&self) -> DecoderLimits {
+  pub(crate) const fn limits_impl(&self) -> DecoderLimits {
     self.limits
   }
 
   /// Borrow the wrapped `ffmpeg::decoder::Subtitle`.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn inner(&self) -> &ffmpeg_next::decoder::Subtitle {
+  pub(crate) const fn inner_impl(&self) -> &ffmpeg_next::decoder::Subtitle {
     &self.decoder
   }
 }
 
-impl SubtitleDecoder for FfmpegSubtitleStreamDecoder {
-  type Adapter = Ffmpeg;
-  type Buffer = FfmpegBytes;
-  type Error = SubtitleDecodeError;
-
-  fn send_packet(
+impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierSubtitleStreamDecoder<C> {
+  pub(crate) fn send_packet_impl(
     &mut self,
-    packet: &SubtitlePacket<SubtitlePacketExtra, Self::Buffer>,
-  ) -> Result<(), Self::Error> {
+    packet: &SubtitlePacket<SubtitlePacketExtra, C::Buffer>,
+  ) -> Result<(), SubtitleDecodeError> {
     // Disallow sending while a previously-decoded frame hasn't been
     // drained yet. The legacy `decode()` API produces a frame inline,
     // so a second send would silently drop the first — surface that
     // as an error so callers notice the drain ordering.
-    if self.pending.is_some() {
+    if self.scratch_pending {
       return Err(SubtitleDecodeError::FramePending);
     }
-    let av_pkt = boundary::ffmpeg_packet_from_subtitle_packet(packet, self.limits.packet_limits())
-      .map_err(|e| SubtitleDecodeError::Decode(Error::PacketBuild(e)))?;
     // Free any allocations from a previous decode before reusing the
     // scratch — avoids leaking when the previous packet produced no
     // frame (got == false, which still mutates the struct).
     self.scratch.clear();
-    let got = self
-      .decoder
-      .decode(&av_pkt, &mut self.scratch.inner)
-      .map_err(|e| {
-        SubtitleDecodeError::Decode(crate::decoder::software_exit(&*self._callback_state, e))
-      })?;
-    if got {
-      // SAFETY: scratch.inner is a live AVSubtitle just filled by
-      // decode. Conversion deep-copies all rect contents into owned
-      // `FfmpegBytes` carriers; the FFmpeg-side allocations are released
-      // unconditionally below (success and error paths both reach
-      // the next `clear()` on the next decode or on drop).
-      let result = unsafe {
-        convert::av_subtitle_to_subtitle_frame(self.scratch.inner.as_ptr(), self.time_base)
-      };
-      match result {
-        Ok(frame) => self.pending = Some(frame),
-        Err(e) => {
-          // Free immediately on conversion failure — without this, a
-          // caller that ignores the error and calls `flush` would
-          // bypass the scratch's deferred cleanup.
-          self.scratch.clear();
-          return Err(SubtitleDecodeError::Convert(e));
-        }
-      }
-    }
+    // Scoped submission — see `boundary::with_ffmpeg_subtitle_packet`.
+    let state: *const crate::ffi::CallbackState = &*self._callback_state;
+    let decoder = &mut self.decoder;
+    let scratch = &mut self.scratch.inner;
+    let got = boundary::with_ffmpeg_subtitle_packet::<C, _>(
+      packet,
+      self.limits.packet_limits(),
+      // Nothing on this road records what it is sent, so the packet
+      // really does die inside the call and its body may be shared.
+      crate::carrier::BodyRoute::Submission,
+      |av_pkt| {
+        decoder.decode(av_pkt, scratch).map_err(|e| {
+          // SAFETY: the callback state outlives this decoder.
+          SubtitleDecodeError::Decode(crate::decoder::software_exit(unsafe { &*state }, e))
+        })
+      },
+    )
+    .map_err(|e| SubtitleDecodeError::Decode(Error::PacketBuild(e)))??;
+    // The cue stays in the scratch until a carrier exists for it — see
+    // [`Self::scratch_pending`]. Nothing is converted here.
+    self.scratch_pending = got;
     Ok(())
   }
 
-  fn receive_frame(
+  pub(crate) fn receive_frame_impl(
     &mut self,
-    dst: &mut SubtitleFrame<SubtitleFrameExtra, Self::Buffer>,
-  ) -> Result<(), Self::Error> {
-    match self.pending.take() {
-      Some(frame) => {
+    dst: &mut SubtitleFrame<SubtitleFrameExtra, C::Buffer>,
+  ) -> Result<(), SubtitleDecodeError> {
+    if !self.scratch_pending {
+      return Err(SubtitleDecodeError::NoFrameReady);
+    }
+    // SAFETY: `scratch.inner` is a live `AVSubtitle` filled by the
+    // decode this seat is holding. Conversion copies every rect it
+    // takes — `AVSubtitleRect` has no refcounted buffer, so both lanes
+    // copy — and the FFmpeg-side allocations are released below, once
+    // there is something to release them in favour of.
+    let converted = unsafe {
+      convert::av_subtitle_to_subtitle_frame_as::<C>(self.scratch.inner.as_ptr(), self.time_base)
+    };
+    match converted {
+      Ok(frame) => {
+        self.scratch.clear();
+        self.scratch_pending = false;
         *dst = frame;
         Ok(())
       }
-      None => Err(SubtitleDecodeError::NoFrameReady),
+      Err(e) if e.parks_in_decode() => {
+        // Kept: another attempt could carry this cue, and there is no
+        // other copy of it anywhere.
+        Err(SubtitleDecodeError::Convert(e))
+      }
+      Err(e) => {
+        // A cue nothing can carry is let go — freed immediately, so a
+        // caller that ignores the error cannot leave the scratch
+        // holding FFmpeg allocations, and re-offering it forever would
+        // stall the session.
+        self.scratch.clear();
+        self.scratch_pending = false;
+        Err(SubtitleDecodeError::Convert(e))
+      }
     }
   }
 
-  fn send_eof(&mut self) -> Result<(), Self::Error> {
+  pub(crate) fn send_eof_impl(&mut self) -> Result<(), SubtitleDecodeError> {
     // Subtitle decoders have no draining — the legacy decode() API
     // produces a frame inline with each packet. EOF is a no-op.
     Ok(())
   }
 
-  fn flush(&mut self) -> Result<(), Self::Error> {
+  pub(crate) fn flush_impl(&mut self) -> Result<(), SubtitleDecodeError> {
     self.decoder.flush();
-    self.pending = None;
+    // A held cue belongs to the position being abandoned.
+    self.scratch_pending = false;
     self.scratch.clear();
     Ok(())
   }
 }
+
+macro_rules! subtitle_lane_face {
+  ($($lane:ty),+ $(,)?) => { $(
+    impl CarrierSubtitleStreamDecoder<$lane> {
+      /// Opens a subtitle decoder for `parameters`.
+      pub fn open(
+        parameters: Parameters,
+        time_base: Timebase,
+        limits: DecoderLimits,
+      ) -> Result<Self, SubtitleDecodeError> {
+        Self::open_impl(parameters, time_base, limits)
+      }
+
+      /// The time base associated with the source stream.
+      pub const fn time_base(&self) -> Timebase {
+        self.time_base_impl()
+      }
+
+      /// The budgets this decoder was opened with.
+      pub const fn limits(&self) -> DecoderLimits {
+        self.limits_impl()
+      }
+
+      /// The wrapped decoder context.
+      pub const fn inner(&self) -> &ffmpeg_next::decoder::Subtitle {
+        self.inner_impl()
+      }
+    }
+
+    impl SubtitleDecoder for CarrierSubtitleStreamDecoder<$lane> {
+      type Adapter = Ffmpeg;
+      type Buffer = <$lane as crate::FfmpegCarrier>::Buffer;
+      type Error = SubtitleDecodeError;
+
+      fn send_packet(
+        &mut self,
+        packet: &SubtitlePacket<SubtitlePacketExtra, Self::Buffer>,
+      ) -> Result<(), Self::Error> {
+        self.send_packet_impl(packet)
+      }
+
+      fn receive_frame(
+        &mut self,
+        dst: &mut SubtitleFrame<SubtitleFrameExtra, Self::Buffer>,
+      ) -> Result<(), Self::Error> {
+        self.receive_frame_impl(dst)
+      }
+
+      fn send_eof(&mut self) -> Result<(), Self::Error> {
+        self.send_eof_impl()
+      }
+
+      fn flush(&mut self) -> Result<(), Self::Error> {
+        self.flush_impl()
+      }
+    }
+  )+ };
+}
+
+subtitle_lane_face!(crate::View, crate::Owned);
 
 /// Errors from [`FfmpegSubtitleStreamDecoder`].
 #[derive(thiserror::Error, Debug, IsVariant, Unwrap, TryUnwrap)]

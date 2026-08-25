@@ -9,10 +9,13 @@ use mediadecode::{
   decoder::{AudioStreamDecoder, SubtitleDecoder},
   subtitle::SubtitlePayload,
 };
+// The owned family under the names this suite was written with — the
+// bare aliases mean the view lane now. Import block only; the
+// assertions below are unchanged.
 use mediadecode_ffmpeg::{
-  AudioFrame, DecoderLimits, Ffmpeg, FfmpegAudioStreamDecoder, FfmpegBytes,
-  FfmpegSubtitleStreamDecoder, audio_packet_from_ffmpeg, empty_audio_frame, empty_subtitle_frame,
-  subtitle_packet_from_ffmpeg,
+  DecoderLimits, Ffmpeg, FfmpegBytes, FfmpegOwnedAudioStreamDecoder as FfmpegAudioStreamDecoder,
+  FfmpegOwnedSubtitleStreamDecoder as FfmpegSubtitleStreamDecoder, OwnedAudioFrame as AudioFrame,
+  empty_owned_audio_frame as empty_audio_frame, empty_owned_subtitle_frame as empty_subtitle_frame,
 };
 use std::num::NonZeroI32;
 
@@ -80,7 +83,13 @@ fn decode_one_audio_frame_through_trait() {
     if s.index() != stream_index {
       continue;
     }
-    let pkt = match audio_packet_from_ffmpeg(&av_packet).expect("a wrappable payload") {
+    let pkt = match mediadecode_ffmpeg::boundary::owned_audio_packet_from_ffmpeg_in(
+      &av_packet,
+      mediadecode::Timebase::default(),
+      mediadecode_ffmpeg::PacketLimits::default(),
+    )
+    .expect("a wrappable payload")
+    {
       Some(p) => p,
       None => continue,
     };
@@ -141,7 +150,13 @@ fn decode_one_subtitle_through_trait() {
     if s.index() != stream_index {
       continue;
     }
-    let pkt = match subtitle_packet_from_ffmpeg(&av_packet).expect("a wrappable payload") {
+    let pkt = match mediadecode_ffmpeg::boundary::owned_subtitle_packet_from_ffmpeg_in(
+      &av_packet,
+      mediadecode::Timebase::default(),
+      mediadecode_ffmpeg::PacketLimits::default(),
+    )
+    .expect("a wrappable payload")
+    {
       Some(p) => p,
       None => continue,
     };

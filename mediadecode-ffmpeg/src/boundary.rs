@@ -34,6 +34,7 @@ use crate::{
     FfmpegBytes, PacketBufferError, SideDataAlloc as BufferSideDataAlloc, SideDataArray,
     SideDataBytes, SideDataEntries, SideDataPayload, UnrepresentableFlags,
   },
+  carrier::BodyRoute,
   convert::{SIDE_DATA_MAX_ENTRIES, SIDE_DATA_MAX_TOTAL_BYTES},
   extras::{
     AttachmentPacketExtra, AudioFrameExtra, AudioPacketExtra, DataPacketExtra, SideDataEntry,
@@ -737,6 +738,110 @@ fn attach_side_data(out: &mut Packet, entries: &[SideDataEntry]) -> Result<(), P
   Ok(())
 }
 
+/// Builds an `AVPacket` that **shares** a view carrier's buffer instead
+/// of copying it — the send half of the zero-copy chain.
+///
+/// # What the census found
+///
+/// 0.8 did not have this. Its reverse builders called the same
+/// `try_packet_copy` the owned lane uses, so a packet demuxed
+/// zero-copy was copied again on its way back into a decoder. The
+/// zero-copy chain 0.8 actually shipped was demux to consumer, and
+/// stopped there.
+///
+/// # The padding proof
+///
+/// libavcodec is entitled to read `AV_INPUT_BUFFER_PADDING_SIZE` bytes
+/// **past** a packet's payload — bitstream readers do it routinely, and
+/// libavformat allocates that slack behind every packet it produces. A
+/// carrier viewing such a packet inherits the slack; a carrier this
+/// crate minted from a slice through
+/// [`FfmpegCarrier::from_bytes`](crate::FfmpegCarrier::from_bytes) does
+/// not.
+///
+/// So sharing is offered only where the slack is **provable**, and
+/// proving it takes two facts, not one:
+///
+/// * **provenance** — the carrier must be a payload captured out of an
+///   `AVPacket`'s own buffer, which is the only place libavformat's
+///   padding contract applies. Trailing *capacity* is not padding: a
+///   video plane has more pixels after it and a resampler's output
+///   frame has more samples, and a bitstream reader running past the
+///   payload would eat either as though it were bitstream. Provenance
+///   is recorded at capture, where it is known, rather than inferred
+///   here from a size comparison that cannot tell padding from a
+///   neighbour;
+/// * **extent** — the view must still leave at least the padding
+///   between its end and the end of the buffer, because a payload can
+///   be narrowed after capture.
+///
+/// Where either fails, the packet is copied, which is what
+/// `try_packet_copy` allocates the padding for. Handing a decoder an
+/// unpadded buffer would be an out-of-bounds read inside somebody
+/// else's bitstream reader, found by nobody.
+pub(crate) fn share_or_copy(
+  body: &crate::FfmpegBuffer,
+) -> std::result::Result<Packet, ffmpeg_next::Error> {
+  use ffmpeg_next::packet::Mut;
+
+  const PADDING: usize = ffmpeg_next::ffi::AV_INPUT_BUFFER_PADDING_SIZE as usize;
+
+  // **Empty first, before anything is dereferenced.** The empty carrier
+  // is deliberately backed by no buffer at all — that is what makes a
+  // placeholder plane slot free — so `as_av_buffer_ref` answers null
+  // for it, and reading `size` through that would be undefined on the
+  // most ordinary packet there is: a side-data-only one.
+  if body.is_empty() {
+    return try_packet_copy(&[]);
+  }
+
+  // Provenance before extent: the cheaper question, and the one that
+  // decides whether the other is worth asking.
+  if body.origin() != crate::view::Origin::PacketPayload {
+    return try_packet_copy(body.as_ref());
+  }
+
+  let buf = body.as_av_buffer_ref();
+  if buf.is_null() {
+    return try_packet_copy(body.as_ref());
+  }
+  // SAFETY: the carrier holds a live reference, just checked non-null;
+  // `size` is a public field on the `AVBufferRef` it names.
+  let capacity = unsafe { (*buf).size };
+  let end = body.offset().saturating_add(body.len());
+  let padded = capacity
+    .checked_sub(end)
+    .is_some_and(|slack| slack >= PADDING);
+
+  if !padded {
+    // No provable slack behind the view — copy, which allocates the
+    // padding libavcodec expects.
+    return try_packet_copy(body.as_ref());
+  }
+
+  let mut out = Packet::empty();
+  // SAFETY: `out` owns a live, zeroed `AVPacket`. `av_buffer_ref`
+  // returns a new reference to the same allocation — the packet owns
+  // that one and releases it on drop, while `body` keeps its own — and
+  // `data`/`size` are set to the view, which was proved to lie inside
+  // the buffer when the carrier was constructed.
+  unsafe {
+    let raw = out.as_mut_ptr();
+    let shared = ffmpeg_next::ffi::av_buffer_ref(buf.cast_mut());
+    if shared.is_null() {
+      return Err(ffmpeg_next::Error::Other {
+        errno: libc::ENOMEM,
+      });
+    }
+    (*raw).buf = shared;
+    (*raw).data = (*shared).data.add(body.offset());
+    (*raw).size = c_int::try_from(body.len()).map_err(|_| ffmpeg_next::Error::Other {
+      errno: libc::EINVAL,
+    })?;
+  }
+  Ok(out)
+}
+
 /// Builds an `ffmpeg::Packet` from a [`mediadecode::VideoPacket`]
 /// parameterized by [`crate::extras::VideoPacketExtra`] and
 /// `FfmpegBytes`.
@@ -756,8 +861,61 @@ fn attach_side_data(out: &mut Packet, entries: &[SideDataEntry]) -> Result<(), P
 /// * a side-data entry this build of FFmpeg cannot name, or one whose
 ///   allocation failed.
 pub fn ffmpeg_packet_from_video_packet(
+  packet: &mediadecode::packet::VideoPacket<VideoPacketExtra, crate::FfmpegBuffer>,
+  limits: PacketLimits,
+) -> std::result::Result<Packet, PacketBuildError> {
+  build_video_packet::<crate::View>(packet, limits, BodyRoute::Copy)
+}
+
+/// [`ffmpeg_packet_from_video_packet`] on the owned lane.
+pub fn ffmpeg_packet_from_owned_video_packet(
   packet: &mediadecode::packet::VideoPacket<VideoPacketExtra, FfmpegBytes>,
   limits: PacketLimits,
+) -> std::result::Result<Packet, PacketBuildError> {
+  build_video_packet::<crate::Owned>(packet, limits, BodyRoute::Copy)
+}
+
+/// [`ffmpeg_packet_from_video_packet`] built for **submission**, and
+/// scoped so the packet cannot outlive the call.
+///
+/// This is the only road on which the view lane may hand a decoder
+/// its own buffer rather than a copy, and the scoping is why it may.
+/// An `ffmpeg_next::Packet` lends `&mut [u8]` through `data_mut`,
+/// while the carrier it was built from still lends `&[u8]` — so a
+/// shared body reachable from a value a caller *holds* is two live
+/// references to one allocation with one of them mutable, out of
+/// entirely safe code, and `!Sync` would not save it either. Here the
+/// packet is built, lent to `submit` as `&Packet`, and dropped before
+/// this function returns: no value that can produce a `&mut` into the
+/// shared bytes ever exists.
+///
+/// **Which is why the route is the caller's to choose.** "Dropped
+/// before this returns" is a claim about this function, and a decoder
+/// that *records* what it is sent makes it false: the video decoder's
+/// hardware probe `av_packet_ref`s every accepted packet into a rescue
+/// history, and `FallbackFailed::unconsumed_packets` hands those
+/// recordings to the caller as owned, **mutable** `Packet`s. A
+/// submission that could be recorded must therefore carry
+/// [`BodyRoute::Copy`], so that what enters the history is storage
+/// nobody else reads. Callers with no history — every software road,
+/// and the hardware road after commit — pass
+/// [`BodyRoute::Submission`] and keep the zero-copy send.
+pub(crate) fn with_ffmpeg_video_packet<C: crate::FfmpegCarrier + crate::CarrierOps, T>(
+  packet: &mediadecode::packet::VideoPacket<VideoPacketExtra, C::Buffer>,
+  limits: PacketLimits,
+  route: BodyRoute,
+  submit: impl FnOnce(&Packet) -> T,
+) -> std::result::Result<T, PacketBuildError> {
+  let av_packet = build_video_packet::<C>(packet, limits, route)?;
+  let out = submit(&av_packet);
+  drop(av_packet);
+  Ok(out)
+}
+
+fn build_video_packet<C: crate::FfmpegCarrier + crate::CarrierOps>(
+  packet: &mediadecode::packet::VideoPacket<VideoPacketExtra, C::Buffer>,
+  limits: PacketLimits,
+  route: BodyRoute,
 ) -> std::result::Result<Packet, PacketBuildError> {
   let body = packet.data().as_ref();
   // Before the budget and before the allocation: an uncarriable
@@ -776,7 +934,7 @@ pub fn ffmpeg_packet_from_video_packet(
       SendPayloadTooLarge::new(body.len(), limits.max_packet_bytes()),
     ));
   }
-  let mut out = try_packet_copy(body)?;
+  let mut out = C::packet_body(packet.data(), route)?;
   attach_side_data(&mut out, packet.extra().side_data())?;
   if let Some(ts) = packet.pts() {
     out.set_pts(Some(ts.pts()));
@@ -798,8 +956,49 @@ pub fn ffmpeg_packet_from_video_packet(
 /// copied; pts/dts/duration/flags/stream_index and side data are
 /// forwarded. Same failure modes.
 pub fn ffmpeg_packet_from_audio_packet(
+  packet: &mediadecode::packet::AudioPacket<AudioPacketExtra, crate::FfmpegBuffer>,
+  limits: PacketLimits,
+) -> std::result::Result<Packet, PacketBuildError> {
+  build_audio_packet::<crate::View>(packet, limits, BodyRoute::Copy)
+}
+
+/// [`ffmpeg_packet_from_audio_packet`] on the owned lane.
+pub fn ffmpeg_packet_from_owned_audio_packet(
   packet: &mediadecode::packet::AudioPacket<AudioPacketExtra, FfmpegBytes>,
   limits: PacketLimits,
+) -> std::result::Result<Packet, PacketBuildError> {
+  build_audio_packet::<crate::Owned>(packet, limits, BodyRoute::Copy)
+}
+
+/// [`ffmpeg_packet_from_audio_packet`] built for **submission**, and
+/// scoped so the packet cannot outlive the call.
+///
+/// This is the only road on which the view lane may hand a decoder
+/// its own buffer rather than a copy, and the scoping is why it may.
+/// An `ffmpeg_next::Packet` lends `&mut [u8]` through `data_mut`,
+/// while the carrier it was built from still lends `&[u8]` — so a
+/// shared body reachable from a value a caller *holds* is two live
+/// references to one allocation with one of them mutable, out of
+/// entirely safe code, and `!Sync` would not save it either. Here the
+/// packet is built, lent to `submit` as `&Packet`, and dropped before
+/// this function returns: no value that can produce a `&mut` into the
+/// shared bytes ever exists.
+pub(crate) fn with_ffmpeg_audio_packet<C: crate::FfmpegCarrier + crate::CarrierOps, T>(
+  packet: &mediadecode::packet::AudioPacket<AudioPacketExtra, C::Buffer>,
+  limits: PacketLimits,
+  route: BodyRoute,
+  submit: impl FnOnce(&Packet) -> T,
+) -> std::result::Result<T, PacketBuildError> {
+  let av_packet = build_audio_packet::<C>(packet, limits, route)?;
+  let out = submit(&av_packet);
+  drop(av_packet);
+  Ok(out)
+}
+
+fn build_audio_packet<C: crate::FfmpegCarrier + crate::CarrierOps>(
+  packet: &mediadecode::packet::AudioPacket<AudioPacketExtra, C::Buffer>,
+  limits: PacketLimits,
+  route: BodyRoute,
 ) -> std::result::Result<Packet, PacketBuildError> {
   let body = packet.data().as_ref();
   // Before the budget and before the allocation: an uncarriable
@@ -818,7 +1017,7 @@ pub fn ffmpeg_packet_from_audio_packet(
       SendPayloadTooLarge::new(body.len(), limits.max_packet_bytes()),
     ));
   }
-  let mut out = try_packet_copy(body)?;
+  let mut out = C::packet_body(packet.data(), route)?;
   attach_side_data(&mut out, packet.extra().side_data())?;
   if let Some(ts) = packet.pts() {
     out.set_pts(Some(ts.pts()));
@@ -840,8 +1039,49 @@ pub fn ffmpeg_packet_from_audio_packet(
 /// forwarded. Subtitle packets have no `dts` in the mediadecode model.
 /// Same failure modes as [`ffmpeg_packet_from_video_packet`].
 pub fn ffmpeg_packet_from_subtitle_packet(
+  packet: &mediadecode::packet::SubtitlePacket<SubtitlePacketExtra, crate::FfmpegBuffer>,
+  limits: PacketLimits,
+) -> std::result::Result<Packet, PacketBuildError> {
+  build_subtitle_packet::<crate::View>(packet, limits, BodyRoute::Copy)
+}
+
+/// [`ffmpeg_packet_from_subtitle_packet`] on the owned lane.
+pub fn ffmpeg_packet_from_owned_subtitle_packet(
   packet: &mediadecode::packet::SubtitlePacket<SubtitlePacketExtra, FfmpegBytes>,
   limits: PacketLimits,
+) -> std::result::Result<Packet, PacketBuildError> {
+  build_subtitle_packet::<crate::Owned>(packet, limits, BodyRoute::Copy)
+}
+
+/// [`ffmpeg_packet_from_subtitle_packet`] built for **submission**, and
+/// scoped so the packet cannot outlive the call.
+///
+/// This is the only road on which the view lane may hand a decoder
+/// its own buffer rather than a copy, and the scoping is why it may.
+/// An `ffmpeg_next::Packet` lends `&mut [u8]` through `data_mut`,
+/// while the carrier it was built from still lends `&[u8]` — so a
+/// shared body reachable from a value a caller *holds* is two live
+/// references to one allocation with one of them mutable, out of
+/// entirely safe code, and `!Sync` would not save it either. Here the
+/// packet is built, lent to `submit` as `&Packet`, and dropped before
+/// this function returns: no value that can produce a `&mut` into the
+/// shared bytes ever exists.
+pub(crate) fn with_ffmpeg_subtitle_packet<C: crate::FfmpegCarrier + crate::CarrierOps, T>(
+  packet: &mediadecode::packet::SubtitlePacket<SubtitlePacketExtra, C::Buffer>,
+  limits: PacketLimits,
+  route: BodyRoute,
+  submit: impl FnOnce(&Packet) -> T,
+) -> std::result::Result<T, PacketBuildError> {
+  let av_packet = build_subtitle_packet::<C>(packet, limits, route)?;
+  let out = submit(&av_packet);
+  drop(av_packet);
+  Ok(out)
+}
+
+fn build_subtitle_packet<C: crate::FfmpegCarrier + crate::CarrierOps>(
+  packet: &mediadecode::packet::SubtitlePacket<SubtitlePacketExtra, C::Buffer>,
+  limits: PacketLimits,
+  route: BodyRoute,
 ) -> std::result::Result<Packet, PacketBuildError> {
   let body = packet.data().as_ref();
   // Before the budget and before the allocation: an uncarriable
@@ -860,7 +1100,7 @@ pub fn ffmpeg_packet_from_subtitle_packet(
       SendPayloadTooLarge::new(body.len(), limits.max_packet_bytes()),
     ));
   }
-  let mut out = try_packet_copy(body)?;
+  let mut out = C::packet_body(packet.data(), route)?;
   attach_side_data(&mut out, packet.extra().side_data())?;
   if let Some(ts) = packet.pts() {
     out.set_pts(Some(ts.pts()));
@@ -879,16 +1119,21 @@ pub fn ffmpeg_packet_from_subtitle_packet(
 // ---------------------------------------------------------------------------
 
 /// Carries a borrowed [`ffmpeg::Packet`] out as a
-/// [`mediadecode::packet::VideoPacket`]. The compressed payload is
-/// **copied** into an [`FfmpegBytes`] — 0.8 shared it with the source
-/// `AVPacket` by refcount bump, which is what tied a delivered packet's
-/// lifetime to libavformat's; see the
-/// [D-seat amputation contract][law]. Timestamps, duration,
-/// key/corrupt flags, and the source stream index are forwarded to the
-/// produced packet.
+/// [`mediadecode::packet::VideoPacket`] on the **view** lane: the
+/// payload is a refcounted window onto the source `AVPacket`'s own
+/// buffer, which is why the delivered packet's lifetime is answerable
+/// to libavformat's — see [the two carrier lanes][lanes]. For a packet
+/// that must outlive the demuxer, ask for the owned lane by name:
+/// `video_packet_from_ffmpeg_as::<Owned>`, whose payload is copied and
+/// which the [D-seat amputation contract][law] governs.
+///
+/// Timestamps, duration, key/corrupt flags, and the source stream index
+/// are forwarded to the produced packet.
 ///
 /// Uses the default [`PacketLimits`]; the `_in` sibling takes them
 /// explicitly, alongside the stream's timebase.
+///
+/// [lanes]: mediadecode::adapter#the-two-carrier-lanes
 ///
 /// Returns `Ok(None)` when the source packet has no payload at all
 /// (an empty packet — typical after EOF), and [`PacketBufferError`]
@@ -901,38 +1146,41 @@ pub fn ffmpeg_packet_from_subtitle_packet(
 pub fn video_packet_from_ffmpeg(
   packet: &Packet,
 ) -> Result<Option<VideoPacket<VideoPacketExtra, FfmpegBytes>>, PacketBufferError> {
-  video_packet_from_ffmpeg_in(
+  video_packet_from_borrowed::<crate::Owned>(
     packet,
     mediadecode::Timebase::default(),
     PacketLimits::default(),
+    crate::buffer::PayloadProvenance::CallerSupplied,
   )
 }
 
 /// Carries a borrowed [`ffmpeg::Packet`] out as a
 /// [`mediadecode::packet::AudioPacket`]. Same shape as
-/// [`video_packet_from_ffmpeg`] — copied payload, forwarded metadata,
+/// [`video_packet_from_ffmpeg`] — shared payload, forwarded metadata,
 /// default budgets.
 pub fn audio_packet_from_ffmpeg(
   packet: &Packet,
 ) -> Result<Option<AudioPacket<AudioPacketExtra, FfmpegBytes>>, PacketBufferError> {
-  audio_packet_from_ffmpeg_in(
+  audio_packet_from_borrowed::<crate::Owned>(
     packet,
     mediadecode::Timebase::default(),
     PacketLimits::default(),
+    crate::buffer::PayloadProvenance::CallerSupplied,
   )
 }
 
 /// Carries a borrowed [`ffmpeg::Packet`] out as a
 /// [`mediadecode::packet::SubtitlePacket`]. Subtitle packets have no
 /// `dts` in the mediadecode model; everything else mirrors
-/// [`video_packet_from_ffmpeg`], copied payload included.
+/// [`video_packet_from_ffmpeg`], shared payload included.
 pub fn subtitle_packet_from_ffmpeg(
   packet: &Packet,
 ) -> Result<Option<SubtitlePacket<SubtitlePacketExtra, FfmpegBytes>>, PacketBufferError> {
-  subtitle_packet_from_ffmpeg_in(
+  subtitle_packet_from_borrowed::<crate::Owned>(
     packet,
     mediadecode::Timebase::default(),
     PacketLimits::default(),
+    crate::buffer::PayloadProvenance::CallerSupplied,
   )
 }
 
@@ -1076,23 +1324,24 @@ fn packet_side_data(packet: &Packet) -> Result<Vec<SideDataEntry>, PacketBufferE
 ///
 /// `Ok(None)` therefore means the packet carried neither a payload nor
 /// side data: the empty marker, and the only thing a pull loop may skip.
-fn delivered_payload(
+fn delivered_payload<C: crate::FfmpegCarrier + crate::CarrierOps>(
   packet: &Packet,
   side_data: &[SideDataEntry],
   limits: PacketLimits,
-) -> Result<Option<FfmpegBytes>, PacketBufferError> {
+  provenance: crate::buffer::PayloadProvenance,
+) -> Result<Option<C::Buffer>, PacketBufferError> {
   use ffmpeg_next::packet::Ref;
   // SAFETY: `packet` keeps the AVPacket live for the duration of this
   // call, which is all `payload_of` requires.
-  if let Some(bytes) =
-    unsafe { crate::buffer::payload_of(packet.as_ptr(), limits.max_packet_bytes()) }?
-  {
+  if let Some(bytes) = unsafe {
+    crate::buffer::payload_of::<C>(packet.as_ptr(), limits.max_packet_bytes(), provenance)
+  }? {
     return Ok(Some(bytes));
   }
   if side_data.is_empty() {
     return Ok(None);
   }
-  Ok(Some(FfmpegBytes::empty()))
+  Ok(Some(C::empty()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1108,13 +1357,39 @@ fn delivered_payload(
 
 /// [`video_packet_from_ffmpeg`], with the stream's timebase stamped
 /// onto every timestamp instead of the 1/1 placeholder.
-pub fn video_packet_from_ffmpeg_in(
+pub(crate) fn video_packet_from_ffmpeg_as<C: crate::FfmpegCarrier + crate::CarrierOps>(
+  source: Packet,
+  time_base: mediadecode::Timebase,
+  limits: PacketLimits,
+  provenance: crate::buffer::PayloadProvenance,
+) -> Result<Option<VideoPacket<VideoPacketExtra, C::Buffer>>, PacketBufferError> {
+  // **The source is consumed.** A borrowed `AVPacket` cannot be
+  // safely viewed: `ffmpeg_next::Packet` lends `&mut [u8]` through
+  // `data_mut` and shares its buffer by refcount with no
+  // copy-on-write, so a caller who kept the packet would hold a
+  // mutable alias of every byte the returned carrier reads — and
+  // both sides are `Send`. Taking it by value is what makes that
+  // unconstructible; the packet is released when this returns, and
+  // the view lane's carrier keeps the buffer alive by its own
+  // reference. See the borrowed siblings for the owned lane, which
+  // copies and so may borrow.
+  video_packet_from_borrowed::<C>(&source, time_base, limits, provenance)
+}
+
+/// The shared implementation of the video road.
+///
+/// Crate-private, and borrowed: the two public doors differ only in
+/// what they owe the borrow checker. The consuming one may be asked
+/// for either lane; the borrowing one is the owned lane, where the
+/// bytes are copied and the source is nobody's concern afterwards.
+pub(crate) fn video_packet_from_borrowed<C: crate::FfmpegCarrier + crate::CarrierOps>(
   packet: &Packet,
   time_base: mediadecode::Timebase,
   limits: PacketLimits,
-) -> Result<Option<VideoPacket<VideoPacketExtra, FfmpegBytes>>, PacketBufferError> {
+  provenance: crate::buffer::PayloadProvenance,
+) -> Result<Option<VideoPacket<VideoPacketExtra, C::Buffer>>, PacketBufferError> {
   let side_data = packet_side_data(packet)?;
-  let Some(buf) = delivered_payload(packet, &side_data, limits)? else {
+  let Some(buf) = delivered_payload::<C>(packet, &side_data, limits, provenance)? else {
     return Ok(None);
   };
   let extra = VideoPacketExtra::new(packet.stream() as i32).with_side_data(side_data);
@@ -1131,13 +1406,39 @@ pub fn video_packet_from_ffmpeg_in(
 
 /// [`audio_packet_from_ffmpeg`], with the stream's timebase stamped
 /// onto every timestamp instead of the 1/1 placeholder.
-pub fn audio_packet_from_ffmpeg_in(
+pub(crate) fn audio_packet_from_ffmpeg_as<C: crate::FfmpegCarrier + crate::CarrierOps>(
+  source: Packet,
+  time_base: mediadecode::Timebase,
+  limits: PacketLimits,
+  provenance: crate::buffer::PayloadProvenance,
+) -> Result<Option<AudioPacket<AudioPacketExtra, C::Buffer>>, PacketBufferError> {
+  // **The source is consumed.** A borrowed `AVPacket` cannot be
+  // safely viewed: `ffmpeg_next::Packet` lends `&mut [u8]` through
+  // `data_mut` and shares its buffer by refcount with no
+  // copy-on-write, so a caller who kept the packet would hold a
+  // mutable alias of every byte the returned carrier reads — and
+  // both sides are `Send`. Taking it by value is what makes that
+  // unconstructible; the packet is released when this returns, and
+  // the view lane's carrier keeps the buffer alive by its own
+  // reference. See the borrowed siblings for the owned lane, which
+  // copies and so may borrow.
+  audio_packet_from_borrowed::<C>(&source, time_base, limits, provenance)
+}
+
+/// The shared implementation of the audio road.
+///
+/// Crate-private, and borrowed: the two public doors differ only in
+/// what they owe the borrow checker. The consuming one may be asked
+/// for either lane; the borrowing one is the owned lane, where the
+/// bytes are copied and the source is nobody's concern afterwards.
+pub(crate) fn audio_packet_from_borrowed<C: crate::FfmpegCarrier + crate::CarrierOps>(
   packet: &Packet,
   time_base: mediadecode::Timebase,
   limits: PacketLimits,
-) -> Result<Option<AudioPacket<AudioPacketExtra, FfmpegBytes>>, PacketBufferError> {
+  provenance: crate::buffer::PayloadProvenance,
+) -> Result<Option<AudioPacket<AudioPacketExtra, C::Buffer>>, PacketBufferError> {
   let side_data = packet_side_data(packet)?;
-  let Some(buf) = delivered_payload(packet, &side_data, limits)? else {
+  let Some(buf) = delivered_payload::<C>(packet, &side_data, limits, provenance)? else {
     return Ok(None);
   };
   let extra = AudioPacketExtra::new(packet.stream() as i32).with_side_data(side_data);
@@ -1154,13 +1455,39 @@ pub fn audio_packet_from_ffmpeg_in(
 
 /// [`subtitle_packet_from_ffmpeg`], with the stream's timebase stamped
 /// onto every timestamp instead of the 1/1 placeholder.
-pub fn subtitle_packet_from_ffmpeg_in(
+pub(crate) fn subtitle_packet_from_ffmpeg_as<C: crate::FfmpegCarrier + crate::CarrierOps>(
+  source: Packet,
+  time_base: mediadecode::Timebase,
+  limits: PacketLimits,
+  provenance: crate::buffer::PayloadProvenance,
+) -> Result<Option<SubtitlePacket<SubtitlePacketExtra, C::Buffer>>, PacketBufferError> {
+  // **The source is consumed.** A borrowed `AVPacket` cannot be
+  // safely viewed: `ffmpeg_next::Packet` lends `&mut [u8]` through
+  // `data_mut` and shares its buffer by refcount with no
+  // copy-on-write, so a caller who kept the packet would hold a
+  // mutable alias of every byte the returned carrier reads — and
+  // both sides are `Send`. Taking it by value is what makes that
+  // unconstructible; the packet is released when this returns, and
+  // the view lane's carrier keeps the buffer alive by its own
+  // reference. See the borrowed siblings for the owned lane, which
+  // copies and so may borrow.
+  subtitle_packet_from_borrowed::<C>(&source, time_base, limits, provenance)
+}
+
+/// The shared implementation of the subtitle road.
+///
+/// Crate-private, and borrowed: the two public doors differ only in
+/// what they owe the borrow checker. The consuming one may be asked
+/// for either lane; the borrowing one is the owned lane, where the
+/// bytes are copied and the source is nobody's concern afterwards.
+pub(crate) fn subtitle_packet_from_borrowed<C: crate::FfmpegCarrier + crate::CarrierOps>(
   packet: &Packet,
   time_base: mediadecode::Timebase,
   limits: PacketLimits,
-) -> Result<Option<SubtitlePacket<SubtitlePacketExtra, FfmpegBytes>>, PacketBufferError> {
+  provenance: crate::buffer::PayloadProvenance,
+) -> Result<Option<SubtitlePacket<SubtitlePacketExtra, C::Buffer>>, PacketBufferError> {
   let side_data = packet_side_data(packet)?;
-  let Some(buf) = delivered_payload(packet, &side_data, limits)? else {
+  let Some(buf) = delivered_payload::<C>(packet, &side_data, limits, provenance)? else {
     return Ok(None);
   };
   let extra = SubtitlePacketExtra::new(packet.stream() as i32).with_side_data(side_data);
@@ -1183,13 +1510,39 @@ pub fn subtitle_packet_from_ffmpeg_in(
 /// [`video_packet_from_ffmpeg_in`]. `byte_pos` is forwarded from
 /// `AVPacket.pos`, which data consumers use to correlate a payload with
 /// its position in the file.
-pub fn data_packet_from_ffmpeg_in(
+pub(crate) fn data_packet_from_ffmpeg_as<C: crate::FfmpegCarrier + crate::CarrierOps>(
+  source: Packet,
+  time_base: mediadecode::Timebase,
+  limits: PacketLimits,
+  provenance: crate::buffer::PayloadProvenance,
+) -> Result<Option<DataPacket<DataPacketExtra, C::Buffer>>, PacketBufferError> {
+  // **The source is consumed.** A borrowed `AVPacket` cannot be
+  // safely viewed: `ffmpeg_next::Packet` lends `&mut [u8]` through
+  // `data_mut` and shares its buffer by refcount with no
+  // copy-on-write, so a caller who kept the packet would hold a
+  // mutable alias of every byte the returned carrier reads — and
+  // both sides are `Send`. Taking it by value is what makes that
+  // unconstructible; the packet is released when this returns, and
+  // the view lane's carrier keeps the buffer alive by its own
+  // reference. See the borrowed siblings for the owned lane, which
+  // copies and so may borrow.
+  data_packet_from_borrowed::<C>(&source, time_base, limits, provenance)
+}
+
+/// The shared implementation of the data road.
+///
+/// Crate-private, and borrowed: the two public doors differ only in
+/// what they owe the borrow checker. The consuming one may be asked
+/// for either lane; the borrowing one is the owned lane, where the
+/// bytes are copied and the source is nobody's concern afterwards.
+pub(crate) fn data_packet_from_borrowed<C: crate::FfmpegCarrier + crate::CarrierOps>(
   packet: &Packet,
   time_base: mediadecode::Timebase,
   limits: PacketLimits,
-) -> Result<Option<DataPacket<DataPacketExtra, FfmpegBytes>>, PacketBufferError> {
+  provenance: crate::buffer::PayloadProvenance,
+) -> Result<Option<DataPacket<DataPacketExtra, C::Buffer>>, PacketBufferError> {
   let side_data = packet_side_data(packet)?;
-  let Some(buf) = delivered_payload(packet, &side_data, limits)? else {
+  let Some(buf) = delivered_payload::<C>(packet, &side_data, limits, provenance)? else {
     return Ok(None);
   };
   let pos = packet.position();
@@ -1222,15 +1575,41 @@ pub fn data_packet_from_ffmpeg_in(
 /// packet carrying none carries no attachment, and this answers
 /// `Ok(None)`. `AttachmentPacketExtra` accordingly has no side-data
 /// seat — a deliberate absence, not an oversight.
-pub fn attachment_packet_from_ffmpeg(
+pub(crate) fn attachment_packet_from_ffmpeg_as<C: crate::FfmpegCarrier + crate::CarrierOps>(
+  source: Packet,
+  limits: PacketLimits,
+  provenance: crate::buffer::PayloadProvenance,
+) -> Result<Option<AttachmentPacket<AttachmentPacketExtra, C::Buffer>>, PacketBufferError> {
+  // **The source is consumed.** A borrowed `AVPacket` cannot be
+  // safely viewed: `ffmpeg_next::Packet` lends `&mut [u8]` through
+  // `data_mut` and shares its buffer by refcount with no
+  // copy-on-write, so a caller who kept the packet would hold a
+  // mutable alias of every byte the returned carrier reads — and
+  // both sides are `Send`. Taking it by value is what makes that
+  // unconstructible; the packet is released when this returns, and
+  // the view lane's carrier keeps the buffer alive by its own
+  // reference. See the borrowed siblings for the owned lane, which
+  // copies and so may borrow.
+  attachment_packet_from_borrowed::<C>(&source, limits, provenance)
+}
+
+/// The shared implementation of the attachment road.
+///
+/// Crate-private, and borrowed: the two public doors differ only in
+/// what they owe the borrow checker. The consuming one may be asked
+/// for either lane; the borrowing one is the owned lane, where the
+/// bytes are copied and the source is nobody's concern afterwards.
+pub(crate) fn attachment_packet_from_borrowed<C: crate::FfmpegCarrier + crate::CarrierOps>(
   packet: &Packet,
   limits: PacketLimits,
-) -> Result<Option<AttachmentPacket<AttachmentPacketExtra, FfmpegBytes>>, PacketBufferError> {
+  provenance: crate::buffer::PayloadProvenance,
+) -> Result<Option<AttachmentPacket<AttachmentPacketExtra, C::Buffer>>, PacketBufferError> {
   use ffmpeg_next::packet::Ref;
   // SAFETY: `packet` keeps the AVPacket live for the duration of this
   // call, which is all `payload_of` requires.
-  let Some(buf) =
-    (unsafe { crate::buffer::payload_of(packet.as_ptr(), limits.max_packet_bytes()) })?
+  let Some(buf) = (unsafe {
+    crate::buffer::payload_of::<C>(packet.as_ptr(), limits.max_packet_bytes(), provenance)
+  })?
   else {
     return Ok(None);
   };
@@ -1380,22 +1759,26 @@ const _: () = {
 /// requires a buffer in every slot, but `plane_count = 0` reports them
 /// as inactive).
 ///
-/// **Infallible in 0.9, and the `try_` sibling is gone.** Through 0.8
-/// each slot was its own one-byte `AVBufferRef`, so building a
-/// placeholder was four FFmpeg allocations that could fail — hence a
-/// `try_empty_video_frame` returning `Option` and an `empty_video_frame`
-/// that panicked on `None`. The amputation removes the allocations:
-/// the empty carrier is made once for the process and cloned by
-/// refcount. A constructor with no failure mode does not get to keep a
-/// `Result`-shaped door.
-pub fn empty_video_frame() -> VideoFrame<PixelFormat, VideoFrameExtra, FfmpegBytes> {
+/// **Infallible on both lanes, and the `try_` sibling is gone.**
+/// Through 0.8 each slot was its own one-byte `AVBufferRef`, so
+/// building a placeholder was four FFmpeg allocations that could fail —
+/// hence a `try_empty_video_frame` returning `Option` and an
+/// `empty_video_frame` that panicked on `None`. Neither lane allocates
+/// here now: the owned lane's empty carrier is made once for the
+/// process and cloned by refcount, and the view lane's is a null-backed
+/// zero-length view, which is what lets the *view* lane keep the same
+/// infallible constructor rather than reintroducing 0.8's failure mode
+/// under a new name. A constructor with no failure mode does not get to
+/// keep a `Result`-shaped door.
+pub(crate) fn empty_video_frame_as<C: crate::FfmpegCarrier + crate::CarrierOps>()
+-> VideoFrame<PixelFormat, VideoFrameExtra, C::Buffer> {
   VideoFrame::new(
     Dimensions::new(0, 0),
     // mediaframe 0.3's named "no format yet" member, and its
     // `Default` — the state a descriptor is in before a decoder has
     // said what it produces, which is exactly this placeholder.
     PixelFormat::None,
-    core::array::from_fn(|_| Plane::new(FfmpegBytes::empty(), 0)),
+    core::array::from_fn(|_| Plane::new(C::empty(), 0)),
     0,
     VideoFrameExtra::default(),
   )
@@ -1406,15 +1789,15 @@ pub fn empty_video_frame() -> VideoFrame<PixelFormat, VideoFrameExtra, FfmpegByt
 /// [`mediadecode::decoder::AudioStreamDecoder::receive_frame`]. Same
 /// behaviour as [`empty_video_frame`] — eight shared empty plane
 /// carriers, `plane_count = 0`, and no way to fail.
-pub fn empty_audio_frame()
--> AudioFrame<SampleFormat, ChannelLayoutDescription, AudioFrameExtra, FfmpegBytes> {
+pub(crate) fn empty_audio_frame_as<C: crate::FfmpegCarrier + crate::CarrierOps>()
+-> AudioFrame<SampleFormat, ChannelLayoutDescription, AudioFrameExtra, C::Buffer> {
   AudioFrame::new(
     0,
     0,
     0,
     SampleFormat::NONE,
     ChannelLayoutDescription::default(),
-    core::array::from_fn(|_| Plane::new(FfmpegBytes::empty(), 0)),
+    core::array::from_fn(|_| Plane::new(C::empty(), 0)),
     0,
     AudioFrameExtra::default(),
   )
@@ -1425,10 +1808,243 @@ pub fn empty_audio_frame()
 /// [`mediadecode::decoder::SubtitleDecoder::receive_frame`]. The
 /// payload is an empty `Text` placeholder; the decoder overwrites it
 /// on success. Infallible, as its two siblings are.
-pub fn empty_subtitle_frame() -> SubtitleFrame<SubtitleFrameExtra, FfmpegBytes> {
+pub(crate) fn empty_subtitle_frame_as<C: crate::FfmpegCarrier + crate::CarrierOps>()
+-> SubtitleFrame<SubtitleFrameExtra, C::Buffer> {
   SubtitleFrame::new(
-    SubtitlePayload::Text(SubtitleText::new(FfmpegBytes::empty(), None)),
+    SubtitlePayload::Text(SubtitleText::new(C::empty(), None)),
     SubtitleFrameExtra::default(),
+  )
+}
+
+// --- The bare names, on the view lane --------------------------------
+//
+// **The signature says the lane, and the compiler enforces it.** A
+// conversion that *borrows* its `AVPacket` can only copy: the packet
+// type lends `&mut [u8]` and shares its buffer by refcount with no
+// copy-on-write, so a caller who still holds the packet holds a mutable
+// alias of anything a view would read. A conversion that *consumes* its
+// packet can share, because after it returns there is no other handle.
+//
+// So: **borrow in, owned lane out; move in, either lane out.** The
+// `_in` names below take the packet by value and answer with the view
+// lane — the ordinary road, where a direct consumer reads a packet in
+// place and drops it — while the lane-generic `_as` workers, also
+// by value, let a caller ask for either. The borrowing doors are the
+// bare `*_packet_from_ffmpeg` names, and they are the owned lane.
+//
+// A generic function has no default parameter to fall back on (defaults
+// are used when a type is *written*, not inferred from a call), so
+// these are monomorphic wrappers rather than a default that would never
+// apply.
+
+/// [`video_packet_from_ffmpeg_as`] on the view lane, with the
+/// stream's timebase stamped onto every timestamp.
+///
+/// **Takes the packet by value**, and that is the safety property, not
+/// a style choice. The program below is the alias this signature
+/// forbids — it was accepted when the parameter was a reference, and
+/// `data_mut` handed out a `&mut [u8]` over bytes the returned carrier
+/// was still lending as `&[u8]`:
+///
+/// ```compile_fail,E0382
+/// use ffmpeg_next::packet::Mut;
+/// use mediadecode::Timebase;
+/// use mediadecode_ffmpeg::{PacketLimits, video_packet_from_ffmpeg_in};
+///
+/// let mut packet = ffmpeg_next::Packet::copy(&[0u8; 64]);
+/// let viewed = video_packet_from_ffmpeg_in(packet, Timebase::default(), PacketLimits::default());
+/// // The source is gone, so this cannot be written.
+/// let _aliased = packet.data_mut();
+/// ```
+///
+/// A caller who wants to keep the packet wants the owned lane, which
+/// copies and may therefore borrow:
+/// [`owned_video_packet_from_ffmpeg_in`].
+pub fn video_packet_from_ffmpeg_in(
+  packet: Packet,
+  time_base: mediadecode::Timebase,
+  limits: PacketLimits,
+) -> Result<Option<VideoPacket<VideoPacketExtra, crate::FfmpegBuffer>>, PacketBufferError> {
+  video_packet_from_ffmpeg_as::<crate::View>(
+    packet,
+    time_base,
+    limits,
+    crate::buffer::PayloadProvenance::CallerSupplied,
+  )
+}
+
+/// [`audio_packet_from_ffmpeg_as`] on the view lane.
+pub fn audio_packet_from_ffmpeg_in(
+  packet: Packet,
+  time_base: mediadecode::Timebase,
+  limits: PacketLimits,
+) -> Result<Option<AudioPacket<AudioPacketExtra, crate::FfmpegBuffer>>, PacketBufferError> {
+  audio_packet_from_ffmpeg_as::<crate::View>(
+    packet,
+    time_base,
+    limits,
+    crate::buffer::PayloadProvenance::CallerSupplied,
+  )
+}
+
+/// [`subtitle_packet_from_ffmpeg_as`] on the view lane.
+pub fn subtitle_packet_from_ffmpeg_in(
+  packet: Packet,
+  time_base: mediadecode::Timebase,
+  limits: PacketLimits,
+) -> Result<Option<SubtitlePacket<SubtitlePacketExtra, crate::FfmpegBuffer>>, PacketBufferError> {
+  subtitle_packet_from_ffmpeg_as::<crate::View>(
+    packet,
+    time_base,
+    limits,
+    crate::buffer::PayloadProvenance::CallerSupplied,
+  )
+}
+
+/// [`data_packet_from_ffmpeg_as`] on the view lane.
+pub fn data_packet_from_ffmpeg_in(
+  packet: Packet,
+  time_base: mediadecode::Timebase,
+  limits: PacketLimits,
+) -> Result<Option<DataPacket<DataPacketExtra, crate::FfmpegBuffer>>, PacketBufferError> {
+  data_packet_from_ffmpeg_as::<crate::View>(
+    packet,
+    time_base,
+    limits,
+    crate::buffer::PayloadProvenance::CallerSupplied,
+  )
+}
+
+// --- The borrowing doors, on the owned lane --------------------------
+//
+// The owned lane may borrow because it copies: nothing it returns
+// points at the source, so the source's fate is its own business.
+// These are the shapes the view lane cannot offer, and the reason it
+// cannot is the whole of the split — see the note above the `_in`
+// family.
+
+/// [`video_packet_from_ffmpeg`] with the stream's timebase and explicit
+/// budgets.
+pub fn owned_video_packet_from_ffmpeg_in(
+  packet: &Packet,
+  time_base: mediadecode::Timebase,
+  limits: PacketLimits,
+) -> Result<Option<VideoPacket<VideoPacketExtra, FfmpegBytes>>, PacketBufferError> {
+  video_packet_from_borrowed::<crate::Owned>(
+    packet,
+    time_base,
+    limits,
+    crate::buffer::PayloadProvenance::CallerSupplied,
+  )
+}
+
+/// [`audio_packet_from_ffmpeg`] with the stream's timebase and explicit
+/// budgets.
+pub fn owned_audio_packet_from_ffmpeg_in(
+  packet: &Packet,
+  time_base: mediadecode::Timebase,
+  limits: PacketLimits,
+) -> Result<Option<AudioPacket<AudioPacketExtra, FfmpegBytes>>, PacketBufferError> {
+  audio_packet_from_borrowed::<crate::Owned>(
+    packet,
+    time_base,
+    limits,
+    crate::buffer::PayloadProvenance::CallerSupplied,
+  )
+}
+
+/// [`subtitle_packet_from_ffmpeg`] with the stream's timebase and
+/// explicit budgets.
+pub fn owned_subtitle_packet_from_ffmpeg_in(
+  packet: &Packet,
+  time_base: mediadecode::Timebase,
+  limits: PacketLimits,
+) -> Result<Option<SubtitlePacket<SubtitlePacketExtra, FfmpegBytes>>, PacketBufferError> {
+  subtitle_packet_from_borrowed::<crate::Owned>(
+    packet,
+    time_base,
+    limits,
+    crate::buffer::PayloadProvenance::CallerSupplied,
+  )
+}
+
+/// [`data_packet_from_ffmpeg_in`] on the owned lane, borrowing its
+/// source.
+pub fn owned_data_packet_from_ffmpeg_in(
+  packet: &Packet,
+  time_base: mediadecode::Timebase,
+  limits: PacketLimits,
+) -> Result<Option<DataPacket<DataPacketExtra, FfmpegBytes>>, PacketBufferError> {
+  data_packet_from_borrowed::<crate::Owned>(
+    packet,
+    time_base,
+    limits,
+    crate::buffer::PayloadProvenance::CallerSupplied,
+  )
+}
+
+/// [`attachment_packet_from_ffmpeg`] on the owned lane, borrowing its
+/// source.
+pub fn owned_attachment_packet_from_ffmpeg(
+  packet: &Packet,
+  limits: PacketLimits,
+) -> Result<Option<AttachmentPacket<AttachmentPacketExtra, FfmpegBytes>>, PacketBufferError> {
+  attachment_packet_from_borrowed::<crate::Owned>(
+    packet,
+    limits,
+    crate::buffer::PayloadProvenance::CallerSupplied,
+  )
+}
+
+/// [`empty_video_frame_as`] on the view lane — the destination a
+/// [`FfmpegVideoStreamDecoder`](crate::FfmpegVideoStreamDecoder) fills.
+#[must_use]
+pub fn empty_video_frame() -> VideoFrame<PixelFormat, VideoFrameExtra, crate::FfmpegBuffer> {
+  empty_video_frame_as::<crate::View>()
+}
+
+/// [`empty_video_frame_as`] on the owned lane.
+#[must_use]
+pub fn empty_owned_video_frame() -> VideoFrame<PixelFormat, VideoFrameExtra, FfmpegBytes> {
+  empty_video_frame_as::<crate::Owned>()
+}
+
+/// [`empty_audio_frame_as`] on the view lane.
+#[must_use]
+pub fn empty_audio_frame()
+-> AudioFrame<SampleFormat, ChannelLayoutDescription, AudioFrameExtra, crate::FfmpegBuffer> {
+  empty_audio_frame_as::<crate::View>()
+}
+
+/// [`empty_audio_frame_as`] on the owned lane.
+#[must_use]
+pub fn empty_owned_audio_frame()
+-> AudioFrame<SampleFormat, ChannelLayoutDescription, AudioFrameExtra, FfmpegBytes> {
+  empty_audio_frame_as::<crate::Owned>()
+}
+
+/// [`empty_subtitle_frame_as`] on the view lane.
+#[must_use]
+pub fn empty_subtitle_frame() -> SubtitleFrame<SubtitleFrameExtra, crate::FfmpegBuffer> {
+  empty_subtitle_frame_as::<crate::View>()
+}
+
+/// [`empty_subtitle_frame_as`] on the owned lane.
+#[must_use]
+pub fn empty_owned_subtitle_frame() -> SubtitleFrame<SubtitleFrameExtra, FfmpegBytes> {
+  empty_subtitle_frame_as::<crate::Owned>()
+}
+
+/// [`attachment_packet_from_ffmpeg_as`] on the view lane.
+pub fn attachment_packet_from_ffmpeg(
+  packet: Packet,
+  limits: PacketLimits,
+) -> Result<Option<AttachmentPacket<AttachmentPacketExtra, crate::FfmpegBuffer>>, PacketBufferError>
+{
+  attachment_packet_from_ffmpeg_as::<crate::View>(
+    packet,
+    limits,
+    crate::buffer::PayloadProvenance::CallerSupplied,
   )
 }
 
@@ -1460,23 +2076,47 @@ mod tests {
     let forged = out_of_bounds_packet();
     let tb = mediadecode::Timebase::default();
     assert!(matches!(
-      video_packet_from_ffmpeg_in(&forged, tb, PacketLimits::default()),
+      video_packet_from_borrowed::<crate::Owned>(
+        &forged,
+        tb,
+        PacketLimits::default(),
+        crate::buffer::PayloadProvenance::CallerSupplied
+      ),
       Err(PacketBufferError::Bounds(_)),
     ));
     assert!(matches!(
-      audio_packet_from_ffmpeg_in(&forged, tb, PacketLimits::default()),
+      audio_packet_from_borrowed::<crate::Owned>(
+        &forged,
+        tb,
+        PacketLimits::default(),
+        crate::buffer::PayloadProvenance::CallerSupplied
+      ),
       Err(PacketBufferError::Bounds(_)),
     ));
     assert!(matches!(
-      subtitle_packet_from_ffmpeg_in(&forged, tb, PacketLimits::default()),
+      subtitle_packet_from_borrowed::<crate::Owned>(
+        &forged,
+        tb,
+        PacketLimits::default(),
+        crate::buffer::PayloadProvenance::CallerSupplied
+      ),
       Err(PacketBufferError::Bounds(_)),
     ));
     assert!(matches!(
-      data_packet_from_ffmpeg_in(&forged, tb, PacketLimits::default()),
+      data_packet_from_borrowed::<crate::Owned>(
+        &forged,
+        tb,
+        PacketLimits::default(),
+        crate::buffer::PayloadProvenance::CallerSupplied
+      ),
       Err(PacketBufferError::Bounds(_)),
     ));
     assert!(matches!(
-      attachment_packet_from_ffmpeg(&forged, PacketLimits::default()),
+      attachment_packet_from_borrowed::<crate::Owned>(
+        &forged,
+        PacketLimits::default(),
+        crate::buffer::PayloadProvenance::CallerSupplied
+      ),
       Err(PacketBufferError::Bounds(_)),
     ));
   }
@@ -1665,19 +2305,43 @@ mod tests {
     [
       (
         "video",
-        video_packet_from_ffmpeg_in(packet, tb, PacketLimits::default()).map(|p| p.is_some()),
+        video_packet_from_borrowed::<crate::Owned>(
+          packet,
+          tb,
+          PacketLimits::default(),
+          crate::buffer::PayloadProvenance::CallerSupplied,
+        )
+        .map(|p| p.is_some()),
       ),
       (
         "audio",
-        audio_packet_from_ffmpeg_in(packet, tb, PacketLimits::default()).map(|p| p.is_some()),
+        audio_packet_from_borrowed::<crate::Owned>(
+          packet,
+          tb,
+          PacketLimits::default(),
+          crate::buffer::PayloadProvenance::CallerSupplied,
+        )
+        .map(|p| p.is_some()),
       ),
       (
         "subtitle",
-        subtitle_packet_from_ffmpeg_in(packet, tb, PacketLimits::default()).map(|p| p.is_some()),
+        subtitle_packet_from_borrowed::<crate::Owned>(
+          packet,
+          tb,
+          PacketLimits::default(),
+          crate::buffer::PayloadProvenance::CallerSupplied,
+        )
+        .map(|p| p.is_some()),
       ),
       (
         "data",
-        data_packet_from_ffmpeg_in(packet, tb, PacketLimits::default()).map(|p| p.is_some()),
+        data_packet_from_borrowed::<crate::Owned>(
+          packet,
+          tb,
+          PacketLimits::default(),
+          crate::buffer::PayloadProvenance::CallerSupplied,
+        )
+        .map(|p| p.is_some()),
       ),
     ]
   }
@@ -1736,10 +2400,11 @@ mod tests {
     // exactly what FFmpeg emits for some side data, and it stays
     // welcome.
     let marker = Forged::null_entry_data(0, true);
-    let packet = video_packet_from_ffmpeg_in(
+    let packet = video_packet_from_borrowed::<crate::Owned>(
       &marker.packet,
       mediadecode::Timebase::default(),
       PacketLimits::default(),
+      crate::buffer::PayloadProvenance::CallerSupplied,
     )
     .expect("a marker entry is carriable")
     .expect("present");
@@ -1759,20 +2424,43 @@ mod tests {
     for (arm, result) in [
       (
         "video",
-        video_packet_from_ffmpeg_in(&oversized, tb, PacketLimits::default()).map(|p| p.is_some()),
+        video_packet_from_borrowed::<crate::Owned>(
+          &oversized,
+          tb,
+          PacketLimits::default(),
+          crate::buffer::PayloadProvenance::CallerSupplied,
+        )
+        .map(|p| p.is_some()),
       ),
       (
         "audio",
-        audio_packet_from_ffmpeg_in(&oversized, tb, PacketLimits::default()).map(|p| p.is_some()),
+        audio_packet_from_borrowed::<crate::Owned>(
+          &oversized,
+          tb,
+          PacketLimits::default(),
+          crate::buffer::PayloadProvenance::CallerSupplied,
+        )
+        .map(|p| p.is_some()),
       ),
       (
         "subtitle",
-        subtitle_packet_from_ffmpeg_in(&oversized, tb, PacketLimits::default())
-          .map(|p| p.is_some()),
+        subtitle_packet_from_borrowed::<crate::Owned>(
+          &oversized,
+          tb,
+          PacketLimits::default(),
+          crate::buffer::PayloadProvenance::CallerSupplied,
+        )
+        .map(|p| p.is_some()),
       ),
       (
         "data",
-        data_packet_from_ffmpeg_in(&oversized, tb, PacketLimits::default()).map(|p| p.is_some()),
+        data_packet_from_borrowed::<crate::Owned>(
+          &oversized,
+          tb,
+          PacketLimits::default(),
+          crate::buffer::PayloadProvenance::CallerSupplied,
+        )
+        .map(|p| p.is_some()),
       ),
     ] {
       match result {
@@ -1789,7 +2477,13 @@ mod tests {
     // therefore looked empty, and the demuxer skipped it in silence.
     let oversized = packet_with_side_data(SIDE_DATA_MAX_TOTAL_BYTES + 1, false);
     assert!(matches!(
-      video_packet_from_ffmpeg_in(&oversized, tb, PacketLimits::default()).map(|p| p.is_some()),
+      video_packet_from_borrowed::<crate::Owned>(
+        &oversized,
+        tb,
+        PacketLimits::default(),
+        crate::buffer::PayloadProvenance::CallerSupplied
+      )
+      .map(|p| p.is_some()),
       Err(PacketBufferError::SideDataBytes(_)),
     ));
   }
@@ -1800,9 +2494,14 @@ mod tests {
 
     // Exactly at the byte cap: carried, whole.
     let at_cap = packet_with_side_data(SIDE_DATA_MAX_TOTAL_BYTES, true);
-    let packet = video_packet_from_ffmpeg_in(&at_cap, tb, PacketLimits::default())
-      .expect("exactly at the cap is not over it")
-      .expect("present");
+    let packet = video_packet_from_borrowed::<crate::Owned>(
+      &at_cap,
+      tb,
+      PacketLimits::default(),
+      crate::buffer::PayloadProvenance::CallerSupplied,
+    )
+    .expect("exactly at the cap is not over it")
+    .expect("present");
     assert_eq!(packet.extra().side_data().len(), 1);
     assert_eq!(
       packet.extra().side_data()[0].data().len(),
@@ -1812,7 +2511,13 @@ mod tests {
     // One byte past: refused.
     let past = packet_with_side_data(SIDE_DATA_MAX_TOTAL_BYTES + 1, true);
     assert!(matches!(
-      video_packet_from_ffmpeg_in(&past, tb, PacketLimits::default()).map(|p| p.is_some()),
+      video_packet_from_borrowed::<crate::Owned>(
+        &past,
+        tb,
+        PacketLimits::default(),
+        crate::buffer::PayloadProvenance::CallerSupplied
+      )
+      .map(|p| p.is_some()),
       Err(PacketBufferError::SideDataBytes(_)),
     ));
 
@@ -1824,14 +2529,24 @@ mod tests {
     assert_eq!(cap, SIDE_DATA_MAX_ENTRIES, "the cap this lane straddles");
 
     let at_cap = Forged::entries(cap, true);
-    let packet = video_packet_from_ffmpeg_in(&at_cap.packet, tb, PacketLimits::default())
-      .expect("exactly at the cap is not over it")
-      .expect("present");
+    let packet = video_packet_from_borrowed::<crate::Owned>(
+      &at_cap.packet,
+      tb,
+      PacketLimits::default(),
+      crate::buffer::PayloadProvenance::CallerSupplied,
+    )
+    .expect("exactly at the cap is not over it")
+    .expect("present");
     assert_eq!(packet.extra().side_data().len(), cap);
 
     let past = Forged::entries(cap + 1, true);
-    match video_packet_from_ffmpeg_in(&past.packet, tb, PacketLimits::default())
-      .map(|p| p.is_some())
+    match video_packet_from_borrowed::<crate::Owned>(
+      &past.packet,
+      tb,
+      PacketLimits::default(),
+      crate::buffer::PayloadProvenance::CallerSupplied,
+    )
+    .map(|p| p.is_some())
     {
       Err(PacketBufferError::SideDataEntries(p)) => {
         assert_eq!(p.count() as usize, cap + 1);
@@ -1844,7 +2559,7 @@ mod tests {
     // data" would be the same silent loss by another route.
     let corrupt = Forged::entries(1, true).with_declared_count(-3);
     assert!(matches!(
-      video_packet_from_ffmpeg_in(&corrupt.packet, tb, PacketLimits::default()).map(|p| p.is_some()),
+      video_packet_from_borrowed::<crate::Owned>(&corrupt.packet, tb, PacketLimits::default(), crate::buffer::PayloadProvenance::CallerSupplied).map(|p| p.is_some()),
       Err(PacketBufferError::SideDataEntries(p)) if p.count() == -3,
     ));
   }
@@ -1865,23 +2580,52 @@ mod tests {
     for (arm, taken) in [
       (
         "video",
-        video_packet_from_ffmpeg_in(&packet, tb, PacketLimits::default()).map(|p| p.is_some()),
+        video_packet_from_borrowed::<crate::Owned>(
+          &packet,
+          tb,
+          PacketLimits::default(),
+          crate::buffer::PayloadProvenance::CallerSupplied,
+        )
+        .map(|p| p.is_some()),
       ),
       (
         "audio",
-        audio_packet_from_ffmpeg_in(&packet, tb, PacketLimits::default()).map(|p| p.is_some()),
+        audio_packet_from_borrowed::<crate::Owned>(
+          &packet,
+          tb,
+          PacketLimits::default(),
+          crate::buffer::PayloadProvenance::CallerSupplied,
+        )
+        .map(|p| p.is_some()),
       ),
       (
         "subtitle",
-        subtitle_packet_from_ffmpeg_in(&packet, tb, PacketLimits::default()).map(|p| p.is_some()),
+        subtitle_packet_from_borrowed::<crate::Owned>(
+          &packet,
+          tb,
+          PacketLimits::default(),
+          crate::buffer::PayloadProvenance::CallerSupplied,
+        )
+        .map(|p| p.is_some()),
       ),
       (
         "data",
-        data_packet_from_ffmpeg_in(&packet, tb, PacketLimits::default()).map(|p| p.is_some()),
+        data_packet_from_borrowed::<crate::Owned>(
+          &packet,
+          tb,
+          PacketLimits::default(),
+          crate::buffer::PayloadProvenance::CallerSupplied,
+        )
+        .map(|p| p.is_some()),
       ),
       (
         "attachment",
-        attachment_packet_from_ffmpeg(&packet, PacketLimits::default()).map(|p| p.is_some()),
+        attachment_packet_from_borrowed::<crate::Owned>(
+          &packet,
+          PacketLimits::default(),
+          crate::buffer::PayloadProvenance::CallerSupplied,
+        )
+        .map(|p| p.is_some()),
       ),
     ] {
       match taken {
@@ -1894,15 +2638,20 @@ mod tests {
     // handed back to a decoder on. Built by hand, because the copy-out
     // leg above will no longer produce one.
     let clean = Packet::copy(&[1u8, 2, 3]);
-    let video = video_packet_from_ffmpeg_in(&clean, tb, PacketLimits::default())
-      .expect("a clean packet is carriable")
-      .expect("present");
+    let video = video_packet_from_borrowed::<crate::Owned>(
+      &clean,
+      tb,
+      PacketLimits::default(),
+      crate::buffer::PayloadProvenance::CallerSupplied,
+    )
+    .expect("a clean packet is carriable")
+    .expect("present");
     let trusted = video
       .clone()
       .with_flags(MdPacketFlags::from_bits_retain(crate::buffer::TRUSTED_BIT));
     assert!(
       matches!(
-        ffmpeg_packet_from_video_packet(&trusted, PacketLimits::default()),
+        ffmpeg_packet_from_owned_video_packet(&trusted, PacketLimits::default()),
         Err(PacketBuildError::TrustedPayload(_)),
       ),
       "a TRUSTED flag must not be written back onto an AVPacket",
@@ -1947,41 +2696,66 @@ mod tests {
     let tb = mediadecode::Timebase::default();
     let expected = MdPacketFlags::from_bits_retain(raw as u8);
 
-    let video = video_packet_from_ffmpeg_in(&packet, tb, PacketLimits::default())
-      .expect("wrappable")
-      .expect("present");
+    let video = video_packet_from_borrowed::<crate::Owned>(
+      &packet,
+      tb,
+      PacketLimits::default(),
+      crate::buffer::PayloadProvenance::CallerSupplied,
+    )
+    .expect("wrappable")
+    .expect("present");
     assert_eq!(video.flags(), expected);
     assert!(video.flags().contains(MdPacketFlags::DISCARD));
-    let audio = audio_packet_from_ffmpeg_in(&packet, tb, PacketLimits::default())
-      .expect("wrappable")
-      .expect("present");
+    let audio = audio_packet_from_borrowed::<crate::Owned>(
+      &packet,
+      tb,
+      PacketLimits::default(),
+      crate::buffer::PayloadProvenance::CallerSupplied,
+    )
+    .expect("wrappable")
+    .expect("present");
     assert_eq!(audio.flags(), expected);
-    let subtitle = subtitle_packet_from_ffmpeg_in(&packet, tb, PacketLimits::default())
-      .expect("wrappable")
-      .expect("present");
+    let subtitle = subtitle_packet_from_borrowed::<crate::Owned>(
+      &packet,
+      tb,
+      PacketLimits::default(),
+      crate::buffer::PayloadProvenance::CallerSupplied,
+    )
+    .expect("wrappable")
+    .expect("present");
     assert_eq!(subtitle.flags(), expected);
-    let data = data_packet_from_ffmpeg_in(&packet, tb, PacketLimits::default())
-      .expect("wrappable")
-      .expect("present");
+    let data = data_packet_from_borrowed::<crate::Owned>(
+      &packet,
+      tb,
+      PacketLimits::default(),
+      crate::buffer::PayloadProvenance::CallerSupplied,
+    )
+    .expect("wrappable")
+    .expect("present");
     assert_eq!(data.flags(), expected);
-    let attachment = attachment_packet_from_ffmpeg(&packet, PacketLimits::default())
-      .expect("wrappable")
-      .expect("present");
+    let attachment = attachment_packet_from_borrowed::<crate::Owned>(
+      &packet,
+      PacketLimits::default(),
+      crate::buffer::PayloadProvenance::CallerSupplied,
+    )
+    .expect("wrappable")
+    .expect("present");
     assert_eq!(attachment.flags(), expected);
 
     // And back out again, on the three paths a decoder is fed from.
     for (arm, rebuilt) in [
       (
         "video",
-        ffmpeg_packet_from_video_packet(&video, PacketLimits::default()).expect("rebuilt"),
+        ffmpeg_packet_from_owned_video_packet(&video, PacketLimits::default()).expect("rebuilt"),
       ),
       (
         "audio",
-        ffmpeg_packet_from_audio_packet(&audio, PacketLimits::default()).expect("rebuilt"),
+        ffmpeg_packet_from_owned_audio_packet(&audio, PacketLimits::default()).expect("rebuilt"),
       ),
       (
         "subtitle",
-        ffmpeg_packet_from_subtitle_packet(&subtitle, PacketLimits::default()).expect("rebuilt"),
+        ffmpeg_packet_from_owned_subtitle_packet(&subtitle, PacketLimits::default())
+          .expect("rebuilt"),
       ),
     ] {
       // SAFETY: `rebuilt` owns a live `AVPacket`.
@@ -2011,10 +2785,342 @@ mod tests {
       );
     }
     assert!(matches!(
-      attachment_packet_from_ffmpeg(&packet, PacketLimits::default()).map(|p| p.is_some()),
+      attachment_packet_from_borrowed::<crate::Owned>(
+        &packet,
+        PacketLimits::default(),
+        crate::buffer::PayloadProvenance::CallerSupplied
+      )
+      .map(|p| p.is_some()),
       Err(PacketBufferError::UnrepresentableFlags(_)),
     ));
     let _ = tb;
+  }
+
+  /// A live `AVBufferRef` of `len` bytes, released when the guard drops.
+  struct TestBuffer(*mut ffmpeg_next::ffi::AVBufferRef);
+
+  impl TestBuffer {
+    fn new(len: usize) -> Self {
+      // SAFETY: a plain allocation, checked for null, written through
+      // its own `data` pointer.
+      unsafe {
+        let raw = ffmpeg_next::ffi::av_buffer_alloc(len as _);
+        assert!(!raw.is_null(), "av_buffer_alloc");
+        core::ptr::write_bytes((*raw).data, 0xAB, len);
+        Self(raw)
+      }
+    }
+  }
+
+  impl Drop for TestBuffer {
+    fn drop(&mut self) {
+      // SAFETY: the guard owns exactly one reference, released once.
+      unsafe { ffmpeg_next::ffi::av_buffer_unref(&mut self.0) };
+    }
+  }
+
+  /// The payload pointer a packet's buffer currently holds.
+  fn payload_address(packet: &Packet) -> usize {
+    use ffmpeg_next::packet::Ref;
+    // SAFETY: the packet is live; `data` is a public field.
+    unsafe { (*packet.as_ptr()).data as usize }
+  }
+
+  /// The refcount of a packet's payload buffer.
+  fn payload_references(packet: &Packet) -> i32 {
+    use ffmpeg_next::packet::Ref;
+    // SAFETY: the packet is live and refcounted; `buf` is a public
+    // field and `av_buffer_get_ref_count` only reads the atomic.
+    unsafe {
+      let buf = (*packet.as_ptr()).buf;
+      assert!(!buf.is_null(), "the fixture must be refcounted");
+      ffmpeg_next::ffi::av_buffer_get_ref_count(buf)
+    }
+  }
+
+  #[test]
+  fn a_shared_packet_buffer_is_refused_without_being_read() {
+    // **The consumption argument has a hole a dependency can open, and
+    // the obvious patch had a worse one.** Taking the packet by value
+    // proves no *other* handle survives only if the packet's buffer was
+    // the caller's alone to give. An earlier round answered a shared
+    // buffer with a silent copy — but a copy needs a read, and a
+    // refcount above one is exactly the state in which somebody else
+    // may be writing those bytes, from safe code, on another thread.
+    // The read *is* the race. So the answer is a refusal that touches
+    // nothing.
+    let mut original = Packet::copy(&[7u8; 4096]);
+    let mut shared = Packet::empty();
+    // SAFETY: both packets are live; `av_packet_ref` takes a reference
+    // to `original`'s buffer without copying it.
+    unsafe {
+      use ffmpeg_next::packet::{Mut, Ref};
+      assert_eq!(
+        ffmpeg_next::ffi::av_packet_ref(shared.as_mut_ptr(), original.as_ptr()),
+        0,
+      );
+    }
+    assert_eq!(
+      payload_address(&shared),
+      payload_address(&original),
+      "the premise: the two packets share one allocation",
+    );
+    assert_eq!(payload_references(&original), 2);
+
+    // The refusal is lane-independent, because the hazard is: both
+    // lanes read the payload, one to view it and one to copy it.
+    match video_packet_from_ffmpeg_as::<crate::View>(
+      shared,
+      mediadecode::Timebase::default(),
+      PacketLimits::default(),
+      crate::buffer::PayloadProvenance::CallerSupplied,
+    ) {
+      Err(PacketBufferError::SharedPayload(refused)) => {
+        assert_eq!(refused.references(), 2);
+      }
+      other => panic!("a shared payload must be refused by name, got {other:?}"),
+    }
+
+    // Nothing was read and nothing was carried: the packet the caller
+    // kept is still theirs, still writable, and now sole owner again.
+    {
+      let slot = original.data_mut().expect("a writable payload");
+      slot[0] = 0xEE;
+    }
+    assert_eq!(
+      payload_references(&original),
+      1,
+      "the refusal must not have taken a reference of its own",
+    );
+
+    // And the owned lane answers the same way, for the same reason: its
+    // copy is a read too.
+    let mut shared_again = Packet::empty();
+    // SAFETY: as above.
+    unsafe {
+      use ffmpeg_next::packet::{Mut, Ref};
+      assert_eq!(
+        ffmpeg_next::ffi::av_packet_ref(shared_again.as_mut_ptr(), original.as_ptr()),
+        0,
+      );
+    }
+    assert!(matches!(
+      owned_video_packet_from_ffmpeg_in(
+        &shared_again,
+        mediadecode::Timebase::default(),
+        PacketLimits::default(),
+      ),
+      Err(PacketBufferError::SharedPayload(_)),
+    ));
+  }
+
+  #[test]
+  fn a_clone_that_silently_shared_is_refused_by_name() {
+    // The exact path: `ffmpeg_next::Packet::clone` calls
+    // `av_packet_ref` then `av_packet_make_writable` and **ignores both
+    // return codes**. Under allocation failure the second one leaves
+    // the "clone" sharing the source's buffer, and nothing says so.
+    //
+    // The cap is process-global, so the manufacture runs alone. It is
+    // lifted before the conversion, because what is being tested is the
+    // conversion's answer to a shared buffer — not its behaviour under
+    // memory pressure, which the other lanes cover.
+    crate::fault_subprocess::in_subprocess(
+      "boundary::tests::a_clone_that_silently_shared_is_refused_by_name",
+      || {
+        let mut original = Packet::copy(&[3u8; 8192]);
+
+        // Small allocations still succeed, so `av_packet_ref` gets its
+        // `AVBufferRef`; a payload-sized one does not, so
+        // `av_packet_make_writable` fails and is ignored.
+        crate::fault_subprocess::cap_ffmpeg_allocations(512);
+        let clone = original.clone();
+        crate::fault_subprocess::uncap_ffmpeg_allocations();
+
+        assert_eq!(
+          payload_address(&clone),
+          payload_address(&original),
+          "the premise this test exists for: a failed `make_writable` \
+           leaves the clone sharing, silently",
+        );
+        assert_eq!(payload_references(&original), 2);
+
+        match video_packet_from_ffmpeg_as::<crate::View>(
+          clone,
+          mediadecode::Timebase::default(),
+          PacketLimits::default(),
+          crate::buffer::PayloadProvenance::CallerSupplied,
+        ) {
+          Err(PacketBufferError::SharedPayload(refused)) => {
+            assert_eq!(refused.references(), 2);
+          }
+          other => panic!("expected a named refusal, got {other:?}"),
+        }
+
+        // The handle the caller kept is untouched and unaliased.
+        {
+          let slot = original.data_mut().expect("a writable payload");
+          slot[0] = 0x5A;
+        }
+        assert_eq!(payload_references(&original), 1);
+      },
+    );
+  }
+
+  #[test]
+  fn only_a_packet_payload_with_provable_padding_is_shared_into_a_decoder() {
+    use crate::view::Origin;
+    use ffmpeg_next::packet::Ref;
+
+    const PADDING: usize = ffmpeg_next::ffi::AV_INPUT_BUFFER_PADDING_SIZE as usize;
+    let src = TestBuffer::new(512);
+    let body_len = 512 - PADDING;
+
+    // The one shape that may share: a payload captured out of an
+    // `AVPacket`'s own buffer, with libavformat's padding behind it.
+    // SAFETY: `src` is live for the test and the extent is inside it.
+    let payload =
+      unsafe { crate::FfmpegBuffer::view_of(src.0, 0, body_len, Origin::PacketPayload) }
+        .expect("a view");
+    let shared = share_or_copy(&payload).expect("built");
+    // SAFETY: both are live; `data` is a public field.
+    assert_eq!(
+      unsafe { (*shared.as_ptr()).data as usize },
+      payload.as_ref().as_ptr() as usize,
+      "a packet payload with provable padding must be shared",
+    );
+
+    // **The same bytes, the same slack, no provenance.** This is the
+    // frame-origin case: a decoded plane or a resampler's output reused
+    // as a packet body. What follows it is more pixels or more samples,
+    // and a bitstream reader running past the payload would eat them.
+    // SAFETY: as above.
+    let plane =
+      unsafe { crate::FfmpegBuffer::view_of(src.0, 0, body_len, Origin::Foreign) }.expect("a view");
+    let copied = share_or_copy(&plane).expect("built");
+    // SAFETY: both are live.
+    assert_ne!(
+      unsafe { (*copied.as_ptr()).data as usize },
+      plane.as_ref().as_ptr() as usize,
+      "trailing capacity is not padding provenance — this must be copied",
+    );
+    assert_eq!(copied.data().unwrap_or(&[]), plane.as_ref());
+
+    // And a payload whose slack is short of the padding is copied too,
+    // provenance or not: the extent has to hold as well.
+    // SAFETY: as above.
+    let tight = unsafe { crate::FfmpegBuffer::view_of(src.0, 0, 511, Origin::PacketPayload) }
+      .expect("a view");
+    let copied = share_or_copy(&tight).expect("built");
+    // SAFETY: both are live.
+    assert_ne!(
+      unsafe { (*copied.as_ptr()).data as usize },
+      tight.as_ref().as_ptr() as usize,
+      "a payload with less than the padding behind it must be copied",
+    );
+
+    // A narrowed payload has lost its claim, and is copied.
+    let mut narrowed = payload.clone();
+    narrowed.shrink_to(16);
+    let copied = share_or_copy(&narrowed).expect("built");
+    // SAFETY: both are live.
+    assert_ne!(
+      unsafe { (*copied.as_ptr()).data as usize },
+      narrowed.as_ref().as_ptr() as usize,
+    );
+  }
+
+  #[test]
+  fn an_empty_view_carrier_builds_a_payload_less_packet() {
+    // The empty carrier is backed by **no buffer at all** — that is
+    // what makes a placeholder plane slot free — so anything that
+    // reads its `AVBufferRef` before asking whether it is empty
+    // dereferences null. A side-data-only packet is the ordinary way
+    // to get here, not an exotic one.
+    let empty = crate::FfmpegBuffer::empty();
+    assert!(empty.as_av_buffer_ref().is_null(), "the premise");
+    let built = share_or_copy(&empty).expect("a payload-less packet");
+    assert_eq!(built.size(), 0);
+    // And it is a packet side data can be attached to.
+    let mut built = built;
+    attach_side_data(
+      &mut built,
+      &[SideDataEntry::new(
+        NEW_EXTRADATA,
+        FfmpegBytes::copy_from_slice(&[1u8, 2, 3, 4]),
+      )],
+    )
+    .expect("side data attaches to a payload-less packet");
+  }
+
+  #[test]
+  fn a_side_data_only_packet_round_trips_on_every_view_decoder_family() {
+    // Every family, both roads: the public builder a caller can call,
+    // and the scoped submission a decoder goes through. Neither may
+    // touch the empty carrier's absent buffer.
+    let tb = mediadecode::Timebase::default();
+    let source = side_data_only_packet();
+    let limits = PacketLimits::default();
+
+    let video = video_packet_from_ffmpeg_as::<crate::View>(
+      source.clone(),
+      tb,
+      limits,
+      crate::buffer::PayloadProvenance::CallerSupplied,
+    )
+    .expect("carried")
+    .expect("a side-data-only packet is a packet");
+    assert!(video.data().as_ref().is_empty(), "the premise: no payload");
+    assert_eq!(
+      ffmpeg_packet_from_video_packet(&video, limits)
+        .expect("built")
+        .size(),
+      0,
+    );
+    with_ffmpeg_video_packet::<crate::View, _>(&video, limits, BodyRoute::Submission, |av| {
+      assert_eq!(av.size(), 0);
+    })
+    .expect("submitted");
+
+    let audio = audio_packet_from_ffmpeg_as::<crate::View>(
+      source.clone(),
+      tb,
+      limits,
+      crate::buffer::PayloadProvenance::CallerSupplied,
+    )
+    .expect("carried")
+    .expect("a side-data-only packet is a packet");
+    assert!(audio.data().as_ref().is_empty());
+    assert_eq!(
+      ffmpeg_packet_from_audio_packet(&audio, limits)
+        .expect("built")
+        .size(),
+      0,
+    );
+    with_ffmpeg_audio_packet::<crate::View, _>(&audio, limits, BodyRoute::Submission, |av| {
+      assert_eq!(av.size(), 0);
+    })
+    .expect("submitted");
+
+    let subtitle = subtitle_packet_from_ffmpeg_as::<crate::View>(
+      source.clone(),
+      tb,
+      limits,
+      crate::buffer::PayloadProvenance::CallerSupplied,
+    )
+    .expect("carried")
+    .expect("a side-data-only packet is a packet");
+    assert!(subtitle.data().as_ref().is_empty());
+    assert_eq!(
+      ffmpeg_packet_from_subtitle_packet(&subtitle, limits)
+        .expect("built")
+        .size(),
+      0,
+    );
+    with_ffmpeg_subtitle_packet::<crate::View, _>(&subtitle, limits, BodyRoute::Submission, |av| {
+      assert_eq!(av.size(), 0);
+    })
+    .expect("submitted");
   }
 
   #[test]
@@ -2053,30 +3159,45 @@ mod tests {
         SKIP_SAMPLES
       };
 
-      let video = video_packet_from_ffmpeg_in(source, tb, PacketLimits::default())
-        .expect("wrappable")
-        .expect("present");
+      let video = video_packet_from_borrowed::<crate::Owned>(
+        source,
+        tb,
+        PacketLimits::default(),
+        crate::buffer::PayloadProvenance::CallerSupplied,
+      )
+      .expect("wrappable")
+      .expect("present");
       let rebuilt =
-        ffmpeg_packet_from_video_packet(&video, PacketLimits::default()).expect("rebuilt");
+        ffmpeg_packet_from_owned_video_packet(&video, PacketLimits::default()).expect("rebuilt");
       let carried = packet_side_data(&rebuilt).expect("readable");
       assert_eq!(carried.len(), 1, "{name}: video lost its side data");
       assert_eq!(carried[0].kind(), expected_kind, "{name}: video");
       assert_eq!(carried[0].data(), video.extra().side_data()[0].data());
 
-      let audio = audio_packet_from_ffmpeg_in(source, tb, PacketLimits::default())
-        .expect("wrappable")
-        .expect("present");
+      let audio = audio_packet_from_borrowed::<crate::Owned>(
+        source,
+        tb,
+        PacketLimits::default(),
+        crate::buffer::PayloadProvenance::CallerSupplied,
+      )
+      .expect("wrappable")
+      .expect("present");
       let rebuilt =
-        ffmpeg_packet_from_audio_packet(&audio, PacketLimits::default()).expect("rebuilt");
+        ffmpeg_packet_from_owned_audio_packet(&audio, PacketLimits::default()).expect("rebuilt");
       let carried = packet_side_data(&rebuilt).expect("readable");
       assert_eq!(carried.len(), 1, "{name}: audio lost its side data");
       assert_eq!(carried[0].data(), audio.extra().side_data()[0].data());
 
-      let subtitle = subtitle_packet_from_ffmpeg_in(source, tb, PacketLimits::default())
-        .expect("wrappable")
-        .expect("present");
-      let rebuilt =
-        ffmpeg_packet_from_subtitle_packet(&subtitle, PacketLimits::default()).expect("rebuilt");
+      let subtitle = subtitle_packet_from_borrowed::<crate::Owned>(
+        source,
+        tb,
+        PacketLimits::default(),
+        crate::buffer::PayloadProvenance::CallerSupplied,
+      )
+      .expect("wrappable")
+      .expect("present");
+      let rebuilt = ffmpeg_packet_from_owned_subtitle_packet(&subtitle, PacketLimits::default())
+        .expect("rebuilt");
       let carried = packet_side_data(&rebuilt).expect("readable");
       assert_eq!(carried.len(), 1, "{name}: subtitle lost its side data");
       assert_eq!(carried[0].data(), subtitle.extra().side_data()[0].data());
@@ -2098,7 +3219,7 @@ mod tests {
         FfmpegBytes::copy_from_slice(&[9u8]),
       )]),
     );
-    match ffmpeg_packet_from_video_packet(&packet, PacketLimits::default()).map(|_| ()) {
+    match ffmpeg_packet_from_owned_video_packet(&packet, PacketLimits::default()).map(|_| ()) {
       Err(PacketBuildError::UnknownSideData(p)) => {
         assert_eq!(p.kind(), limit);
         assert_eq!(p.limit(), limit);
@@ -2106,7 +3227,7 @@ mod tests {
       other => panic!("expected UnknownSideData, got {other:?}"),
     }
     assert!(matches!(
-      ffmpeg_packet_from_video_packet(&mediadecode::packet::VideoPacket::new(
+      ffmpeg_packet_from_owned_video_packet(&mediadecode::packet::VideoPacket::new(
         FfmpegBytes::copy_from_slice(&[1u8]),
         VideoPacketExtra::new(0).with_side_data(vec![SideDataEntry::new(-1, FfmpegBytes::copy_from_slice(&[9u8]))]),
       ), PacketLimits::default())
@@ -2123,38 +3244,62 @@ mod tests {
     let packet = side_data_only_packet();
     let tb = mediadecode::Timebase::default();
 
-    let video = video_packet_from_ffmpeg_in(&packet, tb, PacketLimits::default())
-      .expect("wrappable")
-      .expect("a side-data-only packet is a packet");
+    let video = video_packet_from_borrowed::<crate::Owned>(
+      &packet,
+      tb,
+      PacketLimits::default(),
+      crate::buffer::PayloadProvenance::CallerSupplied,
+    )
+    .expect("wrappable")
+    .expect("a side-data-only packet is a packet");
     assert!(video.data().as_ref().is_empty(), "no body, but a buffer");
     assert_eq!(video.extra().side_data().len(), 1);
     assert_eq!(video.extra().side_data()[0].kind(), NEW_EXTRADATA);
     assert_eq!(video.extra().side_data()[0].data(), &[1, 2, 3, 4]);
 
-    let audio = audio_packet_from_ffmpeg_in(&packet, tb, PacketLimits::default())
-      .expect("wrappable")
-      .expect("present");
+    let audio = audio_packet_from_borrowed::<crate::Owned>(
+      &packet,
+      tb,
+      PacketLimits::default(),
+      crate::buffer::PayloadProvenance::CallerSupplied,
+    )
+    .expect("wrappable")
+    .expect("present");
     assert!(audio.data().as_ref().is_empty());
     assert_eq!(audio.extra().side_data()[0].data(), &[1, 2, 3, 4]);
 
-    let subtitle = subtitle_packet_from_ffmpeg_in(&packet, tb, PacketLimits::default())
-      .expect("wrappable")
-      .expect("present");
+    let subtitle = subtitle_packet_from_borrowed::<crate::Owned>(
+      &packet,
+      tb,
+      PacketLimits::default(),
+      crate::buffer::PayloadProvenance::CallerSupplied,
+    )
+    .expect("wrappable")
+    .expect("present");
     assert!(subtitle.data().as_ref().is_empty());
     assert_eq!(subtitle.extra().side_data()[0].data(), &[1, 2, 3, 4]);
 
-    let data = data_packet_from_ffmpeg_in(&packet, tb, PacketLimits::default())
-      .expect("wrappable")
-      .expect("present");
+    let data = data_packet_from_borrowed::<crate::Owned>(
+      &packet,
+      tb,
+      PacketLimits::default(),
+      crate::buffer::PayloadProvenance::CallerSupplied,
+    )
+    .expect("wrappable")
+    .expect("present");
     assert!(data.data().as_ref().is_empty());
     assert_eq!(data.extra().side_data()[0].data(), &[1, 2, 3, 4]);
 
     // The one arm where a payload-less packet really is nothing: an
     // attachment is its bytes, and there are none.
     assert!(
-      attachment_packet_from_ffmpeg(&packet, PacketLimits::default())
-        .expect("wrappable")
-        .is_none(),
+      attachment_packet_from_borrowed::<crate::Owned>(
+        &packet,
+        PacketLimits::default(),
+        crate::buffer::PayloadProvenance::CallerSupplied
+      )
+      .expect("wrappable")
+      .is_none(),
       "an attachment with no bytes is no attachment",
     );
   }
@@ -2177,10 +3322,11 @@ mod tests {
       assert!(!ptr.is_null());
       core::ptr::copy_nonoverlapping([9u8, 9].as_ptr(), ptr, 2);
     }
-    let video = video_packet_from_ffmpeg_in(
+    let video = video_packet_from_borrowed::<crate::Owned>(
       &packet,
       mediadecode::Timebase::default(),
       PacketLimits::default(),
+      crate::buffer::PayloadProvenance::CallerSupplied,
     )
     .expect("wrappable")
     .expect("present");
@@ -2195,20 +3341,34 @@ mod tests {
     // error — this is the only thing a pull loop may skip.
     let empty = Packet::empty();
     assert!(
-      video_packet_from_ffmpeg_in(&empty, tb, PacketLimits::default())
-        .expect("not a failure")
-        .is_none()
+      video_packet_from_borrowed::<crate::Owned>(
+        &empty,
+        tb,
+        PacketLimits::default(),
+        crate::buffer::PayloadProvenance::CallerSupplied
+      )
+      .expect("not a failure")
+      .is_none()
     );
     assert!(
-      attachment_packet_from_ffmpeg(&empty, PacketLimits::default())
-        .expect("not a failure")
-        .is_none()
+      attachment_packet_from_borrowed::<crate::Owned>(
+        &empty,
+        PacketLimits::default(),
+        crate::buffer::PayloadProvenance::CallerSupplied
+      )
+      .expect("not a failure")
+      .is_none()
     );
 
     let real = Packet::copy(&[9u8, 8, 7]);
-    let wrapped = video_packet_from_ffmpeg_in(&real, tb, PacketLimits::default())
-      .expect("wrappable")
-      .expect("present");
+    let wrapped = video_packet_from_borrowed::<crate::Owned>(
+      &real,
+      tb,
+      PacketLimits::default(),
+      crate::buffer::PayloadProvenance::CallerSupplied,
+    )
+    .expect("wrappable")
+    .expect("present");
     assert_eq!(wrapped.data().as_ref(), &[9, 8, 7]);
   }
 

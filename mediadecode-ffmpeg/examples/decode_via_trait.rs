@@ -3,8 +3,13 @@
 //!
 //! Demonstrates:
 //! - **Backend-neutral consumer code** — `decode_one_video` is generic
-//!   over `VideoStreamDecoder<Adapter = Ffmpeg, Buffer = FfmpegBytes>`.
+//!   over `VideoStreamDecoder<Adapter = Ffmpeg, Buffer = FfmpegBuffer>`.
 //!   Same shape would work for any future mediadecode adapter.
+//! - **The ordinary lane** — the bare names are the view lane, so each
+//!   frame here is a window onto the decoder's own buffer, read and
+//!   dropped inside the loop. Swap `FfmpegBuffer` for `FfmpegBytes` and
+//!   `empty_video_frame` for `empty_owned_video_frame` and the same
+//!   loop produces frames that can be queued and sent elsewhere.
 //! - **Transparent SW fallback** — `FfmpegVideoStreamDecoder::open`
 //!   handles HW probe + SW fallback under the hood.
 //! - **No `unsafe`** — wrappers like `video_packet_from_ffmpeg` and
@@ -23,8 +28,8 @@ use ffmpeg::{format, media};
 use ffmpeg_next as ffmpeg;
 use mediadecode::{Timebase, decoder::VideoStreamDecoder};
 use mediadecode_ffmpeg::{
-  DecoderLimits, Ffmpeg, FfmpegBytes, FfmpegVideoStreamDecoder, VideoFrame, empty_video_frame,
-  video_packet_from_ffmpeg,
+  DecoderLimits, Ffmpeg, FfmpegBuffer, FfmpegVideoStreamDecoder, PacketLimits, VideoFrame,
+  empty_video_frame, video_packet_from_ffmpeg_in,
 };
 use std::num::NonZeroI32;
 
@@ -72,7 +77,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
 /// Generic helper bounded purely on the `mediadecode` trait. Any
 /// decoder satisfying `VideoStreamDecoder<Adapter = Ffmpeg, Buffer =
-/// FfmpegBytes>` works here — `FfmpegVideoStreamDecoder` is just one
+/// FfmpegBuffer>` works here — `FfmpegVideoStreamDecoder` is just one
 /// instance.
 fn decode_one_video<D>(
   decoder: &mut D,
@@ -80,7 +85,7 @@ fn decode_one_video<D>(
   stream_index: usize,
 ) -> std::result::Result<u64, Box<dyn std::error::Error>>
 where
-  D: VideoStreamDecoder<Adapter = Ffmpeg, Buffer = FfmpegBytes>,
+  D: VideoStreamDecoder<Adapter = Ffmpeg, Buffer = FfmpegBuffer>,
   D::Error: std::error::Error + Send + Sync + 'static,
 {
   let mut dst = empty_video_frame();
@@ -103,10 +108,16 @@ where
     if s.index() != stream_index {
       continue;
     }
-    let pkt = match video_packet_from_ffmpeg(&av_packet)? {
-      Some(p) => p,
-      None => continue,
-    };
+    // **By value**: the packet iterator hands the packet over, and so
+    // do we. A view carrier is a window into its buffer, so a source
+    // that survived the call would be a mutable alias of it — which is
+    // why the borrowing door is the owned lane. See
+    // `boundary::video_packet_from_ffmpeg_in`.
+    let pkt =
+      match video_packet_from_ffmpeg_in(av_packet, Timebase::default(), PacketLimits::default())? {
+        Some(p) => p,
+        None => continue,
+      };
     if let Err(e) = decoder.send_packet(&pkt) {
       // EAGAIN: drain and retry.
       drain(decoder, &mut dst, &mut count);

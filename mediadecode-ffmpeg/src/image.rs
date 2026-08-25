@@ -26,10 +26,12 @@
 //!   decoder::ImageDecoder,
 //!   demuxer::{Demuxer, DemuxedPacket, TrackKind},
 //! };
-//! use mediadecode_ffmpeg::{FfmpegDemuxer, FfmpegImageDecoder, DecoderLimits};
+//! use mediadecode_ffmpeg::{FfmpegOwnedDemuxer, FfmpegOwnedImageDecoder, DecoderLimits};
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let mut demuxer = FfmpegDemuxer::open("song.mp3")?;
+//! // The owned lane: this decoder takes owned attachments, and a
+//! // cover is a picture a caller usually keeps.
+//! let mut demuxer = FfmpegOwnedDemuxer::open("song.mp3")?;
 //! let cover_track = demuxer
 //!   .tracks()
 //!   .iter()
@@ -39,7 +41,7 @@
 //!
 //! while let Some(packet) = demuxer.next_packet()? {
 //!   if let DemuxedPacket::Attachment(attachment) = packet {
-//!     let mut decoder = FfmpegImageDecoder::open(parameters, DecoderLimits::default())?;
+//!     let mut decoder = FfmpegOwnedImageDecoder::open(parameters, DecoderLimits::default())?;
 //!     let image = decoder.decode(attachment.packet())?;
 //!     println!("{}x{}", image.width(), image.height());
 //!     break;
@@ -67,7 +69,7 @@ use mediadecode::{
 };
 
 use crate::{
-  DecoderLimits, Error, Ffmpeg, FfmpegBytes, boundary,
+  DecoderLimits, Error, Ffmpeg, boundary,
   convert::{self, ConvertError},
   decoder::{build_codec_context, ensure_video_codec_type, find_decoder},
   extras::{AttachmentPacketExtra, ImageFrameExtra},
@@ -79,7 +81,7 @@ use crate::{
 /// Opened from the codec parameters of an
 /// [`Attachment`](mediadecode::demuxer::TrackKind::Attachment) track —
 /// see the [module docs](self) for the whole road.
-pub struct FfmpegImageDecoder {
+pub struct CarrierImageDecoder<C: crate::FfmpegCarrier> {
   decoder: ffmpeg_next::decoder::Video,
   scratch: frame::Video,
   limits: DecoderLimits,
@@ -90,9 +92,12 @@ pub struct FfmpegImageDecoder {
   /// declaration order, so the `AVCodecContext` is freed first and the
   /// state it references outlives it.
   _callback_state: Box<crate::ffi::CallbackState>,
+  /// The lane this decoder captures into. A marker: the carrier
+  /// appears in the frames it produces, not in its own state.
+  _carrier: core::marker::PhantomData<C>,
 }
 
-impl FfmpegImageDecoder {
+impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierImageDecoder<C> {
   /// Opens a still-image decoder for the given codec parameters.
   ///
   /// The parameters come from an attachment track's
@@ -117,7 +122,10 @@ impl FfmpegImageDecoder {
   /// oversized still before allocating it; the byte half is checked
   /// against what the planes would export, before this crate allocates
   /// anything.
-  pub fn open(parameters: Parameters, limits: DecoderLimits) -> Result<Self, ImageDecodeError> {
+  pub(crate) fn open_impl(
+    parameters: Parameters,
+    limits: DecoderLimits,
+  ) -> Result<Self, ImageDecodeError> {
     // Use the checked codec-context builder — `Context::from_parameters`
     // is OOM-UB-prone (see `crate::decoder::build_codec_context`).
     let (ctx, callback_state) =
@@ -151,33 +159,30 @@ impl FfmpegImageDecoder {
       scratch,
       limits,
       _callback_state: callback_state,
+      _carrier: core::marker::PhantomData,
     })
   }
 
   /// The frame ceilings this decoder was opened with.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn limits(&self) -> DecoderLimits {
+  pub(crate) const fn limits_impl(&self) -> DecoderLimits {
     self.limits
   }
 
   /// Borrow the wrapped `ffmpeg::decoder::Video` (e.g. to query
   /// `width()` / `height()` / `format()` before decoding).
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn inner(&self) -> &ffmpeg_next::decoder::Video {
+  pub(crate) const fn inner_impl(&self) -> &ffmpeg_next::decoder::Video {
     &self.decoder
   }
 }
 
-impl ImageDecoder for FfmpegImageDecoder {
-  type Adapter = Ffmpeg;
-  type Buffer = FfmpegBytes;
-  type Error = ImageDecodeError;
-
-  fn decode(
+impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierImageDecoder<C> {
+  pub(crate) fn decode_impl(
     &mut self,
-    packet: &AttachmentPacket<AttachmentPacketExtra, Self::Buffer>,
-  ) -> Result<ImageFrame<PixelFormat, ImageFrameExtra, Self::Buffer>, Self::Error> {
-    let bytes: &[u8] = packet.data().as_slice();
+    packet: &AttachmentPacket<AttachmentPacketExtra, C::Buffer>,
+  ) -> Result<ImageFrame<PixelFormat, ImageFrameExtra, C::Buffer>, ImageDecodeError> {
+    let bytes: &[u8] = packet.data().as_ref();
     // An attachment with no bytes is no picture. The demuxer really
     // does produce these — a cover-art stream that parks no payload,
     // or an `AVMEDIA_TYPE_ATTACHMENT` track with empty extradata, both
@@ -318,19 +323,71 @@ impl ImageDecoder for FfmpegImageDecoder {
         CorruptSource::DecodedFrame,
       )));
     }
+    // **This road needs no parked-frame seat, and the reason is the
+    // signature.** The timed decoders advance libavcodec and hand the
+    // caller nothing to retry with, which is why they park a frame
+    // whose conversion could not commit. Here the caller still holds
+    // the attachment packet — it was *borrowed* — so a failure leaves
+    // them everything needed to call again, and the decoder is flushed
+    // on the way out so the next attempt starts from the same place
+    // this one did.
+    //
     // SAFETY: `scratch` was just filled by `receive_frame`; the
     // conversion copies every byte it takes, so the scratch frame can
     // be reused on the next call and the produced `ImageFrame` outlives
     // this decoder.
-    let image =
-      unsafe { convert::av_frame_to_image_frame(self.scratch.as_ptr(), self.limits.frame()) }
-        .map_err(ImageDecodeError::Convert)?;
+    let image = unsafe {
+      convert::av_frame_to_image_frame_as::<C>(self.scratch.as_ptr(), self.limits.frame())
+    }
+    .map_err(|e| {
+      self.decoder.flush();
+      ImageDecodeError::Convert(e)
+    })?;
     // Leave the decoder ready for the next attachment rather than
     // drained-and-latched at EOF.
     self.decoder.flush();
     Ok(image)
   }
 }
+
+macro_rules! image_lane_face {
+  ($($lane:ty),+ $(,)?) => { $(
+    impl CarrierImageDecoder<$lane> {
+      /// Opens a still-image decoder for `parameters`.
+      pub fn open(
+        parameters: Parameters,
+        limits: DecoderLimits,
+      ) -> Result<Self, ImageDecodeError> {
+        Self::open_impl(parameters, limits)
+      }
+
+      /// The budgets this decoder was opened with.
+      pub const fn limits(&self) -> DecoderLimits {
+        self.limits_impl()
+      }
+
+      /// The wrapped decoder context.
+      pub const fn inner(&self) -> &ffmpeg_next::decoder::Video {
+        self.inner_impl()
+      }
+    }
+
+    impl ImageDecoder for CarrierImageDecoder<$lane> {
+      type Adapter = Ffmpeg;
+      type Buffer = <$lane as crate::FfmpegCarrier>::Buffer;
+      type Error = ImageDecodeError;
+
+      fn decode(
+        &mut self,
+        packet: &AttachmentPacket<AttachmentPacketExtra, Self::Buffer>,
+      ) -> Result<ImageFrame<PixelFormat, ImageFrameExtra, Self::Buffer>, Self::Error> {
+        self.decode_impl(packet)
+      }
+    }
+  )+ };
+}
+
+image_lane_face!(crate::View, crate::Owned);
 
 /// Payload for [`ImageDecodeError::InputTooLarge`].
 ///

@@ -44,12 +44,21 @@ use mediadecode::{
 use mediaframe::audio::ChannelLayoutDescription;
 
 use crate::{
-  Error, Ffmpeg, buffer::FfmpegBytes, extras::AudioFrameExtra, limits::FrameLimits,
-  sample_format::SampleFormat,
+  Error, Ffmpeg, extras::AudioFrameExtra, limits::FrameLimits, sample_format::SampleFormat,
 };
 
-/// The frame type [`FfmpegResampler`] accepts and produces.
-type Frame = AudioFrame<SampleFormat, ChannelLayoutDescription, AudioFrameExtra, FfmpegBytes>;
+/// The frame type a resampler accepts and produces, on lane `C`.
+///
+/// Written as a projection rather than a bounded alias so the bound
+/// lives on the items that need it — `type_alias_bounds` is not
+/// enforced anyway, and a bound written where it is not enforced reads
+/// like a promise the compiler is keeping.
+type Frame<C> = AudioFrame<
+  SampleFormat,
+  ChannelLayoutDescription,
+  AudioFrameExtra,
+  <C as crate::FfmpegCarrier>::Buffer,
+>;
 
 /// One end of a conversion: sample rate, sample format, channel layout.
 ///
@@ -218,7 +227,7 @@ impl ResampleSpec {
 /// Construction is [`Self::new`], off the trait, taking both specs —
 /// see the trait's own documentation for why the target can never be a
 /// constant.
-pub struct FfmpegResampler {
+pub struct CarrierResampler<C: crate::FfmpegCarrier> {
   ctx: resampling::Context,
   source: ResampleSpec,
   target: ResampleSpec,
@@ -239,7 +248,7 @@ pub struct FfmpegResampler {
   staged_source_layout: ChannelLayout,
   staged_target_layout: ChannelLayout,
   target_timebase: Timebase,
-  ready: VecDeque<Frame>,
+  ready: VecDeque<Frame<C>>,
   /// Next output timestamp, in target-rate ticks. `None` until the
   /// first input frame anchors it.
   next_pts: Option<i64>,
@@ -248,9 +257,13 @@ pub struct FfmpegResampler {
   /// [`Self::check_output_bytes`] for why a resampler needs a ceiling
   /// of its own even when its input already had one.
   limits: FrameLimits,
+  /// The lane. Zero-sized: it selects how a produced plane is carried
+  /// — shared out of the output `AVFrame` or copied out of it — and
+  /// nothing else about the conversion.
+  _carrier: core::marker::PhantomData<C>,
 }
 
-impl FfmpegResampler {
+impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierResampler<C> {
   /// Opens a resampler between two explicit specs.
   ///
   /// Both are required and neither is inferred. The source is what the
@@ -282,7 +295,7 @@ impl FfmpegResampler {
   /// more than a second vocabulary. [`FrameLimits::max_pixels`] is
   /// unused here, as it is on the audio decode path, and for the same
   /// reason: audio has no pixels.
-  pub fn new(
+  pub(crate) fn new_impl(
     source: ResampleSpec,
     target: ResampleSpec,
     limits: FrameLimits,
@@ -328,35 +341,36 @@ impl FfmpegResampler {
       next_pts: None,
       eof: false,
       limits,
+      _carrier: core::marker::PhantomData,
     })
   }
 
   /// The spec frames must arrive in.
   #[inline]
-  pub const fn source(&self) -> &ResampleSpec {
+  pub(crate) const fn source_impl(&self) -> &ResampleSpec {
     &self.source
   }
 
   /// The spec frames leave in.
   #[inline]
-  pub const fn target(&self) -> &ResampleSpec {
+  pub(crate) const fn target_impl(&self) -> &ResampleSpec {
     &self.target
   }
 
   /// Borrows the wrapped `swr` context.
   #[inline]
-  pub const fn inner(&self) -> &resampling::Context {
+  pub(crate) const fn inner_impl(&self) -> &resampling::Context {
     &self.ctx
   }
 
   /// Samples still inside the delay line, counted at the output rate.
   #[inline]
-  pub fn delay(&self) -> i64 {
+  pub(crate) fn delay_impl(&self) -> i64 {
     self.ctx.delay().map_or(0, |d| d.output.max(0))
   }
 
   /// Refuses a frame whose shape is not the source spec.
-  fn check_source(&self, frame: &Frame) -> Result<(), ResampleError> {
+  fn check_source(&self, frame: &Frame<C>) -> Result<(), ResampleError> {
     if frame.sample_rate() != self.source.rate
       || *frame.sample_format() != self.source_format
       || *frame.channel_layout() != self.source_layout
@@ -383,7 +397,7 @@ impl FfmpegResampler {
   /// frame as carrying no timestamp at all and an extreme timestamp is
   /// silently erased. A timestamp that does not fit the output timeline
   /// is refused by name, with the resampler untouched.
-  fn anchor_of(&self, frame: &Frame) -> Result<Option<i64>, ResampleError> {
+  fn anchor_of(&self, frame: &Frame<C>) -> Result<Option<i64>, ResampleError> {
     let Some(timestamp) = frame.pts() else {
       return Ok(None);
     };
@@ -413,7 +427,7 @@ impl FfmpegResampler {
   /// allocation off it first would let a forged frame with a
   /// twelve-byte plane ask for tens of gigabytes on its way to being
   /// refused.
-  fn stage_input(&self, frame: &Frame) -> Result<frame::Audio, ResampleError> {
+  fn stage_input(&self, frame: &Frame<C>) -> Result<frame::Audio, ResampleError> {
     let samples = frame.nb_samples() as usize;
     let channels = self.source.channels();
 
@@ -590,7 +604,7 @@ impl FfmpegResampler {
   /// checked to address `plane_len` bytes inside one of the frame's own
   /// buffers here, so the copy on the far side has nothing left to
   /// judge and [`Self::finish_output`] remains infallible.
-  fn prepare_output(&self, capacity: usize) -> Result<PreparedOutput, ResampleError> {
+  fn prepare_output(&self, capacity: usize) -> Result<PreparedOutput<C>, ResampleError> {
     let channels = self.target.channels();
     let plane_count = if self.target.format.is_planar() {
       // `check_spec` proved this positive at construction.
@@ -625,8 +639,8 @@ impl FfmpegResampler {
       )));
     }
 
-    let mut planes: [*const u8; 8] = [core::ptr::null(); 8];
-    for (index, slot) in planes.iter_mut().enumerate().take(plane_count) {
+    let mut reserved: [Option<C::Reserved>; 8] = core::array::from_fn(|_| None);
+    for (index, slot) in reserved.iter_mut().enumerate().take(plane_count) {
       // SAFETY: `frame` owns a live `AVFrame` this call just
       // allocated; `data` is a public field and `plane_count` is
       // within the eight slots `data` has.
@@ -636,16 +650,29 @@ impl FfmpegResampler {
       }
       // SAFETY: the frame is live, and the helper only reads `buf[]`'s
       // ranges to find the one containing `data_ptr`. Proving it here
-      // is what lets the copy on the far side of the conversion be
-      // unconditional.
-      unsafe { crate::convert::find_audio_backing_buffer(frame.as_ptr(), data_ptr, plane_len) }
-        .ok_or(ResampleError::OutputBuffer(OutputBuffer::new(index)))?;
-      *slot = data_ptr as *const u8;
+      // is what lets the carry on the far side of the conversion be
+      // unconditional — a copy on the owned lane, a view on the other,
+      // and neither has a proof left to make.
+      let backing =
+        unsafe { crate::convert::find_audio_backing_buffer(frame.as_ptr(), data_ptr, plane_len) }
+          .ok_or(ResampleError::OutputBuffer(OutputBuffer::new(index)))?;
+      // The carrier's claim on the plane, taken **here** — before `swr`
+      // consumes anything. See [`FfmpegCarrier::reserve`].
+      //
+      // SAFETY: `backing` is a live buffer of this frame's, proved just
+      // above to cover `plane_len` bytes from `data_ptr`; the frame is
+      // moved into `PreparedOutput` below and so outlives the commit.
+      let offset = unsafe { (data_ptr as usize).wrapping_sub((*backing).data as usize) };
+      // SAFETY: as above — the extent lies inside `backing`.
+      *slot = Some(
+        unsafe { C::reserve(backing, offset, plane_len) }
+          .ok_or(ResampleError::OutputBuffer(OutputBuffer::new(index)))?,
+      );
     }
 
     Ok(PreparedOutput {
       frame,
-      planes,
+      reserved,
       plane_count,
       plane_len,
       per_sample,
@@ -659,7 +686,7 @@ impl FfmpegResampler {
   ///
   /// `None` when the conversion produced nothing — the delay line
   /// swallowed the input, which is ordinary and not a failure.
-  fn finish_output(&mut self, prepared: PreparedOutput) -> Option<Frame> {
+  fn finish_output(&mut self, mut prepared: PreparedOutput<C>) -> Option<Frame<C>> {
     let produced = prepared.frame.samples();
     if produced == 0 {
       return None;
@@ -681,20 +708,30 @@ impl FfmpegResampler {
       .saturating_mul(produced)
       .min(prepared.plane_len);
     let plane_count = prepared.plane_count;
-    let planes = std::array::from_fn(|index| {
-      if index >= plane_count {
-        return Plane::new(FfmpegBytes::empty(), 0);
-      }
-      let data_ptr = prepared.planes[index];
-      // SAFETY: `prepare_output` proved this pointer non-null and
-      // proved it addresses `plane_len` bytes inside one of `frame`'s
-      // own buffers; `bytes <= plane_len` by the `min` above.
-      // `swr_convert_frame` writes into those buffers and does not
-      // replace them, and `frame` has been owned by `prepared` — and so
-      // kept alive — across the whole conversion.
-      let produced_bytes = unsafe { core::slice::from_raw_parts(data_ptr, bytes) };
-      Plane::new(FfmpegBytes::copy_from_slice(produced_bytes), bytes as u32)
-    });
+    let mut planes: [Plane<C::Buffer>; 8] = core::array::from_fn(|_| Plane::new(C::empty(), 0));
+    for (index, slot) in planes.iter_mut().enumerate().take(plane_count) {
+      // Present for every index below `plane_count`: `prepare_output`
+      // fills exactly that many and returns an error otherwise.
+      let Some(reserved) = prepared.reserved[index].take() else {
+        continue;
+      };
+      // **The valid prefix, not the plane.** `plane_len` is what
+      // capacity was allocated for; `bytes` is what `swr` produced.
+      // Both lanes stop at the latter, for the same reason the decode
+      // road does: the tail is allocator memory nothing wrote, and a
+      // carrier's span is a span a consumer may read.
+      //
+      // SAFETY: the reservation covers `plane_len` bytes inside one of
+      // `frame`'s own buffers, and `bytes <= plane_len` by the `min`
+      // above. `swr_convert_frame` has written those bytes and does not
+      // replace the buffers; `frame` has been owned by `prepared` — and
+      // so kept alive — across the whole conversion. A view committed
+      // here outlives `prepared` by refcount, and the writing is over
+      // before the sharing begins: this resampler allocates a fresh
+      // output frame per conversion, so nothing ever writes into a
+      // buffer a delivered frame is reading.
+      *slot = Plane::new(unsafe { C::commit(reserved, bytes) }, bytes as u32);
+    }
 
     Some(
       AudioFrame::new(
@@ -717,16 +754,17 @@ impl FfmpegResampler {
 
 /// Everything a converted frame needs, acquired before the conversion
 /// runs. See [`FfmpegResampler::prepare_output`].
-struct PreparedOutput {
+struct PreparedOutput<C: crate::FfmpegCarrier + crate::CarrierOps> {
   /// The output `AVFrame`. Owning it here is what keeps the plane
   /// pointers below valid across the conversion — moving this struct
   /// moves a pointer to the `AVFrame`, never the `AVFrame` or the
   /// buffers it addresses.
   frame: frame::Audio,
-  /// One proved plane pointer per populated plane, null for every other
-  /// slot. Checked non-null and in-range before the conversion; read
-  /// after it.
-  planes: [*const u8; 8],
+  /// One carrier claim per populated plane, taken before the
+  /// conversion ran and settled at its true length after — which is
+  /// what keeps this struct's whole reason for existing intact on the
+  /// view lane too. `None` for every unpopulated slot.
+  reserved: [Option<C::Reserved>; 8],
   plane_count: usize,
   /// Bytes one plane holds at full capacity — the ceiling every trim
   /// stays under.
@@ -735,12 +773,8 @@ struct PreparedOutput {
   per_sample: usize,
 }
 
-impl AudioResampler for FfmpegResampler {
-  type Adapter = Ffmpeg;
-  type Buffer = FfmpegBytes;
-  type Error = ResampleError;
-
-  fn send_frame(&mut self, frame: &Frame) -> Result<(), ResampleError> {
+impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierResampler<C> {
+  pub(crate) fn send_frame_impl(&mut self, frame: &Frame<C>) -> Result<(), ResampleError> {
     if self.eof {
       return Err(ResampleError::AfterEof);
     }
@@ -791,7 +825,16 @@ impl AudioResampler for FfmpegResampler {
     Ok(())
   }
 
-  fn receive_frame(&mut self, dst: &mut Frame) -> Result<(), ResampleError> {
+  /// **No parked-frame seat here, and none is needed.** The queue holds
+  /// frames that are already built: every fallible step of a
+  /// conversion — the carrier's claim included — happens in
+  /// [`Self::prepare_output`], before `swr` consumes anything, and
+  /// `finish_output` is infallible by construction. There is no
+  /// conversion left to fail after a frame has been taken out of the
+  /// queue, so nothing can be lost between the two. That is the
+  /// property the reserve-then-commit seam was built for, stated where
+  /// the sibling roads state their seats.
+  pub(crate) fn receive_frame_impl(&mut self, dst: &mut Frame<C>) -> Result<(), ResampleError> {
     if let Some(frame) = self.ready.pop_front() {
       *dst = frame;
       return Ok(());
@@ -801,7 +844,7 @@ impl AudioResampler for FfmpegResampler {
     }
     // EOF: drain the conversion tail. Without this every file loses the
     // tens of milliseconds sitting inside the filter.
-    let remaining = self.delay();
+    let remaining = self.delay_impl();
     if remaining <= 0 {
       return Err(ResampleError::Again);
     }
@@ -826,7 +869,7 @@ impl AudioResampler for FfmpegResampler {
     }
   }
 
-  fn send_eof(&mut self) -> Result<(), ResampleError> {
+  pub(crate) fn send_eof_impl(&mut self) -> Result<(), ResampleError> {
     self.eof = true;
     Ok(())
   }
@@ -845,7 +888,7 @@ impl AudioResampler for FfmpegResampler {
   /// The new context is built before the old one is dropped, so a
   /// failure leaves the resampler exactly as it was: this call either
   /// resets everything or changes nothing.
-  fn flush(&mut self) -> Result<(), ResampleError> {
+  pub(crate) fn flush_impl(&mut self) -> Result<(), ResampleError> {
     let ctx = open_context(
       &self.source,
       &self.target,
@@ -856,10 +899,71 @@ impl AudioResampler for FfmpegResampler {
     self.ready.clear();
     self.next_pts = None;
     self.eof = false;
-    debug_assert_eq!(self.delay(), 0, "a fresh swr context holds nothing");
+    debug_assert_eq!(self.delay_impl(), 0, "a fresh swr context holds nothing");
     Ok(())
   }
 }
+
+macro_rules! resampler_lane_face {
+  ($($lane:ty),+ $(,)?) => { $(
+    impl CarrierResampler<$lane> {
+      /// Opens a resampler between two explicit specs. See
+      /// [`CarrierResampler::new_impl`] for the full contract.
+      pub fn new(
+        source: ResampleSpec,
+        target: ResampleSpec,
+        limits: FrameLimits,
+      ) -> Result<Self, ResampleError> {
+        Self::new_impl(source, target, limits)
+      }
+
+      /// The spec frames must arrive in.
+      pub const fn source(&self) -> &ResampleSpec {
+        self.source_impl()
+      }
+
+      /// The spec frames leave in.
+      pub const fn target(&self) -> &ResampleSpec {
+        self.target_impl()
+      }
+
+      /// The wrapped `swr` context.
+      pub const fn inner(&self) -> &resampling::Context {
+        self.inner_impl()
+      }
+
+      /// Samples still inside the delay line, counted at the output
+      /// rate.
+      pub fn delay(&self) -> i64 {
+        self.delay_impl()
+      }
+    }
+
+    impl AudioResampler for CarrierResampler<$lane> {
+      type Adapter = Ffmpeg;
+      type Buffer = <$lane as crate::FfmpegCarrier>::Buffer;
+      type Error = ResampleError;
+
+      fn send_frame(&mut self, frame: &Frame<$lane>) -> Result<(), ResampleError> {
+        self.send_frame_impl(frame)
+      }
+
+      fn receive_frame(&mut self, dst: &mut Frame<$lane>) -> Result<(), ResampleError> {
+        self.receive_frame_impl(dst)
+      }
+
+      fn send_eof(&mut self) -> Result<(), ResampleError> {
+        self.send_eof_impl()
+      }
+
+      fn flush(&mut self) -> Result<(), ResampleError> {
+        self.flush_impl()
+      }
+    }
+  )+ };
+}
+
+resampler_lane_face!(crate::View, crate::Owned);
 
 /// Payload for [`ResampleError::SourceChanged`].
 ///
@@ -1845,6 +1949,17 @@ mod tests {
 
   use mediadecode::resampler::AudioResampler;
 
+  // These exercise the conversion arithmetic — rates, layouts, the
+  // counted timeline, the byte ceiling — which is lane-independent, so
+  // they run on the owned lane exactly as they did before the second
+  // lane existed. The view lane's own road through this type (reserve
+  // before `swr`, commit after) is proved in `tests/view_carriers.rs`,
+  // where a produced plane can be shown to point into the output
+  // frame's buffer.
+  use crate::{FfmpegBytes, FfmpegOwnedResampler as FfmpegResampler};
+
+  type Frame = super::Frame<crate::Owned>;
+
   /// A 48 kHz packed-s16 stereo frame of silence, with the plane its
   /// header claims.
   fn stereo_frame(samples: u32) -> Frame {
@@ -1917,7 +2032,7 @@ mod tests {
       || {
         let mut resampler = stereo_to_mono();
         let frame = stereo_frame(4_800);
-        let mut dst = crate::boundary::empty_audio_frame();
+        let mut dst = crate::boundary::empty_owned_audio_frame();
         resampler.send_frame(&frame).expect("a first frame");
         while resampler.receive_frame(&mut dst).is_ok() {}
         let delay = resampler.delay();
@@ -1960,7 +2075,7 @@ mod tests {
       || {
         let mut resampler = stereo_to_mono();
         let frame = stereo_frame(4_800);
-        let mut dst = crate::boundary::empty_audio_frame();
+        let mut dst = crate::boundary::empty_owned_audio_frame();
         for _ in 0..3 {
           resampler.send_frame(&frame).expect("send_frame");
           while resampler.receive_frame(&mut dst).is_ok() {}

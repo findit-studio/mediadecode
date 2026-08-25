@@ -59,7 +59,7 @@ use ffmpeg_next::{
   Packet, Rational,
   ffi::{
     AV_DISPOSITION_ATTACHED_PIC, AV_DISPOSITION_TIMED_THUMBNAILS, AV_NOPTS_VALUE, AVDictionary,
-    av_dict_get,
+    AVStream, av_dict_get,
   },
   format::{self, context::Input},
 };
@@ -76,7 +76,7 @@ use smol_str::SmolStr;
 
 use crate::{
   Ffmpeg, boundary,
-  buffer::{FfmpegBytes, PacketBufferError},
+  buffer::PacketBufferError,
   codec_id::CodecId,
   extras::{AttachmentPacketExtra, TrackExtra},
   limits::DemuxLimits,
@@ -94,12 +94,12 @@ fn av_time_base_q() -> Timebase {
 ///
 /// Construction is deliberately not on the trait — see [`Self::open`]
 /// and [`Self::open_reader`].
-pub struct FfmpegDemuxer {
+pub struct CarrierDemuxer<C: crate::FfmpegCarrier> {
   input: Input,
   tracks: Vec<TrackInfo<Ffmpeg>>,
   pending: VecDeque<(
     TrackIndex,
-    AttachmentPacket<AttachmentPacketExtra, FfmpegBytes>,
+    AttachmentPacket<AttachmentPacketExtra, C::Buffer>,
   )>,
   /// `true` once this session has answered `Ok(None)`. Only then does
   /// [`Self::seek`] clear the `AVIOContext`'s EOF latch — clearing it
@@ -113,9 +113,36 @@ pub struct FfmpegDemuxer {
   /// The budgets this session spends: on any one timed packet, and —
   /// already spent, at open — on the file's attachments.
   limits: DemuxLimits,
+  /// A packet `av_read_frame` has already handed over and whose
+  /// conversion has **not committed**, with the provenance that was
+  /// observed for it.
+  ///
+  /// `av_read_frame` advances the container: once it returns, that
+  /// packet is off the wire and nothing brings it back. A conversion
+  /// that then fails on an *allocation* — a refcount the view lane
+  /// could not take, a copy the middle row could not make — used to
+  /// drop it, leaving a live session that answered the next pull with
+  /// the **following** packet. Compressed data and subtitle cues went
+  /// missing under memory pressure, quietly.
+  ///
+  /// So the read and the conversion are one transaction with a seat
+  /// between them: a transient refusal parks the packet here and the
+  /// next pull re-attempts *this* packet before reading another. It is
+  /// the same park-then-replay the decode household already runs —
+  /// `CarrierVideoStreamDecoder` holds `sw_replay_frames`, and the
+  /// probe holds its rescue history — for the same reason: a byte C
+  /// has already given up is not re-askable.
+  ///
+  /// The provenance is parked **with** the packet rather than re-probed
+  /// on replay. It is an observation about the moment of delivery, and
+  /// a queue that has moved on could answer it differently.
+  unconverted: Option<(Packet, crate::buffer::PayloadProvenance)>,
 }
 
-impl FfmpegDemuxer {
+// The generic bodies. Crate-private, because their bound is: they are
+// the implementation, and the public faces below are written per lane
+// so that no signature a consumer reads names a trait they cannot.
+impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
   /// Opens a container from a filesystem path.
   ///
   /// Runs `avformat_open_input` followed by
@@ -125,8 +152,8 @@ impl FfmpegDemuxer {
   /// Call [`ffmpeg_next::init`] once before the first open if you want
   /// FFmpeg's logging and network protocols configured; probing a local
   /// container does not require it.
-  pub fn open<P: AsRef<Path> + ?Sized>(path: &P) -> Result<Self, DemuxError> {
-    Self::open_with(path, DemuxLimits::default())
+  pub(crate) fn open_impl<P: AsRef<Path> + ?Sized>(path: &P) -> Result<Self, DemuxError> {
+    Self::open_with_impl(path, DemuxLimits::default())
   }
 
   /// [`Self::open`], with the session's resource budgets named.
@@ -142,7 +169,7 @@ impl FfmpegDemuxer {
   /// [`DemuxError::AttachmentTooLarge`] or
   /// [`DemuxError::AttachmentBudgetExhausted`] naming the track that
   /// crossed the line.
-  pub fn open_with<P: AsRef<Path> + ?Sized>(
+  pub(crate) fn open_with_impl<P: AsRef<Path> + ?Sized>(
     path: &P,
     limits: DemuxLimits,
   ) -> Result<Self, DemuxError> {
@@ -186,16 +213,16 @@ impl FfmpegDemuxer {
   /// as [`DemuxError::ReaderPanic`], carrying the panic's message. The
   /// session is terminal from that point: the `AVIOContext`'s error
   /// state is sticky and the reader's own state is unknown.
-  pub fn open_reader<R: Read + Seek + Send + 'static>(
+  pub(crate) fn open_reader_impl<R: Read + Seek + Send + 'static>(
     reader: R,
     filename: Option<&str>,
   ) -> Result<Self, DemuxError> {
-    Self::open_reader_with(reader, filename, DemuxLimits::default())
+    Self::open_reader_with_impl(reader, filename, DemuxLimits::default())
   }
 
   /// [`Self::open_reader`], with the session's resource budgets named.
   /// See [`Self::open_with`] for why they are taken at open.
-  pub fn open_reader_with<R: Read + Seek + Send + 'static>(
+  pub(crate) fn open_reader_with_impl<R: Read + Seek + Send + 'static>(
     reader: R,
     filename: Option<&str>,
     limits: DemuxLimits,
@@ -245,22 +272,23 @@ impl FfmpegDemuxer {
   /// `av_dump_format`, container-level metadata, chapters, and anything
   /// else the portable track table has no seat for.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn input(&self) -> &Input {
+  pub(crate) const fn input_impl(&self) -> &Input {
     &self.input
   }
 
   /// The budgets this session was opened with.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn limits(&self) -> DemuxLimits {
+  pub(crate) const fn limits_impl(&self) -> DemuxLimits {
     self.limits
   }
 
   fn from_input(input: Input, limits: DemuxLimits) -> Result<Self, DemuxError> {
-    let (tracks, pending) = build_tracks(&input, limits)?;
+    let (tracks, pending) = build_tracks::<C>(&input, limits)?;
     Ok(Self {
       input,
       tracks,
       pending,
+      unconverted: None,
       eof: false,
       reader_panic: None,
       limits,
@@ -340,15 +368,6 @@ impl ProbeBudgetExhausted {
   }
 }
 
-/// Names the stream a payload failure happened on. Shared by all five
-/// delivery arms so the failure cannot be swallowed on one of them.
-fn on_stream<T>(
-  stream_index: usize,
-  result: Result<Option<T>, PacketBufferError>,
-) -> Result<Option<T>, DemuxError> {
-  result.map_err(|source| DemuxError::PacketBuffer(PacketBuffer::new(stream_index, source)))
-}
-
 /// Turns a latched reader panic into the error that names it.
 fn reader_panic(latch: &PanicLatch) -> Option<DemuxError> {
   latch
@@ -356,20 +375,18 @@ fn reader_panic(latch: &PanicLatch) -> Option<DemuxError> {
     .map(|message| DemuxError::ReaderPanic(ReaderPanic::new(message)))
 }
 
-impl Demuxer for FfmpegDemuxer {
-  type Adapter = Ffmpeg;
-  type Buffer = FfmpegBytes;
-  type Error = DemuxError;
-
-  fn tracks(&self) -> &[TrackInfo<Ffmpeg>] {
+impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
+  pub(crate) fn tracks_impl(&self) -> &[TrackInfo<Ffmpeg>] {
     &self.tracks
   }
 
-  fn take_tracks(&mut self) -> Vec<TrackInfo<Ffmpeg>> {
+  pub(crate) fn take_tracks_impl(&mut self) -> Vec<TrackInfo<Ffmpeg>> {
     mem::take(&mut self.tracks)
   }
 
-  fn next_packet(&mut self) -> Result<Option<DemuxedPacket<Ffmpeg, FfmpegBytes>>, DemuxError> {
+  pub(crate) fn next_packet_impl(
+    &mut self,
+  ) -> Result<Option<DemuxedPacket<Ffmpeg, C::Buffer>>, DemuxError> {
     // A latched reader panic is terminal, and terminal starts here. The
     // queue is filled at open and owes nothing to the reader, so a pull
     // that drained it would answer `Ok` to a caller the session has
@@ -389,29 +406,38 @@ impl Demuxer for FfmpegDemuxer {
     }
 
     loop {
-      let mut packet = Packet::empty();
-      let read = packet.read(&mut self.input);
-      // A panicking reader reported an ordinary I/O error to C, and
-      // libavformat may answer that with the error, with EOF (a stream
-      // it cannot read looks finished), or with a packet it had already
-      // buffered. None of those are the file's word, so the latch is
-      // consulted whatever the outcome was.
-      if let Some(panicked) = self.panicked() {
-        return Err(panicked);
-      }
-      match read {
-        Ok(()) => {}
-        Err(ffmpeg_next::Error::Eof) => {
-          self.eof = true;
-          return Ok(None);
+      // **A parked packet is re-attempted before another is read.**
+      // See [`Self::unconverted`]: `av_read_frame` has already given
+      // this one up, so reading past it would lose it.
+      let (packet, parked_provenance) = match self.unconverted.take() {
+        Some((packet, provenance)) => (packet, Some(provenance)),
+        None => {
+          let mut packet = Packet::empty();
+          let read = packet.read(&mut self.input);
+          // A panicking reader reported an ordinary I/O error to C, and
+          // libavformat may answer that with the error, with EOF (a
+          // stream it cannot read looks finished), or with a packet it
+          // had already buffered. None of those are the file's word, so
+          // the latch is consulted whatever the outcome was.
+          if let Some(panicked) = self.panicked() {
+            return Err(panicked);
+          }
+          match read {
+            Ok(()) => {}
+            Err(ffmpeg_next::Error::Eof) => {
+              self.eof = true;
+              return Ok(None);
+            }
+            // A demuxer can resync past a corrupt packet, and
+            // `AVERROR_INVALIDDATA` is not latched into the
+            // `AVIOContext`, so reading again makes progress. Every
+            // other error is sticky and is surfaced.
+            Err(ffmpeg_next::Error::InvalidData) => continue,
+            Err(e) => return Err(DemuxError::Ffmpeg(e)),
+          }
+          (packet, None)
         }
-        // A demuxer can resync past a corrupt packet, and
-        // `AVERROR_INVALIDDATA` is not latched into the `AVIOContext`,
-        // so reading again makes progress. Every other error is sticky
-        // and is surfaced.
-        Err(ffmpeg_next::Error::InvalidData) => continue,
-        Err(e) => return Err(DemuxError::Ffmpeg(e)),
-      }
+      };
 
       let index = packet.stream();
       // A packet for a stream the table does not describe cannot be
@@ -427,35 +453,103 @@ impl Demuxer for FfmpegDemuxer {
       // never a silently dropped packet: `Ok(None)` below means the
       // packet carried nothing, and that is the only thing that reads
       // the next one.
-      let built = match info.kind() {
-        TrackKind::Video => on_stream(
-          index,
-          boundary::video_packet_from_ffmpeg_in(&packet, time_base, self.limits.packet()),
-        )?
-        .map(|packet| DemuxedPacket::Video(VideoTrackPacket::new(track, packet))),
-        TrackKind::Audio => on_stream(
-          index,
-          boundary::audio_packet_from_ffmpeg_in(&packet, time_base, self.limits.packet()),
-        )?
-        .map(|packet| DemuxedPacket::Audio(AudioTrackPacket::new(track, packet))),
-        TrackKind::Subtitle => on_stream(
-          index,
-          boundary::subtitle_packet_from_ffmpeg_in(&packet, time_base, self.limits.packet()),
-        )?
-        .map(|packet| DemuxedPacket::Subtitle(SubtitleTrackPacket::new(track, packet))),
-        TrackKind::Data => on_stream(
-          index,
-          boundary::data_packet_from_ffmpeg_in(&packet, time_base, self.limits.packet()),
-        )?
-        .map(|packet| DemuxedPacket::Data(DataTrackPacket::new(track, packet))),
+      // **Everything this loop delivers is demux-delivered**, whatever
+      // its refcount: libavformat just handed it over, so any other
+      // reference to its buffer is libavformat's own and no
+      // `ffmpeg_next::Packet` wraps one. That is not the hazard a
+      // caller's second handle is — see
+      // [`crate::buffer::PayloadProvenance`].
+      //
+      // Sharing is ordinary here. A queue-backed demuxer — SubRip,
+      // SubViewer and the rest of the `FFDemuxSubtitlesQueue` family —
+      // keeps its parsed cues and delivers `av_packet_ref`s of them,
+      // so *every* packet it produces arrives with two references.
+      //
+      // The one sub-case that is stronger still is the container's
+      // parked picture, which a stream carrying
+      // `ATTACHED_PIC | TIMED_THUMBNAILS` delivers as its first packet:
+      // written once while the container opened, so the view lane may
+      // window it rather than copy. See [`is_streams_attached_pic`] for
+      // the identity proof.
+      //
+      // SAFETY: both the session's `AVFormatContext` and `packet` are
+      // live here.
+      let provenance = match parked_provenance {
+        // Observed when this packet was delivered, and kept with it.
+        Some(provenance) => provenance,
+        None if unsafe { is_streams_attached_pic(&self.input, index, &packet) } => {
+          crate::buffer::PayloadProvenance::AttachedPicture
+        }
+        None => crate::buffer::PayloadProvenance::DemuxDelivered,
+      };
+
+      // The packet this loop just read is **handed over**, not lent: the
+      // view lane's carrier is a window into its buffer, and a source
+      // that survived the conversion would be a mutable alias of it.
+      // Exactly one arm runs, so exactly one move happens.
+      // **The conversion borrows what this session owns.** The packet
+      // stays in hand until the carrier exists, which is what lets a
+      // failure park it instead of dropping it; on success it falls out
+      // of scope at the end of the iteration and the carrier keeps its
+      // buffer alive by refcount, exactly as when the conversion
+      // consumed it. Nothing outside this loop ever sees the packet, so
+      // the borrow cannot become the aliasing shape the public faces
+      // refuse.
+      let converted = match info.kind() {
+        TrackKind::Video => boundary::video_packet_from_borrowed::<C>(
+          &packet,
+          time_base,
+          self.limits.packet(),
+          provenance,
+        )
+        .map(|built| built.map(|p| DemuxedPacket::Video(VideoTrackPacket::new(track, p)))),
+        TrackKind::Audio => boundary::audio_packet_from_borrowed::<C>(
+          &packet,
+          time_base,
+          self.limits.packet(),
+          provenance,
+        )
+        .map(|built| built.map(|p| DemuxedPacket::Audio(AudioTrackPacket::new(track, p)))),
+        TrackKind::Subtitle => boundary::subtitle_packet_from_borrowed::<C>(
+          &packet,
+          time_base,
+          self.limits.packet(),
+          provenance,
+        )
+        .map(|built| built.map(|p| DemuxedPacket::Subtitle(SubtitleTrackPacket::new(track, p)))),
+        TrackKind::Data => boundary::data_packet_from_borrowed::<C>(
+          &packet,
+          time_base,
+          self.limits.packet(),
+          provenance,
+        )
+        .map(|built| built.map(|p| DemuxedPacket::Data(DataTrackPacket::new(track, p)))),
         // Every attachment track's one packet was queued at open time,
         // so anything arriving on one now is the duplicate some
         // demuxers emit for cover art. Drop it — the contract is
-        // exactly one, and the one has already left.
+        // exactly one, and the one has already left. Nothing is
+        // converted here, so there is nothing to park.
         TrackKind::Attachment => continue,
         // The roster of arms is five; a track nothing can name has no
         // arm and its packets are not delivered.
         TrackKind::Unknown => continue,
+      };
+
+      let built = match converted {
+        Ok(built) => built,
+        Err(source) => {
+          // **Park a refusal that another attempt could survive.** An
+          // allocation that failed says nothing about the packet, and
+          // the packet is off the wire either way. Anything else is a
+          // fact about the packet itself — a malformed one is not made
+          // well-formed by retrying, and parking it would answer every
+          // later pull with the same error instead of letting the
+          // session make progress.
+          if source.parks_in_demux() {
+            self.unconverted = Some((packet, provenance));
+          }
+          return Err(DemuxError::PacketBuffer(PacketBuffer::new(index, source)));
+        }
       };
 
       // `None` here means the packet carried no payload — an empty
@@ -467,7 +561,7 @@ impl Demuxer for FfmpegDemuxer {
     }
   }
 
-  fn seek(&mut self, target: Timestamp) -> Result<(), DemuxError> {
+  pub(crate) fn seek_impl(&mut self, target: Timestamp) -> Result<(), DemuxError> {
     let ts = target.rescale_to(av_time_base_q()).pts();
     // Only our own EOF latch is cleared, and only before the seek —
     // the seek machinery gates on `eof_reached`, so clearing it
@@ -487,9 +581,116 @@ impl Demuxer for FfmpegDemuxer {
       return Err(panicked);
     }
     sought?;
+    // **The seat is cleared by a seek that happened, not by one that
+    // was attempted.** A parked packet belongs to the position the
+    // session is leaving, so a successful seek discards it. A *failed*
+    // one leaves the session where it was — and that packet is off the
+    // wire, so dropping it here would be the same silent loss the seat
+    // exists to prevent, with no re-read able to recover it.
+    //
+    // FFmpeg does not specify where a container sits after a seek that
+    // returned an error, and this crate does not guess: it keeps a
+    // packet the container really did deliver, and a caller who saw the
+    // seek fail already knows the position is not the one they asked
+    // for. Every timestamp needed to tell is on the packet.
+    self.unconverted = None;
     Ok(())
   }
 }
+
+macro_rules! demuxer_lane_face {
+  ($($lane:ty),+ $(,)?) => { $(
+    impl CarrierDemuxer<$lane> {
+      /// Opens a container from a filesystem path.
+      ///
+      /// Runs `avformat_open_input` followed by
+      /// `avformat_find_stream_info`, then builds the track table and
+      /// captures every attachment payload.
+      ///
+      /// Call [`ffmpeg_next::init`] once before the first open if you
+      /// want FFmpeg's logging and network protocols configured;
+      /// probing a local container does not require it.
+      pub fn open<P: AsRef<Path> + ?Sized>(path: &P) -> Result<Self, DemuxError> {
+        Self::open_impl(path)
+      }
+
+      /// [`Self::open`], with the session's resource budgets named.
+      ///
+      /// The budgets are taken **at open** rather than through a
+      /// `with_*` builder because the attachment half of them is spent
+      /// here: every attachment payload is captured during this call.
+      pub fn open_with<P: AsRef<Path> + ?Sized>(
+        path: &P,
+        limits: DemuxLimits,
+      ) -> Result<Self, DemuxError> {
+        Self::open_with_impl(path, limits)
+      }
+
+      /// Opens a container from any `Read + Seek` source.
+      pub fn open_reader<R: Read + Seek + Send + 'static>(
+        reader: R,
+        url: Option<&str>,
+      ) -> Result<Self, DemuxError> {
+        Self::open_reader_impl(reader, url)
+      }
+
+      /// [`Self::open_reader`], with the session's budgets named.
+      pub fn open_reader_with<R: Read + Seek + Send + 'static>(
+        reader: R,
+        url: Option<&str>,
+        limits: DemuxLimits,
+      ) -> Result<Self, DemuxError> {
+        Self::open_reader_with_impl(reader, url, limits)
+      }
+
+      /// The wrapped `AVFormatContext`.
+      pub const fn input(&self) -> &Input {
+        self.input_impl()
+      }
+
+      /// The budgets this session was opened with.
+      pub const fn limits(&self) -> DemuxLimits {
+        self.limits_impl()
+      }
+    }
+
+    impl Demuxer for CarrierDemuxer<$lane> {
+      type Adapter = Ffmpeg;
+      type Buffer = <$lane as crate::FfmpegCarrier>::Buffer;
+      type Error = DemuxError;
+
+      fn tracks(&self) -> &[TrackInfo<Ffmpeg>] {
+        self.tracks_impl()
+      }
+
+      fn take_tracks(&mut self) -> Vec<TrackInfo<Ffmpeg>> {
+        self.take_tracks_impl()
+      }
+
+      /// Pulls the next packet.
+      ///
+      /// **A refusal that another attempt could survive costs no
+      /// packet.** `av_read_frame` advances the container, so a
+      /// conversion that then fails on an allocation would otherwise
+      /// drop bytes nothing can ask for again. Such a packet is parked
+      /// instead, and this method re-attempts *it* before reading
+      /// another — so a caller who pulls again loses nothing. A refusal
+      /// about the packet itself is not parked: retrying a malformed
+      /// packet forever would be worse than passing it by.
+      fn next_packet(
+        &mut self,
+      ) -> Result<Option<DemuxedPacket<Ffmpeg, Self::Buffer>>, DemuxError> {
+        self.next_packet_impl()
+      }
+
+      fn seek(&mut self, target: Timestamp) -> Result<(), DemuxError> {
+        self.seek_impl(target)
+      }
+    }
+  )+ };
+}
+
+demuxer_lane_face!(crate::View, crate::Owned);
 
 /// Payload for [`DemuxError::AttachmentTooLarge`].
 ///
@@ -887,15 +1088,18 @@ pub enum DemuxError {
 //  Track-table construction.
 // ---------------------------------------------------------------------------
 
-type BuiltTracks = (
+type BuiltTracks<C> = (
   Vec<TrackInfo<Ffmpeg>>,
   VecDeque<(
     TrackIndex,
-    AttachmentPacket<AttachmentPacketExtra, FfmpegBytes>,
+    AttachmentPacket<AttachmentPacketExtra, <C as crate::FfmpegCarrier>::Buffer>,
   )>,
 );
 
-fn build_tracks(input: &Input, limits: DemuxLimits) -> Result<BuiltTracks, DemuxError> {
+fn build_tracks<C: crate::FfmpegCarrier + crate::CarrierOps>(
+  input: &Input,
+  limits: DemuxLimits,
+) -> Result<BuiltTracks<C>, DemuxError> {
   // **Admission before allocation.** Every attachment in the file is
   // judged here, in full, before the loop below allocates anything at
   // all — see [`admit_streams`] for why the charge cannot live
@@ -1044,9 +1248,9 @@ fn build_tracks(input: &Input, limits: DemuxLimits) -> Result<BuiltTracks, Demux
         // value, and `addr_of!` reaches it without forming a reference
         // to the stream.
         let pkt = unsafe { std::ptr::addr_of!((*stream.as_ptr()).attached_pic) };
-        unsafe { attached_pic_payload(pkt, index, limits) }?
+        unsafe { attached_pic_payload::<C>(pkt, index, limits) }?
       } else {
-        extradata_payload(&stream, limits)?
+        extradata_payload::<C>(&stream, limits)?
       };
       pending.push_back((TrackIndex::new(index), packet));
     }
@@ -1055,6 +1259,100 @@ fn build_tracks(input: &Input, limits: DemuxLimits) -> Result<BuiltTracks, Demux
   }
 
   Ok((tracks, pending))
+}
+
+/// Whether `packet`'s payload is the very allocation the container has
+/// parked in `AVStream.attached_pic` for stream `index`.
+///
+/// # Why this exists
+///
+/// libavformat queues a stream's attached picture as its **first
+/// packet** — `read_frame_internal` does `av_packet_ref(pkt,
+/// &st->attached_pic)` and keeps its own reference — so that packet
+/// arrives with two references through nobody's fault. A pure cover-art
+/// stream never reaches this road (it is an attachment, hoisted at
+/// open), but a stream carrying `ATTACHED_PIC | TIMED_THUMBNAILS` is
+/// deliberately classified as **video** by
+/// [`is_attachment_disposition`], so its first pull comes through here
+/// and would be refused as a shared payload. Every packet after it is
+/// an ordinary timed one with a buffer of its own.
+///
+/// # The probe, and why it is a proof rather than a guess
+///
+/// `av_buffer_ref` sets the new reference's `buffer` field to the
+/// source's, so two `AVBufferRef`s name one allocation **iff** their
+/// `buffer` pointers are equal — the same identity
+/// [`crate::FfmpegBuffer::ptr_eq`] rests on. Comparing them therefore
+/// establishes the fact the carve-out needs: this payload's allocation
+/// *is* `AVStream.attached_pic`'s, so one of its outstanding references
+/// is the container's own.
+///
+/// The alternatives were heuristics and are not used: the disposition
+/// bits say a stream *has* an attached picture, not that this packet is
+/// it; "the first packet on the stream" is an ordering assumption that
+/// nothing in libavformat's contract fixes.
+///
+/// # The soundness argument, restated for this packet
+///
+/// It is the same one the hoisted-attachment road rests on, and it
+/// holds here for the same reason. `AVStream.attached_pic` is written
+/// once, while the container is being opened, and never again; the
+/// reference this crate is looking at is the container's, held for the
+/// lifetime of the `AVFormatContext`, and there is no
+/// `ffmpeg_next::Packet` wrapping it for anyone to call `data_mut` on.
+/// What the uniqueness rule guards against is a *safe Rust* handle that
+/// may write while this crate reads, and the container's reference is
+/// not one.
+///
+/// # Safety
+///
+/// `input` and `packet` must both be live for the duration of the call.
+unsafe fn is_streams_attached_pic(input: &Input, index: usize, packet: &Packet) -> bool {
+  // SAFETY: `input` owns a live `AVFormatContext`; `streams` is an
+  // array of `nb_streams` pointers, and `index` is checked against it.
+  let stream = unsafe {
+    let context = input.as_ptr();
+    if index >= (*context).nb_streams as usize {
+      return false;
+    }
+    *(*context).streams.add(index)
+  };
+  if stream.is_null() {
+    return false;
+  }
+  // SAFETY: `stream` is one of the context's own live `AVStream`s and
+  // `packet` is live per this function's contract.
+  unsafe { packet_is_parked_picture(stream, packet) }
+}
+
+/// The identity itself: whether `packet`'s payload allocation is the
+/// one `stream` has parked in `attached_pic`.
+///
+/// Split out from [`is_streams_attached_pic`] so the comparison can be
+/// tested against a hand-built pair without forging an
+/// `AVFormatContext` — see `a_queued_attached_picture_is_recognised`.
+///
+/// # Safety
+///
+/// `stream` must be a live `AVStream` and `packet` a live `AVPacket`.
+unsafe fn packet_is_parked_picture(stream: *const AVStream, packet: &Packet) -> bool {
+  use ffmpeg_next::packet::Ref;
+
+  // SAFETY: both are live per the contract; `attached_pic` is an inline
+  // `AVPacket` and both `buf` fields may be null, which is answered
+  // before either is read through.
+  unsafe {
+    let parked = (*stream).attached_pic.buf;
+    let carried = (*packet.as_ptr()).buf;
+    if parked.is_null() || carried.is_null() {
+      return false;
+    }
+    // The shared `AVBuffer`, not the `AVBufferRef`: `av_packet_ref`
+    // mints a new reference struct around the same allocation, so
+    // comparing the references themselves would answer "no" to exactly
+    // the case this is for.
+    (*parked).buffer == (*carried).buffer
+  }
 }
 
 /// Whether a stream's disposition makes it an **attachment** — a
@@ -1180,11 +1478,11 @@ unsafe fn metadata_text(dict: *const AVDictionary, key: &CStr) -> Option<SmolStr
 /// `pkt` must be a live `*const AVPacket` — in practice the
 /// `attached_pic` embedded in the `AVStream` at `index` — for the
 /// duration of this call.
-unsafe fn attached_pic_payload(
+unsafe fn attached_pic_payload<C: crate::FfmpegCarrier + crate::CarrierOps>(
   pkt: *const ffmpeg_next::ffi::AVPacket,
   index: usize,
   limits: DemuxLimits,
-) -> Result<AttachmentPacket<AttachmentPacketExtra, FfmpegBytes>, DemuxError> {
+) -> Result<AttachmentPacket<AttachmentPacketExtra, C::Buffer>, DemuxError> {
   // Already admitted: [`admit_streams`] charged this payload — and
   // every other attachment in the file — before `build_tracks`
   // allocated anything. The per-attachment budget is passed down as
@@ -1192,8 +1490,17 @@ unsafe fn attached_pic_payload(
   // a future caller reaches it without the admission pass.
   //
   // SAFETY: `pkt` is live per the contract above.
-  let captured = unsafe { crate::buffer::payload_of(pkt, limits.max_attachment_bytes()) }
-    .map_err(|source| DemuxError::PacketBuffer(PacketBuffer::new(index, source)))?;
+  // **The container's own cover art**, whose buffer libavformat also
+  // holds — see [`crate::buffer::PayloadProvenance`] for why that
+  // second reference is not the hazard a caller's second `Packet` is.
+  let captured = unsafe {
+    crate::buffer::payload_of::<C>(
+      pkt,
+      limits.max_attachment_bytes(),
+      crate::buffer::PayloadProvenance::AttachedPicture,
+    )
+  }
+  .map_err(|source| DemuxError::PacketBuffer(PacketBuffer::new(index, source)))?;
   let extra = AttachmentPacketExtra::new(index as i32);
   Ok(match captured {
     Some(payload) => {
@@ -1209,7 +1516,7 @@ unsafe fn attached_pic_payload(
     }
     // Nothing was parked, so there are no flags to read: an empty set
     // is the honest answer for a packet this layer invented.
-    None => AttachmentPacket::new(FfmpegBytes::empty(), extra.with_synthesized(true)),
+    None => AttachmentPacket::new(C::empty(), extra.with_synthesized(true)),
   })
 }
 
@@ -1221,10 +1528,10 @@ unsafe fn attached_pic_payload(
 /// payload: the contract is one packet per attachment track, and a
 /// consumer that sees an empty one learns something true about the
 /// file. Only an allocation failure is an error.
-fn extradata_payload(
+fn extradata_payload<C: crate::FfmpegCarrier + crate::CarrierOps>(
   stream: &ffmpeg_next::format::stream::Stream<'_>,
   limits: DemuxLimits,
-) -> Result<AttachmentPacket<AttachmentPacketExtra, FfmpegBytes>, DemuxError> {
+) -> Result<AttachmentPacket<AttachmentPacketExtra, C::Buffer>, DemuxError> {
   let index = stream.index();
   let parameters = stream.parameters();
   // SAFETY: `parameters` keeps the `AVCodecParameters` live;
@@ -1250,8 +1557,17 @@ fn extradata_payload(
     // live, and the slice is consumed before this function returns.
     unsafe { std::slice::from_raw_parts(ptr, len) }
   };
+  // Extradata is a plain allocation with no `AVBufferRef` behind it —
+  // an `AVMEDIA_TYPE_ATTACHMENT` stream produces no packets, so a
+  // font's bytes never live in a refcounted buffer. **Both** lanes copy
+  // here, which is what `from_bytes` is for.
   Ok(AttachmentPacket::new(
-    FfmpegBytes::copy_from_slice(bytes),
+    C::from_bytes(bytes).ok_or_else(|| {
+      DemuxError::PacketBuffer(PacketBuffer::new(
+        index,
+        crate::buffer::PacketBufferError::CaptureFailed(crate::buffer::CaptureFailed::new(len)),
+      ))
+    })?,
     AttachmentPacketExtra::new(index as i32).with_synthesized(true),
   ))
 }
@@ -1565,7 +1881,8 @@ mod tests {
       || {
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
-        let opened = FfmpegDemuxer::open_reader(PanicsWithAHostilePayload, Some("x.mkv"));
+        let opened =
+          CarrierDemuxer::<crate::Owned>::open_reader(PanicsWithAHostilePayload, Some("x.mkv"));
         std::panic::set_hook(previous);
         match opened {
           Err(DemuxError::ReaderPanic(_)) => {}
@@ -1759,6 +2076,190 @@ mod tests {
     );
   }
 
+  /// A stream whose `attached_pic` is `parked`, and the packet
+  /// libavformat would queue for it.
+  ///
+  /// # On the fixture road
+  ///
+  /// The container shape this guards — a stream carrying
+  /// `ATTACHED_PIC | TIMED_THUMBNAILS` — **cannot be minted by the
+  /// ffmpeg CLI**, and that was censused rather than assumed: no muxer
+  /// has a field for those bits (`-disposition:v
+  /// attached_pic+timed_thumbnails` round-trips to nothing through
+  /// mp4, mov and matroska alike), because the mov *demuxer* derives
+  /// them from a chapter-track reference its own muxer does not write
+  /// in that direction.
+  ///
+  /// What is reproducible, and what actually matters, is the **packet
+  /// shape**: `read_frame_internal` queues a stream's parked picture
+  /// with `av_packet_ref` while keeping its own reference, which is
+  /// exactly what `av_packet_ref` builds here. The classification half
+  /// — that such a stream is video rather than an attachment — is
+  /// pinned separately by
+  /// [`a_timed_thumbnail_stream_is_not_an_attachment`].
+  fn parked_picture_stream(parked: &Packet) -> (Box<AVStream>, Packet) {
+    use ffmpeg_next::packet::{Mut, Ref};
+
+    let mut stream: Box<AVStream> = Box::new(unsafe { std::mem::zeroed() });
+    let mut queued = Packet::empty();
+    // SAFETY: `parked` is a live refcounted packet; `av_packet_ref`
+    // takes a reference to its buffer, which is precisely what
+    // libavformat does when it queues an attached picture. The stream
+    // is zeroed apart from the one field the probe reads.
+    unsafe {
+      assert_eq!(
+        ffmpeg_next::ffi::av_packet_ref(queued.as_mut_ptr(), parked.as_ptr()),
+        0,
+      );
+      stream.attached_pic.buf = (*parked.as_ptr()).buf;
+      stream.attached_pic.data = (*parked.as_ptr()).data;
+      stream.attached_pic.size = (*parked.as_ptr()).size;
+    }
+    (stream, queued)
+  }
+
+  #[test]
+  fn a_queued_attached_picture_is_recognised() {
+    use ffmpeg_next::packet::Ref;
+
+    let parked = Packet::copy(&[9u8; 2048]);
+    let (stream, queued) = parked_picture_stream(&parked);
+
+    // The two references are different structs around one allocation —
+    // which is the whole reason the probe compares `buffer` and not the
+    // `AVBufferRef`. Asserting the difference is what makes this a test
+    // of the right comparison rather than of a lucky one.
+    // SAFETY: both packets are live.
+    unsafe {
+      assert_ne!(
+        (*queued.as_ptr()).buf,
+        (*parked.as_ptr()).buf,
+        "av_packet_ref must mint a new reference struct",
+      );
+    }
+    // SAFETY: the stream is a zeroed `AVStream` whose only populated
+    // fields are the ones the probe reads, and `queued` is live.
+    assert!(unsafe { packet_is_parked_picture(&*stream, &queued) });
+
+    // An ordinary timed packet — the shape every pull after the first
+    // one has — is not the parked picture.
+    let ordinary = Packet::copy(&[1u8; 2048]);
+    // SAFETY: as above.
+    assert!(!unsafe { packet_is_parked_picture(&*stream, &ordinary) });
+
+    // And a stream that parks nothing recognises nothing.
+    let bare: Box<AVStream> = Box::new(unsafe { std::mem::zeroed() });
+    // SAFETY: as above.
+    assert!(!unsafe { packet_is_parked_picture(&*bare, &queued) });
+  }
+
+  #[test]
+  fn the_queued_picture_is_admitted_and_later_packets_take_the_ordinary_road() {
+    use crate::buffer::{PacketBufferError, PayloadProvenance, payload_of};
+    use ffmpeg_next::packet::Ref;
+
+    let parked = Packet::copy(&[9u8; 2048]);
+    let (_stream, queued) = parked_picture_stream(&parked);
+    // SAFETY: the packet is live; `buf` is a public field.
+    let parked_buffer = unsafe { (*parked.as_ptr()).buf };
+
+    // **The first pull.** Two references, one of them the container's.
+    // From a *caller* that shape is refused, because a caller's second
+    // reference may be a `Packet` with a safe `data_mut`.
+    // SAFETY: `queued` is live for every call in this test.
+    assert!(matches!(
+      unsafe {
+        payload_of::<crate::View>(
+          queued.as_ptr(),
+          usize::MAX,
+          PayloadProvenance::CallerSupplied,
+        )
+      },
+      Err(PacketBufferError::SharedPayload(_)),
+    ));
+
+    // Delivered by the demux loop, the same shape is carried — by copy,
+    // because a window would outlive the exclusivity the read rests on.
+    // SAFETY: as above.
+    let copied = unsafe {
+      payload_of::<crate::View>(
+        queued.as_ptr(),
+        usize::MAX,
+        PayloadProvenance::DemuxDelivered,
+      )
+    }
+    .expect("a demux-delivered shared payload is carriable")
+    .expect("it has a payload");
+    assert_eq!(copied.as_ref(), &[9u8; 2048][..]);
+    // SAFETY: the packet is live; `data` is a public field.
+    unsafe {
+      assert_ne!(
+        copied.as_ref().as_ptr() as usize,
+        (*queued.as_ptr()).data as usize,
+        "a shared demux-delivered payload is copied, not windowed",
+      );
+    }
+
+    // With the provenance the probe establishes, both lanes carry it.
+    // SAFETY: as above.
+    let viewed = unsafe {
+      payload_of::<crate::View>(
+        queued.as_ptr(),
+        usize::MAX,
+        PayloadProvenance::AttachedPicture,
+      )
+    }
+    .expect("the container's own picture is carriable")
+    .expect("it has a payload");
+    assert_eq!(viewed.as_ref(), &[9u8; 2048][..]);
+    // And on the view lane it is a window into the parked allocation
+    // rather than a copy of it.
+    // SAFETY: both are live; `data`/`size` are public fields.
+    unsafe {
+      let start = (*parked_buffer).data as usize;
+      let end = start + (*parked_buffer).size;
+      let at = viewed.as_ref().as_ptr() as usize;
+      assert!(
+        at >= start && at + viewed.len() <= end,
+        "the queued picture must be viewed, not copied",
+      );
+    }
+    // SAFETY: as above.
+    let owned = unsafe {
+      payload_of::<crate::Owned>(
+        queued.as_ptr(),
+        usize::MAX,
+        PayloadProvenance::AttachedPicture,
+      )
+    }
+    .expect("the owned lane carries it too")
+    .expect("it has a payload");
+    assert_eq!(owned.as_ref(), &[9u8; 2048][..]);
+
+    // **Every pull after it.** A timed packet has a buffer of its own,
+    // so it stays on the `Delivered` road, is unique, and the view lane
+    // shares it.
+    let later = Packet::copy(&[4u8; 1024]);
+    // SAFETY: `later` is live.
+    let shared = unsafe {
+      payload_of::<crate::View>(
+        later.as_ptr(),
+        usize::MAX,
+        PayloadProvenance::DemuxDelivered,
+      )
+    }
+    .expect("an ordinary packet is carriable")
+    .expect("it has a payload");
+    // SAFETY: as above.
+    unsafe {
+      assert_eq!(
+        shared.as_ref().as_ptr() as usize,
+        (*later.as_ptr()).data as usize,
+        "a uniquely-referenced packet is still shared, not copied",
+      );
+    }
+  }
+
   #[test]
   fn a_timed_thumbnail_stream_is_not_an_attachment() {
     // `TIMED_THUMBNAILS` is documented as only ever appearing beside
@@ -1804,7 +2305,7 @@ mod tests {
     // fills it in the same call. A zeroed `AVPacket` is exactly what
     // `attached_pic` would hold if one ever did not.
     let empty: ffmpeg_next::ffi::AVPacket = unsafe { std::mem::zeroed() };
-    let packet = unsafe { attached_pic_payload(&empty, 7, DemuxLimits::default()) }
+    let packet = unsafe { attached_pic_payload::<crate::Owned>(&empty, 7, DemuxLimits::default()) }
       .expect("an unparked cover is a degenerate track, not an unreadable file");
     assert!(packet.data().as_ref().is_empty());
     assert!(
