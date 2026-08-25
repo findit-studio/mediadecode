@@ -115,8 +115,12 @@ fn decode_clip(path: &std::path::Path, expected: (u32, u8, u64)) {
     NonZeroI32::new(stream_tb.denominator().max(1)).expect("non-zero den"),
   );
 
-  let mut decoder =
-    FfmpegAudioStreamDecoder::open(stream.parameters(), time_base).expect("open audio decoder");
+  let mut decoder = FfmpegAudioStreamDecoder::open(
+    stream.parameters(),
+    time_base,
+    mediadecode_ffmpeg::DecoderLimits::default(),
+  )
+  .expect("open audio decoder");
 
   let mut frame = empty_audio_frame();
   let mut total_samples: u64 = 0;

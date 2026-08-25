@@ -10,8 +10,9 @@ use mediadecode::{
   subtitle::SubtitlePayload,
 };
 use mediadecode_ffmpeg::{
-  AudioFrame, Ffmpeg, FfmpegAudioStreamDecoder, FfmpegBuffer, FfmpegSubtitleStreamDecoder,
-  audio_packet_from_ffmpeg, empty_audio_frame, empty_subtitle_frame, subtitle_packet_from_ffmpeg,
+  AudioFrame, DecoderLimits, Ffmpeg, FfmpegAudioStreamDecoder, FfmpegBytes,
+  FfmpegSubtitleStreamDecoder, audio_packet_from_ffmpeg, empty_audio_frame, empty_subtitle_frame,
+  subtitle_packet_from_ffmpeg,
 };
 use std::num::NonZeroI32;
 
@@ -19,7 +20,7 @@ use std::num::NonZeroI32;
 fn ffmpeg_audio_decoder_implements_trait() {
   fn _accepts_audio<D>(_: D)
   where
-    D: AudioStreamDecoder<Adapter = Ffmpeg, Buffer = FfmpegBuffer>,
+    D: AudioStreamDecoder<Adapter = Ffmpeg, Buffer = FfmpegBytes>,
   {
   }
   fn _check_audio_at_compile_time() {
@@ -34,7 +35,7 @@ fn ffmpeg_audio_decoder_implements_trait() {
 fn ffmpeg_subtitle_decoder_implements_trait() {
   fn _accepts_subtitle<D>(_: D)
   where
-    D: SubtitleDecoder<Adapter = Ffmpeg, Buffer = FfmpegBuffer>,
+    D: SubtitleDecoder<Adapter = Ffmpeg, Buffer = FfmpegBytes>,
   {
   }
   fn _check_subtitle_at_compile_time() {
@@ -69,7 +70,8 @@ fn decode_one_audio_frame_through_trait() {
   );
 
   let mut decoder =
-    FfmpegAudioStreamDecoder::open(stream.parameters(), time_base).expect("open audio decoder");
+    FfmpegAudioStreamDecoder::open(stream.parameters(), time_base, DecoderLimits::default())
+      .expect("open audio decoder");
 
   let mut dst: AudioFrame = empty_audio_frame();
   let mut got_frame = false;
@@ -128,8 +130,9 @@ fn decode_one_subtitle_through_trait() {
     NonZeroI32::new(stream_tb.denominator().max(1)).expect("non-zero den"),
   );
 
-  let mut decoder = FfmpegSubtitleStreamDecoder::open(stream.parameters(), time_base)
-    .expect("open subtitle decoder");
+  let mut decoder =
+    FfmpegSubtitleStreamDecoder::open(stream.parameters(), time_base, DecoderLimits::default())
+      .expect("open subtitle decoder");
 
   let mut dst = empty_subtitle_frame();
   let mut got_frame = false;

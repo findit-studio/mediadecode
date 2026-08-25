@@ -20,10 +20,18 @@ layer, built on top of
 </div>
 
 Implements `mediadecode`'s `VideoAdapter` / `AudioAdapter` /
-`SubtitleAdapter` traits and the matching push-style `*StreamDecoder`
-traits. Frame payloads are zero-copy refcounted views over FFmpeg's
-`AVBufferRef` via the [`FfmpegBuffer`] type — receiving a frame does
-not memcpy the pixel data.
+`SubtitleAdapter` / `ImageAdapter` traits, the matching push-style
+`*StreamDecoder` traits, the one-shot `ImageDecoder`, and `Demuxer`.
+
+Every byte a frame or packet carries is **copied once, at the FFmpeg
+boundary, into an `FfmpegBytes`** — `mediadecode` 0.9's D-seat
+amputation contract. A delivered frame is owned, `Send + Sync`, and
+cheap to clone (a refcount bump); it holds nothing of libavcodec's
+open, so it can cross a channel, be read from several threads, and
+outlive the decoder that produced it. Through 0.8 the planes were
+refcounted views into `AVBufferRef` behind an `FfmpegBuffer` type,
+which meant every consumer inherited an FFmpeg lifetime it could not
+see. That type is gone.
 
 `FfmpegVideoStreamDecoder` mirrors the `send_packet` / `receive_frame`
 shape of `ffmpeg::decoder::Video`, auto-probes the host's HW backends,
@@ -64,7 +72,7 @@ use ffmpeg_next as ffmpeg;
 use ffmpeg::{format, media};
 use mediadecode::{Timebase, decoder::VideoStreamDecoder};
 use mediadecode_ffmpeg::{
-  Error as FfmpegError, FfmpegVideoStreamDecoder, VideoDecodeError,
+  DecoderLimits, Error as FfmpegError, FfmpegVideoStreamDecoder, VideoDecodeError,
   empty_video_frame, video_packet_from_ffmpeg,
 };
 
@@ -81,7 +89,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   );
 
   // Probes HW backends in order, falls back to software.
-  let mut decoder = match FfmpegVideoStreamDecoder::open(stream.parameters(), time_base) {
+  let mut decoder =
+    match FfmpegVideoStreamDecoder::open(stream.parameters(), time_base, DecoderLimits::default())
+    {
     Ok(d) => d,
     Err(FfmpegError::AllBackendsFailed(p)) => {
       // No backend at all could open this stream — including software.
@@ -114,7 +124,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     while decoder.receive_frame(&mut frame).is_ok() {
       // frame.pixel_format(), frame.width(), frame.height(),
-      // frame.planes() — zero-copy views over AVBufferRef.
+      // frame.planes() — owned `FfmpegBytes`, safe to keep.
     }
   }
   decoder.send_eof()?;
@@ -145,18 +155,28 @@ for end-to-end demuxer-driven runs that cover all three streams.
   whose `Again` variant is the "needs more input" signal and whose
   `SourceChanged` variant is the mid-stream refusal. Disabling the
   feature drops the type and the `libswresample` link along with it.
+- **`FfmpegImageDecoder`**: the one-shot `ImageDecoder` — cover art in,
+  `ImageFrame` out. Opened from an attachment track's codec parameters,
+  which the demuxer's cover-art reclassification retains in full. The
+  picture's EXIF orientation comes back typed on `ImageFrameExtra`,
+  read off the display matrix libavcodec emits for it.
 - **Type aliases**: `VideoPacket`, `AudioPacket`, `SubtitlePacket`,
   `DataPacket`, `AttachmentPacket`, `DemuxedPacket`, `VideoFrame`,
-  `AudioFrame`, `SubtitleFrame`, `TrackInfo`, `TrackParams` — the
-  `mediadecode` generic types pre-parameterized with this crate's
-  adapter / buffer / extras, so you don't have to spell them out.
-- **Buffer**: `FfmpegBuffer` — refcounted view over an `AVBufferRef`
-  with safe constructors (`empty`, `from_packet`, `try_*`
-  panic-free counterparts).
+  `AudioFrame`, `SubtitleFrame`, `ImageFrame`, `TrackInfo`,
+  `TrackParams` — the `mediadecode` generic types pre-parameterized
+  with this crate's adapter / carrier / extras, so you don't have to
+  spell them out.
+- **Carrier**: `FfmpegBytes` — owned, `Send + Sync`, `AsRef<[u8]>`,
+  cloning by refcount. Opaque over an `Arc<[u8]>`, because the storage
+  gains a pooled strategy later
+  ([#35](https://github.com/findit-studio/mediadecode/issues/35)) and a
+  consumer must not have to recompile for it. Construct one with
+  `FfmpegBytes::copy_from_slice` / `::empty` when feeding a packet back
+  into a decoder.
 - **Boundary helpers**: `video_packet_from_ffmpeg`,
   `audio_packet_from_ffmpeg`, `subtitle_packet_from_ffmpeg` — convert a
-  borrowed `ffmpeg::Packet` into the matching `mediadecode` packet
-  without copying the compressed payload. Their `*_in` siblings
+  borrowed `ffmpeg::Packet` into the matching `mediadecode` packet,
+  copying the compressed payload out. Their `*_in` siblings
   (`video_packet_from_ffmpeg_in`, `audio_packet_from_ffmpeg_in`,
   `subtitle_packet_from_ffmpeg_in`, `data_packet_from_ffmpeg_in`) take
   the stream's timebase, so the produced `Timestamp` says what its

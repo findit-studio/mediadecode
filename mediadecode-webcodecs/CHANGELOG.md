@@ -11,6 +11,37 @@ The backend-agnostic core it adapts has its own log at
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-08-24
+
+### Changed
+
+- Version bump to track `mediadecode` 0.9. **No adapter source
+  changed**, and that is the finding rather than an absence of one:
+  0.9's [D-seat amputation contract](../mediadecode/CHANGELOG.md) is
+  the rule that `WebCodecsBuffer` was already built to — an
+  `Arc<Vec<u8>>` view over bytes `copyTo` has already handed to Rust,
+  owned, `Send + Sync`, cloning by refcount, with nothing reaching back
+  into a JS handle. The FFmpeg adapter had to be rebuilt for that
+  release; this one had to be checked, and it passed unchanged.
+
+### Notes
+
+- **Still images: a door, not a gap.** `mediadecode` 0.9 added a
+  fourth frame household (`ImageFrame`) and a one-shot `ImageDecoder`
+  seam. This crate does not implement them yet, and the absence is a
+  schedule rather than a judgement: the browser's answer to "decode
+  these bytes into a picture" is `createImageBitmap`, which is not
+  part of the WebCodecs surface this crate wraps and carries its own
+  async shape and its own pixel-readback problem — an `ImageBitmap`
+  has no `copyTo`, so the bytes come back through a canvas or through
+  `VideoFrame::new(ImageBitmap)`. Recorded on the crate's module docs
+  so the next reader finds the reason where they find the absence.
+
+  The seam this crate will implement when that work happens is
+  `mediadecode::future::local::ImageDecoder`, the `async` mirror that
+  0.9 also mints — `createImageBitmap` returns a `Promise`, so the
+  sync face was never the one on offer here.
+
 ## [0.8.0] - 2026-08-24
 
 ## [0.7.0] - 2026-08-23

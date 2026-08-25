@@ -43,6 +43,39 @@
 //! WebCodecs has no subtitle surface. This crate intentionally
 //! does **not** implement
 //! [`SubtitleAdapter`](mediadecode::adapter::SubtitleAdapter).
+//!
+//! # Still images: a door, not a gap
+//!
+//! `mediadecode` 0.9 added a fourth household —
+//! [`ImageFrame`](mediadecode::frame::ImageFrame) and the one-shot
+//! [`ImageDecoder`](mediadecode::decoder::ImageDecoder) seam — for
+//! cover art and other stills. This crate does **not** implement it
+//! yet, and the absence is a schedule rather than a judgement: the
+//! browser's answer to "decode these bytes into a picture" is
+//! [`createImageBitmap`](https://developer.mozilla.org/en-US/docs/Web/API/createImageBitmap),
+//! which is not part of the WebCodecs surface this crate wraps and
+//! carries its own async shape and its own pixel-readback problem (an
+//! `ImageBitmap` has no `copyTo`; the bytes come back through a canvas
+//! or through `VideoFrame::new(ImageBitmap)`). That is separate work
+//! with separate failure modes, and half of it would have shipped an
+//! [`ImageAdapter`](mediadecode::adapter::ImageAdapter) whose seats
+//! nothing could fill.
+//!
+//! The seam this crate will implement when that work happens is
+//! [`mediadecode::future::local::ImageDecoder`], the `async` mirror —
+//! `createImageBitmap` returns a `Promise`, so the sync face was never
+//! the one on offer here.
+//!
+//! # The carrier
+//!
+//! [`WebCodecsBuffer`] satisfies `mediadecode` 0.9's
+//! [D-seat amputation contract][law], and always did: it is an
+//! `Arc<Vec<u8>>` view over bytes `copyTo` has already handed to Rust,
+//! so nothing in a delivered frame reaches back into a JS handle. The
+//! FFmpeg adapter had to be rebuilt for that release; this one had to
+//! be checked, and it passed unchanged.
+//!
+//! [law]: mediadecode::adapter#the-d-seat-amputation-contract
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(docsrs, allow(unused_attributes))]

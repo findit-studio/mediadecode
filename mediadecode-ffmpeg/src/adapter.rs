@@ -1,10 +1,11 @@
 //! `Ffmpeg` adapter — implements [`mediadecode::VideoAdapter`],
-//! [`mediadecode::AudioAdapter`], [`mediadecode::SubtitleAdapter`] and
+//! [`mediadecode::AudioAdapter`], [`mediadecode::SubtitleAdapter`],
+//! [`mediadecode::adapter::ImageAdapter`] and
 //! [`mediadecode::demuxer::DemuxAdapter`] for this crate.
 //!
 //! The adapter is a zero-sized type whose sole purpose is to bind the
 //! associated types together so the rest of the API (Packet / Frame /
-//! Decoder) reads cleanly: `VideoPacket<Ffmpeg, FfmpegBuffer>` etc.
+//! Decoder) reads cleanly: `VideoPacket<Ffmpeg, FfmpegBytes>` etc.
 //!
 //! `DemuxAdapter` bundles the other three, and `Ffmpeg` fills all four
 //! seats with itself — the demux tier's `CodecId` bound (one
@@ -14,7 +15,7 @@
 
 use mediadecode::{
   PixelFormat,
-  adapter::{AudioAdapter, SubtitleAdapter, VideoAdapter},
+  adapter::{AudioAdapter, ImageAdapter, SubtitleAdapter, VideoAdapter},
   demuxer::DemuxAdapter,
 };
 use mediaframe::audio::ChannelLayoutDescription;
@@ -23,8 +24,8 @@ use smol_str::SmolStr;
 use crate::{
   codec_id::CodecId,
   extras::{
-    AttachmentPacketExtra, AudioFrameExtra, AudioPacketExtra, DataPacketExtra, SubtitleFrameExtra,
-    SubtitlePacketExtra, TrackExtra, VideoFrameExtra, VideoPacketExtra,
+    AttachmentPacketExtra, AudioFrameExtra, AudioPacketExtra, DataPacketExtra, ImageFrameExtra,
+    SubtitleFrameExtra, SubtitlePacketExtra, TrackExtra, VideoFrameExtra, VideoPacketExtra,
   },
   sample_format::SampleFormat,
 };
@@ -59,6 +60,17 @@ impl SubtitleAdapter for Ffmpeg {
   type FrameExtra = SubtitleFrameExtra;
 }
 
+impl ImageAdapter for Ffmpeg {
+  type CodecId = CodecId;
+  type PixelFormat = PixelFormat;
+  // The packet an image decoder is fed is the attachment packet the
+  // demuxer hands out — one type, both seats, so a cover-art payload
+  // goes straight from `next_packet` into `decode` with nothing to
+  // convert in between.
+  type PacketExtra = AttachmentPacketExtra;
+  type FrameExtra = ImageFrameExtra;
+}
+
 impl DemuxAdapter for Ffmpeg {
   type CodecId = CodecId;
   type Video = Ffmpeg;
@@ -84,14 +96,15 @@ mod tests {
   /// mediadecode's generic types.
   #[test]
   fn adapter_parameterizes_mediadecode_types() {
-    use crate::buffer::FfmpegBuffer;
+    use crate::FfmpegBytes;
+
     use mediadecode::{
       adapter::{AudioAdapter, SubtitleAdapter, VideoAdapter},
       packet::{AudioPacket, SubtitlePacket, VideoPacket},
     };
 
     fn _video_packet_resolves(
-      _: &VideoPacket<Ffmpeg, FfmpegBuffer>,
+      _: &VideoPacket<Ffmpeg, FfmpegBytes>,
       _: <Ffmpeg as VideoAdapter>::CodecId,
       _: <Ffmpeg as VideoAdapter>::PixelFormat,
       _: &<Ffmpeg as VideoAdapter>::PacketExtra,
@@ -100,7 +113,7 @@ mod tests {
     }
 
     fn _audio_packet_resolves(
-      _: &AudioPacket<Ffmpeg, FfmpegBuffer>,
+      _: &AudioPacket<Ffmpeg, FfmpegBytes>,
       _: <Ffmpeg as AudioAdapter>::CodecId,
       _: <Ffmpeg as AudioAdapter>::SampleFormat,
       _: &<Ffmpeg as AudioAdapter>::ChannelLayout,
@@ -110,7 +123,7 @@ mod tests {
     }
 
     fn _subtitle_packet_resolves(
-      _: &SubtitlePacket<Ffmpeg, FfmpegBuffer>,
+      _: &SubtitlePacket<Ffmpeg, FfmpegBytes>,
       _: <Ffmpeg as SubtitleAdapter>::CodecId,
       _: &<Ffmpeg as SubtitleAdapter>::PacketExtra,
       _: &<Ffmpeg as SubtitleAdapter>::FrameExtra,

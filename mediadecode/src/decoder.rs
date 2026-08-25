@@ -1,11 +1,43 @@
 //! Decoder traits — push-style streams (FFmpeg / WebCodecs / ProRes
-//! RAW via VTDecompressionSession) and pull-style frame sources
-//! (R3D / BRAW / ARRIRAW / X-OCN / Canon RAW Light).
+//! RAW via VTDecompressionSession), pull-style frame sources
+//! (R3D / BRAW / ARRIRAW / X-OCN / Canon RAW Light), and the one-shot
+//! [`ImageDecoder`].
+//!
+//! # What the names say
+//!
+//! `Stream` in a name means the decoder has a *rhythm*: packets go in
+//! over time, frames come out over time, and the two are not in step —
+//! hence `send_packet` / `receive_frame` / `send_eof` / `flush`.
+//! [`VideoStreamDecoder`] and [`AudioStreamDecoder`] carry it.
+//! [`SubtitleDecoder`] and [`ImageDecoder`] do not, and their names say
+//! so: a subtitle cue and a still image each come out of exactly the
+//! packet that went in.
+//!
+//! All four are mirrored under [`crate::future`] with `async fn`
+//! methods, in both the `!Send` and the `Send`-bounded variant.
+//!
+//! # The buffer seat
+//!
+//! Every trait here carries a `Buffer` associated type bounded only by
+//! `AsRef<[u8]>`, and none of them names a concrete carrier. What a
+//! backend may bind there is the
+//! [D-seat amputation contract](crate::adapter#the-d-seat-amputation-contract):
+//! owned, `Send + Sync`, clone-is-a-refcount-bump, with no
+//! backend-internal lifetime crossing the seam.
+//!
+//! # Construction is not on these traits
+//!
+//! Opening a decoder is each backend's own business and each
+//! backend's is different — codec parameters, a WebCodecs config
+//! dictionary, a clip handle. Putting a constructor on the trait would
+//! force one of those spellings onto all of them, which is the same
+//! stance [`crate::demuxer::Demuxer`] takes for the same reason.
 
 use crate::{
   Timebase, Timestamp,
-  adapter::{AudioAdapter, SubtitleAdapter, VideoAdapter},
-  frame::{AudioFrame, SubtitleFrame, VideoFrame},
+  adapter::{AudioAdapter, ImageAdapter, SubtitleAdapter, VideoAdapter},
+  demuxer::AttachmentPacket,
+  frame::{AudioFrame, ImageFrame, SubtitleFrame, VideoFrame},
   packet::{AudioPacket, SubtitlePacket, VideoPacket},
 };
 
@@ -169,6 +201,67 @@ pub trait SubtitleDecoder {
   fn send_eof(&mut self) -> Result<(), Self::Error>;
   /// Flushes internal state.
   fn flush(&mut self) -> Result<(), Self::Error>;
+}
+
+/// One-shot still-image decoder — cover art, an embedded thumbnail, a
+/// poster frame.
+///
+/// **No `Stream` in the name, and no rhythm to go with it.** An
+/// attachment track delivers exactly one packet (see
+/// [`Demuxer`](crate::demuxer::Demuxer)'s attachment contract), that
+/// packet is a whole file, and decoding it produces exactly one
+/// picture. There is nothing to queue, nothing to drain, and no
+/// end-of-stream to signal — so [`decode`](Self::decode) takes the
+/// packet and returns the frame, instead of the
+/// `send_packet` / `receive_frame` split the two `*StreamDecoder`
+/// traits need. [`SubtitleDecoder`] keeps that split only because
+/// FFmpeg's own subtitle API is push-shaped; nothing forces it here.
+///
+/// **The frame has no timestamps**, because
+/// [`ImageFrame`] has no seats for them.
+///
+/// # Where the input comes from
+///
+/// A container's still images arrive as
+/// [`TrackKind::Attachment`](crate::demuxer::TrackKind::Attachment)
+/// tracks: the track row says what codec the picture is in, and the
+/// track's one [`AttachmentPacket`] carries its bytes. So the row
+/// opens the decoder — off-trait, per the module docs — and the packet
+/// is what `decode` is handed.
+///
+/// # `&mut self`
+///
+/// Decoding one image needs no state across calls; the exclusive
+/// borrow is here because a backend's decoder handle is a mutable
+/// resource (FFmpeg's `AVCodecContext` is), and because it lets a
+/// backend reuse one open decoder across several attachments of the
+/// same codec rather than reopening per picture.
+pub trait ImageDecoder {
+  /// Backend-specific vocabulary.
+  type Adapter: ImageAdapter;
+  /// Buffer type held by the packet this decoder accepts and the frame
+  /// it produces. See the module docs for what may be bound here.
+  type Buffer: AsRef<[u8]>;
+  /// Decoder-specific error type.
+  type Error;
+
+  /// Decodes one attachment payload — a whole image file — into a
+  /// still.
+  ///
+  /// Backends signal "these bytes are not a picture this decoder can
+  /// read" through a backend-specific `Error` variant, never by
+  /// returning an empty frame.
+  fn decode(
+    &mut self,
+    packet: &AttachmentPacket<<Self::Adapter as ImageAdapter>::PacketExtra, Self::Buffer>,
+  ) -> Result<
+    ImageFrame<
+      <Self::Adapter as ImageAdapter>::PixelFormat,
+      <Self::Adapter as ImageAdapter>::FrameExtra,
+      Self::Buffer,
+    >,
+    Self::Error,
+  >;
 }
 
 #[cfg(test)]
@@ -350,5 +443,43 @@ mod tests {
   fn subtitle_decoder_is_implementable() {
     fn _decoder<D: SubtitleDecoder>() {}
     _decoder::<LoopSubtitleStream>();
+  }
+
+  pub(crate) struct ILoop;
+  impl ImageAdapter for ILoop {
+    type CodecId = u32;
+    type PixelFormat = u32;
+    type PacketExtra = ();
+    type FrameExtra = ();
+  }
+
+  pub(crate) struct LoopImage;
+
+  impl ImageDecoder for LoopImage {
+    type Adapter = ILoop;
+    type Buffer = &'static [u8];
+    type Error = LoopError;
+
+    fn decode(
+      &mut self,
+      _: &AttachmentPacket<(), &'static [u8]>,
+    ) -> Result<ImageFrame<u32, (), &'static [u8]>, LoopError> {
+      Err(LoopError)
+    }
+  }
+
+  #[test]
+  fn image_decoder_is_implementable() {
+    fn _decoder<D: ImageDecoder>() {}
+    _decoder::<LoopImage>();
+  }
+
+  #[test]
+  fn the_one_shot_seam_takes_a_packet_and_answers_a_frame() {
+    // The shape the register turns on: no `send_*`, no `receive_*`, no
+    // `flush`. One call in, one picture out.
+    let mut decoder = LoopImage;
+    let packet: AttachmentPacket<(), &'static [u8]> = AttachmentPacket::new(&[][..], ());
+    assert!(decoder.decode(&packet).is_err());
   }
 }

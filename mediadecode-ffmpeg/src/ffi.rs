@@ -158,6 +158,79 @@ pub(crate) struct CallbackState {
   /// Same value as `wanted` cast to `i32`, cached so the callback's
   /// pix_fmts walk doesn't have to convert per iteration.
   pub(crate) wanted_int: i32,
+  /// Set by [`get_hw_format`] when it declines this backend because the
+  /// **coded** surface is over the frame ceiling.
+  ///
+  /// A `get_format` callback has no way to return a reason: declining
+  /// means returning `AV_PIX_FMT_NONE`, which libavcodec reports as
+  /// `Invalid data found when processing input`. That is a true
+  /// statement about what libavcodec saw and a false one about what
+  /// happened — the data was fine and this crate declined it — so the
+  /// reason is left here instead, where the probe machinery can pick it
+  /// up and give the caller the name the callback could not.
+  pub(crate) ceiling_declined: core::sync::atomic::AtomicBool,
+  /// The coded pixel count that was refused, for the message.
+  pub(crate) declined_pixels: core::sync::atomic::AtomicI64,
+  /// The ceiling it was refused against.
+  pub(crate) declined_limit: core::sync::atomic::AtomicI64,
+  /// The caller's [`FrameLimits::max_frame_bytes`](crate::FrameLimits::max_frame_bytes),
+  /// verbatim.
+  ///
+  /// **The single source of truth for the allocator judge.** It used to
+  /// be recovered from `AVCodecContext.max_pixels`, which is set to
+  /// `min(pixel ceiling, byte ceiling / worst-bytes-per-pixel)` — so
+  /// when the *pixel* seat was the tighter of the two, `max_pixels`
+  /// stopped encoding the byte ceiling at all and the recovery invented
+  /// a smaller one. A 256x256 frame at 16 bytes a pixel under
+  /// `max_pixels = 65536` and a 2 MiB byte budget satisfies both of the
+  /// caller's limits and costs 1,050,624 bytes — and was judged against
+  /// 1,048,576 and refused. The recovery also omitted the footprint's
+  /// own alignment and slack, which is where those extra 2,048 bytes
+  /// come from.
+  ///
+  /// Carried here instead, so the judge reads the number the caller
+  /// actually set.
+  pub(crate) max_frame_bytes: u64,
+  /// Set by `judge_buffer` when it refuses a **software** allocation
+  /// over [`Self::max_frame_bytes`].
+  ///
+  /// A `get_buffer2` callback can only answer with an errno, and
+  /// `AVERROR(EINVAL)` is what libavcodec also reports for corrupt
+  /// input — so a caller could not tell a budget refusal this crate
+  /// made from a broken file. The reason is left here and collected by
+  /// the decoder funnels, exactly as the `get_format` declination is.
+  pub(crate) frame_budget_declined: core::sync::atomic::AtomicBool,
+  /// What the refused frame would have cost.
+  pub(crate) declined_frame_bytes: core::sync::atomic::AtomicU64,
+  /// Whether the refused frame was audio (`true`) or a picture.
+  pub(crate) declined_frame_audio: core::sync::atomic::AtomicBool,
+}
+
+/// Reads and clears a software frame-budget refusal, if one was left.
+///
+/// Clear-on-read for the same reason the `get_format` declination is: a
+/// refusal that latched would be reported again against the next frame,
+/// which never declined anything.
+pub(crate) fn take_frame_budget_declination(
+  state: *const CallbackState,
+) -> Option<(u64, u64, bool)> {
+  use core::sync::atomic::Ordering;
+  if state.is_null() {
+    return None;
+  }
+  // SAFETY: `state` is the live `CallbackState` the caller owns; it is
+  // freed only after the codec context it belongs to.
+  let (declined, bytes, limit, audio) = unsafe {
+    (
+      (*state)
+        .frame_budget_declined
+        .swap(false, Ordering::Acquire),
+      (*state).declined_frame_bytes.load(Ordering::Relaxed),
+      (*state).max_frame_bytes,
+      (*state).declined_frame_audio.load(Ordering::Relaxed),
+    )
+  };
+  declined.then_some((bytes, limit, audio))
 }
 
 /// `AVCodecContext::get_format` callback. FFmpeg invokes it with the list of
@@ -202,10 +275,180 @@ pub(crate) unsafe extern "C" fn get_hw_format(
       return AVPixelFormat::AV_PIX_FMT_NONE;
     }
     if v == wanted_int {
+      // **The coded-dimension seat.** This is the last moment before
+      // the hardware frames pool is built, and the first at which the
+      // *coded* extent is known — which is the extent that gets
+      // allocated, and not the one `max_pixels` was checked against.
+      //
+      // `ff_set_dimensions` applies `av_image_check_size2` to the dims
+      // the decoder passes it, and for a cropped stream those are the
+      // **display** dims. Measured on this build with an h264 stream
+      // carrying SPS cropping of 32x32 out of a 1920x1088 macroblock
+      // grid — a 2040x divergence: `max_pixels = 5000` admits it,
+      // because 32x32 is 1024 pixels. The surface behind it is
+      // 2,088,960.
+      //
+      // On the software road that gap is already closed, and this was
+      // measured too: `get_buffer2` receives the frame at **coded**
+      // dims (1920x1088, aligned to 1920x1090, a 2 MiB allocation), so
+      // `judge_buffer` bounds the real extent. The hardware road never
+      // reaches `get_buffer2` at all — `ff_get_buffer` goes to
+      // `hwaccel->alloc_frame` — which leaves this callback as the only
+      // place the same number can be applied to the same extent.
+      //
+      // Refused by returning `AV_PIX_FMT_NONE`: that is already this
+      // callback's vocabulary for "not this backend", and the machinery
+      // around it already answers by falling back to software — where
+      // `judge_buffer` applies the very same ceiling to the very same
+      // coded dimensions. One number, both roads, and no refusal mode
+      // invented for the occasion.
+      // SAFETY: `state` is the live `CallbackState` this crate put in
+      // `opaque`; it outlives the codec context. A null one means a
+      // context this crate did not build, and gets no budget to judge
+      // against.
+      let budget = if state.is_null() {
+        u64::MAX
+      } else {
+        unsafe { (*state).max_frame_bytes }
+      };
+      if let Some((cost, limit)) = unsafe { coded_extent_over_ceiling(ctx, wanted, budget) } {
+        if !state.is_null() {
+          use core::sync::atomic::Ordering;
+          // SAFETY: as above.
+          unsafe {
+            (*state)
+              .declined_pixels
+              .store(i64::try_from(cost).unwrap_or(i64::MAX), Ordering::Relaxed);
+            (*state)
+              .declined_limit
+              .store(i64::try_from(limit).unwrap_or(i64::MAX), Ordering::Relaxed);
+            (*state).ceiling_declined.store(true, Ordering::Release);
+          }
+        }
+        return AVPixelFormat::AV_PIX_FMT_NONE;
+      }
       return wanted;
     }
     p = unsafe { p.add(1) };
   }
+}
+
+/// Whether this context's **coded** extent, aligned as the allocator
+/// will align it, exceeds the pixel ceiling the context carries.
+///
+/// Reads `max_pixels` off the context — the field the crate set itself,
+/// already carrying the byte ceiling converted at the worst per-pixel
+/// rate — so there is no state to thread and no second number to keep
+/// in step. The same read `judge_buffer` does on the software road.
+///
+/// Conservative when the context declares no coded extent: a zero or
+/// negative dimension is nothing to judge, and refusing it here would
+/// reject streams whose dimensions arrive later.
+///
+/// # Safety
+///
+/// `ctx` must be the live `AVCodecContext` FFmpeg passed to the
+/// callback.
+unsafe fn coded_extent_over_ceiling(
+  ctx: *mut AVCodecContext,
+  wanted: AVPixelFormat,
+  budget: u64,
+) -> Option<(u64, u64)> {
+  // **Ask the pool what it will be, and refuse it if it will not say.**
+  // `avcodec_get_hw_frames_parameters` builds the `AVHWFramesContext`
+  // the decoder is about to initialise — fully populated and *not yet*
+  // allocated — so its `width`/`height` are the pool's own declaration
+  // of its extent and its `sw_format` is the layout that extent is
+  // stored in.
+  //
+  // There used to be a fallback here: when the query failed, the judge
+  // computed the codec's own aligned dimensions instead. That fallback
+  // was unsound on its face, and the comment beside it said so — a
+  // hardware pool aligns by its own API's rules, and D3D11 HEVC and AV1
+  // round both dimensions to 128, so codec alignment can answer
+  // *smaller* than the pool. A conservative fallback that can
+  // under-state is not conservative; it is a hole with a comment on it.
+  //
+  // So this seat takes the rule the transfer judge already keeps: **a
+  // pool that will not declare itself is a pool that cannot be judged,
+  // and an unprovable extent is not a small one.** Refusing here
+  // declines the hardware format, which falls the decode back to
+  // software — where `judge_buffer` applies the same budget to the
+  // frame it can see.
+  //
+  // SAFETY: `ctx` is the live context; the out-parameter is a fresh
+  // null pointer FFmpeg fills with a reference we unref before
+  // returning, and the device reference is borrowed, not consumed.
+  let device_ref = unsafe { (*ctx).hw_device_ctx };
+  if device_ref.is_null() {
+    // No device means no hardware frames pool will be built at all, so
+    // there is nothing for this seat to guard. That is a different
+    // thing from a pool declining to describe itself, which is refused
+    // below — this crate's hardware road always attaches a device
+    // before opening, so reaching here means the caller is not on it.
+    return None;
+  }
+  let mut frames_ref: *mut ffmpeg_next::ffi::AVBufferRef = core::ptr::null_mut();
+  // **The format being negotiated, not `ctx->pix_fmt`.** At
+  // `get_format` time the context still carries the software format;
+  // asking about that one answers `ENOENT`. Measured: with the
+  // hardware format the query returns the pool's own 32x32
+  // declaration; with `ctx->pix_fmt` it returns -2.
+  let rc = unsafe {
+    ffmpeg_next::ffi::avcodec_get_hw_frames_parameters(ctx, device_ref, wanted, &mut frames_ref)
+  };
+  if rc < 0 || frames_ref.is_null() {
+    return Some((u64::MAX, budget));
+  }
+  // SAFETY: on success `frames_ref` holds a live, uninitialised
+  // `AVHWFramesContext`. `width`/`height` are plain `c_int`s;
+  // `sw_format` is read as the integer it is, never as an enum.
+  let (pool_w, pool_h, sw_format) = unsafe {
+    let fc = (*frames_ref).data as *const ffmpeg_next::ffi::AVHWFramesContext;
+    (
+      (*fc).width,
+      (*fc).height,
+      core::ptr::read(core::ptr::addr_of!((*fc).sw_format) as *const libc::c_int),
+    )
+  };
+  // SAFETY: the reference is ours to release and is released once.
+  unsafe { ffmpeg_next::ffi::av_buffer_unref(&mut frames_ref) };
+
+  let Some(cost) = pool_bytes(sw_format, pool_w, pool_h) else {
+    // Dimensions that are not a picture: nothing here can be priced,
+    // and nothing here will guess.
+    return Some((u64::MAX, budget));
+  };
+  if cost > budget {
+    tracing::warn!(
+      pool_width = pool_w,
+      pool_height = pool_h,
+      cost,
+      budget,
+      "hwdecode: the hardware surface pool exceeds the frame ceiling; declining the \
+       hardware format so the decode falls back to software, where the same ceiling applies"
+    );
+    return Some((cost, budget));
+  }
+  None
+}
+
+/// What a pool of `w` x `h` in `sw_format` costs.
+///
+/// Priced through the allocator-parity footprint when libavutil can
+/// size the layout, and through
+/// [`crate::footprint::video_frame_bytes_upper_bound`] when it cannot —
+/// which applies the same dimension alignment and per-plane overhead at
+/// the widest per-pixel rate, so it dominates every layout the build
+/// could have priced. The bare `w * h * 16` this replaced omitted both
+/// and could land *below* the accurate path.
+///
+/// `None` when the dimensions are not a picture, which callers treat as
+/// unjudgeable rather than free.
+fn pool_bytes(sw_format: libc::c_int, w: libc::c_int, h: libc::c_int) -> Option<u64> {
+  crate::footprint::video_frame_bytes(sw_format, w, h)
+    .or_else(|| crate::footprint::video_frame_bytes_upper_bound(w, h))
+    .map(|bytes| bytes as u64)
 }
 
 /// Walk the codec's `AVCodecHWConfig` table and return whether the codec
@@ -320,6 +563,13 @@ mod tests {
     CallbackState {
       wanted,
       wanted_int: wanted as i32,
+      ceiling_declined: core::sync::atomic::AtomicBool::new(false),
+      declined_pixels: core::sync::atomic::AtomicI64::new(0),
+      declined_limit: core::sync::atomic::AtomicI64::new(0),
+      max_frame_bytes: u64::MAX,
+      frame_budget_declined: core::sync::atomic::AtomicBool::new(false),
+      declined_frame_bytes: core::sync::atomic::AtomicU64::new(0),
+      declined_frame_audio: core::sync::atomic::AtomicBool::new(false),
     }
   }
 

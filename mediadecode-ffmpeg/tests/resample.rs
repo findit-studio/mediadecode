@@ -67,6 +67,7 @@ fn run(path: &std::path::Path, target: ResampleSpec) -> Converted {
       .clone_parameters()
       .expect("the checked handoff"),
     info.timebase(),
+    mediadecode_ffmpeg::DecoderLimits::default(),
   )
   .expect("open decoder");
 
@@ -80,7 +81,9 @@ fn run(path: &std::path::Path, target: ResampleSpec) -> Converted {
     "for PCM the declared spec and the decoder's own spec are the same",
   );
 
-  let mut resampler = FfmpegResampler::new(source, target).expect("open resampler");
+  let mut resampler =
+    FfmpegResampler::new(source, target, mediadecode_ffmpeg::FrameLimits::default())
+      .expect("open resampler");
   let mut decoded = empty_audio_frame();
   let mut out = empty_audio_frame();
   let mut converted = Converted {
@@ -266,7 +269,12 @@ fn a_mid_stream_format_change_is_refused_by_name() {
   support::init_ffmpeg();
 
   let source = ResampleSpec::new(48_000, Sample::I16(Type::Packed), ChannelLayout::STEREO);
-  let mut resampler = FfmpegResampler::new(source, mono_16k()).expect("open resampler");
+  let mut resampler = FfmpegResampler::new(
+    source,
+    mono_16k(),
+    mediadecode_ffmpeg::FrameLimits::default(),
+  )
+  .expect("open resampler");
 
   let good = mediadecode_ffmpeg::AudioFrame::new(
     48_000,
@@ -275,7 +283,7 @@ fn a_mid_stream_format_change_is_refused_by_name() {
     mediadecode_ffmpeg::SampleFormat::S16,
     mediadecode_ffmpeg::channel_layout_description_from_ffmpeg(&ChannelLayout::STEREO),
     std::array::from_fn(|_| {
-      mediadecode::frame::Plane::new(mediadecode_ffmpeg::FfmpegBuffer::empty(), 0)
+      mediadecode::frame::Plane::new(mediadecode_ffmpeg::FfmpegBytes::empty(), 0)
     }),
     1,
     Default::default(),
@@ -292,7 +300,7 @@ fn a_mid_stream_format_change_is_refused_by_name() {
     mediadecode_ffmpeg::SampleFormat::S16,
     mediadecode_ffmpeg::channel_layout_description_from_ffmpeg(&ChannelLayout::STEREO),
     std::array::from_fn(|_| {
-      mediadecode::frame::Plane::new(mediadecode_ffmpeg::FfmpegBuffer::empty(), 0)
+      mediadecode::frame::Plane::new(mediadecode_ffmpeg::FfmpegBytes::empty(), 0)
     }),
     1,
     Default::default(),
@@ -315,7 +323,7 @@ fn a_mid_stream_format_change_is_refused_by_name() {
     mediadecode_ffmpeg::SampleFormat::S16,
     mediadecode_ffmpeg::channel_layout_description_from_ffmpeg(&ChannelLayout::MONO),
     std::array::from_fn(|_| {
-      mediadecode::frame::Plane::new(mediadecode_ffmpeg::FfmpegBuffer::empty(), 0)
+      mediadecode::frame::Plane::new(mediadecode_ffmpeg::FfmpegBytes::empty(), 0)
     }),
     1,
     Default::default(),
@@ -330,7 +338,12 @@ fn a_mid_stream_format_change_is_refused_by_name() {
 fn the_needs_more_signal_is_an_error_variant() {
   support::init_ffmpeg();
   let source = ResampleSpec::new(48_000, Sample::I16(Type::Packed), ChannelLayout::STEREO);
-  let mut resampler = FfmpegResampler::new(source, mono_16k()).expect("open resampler");
+  let mut resampler = FfmpegResampler::new(
+    source,
+    mono_16k(),
+    mediadecode_ffmpeg::FrameLimits::default(),
+  )
+  .expect("open resampler");
   let mut dst = empty_audio_frame();
 
   let err = resampler
@@ -356,7 +369,7 @@ fn the_needs_more_signal_is_an_error_variant() {
     mediadecode_ffmpeg::SampleFormat::S16,
     mediadecode_ffmpeg::channel_layout_description_from_ffmpeg(&ChannelLayout::STEREO),
     std::array::from_fn(|_| {
-      mediadecode::frame::Plane::new(mediadecode_ffmpeg::FfmpegBuffer::empty(), 0)
+      mediadecode::frame::Plane::new(mediadecode_ffmpeg::FfmpegBytes::empty(), 0)
     }),
     1,
     Default::default(),
@@ -420,13 +433,13 @@ fn filled_frame(
   bytes: &[u8],
   pts: Option<i64>,
 ) -> mediadecode_ffmpeg::AudioFrame {
-  let plane = mediadecode_ffmpeg::FfmpegBuffer::copy_from_slice(bytes).expect("plane allocation");
+  let plane = mediadecode_ffmpeg::FfmpegBytes::copy_from_slice(bytes);
   let planes = std::array::from_fn(|index| {
     mediadecode::frame::Plane::new(
       if index == 0 {
         plane.clone()
       } else {
-        mediadecode_ffmpeg::FfmpegBuffer::empty()
+        mediadecode_ffmpeg::FfmpegBytes::empty()
       },
       0,
     )
@@ -474,7 +487,11 @@ fn a_custom_layout_is_refused_by_name() {
   let custom = ChannelLayout(raw);
 
   let hazardous = ResampleSpec::new(48_000, Sample::I16(Type::Packed), custom);
-  match FfmpegResampler::new(hazardous, mono_16k()) {
+  match FfmpegResampler::new(
+    hazardous,
+    mono_16k(),
+    mediadecode_ffmpeg::FrameLimits::default(),
+  ) {
     Err(ResampleError::UnsupportedLayout(p)) => {
       assert_eq!(p.end().to_string(), "source");
       assert_eq!(p.channels(), 2);
@@ -488,8 +505,7 @@ fn a_custom_layout_is_refused_by_name() {
   assert!(matches!(
     FfmpegResampler::new(
       source,
-      ResampleSpec::new(16_000, Sample::I16(Type::Packed), custom)
-    ),
+      ResampleSpec::new(16_000, Sample::I16(Type::Packed), custom), mediadecode_ffmpeg::FrameLimits::default()),
     Err(ResampleError::UnsupportedLayout(p)) if p.end() == mediadecode_ffmpeg::SpecEnd::Target,
   ));
 
@@ -501,14 +517,14 @@ fn a_custom_layout_is_refused_by_name() {
   assert!(matches!(
     FfmpegResampler::new(
       ResampleSpec::new(0, Sample::I16(Type::Packed), ChannelLayout::STEREO),
-      mono_16k(),
-    ),
+      mono_16k(), mediadecode_ffmpeg::FrameLimits::default()),
     Err(ResampleError::UnsupportedRate(p)) if p.rate() == 0,
   ));
   assert!(matches!(
     FfmpegResampler::new(
       ResampleSpec::new(48_000, Sample::None, ChannelLayout::STEREO),
       mono_16k(),
+      mediadecode_ffmpeg::FrameLimits::default()
     ),
     Err(ResampleError::UnsupportedFormat(_)),
   ));
@@ -517,8 +533,7 @@ fn a_custom_layout_is_refused_by_name() {
   assert!(matches!(
     FfmpegResampler::new(
       ResampleSpec::new(48_000, Sample::I16(Type::Packed), ChannelLayout(empty)),
-      mono_16k(),
-    ),
+      mono_16k(), mediadecode_ffmpeg::FrameLimits::default()),
     Err(ResampleError::UnsupportedLayout(p)) if p.channels() == 0,
   ));
 }
@@ -584,7 +599,12 @@ fn no_accepted_conversion_silently_drops_a_channel() {
   // 7.1 -> mono: an everyday downmix, accepted.
   let source = ResampleSpec::new(rate, Sample::I16(Type::Packed), ChannelLayout::_7POINT1);
   for channel in 0..8 {
-    let mut resampler = FfmpegResampler::new(source, mono_16k()).expect("7.1 -> mono opens");
+    let mut resampler = FfmpegResampler::new(
+      source,
+      mono_16k(),
+      mediadecode_ffmpeg::FrameLimits::default(),
+    )
+    .expect("7.1 -> mono opens");
     let rms = converted_rms(
       &mut resampler,
       &tone_in_one_channel(rate, samples, ChannelLayout::_7POINT1, channel),
@@ -609,7 +629,9 @@ fn no_accepted_conversion_silently_drops_a_channel() {
   let source = ResampleSpec::new(rate, Sample::I16(Type::Packed), big);
   let target = ResampleSpec::new(16_000, Sample::I16(Type::Packed), big);
   for channel in 0..24 {
-    let mut resampler = FfmpegResampler::new(source, target).expect("22.2 -> 22.2 opens");
+    let mut resampler =
+      FfmpegResampler::new(source, target, mediadecode_ffmpeg::FrameLimits::default())
+        .expect("22.2 -> 22.2 opens");
     let rms = converted_rms(
       &mut resampler,
       &tone_in_one_channel(rate, samples, big, channel),
@@ -628,7 +650,11 @@ fn a_rematrix_that_would_drop_channels_is_refused_by_name() {
   // processes the rest as though they were not there. It used to open
   // happily — the planar-only refusal never looked at it.
   let source = ResampleSpec::new(48_000, Sample::I16(Type::Packed), ChannelLayout::_22POINT2);
-  match FfmpegResampler::new(source, mono_16k()) {
+  match FfmpegResampler::new(
+    source,
+    mono_16k(),
+    mediadecode_ffmpeg::FrameLimits::default(),
+  ) {
     Err(ResampleError::ChannelDropped(p)) => {
       assert_eq!((p.source_channels(), p.target_channels()), (24, 1));
       assert_eq!(
@@ -647,8 +673,7 @@ fn a_rematrix_that_would_drop_channels_is_refused_by_name() {
     matches!(
       FfmpegResampler::new(
         ResampleSpec::new(48_000, Sample::I16(Type::Packed), ChannelLayout::CUBE),
-        ResampleSpec::new(16_000, Sample::I16(Type::Packed), ChannelLayout::STEREO),
-      )
+        ResampleSpec::new(16_000, Sample::I16(Type::Packed), ChannelLayout::STEREO), mediadecode_ffmpeg::FrameLimits::default())
       .map(|_| ()),
       Err(ResampleError::ChannelDropped(p)) if p.channel() == 6,
     ),
@@ -688,6 +713,7 @@ fn a_rematrix_that_would_drop_channels_is_refused_by_name() {
     FfmpegResampler::new(
       ResampleSpec::new(48_000, Sample::I16(Type::Packed), source_layout),
       ResampleSpec::new(16_000, Sample::I16(Type::Packed), target_layout),
+      mediadecode_ffmpeg::FrameLimits::default(),
     )
     .unwrap_or_else(|e| panic!("{name} must still open: {e}"));
   }
@@ -792,7 +818,9 @@ fn an_unspecified_layout_cannot_smuggle_a_lossy_conversion_past_the_pair_check()
   let source = ResampleSpec::new(48_000, Sample::I16(Type::Packed), unspec24);
   for target_layout in [ChannelLayout::MONO, ChannelLayout::STEREO] {
     let target = ResampleSpec::new(16_000, Sample::I16(Type::Packed), target_layout);
-    match FfmpegResampler::new(source, target).map(|_| ()) {
+    match FfmpegResampler::new(source, target, mediadecode_ffmpeg::FrameLimits::default())
+      .map(|_| ())
+    {
       Err(ResampleError::ChannelDropped(p)) => {
         assert_eq!(p.source_channels(), 24);
         assert_eq!(
@@ -824,7 +852,9 @@ fn the_maskless_wav_population_still_converts() {
     Sample::I16(Type::Packed),
     ResampleSpec::unspecified_layout(1),
   );
-  let mut resampler = FfmpegResampler::new(mono, mono_16k()).expect("maskless mono still opens");
+  let mut resampler =
+    FfmpegResampler::new(mono, mono_16k(), mediadecode_ffmpeg::FrameLimits::default())
+      .expect("maskless mono still opens");
   let rms = converted_rms(
     &mut resampler,
     &tone_in_one_channel(rate, samples, ResampleSpec::unspecified_layout(1), 0),
@@ -837,8 +867,12 @@ fn the_maskless_wav_population_still_converts() {
   let stereo_layout = ResampleSpec::unspecified_layout(2);
   let stereo = ResampleSpec::new(rate, Sample::I16(Type::Packed), stereo_layout);
   for channel in 0..2 {
-    let mut resampler =
-      FfmpegResampler::new(stereo, mono_16k()).expect("maskless stereo still opens");
+    let mut resampler = FfmpegResampler::new(
+      stereo,
+      mono_16k(),
+      mediadecode_ffmpeg::FrameLimits::default(),
+    )
+    .expect("maskless stereo still opens");
     let rms = converted_rms(
       &mut resampler,
       &tone_in_one_channel(rate, samples, stereo_layout, channel),
@@ -862,6 +896,7 @@ fn the_maskless_wav_population_still_converts() {
       Sample::I16(Type::Packed),
       ResampleSpec::unspecified_layout(24),
     ),
+    mediadecode_ffmpeg::FrameLimits::default(),
   )
   .expect("nothing is being rematrixed here");
 }
@@ -878,7 +913,11 @@ fn a_planar_layout_past_eight_channels_is_refused_at_construction() {
   let planar_22_2 = ResampleSpec::new(48_000, Sample::F32(Type::Planar), ChannelLayout::_22POINT2);
   assert_eq!(planar_22_2.channels(), 24, "22.2 really is 24 channels");
 
-  match FfmpegResampler::new(planar_22_2, mono_16k()) {
+  match FfmpegResampler::new(
+    planar_22_2,
+    mono_16k(),
+    mediadecode_ffmpeg::FrameLimits::default(),
+  ) {
     Err(ResampleError::TooManyPlanes(p)) => {
       assert_eq!(p.end().to_string(), "source");
       assert_eq!((p.channels(), p.limit()), (24, 8));
@@ -890,7 +929,7 @@ fn a_planar_layout_past_eight_channels_is_refused_at_construction() {
   let stereo = ResampleSpec::new(48_000, Sample::I16(Type::Packed), ChannelLayout::STEREO);
   assert!(
     matches!(
-      FfmpegResampler::new(stereo, planar_22_2).map(|_| ()),
+      FfmpegResampler::new(stereo, planar_22_2, mediadecode_ffmpeg::FrameLimits::default()).map(|_| ()),
       Err(ResampleError::TooManyPlanes(p))
         if p.end() == mediadecode_ffmpeg::SpecEnd::Target && p.channels() == 24,
     ),
@@ -906,6 +945,7 @@ fn a_planar_layout_past_eight_channels_is_refused_at_construction() {
   FfmpegResampler::new(
     ResampleSpec::new(48_000, Sample::I16(Type::Packed), ChannelLayout::_22POINT2),
     ResampleSpec::new(16_000, Sample::I16(Type::Packed), ChannelLayout::_22POINT2),
+    mediadecode_ffmpeg::FrameLimits::default(),
   )
   .expect("packed 22.2 is one plane");
   assert!(
@@ -913,6 +953,7 @@ fn a_planar_layout_past_eight_channels_is_refused_at_construction() {
       FfmpegResampler::new(
         ResampleSpec::new(48_000, Sample::F32(Type::Planar), ChannelLayout::_22POINT2),
         ResampleSpec::new(16_000, Sample::F32(Type::Planar), ChannelLayout::_22POINT2),
+        mediadecode_ffmpeg::FrameLimits::default()
       )
       .map(|_| ()),
       Err(ResampleError::TooManyPlanes(_)),
@@ -922,6 +963,7 @@ fn a_planar_layout_past_eight_channels_is_refused_at_construction() {
   FfmpegResampler::new(
     ResampleSpec::new(48_000, Sample::F32(Type::Planar), ChannelLayout::_7POINT1),
     mono_16k(),
+    mediadecode_ffmpeg::FrameLimits::default(),
   )
   .expect("eight planar channels is exactly the limit");
 }
@@ -930,7 +972,12 @@ fn a_planar_layout_past_eight_channels_is_refused_at_construction() {
 fn a_forged_frame_geometry_is_refused_before_it_can_allocate() {
   support::init_ffmpeg();
   let source = ResampleSpec::new(48_000, Sample::I16(Type::Packed), ChannelLayout::STEREO);
-  let mut resampler = FfmpegResampler::new(source, mono_16k()).expect("open resampler");
+  let mut resampler = FfmpegResampler::new(
+    source,
+    mono_16k(),
+    mediadecode_ffmpeg::FrameLimits::default(),
+  )
+  .expect("open resampler");
 
   // A header claiming more samples than a `c_int` can hold, over a
   // plane holding sixteen bytes. Sizing the staging allocation off the
@@ -959,7 +1006,7 @@ fn a_forged_frame_geometry_is_refused_before_it_can_allocate() {
     mediadecode_ffmpeg::SampleFormat::S16,
     mediadecode_ffmpeg::channel_layout_description_from_ffmpeg(&ChannelLayout::STEREO),
     std::array::from_fn(|_| {
-      mediadecode::frame::Plane::new(mediadecode_ffmpeg::FfmpegBuffer::empty(), 0)
+      mediadecode::frame::Plane::new(mediadecode_ffmpeg::FfmpegBytes::empty(), 0)
     }),
     0,
     Default::default(),
@@ -980,7 +1027,12 @@ fn a_forged_frame_geometry_is_refused_before_it_can_allocate() {
 fn a_refused_frame_does_not_stamp_the_next_good_one() {
   support::init_ffmpeg();
   let source = ResampleSpec::new(48_000, Sample::I16(Type::Packed), ChannelLayout::STEREO);
-  let mut resampler = FfmpegResampler::new(source, mono_16k()).expect("open resampler");
+  let mut resampler = FfmpegResampler::new(
+    source,
+    mono_16k(),
+    mediadecode_ffmpeg::FrameLimits::default(),
+  )
+  .expect("open resampler");
 
   // The first frame the session ever sees is a forged one carrying a
   // timestamp far down the timeline. Anchoring before staging took its
@@ -1016,7 +1068,9 @@ fn a_timestamp_that_cannot_be_rescaled_is_refused_before_anything_moves() {
   // timestamp was not clamped, it was erased.
   let source = ResampleSpec::new(48_000, Sample::I16(Type::Packed), ChannelLayout::STEREO);
   let target = ResampleSpec::new(192_000, Sample::I16(Type::Packed), ChannelLayout::MONO);
-  let mut resampler = FfmpegResampler::new(source, target).expect("open resampler");
+  let mut resampler =
+    FfmpegResampler::new(source, target, mediadecode_ffmpeg::FrameLimits::default())
+      .expect("open resampler");
 
   let samples = 480;
   let bytes = samples as usize * 2 * 2;
@@ -1065,7 +1119,9 @@ fn the_output_timeline_refuses_to_overflow() {
   // can move it.
   let source = ResampleSpec::new(48_000, Sample::I16(Type::Packed), ChannelLayout::STEREO);
   let target = ResampleSpec::new(48_000, Sample::I16(Type::Packed), ChannelLayout::MONO);
-  let mut resampler = FfmpegResampler::new(source, target).expect("open resampler");
+  let mut resampler =
+    FfmpegResampler::new(source, target, mediadecode_ffmpeg::FrameLimits::default())
+      .expect("open resampler");
 
   let samples = 4_800;
   let frame = stereo_frame(samples, samples as usize * 2 * 2, Some(i64::MAX - 8));
@@ -1113,7 +1169,12 @@ fn flush_leaves_nothing_of_the_previous_stream_behind() {
   // A fractional ratio, so the filter really holds a tail between
   // calls: 44100 -> 16000 is 441:160.
   let source = ResampleSpec::new(44_100, Sample::I16(Type::Packed), ChannelLayout::MONO);
-  let mut resampler = FfmpegResampler::new(source, mono_16k()).expect("open resampler");
+  let mut resampler = FfmpegResampler::new(
+    source,
+    mono_16k(),
+    mediadecode_ffmpeg::FrameLimits::default(),
+  )
+  .expect("open resampler");
 
   let mut out = empty_audio_frame();
   for index in 0..4 {
@@ -1158,5 +1219,64 @@ fn flush_leaves_nothing_of_the_previous_stream_behind() {
   assert!(
     loudest < 100,
     "silence came out at amplitude {loudest}: the previous stream's tail survived the flush",
+  );
+}
+
+#[test]
+fn a_packed_spec_above_255_channels_is_refused_at_construction() {
+  support::init_ffmpeg();
+
+  // The packed sibling of the plane ceiling. `TooManyPlanes` only ever
+  // looked at planar specs, because packed audio declares one plane at
+  // any channel count — so a 256-channel packed spec walked through and
+  // had its count clipped to 255 on the way into every output frame,
+  // which then advertised a shape its bytes were not computed from.
+  //
+  // Refused at construction, like every other spec this backend cannot
+  // carry: the target end's refusal would otherwise arrive after `swr`
+  // had consumed the input.
+  let wide = ResampleSpec::new(
+    48_000,
+    Sample::I16(Type::Packed),
+    ChannelLayout::default(256),
+  );
+  match FfmpegResampler::new(wide, mono_16k(), mediadecode_ffmpeg::FrameLimits::default()) {
+    Err(ResampleError::UnsupportedChannelCount(p)) => {
+      assert_eq!(p.end(), mediadecode_ffmpeg::SpecEnd::Source);
+      assert_eq!(p.channels(), 256, "the refusal reports the declared count");
+      assert_eq!(p.limit(), 255);
+    }
+    Err(other) => panic!("expected UnsupportedChannelCount, got {other:?}"),
+    Ok(_) => panic!("256 packed channels must not reach a frame's channel seat"),
+  }
+
+  // The same refusal from the other end.
+  let source = ResampleSpec::new(48_000, Sample::I16(Type::Packed), ChannelLayout::STEREO);
+  assert!(matches!(
+    FfmpegResampler::new(
+      source,
+      ResampleSpec::new(16_000, Sample::I16(Type::Packed), ChannelLayout::default(256)),
+      mediadecode_ffmpeg::FrameLimits::default(),
+    ),
+    Err(ResampleError::UnsupportedChannelCount(p)) if p.end() == mediadecode_ffmpeg::SpecEnd::Target,
+  ));
+
+  // And the ceiling does not fire below itself. It cannot be asserted
+  // as a *success* at 255: `swr` has its own, lower limit (`SWR_CH_MAX`
+  // is 64) and answers EINVAL well before this arm's boundary. So the
+  // claim this lane can make — and the one that matters — is that a
+  // count inside the seat is never attributed to *this* refusal. Every
+  // ordinary count in the rest of this file constructs fine.
+  let ok = ResampleSpec::new(
+    48_000,
+    Sample::I16(Type::Packed),
+    ChannelLayout::default(255),
+  );
+  assert!(
+    !matches!(
+      FfmpegResampler::new(ok, mono_16k(), mediadecode_ffmpeg::FrameLimits::default()),
+      Err(ResampleError::UnsupportedChannelCount(_)),
+    ),
+    "255 is inside the seat; whatever refuses it, it is not this ceiling",
   );
 }

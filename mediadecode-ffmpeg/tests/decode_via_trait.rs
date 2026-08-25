@@ -5,7 +5,7 @@
 //!
 //! Two pieces:
 //! 1. **Compile-time check** (always run): a generic helper bounded on
-//!    `VideoStreamDecoder<Adapter = Ffmpeg, Buffer = FfmpegBuffer>`
+//!    `VideoStreamDecoder<Adapter = Ffmpeg, Buffer = FfmpegBytes>`
 //!    accepts a `FfmpegVideoStreamDecoder`. If trait associated types
 //!    or method signatures drift, this fails to build.
 //! 2. **Runtime smoke** (`#[ignore]`-gated unless
@@ -18,8 +18,8 @@ use ffmpeg::{format, media};
 use ffmpeg_next as ffmpeg;
 use mediadecode::{Timebase, decoder::VideoStreamDecoder};
 use mediadecode_ffmpeg::{
-  Ffmpeg, FfmpegBuffer, FfmpegVideoStreamDecoder, VideoFrame, VideoPacket, empty_video_frame,
-  video_packet_from_ffmpeg,
+  DecoderLimits, Ffmpeg, FfmpegBytes, FfmpegVideoStreamDecoder, VideoFrame, VideoPacket,
+  empty_video_frame, video_packet_from_ffmpeg,
 };
 use std::num::NonZeroI32;
 
@@ -31,7 +31,7 @@ fn decode_through_trait<D>(
   dst: &mut VideoFrame,
 ) -> Result<bool, D::Error>
 where
-  D: VideoStreamDecoder<Adapter = Ffmpeg, Buffer = FfmpegBuffer>,
+  D: VideoStreamDecoder<Adapter = Ffmpeg, Buffer = FfmpegBytes>,
 {
   decoder.send_packet(packet)?;
   match decoder.receive_frame(dst) {
@@ -44,7 +44,7 @@ where
 fn ffmpeg_video_stream_decoder_implements_trait() {
   fn _accepts<D>(_: D)
   where
-    D: VideoStreamDecoder<Adapter = Ffmpeg, Buffer = FfmpegBuffer>,
+    D: VideoStreamDecoder<Adapter = Ffmpeg, Buffer = FfmpegBytes>,
   {
   }
 
@@ -78,7 +78,8 @@ fn decode_one_frame_through_trait() {
   );
 
   let mut decoder =
-    FfmpegVideoStreamDecoder::open(stream.parameters(), time_base).expect("open decoder");
+    FfmpegVideoStreamDecoder::open(stream.parameters(), time_base, DecoderLimits::default())
+      .expect("open decoder");
 
   eprintln!(
     "decoder opened — initial path: {}",

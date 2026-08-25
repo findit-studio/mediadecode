@@ -1,31 +1,170 @@
 //! Conversion helpers from FFmpeg `AVFrame` / `AVPacket` to the
 //! `mediadecode` types parameterized by [`crate::Ffmpeg`] and
-//! [`crate::FfmpegBuffer`].
+//! `FfmpegBytes`.
 //!
-//! The video-frame conversion is **zero-copy**: each plane is exposed
-//! as an `FfmpegBuffer` view into the underlying `AVBufferRef`, so the
-//! FFmpeg-allocated pixel memory is shared between the source frame
-//! and the produced `VideoFrame`. Cloning the resulting `VideoFrame`
-//! bumps refcounts; dropping releases them.
+//! Every plane is **copied once**, here, out of FFmpeg's
+//! `AVBufferRef` and into Rust-owned memory — the
+//! [D-seat amputation contract][law]. Through 0.8 the video path
+//! exported a refcounted *view* into libavcodec's own allocation
+//! whenever the stride happened to be tight, and copied only when it
+//! was padded; a consumer therefore inherited an FFmpeg lifetime it
+//! could not see, on some frames and not others. 0.9 copies both
+//! branches. What is unchanged is the *shape* each branch produces —
+//! a tight plane keeps the decoder's `linesize` as its stride, a
+//! padded one is compacted to `row_bytes` — because that geometry is
+//! what consumers read, and the amputation is about ownership, not
+//! about relaying out the picture.
+//!
+//! # Header fields: the validation-order census
+//!
+//! Every number in this module comes out of an `AVFrame` a file chose
+//! the contents of, and each one is answerable to two questions —
+//! *what judges it*, and *what reads it first*. When the second
+//! precedes the first, the judgement is being made against a value its
+//! own consumer has already laundered, which is not a judgement. That
+//! is not hypothetical: it is how a declared `-1` channel count reached
+//! a ceiling as a legitimate-looking `0`, having been floored by the
+//! very helper the ceiling was supposed to run before.
+//!
+//! So the order is censused rather than assumed. Every raw header field
+//! these three paths read, with its validator and its first consumer:
+//!
+//! | path | field | validator | first consumer | order |
+//! |---|---|---|---|---|
+//! | audio | `nb_samples` | `< 0` → [`InvalidSampleCount`] | the byte product | validator first |
+//! | audio | `ch_layout.nb_channels` | `< 0`, `> 255`, `== 0` with samples → [`UnsupportedChannelCount`] | `channel_layout_description_from_raw_ptr` | **was inverted — hoisted** |
+//! | audio | `format` | `bytes_per_sample()` → [`UnsupportedSampleFormat`] | `is_planar()`, for the plane count | validator first |
+//! | audio | `linesize[0]` | `< 0`, and `== 0` with samples → [`InvalidPlaneLayout`] | `allocated_per_plane` | validator first |
+//! | audio | `sample_rate` | none — censused metadata | `AudioFrame::new` | no geometry rides it |
+//! | audio | `data[i]` | null check, then the backing-buffer proof | the copy | validator first |
+//! | picture | `width` / `height` | `< 0` → [`InvalidDimensions`] | `copy_out_planes`' pixel ceiling | **was inverted — hoisted** |
+//! | picture | `format` | `is_deliverable` → unsupported-format | `plane_geometry` | validator first |
+//! | picture | `linesize[i]` | `<= 0` **and** `< row_bytes[i]` → [`InvalidPlaneLayout`] | its own pass, after the budget and before any copy | validator first |
+//! | picture | `crop_*` | `checked_add` per pair, then `sum < extent` | the rect | validator first |
+//! | picture | `nb_side_data`, entry `size` (still road) | the entry cap and [`FrameLimits::max_image_side_data_bytes`](crate::FrameLimits::max_image_side_data_bytes) | the plane copy, then the side-data copy | **was inverted — hoisted ahead of `copy_out_planes`** |
+//! | picture | colour enums, `pict_type` | the raw `i32` fold, which is total | the fold's own output | the fold *is* the validator |
+//! | packet | `flags` (`AV_PKT_FLAG_TRUSTED`) | [`crate::buffer::TrustedPayload`], both legs | the payload copy | validator first |
+//!
+//! # The open-C-enum sweep, including this crate's own code
+//!
+//! The same discipline, applied to *entry points* rather than fields: a
+//! value read out of FFmpeg memory as a closed Rust enum is undefined
+//! behaviour before any comparison on it can run, and FFmpeg extends
+//! these enums in ABI-compatible releases.
+//!
+//! | caller | entry point | enum | closed by |
+//! |---|---|---|---|
+//! | image / video / audio / subtitle open | `Decoder::{video,audio,subtitle}()` | `AVCodecID`, `AVMediaType` | `find_decoder` (raw `u32`) + `ensure_codec_type` (raw `i32`) |
+//! | track build, attachment classify, resampler spec, `Debug` | `Parameters::medium()` | `AVMediaType` | `boundary::media_kind_of`, a total fold |
+//! | **the pixel-format census** | `av_pix_fmt_desc_get_id` | `AVPixelFormat` | local `c_int` shim |
+//! | **the pixel-format census** | `av_image_get_buffer_size` | `AVPixelFormat` | local `c_int` shim |
+//! | **the sample-format census** | `av_get_bytes_per_sample` | `AVSampleFormat` | local `c_int` shim |
+//! | HW format negotiation | `get_format` callback list | `AVPixelFormat` | walked as `*const i32` |
+//!
+//! # The dimension-vocabulary sweep
+//!
+//! A frame has more than one extent, and a judge that reads the wrong
+//! one is not a judge. `AVFrame.width`/`.height` are the **display**
+//! dims; what gets *allocated* is the **coded** extent on the software
+//! road and the **frames-context pool** on the hardware one. On a
+//! cropped stream they diverge without limit — measured on this build,
+//! an h264 clip carrying SPS cropping shows 32x32 display over a
+//! 1920x1088 coded surface, a 2040x gap.
+//!
+//! Every site that reads a dimension, and which vocabulary it needs:
+//!
+//! | site | reads | sizes what | verdict |
+//! |---|---|---|---|
+//! | `judge_buffer` | `AVFrame.width/height` at `get_buffer2` | the software allocation's **cost** | **correct**: measured, libavcodec hands this hook the frame at *coded* extent (1920x1088, aligned 1920x1090, 2,092,831 bytes), and the footprint prices those aligned dims against `max_frame_bytes`. Logical extent is not this seat's question — `max_pixels` is enforced by `ff_set_dimensions` against the **raw** dims, which is the semantics it has |
+//! | `get_hw_format` | `AVCodecContext.coded_width/height` | the hardware pool | **correct, and new**: the display dims `max_pixels` was checked against are blind to it |
+//! | `judge_hw_transfer` | the frames-context pool dims | the transfer's CPU destination | **was display — repriced** |
+//! | `estimate_transfer_bytes` | the frames-context pool dims | the probe's pending budget | correct already, and its doc named this trap first |
+//! | `drain_into_pending` (two sites) | `AVFrame.width/height` | **nothing** — log fields only | benign |
+//! | `VideoDecoder::width/height` | the decoder's display dims | nothing; a public accessor | correct — display is what a caller is asking for |
+//! | `copy_out_planes` | the converted frame's own extent | the plane copy | correct — a decoded CPU frame's extent *is* its allocation |
+//!
+//! The pattern worth keeping: **the extent to judge is the one the
+//! allocator will use, and it is never assumed — it is read from
+//! whatever structure the allocation is sized from.** Where that
+//! structure cannot be read, the judge fails closed, because an
+//! unprovable extent is not a small one.
+//!
+//! And the capstone the whole series arrives at, which generalises both
+//! tables above:
+//!
+//! > **A judge must dominate the allocator's arithmetic, not the
+//! > payload's.**
+//!
+//! Every ceiling here answers "may this be allocated?", so the number
+//! it compares has to be what the *allocator* will take — not what the
+//! bytes nominally weigh, not what a tight layout would cost, and not
+//! what the header displays. The two differ by under one percent on
+//! ordinary frames, which is precisely why every under-pricing defect
+//! in this release hid behind a shape big enough for the slack not to
+//! show: `nv12` 16x16 is 384 bytes of pixels and a 1,792-byte
+//! allocation, a one-sample eight-channel planar frame is 16 bytes of
+//! samples and 768 allocated, and `yuv420p` 1920x1080 is 3,110,400
+//! against 3,133,696. See [`crate::footprint`], where the pricing lives
+//! and where the estimates are verified against real allocations rather
+//! than argued.
+//!
+//! The last three rows of the enum table above are the class **inside
+//! this crate's own new code**, and the census rows are its sharpest instance: that code
+//! exists precisely to price formats this build's bindings may not
+//! name, and the binding it called handed those ids back as a closed
+//! `AVPixelFormat`. Every future format would have become an invalid
+//! enum value on the way into the pricing meant to handle it — the
+//! census would have been undefined behaviour on exactly its reason for
+//! existing. Writing the discipline down was not enough; it had to be
+//! re-applied to the code that enforces it.
+//!
+//! The still road's side-data judgement is the same lesson one level
+//! up, about passes rather than fields: it was correct, and it ran
+//! after `copy_out_planes`, so an over-budget still had already bought
+//! up to `max_frame_bytes` of plane copies before its annotations were
+//! totalled. It reads only header fields and allocates nothing, so it
+//! now runs with the other free judgements. **Everything a conversion
+//! can refuse is refused before anything it can allocate is
+//! allocated.**
+//!
+//! The picture road's byte ceiling is now judged from the **geometry
+//! alone** — the format's row width times its row count, which no
+//! number the frame chose can influence — so it runs before any stride
+//! is so much as read. Then every stride is judged, in its own pass,
+//! before a single plane is bought: a layout fault is a property of the
+//! frame, knowable before any of it is paid for, and discovering it
+//! three plane allocations in was how a refused frame still cost three
+//! allocations.
+//!
+//! The colour row is the shape to copy: a fold that cannot fail and
+//! maps everything unknown onto a named "not stated" leaves nothing for
+//! an order to get wrong.
+//!
+//! [law]: mediadecode::adapter#the-d-seat-amputation-contract
 use core::ptr::{addr_of, read_unaligned};
 
 use derive_more::{IsVariant, TryUnwrap, Unwrap};
 use ffmpeg_next::ffi::{
   AV_NOPTS_VALUE, AVChromaLocation, AVColorPrimaries, AVColorRange, AVColorSpace,
-  AVColorTransferCharacteristic, AVFrame, AVPictureType, AVSubtitleType, av_buffer_alloc,
+  AVColorTransferCharacteristic, AVFrame, AVFrameSideDataType, AVPictureType, AVSubtitleType,
 };
 use mediadecode::{
   PixelFormat, Timebase, Timestamp,
   color::{ChromaLocation, ColorInfo, ColorMatrix, ColorPrimaries, ColorRange, ColorTransfer},
-  frame::{AudioFrame, Dimensions, Plane, Rect, SubtitleFrame, VideoFrame},
+  frame::{AudioFrame, Dimensions, ImageFrame, Plane, Rect, SubtitleFrame, VideoFrame},
   subtitle::{Bitmap as SubtitleBitmap, SubtitlePayload, Text as SubtitleText},
 };
 use mediaframe::audio::ChannelLayoutDescription;
 use smol_str::SmolStr;
 
 use crate::{
-  FfmpegBuffer, boundary,
-  extras::{AudioFrameExtra, PictureType, SideDataEntry, SubtitleFrameExtra, VideoFrameExtra},
+  boundary,
+  buffer::FfmpegBytes,
+  extras::{
+    AudioFrameExtra, ImageFrameExtra, ImageOrientation, PictureType, SideDataEntry,
+    SubtitleFrameExtra, VideoFrameExtra,
+  },
+  limits::FrameLimits,
   pixdesc,
   sample_format::SampleFormat,
 };
@@ -156,6 +295,336 @@ impl core::fmt::Display for BufferAcquireFailed {
   }
 }
 
+/// Payload for [`ConvertError::TooManyPixels`].
+///
+/// A frame declares more pixels than the session's
+/// [`FrameLimits::max_pixels`] allows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TooManyPixels {
+  pixels: u64,
+  limit: u64,
+}
+
+impl TooManyPixels {
+  /// Constructs a `TooManyPixels` payload.
+  #[inline]
+  pub const fn new(pixels: u64, limit: u64) -> Self {
+    Self { pixels, limit }
+  }
+  /// The pixel count the frame declared.
+  #[inline]
+  pub const fn pixels(&self) -> u64 {
+    self.pixels
+  }
+  /// The ceiling in force.
+  #[inline]
+  pub const fn limit(&self) -> u64 {
+    self.limit
+  }
+}
+
+impl core::fmt::Display for TooManyPixels {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    write!(
+      f,
+      "convert: a {}-pixel frame exceeds the {}-pixel ceiling",
+      self.pixels, self.limit
+    )
+  }
+}
+
+/// Payload for [`ConvertError::FrameTooLarge`].
+///
+/// A frame's planes would export more bytes than the session's
+/// [`FrameLimits::max_frame_bytes`] allows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameTooLarge {
+  bytes: usize,
+  limit: usize,
+}
+
+impl FrameTooLarge {
+  /// Constructs a `FrameTooLarge` payload.
+  #[inline]
+  pub const fn new(bytes: usize, limit: usize) -> Self {
+    Self { bytes, limit }
+  }
+  /// The bytes the frame's planes would have exported.
+  #[inline]
+  pub const fn bytes(&self) -> usize {
+    self.bytes
+  }
+  /// The ceiling in force.
+  #[inline]
+  pub const fn limit(&self) -> usize {
+    self.limit
+  }
+}
+
+impl core::fmt::Display for FrameTooLarge {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    write!(
+      f,
+      "convert: a frame exporting {} bytes exceeds the {}-byte ceiling",
+      self.bytes, self.limit
+    )
+  }
+}
+
+/// Payload for [`ConvertError::InvalidSampleCount`].
+///
+/// An audio frame declares a negative `nb_samples`.
+///
+/// Refused rather than floored to zero. A negative count is not an
+/// empty frame — it is a header that cannot be read — and clamping it
+/// turned a malformed frame into a well-formed empty one that a
+/// consumer would have gone on decoding past.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidSampleCount {
+  count: i32,
+}
+
+impl InvalidSampleCount {
+  /// Constructs an `InvalidSampleCount` payload.
+  #[inline]
+  pub const fn new(count: i32) -> Self {
+    Self { count }
+  }
+  /// The count the frame declared.
+  #[inline]
+  pub const fn count(&self) -> i32 {
+    self.count
+  }
+}
+
+impl core::fmt::Display for InvalidSampleCount {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    write!(f, "convert: {} is not a sample count", self.count)
+  }
+}
+
+/// Payload for [`ConvertError::UnsupportedSampleFormat`].
+///
+/// The frame's sample format has no byte width — `AV_SAMPLE_FMT_NONE`,
+/// or a format newer than this build names.
+///
+/// Checked **before** the zero-sample shortcut, because a frame with no
+/// readable format is malformed whether or not it carries samples.
+/// Letting an empty one through returned an `AudioFrame` advertising a
+/// format nothing can interpret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnsupportedSampleFormat {
+  raw: i32,
+}
+
+impl UnsupportedSampleFormat {
+  /// Constructs an `UnsupportedSampleFormat` payload.
+  #[inline]
+  pub const fn new(raw: i32) -> Self {
+    Self { raw }
+  }
+  /// The raw `AVFrame.format` integer, exactly as FFmpeg wrote it.
+  #[inline]
+  pub const fn raw(&self) -> i32 {
+    self.raw
+  }
+}
+
+impl core::fmt::Display for UnsupportedSampleFormat {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    write!(
+      f,
+      "convert: AVSampleFormat {} has no byte width this build can use",
+      self.raw
+    )
+  }
+}
+
+/// Payload for [`ConvertError::UnsupportedChannelCount`].
+///
+/// A channel count this crate will not carry: more than
+/// [`u8::MAX`], which the portable `AudioFrame` seat cannot hold, or
+/// none at all on a frame that claims samples.
+///
+/// **Refused, never clamped.** Clamping to 255 was silent truncation of
+/// exactly the kind this boundary exists to refuse: a 256-channel
+/// packed frame then computed its byte product from the clipped count
+/// and copied 510 of its 512 bytes, delivering a short buffer that
+/// advertised 255 channels. A short read is not a smaller frame; it is
+/// a wrong one.
+///
+/// The count is carried **signed**, as `AVChannelLayout.nb_channels`
+/// declares it. It has to be: a negative count is one of the things
+/// this arm refuses, and the first version of this refusal read the
+/// count off a materialised layout description that had already
+/// floored it to zero — so `nb_channels == -1` arrived looking like a
+/// legitimate zero-channel frame and was never seen by the guard meant
+/// to catch it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnsupportedChannelCount {
+  channels: i32,
+}
+
+impl UnsupportedChannelCount {
+  /// Constructs an `UnsupportedChannelCount` payload.
+  #[inline]
+  pub const fn new(channels: i32) -> Self {
+    Self { channels }
+  }
+  /// The count the frame's layout declared, exactly as it read.
+  #[inline]
+  pub const fn channels(&self) -> i32 {
+    self.channels
+  }
+}
+
+impl core::fmt::Display for UnsupportedChannelCount {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    write!(
+      f,
+      "convert: {} channels cannot be carried (1..={} on a frame with samples)",
+      self.channels,
+      u8::MAX,
+    )
+  }
+}
+
+/// Payload for [`ConvertError::InvalidDimensions`].
+///
+/// A picture frame declaring a negative width or height.
+///
+/// The sibling of [`InvalidSampleCount`] on the picture road, and found
+/// by auditing for it: `width` and `height` were floored with `.max(0)`
+/// before anything judged them, so a declared `-1` became `0` and then
+/// sailed through the pixel ceiling (zero pixels is under every
+/// ceiling) to produce a real `VideoFrame` of zero extent. A refusal
+/// delivered as a successful decode, which is the one outcome worse
+/// than an error.
+///
+/// Zero itself is **not** refused here: it is what an unset dimension
+/// reads as, the ceilings and the plane geometry both handle it, and
+/// inventing a refusal for it would be policy this audit has no
+/// evidence for. Only the negative — which cannot be a dimension under
+/// any reading — is named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidDimensions {
+  width: i32,
+  height: i32,
+}
+
+impl InvalidDimensions {
+  /// Constructs an `InvalidDimensions` payload.
+  #[inline]
+  pub const fn new(width: i32, height: i32) -> Self {
+    Self { width, height }
+  }
+  /// The width the frame declared, exactly as it read.
+  #[inline]
+  pub const fn width(&self) -> i32 {
+    self.width
+  }
+  /// The height the frame declared, exactly as it read.
+  #[inline]
+  pub const fn height(&self) -> i32 {
+    self.height
+  }
+}
+
+impl core::fmt::Display for InvalidDimensions {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    write!(
+      f,
+      "convert: frame declares dimensions {}x{}, which are not a picture",
+      self.width, self.height,
+    )
+  }
+}
+
+/// Payload for [`ConvertError::ImageSideDataTooLarge`].
+///
+/// A decoded still whose side data exceeds
+/// [`FrameLimits::max_image_side_data_bytes`](crate::FrameLimits::max_image_side_data_bytes).
+///
+/// Refused rather than truncated. The shared stream collector drops
+/// what does not fit and logs it, which on a still is the wrong answer
+/// twice: an ICC profile is the entry most likely to be large and the
+/// one whose loss silently changes the colours, and the drop is
+/// positional, so a big profile pushes the display matrix off the end
+/// and the picture comes back rotated wrong with nothing to say so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageSideDataTooLarge {
+  bytes: usize,
+  limit: usize,
+}
+
+impl ImageSideDataTooLarge {
+  /// Constructs an `ImageSideDataTooLarge` payload.
+  #[inline]
+  pub const fn new(bytes: usize, limit: usize) -> Self {
+    Self { bytes, limit }
+  }
+  /// Bytes the still's side data reached.
+  #[inline]
+  pub const fn bytes(&self) -> usize {
+    self.bytes
+  }
+  /// The ceiling in force.
+  #[inline]
+  pub const fn limit(&self) -> usize {
+    self.limit
+  }
+}
+
+impl core::fmt::Display for ImageSideDataTooLarge {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    write!(
+      f,
+      "convert: still side data reaches {} bytes over a ceiling of {}",
+      self.bytes, self.limit,
+    )
+  }
+}
+
+/// Payload for [`ConvertError::ImageSideDataEntries`].
+///
+/// A decoded still declaring more side-data entries than this crate
+/// will walk. The count sibling of [`ImageSideDataTooLarge`], and
+/// refused for the same reason: truncating the list is how the
+/// orientation goes missing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageSideDataEntries {
+  count: usize,
+  limit: usize,
+}
+
+impl ImageSideDataEntries {
+  /// Constructs an `ImageSideDataEntries` payload.
+  #[inline]
+  pub const fn new(count: usize, limit: usize) -> Self {
+    Self { count, limit }
+  }
+  /// Entries the still declared.
+  #[inline]
+  pub const fn count(&self) -> usize {
+    self.count
+  }
+  /// The cap in force.
+  #[inline]
+  pub const fn limit(&self) -> usize {
+    self.limit
+  }
+}
+
+impl core::fmt::Display for ImageSideDataEntries {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    write!(
+      f,
+      "convert: still declares {} side-data entries over a cap of {}",
+      self.count, self.limit,
+    )
+  }
+}
+
 /// Errors from [`av_frame_to_video_frame`].
 #[derive(Debug, Clone, IsVariant, Unwrap, TryUnwrap)]
 #[non_exhaustive]
@@ -164,6 +633,25 @@ impl core::fmt::Display for BufferAcquireFailed {
 pub enum ConvertError {
   /// `av_frame` was null.
   NullFrame,
+  /// The frame declares more pixels than the ceiling allows. Refused
+  /// **before** any plane is allocated.
+  TooManyPixels(TooManyPixels),
+  /// The frame's planes would export more bytes than the ceiling
+  /// allows. Refused **before** any plane is allocated.
+  FrameTooLarge(FrameTooLarge),
+  /// An audio frame declares a negative sample count.
+  InvalidSampleCount(InvalidSampleCount),
+  /// A picture frame declares a negative width or height.
+  InvalidDimensions(InvalidDimensions),
+  /// A decoded still's side data is larger than the ceiling allows.
+  ImageSideDataTooLarge(ImageSideDataTooLarge),
+  /// A decoded still declares more side-data entries than this crate
+  /// will walk.
+  ImageSideDataEntries(ImageSideDataEntries),
+  /// An audio frame's sample format has no byte width.
+  UnsupportedSampleFormat(UnsupportedSampleFormat),
+  /// An audio frame's channel count is one this crate will not carry.
+  UnsupportedChannelCount(UnsupportedChannelCount),
   /// The frame's pixel format isn't in the closed CPU-format set this
   /// crate supports for safe per-plane access.
   UnsupportedPixelFormat(UnsupportedPixelFormat),
@@ -178,6 +666,14 @@ impl core::fmt::Display for ConvertError {
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
     match self {
       Self::NullFrame => write!(f, "convert: AVFrame pointer was null"),
+      Self::TooManyPixels(p) => core::fmt::Display::fmt(p, f),
+      Self::FrameTooLarge(p) => core::fmt::Display::fmt(p, f),
+      Self::InvalidSampleCount(p) => core::fmt::Display::fmt(p, f),
+      Self::InvalidDimensions(p) => core::fmt::Display::fmt(p, f),
+      Self::ImageSideDataTooLarge(p) => core::fmt::Display::fmt(p, f),
+      Self::ImageSideDataEntries(p) => core::fmt::Display::fmt(p, f),
+      Self::UnsupportedSampleFormat(p) => core::fmt::Display::fmt(p, f),
+      Self::UnsupportedChannelCount(p) => core::fmt::Display::fmt(p, f),
       Self::UnsupportedPixelFormat(p) => core::fmt::Display::fmt(p, f),
       Self::InvalidPlaneLayout(p) => core::fmt::Display::fmt(p, f),
       Self::BufferAcquireFailed(p) => core::fmt::Display::fmt(p, f),
@@ -209,10 +705,11 @@ fn unsupported_pixel_format(format: PixelFormat, raw: i32) -> ConvertError {
 pub fn video_frame_from(
   frame: &ffmpeg_next::Frame,
   time_base: Timebase,
-) -> Result<VideoFrame<mediadecode::PixelFormat, VideoFrameExtra, FfmpegBuffer>, ConvertError> {
+  limits: FrameLimits,
+) -> Result<VideoFrame<mediadecode::PixelFormat, VideoFrameExtra, FfmpegBytes>, ConvertError> {
   // SAFETY: `&frame` keeps the AVFrame alive for the duration of this
   // call; the unsafe convert just reads through the pointer.
-  unsafe { av_frame_to_video_frame(frame.as_ptr(), time_base) }
+  unsafe { av_frame_to_video_frame(frame.as_ptr(), time_base, limits) }
 }
 
 /// Safe wrapper around [`av_frame_to_audio_frame`] taking a borrowed
@@ -220,13 +717,14 @@ pub fn video_frame_from(
 pub fn audio_frame_from(
   frame: &ffmpeg_next::frame::Audio,
   time_base: Timebase,
+  limits: FrameLimits,
 ) -> Result<
-  AudioFrame<SampleFormat, ChannelLayoutDescription, AudioFrameExtra, FfmpegBuffer>,
+  AudioFrame<SampleFormat, ChannelLayoutDescription, AudioFrameExtra, FfmpegBytes>,
   ConvertError,
 > {
   // SAFETY: `&frame` keeps the AVFrame alive for the duration of this
   // call.
-  unsafe { av_frame_to_audio_frame(frame.as_ptr(), time_base) }
+  unsafe { av_frame_to_audio_frame(frame.as_ptr(), time_base, limits) }
 }
 
 /// Safe wrapper around [`av_subtitle_to_subtitle_frame`] taking a
@@ -234,7 +732,7 @@ pub fn audio_frame_from(
 pub fn subtitle_frame_from(
   subtitle: &ffmpeg_next::Subtitle,
   time_base: Timebase,
-) -> Result<SubtitleFrame<SubtitleFrameExtra, FfmpegBuffer>, ConvertError> {
+) -> Result<SubtitleFrame<SubtitleFrameExtra, FfmpegBytes>, ConvertError> {
   // SAFETY: `&subtitle` keeps the AVSubtitle alive for the duration
   // of this call.
   unsafe { av_subtitle_to_subtitle_frame(subtitle.as_ptr(), time_base) }
@@ -242,7 +740,7 @@ pub fn subtitle_frame_from(
 
 /// Converts an FFmpeg `AVFrame` (CPU-side, post-`av_hwframe_transfer_data`
 /// or from a software decoder) into a `mediadecode::VideoFrame`
-/// parameterized by [`crate::Ffmpeg`] / [`crate::FfmpegBuffer`].
+/// parameterized by [`crate::Ffmpeg`] / `FfmpegBytes`.
 ///
 /// `time_base` is the source stream's time base, used to label
 /// `pts`/`duration` as mediatime [`Timestamp`]s.
@@ -250,12 +748,15 @@ pub fn subtitle_frame_from(
 /// # Safety
 ///
 /// `av_frame` must be a live `*const AVFrame` for the duration of this
-/// call. The frame's `buf[]` references are not consumed; the produced
-/// `VideoFrame` holds its own refcounts on each underlying buffer.
+/// call. The frame's buffers are neither consumed nor referenced —
+/// every byte the produced `VideoFrame` carries is a copy, so the
+/// source frame may be unreffed, reused or dropped the moment this
+/// returns.
 pub unsafe fn av_frame_to_video_frame(
   av_frame: *const AVFrame,
   time_base: Timebase,
-) -> Result<VideoFrame<mediadecode::PixelFormat, VideoFrameExtra, FfmpegBuffer>, ConvertError> {
+  limits: FrameLimits,
+) -> Result<VideoFrame<mediadecode::PixelFormat, VideoFrameExtra, FfmpegBytes>, ConvertError> {
   if av_frame.is_null() {
     return Err(ConvertError::NullFrame);
   }
@@ -278,170 +779,32 @@ pub unsafe fn av_frame_to_video_frame(
   let height_raw = unsafe { (*av_frame).height };
   let pts_raw = unsafe { (*av_frame).pts };
   let duration_raw = unsafe { (*av_frame).duration };
+  // **Judged before anything consumes them.** These were floored with
+  // `.max(0)`, which turned a declared `-1` into `0` — and zero pixels
+  // is under every ceiling, so the frame was built rather than refused.
+  // The same order bug the audio road had with its channel count: the
+  // field's first consumer ran ahead of the field's validator.
+  if width_raw < 0 || height_raw < 0 {
+    return Err(ConvertError::InvalidDimensions(InvalidDimensions::new(
+      width_raw, height_raw,
+    )));
+  }
+  let width = width_raw as u32;
+  let height = height_raw as u32;
   let pix_fmt = boundary::from_av_pixel_format(format_raw);
-  let width = width_raw.max(0) as u32;
-  let height = height_raw.max(0) as u32;
 
-  // Build planes. Reject any format whose planes we can't safely
-  // extract — HWACCEL surfaces, Bayer mosaics, paletted, and sub-byte
-  // bitstream packings — before touching plane memory. Without a
-  // deliverable layout we'd be reading garbage `linesize * height`
-  // bytes.
-  if !pixdesc::is_deliverable(&pix_fmt) {
-    return Err(unsupported_pixel_format(pix_fmt, format_raw));
-  }
-  // The per-plane row count and visible (tight) byte width come from
-  // `pixdesc::plane_geometry`, which derives them from libavutil's own
-  // `av_image_fill_linesizes` / `av_image_fill_plane_sizes` for this
-  // exact `(format, width, height)` — correct by construction for every
-  // deliverable CPU format. For a deliverable format `plane_geometry`
-  // only returns `None` on out-of-range dimensions; treat that as an
-  // unsupported frame rather than guessing a layout.
-  let geom = match pixdesc::plane_geometry(&pix_fmt, width as usize, height as usize) {
-    Some(g) => g,
-    None => return Err(unsupported_pixel_format(pix_fmt, format_raw)),
-  };
-
-  let mut planes_out: [Plane<FfmpegBuffer>; 4] = [
-    plane_placeholder()?,
-    plane_placeholder()?,
-    plane_placeholder()?,
-    plane_placeholder()?,
-  ];
-  let mut plane_count: u8 = 0;
-
-  // The loop body indexes `planes_out`, the AVFrame's `linesize`, and
-  // its `data` array all by `plane_idx`. None of these are slices we
-  // can iterate via `iter_mut().enumerate()` — `linesize` / `data` are
-  // raw `[T; 8]` fields read through `(*av_frame).field[plane_idx]`,
-  // and `planes_out` is also indexed by the same key for symmetry —
-  // so the index-based loop is the natural shape. The descriptor's
-  // `count` (`1..=4`) bounds the loop to exactly the planes this format
-  // populates.
-  #[allow(clippy::needless_range_loop)]
-  for plane_idx in 0..geom.count {
-    // Read per-plane fields through the raw pointer (no `&AVFrame`
-    // formed). `linesize` is `[c_int; 8]` and `data` is `[*mut u8; 8]`.
-    let linesize = unsafe { (*av_frame).linesize[plane_idx] };
-    if linesize <= 0 {
-      // `plane_idx < geom.count`, so this plane must be populated; a
-      // zero linesize means the decoder left an expected plane unset,
-      // and a negative linesize is FFmpeg's vertical-flip convention
-      // (which our safe accessors refuse). Either way the layout is
-      // unusable.
-      return Err(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(
-        plane_idx,
-      )));
-    }
-    let data_ptr = unsafe { (*av_frame).data[plane_idx] };
-    if data_ptr.is_null() {
-      return Err(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(
-        plane_idx,
-      )));
-    }
-    let plane_h = geom.height[plane_idx];
-    let row_bytes = geom.row_bytes[plane_idx];
-    if row_bytes > linesize as usize {
-      return Err(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(
-        plane_idx,
-      )));
-    }
-    // Safe-API stance for stride padding:
-    //
-    // Each row in the AVBufferRef is `linesize` bytes wide but only the
-    // first `row_bytes` of them are guaranteed-initialized (the
-    // codec's actual output). The remaining `linesize - row_bytes`
-    // bytes per row are FFmpeg-allocator scratch — `av_malloc`'d, not
-    // necessarily written by the decoder. Exposing those bytes as
-    // part of an `&[u8]` slice is UB even if no consumer reads them.
-    //
-    // - When `linesize == row_bytes` (no padding), zero-copy: refcount
-    //   the AVBufferRef and expose the full plane.
-    // - When `linesize > row_bytes`, we copy each row tightly into a
-    //   fresh AVBufferRef and expose that — `stride` becomes
-    //   `row_bytes` and the buffer's length is `row_bytes * plane_h`
-    //   with every byte initialized.
-    let (view, exported_stride) = if (linesize as usize) == row_bytes {
-      let plane_bytes =
-        (plane_h)
-          .checked_mul(linesize as usize)
-          .ok_or(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(
-            plane_idx,
-          )))?;
-      let buf = unsafe { find_backing_buffer(av_frame, data_ptr, plane_bytes) }.ok_or(
-        ConvertError::BufferAcquireFailed(BufferAcquireFailed::new(plane_idx)),
-      )?;
-      // Plain address subtraction (avoids `offset_from`'s
-      // strict-provenance requirement; the pointers are independent
-      // C-side casts).
-      let offset = unsafe { (data_ptr as usize).wrapping_sub((*buf).data as usize) };
-      // SAFETY: `buf` is non-null and live; offset + plane_bytes <= buf.size
-      // by find_backing_buffer's check.
-      let view = unsafe { FfmpegBuffer::from_ref_view(buf, offset, plane_bytes) }.ok_or(
-        ConvertError::BufferAcquireFailed(BufferAcquireFailed::new(plane_idx)),
-      )?;
-      (view, linesize as u32)
-    } else {
-      let total_bytes = row_bytes
-        .checked_mul(plane_h)
-        .ok_or(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(
-          plane_idx,
-        )))?;
-      // Bound-check the readable extent in the source AVBufferRef
-      // BEFORE we start dereferencing per-row offsets. The zero-copy
-      // branch above did this implicitly by passing `plane_bytes` to
-      // `find_backing_buffer`; the copy branch must do the same — a
-      // buggy or hostile decoder/filter could hand us a `data_ptr`
-      // backed by a buffer too small for `(plane_h - 1) * linesize +
-      // row_bytes`, in which case `from_raw_parts` on the last few
-      // rows would form a slice over invalid memory (immediate UB,
-      // before any read).
-      let last_row_offset = (plane_h.saturating_sub(1))
-        .checked_mul(linesize as usize)
-        .ok_or(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(
-          plane_idx,
-        )))?;
-      let readable_extent =
-        last_row_offset
-          .checked_add(row_bytes)
-          .ok_or(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(
-            plane_idx,
-          )))?;
-      // `find_backing_buffer` confirms the AVBufferRef in `(*av_frame).buf[]`
-      // that contains `data_ptr` covers at least `readable_extent`
-      // bytes from the data pointer. We don't need the returned ptr;
-      // we just need the existence guarantee.
-      unsafe { find_backing_buffer(av_frame, data_ptr, readable_extent) }.ok_or(
-        ConvertError::BufferAcquireFailed(BufferAcquireFailed::new(plane_idx)),
-      )?;
-      let mut packed: std::vec::Vec<u8> = std::vec::Vec::new();
-      packed
-        .try_reserve_exact(total_bytes)
-        .map_err(|_| ConvertError::BufferAcquireFailed(BufferAcquireFailed::new(plane_idx)))?;
-      for row_idx in 0..plane_h {
-        let row_offset =
-          (row_idx)
-            .checked_mul(linesize as usize)
-            .ok_or(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(
-              plane_idx,
-            )))?;
-        // SAFETY: bounds-checked above via `find_backing_buffer`;
-        // `row_offset + row_bytes <= readable_extent <= buf.size`.
-        // Each per-row slice is the part the decoder writes
-        // (initialized).
-        let row_slice =
-          unsafe { core::slice::from_raw_parts(data_ptr.add(row_offset) as *const u8, row_bytes) };
-        packed.extend_from_slice(row_slice);
-      }
-      let buf = FfmpegBuffer::copy_from_slice(&packed).ok_or(ConvertError::BufferAcquireFailed(
-        BufferAcquireFailed::new(plane_idx),
-      ))?;
-      (buf, row_bytes as u32)
-    };
-
-    planes_out[plane_idx] = Plane::new(view, exported_stride);
-    plane_count = (plane_idx + 1) as u8;
-  }
+  // SAFETY: caller upholds `av_frame`'s liveness for the whole call.
+  let (planes_out, plane_count) = unsafe {
+    copy_out_planes(
+      av_frame,
+      &pix_fmt,
+      format_raw,
+      width,
+      height,
+      limits,
+      PlaneRoad::Video,
+    )
+  }?;
 
   // pts / duration / time_base
   let pts = if pts_raw != AV_NOPTS_VALUE {
@@ -504,28 +867,504 @@ pub unsafe fn av_frame_to_video_frame(
   Ok(out)
 }
 
-fn plane_placeholder() -> Result<Plane<FfmpegBuffer>, ConvertError> {
-  // Allocate a zero-byte AVBufferRef as a placeholder for unused plane
-  // slots. `[Plane<B>; 4]` requires four populated entries; we only
-  // expose `plane_count` of them through `VideoFrame::planes()`.
-  let raw = unsafe { av_buffer_alloc(0) };
-  // `av_buffer_alloc(0)` is allowed to return null on some platforms;
-  // fall back to allocating 1 byte if so.
-  let raw = if raw.is_null() {
-    unsafe { av_buffer_alloc(1) }
-  } else {
-    raw
-  };
-  if raw.is_null() {
-    // Truly OOM. Return an error by way of a poisoned plane.
-    return Err(ConvertError::BufferAcquireFailed(BufferAcquireFailed::new(
-      4,
+/// Safe wrapper around [`av_frame_to_image_frame`] taking a borrowed
+/// [`ffmpeg::Frame`](ffmpeg_next::Frame).
+pub fn image_frame_from(
+  frame: &ffmpeg_next::Frame,
+  limits: FrameLimits,
+) -> Result<ImageFrame<mediadecode::PixelFormat, ImageFrameExtra, FfmpegBytes>, ConvertError> {
+  // SAFETY: `&frame` keeps the AVFrame alive for the duration of this
+  // call; the unsafe convert just reads through the pointer.
+  unsafe { av_frame_to_image_frame(frame.as_ptr(), limits) }
+}
+
+/// Converts an FFmpeg `AVFrame` holding a decoded **still** into a
+/// [`mediadecode::frame::ImageFrame`].
+///
+/// The same picture geometry as [`av_frame_to_video_frame`] — one
+/// plane-extraction rule, shared — and none of its timeline. There is
+/// no `time_base` parameter because there is nothing to label with it:
+/// a still is not on the timeline, so `ImageFrame` has no `pts` and no
+/// `duration` seats. Whatever `AVFrame.pts` a one-shot image decoder
+/// happens to leave behind is an artefact of the packet it was fed,
+/// not a fact about the picture, and it is deliberately dropped rather
+/// than carried into a field that would invite a consumer to sort by
+/// it.
+///
+/// `visible_rect` is FFmpeg's crop, exactly as on the video side, and
+/// it earns its place here: a JPEG's coded dimensions are rounded up
+/// to its MCU grid, so the crop is what distinguishes the picture from
+/// the padding the encoder added to reach a multiple of 8 or 16.
+///
+/// # Safety
+///
+/// `av_frame` must be a live `*const AVFrame` for the duration of this
+/// call. The frame's buffers are not consumed — every byte the
+/// produced [`ImageFrame`] carries is a copy.
+pub unsafe fn av_frame_to_image_frame(
+  av_frame: *const AVFrame,
+  limits: FrameLimits,
+) -> Result<ImageFrame<mediadecode::PixelFormat, ImageFrameExtra, FfmpegBytes>, ConvertError> {
+  if av_frame.is_null() {
+    return Err(ConvertError::NullFrame);
+  }
+  // Same stance as `av_frame_to_video_frame`: never form `&AVFrame`.
+  // See its comments for why every read here goes through the raw
+  // pointer, and why the enum-typed fields go through `addr_of!` +
+  // `read_unaligned::<i32>`.
+  let format_raw = unsafe { (*av_frame).format };
+  let width_raw = unsafe { (*av_frame).width };
+  let height_raw = unsafe { (*av_frame).height };
+  // **Judged before anything consumes them.** These were floored with
+  // `.max(0)`, which turned a declared `-1` into `0` — and zero pixels
+  // is under every ceiling, so the frame was built rather than refused.
+  // The same order bug the audio road had with its channel count: the
+  // field's first consumer ran ahead of the field's validator.
+  if width_raw < 0 || height_raw < 0 {
+    return Err(ConvertError::InvalidDimensions(InvalidDimensions::new(
+      width_raw, height_raw,
     )));
   }
-  let buf = unsafe { FfmpegBuffer::take(raw) }.ok_or(ConvertError::BufferAcquireFailed(
-    BufferAcquireFailed::new(4),
-  ))?;
-  Ok(Plane::new(buf, 0))
+  let width = width_raw as u32;
+  let height = height_raw as u32;
+  let pix_fmt = boundary::from_av_pixel_format(format_raw);
+
+  // **The still's side data is judged here, before a plane is bought.**
+  // It reads only header fields and allocates nothing, so it is one of
+  // the free judgements and belongs with them. After the copy it meant
+  // an over-budget still had already paid for up to `max_frame_bytes`
+  // of plane copies before its annotations were so much as totalled —
+  // a correct refusal delivered after the expensive half of the work.
+  //
+  // Everything this conversion can refuse is now refused before
+  // anything it can allocate is allocated.
+  //
+  // SAFETY: caller upholds `av_frame`'s liveness for the whole call.
+  unsafe { measure_image_side_data(av_frame, limits) }?;
+
+  // SAFETY: caller upholds `av_frame`'s liveness for the whole call.
+  let (planes_out, plane_count) = unsafe {
+    copy_out_planes(
+      av_frame,
+      &pix_fmt,
+      format_raw,
+      width,
+      height,
+      limits,
+      PlaneRoad::Still,
+    )
+  }?;
+
+  // SAFETY: `av_frame` is live; the crop fields are plain integers.
+  let visible_rect = unsafe { build_visible_rect(av_frame, width, height) };
+
+  // SAFETY: `av_frame` points at a live AVFrame; each enum-typed field
+  // is read through a raw `i32` window rather than as its bindgen enum.
+  let color_primaries_raw =
+    unsafe { read_unaligned(addr_of!((*av_frame).color_primaries) as *const i32) };
+  let color_trc_raw = unsafe { read_unaligned(addr_of!((*av_frame).color_trc) as *const i32) };
+  let colorspace_raw = unsafe { read_unaligned(addr_of!((*av_frame).colorspace) as *const i32) };
+  let color_range_raw = unsafe { read_unaligned(addr_of!((*av_frame).color_range) as *const i32) };
+  let chroma_location_raw =
+    unsafe { read_unaligned(addr_of!((*av_frame).chroma_location) as *const i32) };
+  let color = ColorInfo::UNSPECIFIED
+    .with_primaries(map_primaries(color_primaries_raw))
+    .with_transfer(map_transfer(color_trc_raw))
+    .with_matrix(map_matrix(colorspace_raw))
+    // The `yuvj*` override matters more here than anywhere: cover art
+    // is overwhelmingly MJPEG, and MJPEG is where a frame's
+    // `color_range` is routinely left unspecified on a signal that is
+    // full-range by definition.
+    .with_range(map_range_for(&pix_fmt, color_range_raw))
+    .with_chroma_location(map_chroma_loc(chroma_location_raw));
+
+  // SAFETY: caller upholds liveness; the collector reads the enum-typed
+  // `type_` raw and bounds-checks each entry's data slice.
+  let side_data = unsafe { collect_image_side_data(av_frame, limits) }?;
+  let extra = ImageFrameExtra::default()
+    .with_orientation(orientation_of(&side_data))
+    .with_side_data(side_data);
+
+  Ok(
+    ImageFrame::new(
+      Dimensions::new(width, height),
+      pix_fmt,
+      planes_out,
+      plane_count,
+      extra,
+    )
+    .with_visible_rect(visible_rect)
+    .with_color(color),
+  )
+}
+
+/// The orientation a still's display matrix names, if it carries one.
+///
+/// Read out of the side data this crate already collects rather than
+/// off the `AVFrame` a second time: the entry is there, whole and
+/// unparsed, and one read is one place for the fact to come from.
+///
+/// `None` when the frame carries no display matrix — the ordinary case
+/// — and also when it carries one this vocabulary cannot read, in
+/// which case the raw entry stays in the side-data list rather than
+/// being lost.
+fn orientation_of(side_data: &[SideDataEntry]) -> Option<ImageOrientation> {
+  const DISPLAY_MATRIX: i32 = AVFrameSideDataType::AV_FRAME_DATA_DISPLAYMATRIX as i32;
+  side_data
+    .iter()
+    .find(|entry| entry.kind() == DISPLAY_MATRIX)
+    .and_then(|entry| ImageOrientation::from_display_matrix(entry.data()))
+}
+
+/// Whether the **video** road can deliver `pix_fmt`.
+///
+/// Exposed so a consumer — and this crate's own tests — can ask the
+/// question the still road answers differently. See [`PlaneRoad`].
+pub fn is_video_deliverable(pix_fmt: &PixelFormat) -> bool {
+  pixdesc::is_deliverable(pix_fmt)
+}
+
+/// Which plane vocabulary a conversion is working in.
+///
+/// The two roads differ by exactly two layouts. A still may be
+/// paletted (`pal8`, an indexed PNG or BMP — indices in `data[0]`, a
+/// fixed 1024-byte palette in `data[1]`) or sub-byte packed (`monob` /
+/// `monow`, a 1-bit PNG — rows of `ceil(width / 8)`); motion video
+/// keeps refusing both.
+///
+/// **The still road was widened, not the shared one, and that was a
+/// measured choice.** Widening the shared road would have changed what
+/// every existing video consumer can be handed — `is_supported_cpu_pix_fmt`,
+/// the HW transfer validation and the video suites all key off the same
+/// deliverability answer — to serve formats motion video does not
+/// occur in. The still road is where indexed and 1-bit pictures
+/// actually arrive, and it is one enum away.
+///
+/// Nothing is converted on either road. mediadecode delivers what
+/// FFmpeg decoded; turning `pal8` into RGB is colconv's job, one tier
+/// along, and doing it here would be this crate deciding what a
+/// consumer's pixels should look like.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum PlaneRoad {
+  /// Motion video: the shared vocabulary.
+  Video,
+  /// A still: the shared vocabulary plus paletted and sub-byte
+  /// layouts.
+  Still,
+}
+
+impl PlaneRoad {
+  fn is_deliverable(self, pix_fmt: &PixelFormat) -> bool {
+    match self {
+      Self::Video => pixdesc::is_deliverable(pix_fmt),
+      Self::Still => pixdesc::is_still_deliverable(pix_fmt),
+    }
+  }
+
+  fn plane_geometry(
+    self,
+    pix_fmt: &PixelFormat,
+    width: usize,
+    height: usize,
+  ) -> Option<pixdesc::PlaneGeometry> {
+    match self {
+      Self::Video => pixdesc::plane_geometry(pix_fmt, width, height),
+      Self::Still => pixdesc::still_plane_geometry(pix_fmt, width, height),
+    }
+  }
+}
+
+/// The planes of a CPU-side picture `AVFrame`, copied out.
+///
+/// Shared by the video and image households: the geometry of a still
+/// is the geometry of a picture, and there is one plane-extraction
+/// rule here rather than two that could drift apart.
+///
+/// Returns the four-slot array and how many of its entries are
+/// populated. Unused slots hold the shared empty carrier.
+///
+/// # Safety
+///
+/// `av_frame` must be a live `*const AVFrame` for the duration of this
+/// call, and `format_raw` / `pix_fmt` / `width` / `height` must be the
+/// values read from it.
+unsafe fn copy_out_planes(
+  av_frame: *const AVFrame,
+  pix_fmt: &PixelFormat,
+  format_raw: i32,
+  width: u32,
+  height: u32,
+  limits: FrameLimits,
+  road: PlaneRoad,
+) -> Result<([Plane<FfmpegBytes>; 4], u8), ConvertError> {
+  // The pixel ceiling, first of all — before the format is even looked
+  // up, because a forged `width` / `height` costs nothing to write and
+  // everything to honour. libavcodec has normally refused such a frame
+  // already (the same number reaches `AVCodecContext.max_pixels` when a
+  // decoder is opened from these limits), but this path also converts
+  // frames the caller produced by other means, so the ceiling is
+  // enforced on both sides of that door.
+  let pixels = u64::from(width) * u64::from(height);
+  if pixels > limits.max_pixels() {
+    return Err(ConvertError::TooManyPixels(TooManyPixels::new(
+      pixels,
+      limits.max_pixels(),
+    )));
+  }
+  // Reject any format whose planes we can't safely extract — HWACCEL
+  // surfaces, Bayer mosaics, paletted, and sub-byte bitstream
+  // packings — before touching plane memory. Without a deliverable
+  // layout we'd be reading garbage `linesize * height` bytes.
+  if !road.is_deliverable(pix_fmt) {
+    return Err(unsupported_pixel_format(pix_fmt.clone(), format_raw));
+  }
+  // The per-plane row count and visible (tight) byte width come from
+  // `pixdesc::plane_geometry`, which derives them from libavutil's own
+  // `av_image_fill_linesizes` / `av_image_fill_plane_sizes` for this
+  // exact `(format, width, height)` — correct by construction for every
+  // deliverable CPU format. For a deliverable format `plane_geometry`
+  // only returns `None` on out-of-range dimensions; treat that as an
+  // unsupported frame rather than guessing a layout.
+  let geom = match road.plane_geometry(pix_fmt, width as usize, height as usize) {
+    Some(g) => g,
+    None => return Err(unsupported_pixel_format(pix_fmt.clone(), format_raw)),
+  };
+
+  // The byte ceiling, before a single plane is allocated. Totalled over
+  // what the planes will *actually* export — which needs the stride
+  // decision, so it is this crate's real allocation figure rather than
+  // an estimate of it. A first pass to judge, a second to pay: the
+  // alternative is discovering the frame was too big three plane
+  // allocations in, which is the shape that OOMs.
+  // **Judged from the geometry alone — no per-plane frame read at
+  // all.** Every plane exports the format's own row width times its own
+  // row count: a tight stride equals that width and a padded one is
+  // compacted back to it, so the total does not depend on any number
+  // the frame chose. That makes this the cheapest judgement available,
+  // which is why it runs before the strides are so much as looked at.
+  let mut exported: usize = 0;
+  for plane_idx in 0..geom.count {
+    let plane_bytes = geom.row_bytes[plane_idx]
+      .checked_mul(geom.height[plane_idx])
+      .ok_or(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(
+        plane_idx,
+      )))?;
+    exported = exported
+      .checked_add(plane_bytes)
+      .ok_or(ConvertError::FrameTooLarge(FrameTooLarge::new(
+        usize::MAX,
+        limits.max_frame_bytes(),
+      )))?;
+  }
+  if exported > limits.max_frame_bytes() {
+    return Err(ConvertError::FrameTooLarge(FrameTooLarge::new(
+      exported,
+      limits.max_frame_bytes(),
+    )));
+  }
+
+  // **Then every stride, before a single plane is copied.** Splitting
+  // this out of the copy loop is the point: the loop allocates as it
+  // goes, so a frame refused on plane 2 had already paid for planes 0
+  // and 1 and thrown them away. A layout fault is a property of the
+  // frame, knowable before any of it is bought.
+  //
+  // An undersized stride used to be treated as a *padded* one here —
+  // the branch for a stride that is larger — which meant the frame was
+  // sized from a row width the plane did not have and the real refusal
+  // was left to the copy. The copy loop keeps its own form of this
+  // check: one comparison guarding a `from_raw_parts`, and defence in
+  // depth at a pointer boundary is not duplication.
+  for plane_idx in 0..geom.count {
+    // The palette is flat: its size is the format's, and FFmpeg leaves
+    // its `linesize` at zero deliberately, so there is no stride here
+    // to judge.
+    if geom.palette_plane == Some(plane_idx) {
+      continue;
+    }
+    // SAFETY: `av_frame` is live per the contract and `plane_idx` is
+    // below the descriptor's plane count, so within `linesize`'s eight
+    // slots.
+    let linesize = unsafe { (*av_frame).linesize[plane_idx] };
+    // A zero stride means the decoder left a plane this format
+    // populates unset; a negative one is FFmpeg's vertical-flip
+    // convention, which this crate's safe accessors refuse; and one
+    // below the row width is a plane that does not hold what the format
+    // says it holds. All three are the same answer.
+    if linesize <= 0 || (linesize as usize) < geom.row_bytes[plane_idx] {
+      return Err(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(
+        plane_idx,
+      )));
+    }
+  }
+
+  let mut planes_out: [Plane<FfmpegBytes>; 4] = std::array::from_fn(|_| plane_placeholder());
+  let mut plane_count: u8 = 0;
+
+  // The loop body indexes `planes_out`, the AVFrame's `linesize`, and
+  // its `data` array all by `plane_idx`. None of these are slices we
+  // can iterate via `iter_mut().enumerate()` — `linesize` / `data` are
+  // raw `[T; 8]` fields read through `(*av_frame).field[plane_idx]`,
+  // and `planes_out` is also indexed by the same key for symmetry —
+  // so the index-based loop is the natural shape. The descriptor's
+  // `count` (`1..=4`) bounds the loop to exactly the planes this format
+  // populates.
+  #[allow(clippy::needless_range_loop)]
+  for plane_idx in 0..geom.count {
+    // Read per-plane fields through the raw pointer (no `&AVFrame`
+    // formed). `linesize` is `[c_int; 8]` and `data` is `[*mut u8; 8]`.
+    // The palette first: a flat `AVPALETTE_SIZE` run at `data[i]` with
+    // no linesize of its own. Bounded by the format, so there is
+    // nothing here for a budget to judge.
+    if geom.palette_plane == Some(plane_idx) {
+      let data_ptr = unsafe { (*av_frame).data[plane_idx] };
+      if data_ptr.is_null() {
+        return Err(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(
+          plane_idx,
+        )));
+      }
+      let bytes = geom.row_bytes[plane_idx];
+      // SAFETY: `find_backing_buffer` proves the run lies inside one of
+      // the frame's own live buffers before it is read.
+      unsafe { find_backing_buffer(av_frame, data_ptr, bytes) }.ok_or(
+        ConvertError::BufferAcquireFailed(BufferAcquireFailed::new(plane_idx)),
+      )?;
+      // SAFETY: non-null and just proved to address `bytes` initialised
+      // bytes inside a live buffer.
+      let palette = unsafe { core::slice::from_raw_parts(data_ptr as *const u8, bytes) };
+      planes_out[plane_idx] = Plane::new(FfmpegBytes::copy_from_slice(palette), bytes as u32);
+      plane_count = (plane_idx + 1) as u8;
+      continue;
+    }
+
+    let linesize = unsafe { (*av_frame).linesize[plane_idx] };
+    if linesize <= 0 {
+      // `plane_idx < geom.count`, so this plane must be populated; a
+      // zero linesize means the decoder left an expected plane unset,
+      // and a negative linesize is FFmpeg's vertical-flip convention
+      // (which our safe accessors refuse). Either way the layout is
+      // unusable.
+      return Err(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(
+        plane_idx,
+      )));
+    }
+    let data_ptr = unsafe { (*av_frame).data[plane_idx] };
+    if data_ptr.is_null() {
+      return Err(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(
+        plane_idx,
+      )));
+    }
+    let plane_h = geom.height[plane_idx];
+    let row_bytes = geom.row_bytes[plane_idx];
+    if row_bytes > linesize as usize {
+      return Err(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(
+        plane_idx,
+      )));
+    }
+    // What the copy may read, and what shape it leaves behind:
+    //
+    // Each row in the AVBufferRef is `linesize` bytes wide but only the
+    // first `row_bytes` of them are guaranteed-initialized (the
+    // codec's actual output). The remaining `linesize - row_bytes`
+    // bytes per row are FFmpeg-allocator scratch — `av_malloc`'d, not
+    // necessarily written by the decoder. Forming an `&[u8]` over those
+    // bytes is UB even if no consumer reads them, which is why the
+    // padded branch never touches them.
+    //
+    // - When `linesize == row_bytes` (no padding), the plane is one
+    //   contiguous run and is copied whole; `stride` stays `linesize`.
+    // - When `linesize > row_bytes`, each row is copied tightly and
+    //   `stride` becomes `row_bytes`.
+    //
+    // Both branches copy in 0.9 — the amputation. The *geometry* is
+    // untouched: a consumer of a tight plane still reads the decoder's
+    // own stride, and a padded plane still arrives compacted.
+    let (data, exported_stride) = if (linesize as usize) == row_bytes {
+      let plane_bytes =
+        (plane_h)
+          .checked_mul(linesize as usize)
+          .ok_or(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(
+            plane_idx,
+          )))?;
+      // The bounds proof: the AVBufferRef in `(*av_frame).buf[]` that
+      // contains `data_ptr` covers at least `plane_bytes` from it. The
+      // returned pointer is not needed — 0.8 used it to compute a view
+      // offset; 0.9 only needs the guarantee that the read is in range.
+      unsafe { find_backing_buffer(av_frame, data_ptr, plane_bytes) }.ok_or(
+        ConvertError::BufferAcquireFailed(BufferAcquireFailed::new(plane_idx)),
+      )?;
+      // SAFETY: `data_ptr` is non-null and was just proved to address
+      // `plane_bytes` initialized bytes inside one of the frame's own
+      // live buffers.
+      let bytes = unsafe { core::slice::from_raw_parts(data_ptr as *const u8, plane_bytes) };
+      (FfmpegBytes::copy_from_slice(bytes), linesize as u32)
+    } else {
+      let total_bytes = row_bytes
+        .checked_mul(plane_h)
+        .ok_or(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(
+          plane_idx,
+        )))?;
+      // Bound-check the readable extent in the source AVBufferRef
+      // BEFORE we start dereferencing per-row offsets. The contiguous
+      // branch above does this by passing `plane_bytes` to
+      // `find_backing_buffer`; the row-wise branch must do the same — a
+      // buggy or hostile decoder/filter could hand us a `data_ptr`
+      // backed by a buffer too small for `(plane_h - 1) * linesize +
+      // row_bytes`, in which case `from_raw_parts` on the last few
+      // rows would form a slice over invalid memory (immediate UB,
+      // before any read).
+      let last_row_offset = (plane_h.saturating_sub(1))
+        .checked_mul(linesize as usize)
+        .ok_or(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(
+          plane_idx,
+        )))?;
+      let readable_extent =
+        last_row_offset
+          .checked_add(row_bytes)
+          .ok_or(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(
+            plane_idx,
+          )))?;
+      unsafe { find_backing_buffer(av_frame, data_ptr, readable_extent) }.ok_or(
+        ConvertError::BufferAcquireFailed(BufferAcquireFailed::new(plane_idx)),
+      )?;
+      // Written straight into the carrier's allocation, one row at a
+      // time — **not** staged through a `Vec` first. The staged
+      // spelling allocated the whole plane twice and copied it twice,
+      // so a 250 MiB frame peaked at 750 MiB counting FFmpeg's own;
+      // this leaves the unavoidable 2×. The size was checked against
+      // the frame ceiling above, before any of this was allocated,
+      // which is what took the place of the staging `Vec`'s
+      // `try_reserve_exact`.
+      debug_assert_eq!(total_bytes, row_bytes * plane_h);
+      let packed = FfmpegBytes::from_rows(plane_h, row_bytes, |row_idx| {
+        // `row_offset` cannot overflow: `readable_extent` above already
+        // added `(plane_h - 1) * linesize` to `row_bytes` without
+        // overflowing, and `row_idx < plane_h`.
+        let row_offset = row_idx * linesize as usize;
+        // SAFETY: bounds-checked above via `find_backing_buffer`;
+        // `row_offset + row_bytes <= readable_extent <= buf.size`.
+        // Each per-row slice is the part the decoder writes
+        // (initialized).
+        unsafe { core::slice::from_raw_parts(data_ptr.add(row_offset) as *const u8, row_bytes) }
+      });
+      (packed, row_bytes as u32)
+    };
+
+    planes_out[plane_idx] = Plane::new(data, exported_stride);
+    plane_count = (plane_idx + 1) as u8;
+  }
+
+  Ok((planes_out, plane_count))
+}
+
+/// A placeholder for an unused plane slot.
+///
+/// `[Plane<D>; 4]` requires four populated entries; only
+/// `plane_count` of them are exposed through `planes()`. 0.8 gave each
+/// slot its own one-byte `AVBufferRef` and could fail doing it; the
+/// shared empty carrier costs one allocation for the process.
+fn plane_placeholder() -> Plane<FfmpegBytes> {
+  Plane::new(FfmpegBytes::empty(), 0)
 }
 
 /// # Safety
@@ -534,18 +1373,59 @@ fn plane_placeholder() -> Result<Plane<FfmpegBuffer>, ConvertError> {
 /// pointer — it never forms `&AVFrame`, so unrelated invalid enum
 /// fields elsewhere in the struct don't matter.
 unsafe fn build_visible_rect(av_frame: *const AVFrame, width: u32, height: u32) -> Option<Rect> {
-  let crop_left = unsafe { (*av_frame).crop_left } as u32;
-  let crop_top = unsafe { (*av_frame).crop_top } as u32;
-  let crop_right = unsafe { (*av_frame).crop_right } as u32;
-  let crop_bottom = unsafe { (*av_frame).crop_bottom } as u32;
+  // The crops are `size_t`. Read as `u64` and kept there: `as u32`
+  // truncated them, so a crop of `2^32 + 5` arrived as a perfectly
+  // plausible `5` and the rect that came out was wrong in a way nothing
+  // could see. The same law as the dimensions above — a number a file
+  // chooses is judged, not clipped — applied to the one field on this
+  // road that is pure annotation.
+  let crop_left = unsafe { (*av_frame).crop_left } as u64;
+  let crop_top = unsafe { (*av_frame).crop_top } as u64;
+  let crop_right = unsafe { (*av_frame).crop_right } as u64;
+  let crop_bottom = unsafe { (*av_frame).crop_bottom } as u64;
   if crop_left == 0 && crop_top == 0 && crop_right == 0 && crop_bottom == 0 {
     return None;
   }
-  let x = crop_left;
-  let y = crop_top;
-  let w = width.saturating_sub(crop_left).saturating_sub(crop_right);
-  let h = height.saturating_sub(crop_top).saturating_sub(crop_bottom);
-  Some(Rect::new(x, y, w, h))
+  // A crop that does not fit inside the picture is not a crop. FFmpeg's
+  // own `av_frame_apply_cropping` maintains `left + right < width`, so
+  // a frame breaking that is malformed — and `saturating_sub` used to
+  // answer it with a zero-extent rect, which is a claim rather than an
+  // absence.
+  //
+  // The frame is not refused over it: the pixels are still whatever the
+  // decoder produced, and this field only annotates them. What is
+  // withheld is the annotation. That is the same stance the colour
+  // fields take toward a value this build cannot name — say nothing
+  // rather than say something invented.
+  // Checked, per pair. These are `size_t` straight off the frame, so
+  // each one alone can be near `u64::MAX` and `left + right` is a real
+  // overflow — which panics in debug and *wraps* in release, and a
+  // wrapped sum passes the extent test and then narrows into a rect
+  // pointing outside the picture. The refusal has to come before the
+  // arithmetic can lie, not after it.
+  let (Some(horizontal), Some(vertical)) = (
+    crop_left.checked_add(crop_right),
+    crop_top.checked_add(crop_bottom),
+  ) else {
+    return None;
+  };
+  // `>=`, not `>`. FFmpeg's own `av_frame_apply_cropping` requires the
+  // crops to leave something behind, and a sum *equal* to the extent
+  // leaves a zero-width or zero-height rect — which is not a smaller
+  // picture, it is the absence of one, asserted as a fact. Withheld
+  // like any other uninterpretable annotation.
+  if horizontal >= u64::from(width) || vertical >= u64::from(height) {
+    return None;
+  }
+  // Narrowed only now. Each subtraction is proved non-negative by the
+  // test above, and all four values are proved strictly below the
+  // frame's own `u32` extent, so no cast here can truncate.
+  Some(Rect::new(
+    crop_left as u32,
+    crop_top as u32,
+    (u64::from(width) - horizontal) as u32,
+    (u64::from(height) - vertical) as u32,
+  ))
 }
 
 /// # Safety
@@ -704,7 +1584,7 @@ unsafe fn collect_side_data(av_frame: *const AVFrame) -> std::vec::Vec<SideDataE
     let size = unsafe { (*sd).size };
     let data_ptr = unsafe { (*sd).data };
     let data_slice = if size == 0 || data_ptr.is_null() {
-      Vec::new()
+      FfmpegBytes::empty()
     } else {
       // Byte-budget check: stop copying further side-data entries
       // once we've reached the per-frame cap. Earlier entries
@@ -719,8 +1599,15 @@ unsafe fn collect_side_data(av_frame: *const AVFrame) -> std::vec::Vec<SideDataE
         break;
       }
       total_bytes = projected;
-      // Fallible copy. `try_reserve_exact` lets OOM surface as a
-      // dropped entry rather than a process abort.
+      // Staged through a `Vec` first, so `try_reserve_exact` keeps
+      // *one* of the two payload-sized allocations a dropped entry
+      // rather than a process abort. The carrier copy that follows is a
+      // second full allocation of the same size — not a header — and it
+      // is infallible; what the staging buys is that the first and
+      // larger risk is reportable and the second is asked for a size
+      // the allocator has just proved it has. Affordable only because
+      // side data is capped at `SIDE_DATA_MAX_TOTAL_BYTES`; the plane
+      // path next door is not small and uses the one-allocation road.
       let mut buf: Vec<u8> = Vec::new();
       if buf.try_reserve_exact(size).is_err() {
         continue;
@@ -729,11 +1616,136 @@ unsafe fn collect_side_data(av_frame: *const AVFrame) -> std::vec::Vec<SideDataE
       // per FFmpeg's AVFrameSideData contract.
       let src = unsafe { core::slice::from_raw_parts(data_ptr, size) };
       buf.extend_from_slice(src);
-      buf
+      FfmpegBytes::copy_from_slice(&buf)
     };
     out.push(SideDataEntry::new(kind, data_slice));
   }
   out
+}
+
+/// Totals a still's declared side data and judges it, **allocating
+/// nothing and reading no payload**.
+///
+/// Split out of [`collect_image_side_data`] so it can run before the
+/// planes are copied. It was not enough for the budget to be checked
+/// before the side data was copied: `av_frame_to_image_frame` buys the
+/// planes first, so an over-budget still had already paid for up to
+/// `max_frame_bytes` of plane copies by the time its annotations were
+/// judged. The refusal was correct and arrived after the expensive half
+/// of the work.
+///
+/// Judging is free here. Every number this pass reads is a header
+/// field — the entry count, and each entry's declared `size` — and no
+/// payload is dereferenced. So it belongs at the front, with the other
+/// free judgements.
+///
+/// # Safety
+///
+/// `av_frame` must be a live `*const AVFrame`.
+unsafe fn measure_image_side_data(
+  av_frame: *const AVFrame,
+  limits: FrameLimits,
+) -> Result<usize, ConvertError> {
+  let nb_side_data_raw = unsafe { (*av_frame).nb_side_data };
+  let side_data = unsafe { (*av_frame).side_data };
+  if nb_side_data_raw <= 0 || side_data.is_null() {
+    return Ok(0);
+  }
+  let count = nb_side_data_raw as usize;
+  if count > SIDE_DATA_MAX_ENTRIES {
+    return Err(ConvertError::ImageSideDataEntries(
+      ImageSideDataEntries::new(count, SIDE_DATA_MAX_ENTRIES),
+    ));
+  }
+  let budget = limits.max_image_side_data_bytes();
+  let mut total: usize = 0;
+  for i in 0..count {
+    // The entry *pointer* comes out of the array; the entry itself is
+    // read only for its declared size. A null slot is skipped exactly
+    // as the copying pass skips it, so the two totals agree.
+    let sd = unsafe { *side_data.add(i) };
+    if sd.is_null() {
+      continue;
+    }
+    let size = unsafe { (*sd).size };
+    total = total.saturating_add(size);
+    if total > budget {
+      return Err(ConvertError::ImageSideDataTooLarge(
+        ImageSideDataTooLarge::new(total, budget),
+      ));
+    }
+  }
+  Ok(total)
+}
+
+/// [`collect_side_data`] for the **still** road: budgeted, and it
+/// refuses rather than truncating.
+///
+/// The two roads want different answers to the same overflow. A video
+/// stream's frame side data is small, repeated, and per-frame, so the
+/// shared collector's fixed caps and silent drop are a reasonable trade
+/// — losing one frame's annotation is recoverable, and refusing a
+/// frame mid-stream is not. A still is decoded once and *is* its
+/// annotations: the ICC profile that decides its colours and the
+/// display matrix that decides its orientation both live here, both are
+/// carried by exactly one frame, and dropping either is not degradation
+/// but a wrong picture returned as a right one.
+///
+/// So this collector takes a budget from [`FrameLimits`] and names its
+/// refusals. See
+/// [`DEFAULT_MAX_IMAGE_SIDE_DATA_BYTES`](crate::DEFAULT_MAX_IMAGE_SIDE_DATA_BYTES)
+/// for why the default is what the parameter road already admits.
+///
+/// # Safety
+///
+/// `av_frame` must be a live `*const AVFrame`.
+unsafe fn collect_image_side_data(
+  av_frame: *const AVFrame,
+  limits: FrameLimits,
+) -> Result<std::vec::Vec<SideDataEntry>, ConvertError> {
+  // Same raw reads as the shared collector: a negative count is
+  // malformed rather than empty, and the entry `type_` is an open C
+  // enum read as the integer it is.
+  let nb_side_data_raw = unsafe { (*av_frame).nb_side_data };
+  let side_data = unsafe { (*av_frame).side_data };
+  if nb_side_data_raw <= 0 || side_data.is_null() {
+    return Ok(Vec::new());
+  }
+  let count = nb_side_data_raw as usize;
+  let budget = limits.max_image_side_data_bytes();
+  // **The measuring pass, re-run.** It runs earlier too — before the
+  // planes are bought — and this is the copying pass. Repeating a pair
+  // of comparisons that guard an allocation is defence in depth, not
+  // duplication: it keeps this function correct on its own terms rather
+  // than only in the order it happens to be called in.
+  let total = unsafe { measure_image_side_data(av_frame, limits) }?;
+
+  let mut out: Vec<SideDataEntry> = Vec::new();
+  if out.try_reserve_exact(count).is_err() {
+    return Err(ConvertError::ImageSideDataTooLarge(
+      ImageSideDataTooLarge::new(total, budget),
+    ));
+  }
+  for i in 0..count {
+    let sd = unsafe { *side_data.add(i) };
+    if sd.is_null() {
+      continue;
+    }
+    let kind = unsafe { read_unaligned(addr_of!((*sd).type_) as *const i32) };
+    let size = unsafe { (*sd).size };
+    let data_ptr = unsafe { (*sd).data };
+    let payload = if size == 0 || data_ptr.is_null() {
+      FfmpegBytes::empty()
+    } else {
+      // SAFETY: `data_ptr` is documented as valid for `size` bytes per
+      // FFmpeg's `AVFrameSideData` contract, and the total was proved
+      // to fit the budget above.
+      let src = unsafe { core::slice::from_raw_parts(data_ptr, size) };
+      FfmpegBytes::copy_from_slice(src)
+    };
+    out.push(SideDataEntry::new(kind, payload));
+  }
+  Ok(out)
 }
 
 /// Locate the `AVBufferRef` in `(*av_frame).buf[]` that backs
@@ -901,23 +1913,26 @@ fn map_chroma_loc(raw: i32) -> ChromaLocation {
 
 /// Converts an FFmpeg audio `AVFrame` into a `mediadecode::AudioFrame`.
 ///
-/// The plane payloads are zero-copy views into the source frame's
-/// `AVBufferRef` entries (the corresponding `data[i]` is always
-/// covered by exactly one of `buf[i]` per FFmpeg's contract). Channel
-/// counts above 8 (which would spill into `extended_buf`) are clamped
-/// to 8 — the rare cases where this matters can read the source
-/// `AVFrame` directly.
+/// Each plane is copied out of the source frame's `AVBufferRef`
+/// entries into an `FfmpegBytes` (the corresponding `data[i]` is always
+/// covered by exactly one of `buf[i]` per FFmpeg's contract, which is
+/// what bounds the read). Channel counts above 8 (which would spill
+/// into `extended_buf`) are refused rather than clamped — see the
+/// plane-count check below.
 ///
 /// # Safety
 ///
 /// `av_frame` must be a live `*const AVFrame` for the duration of this
 /// call and must describe an audio frame (`format` is an
-/// `AVSampleFormat`, `nb_samples > 0`, and `data[]` / `buf[]` populated).
+/// `AVSampleFormat`, `nb_samples > 0`, and `data[]` / `buf[]`
+/// populated). The frame's buffers are neither consumed nor
+/// referenced; every byte the produced `AudioFrame` carries is a copy.
 pub unsafe fn av_frame_to_audio_frame(
   av_frame: *const AVFrame,
   time_base: Timebase,
+  limits: FrameLimits,
 ) -> Result<
-  AudioFrame<SampleFormat, ChannelLayoutDescription, AudioFrameExtra, FfmpegBuffer>,
+  AudioFrame<SampleFormat, ChannelLayoutDescription, AudioFrameExtra, FfmpegBytes>,
   ConvertError,
 > {
   if av_frame.is_null() {
@@ -939,16 +1954,106 @@ pub unsafe fn av_frame_to_audio_frame(
 
   let sample_format = SampleFormat::from_raw(format_raw);
   let sample_rate = sample_rate_raw.max(0) as u32;
-  let nb_samples = nb_samples_raw.max(0) as u32;
+
+  // **Every header field is judged here, before a byte of geometry is
+  // computed — and none of them is clamped.**
+  //
+  // A clamp on this road is silent truncation of an attacker-supplied
+  // number, which is the exact sin this boundary exists to refuse. The
+  // three that mattered each produced a *well-formed-looking* frame out
+  // of a malformed one, which is worse than an error: a floored
+  // negative count became an empty frame a consumer went on decoding
+  // past, and a clipped channel count made a packed frame compute its
+  // byte product from 255 when the file said 256 — copying 510 of 512
+  // bytes and advertising the wrong shape.
+  //
+  // The one survivor is `sample_rate`, floored above. Censused and
+  // kept: it feeds no geometry, no allocation and no copy length — it
+  // is metadata — and zero is already this crate's "rate unspecified".
+  // Nothing downstream sizes anything from it.
+  if nb_samples_raw < 0 {
+    return Err(ConvertError::InvalidSampleCount(InvalidSampleCount::new(
+      nb_samples_raw,
+    )));
+  }
+  let nb_samples = nb_samples_raw as u32;
 
   // SAFETY: `av_frame` is a live `*const AVFrame`; passing the
   // address of the embedded ch_layout as `*const AVChannelLayout`
   // is sound because `addr_of!` doesn't form a reference.
   let ch_layout_ptr = unsafe { addr_of!((*av_frame).ch_layout) };
+
+  // **The channel count is judged off the raw field, before the layout
+  // is materialised.** The first version of this guard read it back off
+  // the `ChannelLayoutDescription`, which was two bugs at once:
+  //
+  // * the description stores `nb_channels.max(0) as u32`, so a declared
+  //   `-1` reached the guard as a legitimate-looking zero and produced
+  //   a zero-channel frame instead of a refusal — the validator was
+  //   reading a number its own consumer had already laundered; and
+  // * materialising runs first. For an `AV_CHANNEL_ORDER_CUSTOM`
+  //   layout that means rendering the layout's name and walking
+  //   `nb_channels` map entries into a `Vec` — work proportional to a
+  //   number this very guard exists to bound, done *before* the bound
+  //   is applied.
+  //
+  // A validator downstream of its own field's first consumer is not a
+  // validator. The raw signed read comes first, every refusal is stated
+  // against it, and only a count already proved to be in `0..=255` is
+  // allowed to drive the description.
+  //
+  // SAFETY: `ch_layout_ptr` addresses the frame's live embedded layout.
+  // `nb_channels` is a plain `c_int`, so a direct field read through the
+  // raw pointer is sound — the enum-typed `order` beside it is what
+  // needs `addr_of!` + a raw `i32` read, and that read happens inside
+  // the description helper below, not here.
+  let channel_count_raw = unsafe { (*ch_layout_ptr).nb_channels };
+  if channel_count_raw < 0 {
+    return Err(ConvertError::UnsupportedChannelCount(
+      UnsupportedChannelCount::new(channel_count_raw),
+    ));
+  }
+  // Refused before any plane geometry, and refused for packed layouts
+  // too — which the old `> 8` plane check never reached, because packed
+  // audio declares one plane whatever its channel count is.
+  if channel_count_raw > i32::from(u8::MAX) {
+    return Err(ConvertError::UnsupportedChannelCount(
+      UnsupportedChannelCount::new(channel_count_raw),
+    ));
+  }
+  // A frame carrying samples across no channels is not an empty frame;
+  // it is an incoherent one. The packed byte product used to substitute
+  // 1 here, which invented a channel the file never declared.
+  if channel_count_raw == 0 && nb_samples > 0 {
+    return Err(ConvertError::UnsupportedChannelCount(
+      UnsupportedChannelCount::new(channel_count_raw),
+    ));
+  }
+  let channel_count_full = channel_count_raw as u32;
+  let channel_count = channel_count_raw as u8;
+
+  // Materialised only now, with the count it will report already
+  // proved to be one this crate can carry. Because the raw field is in
+  // `0..=255`, the description's own `nb_channels.max(0)` is the
+  // identity here and its `channels()` equals `channel_count_full`.
   let channel_layout =
     unsafe { crate::channel_layout::channel_layout_description_from_raw_ptr(ch_layout_ptr) };
-  let channel_count_full = channel_layout.channels();
-  let channel_count = channel_count_full.min(255) as u8;
+  debug_assert_eq!(
+    channel_layout.channels(),
+    channel_count_full,
+    "the description must report the count that was judged",
+  );
+
+  // The sample format, **before** the zero-sample shortcut: a frame
+  // whose format has no byte width is malformed whether or not it
+  // carries samples, and letting an empty one through returned an
+  // `AudioFrame` advertising a format nothing can interpret.
+  let bytes_per_sample =
+    sample_format
+      .bytes_per_sample()
+      .ok_or(ConvertError::UnsupportedSampleFormat(
+        UnsupportedSampleFormat::new(format_raw),
+      ))? as usize;
 
   // Plane count: 1 for packed, channel_count for planar.
   let is_planar = sample_format.is_planar();
@@ -965,55 +2070,114 @@ pub unsafe fn av_frame_to_audio_frame(
   }
   let plane_count = plane_count_full as u8;
 
-  // Per-plane size in bytes. For audio, FFmpeg only sets `linesize[0]`;
-  // every planar plane has the same size, every packed buffer is the
-  // total size for all channels. Validate against the format's
-  // expected minimum so a hostile/buggy decoder can't smuggle a
-  // shrunk linesize past us (which would let consumers read past
-  // valid bytes when they trust `nb_samples`).
+  // **Two different numbers, and conflating them was a bug.**
+  //
+  // `linesize[0]` is what FFmpeg *allocated* per plane, which
+  // `av_samples_get_buffer_size` rounds up for alignment — routinely
+  // 32 or 64 bytes past the samples. The bytes that are *valid* are
+  // `nb_samples * bytes_per_sample`, per plane when planar and times
+  // the channel count when packed. Nothing initialises the difference.
+  //
+  // Exporting `linesize` therefore did two wrong things at once: it
+  // formed a `&[u8]` over maybe-uninitialised padding, which is
+  // undefined behaviour before anything reads it, and it handed that
+  // padding to a consumer inside a safe `FfmpegBytes` — stale heap,
+  // leaked through an owned carrier.
+  //
+  // So `linesize` is used for exactly one thing below: proving the
+  // source allocation really is as large as it claims. What is copied
+  // is the valid product. This is what the resampler's own output path
+  // has always done (`per_sample * produced`); the decode path now
+  // agrees with it.
   let linesize0 = unsafe { (*av_frame).linesize[0] };
-  if nb_samples > 0 && linesize0 <= 0 {
+  // A negative allocation is incoherent at any sample count, so it is
+  // refused before the count is consulted rather than floored to zero.
+  // Zero itself is only refused when the frame claims samples — it is
+  // the canonical shape of an empty audio frame.
+  if linesize0 < 0 || (nb_samples > 0 && linesize0 == 0) {
     return Err(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(0)));
   }
-  let plane_bytes = linesize0.max(0) as usize;
-  if nb_samples > 0 {
-    let bytes_per_sample = sample_format
-      .bytes_per_sample()
-      .ok_or(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(0)))?
-      as usize;
-    let expected_per_plane = if is_planar {
+  let allocated_per_plane = linesize0 as usize;
+  let valid_per_plane = if nb_samples_raw == 0 {
+    // A header frame: real, and carrying no samples. There is nothing
+    // valid to export, whatever the allocation says. Reached only for a
+    // count that is *exactly* zero — a negative one was refused by name
+    // above rather than floored into this branch.
+    0
+  } else {
+    let valid = if is_planar {
       // Planar: each plane carries `nb_samples * bytes_per_sample`.
       (nb_samples as usize)
         .checked_mul(bytes_per_sample)
         .ok_or(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(0)))?
     } else {
       // Packed: the single plane interleaves all channels.
+      // The **declared** channel count, never a substituted one: it was
+      // proved above to be in `1..=u8::MAX` on a frame with samples.
       (nb_samples as usize)
         .checked_mul(bytes_per_sample)
-        .and_then(|x| x.checked_mul(channel_count.max(1) as usize))
+        .and_then(|x| x.checked_mul(channel_count_full as usize))
         .ok_or(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(0)))?
     };
-    if plane_bytes < expected_per_plane {
+    // The allocation must cover the samples the header claims —
+    // otherwise a shrunk `linesize` would let a consumer that trusts
+    // `nb_samples` read past what is there.
+    if allocated_per_plane < valid {
       return Err(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(0)));
     }
+    valid
+  };
+
+  // The byte ceiling, before a single plane is allocated. An audio
+  // frame has no pixels to bound, so this is the whole ceiling here —
+  // and it is needed: `linesize[0]` is a number from the decoder, and
+  // the check above only proves it is not *smaller* than the format
+  // requires. Nothing above bounds it from the other side.
+  let exported =
+    valid_per_plane
+      .checked_mul(plane_count as usize)
+      .ok_or(ConvertError::FrameTooLarge(FrameTooLarge::new(
+        usize::MAX,
+        limits.max_frame_bytes(),
+      )))?;
+  if exported > limits.max_frame_bytes() {
+    return Err(ConvertError::FrameTooLarge(FrameTooLarge::new(
+      exported,
+      limits.max_frame_bytes(),
+    )));
   }
 
-  let mut planes_out: [Plane<FfmpegBuffer>; 8] = [
-    audio_plane_placeholder()?,
-    audio_plane_placeholder()?,
-    audio_plane_placeholder()?,
-    audio_plane_placeholder()?,
-    audio_plane_placeholder()?,
-    audio_plane_placeholder()?,
-    audio_plane_placeholder()?,
-    audio_plane_placeholder()?,
-  ];
+  // Every slot starts as the shared empty carrier at stride zero, which
+  // is already exactly what a zero-sample frame's planes should be.
+  let mut planes_out: [Plane<FfmpegBytes>; 8] = std::array::from_fn(|_| plane_placeholder());
+
+  // **A zero-sample frame has no planes to validate.** FFmpeg's
+  // canonical empty audio frame carries a format, a layout and a rate
+  // with `data[i] == NULL`, `linesize == 0` and no `AVBufferRef` at
+  // all — there is nothing allocated because there is nothing to hold.
+  // Running the loop below over it refused the frame on the first null
+  // pointer, so a header frame mid-stream came back as
+  // `InvalidPlaneLayout` and interrupted a decode that was going fine.
+  //
+  // The declared layout is still reported: `plane_count` stays packed's
+  // 1 or planar's channel count, and those slots hold the empty carrier
+  // at stride 0 — a consumer sees the shape it expects, carrying no
+  // samples, which is what the frame says. No allocation happens; the
+  // empty carrier is one refcount bump.
+  //
+  // Nothing below changes for a frame that does carry samples: the loop
+  // body is untouched, and this only decides whether it runs at all.
+  let populated = if valid_per_plane == 0 {
+    0
+  } else {
+    plane_count as usize
+  };
 
   // Same rationale as in the video path — index-by-key over three
   // unrelated raw arrays (`planes_out`, `(*av_frame).data`, and the
   // implicit per-plane bookkeeping); no slice iteration applies.
   #[allow(clippy::needless_range_loop)]
-  for plane_idx in 0..plane_count as usize {
+  for plane_idx in 0..populated {
     let data_ptr = unsafe { (*av_frame).data[plane_idx] };
     if data_ptr.is_null() {
       // A null plane in a planar layout (or the sole plane in a
@@ -1025,18 +2189,25 @@ pub unsafe fn av_frame_to_audio_frame(
         plane_idx,
       )));
     }
-    let buf = unsafe { find_audio_backing_buffer(av_frame, data_ptr, plane_bytes) }.ok_or(
+    // The bounds proof, against the **allocation**: the plane really is
+    // as large as its `linesize` claims, and lies inside one of the
+    // frame's own buffers. This is the only thing `linesize` is used
+    // for.
+    unsafe { find_audio_backing_buffer(av_frame, data_ptr, allocated_per_plane) }.ok_or(
       ConvertError::BufferAcquireFailed(BufferAcquireFailed::new(plane_idx)),
     )?;
-    // See `av_frame_to_video_frame` for the rationale on plain
-    // address subtraction over `offset_from`.
-    let offset = unsafe { (data_ptr as usize).wrapping_sub((*buf).data as usize) };
-    // SAFETY: `buf` is non-null and live; offset + plane_bytes <= buf.size
-    // by find_audio_backing_buffer's bounds check.
-    let view = unsafe { FfmpegBuffer::from_ref_view(buf, offset, plane_bytes) }.ok_or(
-      ConvertError::BufferAcquireFailed(BufferAcquireFailed::new(plane_idx)),
-    )?;
-    planes_out[plane_idx] = Plane::new(view, plane_bytes as u32);
+    // SAFETY: `data_ptr` is non-null and was just proved to address
+    // `allocated_per_plane` bytes inside one of the frame's own live
+    // buffers, and `valid_per_plane <= allocated_per_plane`. The slice
+    // covers only the samples the decoder wrote — never the alignment
+    // padding past them, which nothing initialises.
+    let bytes = unsafe { core::slice::from_raw_parts(data_ptr as *const u8, valid_per_plane) };
+    // Lossless, and provably so rather than by ceiling: this branch runs
+    // only when `valid_per_plane <= allocated_per_plane`, which is an
+    // `i32` read from `linesize[0]` proved non-negative above. No plane
+    // can exceed `i32::MAX` bytes, so nothing here is truncated even if
+    // a caller raises `max_frame_bytes` past `u32::MAX`.
+    planes_out[plane_idx] = Plane::new(FfmpegBytes::copy_from_slice(bytes), valid_per_plane as u32);
   }
 
   let pts = if pts_raw != AV_NOPTS_VALUE {
@@ -1073,19 +2244,6 @@ pub unsafe fn av_frame_to_audio_frame(
     .with_pts(pts)
     .with_duration(duration),
   )
-}
-
-fn audio_plane_placeholder() -> Result<Plane<FfmpegBuffer>, ConvertError> {
-  let raw = unsafe { av_buffer_alloc(1) };
-  if raw.is_null() {
-    return Err(ConvertError::BufferAcquireFailed(BufferAcquireFailed::new(
-      8,
-    )));
-  }
-  let buf = unsafe { FfmpegBuffer::take(raw) }.ok_or(ConvertError::BufferAcquireFailed(
-    BufferAcquireFailed::new(8),
-  ))?;
-  Ok(Plane::new(buf, 0))
 }
 
 /// The `AVBufferRef` in `(*av_frame).buf[]` that backs `data_ptr` for
@@ -1137,8 +2295,8 @@ pub(crate) unsafe fn find_audio_backing_buffer(
 /// - Otherwise, if the subtitle contains bitmap rects, produce a
 ///   [`SubtitlePayload::Bitmap`] with one [`mediadecode::subtitle::BitmapRegion`]
 ///   per rect (paletted indices and RGBA palette copied into fresh
-///   refcounted FfmpegBuffers, since `AVSubtitleRect` data is not
-///   refcounted).
+///   owned `FfmpegBytes` carriers, since `AVSubtitleRect` data is not
+///   refcounted and does not outlive the `AVSubtitle`).
 /// - An empty subtitle (no rects) becomes an empty `Text` payload.
 ///
 /// `time_base` is the source stream's time base, used to label
@@ -1154,7 +2312,7 @@ pub(crate) unsafe fn find_audio_backing_buffer(
 pub unsafe fn av_subtitle_to_subtitle_frame(
   av_subtitle: *const ffmpeg_next::ffi::AVSubtitle,
   time_base: Timebase,
-) -> Result<SubtitleFrame<SubtitleFrameExtra, FfmpegBuffer>, ConvertError> {
+) -> Result<SubtitleFrame<SubtitleFrameExtra, FfmpegBytes>, ConvertError> {
   if av_subtitle.is_null() {
     return Err(ConvertError::NullFrame);
   }
@@ -1163,7 +2321,7 @@ pub unsafe fn av_subtitle_to_subtitle_frame(
   // fields). Read every field through the raw pointer.
 
   let mut text_chunks: std::vec::Vec<u8> = std::vec::Vec::new();
-  let mut bitmap_regions: std::vec::Vec<mediadecode::subtitle::BitmapRegion<FfmpegBuffer>> =
+  let mut bitmap_regions: std::vec::Vec<mediadecode::subtitle::BitmapRegion<FfmpegBytes>> =
     std::vec::Vec::new();
 
   let count_raw = unsafe { (*av_subtitle).num_rects } as usize;
@@ -1304,20 +2462,14 @@ pub unsafe fn av_subtitle_to_subtitle_frame(
         // SAFETY: data[0] is valid for `linesize[0] * h` bytes per
         // FFmpeg's contract; the multiplication is checked above.
         let data_slice = unsafe { core::slice::from_raw_parts(rect_data0_ptr, data_len) };
-        let data_buf = FfmpegBuffer::copy_from_slice(data_slice).ok_or(
-          ConvertError::BufferAcquireFailed(BufferAcquireFailed::new(0)),
-        )?;
+        let data_buf = FfmpegBytes::copy_from_slice(data_slice);
         let palette_len = 256 * 4;
         let palette_buf = if rect_data1_ptr.is_null() {
-          FfmpegBuffer::copy_from_slice(&[]).ok_or(ConvertError::BufferAcquireFailed(
-            BufferAcquireFailed::new(1),
-          ))?
+          FfmpegBytes::empty()
         } else {
           // SAFETY: palette buffer is 256*4 bytes per FFmpeg's contract.
           let p = unsafe { core::slice::from_raw_parts(rect_data1_ptr, palette_len) };
-          FfmpegBuffer::copy_from_slice(p).ok_or(ConvertError::BufferAcquireFailed(
-            BufferAcquireFailed::new(1),
-          ))?
+          FfmpegBytes::copy_from_slice(p)
         };
         bitmap_regions.push(mediadecode::subtitle::BitmapRegion::new(
           rect_x.max(0) as u32,
@@ -1335,18 +2487,15 @@ pub unsafe fn av_subtitle_to_subtitle_frame(
   }
 
   let payload = if !text_chunks.is_empty() {
-    let buf = FfmpegBuffer::copy_from_slice(&text_chunks).ok_or(
-      ConvertError::BufferAcquireFailed(BufferAcquireFailed::new(0)),
-    )?;
-    SubtitlePayload::Text(SubtitleText::new(buf, None))
+    SubtitlePayload::Text(SubtitleText::new(
+      FfmpegBytes::copy_from_slice(&text_chunks),
+      None,
+    ))
   } else if !bitmap_regions.is_empty() {
     SubtitlePayload::Bitmap(SubtitleBitmap::new(bitmap_regions))
   } else {
     // No rects (or only `None`-typed) — empty text payload.
-    let buf = FfmpegBuffer::copy_from_slice(&[]).ok_or(ConvertError::BufferAcquireFailed(
-      BufferAcquireFailed::new(0),
-    ))?;
-    SubtitlePayload::Text(SubtitleText::new(buf, None))
+    SubtitlePayload::Text(SubtitleText::new(FfmpegBytes::empty(), None))
   };
 
   let sub_pts = unsafe { (*av_subtitle).pts };

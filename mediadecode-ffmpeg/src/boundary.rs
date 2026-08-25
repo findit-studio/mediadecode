@@ -23,7 +23,6 @@ use mediadecode::{
 use mediaframe::audio::ChannelLayoutDescription;
 
 use crate::{
-  FfmpegBuffer,
   // `buffer::SideDataAlloc` is aliased: this module also defines its own
   // `PacketBuildError::SideDataAlloc` payload (the write-side failure —
   // FFmpeg refusing an allocation while rebuilding an `AVPacket`'s side
@@ -32,7 +31,7 @@ use crate::{
   // (out of memory copying a side-data entry *out of* an `AVPacket`) —
   // same short name, different struct, different direction.
   buffer::{
-    PacketBufferError, Refcount, SideDataAlloc as BufferSideDataAlloc, SideDataArray,
+    FfmpegBytes, PacketBufferError, SideDataAlloc as BufferSideDataAlloc, SideDataArray,
     SideDataBytes, SideDataEntries, SideDataPayload, UnrepresentableFlags,
   },
   convert::{SIDE_DATA_MAX_ENTRIES, SIDE_DATA_MAX_TOTAL_BYTES},
@@ -40,6 +39,7 @@ use crate::{
     AttachmentPacketExtra, AudioFrameExtra, AudioPacketExtra, DataPacketExtra, SideDataEntry,
     SubtitleFrameExtra, SubtitlePacketExtra, VideoFrameExtra, VideoPacketExtra,
   },
+  limits::PacketLimits,
   sample_format::SampleFormat,
 };
 
@@ -399,7 +399,7 @@ pub const fn is_hardware_pix_fmt(raw: i32) -> bool {
 /// * `av_new_packet` allocation failure (signalled by `data_mut()`
 ///   returning `None`) → `ffmpeg_next::Error::Other { errno:
 ///   libc::ENOMEM }`.
-fn try_packet_copy(data: &[u8]) -> std::result::Result<Packet, ffmpeg_next::Error> {
+pub(crate) fn try_packet_copy(data: &[u8]) -> std::result::Result<Packet, ffmpeg_next::Error> {
   // FFmpeg's `AVPacket.size` is `c_int`. A payload larger than that
   // can't fit in a single packet — refuse rather than truncate via
   // `as c_int` inside `Packet::new`.
@@ -437,6 +437,11 @@ fn try_packet_copy(data: &[u8]) -> std::result::Result<Packet, ffmpeg_next::Erro
 /// Writes every flag the portable packet carries onto the `AVPacket`
 /// being rebuilt.
 ///
+/// The one place this crate writes packet flags into FFmpeg. The three
+/// stream families rebuild through it, and so does the one-shot image
+/// road — which for two releases forgot to, and sent every attachment
+/// to libavcodec with a zeroed `flags` field.
+///
 /// Not through `Packet::set_flags`, which takes `ffmpeg_next`'s `Flags`
 /// and so can only spell `KEY` and `CORRUPT`: the bits are written to
 /// `AVPacket.flags` directly, so `DISCARD` — and anything else the
@@ -447,7 +452,7 @@ fn try_packet_copy(data: &[u8]) -> std::result::Result<Packet, ffmpeg_next::Erro
 /// # Safety
 ///
 /// `packet` must own a live `AVPacket`.
-unsafe fn write_md_flags(packet: &mut Packet, flags: MdPacketFlags) {
+pub(crate) unsafe fn write_md_flags(packet: &mut Packet, flags: MdPacketFlags) {
   use ffmpeg_next::packet::Mut;
   unsafe {
     (*packet.as_mut_ptr()).flags = c_int::from(flags.bits());
@@ -517,6 +522,40 @@ impl SideDataAlloc {
   }
 }
 
+/// Payload for [`PacketBuildError::SendPayloadTooLarge`].
+///
+/// A compressed payload on its way **into** FFmpeg is larger than the
+/// session's budget allows.
+///
+/// Named for the direction: this is the send leg. Its outbound twin is
+/// [`PacketBufferError::PacketTooLarge`](crate::PacketBufferError),
+/// which judges the same quantity coming the other way, against the
+/// same seat.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("a {bytes}-byte packet payload exceeds the {limit}-byte budget on the way into FFmpeg")]
+pub struct SendPayloadTooLarge {
+  bytes: usize,
+  limit: usize,
+}
+
+impl SendPayloadTooLarge {
+  /// Constructs a `SendPayloadTooLarge` payload.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(bytes: usize, limit: usize) -> Self {
+    Self { bytes, limit }
+  }
+  /// The payload length the caller handed over.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn bytes(&self) -> usize {
+    self.bytes
+  }
+  /// The budget in force.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn limit(&self) -> usize {
+    self.limit
+  }
+}
+
 /// Why a portable packet could not be rebuilt as an `AVPacket`.
 ///
 /// The reverse direction is what feeds a decoder, so everything the
@@ -526,6 +565,12 @@ impl SideDataAlloc {
 #[unwrap(ref, ref_mut)]
 #[try_unwrap(ref, ref_mut)]
 pub enum PacketBuildError {
+  /// The payload is larger than the session's budget allows. Refused
+  /// **before** the `AVPacket` is allocated — the into-FFmpeg leg of
+  /// the budget the outbound leg already kept.
+  #[error(transparent)]
+  SendPayloadTooLarge(#[from] SendPayloadTooLarge),
+
   /// The packet body could not be allocated or is larger than
   /// `AVPacket.size` can hold.
   #[error(transparent)]
@@ -538,6 +583,124 @@ pub enum PacketBuildError {
   /// FFmpeg refused the side-data allocation.
   #[error(transparent)]
   SideDataAlloc(#[from] SideDataAlloc),
+
+  /// The packet is marked `AV_PKT_FLAG_TRUSTED`. See
+  /// [`crate::buffer::TrustedPayload`] — the other leg of the same
+  /// refusal.
+  #[error(transparent)]
+  TrustedPayload(#[from] crate::buffer::TrustedPayload),
+
+  /// The packet's side-data list is over the entry or byte cap the read
+  /// side has always applied. See [`SendSideDataTooLarge`].
+  #[error(transparent)]
+  SendSideDataTooLarge(#[from] SendSideDataTooLarge),
+}
+
+/// Judges the **whole** side-data list before a byte of it is
+/// allocated.
+///
+/// # One seat, both directions
+///
+/// The read side has capped frame and packet side data at 64 entries
+/// and 256 KiB since it was written; the send side had no cap at all.
+/// The preflight checked `body.len()` and then `attach_side_data`
+/// allocated every entry the caller handed over, one
+/// `av_packet_new_side_data` at a time, with nothing bounding the count
+/// or the total — so bytes the demux boundary would have refused coming
+/// *out* of a container went straight into libavcodec going *in*. That
+/// is the same asymmetry `PacketLimits` was introduced to close for the
+/// packet body, one field along.
+///
+/// So the caps are the read side's, applied here, before anything is
+/// allocated — including the body, because a list that cannot be
+/// carried should not cost a packet allocation first.
+fn check_side_data_budget(entries: &[SideDataEntry]) -> Result<(), PacketBuildError> {
+  use crate::convert::{SIDE_DATA_MAX_ENTRIES, SIDE_DATA_MAX_TOTAL_BYTES};
+
+  if entries.len() > SIDE_DATA_MAX_ENTRIES {
+    return Err(PacketBuildError::SendSideDataTooLarge(
+      SendSideDataTooLarge::new_entries(entries.len(), SIDE_DATA_MAX_ENTRIES),
+    ));
+  }
+  let mut total: usize = 0;
+  for entry in entries {
+    total = total.saturating_add(entry.data().len());
+    if total > SIDE_DATA_MAX_TOTAL_BYTES {
+      return Err(PacketBuildError::SendSideDataTooLarge(
+        SendSideDataTooLarge::new_bytes(total, SIDE_DATA_MAX_TOTAL_BYTES),
+      ));
+    }
+  }
+  Ok(())
+}
+
+/// Payload for [`PacketBuildError::SendSideDataTooLarge`].
+///
+/// A side-data list too long or too large to carry into a decoder.
+/// Carries whichever of the two caps was reached, so a caller can tell
+/// "too many annotations" from "too much annotation".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("packet side data is over the {what} ceiling: {value} against {limit}")]
+pub struct SendSideDataTooLarge {
+  what: &'static str,
+  value: usize,
+  limit: usize,
+}
+
+impl SendSideDataTooLarge {
+  /// The entry-count cap was reached.
+  #[inline]
+  pub const fn new_entries(value: usize, limit: usize) -> Self {
+    Self {
+      what: "entry-count",
+      value,
+      limit,
+    }
+  }
+  /// The aggregate-byte cap was reached.
+  #[inline]
+  pub const fn new_bytes(value: usize, limit: usize) -> Self {
+    Self {
+      what: "byte",
+      value,
+      limit,
+    }
+  }
+  /// The count or byte total the list reached.
+  #[inline]
+  pub const fn value(&self) -> usize {
+    self.value
+  }
+  /// The cap in force.
+  #[inline]
+  pub const fn limit(&self) -> usize {
+    self.limit
+  }
+  /// Which cap: `"entry-count"` or `"byte"`.
+  #[inline]
+  pub const fn what(&self) -> &'static str {
+    self.what
+  }
+}
+
+/// Refuses a portable packet whose flags carry `AV_PKT_FLAG_TRUSTED`.
+///
+/// The rebuild leg of the refusal `payload_of` makes on the way out.
+/// Closing only the copy-out leg would leave the loop open: a flag that
+/// reached a portable packet by some other route (a caller composing
+/// one by hand, a future producer, a graph that round-trips flags it
+/// does not interpret) would be written back onto a fresh `AVPacket` by
+/// `write_md_flags` and handed to a decoder entitled to believe it.
+///
+/// See [`crate::buffer::TrustedPayload`] for why the flag makes the
+/// payload uncarriable rather than merely suspicious.
+fn refuse_trusted(flags: MdPacketFlags, len: usize) -> std::result::Result<(), PacketBuildError> {
+  if flags.bits() & crate::buffer::TRUSTED_BIT != 0 {
+    return Err(PacketBuildError::TrustedPayload(
+      crate::buffer::TrustedPayload::new(len),
+    ));
+  }
+  Ok(())
 }
 
 /// Copies `entries` onto an `AVPacket` under construction.
@@ -576,12 +739,12 @@ fn attach_side_data(out: &mut Packet, entries: &[SideDataEntry]) -> Result<(), P
 
 /// Builds an `ffmpeg::Packet` from a [`mediadecode::VideoPacket`]
 /// parameterized by [`crate::extras::VideoPacketExtra`] and
-/// [`crate::FfmpegBuffer`].
+/// `FfmpegBytes`.
 ///
-/// The compressed bytes are **copied** into a new packet allocation —
-/// zero-copy passthrough of the FfmpegBuffer's underlying AVBufferRef
-/// is a future optimization (would need to wire an `AVBufferRef` into
-/// `AVPacket.buf` directly via `av_packet_alloc` + manual buffer set).
+/// The compressed bytes are **copied** into a new packet allocation.
+/// The return leg copies for the same reason the outbound one does:
+/// the carrier is Rust-owned memory with no `AVBufferRef` behind it to
+/// hand back.
 /// PTS / DTS / duration / flags / stream_index are propagated.
 ///
 /// Side data on the extras is reattached to the rebuilt packet — see
@@ -593,9 +756,27 @@ fn attach_side_data(out: &mut Packet, entries: &[SideDataEntry]) -> Result<(), P
 /// * a side-data entry this build of FFmpeg cannot name, or one whose
 ///   allocation failed.
 pub fn ffmpeg_packet_from_video_packet(
-  packet: &mediadecode::packet::VideoPacket<VideoPacketExtra, FfmpegBuffer>,
+  packet: &mediadecode::packet::VideoPacket<VideoPacketExtra, FfmpegBytes>,
+  limits: PacketLimits,
 ) -> std::result::Result<Packet, PacketBuildError> {
-  let mut out = try_packet_copy(packet.data().as_ref())?;
+  let body = packet.data().as_ref();
+  // Before the budget and before the allocation: an uncarriable
+  // payload is not made carriable by fitting.
+  refuse_trusted(packet.flags(), body.len())?;
+  // And the annotations, judged whole before the body is allocated —
+  // a list that cannot be carried should not cost a packet first.
+  check_side_data_budget(packet.extra().side_data())?;
+  // **The into-FFmpeg budget, before the allocation.** `try_packet_copy`
+  // duplicates these bytes into a fresh `AVPacket` and checks only that
+  // they fit `c_int`. Without this the configured ceiling was dead on
+  // the road a caller feeds a decoder directly: bytes the demux
+  // boundary would have refused went straight into libavcodec.
+  if body.len() > limits.max_packet_bytes() {
+    return Err(PacketBuildError::SendPayloadTooLarge(
+      SendPayloadTooLarge::new(body.len(), limits.max_packet_bytes()),
+    ));
+  }
+  let mut out = try_packet_copy(body)?;
   attach_side_data(&mut out, packet.extra().side_data())?;
   if let Some(ts) = packet.pts() {
     out.set_pts(Some(ts.pts()));
@@ -617,9 +798,27 @@ pub fn ffmpeg_packet_from_video_packet(
 /// copied; pts/dts/duration/flags/stream_index and side data are
 /// forwarded. Same failure modes.
 pub fn ffmpeg_packet_from_audio_packet(
-  packet: &mediadecode::packet::AudioPacket<AudioPacketExtra, FfmpegBuffer>,
+  packet: &mediadecode::packet::AudioPacket<AudioPacketExtra, FfmpegBytes>,
+  limits: PacketLimits,
 ) -> std::result::Result<Packet, PacketBuildError> {
-  let mut out = try_packet_copy(packet.data().as_ref())?;
+  let body = packet.data().as_ref();
+  // Before the budget and before the allocation: an uncarriable
+  // payload is not made carriable by fitting.
+  refuse_trusted(packet.flags(), body.len())?;
+  // And the annotations, judged whole before the body is allocated —
+  // a list that cannot be carried should not cost a packet first.
+  check_side_data_budget(packet.extra().side_data())?;
+  // **The into-FFmpeg budget, before the allocation.** `try_packet_copy`
+  // duplicates these bytes into a fresh `AVPacket` and checks only that
+  // they fit `c_int`. Without this the configured ceiling was dead on
+  // the road a caller feeds a decoder directly: bytes the demux
+  // boundary would have refused went straight into libavcodec.
+  if body.len() > limits.max_packet_bytes() {
+    return Err(PacketBuildError::SendPayloadTooLarge(
+      SendPayloadTooLarge::new(body.len(), limits.max_packet_bytes()),
+    ));
+  }
+  let mut out = try_packet_copy(body)?;
   attach_side_data(&mut out, packet.extra().side_data())?;
   if let Some(ts) = packet.pts() {
     out.set_pts(Some(ts.pts()));
@@ -641,9 +840,27 @@ pub fn ffmpeg_packet_from_audio_packet(
 /// forwarded. Subtitle packets have no `dts` in the mediadecode model.
 /// Same failure modes as [`ffmpeg_packet_from_video_packet`].
 pub fn ffmpeg_packet_from_subtitle_packet(
-  packet: &mediadecode::packet::SubtitlePacket<SubtitlePacketExtra, FfmpegBuffer>,
+  packet: &mediadecode::packet::SubtitlePacket<SubtitlePacketExtra, FfmpegBytes>,
+  limits: PacketLimits,
 ) -> std::result::Result<Packet, PacketBuildError> {
-  let mut out = try_packet_copy(packet.data().as_ref())?;
+  let body = packet.data().as_ref();
+  // Before the budget and before the allocation: an uncarriable
+  // payload is not made carriable by fitting.
+  refuse_trusted(packet.flags(), body.len())?;
+  // And the annotations, judged whole before the body is allocated —
+  // a list that cannot be carried should not cost a packet first.
+  check_side_data_budget(packet.extra().side_data())?;
+  // **The into-FFmpeg budget, before the allocation.** `try_packet_copy`
+  // duplicates these bytes into a fresh `AVPacket` and checks only that
+  // they fit `c_int`. Without this the configured ceiling was dead on
+  // the road a caller feeds a decoder directly: bytes the demux
+  // boundary would have refused went straight into libavcodec.
+  if body.len() > limits.max_packet_bytes() {
+    return Err(PacketBuildError::SendPayloadTooLarge(
+      SendPayloadTooLarge::new(body.len(), limits.max_packet_bytes()),
+    ));
+  }
+  let mut out = try_packet_copy(body)?;
   attach_side_data(&mut out, packet.extra().side_data())?;
   if let Some(ts) = packet.pts() {
     out.set_pts(Some(ts.pts()));
@@ -661,42 +878,62 @@ pub fn ffmpeg_packet_from_subtitle_packet(
 //  Safe wrappers — `&ffmpeg::Packet` → `mediadecode::*Packet`.
 // ---------------------------------------------------------------------------
 
-/// Wraps a borrowed [`ffmpeg::Packet`] as a
+/// Carries a borrowed [`ffmpeg::Packet`] out as a
 /// [`mediadecode::packet::VideoPacket`]. The compressed payload is
-/// shared with the source `AVPacket` via refcount bump (no copy).
-/// Timestamps, duration, key/corrupt flags, and the source stream
-/// index are forwarded to the produced packet.
+/// **copied** into an [`FfmpegBytes`] — 0.8 shared it with the source
+/// `AVPacket` by refcount bump, which is what tied a delivered packet's
+/// lifetime to libavformat's; see the
+/// [D-seat amputation contract][law]. Timestamps, duration,
+/// key/corrupt flags, and the source stream index are forwarded to the
+/// produced packet.
+///
+/// Uses the default [`PacketLimits`]; the `_in` sibling takes them
+/// explicitly, alongside the stream's timebase.
 ///
 /// Returns `Ok(None)` when the source packet has no payload at all
-/// (an empty packet — typical after EOF), and
-/// [`PacketBufferError`] when a payload that *is* there could not be
-/// referenced: the two are never the same answer. Caller can also fill
-/// in [`VideoPacketExtra::byte_pos`] / `side_data` post-construction if
-/// they need those.
+/// (an empty packet — typical after EOF), and [`PacketBufferError`]
+/// when a payload that *is* there could not be carried — over budget,
+/// or claiming bytes outside its own buffer. Those are never the same
+/// answer. Caller can also fill in [`VideoPacketExtra::byte_pos`] /
+/// `side_data` post-construction if they need those.
+///
+/// [law]: mediadecode::adapter#the-d-seat-amputation-contract
 pub fn video_packet_from_ffmpeg(
   packet: &Packet,
-) -> Result<Option<VideoPacket<VideoPacketExtra, FfmpegBuffer>>, PacketBufferError> {
-  video_packet_from_ffmpeg_in(packet, mediadecode::Timebase::default())
+) -> Result<Option<VideoPacket<VideoPacketExtra, FfmpegBytes>>, PacketBufferError> {
+  video_packet_from_ffmpeg_in(
+    packet,
+    mediadecode::Timebase::default(),
+    PacketLimits::default(),
+  )
 }
 
-/// Wraps a borrowed [`ffmpeg::Packet`] as a
+/// Carries a borrowed [`ffmpeg::Packet`] out as a
 /// [`mediadecode::packet::AudioPacket`]. Same shape as
-/// [`video_packet_from_ffmpeg`] — refcounted payload, forwarded
-/// metadata.
+/// [`video_packet_from_ffmpeg`] — copied payload, forwarded metadata,
+/// default budgets.
 pub fn audio_packet_from_ffmpeg(
   packet: &Packet,
-) -> Result<Option<AudioPacket<AudioPacketExtra, FfmpegBuffer>>, PacketBufferError> {
-  audio_packet_from_ffmpeg_in(packet, mediadecode::Timebase::default())
+) -> Result<Option<AudioPacket<AudioPacketExtra, FfmpegBytes>>, PacketBufferError> {
+  audio_packet_from_ffmpeg_in(
+    packet,
+    mediadecode::Timebase::default(),
+    PacketLimits::default(),
+  )
 }
 
-/// Wraps a borrowed [`ffmpeg::Packet`] as a
+/// Carries a borrowed [`ffmpeg::Packet`] out as a
 /// [`mediadecode::packet::SubtitlePacket`]. Subtitle packets have no
 /// `dts` in the mediadecode model; everything else mirrors
-/// [`video_packet_from_ffmpeg`].
+/// [`video_packet_from_ffmpeg`], copied payload included.
 pub fn subtitle_packet_from_ffmpeg(
   packet: &Packet,
-) -> Result<Option<SubtitlePacket<SubtitlePacketExtra, FfmpegBuffer>>, PacketBufferError> {
-  subtitle_packet_from_ffmpeg_in(packet, mediadecode::Timebase::default())
+) -> Result<Option<SubtitlePacket<SubtitlePacketExtra, FfmpegBytes>>, PacketBufferError> {
+  subtitle_packet_from_ffmpeg_in(
+    packet,
+    mediadecode::Timebase::default(),
+    PacketLimits::default(),
+  )
 }
 
 /// The most side-data entries this crate will walk on one packet.
@@ -784,7 +1021,7 @@ fn packet_side_data(packet: &Packet) -> Result<Vec<SideDataEntry>, PacketBufferE
     let data = if size == 0 {
       // A marker entry: a type and no bytes. FFmpeg emits these, and
       // there is nothing to carry or to charge the budget for.
-      Vec::new()
+      FfmpegBytes::empty()
     } else if data_ptr.is_null() {
       // Bytes declared and not carried. Reading this as an empty entry
       // delivered a packet whose side data was a lie, and charged the
@@ -809,7 +1046,17 @@ fn packet_side_data(packet: &Packet) -> Result<Vec<SideDataEntry>, PacketBufferE
       // SAFETY: `data` is valid for `size` bytes per FFmpeg's
       // `AVPacketSideData` contract.
       buf.extend_from_slice(unsafe { core::slice::from_raw_parts(data_ptr, size) });
-      buf
+      // Staged through the `Vec` so `try_reserve_exact` keeps *one* of
+      // the two payload-sized allocations a named refusal rather than
+      // an abort. The carrier copy that follows is a second full
+      // allocation of the same size — not a header — and it is
+      // infallible, so what the staging really buys is that the first
+      // and larger risk is reportable and the second is asked for a
+      // size the allocator has just proved it has. The doubling is
+      // affordable only because side data is capped at
+      // [`SIDE_DATA_MAX_TOTAL_BYTES`]; the plane paths, which are not
+      // small, use the one-allocation road instead.
+      FfmpegBytes::copy_from_slice(&buf)
     };
     out.push(SideDataEntry::new(kind, data));
   }
@@ -832,16 +1079,20 @@ fn packet_side_data(packet: &Packet) -> Result<Vec<SideDataEntry>, PacketBufferE
 fn delivered_payload(
   packet: &Packet,
   side_data: &[SideDataEntry],
-) -> Result<Option<FfmpegBuffer>, PacketBufferError> {
-  if let Some(buf) = FfmpegBuffer::from_packet(packet)? {
-    return Ok(Some(buf));
+  limits: PacketLimits,
+) -> Result<Option<FfmpegBytes>, PacketBufferError> {
+  use ffmpeg_next::packet::Ref;
+  // SAFETY: `packet` keeps the AVPacket live for the duration of this
+  // call, which is all `payload_of` requires.
+  if let Some(bytes) =
+    unsafe { crate::buffer::payload_of(packet.as_ptr(), limits.max_packet_bytes()) }?
+  {
+    return Ok(Some(bytes));
   }
   if side_data.is_empty() {
     return Ok(None);
   }
-  FfmpegBuffer::copy_from_slice(&[])
-    .map(Some)
-    .ok_or(PacketBufferError::Refcount(Refcount::new(0)))
+  Ok(Some(FfmpegBytes::empty()))
 }
 
 // ---------------------------------------------------------------------------
@@ -860,9 +1111,10 @@ fn delivered_payload(
 pub fn video_packet_from_ffmpeg_in(
   packet: &Packet,
   time_base: mediadecode::Timebase,
-) -> Result<Option<VideoPacket<VideoPacketExtra, FfmpegBuffer>>, PacketBufferError> {
+  limits: PacketLimits,
+) -> Result<Option<VideoPacket<VideoPacketExtra, FfmpegBytes>>, PacketBufferError> {
   let side_data = packet_side_data(packet)?;
-  let Some(buf) = delivered_payload(packet, &side_data)? else {
+  let Some(buf) = delivered_payload(packet, &side_data, limits)? else {
     return Ok(None);
   };
   let extra = VideoPacketExtra::new(packet.stream() as i32).with_side_data(side_data);
@@ -882,9 +1134,10 @@ pub fn video_packet_from_ffmpeg_in(
 pub fn audio_packet_from_ffmpeg_in(
   packet: &Packet,
   time_base: mediadecode::Timebase,
-) -> Result<Option<AudioPacket<AudioPacketExtra, FfmpegBuffer>>, PacketBufferError> {
+  limits: PacketLimits,
+) -> Result<Option<AudioPacket<AudioPacketExtra, FfmpegBytes>>, PacketBufferError> {
   let side_data = packet_side_data(packet)?;
-  let Some(buf) = delivered_payload(packet, &side_data)? else {
+  let Some(buf) = delivered_payload(packet, &side_data, limits)? else {
     return Ok(None);
   };
   let extra = AudioPacketExtra::new(packet.stream() as i32).with_side_data(side_data);
@@ -904,9 +1157,10 @@ pub fn audio_packet_from_ffmpeg_in(
 pub fn subtitle_packet_from_ffmpeg_in(
   packet: &Packet,
   time_base: mediadecode::Timebase,
-) -> Result<Option<SubtitlePacket<SubtitlePacketExtra, FfmpegBuffer>>, PacketBufferError> {
+  limits: PacketLimits,
+) -> Result<Option<SubtitlePacket<SubtitlePacketExtra, FfmpegBytes>>, PacketBufferError> {
   let side_data = packet_side_data(packet)?;
-  let Some(buf) = delivered_payload(packet, &side_data)? else {
+  let Some(buf) = delivered_payload(packet, &side_data, limits)? else {
     return Ok(None);
   };
   let extra = SubtitlePacketExtra::new(packet.stream() as i32).with_side_data(side_data);
@@ -932,9 +1186,10 @@ pub fn subtitle_packet_from_ffmpeg_in(
 pub fn data_packet_from_ffmpeg_in(
   packet: &Packet,
   time_base: mediadecode::Timebase,
-) -> Result<Option<DataPacket<DataPacketExtra, FfmpegBuffer>>, PacketBufferError> {
+  limits: PacketLimits,
+) -> Result<Option<DataPacket<DataPacketExtra, FfmpegBytes>>, PacketBufferError> {
   let side_data = packet_side_data(packet)?;
-  let Some(buf) = delivered_payload(packet, &side_data)? else {
+  let Some(buf) = delivered_payload(packet, &side_data, limits)? else {
     return Ok(None);
   };
   let pos = packet.position();
@@ -969,8 +1224,14 @@ pub fn data_packet_from_ffmpeg_in(
 /// seat — a deliberate absence, not an oversight.
 pub fn attachment_packet_from_ffmpeg(
   packet: &Packet,
-) -> Result<Option<AttachmentPacket<AttachmentPacketExtra, FfmpegBuffer>>, PacketBufferError> {
-  let Some(buf) = FfmpegBuffer::from_packet(packet)? else {
+  limits: PacketLimits,
+) -> Result<Option<AttachmentPacket<AttachmentPacketExtra, FfmpegBytes>>, PacketBufferError> {
+  use ffmpeg_next::packet::Ref;
+  // SAFETY: `packet` keeps the AVPacket live for the duration of this
+  // call, which is all `payload_of` requires.
+  let Some(buf) =
+    (unsafe { crate::buffer::payload_of(packet.as_ptr(), limits.max_packet_bytes()) })?
+  else {
     return Ok(None);
   };
   Ok(Some(
@@ -1029,6 +1290,67 @@ pub(crate) unsafe fn md_flags_from_av_packet(
   Ok(MdPacketFlags::from_bits_retain(raw as u8))
 }
 
+/// What a track is, folded from `AVCodecParameters.codec_type` read as
+/// the integer it is on the wire.
+///
+/// The dependency-API half of this crate's open-C-enum discipline.
+/// `ffmpeg_next::codec::Parameters::medium()` materialises an
+/// `AVMediaType` out of FFmpeg memory to answer the same question, and
+/// a value outside this build's discriminant set is undefined behaviour
+/// the moment it exists — before any `match` on it can run. That the
+/// set is small and has been stable for years is a reason it has not
+/// bitten, not a reason it cannot.
+///
+/// So the read is raw and the fold is total: anything this build does
+/// not name becomes [`Unknown`](Self::Unknown), which the callers
+/// already had to handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, IsVariant)]
+pub enum MediaKind {
+  /// `AVMEDIA_TYPE_VIDEO`.
+  Video,
+  /// `AVMEDIA_TYPE_AUDIO`.
+  Audio,
+  /// `AVMEDIA_TYPE_SUBTITLE`.
+  Subtitle,
+  /// `AVMEDIA_TYPE_DATA`.
+  Data,
+  /// `AVMEDIA_TYPE_ATTACHMENT`.
+  Attachment,
+  /// Anything this build of FFmpeg does not name, `AVMEDIA_TYPE_UNKNOWN`
+  /// included.
+  Unknown,
+}
+
+/// Folds a raw `AVMediaType` integer into [`MediaKind`].
+pub(crate) fn media_kind_from_raw(raw: i32) -> MediaKind {
+  use ffmpeg_next::ffi::AVMediaType::*;
+  match raw {
+    x if x == AVMEDIA_TYPE_VIDEO as i32 => MediaKind::Video,
+    x if x == AVMEDIA_TYPE_AUDIO as i32 => MediaKind::Audio,
+    x if x == AVMEDIA_TYPE_SUBTITLE as i32 => MediaKind::Subtitle,
+    x if x == AVMEDIA_TYPE_DATA as i32 => MediaKind::Data,
+    x if x == AVMEDIA_TYPE_ATTACHMENT as i32 => MediaKind::Attachment,
+    _ => MediaKind::Unknown,
+  }
+}
+
+/// The medium a set of codec parameters declares, without forming an
+/// `AVMediaType`. Replaces every `Parameters::medium()` call in this
+/// crate — see [`MediaKind`].
+pub(crate) fn media_kind_of(parameters: &ffmpeg_next::codec::Parameters) -> MediaKind {
+  // SAFETY: `as_ptr` is `unsafe` only because the pointer must not
+  // outlive `parameters`; it is used and discarded inside this call.
+  let ptr = unsafe { parameters.as_ptr() };
+  if ptr.is_null() {
+    return MediaKind::Unknown;
+  }
+  // SAFETY: `ptr` is a live `*const AVCodecParameters`; `addr_of!`
+  // computes the field address without forming a reference, and reading
+  // as `i32` matches the bindgen enum's `c_int` storage.
+  let raw = unsafe { read_unaligned(addr_of!((*ptr).codec_type) as *const i32) };
+  media_kind_from_raw(raw)
+}
+
 /// Every packet flag this build of FFmpeg names fits the byte
 /// `PacketFlags` carries. If that stops being true, this fails the
 /// build rather than letting a flag go missing at run time.
@@ -1054,103 +1376,60 @@ const _: () = {
 /// decoder overwrites the frame on success; this just provides a
 /// well-formed slot.
 ///
-/// All four plane slots get a 1-byte `FfmpegBuffer` placeholder
-/// (the array shape requires a buffer in every slot, but
-/// `plane_count = 0` reports them as inactive).
+/// All four plane slots hold the shared empty carrier (the array shape
+/// requires a buffer in every slot, but `plane_count = 0` reports them
+/// as inactive).
 ///
-/// # Panics
-///
-/// Panics on FFmpeg-side OOM (the per-plane 1-byte allocation
-/// failed). Callers who need to recover from OOM should use
-/// [`try_empty_video_frame`].
-pub fn empty_video_frame() -> VideoFrame<PixelFormat, VideoFrameExtra, FfmpegBuffer> {
-  try_empty_video_frame().expect("empty_video_frame: av_buffer_alloc returned null (OOM)")
-}
-
-/// Fallible counterpart to [`empty_video_frame`]. Returns `None` if
-/// any of the four placeholder allocations fails.
-pub fn try_empty_video_frame() -> Option<VideoFrame<PixelFormat, VideoFrameExtra, FfmpegBuffer>> {
-  let planes = [
-    Plane::new(FfmpegBuffer::try_empty()?, 0),
-    Plane::new(FfmpegBuffer::try_empty()?, 0),
-    Plane::new(FfmpegBuffer::try_empty()?, 0),
-    Plane::new(FfmpegBuffer::try_empty()?, 0),
-  ];
-  Some(VideoFrame::new(
+/// **Infallible in 0.9, and the `try_` sibling is gone.** Through 0.8
+/// each slot was its own one-byte `AVBufferRef`, so building a
+/// placeholder was four FFmpeg allocations that could fail — hence a
+/// `try_empty_video_frame` returning `Option` and an `empty_video_frame`
+/// that panicked on `None`. The amputation removes the allocations:
+/// the empty carrier is made once for the process and cloned by
+/// refcount. A constructor with no failure mode does not get to keep a
+/// `Result`-shaped door.
+pub fn empty_video_frame() -> VideoFrame<PixelFormat, VideoFrameExtra, FfmpegBytes> {
+  VideoFrame::new(
     Dimensions::new(0, 0),
     // mediaframe 0.3's named "no format yet" member, and its
     // `Default` — the state a descriptor is in before a decoder has
     // said what it produces, which is exactly this placeholder.
     PixelFormat::None,
-    planes,
+    core::array::from_fn(|_| Plane::new(FfmpegBytes::empty(), 0)),
     0,
     VideoFrameExtra::default(),
-  ))
+  )
 }
 
 /// Constructs an empty [`mediadecode::frame::AudioFrame`] suitable as
 /// the destination argument to
 /// [`mediadecode::decoder::AudioStreamDecoder::receive_frame`]. Same
-/// behaviour as [`empty_video_frame`] — eight 1-byte plane
-/// placeholders, `plane_count = 0`.
-///
-/// # Panics
-///
-/// Panics on FFmpeg-side OOM. See [`try_empty_audio_frame`] for the
-/// fallible variant.
+/// behaviour as [`empty_video_frame`] — eight shared empty plane
+/// carriers, `plane_count = 0`, and no way to fail.
 pub fn empty_audio_frame()
--> AudioFrame<SampleFormat, ChannelLayoutDescription, AudioFrameExtra, FfmpegBuffer> {
-  try_empty_audio_frame().expect("empty_audio_frame: av_buffer_alloc returned null (OOM)")
-}
-
-/// Fallible counterpart to [`empty_audio_frame`]. Returns `None` if
-/// any of the eight placeholder allocations fails.
-pub fn try_empty_audio_frame()
--> Option<AudioFrame<SampleFormat, ChannelLayoutDescription, AudioFrameExtra, FfmpegBuffer>> {
-  let planes = [
-    Plane::new(FfmpegBuffer::try_empty()?, 0),
-    Plane::new(FfmpegBuffer::try_empty()?, 0),
-    Plane::new(FfmpegBuffer::try_empty()?, 0),
-    Plane::new(FfmpegBuffer::try_empty()?, 0),
-    Plane::new(FfmpegBuffer::try_empty()?, 0),
-    Plane::new(FfmpegBuffer::try_empty()?, 0),
-    Plane::new(FfmpegBuffer::try_empty()?, 0),
-    Plane::new(FfmpegBuffer::try_empty()?, 0),
-  ];
-  Some(AudioFrame::new(
+-> AudioFrame<SampleFormat, ChannelLayoutDescription, AudioFrameExtra, FfmpegBytes> {
+  AudioFrame::new(
     0,
     0,
     0,
     SampleFormat::NONE,
     ChannelLayoutDescription::default(),
-    planes,
+    core::array::from_fn(|_| Plane::new(FfmpegBytes::empty(), 0)),
     0,
     AudioFrameExtra::default(),
-  ))
+  )
 }
 
 /// Constructs an empty [`mediadecode::frame::SubtitleFrame`] suitable
 /// as the destination argument to
 /// [`mediadecode::decoder::SubtitleDecoder::receive_frame`]. The
-/// payload is an empty `Text` placeholder; the decoder overwrites
-/// it on success.
-///
-/// # Panics
-///
-/// Panics on FFmpeg-side OOM. See [`try_empty_subtitle_frame`] for
-/// the fallible variant.
-pub fn empty_subtitle_frame() -> SubtitleFrame<SubtitleFrameExtra, FfmpegBuffer> {
-  try_empty_subtitle_frame().expect("empty_subtitle_frame: av_buffer_alloc returned null (OOM)")
-}
-
-/// Fallible counterpart to [`empty_subtitle_frame`]. Returns `None`
-/// if the placeholder allocation fails.
-pub fn try_empty_subtitle_frame() -> Option<SubtitleFrame<SubtitleFrameExtra, FfmpegBuffer>> {
-  let buf = FfmpegBuffer::copy_from_slice(&[]).or_else(FfmpegBuffer::try_empty)?;
-  Some(SubtitleFrame::new(
-    SubtitlePayload::Text(SubtitleText::new(buf, None)),
+/// payload is an empty `Text` placeholder; the decoder overwrites it
+/// on success. Infallible, as its two siblings are.
+pub fn empty_subtitle_frame() -> SubtitleFrame<SubtitleFrameExtra, FfmpegBytes> {
+  SubtitleFrame::new(
+    SubtitlePayload::Text(SubtitleText::new(FfmpegBytes::empty(), None)),
     SubtitleFrameExtra::default(),
-  ))
+  )
 }
 
 #[cfg(test)]
@@ -1181,23 +1460,23 @@ mod tests {
     let forged = out_of_bounds_packet();
     let tb = mediadecode::Timebase::default();
     assert!(matches!(
-      video_packet_from_ffmpeg_in(&forged, tb),
+      video_packet_from_ffmpeg_in(&forged, tb, PacketLimits::default()),
       Err(PacketBufferError::Bounds(_)),
     ));
     assert!(matches!(
-      audio_packet_from_ffmpeg_in(&forged, tb),
+      audio_packet_from_ffmpeg_in(&forged, tb, PacketLimits::default()),
       Err(PacketBufferError::Bounds(_)),
     ));
     assert!(matches!(
-      subtitle_packet_from_ffmpeg_in(&forged, tb),
+      subtitle_packet_from_ffmpeg_in(&forged, tb, PacketLimits::default()),
       Err(PacketBufferError::Bounds(_)),
     ));
     assert!(matches!(
-      data_packet_from_ffmpeg_in(&forged, tb),
+      data_packet_from_ffmpeg_in(&forged, tb, PacketLimits::default()),
       Err(PacketBufferError::Bounds(_)),
     ));
     assert!(matches!(
-      attachment_packet_from_ffmpeg(&forged),
+      attachment_packet_from_ffmpeg(&forged, PacketLimits::default()),
       Err(PacketBufferError::Bounds(_)),
     ));
   }
@@ -1386,19 +1665,19 @@ mod tests {
     [
       (
         "video",
-        video_packet_from_ffmpeg_in(packet, tb).map(|p| p.is_some()),
+        video_packet_from_ffmpeg_in(packet, tb, PacketLimits::default()).map(|p| p.is_some()),
       ),
       (
         "audio",
-        audio_packet_from_ffmpeg_in(packet, tb).map(|p| p.is_some()),
+        audio_packet_from_ffmpeg_in(packet, tb, PacketLimits::default()).map(|p| p.is_some()),
       ),
       (
         "subtitle",
-        subtitle_packet_from_ffmpeg_in(packet, tb).map(|p| p.is_some()),
+        subtitle_packet_from_ffmpeg_in(packet, tb, PacketLimits::default()).map(|p| p.is_some()),
       ),
       (
         "data",
-        data_packet_from_ffmpeg_in(packet, tb).map(|p| p.is_some()),
+        data_packet_from_ffmpeg_in(packet, tb, PacketLimits::default()).map(|p| p.is_some()),
       ),
     ]
   }
@@ -1457,9 +1736,13 @@ mod tests {
     // exactly what FFmpeg emits for some side data, and it stays
     // welcome.
     let marker = Forged::null_entry_data(0, true);
-    let packet = video_packet_from_ffmpeg_in(&marker.packet, mediadecode::Timebase::default())
-      .expect("a marker entry is carriable")
-      .expect("present");
+    let packet = video_packet_from_ffmpeg_in(
+      &marker.packet,
+      mediadecode::Timebase::default(),
+      PacketLimits::default(),
+    )
+    .expect("a marker entry is carriable")
+    .expect("present");
     assert_eq!(packet.extra().side_data().len(), 1);
     assert!(packet.extra().side_data()[0].data().is_empty());
   }
@@ -1476,19 +1759,20 @@ mod tests {
     for (arm, result) in [
       (
         "video",
-        video_packet_from_ffmpeg_in(&oversized, tb).map(|p| p.is_some()),
+        video_packet_from_ffmpeg_in(&oversized, tb, PacketLimits::default()).map(|p| p.is_some()),
       ),
       (
         "audio",
-        audio_packet_from_ffmpeg_in(&oversized, tb).map(|p| p.is_some()),
+        audio_packet_from_ffmpeg_in(&oversized, tb, PacketLimits::default()).map(|p| p.is_some()),
       ),
       (
         "subtitle",
-        subtitle_packet_from_ffmpeg_in(&oversized, tb).map(|p| p.is_some()),
+        subtitle_packet_from_ffmpeg_in(&oversized, tb, PacketLimits::default())
+          .map(|p| p.is_some()),
       ),
       (
         "data",
-        data_packet_from_ffmpeg_in(&oversized, tb).map(|p| p.is_some()),
+        data_packet_from_ffmpeg_in(&oversized, tb, PacketLimits::default()).map(|p| p.is_some()),
       ),
     ] {
       match result {
@@ -1505,7 +1789,7 @@ mod tests {
     // therefore looked empty, and the demuxer skipped it in silence.
     let oversized = packet_with_side_data(SIDE_DATA_MAX_TOTAL_BYTES + 1, false);
     assert!(matches!(
-      video_packet_from_ffmpeg_in(&oversized, tb).map(|p| p.is_some()),
+      video_packet_from_ffmpeg_in(&oversized, tb, PacketLimits::default()).map(|p| p.is_some()),
       Err(PacketBufferError::SideDataBytes(_)),
     ));
   }
@@ -1516,7 +1800,7 @@ mod tests {
 
     // Exactly at the byte cap: carried, whole.
     let at_cap = packet_with_side_data(SIDE_DATA_MAX_TOTAL_BYTES, true);
-    let packet = video_packet_from_ffmpeg_in(&at_cap, tb)
+    let packet = video_packet_from_ffmpeg_in(&at_cap, tb, PacketLimits::default())
       .expect("exactly at the cap is not over it")
       .expect("present");
     assert_eq!(packet.extra().side_data().len(), 1);
@@ -1528,7 +1812,7 @@ mod tests {
     // One byte past: refused.
     let past = packet_with_side_data(SIDE_DATA_MAX_TOTAL_BYTES + 1, true);
     assert!(matches!(
-      video_packet_from_ffmpeg_in(&past, tb).map(|p| p.is_some()),
+      video_packet_from_ffmpeg_in(&past, tb, PacketLimits::default()).map(|p| p.is_some()),
       Err(PacketBufferError::SideDataBytes(_)),
     ));
 
@@ -1540,13 +1824,15 @@ mod tests {
     assert_eq!(cap, SIDE_DATA_MAX_ENTRIES, "the cap this lane straddles");
 
     let at_cap = Forged::entries(cap, true);
-    let packet = video_packet_from_ffmpeg_in(&at_cap.packet, tb)
+    let packet = video_packet_from_ffmpeg_in(&at_cap.packet, tb, PacketLimits::default())
       .expect("exactly at the cap is not over it")
       .expect("present");
     assert_eq!(packet.extra().side_data().len(), cap);
 
     let past = Forged::entries(cap + 1, true);
-    match video_packet_from_ffmpeg_in(&past.packet, tb).map(|p| p.is_some()) {
+    match video_packet_from_ffmpeg_in(&past.packet, tb, PacketLimits::default())
+      .map(|p| p.is_some())
+    {
       Err(PacketBufferError::SideDataEntries(p)) => {
         assert_eq!(p.count() as usize, cap + 1);
         assert_eq!(p.cap(), cap);
@@ -1558,9 +1844,69 @@ mod tests {
     // data" would be the same silent loss by another route.
     let corrupt = Forged::entries(1, true).with_declared_count(-3);
     assert!(matches!(
-      video_packet_from_ffmpeg_in(&corrupt.packet, tb).map(|p| p.is_some()),
+      video_packet_from_ffmpeg_in(&corrupt.packet, tb, PacketLimits::default()).map(|p| p.is_some()),
       Err(PacketBufferError::SideDataEntries(p)) if p.count() == -3,
     ));
+  }
+
+  #[test]
+  fn a_trusted_packet_is_refused_on_both_legs() {
+    use ffmpeg_next::packet::Mut;
+    let tb = mediadecode::Timebase::default();
+
+    // Copy-out: the leg such a packet would enter the graph on.
+    let mut packet = Packet::copy(&[1u8, 2, 3]);
+    // SAFETY: `packet` owns a live `AVPacket`; `flags` is a public field
+    // and this bit has no `ffmpeg_next::Flags` spelling.
+    unsafe {
+      (*packet.as_mut_ptr()).flags =
+        ffmpeg_next::ffi::AV_PKT_FLAG_KEY | ffmpeg_next::ffi::AV_PKT_FLAG_TRUSTED;
+    };
+    for (arm, taken) in [
+      (
+        "video",
+        video_packet_from_ffmpeg_in(&packet, tb, PacketLimits::default()).map(|p| p.is_some()),
+      ),
+      (
+        "audio",
+        audio_packet_from_ffmpeg_in(&packet, tb, PacketLimits::default()).map(|p| p.is_some()),
+      ),
+      (
+        "subtitle",
+        subtitle_packet_from_ffmpeg_in(&packet, tb, PacketLimits::default()).map(|p| p.is_some()),
+      ),
+      (
+        "data",
+        data_packet_from_ffmpeg_in(&packet, tb, PacketLimits::default()).map(|p| p.is_some()),
+      ),
+      (
+        "attachment",
+        attachment_packet_from_ffmpeg(&packet, PacketLimits::default()).map(|p| p.is_some()),
+      ),
+    ] {
+      match taken {
+        Err(PacketBufferError::TrustedPayload(p)) => assert_eq!(p.len(), 3, "{arm}"),
+        other => panic!("{arm}: a TRUSTED payload must not be copied out, got {other:?}"),
+      }
+    }
+
+    // Rebuild: the leg a flag that arrived by some other route would be
+    // handed back to a decoder on. Built by hand, because the copy-out
+    // leg above will no longer produce one.
+    let clean = Packet::copy(&[1u8, 2, 3]);
+    let video = video_packet_from_ffmpeg_in(&clean, tb, PacketLimits::default())
+      .expect("a clean packet is carriable")
+      .expect("present");
+    let trusted = video
+      .clone()
+      .with_flags(MdPacketFlags::from_bits_retain(crate::buffer::TRUSTED_BIT));
+    assert!(
+      matches!(
+        ffmpeg_packet_from_video_packet(&trusted, PacketLimits::default()),
+        Err(PacketBuildError::TrustedPayload(_)),
+      ),
+      "a TRUSTED flag must not be written back onto an AVPacket",
+    );
   }
 
   #[test]
@@ -1577,7 +1923,15 @@ mod tests {
     const TRUSTED: i32 = ffmpeg_next::ffi::AV_PKT_FLAG_TRUSTED;
     const DISPOSABLE: i32 = ffmpeg_next::ffi::AV_PKT_FLAG_DISPOSABLE;
     const UNNAMED: i32 = 0b0010_0000; // nothing names this bit yet
-    let raw = ffmpeg_next::ffi::AV_PKT_FLAG_KEY | DISCARD | TRUSTED | DISPOSABLE | UNNAMED;
+    // `TRUSTED` is deliberately **not** in this set, and the constant is
+    // kept only to say so. It used to be — this lane asserted it made
+    // the round trip — and that assertion was the bug: a `TRUSTED`
+    // payload may be a structure of pointers into other live objects,
+    // so copying it mints an owned-looking carrier that dangles when
+    // its source drops. It is now refused on both legs, which
+    // `a_trusted_packet_is_refused_on_both_legs` pins.
+    let _ = TRUSTED;
+    let raw = ffmpeg_next::ffi::AV_PKT_FLAG_KEY | DISCARD | DISPOSABLE | UNNAMED;
 
     let mut packet = Packet::copy(&[1u8, 2, 3]);
     // SAFETY: `packet` owns a live `AVPacket`; `flags` is a public
@@ -1593,24 +1947,24 @@ mod tests {
     let tb = mediadecode::Timebase::default();
     let expected = MdPacketFlags::from_bits_retain(raw as u8);
 
-    let video = video_packet_from_ffmpeg_in(&packet, tb)
+    let video = video_packet_from_ffmpeg_in(&packet, tb, PacketLimits::default())
       .expect("wrappable")
       .expect("present");
     assert_eq!(video.flags(), expected);
     assert!(video.flags().contains(MdPacketFlags::DISCARD));
-    let audio = audio_packet_from_ffmpeg_in(&packet, tb)
+    let audio = audio_packet_from_ffmpeg_in(&packet, tb, PacketLimits::default())
       .expect("wrappable")
       .expect("present");
     assert_eq!(audio.flags(), expected);
-    let subtitle = subtitle_packet_from_ffmpeg_in(&packet, tb)
+    let subtitle = subtitle_packet_from_ffmpeg_in(&packet, tb, PacketLimits::default())
       .expect("wrappable")
       .expect("present");
     assert_eq!(subtitle.flags(), expected);
-    let data = data_packet_from_ffmpeg_in(&packet, tb)
+    let data = data_packet_from_ffmpeg_in(&packet, tb, PacketLimits::default())
       .expect("wrappable")
       .expect("present");
     assert_eq!(data.flags(), expected);
-    let attachment = attachment_packet_from_ffmpeg(&packet)
+    let attachment = attachment_packet_from_ffmpeg(&packet, PacketLimits::default())
       .expect("wrappable")
       .expect("present");
     assert_eq!(attachment.flags(), expected);
@@ -1619,15 +1973,15 @@ mod tests {
     for (arm, rebuilt) in [
       (
         "video",
-        ffmpeg_packet_from_video_packet(&video).expect("rebuilt"),
+        ffmpeg_packet_from_video_packet(&video, PacketLimits::default()).expect("rebuilt"),
       ),
       (
         "audio",
-        ffmpeg_packet_from_audio_packet(&audio).expect("rebuilt"),
+        ffmpeg_packet_from_audio_packet(&audio, PacketLimits::default()).expect("rebuilt"),
       ),
       (
         "subtitle",
-        ffmpeg_packet_from_subtitle_packet(&subtitle).expect("rebuilt"),
+        ffmpeg_packet_from_subtitle_packet(&subtitle, PacketLimits::default()).expect("rebuilt"),
       ),
     ] {
       // SAFETY: `rebuilt` owns a live `AVPacket`.
@@ -1657,7 +2011,7 @@ mod tests {
       );
     }
     assert!(matches!(
-      attachment_packet_from_ffmpeg(&packet).map(|p| p.is_some()),
+      attachment_packet_from_ffmpeg(&packet, PacketLimits::default()).map(|p| p.is_some()),
       Err(PacketBufferError::UnrepresentableFlags(_)),
     ));
     let _ = tb;
@@ -1699,27 +2053,30 @@ mod tests {
         SKIP_SAMPLES
       };
 
-      let video = video_packet_from_ffmpeg_in(source, tb)
+      let video = video_packet_from_ffmpeg_in(source, tb, PacketLimits::default())
         .expect("wrappable")
         .expect("present");
-      let rebuilt = ffmpeg_packet_from_video_packet(&video).expect("rebuilt");
+      let rebuilt =
+        ffmpeg_packet_from_video_packet(&video, PacketLimits::default()).expect("rebuilt");
       let carried = packet_side_data(&rebuilt).expect("readable");
       assert_eq!(carried.len(), 1, "{name}: video lost its side data");
       assert_eq!(carried[0].kind(), expected_kind, "{name}: video");
       assert_eq!(carried[0].data(), video.extra().side_data()[0].data());
 
-      let audio = audio_packet_from_ffmpeg_in(source, tb)
+      let audio = audio_packet_from_ffmpeg_in(source, tb, PacketLimits::default())
         .expect("wrappable")
         .expect("present");
-      let rebuilt = ffmpeg_packet_from_audio_packet(&audio).expect("rebuilt");
+      let rebuilt =
+        ffmpeg_packet_from_audio_packet(&audio, PacketLimits::default()).expect("rebuilt");
       let carried = packet_side_data(&rebuilt).expect("readable");
       assert_eq!(carried.len(), 1, "{name}: audio lost its side data");
       assert_eq!(carried[0].data(), audio.extra().side_data()[0].data());
 
-      let subtitle = subtitle_packet_from_ffmpeg_in(source, tb)
+      let subtitle = subtitle_packet_from_ffmpeg_in(source, tb, PacketLimits::default())
         .expect("wrappable")
         .expect("present");
-      let rebuilt = ffmpeg_packet_from_subtitle_packet(&subtitle).expect("rebuilt");
+      let rebuilt =
+        ffmpeg_packet_from_subtitle_packet(&subtitle, PacketLimits::default()).expect("rebuilt");
       let carried = packet_side_data(&rebuilt).expect("readable");
       assert_eq!(carried.len(), 1, "{name}: subtitle lost its side data");
       assert_eq!(carried[0].data(), subtitle.extra().side_data()[0].data());
@@ -1735,10 +2092,13 @@ mod tests {
     // is the very defect this whole seam exists to close.
     let limit = crate::ffi::side_data_type_count();
     let packet = mediadecode::packet::VideoPacket::new(
-      FfmpegBuffer::copy_from_slice(&[1u8]).expect("body"),
-      VideoPacketExtra::new(0).with_side_data(vec![SideDataEntry::new(limit, vec![9u8])]),
+      FfmpegBytes::copy_from_slice(&[1u8]),
+      VideoPacketExtra::new(0).with_side_data(vec![SideDataEntry::new(
+        limit,
+        FfmpegBytes::copy_from_slice(&[9u8]),
+      )]),
     );
-    match ffmpeg_packet_from_video_packet(&packet).map(|_| ()) {
+    match ffmpeg_packet_from_video_packet(&packet, PacketLimits::default()).map(|_| ()) {
       Err(PacketBuildError::UnknownSideData(p)) => {
         assert_eq!(p.kind(), limit);
         assert_eq!(p.limit(), limit);
@@ -1747,9 +2107,9 @@ mod tests {
     }
     assert!(matches!(
       ffmpeg_packet_from_video_packet(&mediadecode::packet::VideoPacket::new(
-        FfmpegBuffer::copy_from_slice(&[1u8]).expect("body"),
-        VideoPacketExtra::new(0).with_side_data(vec![SideDataEntry::new(-1, vec![9u8])]),
-      ))
+        FfmpegBytes::copy_from_slice(&[1u8]),
+        VideoPacketExtra::new(0).with_side_data(vec![SideDataEntry::new(-1, FfmpegBytes::copy_from_slice(&[9u8]))]),
+      ), PacketLimits::default())
       .map(|_| ()),
       Err(PacketBuildError::UnknownSideData(p)) if p.kind() == -1,
     ));
@@ -1763,7 +2123,7 @@ mod tests {
     let packet = side_data_only_packet();
     let tb = mediadecode::Timebase::default();
 
-    let video = video_packet_from_ffmpeg_in(&packet, tb)
+    let video = video_packet_from_ffmpeg_in(&packet, tb, PacketLimits::default())
       .expect("wrappable")
       .expect("a side-data-only packet is a packet");
     assert!(video.data().as_ref().is_empty(), "no body, but a buffer");
@@ -1771,19 +2131,19 @@ mod tests {
     assert_eq!(video.extra().side_data()[0].kind(), NEW_EXTRADATA);
     assert_eq!(video.extra().side_data()[0].data(), &[1, 2, 3, 4]);
 
-    let audio = audio_packet_from_ffmpeg_in(&packet, tb)
+    let audio = audio_packet_from_ffmpeg_in(&packet, tb, PacketLimits::default())
       .expect("wrappable")
       .expect("present");
     assert!(audio.data().as_ref().is_empty());
     assert_eq!(audio.extra().side_data()[0].data(), &[1, 2, 3, 4]);
 
-    let subtitle = subtitle_packet_from_ffmpeg_in(&packet, tb)
+    let subtitle = subtitle_packet_from_ffmpeg_in(&packet, tb, PacketLimits::default())
       .expect("wrappable")
       .expect("present");
     assert!(subtitle.data().as_ref().is_empty());
     assert_eq!(subtitle.extra().side_data()[0].data(), &[1, 2, 3, 4]);
 
-    let data = data_packet_from_ffmpeg_in(&packet, tb)
+    let data = data_packet_from_ffmpeg_in(&packet, tb, PacketLimits::default())
       .expect("wrappable")
       .expect("present");
     assert!(data.data().as_ref().is_empty());
@@ -1792,7 +2152,7 @@ mod tests {
     // The one arm where a payload-less packet really is nothing: an
     // attachment is its bytes, and there are none.
     assert!(
-      attachment_packet_from_ffmpeg(&packet)
+      attachment_packet_from_ffmpeg(&packet, PacketLimits::default())
         .expect("wrappable")
         .is_none(),
       "an attachment with no bytes is no attachment",
@@ -1817,9 +2177,13 @@ mod tests {
       assert!(!ptr.is_null());
       core::ptr::copy_nonoverlapping([9u8, 9].as_ptr(), ptr, 2);
     }
-    let video = video_packet_from_ffmpeg_in(&packet, mediadecode::Timebase::default())
-      .expect("wrappable")
-      .expect("present");
+    let video = video_packet_from_ffmpeg_in(
+      &packet,
+      mediadecode::Timebase::default(),
+      PacketLimits::default(),
+    )
+    .expect("wrappable")
+    .expect("present");
     assert_eq!(video.data().as_ref(), &[7, 7, 7]);
     assert_eq!(video.extra().side_data()[0].data(), &[9, 9]);
   }
@@ -1831,18 +2195,18 @@ mod tests {
     // error — this is the only thing a pull loop may skip.
     let empty = Packet::empty();
     assert!(
-      video_packet_from_ffmpeg_in(&empty, tb)
+      video_packet_from_ffmpeg_in(&empty, tb, PacketLimits::default())
         .expect("not a failure")
         .is_none()
     );
     assert!(
-      attachment_packet_from_ffmpeg(&empty)
+      attachment_packet_from_ffmpeg(&empty, PacketLimits::default())
         .expect("not a failure")
         .is_none()
     );
 
     let real = Packet::copy(&[9u8, 8, 7]);
-    let wrapped = video_packet_from_ffmpeg_in(&real, tb)
+    let wrapped = video_packet_from_ffmpeg_in(&real, tb, PacketLimits::default())
       .expect("wrappable")
       .expect("present");
     assert_eq!(wrapped.data().as_ref(), &[9, 8, 7]);

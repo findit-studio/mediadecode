@@ -30,12 +30,56 @@ pub enum Error {
   #[error(transparent)]
   PacketBuild(#[from] crate::boundary::PacketBuildError),
 
+  /// A stream's codec parameters hold more heap bytes than the
+  /// decoder tier will copy — see
+  /// [`crate::DEFAULT_MAX_CODEC_PARAMETER_BYTES`].
+  ///
+  /// The decoder tier has no options object of its own for this, so it
+  /// applies the default ceiling. A caller that needs a larger one
+  /// opens the parameters through the demux tier, where
+  /// [`DemuxLimits`](crate::DemuxLimits) carries the seat.
+  #[error(transparent)]
+  ParametersTooLarge(#[from] crate::demuxer::ParametersTooLarge),
+
   /// `avcodec_find_decoder` returned null for the input codec id. The id
   /// is reported as the raw integer (`AVCodecID` discriminant) — we do not
   /// construct the bindgen `AVCodecID` enum from a runtime value, since
   /// values outside our build's discriminant set would invoke UB.
   #[error("no decoder for codec id {0}")]
   NoCodec(u32),
+
+  /// The CPU frame a hardware->CPU transfer would allocate is larger
+  /// than [`FrameLimits::max_frame_bytes`](crate::FrameLimits::max_frame_bytes).
+  ///
+  /// The hardware road's own seat. `judge_buffer` — the allocator hook
+  /// that applies the byte ceiling to aligned dimensions — is **not** a
+  /// universal choke point: `ff_get_buffer` calls `hwaccel->alloc_frame`
+  /// directly for VideoToolbox h264/hevc/vp9 and never reaches
+  /// `get_buffer2` at all, and `av_hwframe_transfer_data` allocates its
+  /// CPU destination outside both. This is the seat for that second
+  /// road, judged before the transfer rather than after it.
+  #[error(transparent)]
+  HwTransferTooLarge(#[from] HwTransferTooLarge),
+
+  /// A frame's allocation would have cost more than
+  /// [`FrameLimits::max_frame_bytes`](crate::FrameLimits::max_frame_bytes),
+  /// so it was refused in the allocator, before the allocation.
+  #[error(transparent)]
+  FrameBudgetExceeded(#[from] FrameBudgetExceeded),
+
+  /// The stream's **coded** surface is over the frame ceiling, so the
+  /// hardware format was declined before its pool could be built.
+  ///
+  /// The two dimension vocabularies: `max_pixels` is applied by
+  /// `ff_set_dimensions` to a stream's *display* dims, and a cropped
+  /// stream can display 32x32 out of a 1920x1088 coded surface. What
+  /// gets allocated is the coded figure, so it is the one judged here —
+  /// and it is judged in **bytes**, priced through the allocator-parity
+  /// footprint against the caller's `max_frame_bytes`, because
+  /// `max_pixels` carries the caller's logical pixel limit and nothing
+  /// about cost.
+  #[error(transparent)]
+  HwSurfaceTooLarge(#[from] HwSurfaceTooLarge),
 
   /// The codec does not advertise a hardware configuration matching the
   /// requested backend (via `avcodec_get_hw_config`).
@@ -318,5 +362,130 @@ impl std::fmt::Debug for FallbackFailed {
         &format_args!("[{} packets]", self.unconsumed_packets.len()),
       )
       .finish()
+  }
+}
+
+/// Payload for [`Error::HwTransferTooLarge`].
+///
+/// The CPU-side cost of a hardware->CPU download, priced before it
+/// happens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("hw->cpu transfer would allocate {bytes} bytes for one frame, over a ceiling of {limit}")]
+pub struct HwTransferTooLarge {
+  bytes: usize,
+  limit: usize,
+}
+
+impl HwTransferTooLarge {
+  /// Constructs a `HwTransferTooLarge` payload.
+  #[inline]
+  pub const fn new(bytes: usize, limit: usize) -> Self {
+    Self { bytes, limit }
+  }
+  /// Bytes the destination frame would have cost.
+  #[inline]
+  pub const fn bytes(&self) -> usize {
+    self.bytes
+  }
+  /// The ceiling in force.
+  #[inline]
+  pub const fn limit(&self) -> usize {
+    self.limit
+  }
+}
+
+/// Payload for [`Error::HwSurfaceTooLarge`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+  "the hardware surface pool would cost {bytes} bytes, over a ceiling of {limit}; \
+   the hardware format was declined before the pool was built"
+)]
+pub struct HwSurfaceTooLarge {
+  bytes: i64,
+  limit: i64,
+}
+
+impl HwSurfaceTooLarge {
+  /// Constructs a `HwSurfaceTooLarge` payload.
+  #[inline]
+  pub const fn new(bytes: i64, limit: i64) -> Self {
+    Self { bytes, limit }
+  }
+  /// What the pool would have cost, priced through the same
+  /// allocator-parity footprint every other judge uses.
+  #[inline]
+  pub const fn bytes(&self) -> i64 {
+    self.bytes
+  }
+  /// The ceiling in force.
+  #[inline]
+  pub const fn limit(&self) -> i64 {
+    self.limit
+  }
+}
+
+/// Which kind of frame a [`FrameBudgetExceeded`] refers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameMedium {
+  /// A picture.
+  Video,
+  /// An audio frame.
+  Audio,
+}
+
+impl core::fmt::Display for FrameMedium {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    match self {
+      Self::Video => f.write_str("picture"),
+      Self::Audio => f.write_str("audio frame"),
+    }
+  }
+}
+
+/// Payload for [`Error::FrameBudgetExceeded`].
+///
+/// The allocator judge refused a frame whose real cost — priced through
+/// the allocator-parity footprint, before `avcodec_default_get_buffer2`
+/// ran — exceeds the caller's ceiling.
+///
+/// # Why this has a name
+///
+/// A `get_buffer2` callback can only answer libavcodec with an errno,
+/// and `AVERROR(EINVAL)` is what libavcodec itself reports for corrupt
+/// input. Without a name, a caller could not tell "this file is broken"
+/// from "your budget refused this frame" — and only one of those is
+/// worth retrying with a larger ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("the {medium} would allocate {bytes} bytes, over a ceiling of {limit}")]
+pub struct FrameBudgetExceeded {
+  bytes: u64,
+  limit: u64,
+  medium: FrameMedium,
+}
+
+impl FrameBudgetExceeded {
+  /// Constructs a `FrameBudgetExceeded` payload.
+  #[inline]
+  pub const fn new(bytes: u64, limit: u64, medium: FrameMedium) -> Self {
+    Self {
+      bytes,
+      limit,
+      medium,
+    }
+  }
+  /// What the frame would have cost.
+  #[inline]
+  pub const fn bytes(&self) -> u64 {
+    self.bytes
+  }
+  /// The ceiling in force.
+  #[inline]
+  pub const fn limit(&self) -> u64 {
+    self.limit
+  }
+  /// Whether the frame was a picture or audio.
+  #[inline]
+  pub const fn medium(&self) -> FrameMedium {
+    self.medium
   }
 }

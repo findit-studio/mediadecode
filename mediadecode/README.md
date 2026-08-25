@@ -46,16 +46,26 @@ bytes. Adapter implementations live in sibling crates such as
   re-exported from `videoframe`.
 - **Generic packet / frame types** — `VideoPacket<A, B>`,
   `AudioPacket<A, B>`, `SubtitlePacket<A, B>`, `VideoFrame<A, B>`,
-  `AudioFrame<A, B>`, `SubtitleFrame<A, B>` parameterized over an
-  adapter's per-item **extras** type `A` and **buffer** type `B`.
-  `Plane<B>` is the generic plane carrier.
+  `AudioFrame<A, B>`, `SubtitleFrame<A, B>` and `ImageFrame<A, B>`
+  parameterized over an adapter's per-item **extras** type `A` and
+  **buffer** type `B`. `Plane<B>` is the generic plane carrier.
+  `ImageFrame` is the still-image household: no `pts`, no `duration`,
+  because a still is not on the timeline — the same fact
+  `AttachmentPacket` states on the packet side.
+- **The D-seat amputation contract** — the one law a backend's buffer
+  type `B` must obey: owned, `Send + Sync`, cheap to clone (a refcount
+  bump), with no backend-internal lifetime crossing the seam. This
+  crate names no carrier and pins no bound past `AsRef<[u8]>`; the
+  contract is written out in full on the `adapter` module.
 - **Adapter traits** — `VideoAdapter`, `AudioAdapter`,
-  `SubtitleAdapter`. A backend implements these on a zero-sized
-  type to fix `A` and `B` once for the whole pipeline.
+  `SubtitleAdapter`, `ImageAdapter`. A backend implements these on a
+  zero-sized type to fix `A` and `B` once for the whole pipeline.
 - **Decoder traits** — `VideoStreamDecoder`, `AudioStreamDecoder`,
-  `SubtitleStreamDecoder`. Push-style `send_packet` /
-  `receive_frame` / `send_eof` / `flush` shape; mirrors FFmpeg's
-  decoder API while staying backend-agnostic.
+  `SubtitleDecoder`, `ImageDecoder`. The two `*Stream*` faces are
+  push-style (`send_packet` / `receive_frame` / `send_eof` / `flush`),
+  mirroring FFmpeg's decoder API while staying backend-agnostic; the
+  other two are not, and their names say so — a subtitle cue and a
+  still image each come out of exactly the packet that went in.
 - **The demux tier** — `Demuxer`, the pull session over an opened
   container (`tracks()` / `next_packet()` / `seek()`), the five-arm
   `DemuxedPacket` envelope, the `TrackInfo` / `TrackParams` /

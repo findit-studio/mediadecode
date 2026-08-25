@@ -6,8 +6,9 @@
 
 use crate::{
   Timebase, Timestamp,
-  adapter::{AudioAdapter, SubtitleAdapter, VideoAdapter},
-  frame::{AudioFrame, SubtitleFrame, VideoFrame},
+  adapter::{AudioAdapter, ImageAdapter, SubtitleAdapter, VideoAdapter},
+  demuxer::AttachmentPacket,
+  frame::{AudioFrame, ImageFrame, SubtitleFrame, VideoFrame},
   packet::{AudioPacket, SubtitlePacket, VideoPacket},
 };
 
@@ -187,6 +188,41 @@ pub trait SubtitleDecoder {
   async fn flush(&mut self) -> Result<(), Self::Error>;
 }
 
+/// Async one-shot still-image decoder. Mirror of
+/// [`crate::decoder::ImageDecoder`]. The `Send`-bounded variant is
+/// [`crate::future::send::ImageDecoder`].
+///
+/// One `async fn`, because the sync trait has one method: an
+/// attachment track's contract is exactly one packet and a still
+/// codec's answer to it is exactly one picture. What the `async`
+/// buys is a backend whose *decode* is asynchronous — a browser's
+/// `createImageBitmap`, a GPU submission — not a rhythm the sync
+/// trait was hiding.
+#[trait_variant::make(SendImageDecoder: Send)]
+pub trait ImageDecoder {
+  /// Backend vocabulary.
+  type Adapter: ImageAdapter;
+  /// Buffer type held by the packet this decoder accepts and the frame
+  /// it produces.
+  type Buffer: AsRef<[u8]>;
+  /// Decoder-specific error.
+  type Error;
+
+  /// Awaits the decode of one attachment payload — a whole image file
+  /// — into a still.
+  async fn decode(
+    &mut self,
+    packet: &AttachmentPacket<<Self::Adapter as ImageAdapter>::PacketExtra, Self::Buffer>,
+  ) -> Result<
+    ImageFrame<
+      <Self::Adapter as ImageAdapter>::PixelFormat,
+      <Self::Adapter as ImageAdapter>::FrameExtra,
+      Self::Buffer,
+    >,
+    Self::Error,
+  >;
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -212,6 +248,14 @@ mod tests {
   struct SLoop;
   impl SubtitleAdapter for SLoop {
     type CodecId = u32;
+    type PacketExtra = ();
+    type FrameExtra = ();
+  }
+
+  struct ILoop;
+  impl ImageAdapter for ILoop {
+    type CodecId = u32;
+    type PixelFormat = u32;
     type PacketExtra = ();
     type FrameExtra = ();
   }
@@ -345,6 +389,19 @@ mod tests {
     }
   }
 
+  struct AsyncImage;
+  impl ImageDecoder for AsyncImage {
+    type Adapter = ILoop;
+    type Buffer = &'static [u8];
+    type Error = LoopError;
+    async fn decode(
+      &mut self,
+      _: &AttachmentPacket<(), &'static [u8]>,
+    ) -> Result<ImageFrame<u32, (), &'static [u8]>, LoopError> {
+      Err(LoopError)
+    }
+  }
+
   #[test]
   fn local_traits_are_implementable() {
     fn _v<D: VideoStreamDecoder>() {}
@@ -352,10 +409,12 @@ mod tests {
     fn _a<D: AudioStreamDecoder>() {}
     fn _as<D: AudioFrameSource>() {}
     fn _s<D: SubtitleDecoder>() {}
+    fn _i<D: ImageDecoder>() {}
     _v::<AsyncVideo>();
     _vs::<AsyncVideoSrc>();
     _a::<AsyncAudio>();
     _as::<AsyncAudioSrc>();
     _s::<AsyncSubtitle>();
+    _i::<AsyncImage>();
   }
 }

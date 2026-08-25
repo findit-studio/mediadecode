@@ -19,7 +19,7 @@ use mediadecode::{
 };
 
 use crate::{
-  Error, Ffmpeg, FfmpegBuffer, boundary,
+  DecoderLimits, Error, Ffmpeg, FfmpegBytes, boundary,
   convert::{self, ConvertError},
   decoder::build_codec_context,
   extras::{SubtitleFrameExtra, SubtitlePacketExtra},
@@ -68,25 +68,59 @@ impl Drop for ScratchSubtitle {
 pub struct FfmpegSubtitleStreamDecoder {
   decoder: ffmpeg_next::decoder::Subtitle,
   scratch: ScratchSubtitle,
-  pending: Option<SubtitleFrame<SubtitleFrameExtra, FfmpegBuffer>>,
+  pending: Option<SubtitleFrame<SubtitleFrameExtra, FfmpegBytes>>,
   time_base: Timebase,
+  /// Retained, not discarded at open: the send path judges
+  /// [`DecoderLimits::max_packet_bytes`] against every packet it
+  /// rebuilds into an `AVPacket`.
+  limits: DecoderLimits,
+  /// Keeps the [`CallbackState`](crate::ffi::CallbackState) alive for as
+  /// long as the codec context that points at it.
+  ///
+  /// Declared **after** the decoder on purpose: struct fields drop in
+  /// declaration order, so the `AVCodecContext` is freed first and the
+  /// state it references outlives it.
+  _callback_state: Box<crate::ffi::CallbackState>,
 }
 
 impl FfmpegSubtitleStreamDecoder {
   /// Opens a subtitle decoder for the given codec parameters.
-  pub fn open(parameters: Parameters, time_base: Timebase) -> Result<Self, SubtitleDecodeError> {
+  ///
+  /// `limits` reaches the `AVCodecContext` this call opens. A subtitle
+  /// decoder produces no pixels, so the pixel half never fires here —
+  /// it is passed for one reason: every decoder this crate opens gets
+  /// the same ceiling written into it, and a seam that skipped one
+  /// would be a seam somebody has to remember.
+  pub fn open(
+    parameters: Parameters,
+    time_base: Timebase,
+    limits: DecoderLimits,
+  ) -> Result<Self, SubtitleDecodeError> {
     // Use the checked codec-context builder — `Context::from_parameters`
     // is OOM-UB-prone (see `crate::decoder::build_codec_context`).
-    let ctx = build_codec_context(&parameters).map_err(SubtitleDecodeError::Decode)?;
-    let decoder = ctx
+    let (ctx, callback_state) =
+      build_codec_context(&parameters, limits).map_err(SubtitleDecodeError::Decode)?;
+    // Opened without forming a bindgen enum from FFmpeg memory: the codec
+    // is resolved off a raw `codec_id`, and the medium is proved off a raw
+    // `codec_type`. See `crate::decoder::ensure_codec_type`.
+    let codec = crate::decoder::find_decoder(&parameters).map_err(SubtitleDecodeError::Decode)?;
+    let opened = ctx
       .decoder()
-      .subtitle()
+      .open_as(codec)
       .map_err(|e| SubtitleDecodeError::Decode(Error::Ffmpeg(e)))?;
+    crate::decoder::ensure_codec_type(
+      &opened,
+      ffmpeg_next::ffi::AVMediaType::AVMEDIA_TYPE_SUBTITLE,
+    )
+    .map_err(SubtitleDecodeError::Decode)?;
+    let decoder = ffmpeg_next::decoder::Subtitle(opened);
     Ok(Self {
       decoder,
       scratch: ScratchSubtitle::new(),
       pending: None,
       time_base,
+      limits,
+      _callback_state: callback_state,
     })
   }
 
@@ -94,6 +128,12 @@ impl FfmpegSubtitleStreamDecoder {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn time_base(&self) -> Timebase {
     self.time_base
+  }
+
+  /// The ceilings this decoder was opened with.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn limits(&self) -> DecoderLimits {
+    self.limits
   }
 
   /// Borrow the wrapped `ffmpeg::decoder::Subtitle`.
@@ -105,7 +145,7 @@ impl FfmpegSubtitleStreamDecoder {
 
 impl SubtitleDecoder for FfmpegSubtitleStreamDecoder {
   type Adapter = Ffmpeg;
-  type Buffer = FfmpegBuffer;
+  type Buffer = FfmpegBytes;
   type Error = SubtitleDecodeError;
 
   fn send_packet(
@@ -119,7 +159,7 @@ impl SubtitleDecoder for FfmpegSubtitleStreamDecoder {
     if self.pending.is_some() {
       return Err(SubtitleDecodeError::FramePending);
     }
-    let av_pkt = boundary::ffmpeg_packet_from_subtitle_packet(packet)
+    let av_pkt = boundary::ffmpeg_packet_from_subtitle_packet(packet, self.limits.packet_limits())
       .map_err(|e| SubtitleDecodeError::Decode(Error::PacketBuild(e)))?;
     // Free any allocations from a previous decode before reusing the
     // scratch — avoids leaking when the previous packet produced no
@@ -128,11 +168,13 @@ impl SubtitleDecoder for FfmpegSubtitleStreamDecoder {
     let got = self
       .decoder
       .decode(&av_pkt, &mut self.scratch.inner)
-      .map_err(|e| SubtitleDecodeError::Decode(Error::Ffmpeg(e)))?;
+      .map_err(|e| {
+        SubtitleDecodeError::Decode(crate::decoder::software_exit(&*self._callback_state, e))
+      })?;
     if got {
       // SAFETY: scratch.inner is a live AVSubtitle just filled by
       // decode. Conversion deep-copies all rect contents into owned
-      // FfmpegBuffers; the FFmpeg-side allocations are released
+      // `FfmpegBytes` carriers; the FFmpeg-side allocations are released
       // unconditionally below (success and error paths both reach
       // the next `clear()` on the next decode or on drop).
       let result = unsafe {

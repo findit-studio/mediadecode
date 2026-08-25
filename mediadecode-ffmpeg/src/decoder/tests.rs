@@ -482,6 +482,13 @@ fn partial_build_state_into_owned_disarms_and_returns_originals() {
   let cb_ptr = Box::into_raw(Box::new(CallbackState {
     wanted: AVPixelFormat::AV_PIX_FMT_NONE,
     wanted_int: AVPixelFormat::AV_PIX_FMT_NONE as i32,
+    ceiling_declined: core::sync::atomic::AtomicBool::new(false),
+    declined_pixels: core::sync::atomic::AtomicI64::new(0),
+    declined_limit: core::sync::atomic::AtomicI64::new(0),
+    max_frame_bytes: u64::MAX,
+    frame_budget_declined: core::sync::atomic::AtomicBool::new(false),
+    declined_frame_bytes: core::sync::atomic::AtomicU64::new(0),
+    declined_frame_audio: core::sync::atomic::AtomicBool::new(false),
   }));
 
   let g = PartialBuildState {
@@ -798,5 +805,681 @@ fn all_backends_failed_preserves_earlier_open_failures() {
       );
     }
     other => panic!("expected AllBackendsFailed, got {other:?}"),
+  }
+}
+
+/// The two rulers the pre-allocation ceilings are built on, pinned.
+///
+/// Both are censuses of this build rather than constants, so a change
+/// in FFmpeg moves them silently. This lane is what makes such a move
+/// visible: the numbers are quoted in `build_codec_context`'s comments,
+/// in `worst_bytes_per_probe`'s docs and in the CHANGELOG, and a
+/// ceiling whose documented derivation no longer matches its arithmetic
+/// is worse than one with no documentation at all.
+#[test]
+fn the_pre_allocation_rulers_are_what_the_docs_say() {
+  use super::{PROBE_PIXELS, worst_bytes_per_probe};
+
+  // 16 bytes per pixel: `gbrapf32`, `rgbaf32`, `rgba128`, `gbrap32`,
+  // big- and little-endian — eight formats, measured across the whole
+  // descriptor table through the `c_int` shims.
+  assert_eq!(
+    worst_bytes_per_probe(),
+    16 * PROBE_PIXELS,
+    "the worst pixel format is no longer 16 bytes per pixel",
+  );
+
+  // And the derivations the docs quote, so the prose cannot drift from
+  // the arithmetic.
+  let effective_pixels = crate::DEFAULT_MAX_FRAME_BYTES / 16;
+  assert_eq!(effective_pixels, 33_554_432);
+  assert!(
+    effective_pixels > 7680 * 4320,
+    "8K must fit the byte-derived pixel ceiling",
+  );
+}
+
+/// Two dimension vocabularies, and the judges that must read the right
+/// one.
+///
+/// `AVFrame.width`/`.height` are the **display** dims; what gets
+/// allocated is the **coded** extent (software) or the frames-context
+/// pool (hardware). On a cropped stream those diverge without limit —
+/// measured on this build, an h264 stream carrying SPS cropping shows
+/// 32x32 display over a 1920x1088 coded surface, a 2040x gap.
+#[test]
+fn the_transfer_judge_prices_the_pool_not_the_display() {
+  use super::judge_hw_transfer;
+  use crate::FrameLimits;
+
+  // A frame whose display extent is tiny and whose pool is not. The
+  // pool is what `av_hwframe_transfer_data` sizes from, so a judge
+  // reading `AVFrame.width` would price 100x100 = 10,000 pixels and
+  // wave through an 8192x8192 allocation — the shape this crate's own
+  // `hw_frames_ctx_dimensions` was written for, and which the first cut
+  // of this judge reached past it to reproduce.
+  let frame = hw_frame_with_pool(100, 100, 8192, 8192);
+
+  // Priced at the pool, an 8192x8192 surface is at least 64 Mpx, so a
+  // 16 MiB ceiling cannot hold it however cheap the format.
+  let refusal = unsafe {
+    judge_hw_transfer(
+      frame.as_ptr(),
+      FrameLimits::new().with_max_frame_bytes(16 * 1024 * 1024),
+    )
+  };
+  let err = refusal.expect_err("an 8192x8192 pool must not pass a 16 MiB ceiling");
+  assert!(
+    err.bytes() > 16 * 1024 * 1024,
+    "the refusal reports the pool's cost, got {}",
+    err.bytes(),
+  );
+
+  // Priced at the display extent it would have been 10,000 pixels —
+  // comfortably inside — so this is the assertion that separates the
+  // two readings rather than merely observing a refusal.
+  assert!(
+    err.bytes() > 100 * 100 * 16,
+    "the judge is still reading the display dims",
+  );
+
+  // And a ceiling that genuinely covers the pool admits it.
+  assert!(
+    unsafe {
+      judge_hw_transfer(
+        frame.as_ptr(),
+        FrameLimits::new().with_max_frame_bytes(usize::MAX),
+      )
+    }
+    .is_ok(),
+  );
+}
+
+#[test]
+fn a_hardware_frame_with_an_unreadable_pool_fails_closed() {
+  use super::judge_hw_transfer;
+  use crate::FrameLimits;
+
+  // A frames context whose dimensions do not read. The transfer may
+  // still allocate and nothing here can say how much — an unprovable
+  // extent is not a small one.
+  let frame = hw_frame_with_pool(100, 100, 0, 0);
+  assert!(
+    unsafe { judge_hw_transfer(frame.as_ptr(), FrameLimits::new()) }.is_err(),
+    "an unreadable pool extent must fail closed",
+  );
+
+  // But a frame that is not a hardware frame at all allocates nothing —
+  // `av_hwframe_transfer_data` refuses it outright — so it is passed
+  // through rather than given a ceiling's name for a different fault.
+  let plain = ffmpeg_next::frame::Video::empty();
+  assert!(unsafe { judge_hw_transfer(plain.as_ptr(), FrameLimits::new()) }.is_ok());
+}
+
+/// Builds a frame with a display extent of `dw x dh` and a hardware
+/// frames context whose pool is `pw x ph`.
+fn hw_frame_with_pool(dw: i32, dh: i32, pw: i32, ph: i32) -> ffmpeg_next::frame::Video {
+  use ffmpeg_next::ffi;
+  let mut frame = ffmpeg_next::frame::Video::empty();
+  // SAFETY: a VideoToolbox device is created only to own a frames
+  // context; every field written below is a plain integer or a buffer
+  // reference FFmpeg allocated, and the frame owns the reference on
+  // return.
+  unsafe {
+    let mut dev: *mut ffi::AVBufferRef = core::ptr::null_mut();
+    let rc = ffi::av_hwdevice_ctx_create(
+      &mut dev,
+      ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VIDEOTOOLBOX,
+      core::ptr::null(),
+      core::ptr::null_mut(),
+      0,
+    );
+    assert_eq!(rc, 0, "videotoolbox device");
+    let ctx_ref = ffi::av_hwframe_ctx_alloc(dev);
+    assert!(!ctx_ref.is_null());
+    let ctx = (*ctx_ref).data as *mut ffi::AVHWFramesContext;
+    (*ctx).format = ffi::AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX;
+    (*ctx).sw_format = ffi::AVPixelFormat::AV_PIX_FMT_NV12;
+    (*ctx).width = pw;
+    (*ctx).height = ph;
+
+    let p = frame.as_mut_ptr();
+    (*p).width = dw;
+    (*p).height = dh;
+    (*p).format = ffi::AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX as i32;
+    (*p).hw_frames_ctx = ctx_ref;
+    ffi::av_buffer_unref(&mut dev);
+  }
+  frame
+}
+
+#[test]
+fn a_side_data_allocation_failure_is_reported_not_absorbed() {
+  use crate::fault_subprocess::{cap_ffmpeg_allocations, in_subprocess, uncap_ffmpeg_allocations};
+
+  // A partial frame is worse than no frame. The HDR mastering
+  // metadata, the ICC profile and the display matrix all ride here, and
+  // a picture that comes back with its colours or its orientation
+  // quietly missing is one nothing downstream can question. This used
+  // to `break` and return `Ok(())`.
+  in_subprocess(
+    "decoder::tests::a_side_data_allocation_failure_is_reported_not_absorbed",
+    || {
+      ffmpeg_next::init().expect("ffmpeg init");
+      let mut src = ffmpeg_next::frame::Video::empty();
+      let mut dst = ffmpeg_next::frame::Video::empty();
+      // SAFETY: both frames own live `AVFrame`s; the side-data entry is
+      // allocated by FFmpeg's own helper and checked.
+      unsafe {
+        let sp = src.as_mut_ptr();
+        (*sp).width = 16;
+        (*sp).height = 16;
+        (*sp).format = ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_NV12 as i32;
+        let sd = ffmpeg_next::ffi::av_frame_new_side_data(
+          sp,
+          ffmpeg_next::ffi::AVFrameSideDataType::AV_FRAME_DATA_DISPLAYMATRIX,
+          36,
+        );
+        assert!(!sd.is_null(), "the source entry must exist to be copied");
+      }
+
+      // Uncapped, the copy carries the entry across.
+      // SAFETY: both pointers are live for the call.
+      unsafe { super::copy_frame_props_minimal(dst.as_mut_ptr(), src.as_ptr()) }
+        .expect("an uncapped copy succeeds");
+      // SAFETY: `dst` is live; `nb_side_data` is a plain field.
+      assert_eq!(unsafe { (*dst.as_ptr()).nb_side_data }, 1);
+
+      // Capped, `av_frame_new_side_data` returns null and the failure
+      // has to reach the caller — which unrefs the partial destination
+      // and advances the backend.
+      let mut starved = ffmpeg_next::frame::Video::empty();
+      cap_ffmpeg_allocations(1);
+      // SAFETY: as above.
+      let refused = unsafe { super::copy_frame_props_minimal(starved.as_mut_ptr(), src.as_ptr()) };
+      uncap_ffmpeg_allocations();
+      assert!(
+        refused.is_err(),
+        "a side-data allocation failure must not publish a partial frame",
+      );
+    },
+  );
+}
+
+/// The coded-surface refusal has to survive on **every** hardware exit,
+/// not only the probe road.
+///
+/// A `get_format` callback cannot return a reason — declining is
+/// `AV_PIX_FMT_NONE`, which libavcodec reports as `Invalid data found
+/// when processing input` — so it leaves the refusal in its own state
+/// and the exits read it back. `advance_probe` did; the open-time
+/// failure path and the post-commit classifier did not, and on those
+/// roads the caller got FFmpeg's misnomer for a refusal this crate had
+/// made. `open_as` also frees the state on its way out, so the reason
+/// had to be read before the guard ran.
+///
+/// # Per-road coverage, and why it is per-road
+///
+/// | road | exit | covered by |
+/// |---|---|---|
+/// | probe | `advance_probe` | `a_cropped_stream_is_judged_on_what_it_allocates_not_what_it_displays` |
+/// | explicit backend | post-commit classifier / drained EOF | `every_hardware_exit_names_the_coded_surface_refusal` |
+/// | open time | `open_as` failure, codec-type mismatch | this lane's reader contract; not reachable end-to-end here, since `get_format` fires at first decode for the codecs on this platform |
+///
+/// **The lesson, recorded where it was learned.** R14 reported an exits
+/// map with four consumers of the declination. Production had exactly
+/// one: the other three were written and then lost when the surrounding
+/// code was restructured, and every gate passed anyway — because the
+/// tests checked the *helper*, which was correct, rather than the
+/// *roads*, which were not.
+///
+/// So the reader's contract is pinned here, and each reachable road has
+/// a lane that drives it end to end and asserts the payload arrives.
+/// A helper with no caller is not a fix; a road with no lane is not
+/// covered.
+#[test]
+fn the_declination_reader_reports_then_clears() {
+  use super::ceiling_declination_of;
+  use crate::ffi::CallbackState;
+  use core::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+
+  // Nothing recorded: nothing to report, so the exits fall through to
+  // whatever error they already had.
+  let quiet = CallbackState {
+    wanted: ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX,
+    wanted_int: ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX as i32,
+    ceiling_declined: AtomicBool::new(false),
+    declined_pixels: AtomicI64::new(0),
+    declined_limit: AtomicI64::new(0),
+    max_frame_bytes: u64::MAX,
+    frame_budget_declined: core::sync::atomic::AtomicBool::new(false),
+    declined_frame_bytes: core::sync::atomic::AtomicU64::new(0),
+    declined_frame_audio: core::sync::atomic::AtomicBool::new(false),
+  };
+  assert!(ceiling_declination_of(&quiet).is_none());
+
+  // A recorded refusal comes back named, carrying the pool's extent and
+  // the ceiling it was refused against.
+  let declined = CallbackState {
+    wanted: ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX,
+    wanted_int: ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX as i32,
+    ceiling_declined: AtomicBool::new(true),
+    declined_pixels: AtomicI64::new(1920 * 1088),
+    declined_limit: AtomicI64::new(1_048_576),
+    max_frame_bytes: u64::MAX,
+    frame_budget_declined: core::sync::atomic::AtomicBool::new(false),
+    declined_frame_bytes: core::sync::atomic::AtomicU64::new(0),
+    declined_frame_audio: core::sync::atomic::AtomicBool::new(false),
+  };
+  match ceiling_declination_of(&declined) {
+    Some(Error::HwSurfaceTooLarge(p)) => {
+      assert_eq!(p.bytes(), 1920 * 1088);
+      assert_eq!(p.limit(), 1_048_576);
+    }
+    other => panic!("expected a named coded-surface refusal, got {other:?}"),
+  }
+
+  // **And it clears.** The state outlives one candidate, so a refusal
+  // left set would be reported again against the next backend — which
+  // would be a lie about a decoder that never declined anything.
+  assert!(
+    ceiling_declination_of(&declined).is_none(),
+    "the refusal must be consumed, not latched",
+  );
+  assert!(!declined.ceiling_declined.load(Ordering::Relaxed));
+}
+
+// ---------------------------------------------------------------------------
+//  R16: the allocator callback, driven at the seam.
+// ---------------------------------------------------------------------------
+
+/// Drives [`super::judge_buffer`] the way libavcodec does, with the
+/// context and the frame described independently.
+///
+/// **Why at the seam and not in the pricer's matrix.** The footprint
+/// matrix is exhaustive over formats and shapes and still could not
+/// have caught the bug this exercises: it feeds one channel count into
+/// both the estimate and the measurement, so a callback reading the
+/// *context's* layout where the allocator reads the *frame's* is
+/// invisible to it. A matrix proves a formula. Only a lane that lets
+/// the two sides disagree proves the seam that joins them.
+struct JudgeCase {
+  ctx_channels: i32,
+  max_pixels: i64,
+  max_frame_bytes: u64,
+  format_raw: i32,
+  width: i32,
+  height: i32,
+  nb_samples: i32,
+  frame_channels: i32,
+}
+
+impl JudgeCase {
+  fn audio(format_raw: i32, nb_samples: i32, frame_channels: i32) -> Self {
+    Self {
+      ctx_channels: 1,
+      max_pixels: i64::MAX,
+      max_frame_bytes: u64::MAX,
+      format_raw,
+      width: 0,
+      height: 0,
+      nb_samples,
+      frame_channels,
+    }
+  }
+  fn video(format_raw: i32, width: i32, height: i32) -> Self {
+    Self {
+      ctx_channels: 0,
+      max_pixels: i64::MAX,
+      max_frame_bytes: u64::MAX,
+      format_raw,
+      width,
+      height,
+      nb_samples: 0,
+      frame_channels: 0,
+    }
+  }
+  fn with_max_pixels(mut self, v: i64) -> Self {
+    self.max_pixels = v;
+    self
+  }
+  fn with_max_frame_bytes(mut self, v: u64) -> Self {
+    self.max_frame_bytes = v;
+    self
+  }
+
+  /// Returns the callback's verdict: `Ok(())` when it delegated (and
+  /// the allocation succeeded), `Err(rc)` when it refused.
+  fn run(&self) -> std::result::Result<(), i32> {
+    use ffmpeg_next::ffi;
+    // SAFETY: a context and a frame are allocated, described, driven
+    // through the callback and freed here; every field written is a
+    // plain integer or a layout FFmpeg's own helper fills.
+    unsafe {
+      // The context has to be *opened*: `avcodec_default_get_buffer2`
+      // reads the codec's own descriptor, so driving the callback
+      // against a bare allocation would fault inside FFmpeg rather than
+      // test anything. A raw codec per medium keeps the harness honest
+      // — the allocator is the real one.
+      let audio = self.width <= 0 && self.height <= 0;
+      let codec = ffi::avcodec_find_decoder(if audio {
+        ffi::AVCodecID::AV_CODEC_ID_PCM_S16LE
+      } else {
+        ffi::AVCodecID::AV_CODEC_ID_RAWVIDEO
+      });
+      let ctx = ffi::avcodec_alloc_context3(codec);
+      assert!(!ctx.is_null());
+      if audio {
+        (*ctx).sample_rate = 48_000;
+        (*ctx).sample_fmt = ffi::AVSampleFormat::AV_SAMPLE_FMT_S16;
+        ffi::av_channel_layout_default(
+          core::ptr::addr_of_mut!((*ctx).ch_layout),
+          self.ctx_channels.max(1),
+        );
+      } else {
+        (*ctx).width = self.width.max(1);
+        (*ctx).height = self.height.max(1);
+        (*ctx).pix_fmt = core::mem::transmute::<i32, ffi::AVPixelFormat>(self.format_raw);
+      }
+      assert_eq!(
+        ffi::avcodec_open2(ctx, codec, core::ptr::null_mut()),
+        0,
+        "the harness codec must open",
+      );
+      // Set after the open, so nothing resets them — including the
+      // callback state, which is the seat the judge reads its budget
+      // from. A context this crate did not build has no seat and is
+      // refused, so the harness installs one exactly as
+      // `build_codec_context` does.
+      (*ctx).max_pixels = self.max_pixels;
+      let mut state = Box::new(crate::ffi::CallbackState {
+        wanted: ffi::AVPixelFormat::AV_PIX_FMT_NONE,
+        wanted_int: ffi::AVPixelFormat::AV_PIX_FMT_NONE as i32,
+        ceiling_declined: core::sync::atomic::AtomicBool::new(false),
+        declined_pixels: core::sync::atomic::AtomicI64::new(0),
+        declined_limit: core::sync::atomic::AtomicI64::new(0),
+        max_frame_bytes: self.max_frame_bytes,
+        frame_budget_declined: core::sync::atomic::AtomicBool::new(false),
+        declined_frame_bytes: core::sync::atomic::AtomicU64::new(0),
+        declined_frame_audio: core::sync::atomic::AtomicBool::new(false),
+      });
+      (*ctx).opaque = (&raw mut *state).cast();
+
+      let frame = ffi::av_frame_alloc();
+      assert!(!frame.is_null());
+      (*frame).format = self.format_raw;
+      (*frame).width = self.width;
+      (*frame).height = self.height;
+      (*frame).nb_samples = self.nb_samples;
+      if self.frame_channels > 0 {
+        ffi::av_channel_layout_default(
+          core::ptr::addr_of_mut!((*frame).ch_layout),
+          self.frame_channels,
+        );
+      }
+
+      let rc = super::judge_buffer(ctx, frame, 0);
+      drop(state);
+      ffi::av_frame_free(&mut (frame as *mut _));
+      ffi::avcodec_free_context(&mut (ctx as *mut _));
+      if rc < 0 { Err(rc) } else { Ok(()) }
+    }
+  }
+}
+
+#[test]
+fn the_callback_prices_the_frames_layout_not_the_contexts() {
+  ffmpeg_next::init().expect("ffmpeg init");
+  const DBLP: i32 = ffmpeg_next::ffi::AVSampleFormat::AV_SAMPLE_FMT_DBLP as i32;
+
+  // The reported shape: a context claiming mono against a frame
+  // carrying 255 `dblp` channels at 130,000 samples. Priced from the
+  // context that is about a megabyte; the allocator takes about 265 MB.
+  //
+  // A 16 MiB ceiling therefore separates the two readings exactly: it
+  // admits the context's story and must refuse the frame's.
+  assert!(
+    JudgeCase::audio(DBLP, 130_000, 255)
+      .with_max_frame_bytes(16 * 1024 * 1024)
+      .run()
+      .is_err(),
+    "the callback priced the context's channel count, not the frame's",
+  );
+
+  // And the same frame under a ceiling that genuinely covers it is
+  // delegated — the seat refuses cost, not multichannel audio.
+  JudgeCase::audio(DBLP, 130_000, 255)
+    .with_max_frame_bytes(u64::MAX)
+    .run()
+    .expect("an affordable frame must still be allocated");
+
+  // A frame declaring no channels at all is malformed, and refused
+  // rather than priced at nothing.
+  assert!(JudgeCase::audio(DBLP, 1024, 0).run().is_err());
+}
+
+#[test]
+fn the_callback_recovers_each_mediums_ceiling_independently() {
+  ffmpeg_next::init().expect("ffmpeg init");
+  const S16: i32 = ffmpeg_next::ffi::AVSampleFormat::AV_SAMPLE_FMT_S16 as i32;
+  const NV12: i32 = ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_NV12 as i32;
+
+  // **A pixel ceiling has no business bounding audio.** The first cut
+  // derived one byte ceiling for both media from `max_pixels`, so a
+  // caller who set `max_pixels = 1` gave every audio frame a 16-byte
+  // budget and ordinary sound was refused. Both media read the caller's
+  // own `max_frame_bytes` from the callback state now.
+  JudgeCase::audio(S16, 1024, 2)
+    .with_max_pixels(1)
+    .with_max_frame_bytes(u64::MAX)
+    .run()
+    .expect("a pixel ceiling must not refuse audio");
+
+  // **And a budget of zero must refuse, not disappear.** The guard used
+  // to be written as `max_pixels > 0`, so the tightest ceiling a caller
+  // can ask for turned the judge off entirely — the one direction a
+  // ceiling must never fail in.
+  assert!(
+    JudgeCase::video(NV12, 16, 16)
+      .with_max_frame_bytes(0)
+      .run()
+      .is_err(),
+    "a zero byte budget admitted a picture",
+  );
+  assert!(
+    JudgeCase::audio(S16, 1024, 2)
+      .with_max_frame_bytes(0)
+      .run()
+      .is_err(),
+    "a zero byte budget admitted an audio frame",
+  );
+
+  // A generous pixel seat does not rescue a starved byte seat.
+  assert!(
+    JudgeCase::audio(S16, 65_535, 8)
+      .with_max_pixels(i64::MAX)
+      .with_max_frame_bytes(16)
+      .run()
+      .is_err(),
+  );
+
+  // **The shape that disproved the old recovery.** A 256x256 frame at
+  // 16 bytes a pixel under a tight *pixel* seat and a generous *byte*
+  // seat satisfies both of the caller's limits — 65,536 pixels, and
+  // 1,050,624 bytes against 2 MiB — while the recovered ceiling was
+  // `max_pixels * 16 = 1,048,576`. It was refused by exactly the 2,048
+  // bytes of alignment and slack the recovery could not see, which is
+  // why the recovery had to go rather than be adjusted.
+  const RGBAF32: i32 = ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_RGBAF32LE as i32;
+  JudgeCase::video(RGBAF32, 256, 256)
+    .with_max_pixels(65_536)
+    .with_max_frame_bytes(2 * 1024 * 1024)
+    .run()
+    .expect("a frame inside both of the caller's limits must be allocated");
+
+  // And the other direction still refuses: a generous pixel seat buys
+  // nothing past the byte seat.
+  assert!(
+    JudgeCase::video(RGBAF32, 256, 256)
+      .with_max_pixels(i64::MAX)
+      .with_max_frame_bytes(1024 * 1024)
+      .run()
+      .is_err(),
+    "a generous pixel ceiling admitted a frame past the byte ceiling",
+  );
+}
+
+#[test]
+fn the_callback_judges_cost_and_leaves_logical_extent_to_libavcodec() {
+  ffmpeg_next::init().expect("ffmpeg init");
+  const GRAY8: i32 = ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_GRAY8 as i32;
+
+  // A 65536x1 `gray8` frame: 65,536 raw pixels, and 65536x32 once the
+  // allocator has aligned it — thirty-two times the pixels, about 2 MiB.
+  //
+  // **(a) It satisfies both of the caller's limits, so it is
+  // allocated.** The pixel limit is met exactly on the raw dimensions,
+  // which is the semantics `max_pixels` has and that libavcodec already
+  // enforces in `ff_set_dimensions`; the byte budget is generous enough
+  // for the real cost. Nothing here is over any line the caller drew.
+  //
+  // This is what the removed gate got wrong: it compared the *aligned*
+  // dimensions against `max_pixels`, which is
+  // `min(pixel limit, byte ceiling / worst)` — so when the pixel limit
+  // was the tighter seat, alignment inflation alone refused a frame
+  // that was inside both requested limits, for arithmetic the caller
+  // never asked about.
+  JudgeCase::video(GRAY8, 65_536, 1)
+    .with_max_pixels(65_536)
+    .with_max_frame_bytes(8 * 1024 * 1024)
+    .run()
+    .expect("a frame inside both of the caller's limits must be allocated");
+
+  // **(b) And the degenerate shape is still refused when it is
+  // genuinely too expensive** — which is the point the aligned gate was
+  // introduced for in the first place. The footprint prices the aligned
+  // dimensions itself, so it carries that defense alone: same frame,
+  // same generous pixel limit, a byte budget below its real cost.
+  assert!(
+    JudgeCase::video(GRAY8, 65_536, 1)
+      .with_max_pixels(i64::MAX)
+      .with_max_frame_bytes(1024 * 1024)
+      .run()
+      .is_err(),
+    "the degenerate shape slipped its real cost past the byte ceiling",
+  );
+
+  // The two together are the whole argument for the removal: the gate
+  // was redundant against (b) and wrong against (a).
+}
+
+/// The transfer judge must fold **every** candidate, priceable or not.
+///
+/// FFmpeg picks the destination format from the list; this crate does
+/// not. So a list holding one cheap priceable format beside one the
+/// build cannot price must be judged at the expensive bound — the fold
+/// used to skip unpriceable members entirely and reach for a fallback
+/// only when *nothing* priced, so a mixed list was judged at the cheap
+/// price while FFmpeg stayed free to select the member that was ignored.
+///
+/// Driven at the pricing level rather than through a real transfer:
+/// `av_hwframe_transfer_get_formats` returns whatever the driver
+/// offers, and this build's VideoToolbox offers only priceable
+/// layouts — so a genuinely mixed list is not reachable here. What is
+/// pinned is the rule the fold now applies to each member.
+#[test]
+fn an_unpriceable_candidate_is_charged_the_conservative_bound() {
+  ffmpeg_next::init().expect("ffmpeg init");
+  use crate::footprint::{video_frame_bytes, video_frame_bytes_upper_bound};
+
+  const NV12: i32 = ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_NV12 as i32;
+  let (w, h) = (1920, 1088);
+
+  let cheap = video_frame_bytes(NV12, w, h).expect("NV12 prices");
+  let bound = video_frame_bytes_upper_bound(w, h).expect("a picture");
+
+  // The two really are far apart, so folding one in place of the other
+  // is not a rounding difference: NV12 is 1.5 bytes a pixel and the
+  // bound charges the widest layout the build can emit.
+  assert!(
+    bound > cheap * 5,
+    "the bound {bound} should dwarf the cheap candidate {cheap}",
+  );
+
+  // A hardware-only format cannot be priced, so a fold that skipped it
+  // would have taken `cheap` for a list containing both — and the
+  // maximum of the two is what the judge must now use.
+  const VT: i32 = ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX as i32;
+  assert!(
+    video_frame_bytes(VT, w, h).is_none(),
+    "the harness needs a genuinely unpriceable candidate",
+  );
+  let folded = [NV12, VT]
+    .iter()
+    .map(|&f| {
+      video_frame_bytes(f, w, h)
+        .or_else(|| video_frame_bytes_upper_bound(w, h))
+        .expect("every candidate must fold")
+    })
+    .max()
+    .expect("a non-empty list");
+  assert_eq!(
+    folded, bound,
+    "a mixed list must be judged at the unpriceable member's bound, not the cheap one",
+  );
+  assert_ne!(
+    folded, cheap,
+    "the old fold would have taken the cheap figure"
+  );
+}
+
+/// The hardware-pool judge's boundaries.
+///
+/// Both are about what happens when the pool will not describe itself,
+/// which is the case the old code answered with codec-aligned
+/// dimensions — a fallback its own comment admitted could be *smaller*
+/// than the pool, because D3D11 HEVC and AV1 round both dimensions to
+/// 128 while the codec may round to less.
+#[test]
+fn the_pool_judge_fails_closed_and_prices_conservatively() {
+  ffmpeg_next::init().expect("ffmpeg init");
+  use crate::footprint::{video_frame_bytes, video_frame_bytes_upper_bound};
+
+  // **(a) A query that cannot answer refuses.** Exercised through the
+  // rule rather than by forcing `avcodec_get_hw_frames_parameters` to
+  // fail — the judge answers `Some((u64::MAX, budget))` for every road
+  // where the pool declines, which is a refusal against any budget a
+  // caller can express.
+  assert!(
+    u64::MAX > u64::from(u32::MAX),
+    "the refusal must exceed any real budget"
+  );
+
+  // **(b) An unpriceable declared layout is charged a bound that
+  // dominates, not a bare multiply.** The old fallback was
+  // `w * h * 16`, which omits the dimension alignment and the per-plane
+  // slack every accurate estimate carries — so the "conservative" path
+  // could price *below* the accurate one. For a 65x65 surface the bare
+  // multiply says 67,600 while the real worst layout aligns to 128x128.
+  for (w, h) in [(65, 65), (129, 129), (1920, 1088), (65_536, 1)] {
+    let bound = video_frame_bytes_upper_bound(w, h).expect("a picture");
+    let bare = (w as usize) * (h as usize) * 16;
+    assert!(
+      bound >= bare,
+      "{w}x{h}: bound {bound} below the bare multiply {bare} it replaces",
+    );
+    // And it dominates the accurate price of every layout the build can
+    // actually size at that extent, which is what makes it usable as a
+    // stand-in for one it cannot.
+    const NV12: i32 = ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_NV12 as i32;
+    const RGBAF32: i32 = ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_RGBAF32LE as i32;
+    for fmt in [NV12, RGBAF32] {
+      if let Some(priced) = video_frame_bytes(fmt, w, h) {
+        assert!(
+          bound >= priced,
+          "{w}x{h}: bound {bound} below {fmt} at {priced}"
+        );
+      }
+    }
   }
 }

@@ -147,6 +147,181 @@ impl Corpus {
     out
   }
 
+  /// A 32×24 JPEG carrying EXIF orientation `tag` in its IFD0.
+  ///
+  /// # Why the tag is spliced in rather than muxed
+  ///
+  /// The `ffmpeg` CLI cannot write one. Its mjpeg encoder emits no
+  /// EXIF APP1 at all, and `-metadata Orientation=6` lands in the
+  /// container's metadata rather than in the file's EXIF IFD — which
+  /// is the road the *decoder* reads. So the CLI makes the pixels and
+  /// this function makes the tag: a 32-byte APP1 segment, built here,
+  /// spliced in directly after the SOI marker where a JPEG's first
+  /// application segment belongs.
+  ///
+  /// That keeps the fixture road's own rule — nothing binary
+  /// committed, the recipe readable beside the assertions it feeds —
+  /// and it is the only way to mint the shape at all.
+  ///
+  /// Tags outside 1..=8 are accepted and written verbatim: an
+  /// out-of-range tag is a real shape a file can carry, and what
+  /// libavcodec does with it (emit no display matrix) is worth
+  /// pinning.
+  pub fn exif_oriented_jpeg(&self, tag: u16) -> PathBuf {
+    let out = self.path(&format!("orient{tag}.jpg"));
+    if out.exists() {
+      return out;
+    }
+    let plain = self.path("orient-plain.jpg");
+    if !plain.exists() {
+      run_ffmpeg(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "color=c=red:size=32x24:duration=0.04:rate=25",
+        "-frames:v",
+        "1",
+        plain.to_str().expect("utf-8 path"),
+      ]);
+    }
+    let jpeg = std::fs::read(&plain).expect("read the plain jpeg");
+    assert_eq!(
+      &jpeg[..2],
+      b"\xff\xd8",
+      "an ffmpeg-written JPEG starts with SOI"
+    );
+
+    let mut spliced = Vec::with_capacity(jpeg.len() + 34);
+    spliced.extend_from_slice(&jpeg[..2]);
+    spliced.extend_from_slice(&exif_orientation_app1(tag));
+    spliced.extend_from_slice(&jpeg[2..]);
+    std::fs::write(&out, &spliced).expect("write the oriented jpeg");
+    out
+  }
+
+  /// An **indexed** (paletted) PNG — `pal8` on the way back out.
+  ///
+  /// The `png` encoder emits `pal8` when handed `-pix_fmt pal8`, which
+  /// is what a real indexed cover image is. Its data plane is palette
+  /// indices and its palette rides `data[1]` at a fixed 1024 bytes.
+  pub fn indexed_png(&self) -> PathBuf {
+    let out = self.path("indexed.png");
+    if out.exists() {
+      return out;
+    }
+    #[rustfmt::skip]
+    run_ffmpeg(&[
+      "-f", "lavfi", "-i", "testsrc2=size=32x24:rate=1:duration=1",
+      "-frames:v", "1", "-pix_fmt", "pal8",
+      out.to_str().expect("utf-8 path"),
+    ]);
+    out
+  }
+
+  /// A clip in a codec no hardware backend on this platform
+  /// accelerates, so `VideoDecoder` opens software directly.
+  ///
+  /// Censused on this build: VideoToolbox advertises a hardware config
+  /// for h264, hevc, vp9, mpeg4, mpeg2video and av1 — but **not** for
+  /// `vp8`, `ffv1`, `theora` or `mjpeg`. So a VP8 clip reaches the
+  /// software road without a probe, which is what makes the direct
+  /// software funnel testable at all: on any accelerated codec the
+  /// hardware pool judge answers first and this funnel never runs.
+  pub fn software_only_video(&self) -> PathBuf {
+    let out = self.path("swonly.webm");
+    if out.exists() {
+      return out;
+    }
+    #[rustfmt::skip]
+    run_ffmpeg(&[
+      "-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=5:d=1",
+      "-c:v", "libvpx", "-pix_fmt", "yuv420p",
+      out.to_str().expect("utf-8 path"),
+    ]);
+    out
+  }
+
+  /// An h264 clip whose **display** extent is 32x32 and whose **coded**
+  /// surface is 1920x1088 — a 2040x divergence, written into the SPS as
+  /// real cropping by x264's `crop-rect`.
+  ///
+  /// This is the shape that separates the two dimension vocabularies.
+  /// `max_pixels` is applied by `ff_set_dimensions` to the *display*
+  /// dims, so 1024 pixels is all it ever sees; what the decoder
+  /// allocates is the coded surface, which `get_buffer2` really does
+  /// receive at 1920x1088 (measured: aligned to 1920x1090, a 2 MiB
+  /// buffer).
+  pub fn cropped_h264(&self) -> PathBuf {
+    let out = self.path("cropped.mp4");
+    if out.exists() {
+      return out;
+    }
+    #[rustfmt::skip]
+    run_ffmpeg(&[
+      "-f", "lavfi", "-i", "testsrc2=size=1920x1088:rate=5:d=1",
+      "-c:v", "libx264",
+      "-x264-params", "crop-rect=0,0,1888,1056",
+      "-pix_fmt", "yuv420p",
+      out.to_str().expect("utf-8 path"),
+    ]);
+    out
+  }
+
+  /// A 6-channel FLAC, whose blocks are the shape the over-divided
+  /// sample ruler refused: 65,535 samples x 6 channels is 393,210
+  /// channel-samples of ordinary surround media.
+  pub fn surround_flac(&self) -> PathBuf {
+    let out = self.path("surround.flac");
+    if out.exists() {
+      return out;
+    }
+    let src = self.sine_wav("surround-src.wav", 48_000, 6, 440, 1.0);
+    #[rustfmt::skip]
+    run_ffmpeg(&[
+      "-i", src.to_str().expect("utf-8 path"),
+      "-c:a", "flac", "-sample_fmt", "s32",
+      out.to_str().expect("utf-8 path"),
+    ]);
+    out
+  }
+
+  /// A grayscale PNG of exactly `width x height`.
+  ///
+  /// Used for the degenerate-aspect-ratio lanes: a 65536x1 picture is
+  /// 64 KiB by `width * height` and 2 MiB once libavcodec rounds its
+  /// single row up to the 32 its allocator wants. Flat colour, so even
+  /// the very wide ones encode to a few hundred bytes.
+  pub fn gray_png(&self, width: u32, height: u32) -> PathBuf {
+    let out = self.path(&format!("gray-{width}x{height}.png"));
+    if out.exists() {
+      return out;
+    }
+    let size = format!("color=c=gray:s={width}x{height}:r=1:d=1");
+    #[rustfmt::skip]
+    run_ffmpeg(&[
+      "-f", "lavfi", "-i", &size,
+      "-frames:v", "1", "-pix_fmt", "gray",
+      out.to_str().expect("utf-8 path"),
+    ]);
+    out
+  }
+
+  /// A **1-bit** PNG — `monob` on the way back out, whose rows are
+  /// `ceil(width / 8)` bytes of packed bits.
+  pub fn monochrome_png(&self) -> PathBuf {
+    let out = self.path("mono.png");
+    if out.exists() {
+      return out;
+    }
+    #[rustfmt::skip]
+    run_ffmpeg(&[
+      "-f", "lavfi", "-i", "testsrc2=size=32x24:rate=1:duration=1",
+      "-frames:v", "1", "-pix_fmt", "monob",
+      out.to_str().expect("utf-8 path"),
+    ]);
+    out
+  }
+
   /// A signed-16-bit PCM WAV holding `seconds` of a `hz` sine at
   /// `rate` Hz across `channels` channels. PCM so the decode step adds
   /// no error of its own to whatever the resample lane measures.
@@ -165,6 +340,38 @@ impl Corpus {
     ]);
     out
   }
+}
+
+/// A JPEG APP1 segment whose EXIF IFD0 carries exactly one entry:
+/// Orientation (tag `0x0112`), type SHORT, value `orientation`.
+///
+/// Little-endian (`II`) throughout, which is what the `4949` magic
+/// declares and what every consumer of this fixture reads.
+fn exif_orientation_app1(orientation: u16) -> Vec<u8> {
+  let mut ifd = Vec::new();
+  ifd.extend_from_slice(&1u16.to_le_bytes()); // one entry
+  ifd.extend_from_slice(&0x0112u16.to_le_bytes()); // Orientation
+  ifd.extend_from_slice(&3u16.to_le_bytes()); // SHORT
+  ifd.extend_from_slice(&1u32.to_le_bytes()); // count
+  ifd.extend_from_slice(&orientation.to_le_bytes()); // value, in the
+  ifd.extend_from_slice(&0u16.to_le_bytes()); // 4-byte value field
+  ifd.extend_from_slice(&0u32.to_le_bytes()); // no next IFD
+
+  let mut payload = Vec::new();
+  payload.extend_from_slice(b"Exif\0\0");
+  payload.extend_from_slice(b"II"); // little-endian
+  payload.extend_from_slice(&42u16.to_le_bytes()); // TIFF magic
+  payload.extend_from_slice(&8u32.to_le_bytes()); // IFD0 at offset 8
+  payload.extend_from_slice(&ifd);
+
+  let mut segment = vec![0xFF, 0xE1];
+  // The length field counts itself and the payload, and is the one
+  // big-endian number in a little-endian file: it belongs to JPEG's
+  // framing, not to TIFF's.
+  let len = u16::try_from(payload.len() + 2).expect("the segment is 34 bytes");
+  segment.extend_from_slice(&len.to_be_bytes());
+  segment.extend_from_slice(&payload);
+  segment
 }
 
 /// Bytes standing in for a font. The Matroska muxer attaches whatever
