@@ -695,6 +695,42 @@ mod tests {
     }
   }
 
+  // -------------------------------------------------------------------
+  //  `serde` feature forwarding pin (`mediaframe/serde`)
+  // -------------------------------------------------------------------
+
+  // `PixelFormat` and `BayerPattern` carry no `Serialize` / `Deserialize`
+  // impl in this crate — they are mediaframe vocabulary types the facade
+  // only re-exports. They compile here solely because mediadecode's
+  // `serde` feature also turns on `mediaframe/serde`, which is where
+  // mediaframe writes those impls. If that forwarding entry in
+  // `Cargo.toml` is ever dropped, this module stops compiling under
+  // `--features serde` instead of silently losing coverage.
+  #[cfg(all(feature = "serde", any(feature = "alloc", feature = "std")))]
+  mod mediaframe_serde_forwarding_tests {
+    #[test]
+    fn pixel_format_round_trips_through_json() {
+      let value = crate::PixelFormat::Yuv420p;
+      let json = serde_json::to_string(&value).expect("mediaframe/serde forwards PixelFormat");
+      assert_eq!(json, "\"yuv420p\"");
+      assert_eq!(
+        serde_json::from_str::<crate::PixelFormat>(&json).expect("its own output parses"),
+        value
+      );
+    }
+
+    #[test]
+    fn bayer_pattern_round_trips_through_json() {
+      let value = crate::cfa::BayerPattern::Rggb;
+      let json = serde_json::to_string(&value).expect("mediaframe/serde forwards BayerPattern");
+      assert_eq!(json, "\"rggb\"");
+      assert_eq!(
+        serde_json::from_str::<crate::cfa::BayerPattern>(&json).expect("its own output parses"),
+        value
+      );
+    }
+  }
+
   #[cfg(feature = "arbitrary")]
   mod arbitrary_tests {
     use arbitrary::{Arbitrary, Unstructured};
