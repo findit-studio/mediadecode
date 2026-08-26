@@ -24,7 +24,7 @@
 use std::{num::NonZeroI32, path::PathBuf};
 
 use ffmpeg_next as ffmpeg;
-use mediadecode::{Timebase, decoder::AudioStreamDecoder};
+use mediadecode::{Received, Sent, Timebase, decoder::AudioStreamDecoder};
 // The owned family under the names this suite was written with — the
 // bare aliases mean the view lane now. Import block only; the
 // assertions below are unchanged.
@@ -146,18 +146,37 @@ fn decode_clip(path: &std::path::Path, expected: (u32, u8, u64)) {
     .expect("a wrappable payload") else {
       continue;
     };
-    decoder.send_packet(&pkt).expect("audio send_packet");
-    while decoder.receive_frame(&mut frame).is_ok() {
+    assert_eq!(
+      decoder.send_packet(&pkt).expect("audio send_packet"),
+      Sent::Accepted,
+      "these fixtures feed a session this loop has just drained",
+    );
+    while matches!(
+      decoder
+        .receive_frame(&mut frame)
+        .expect("audio receive_frame"),
+      Received::Frame
+    ) {
       total_samples = total_samples.saturating_add(frame.nb_samples() as u64);
       frame_count = frame_count.saturating_add(1);
       observed_sample_rate.get_or_insert(frame.sample_rate());
       observed_channels.get_or_insert(frame.channel_count());
     }
   }
-  decoder.send_eof().expect("send_eof");
-  while decoder.receive_frame(&mut frame).is_ok() {
-    total_samples = total_samples.saturating_add(frame.nb_samples() as u64);
-    frame_count = frame_count.saturating_add(1);
+  assert_eq!(decoder.send_eof().expect("send_eof"), Sent::Accepted);
+  // The tail, and it has an end that says so.
+  loop {
+    match decoder
+      .receive_frame(&mut frame)
+      .expect("audio receive_frame")
+    {
+      Received::Frame => {
+        total_samples = total_samples.saturating_add(frame.nb_samples() as u64);
+        frame_count = frame_count.saturating_add(1);
+      }
+      Received::NeedsInput => panic!("a decoder at EOF asked for input"),
+      Received::Ended => break,
+    }
   }
 
   assert!(frame_count > 0, "no audio frames decoded for {path:?}");
@@ -202,4 +221,176 @@ fn decode_all_audio_fixtures() {
     "decoded {} fixtures end-to-end through the trait surface",
     FIXTURES.len(),
   );
+}
+
+/// **The uniform contract, and the one asymmetry it makes visible
+/// instead of hiding.**
+///
+/// All three decoder faces answer [`Sent`] now, which is the point: a
+/// consumer generic over the traits reads one protocol whichever
+/// backend it holds. What differs between them is *behaviour*, not
+/// shape — and the audio road's difference is that it never answers
+/// [`Sent::MustDrain`] for a parked frame.
+///
+/// That is deliberate and documented at the seat: the video decoder has
+/// two scratches and can change which is current mid-fallback, so a
+/// submission under a park would leave the retry reading the other one;
+/// this decoder has a single scratch, so a submission under a park
+/// costs nothing. Before the reform the asymmetry was invisible at the
+/// trait tier — video and subtitle raised a `FramePending` arm that the
+/// audio error type simply did not have, so a generic consumer could
+/// not have discovered either fact. Now it is one vocabulary with one
+/// backend answering it differently, which is a property a test can
+/// pin.
+#[test]
+fn the_audio_face_answers_the_same_vocabulary_without_a_park_refusal() {
+  let path = fixtures_root().join("pcm_s16le/02_pyannote_sample.wav");
+  if !path.exists() {
+    eprintln!("skipping: run `git submodule update --init` for {path:?}");
+    return;
+  }
+  ffmpeg::init().expect("ffmpeg init");
+
+  let mut input = ffmpeg::format::input(&path).expect("open input");
+  let stream = input
+    .streams()
+    .best(ffmpeg::media::Type::Audio)
+    .expect("audio stream");
+  let stream_index = stream.index();
+  let mut decoder = FfmpegAudioStreamDecoder::open(
+    stream.parameters(),
+    Timebase::default(),
+    mediadecode_ffmpeg::DecoderLimits::default(),
+  )
+  .expect("open audio decoder");
+
+  let mut packets = input
+    .packets()
+    .filter_map(|(s, p)| (s.index() == stream_index).then_some(p));
+  let mut take = || {
+    let av = packets.next().expect("the fixture has packets");
+    mediadecode_ffmpeg::boundary::owned_audio_packet_from_ffmpeg_in(
+      &av,
+      mediadecode::Timebase::default(),
+      mediadecode_ffmpeg::PacketLimits::default(),
+    )
+    .expect("a wrappable payload")
+    .expect("packet has a buffer")
+  };
+
+  // Two packets, back to back, with **no drain between them**. The
+  // first fills the scratch seat; on the video or subtitle road the
+  // second would be told to drain. Here it is simply taken.
+  assert_eq!(
+    decoder.send_packet(&take()).expect("no fault"),
+    Sent::Accepted,
+  );
+  assert_eq!(
+    decoder.send_packet(&take()).expect("no fault"),
+    Sent::Accepted,
+    "the audio road has one scratch, so a send under a park loses nothing",
+  );
+
+  // And the rhythm still works: frames come out, and the end says so.
+  let mut frame = empty_audio_frame();
+  let mut delivered = 0u32;
+  while matches!(
+    decoder.receive_frame(&mut frame).expect("no fault"),
+    Received::Frame
+  ) {
+    delivered += 1;
+  }
+  assert!(delivered > 0, "the two packets produced no frame at all");
+
+  assert_eq!(decoder.send_eof().expect("no fault"), Sent::Accepted);
+  loop {
+    match decoder.receive_frame(&mut frame).expect("no fault") {
+      Received::Frame => {}
+      Received::NeedsInput => panic!("a decoder at EOF asked for input"),
+      Received::Ended => break,
+    }
+  }
+}
+
+/// **Class audit: the substrate's own post-EOF refusal, observed rather
+/// than assumed.**
+///
+/// The subtitle seam needed a hand-rolled `eof` latch on its send side
+/// because `avcodec_decode_subtitle2` has no state machine to refuse
+/// for it. The claim that the *stream* decoders need no such latch —
+/// that libavcodec answers `AVERROR_EOF` to a packet after a flush
+/// packet, and that this crate's send gate reports it as a fault rather
+/// than laundering it into `Sent::MustDrain` — is the other half of
+/// that finding, and it is checked here against a live decoder instead
+/// of being read off the docs.
+///
+/// The failure this excludes is the one the subtitle seam actually had:
+/// a post-EOF packet accepted, decoded, and a terminal `Received::Ended`
+/// reversed with no `flush` in the story.
+#[test]
+fn a_packet_after_eof_is_refused_by_the_audio_substrate() {
+  let path = fixtures_root().join("pcm_s16le/02_pyannote_sample.wav");
+  if !path.exists() {
+    eprintln!("skipping: run `git submodule update --init` for {path:?}");
+    return;
+  }
+  ffmpeg::init().expect("ffmpeg init");
+
+  let mut input = ffmpeg::format::input(&path).expect("open input");
+  let stream = input
+    .streams()
+    .best(ffmpeg::media::Type::Audio)
+    .expect("audio stream");
+  let stream_index = stream.index();
+  let mut decoder = FfmpegAudioStreamDecoder::open(
+    stream.parameters(),
+    Timebase::default(),
+    mediadecode_ffmpeg::DecoderLimits::default(),
+  )
+  .expect("open audio decoder");
+
+  let packet = input
+    .packets()
+    .find_map(|(s, p)| (s.index() == stream_index).then_some(p))
+    .expect("the fixture has packets");
+  let pkt = mediadecode_ffmpeg::boundary::owned_audio_packet_from_ffmpeg_in(
+    &packet,
+    mediadecode::Timebase::default(),
+    mediadecode_ffmpeg::PacketLimits::default(),
+  )
+  .expect("a wrappable payload")
+  .expect("packet has a buffer");
+
+  assert_eq!(decoder.send_packet(&pkt).expect("no fault"), Sent::Accepted);
+  assert_eq!(decoder.send_eof().expect("no fault"), Sent::Accepted);
+
+  // Drain to the settled end.
+  let mut frame = empty_audio_frame();
+  loop {
+    match decoder.receive_frame(&mut frame).expect("no fault") {
+      Received::Frame => {}
+      Received::NeedsInput => panic!("a decoder at EOF asked for input"),
+      Received::Ended => break,
+    }
+  }
+
+  // The reversal, refused — by libavcodec, reported by the send gate.
+  // **Never `MustDrain`**: draining changes nothing, so that answer
+  // would be a loop whose next offer can never succeed.
+  for _ in 0..2 {
+    let refused = decoder.send_packet(&pkt);
+    assert!(
+      refused.is_err(),
+      "a packet after end-of-stream must be a fault, got {refused:?}",
+    );
+  }
+  assert_eq!(
+    decoder.receive_frame(&mut frame).expect("no fault"),
+    Received::Ended,
+    "the refused packet must not have re-armed the decoder",
+  );
+
+  // `flush` is the way back on this road too.
+  decoder.flush().expect("flush");
+  assert_eq!(decoder.send_packet(&pkt).expect("no fault"), Sent::Accepted);
 }

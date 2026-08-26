@@ -133,31 +133,64 @@ mediadecode = { version = "0.8", default-features = false, features = ["alloc"] 
 ## Usage
 
 This crate defines the surface; concrete decoding happens in adapter
-crates. A backend-agnostic consumer programs against the traits:
+crates. A backend-agnostic consumer programs against the traits, and
+both faces answer states: `send_packet` answers `Sent` — *accepted* or
+*must drain* — and `receive_frame` answers `Received` — *a frame*,
+*needs input*, or *ended*. `Err` means a fault and nothing else:
 
 ```rust,no_run
 use mediadecode::{
+  Received, Sent,
+  adapter::VideoAdapter,
   decoder::VideoStreamDecoder,
   frame::VideoFrame,
   packet::VideoPacket,
 };
 
+type Frame<D> = VideoFrame<
+  <<D as VideoStreamDecoder>::Adapter as VideoAdapter>::PixelFormat,
+  <<D as VideoStreamDecoder>::Adapter as VideoAdapter>::FrameExtra,
+  <D as VideoStreamDecoder>::Buffer,
+>;
+
+/// Feeds one packet and delivers every frame it made ready.
+/// Answers `true` once the stream is over.
 fn decode_one<D: VideoStreamDecoder>(
   decoder: &mut D,
   packet: &VideoPacket<
-    <D::Adapter as mediadecode::adapter::VideoAdapter>::PacketExtra,
+    <D::Adapter as VideoAdapter>::PacketExtra,
     D::Buffer,
   >,
-  dst: &mut VideoFrame<
-    <D::Adapter as mediadecode::adapter::VideoAdapter>::PixelFormat,
-    <D::Adapter as mediadecode::adapter::VideoAdapter>::FrameExtra,
-    D::Buffer,
-  >,
-) -> Result<(), D::Error> {
-  decoder.send_packet(packet)?;
-  decoder.receive_frame(dst)
+  dst: &mut Frame<D>,
+  mut on_frame: impl FnMut(&Frame<D>),
+) -> Result<bool, D::Error> {
+  // Offer until the decoder takes it. `MustDrain` promises nothing was
+  // consumed, so the *same* packet is re-offered after a drain.
+  loop {
+    // `?` gives up on a real failure — and only on a real failure.
+    match decoder.send_packet(packet)? {
+      Sent::Accepted => break,
+      Sent::MustDrain => {
+        while let Received::Frame = decoder.receive_frame(dst)? {
+          on_frame(dst);
+        }
+      }
+    }
+  }
+  loop {
+    match decoder.receive_frame(dst)? {
+      Received::Frame => on_frame(dst),
+      Received::NeedsInput => return Ok(false),
+      Received::Ended => return Ok(true),
+    }
+  }
 }
 ```
+
+The compiler is what makes this correct: a consumer that forgets
+end-of-stream does not compile, a receive-side failure can no longer be
+mistaken for a drained decoder, and back pressure no longer has to be
+guessed at by offering every packet twice.
 
 For an end-to-end example using the FFmpeg adapter, see
 [`mediadecode-ffmpeg`](../mediadecode-ffmpeg).

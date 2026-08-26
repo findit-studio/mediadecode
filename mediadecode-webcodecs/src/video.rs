@@ -12,9 +12,10 @@
 //! callback `spawn_local`s a copy task that pulls bytes out of the
 //! JS-side `VideoFrame` (only available via async `copyTo`),
 //! pushes the result onto the queue, and wakes the receive future.
-//! `receive_frame` is a `poll_fn` that drains the queue, returns
-//! [`VideoDecodeError::Eof`] once `send_eof` has completed and the
-//! drain is empty, or registers a waker and yields otherwise.
+//! `receive_frame` is a `poll_fn` that drains the queue, answers
+//! [`Received::Ended`](mediadecode::Received) once `send_eof` has
+//! completed and the drain is empty, or registers a waker and yields
+//! otherwise.
 //!
 //! # Backpressure
 //!
@@ -30,7 +31,7 @@
 use std::{num::NonZeroI32, sync::Arc};
 
 use mediadecode::{
-  Timebase, Timestamp,
+  Received, Sent, Timebase, Timestamp,
   color::{ColorInfo, ColorMatrix, ColorPrimaries, ColorRange, ColorTransfer},
   frame::{Dimensions, Plane, Rect, VideoFrame},
   future::local::VideoStreamDecoder,
@@ -83,7 +84,7 @@ pub const MAX_FRAME_ALLOCATION_BYTES: u32 = 256 * 1024 * 1024; // 256 MiB
 /// `send_packet` estimates per-frame bytes as
 /// `coded_width × coded_height × 4` (worst-case 4 bytes per
 /// pixel, conservative across NV12 / P010 / RGBA) and applies
-/// `OutputFull` when the projected aggregate would exceed
+/// [`Sent::MustDrain`](mediadecode::Sent) when the projected aggregate would exceed
 /// this cap. The 4 bytes/pixel constant is intentionally
 /// pessimistic — for NV12 (~1.5 B/px) the budget pipelines
 /// fewer frames than strictly necessary, but the trade vs.
@@ -125,7 +126,7 @@ pub const MAX_INPUT_INFLIGHT_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
 /// queue is `receive_frame`, which also takes `&mut self` on
 /// the decoder, so awaiting here would deadlock. Instead, when
 /// the queue is at the cap, `send_packet` returns
-/// [`VideoDecodeError::OutputFull`] and the caller drives the
+/// [`Sent::MustDrain`](mediadecode::Sent) and the caller drives the
 /// drain themselves (typically by interleaving `send_packet`
 /// and `receive_frame` calls).
 ///
@@ -266,9 +267,14 @@ pub struct WebCodecsVideoStreamDecoder {
   output_slot_id: u64,
   error_slot_id: u64,
   dequeue_slot_id: u64,
-  /// `true` once the `send_eof` future has resolved. The async
-  /// `receive_frame` returns `Eof` after this when the queue
-  /// drains and no copy tasks remain.
+  /// `true` once the `send_eof` future has resolved.
+  ///
+  /// **The only thing that distinguishes the drain's two no-frame
+  /// answers.** With the queue empty and no copy task in flight,
+  /// `receive_frame` answers [`Received::Ended`](mediadecode::Received)
+  /// when this is set and [`Received::NeedsInput`](mediadecode::Received)
+  /// when it is not — "there will be no more" versus "send another
+  /// packet", which are opposite instructions to a caller.
   eof: bool,
 }
 
@@ -714,13 +720,20 @@ impl WebCodecsVideoStreamDecoder {
   /// Admission control for `send_packet`. Returns:
   ///
   /// - `Err(Closed)` if the decoder has errored.
-  /// - `Err(OutputFull)` *immediately* (no await) when the
+  /// - `Ok(Sent::MustDrain)` *immediately* (no await) when the
   ///   output queue is at [`MAX_QUEUED_OUTPUT`]. Caller drains
   ///   via `receive_frame` and retries (cannot await here —
   ///   would deadlock on `&mut self`).
-  /// - `Ok(())` once `decode_queue_size + pending_copies <
+  /// - `Ok(Sent::Accepted)` once `decode_queue_size + pending_copies <
   ///   MAX_PENDING_DECODE`. Awaits while the cap is closed,
   ///   waking on the WebCodecs `dequeue` event.
+  ///
+  /// **The two kinds of pressure part company here, and that is what
+  /// the return type now says.** The decoder-side cap drains by itself
+  /// as the browser works, so this awaits it; the *output* cap drains
+  /// only when the caller calls `receive_frame`, which needs the
+  /// `&mut self` this method is holding — so awaiting that one would
+  /// deadlock, and it is reported instead.
   ///
   /// The decoder-side cap is gated on
   /// [`web_sys::VideoDecoder::decode_queue_size`] — the
@@ -733,7 +746,7 @@ impl WebCodecsVideoStreamDecoder {
   /// chunks reorder before output (a producer parked at the
   /// cap can't supply the input the decoder is waiting on).
   /// Browser internal pipelines self-bound; we trust them.
-  async fn await_decode_room(&self) -> Result<(), VideoDecodeError> {
+  async fn await_decode_room(&self) -> Result<Sent, VideoDecodeError> {
     loop {
       {
         let inner = self.state.borrow();
@@ -741,7 +754,7 @@ impl WebCodecsVideoStreamDecoder {
           return Err(VideoDecodeError::Closed(err));
         }
         if inner.queue_len() >= MAX_QUEUED_OUTPUT as usize {
-          return Err(VideoDecodeError::OutputFull);
+          return Ok(Sent::MustDrain);
         }
         // Aggregate byte budget. Three terms:
         //
@@ -775,10 +788,10 @@ impl WebCodecsVideoStreamDecoder {
         // would otherwise wedge admission forever once the
         // pipeline drains.
         if in_flight_bytes > MAX_INFLIGHT_BYTES {
-          return Err(VideoDecodeError::OutputFull);
+          return Ok(Sent::MustDrain);
         }
         if pending_decode(&self.decoder, &inner) < MAX_PENDING_DECODE as usize {
-          return Ok(());
+          return Ok(Sent::Accepted);
         }
       }
       let _guard = self.state.dequeue_waker_guard();
@@ -877,17 +890,21 @@ impl VideoStreamDecoder for WebCodecsVideoStreamDecoder {
   async fn send_packet(
     &mut self,
     packet: &VideoPacket<VideoPacketExtra, Self::Buffer>,
-  ) -> Result<(), Self::Error> {
+  ) -> Result<Sent, Self::Error> {
     self.check_closed()?;
     if self.eof {
       // `send_eof` already drained the decoder; admitting more
       // chunks now would either silently corrupt observation
-      // (`receive_frame` would still report `Eof` with the new
+      // (`receive_frame` would still answer `Ended` with the new
       // work in flight) or violate the spec (depending on the
       // browser's tolerance). Caller must `flush()` to reset.
-      return Err(VideoDecodeError::AtEof);
+      return Err(VideoDecodeError::AfterEof);
     }
-    self.await_decode_room().await?;
+    // Back pressure the caller has to relieve: nothing is submitted,
+    // and the same packet is offered again after a drain.
+    if self.await_decode_room().await?.is_must_drain() {
+      return Ok(Sent::MustDrain);
+    }
 
     let key = packet.flags().contains(PacketFlags::KEY);
     let chunk_type = if key {
@@ -1003,14 +1020,25 @@ impl VideoStreamDecoder for WebCodecsVideoStreamDecoder {
       self.state.borrow_mut().remove_pending_output(submission_id);
       return Err(VideoDecodeError::Js(Error::from_js(e)));
     }
-    Ok(())
+    Ok(Sent::Accepted)
   }
 
   async fn receive_frame(
     &mut self,
     dst: &mut VideoFrame<PixelFormat, VideoFrameExtra, Self::Buffer>,
-  ) -> Result<(), Self::Error> {
-    let frame = wait_for_frame(&self.state, &self.decoder, self.eof).await?;
+  ) -> Result<Received, Self::Error> {
+    // The wait says only whether a frame arrived. **Which of the two
+    // no-frame answers this is comes from the session's own EOF
+    // latch**, which lives here, and the two must not be one word:
+    // "send another packet" and "there will be no more" are the
+    // opposite instruction to a caller.
+    let Some(frame) = wait_for_frame(&self.state, &self.decoder).await? else {
+      return Ok(if self.eof {
+        Received::Ended
+      } else {
+        Received::NeedsInput
+      });
+    };
 
     let dimensions = frame.dimensions();
     let format = frame.format();
@@ -1038,10 +1066,10 @@ impl VideoStreamDecoder for WebCodecsVideoStreamDecoder {
     .with_duration(duration)
     .with_visible_rect(visible_rect)
     .with_color(color);
-    Ok(())
+    Ok(Received::Frame)
   }
 
-  async fn send_eof(&mut self) -> Result<(), Self::Error> {
+  async fn send_eof(&mut self) -> Result<Sent, Self::Error> {
     self.check_closed()?;
 
     // Cancellation / failure policy:
@@ -1112,7 +1140,7 @@ impl VideoStreamDecoder for WebCodecsVideoStreamDecoder {
     }
     self.eof = true;
     guard.completed = true;
-    Ok(())
+    Ok(Sent::Accepted)
   }
 
   async fn flush(&mut self) -> Result<(), Self::Error> {
@@ -1133,8 +1161,9 @@ impl VideoStreamDecoder for WebCodecsVideoStreamDecoder {
     // flagged: an early-return from `?` on `reset()` /
     // `configure()` used to leave the JS decoder unconfigured
     // while `check_closed()` still passed, so subsequent
-    // `send_packet` / `receive_frame` would surface
-    // `Js`/`NoFrameReady` instead of `Closed`. The guard
+    // `send_packet` / `receive_frame` would surface a bare
+    // `Js` error (or a clean "needs input") instead of
+    // `Closed`. The guard
     // records `Closed` on every drop except the success path
     // that explicitly sets `completed = true`.
     self.state.bump_epoch();
@@ -1198,13 +1227,13 @@ impl VideoStreamDecoder for WebCodecsVideoStreamDecoder {
 /// chunks the decoder is buffering for B-frame / DTS reorder,
 /// and they only drain when *more input* arrives — which only
 /// `send_packet` can supply. Waiting under `&mut self` would
-/// deadlock since the caller can't feed that input. Returning
-/// `NoFrameReady` instead lets the caller drive.
+/// deadlock since the caller can't feed that input. Answering
+/// `Ok(None)` — which `receive_frame` reads as needs-input, or as
+/// ended once EOF has resolved — lets the caller drive.
 async fn wait_for_frame(
   state: &SharedState<DecodedVideoFrame>,
   decoder: &web_sys::VideoDecoder,
-  eof: bool,
-) -> Result<DecodedVideoFrame, VideoDecodeError> {
+) -> Result<Option<DecodedVideoFrame>, VideoDecodeError> {
   loop {
     let popped = {
       let mut inner = state.borrow_mut();
@@ -1231,14 +1260,16 @@ async fn wait_for_frame(
         // between `decode_queue_size` decrementing and the
         // matching output callback firing is real but
         // microsecond-scale; the right resolution is to
-        // return `NoFrameReady` and let the caller retry,
-        // not to park on a state that may never advance.
+        // report no frame and let the caller retry, not to
+        // park on a state that may never advance.
         let active_decode_work = inner.pending_copies() > 0 || decoder.decode_queue_size() > 0;
+        // No frame, and nothing in flight that could produce one
+        // without the caller acting. **Which of the two protocol
+        // answers that is belongs to the session, not to this
+        // helper** — it is the `eof` latch that decides, and
+        // `receive_frame` owns it.
         if !active_decode_work {
-          if eof {
-            return Err(VideoDecodeError::Eof);
-          }
-          return Err(VideoDecodeError::NoFrameReady);
+          return Ok(None);
         }
       }
       frame
@@ -1246,12 +1277,12 @@ async fn wait_for_frame(
     if let Some(frame) = popped.map(DecodedFrame::into_frame) {
       // Popping decreases `queue.len()`, which may bring the
       // pipeline back below `MAX_QUEUED_OUTPUT`. A producer
-      // that hit `OutputFull` and is now retrying will see the
+      // that was told to drain and is now retrying will see the
       // freed slot on its next call. Also wake any decoder-side
       // backpressure waiter — they may have been parked
       // while the queue was full.
       state.wake_dequeue();
-      return Ok(frame);
+      return Ok(Some(frame));
     }
     // Register the current task's waker and yield. The output
     // callback's spawned copy task wakes us when it pushes a
@@ -1270,8 +1301,9 @@ async fn wait_for_frame(
       let active_decode_work = inner.pending_copies() > 0 || decoder.decode_queue_size() > 0;
       // Resolve Ready when the queue has a frame, the decoder
       // has been closed, OR no further JS work can advance
-      // without caller action (the outer loop translates the
-      // last branch to `NoFrameReady` / `Eof`). Park otherwise.
+      // without caller action (the outer loop answers `None` for
+      // the last branch, and `receive_frame` turns that into
+      // needs-input or ended). Park otherwise.
       if !inner.queue_is_empty() || inner.is_closed() || !active_decode_work {
         core::task::Poll::Ready(())
       } else {

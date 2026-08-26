@@ -16,7 +16,7 @@
 
 use ffmpeg::{format, media};
 use ffmpeg_next as ffmpeg;
-use mediadecode::{Timebase, decoder::VideoStreamDecoder};
+use mediadecode::{Received, Sent, Timebase, decoder::VideoStreamDecoder};
 // The owned family under the names this suite was written with — the
 // bare aliases mean the view lane now. Import block only; the
 // assertions below are unchanged.
@@ -29,6 +29,11 @@ use std::num::NonZeroI32;
 
 /// Generic helper bounded purely on the `mediadecode` trait — proves
 /// `FfmpegVideoStreamDecoder` is reachable through the abstraction.
+///
+/// **And that the whole rhythm is reachable through it.** Both faces
+/// answer states now, so the feed half is a loop with an exit condition
+/// rather than the two-offer guess: offer, drain when told to, offer
+/// the same packet again. `?` is honest on both — only a fault leaves.
 fn decode_through_trait<D>(
   decoder: &mut D,
   packet: &VideoPacket,
@@ -37,11 +42,18 @@ fn decode_through_trait<D>(
 where
   D: VideoStreamDecoder<Adapter = Ffmpeg, Buffer = FfmpegBytes>,
 {
-  decoder.send_packet(packet)?;
-  match decoder.receive_frame(dst) {
-    Ok(()) => Ok(true),
-    Err(_e) => Ok(false), // EAGAIN — caller should send more packets
+  let mut delivered = false;
+  loop {
+    match decoder.send_packet(packet)? {
+      Sent::Accepted => break,
+      Sent::MustDrain => {
+        while let Received::Frame = decoder.receive_frame(dst)? {
+          delivered = true;
+        }
+      }
+    }
   }
+  Ok(matches!(decoder.receive_frame(dst)?, Received::Frame) || delivered)
 }
 
 #[test]

@@ -30,7 +30,7 @@ use std::{
 };
 
 use mediadecode::{
-  Timebase, Timestamp,
+  Received, Timebase, Timestamp,
   demuxer::{DemuxedPacket, Demuxer, TrackKind},
   packet::PacketFlags,
 };
@@ -346,14 +346,21 @@ fn decoded_samples(path: &std::path::Path, strip_side_data: bool) -> u64 {
     } else {
       packet
     };
-    decoder.send_packet(&packet).expect("send_packet");
-    while decoder.receive_frame(&mut frame).is_ok() {
+    support::accepted(decoder.send_packet(&packet), "send_packet");
+    while matches!(
+      decoder.receive_frame(&mut frame).expect("receive_frame"),
+      Received::Frame
+    ) {
       total += u64::from(frame.nb_samples());
     }
   }
-  decoder.send_eof().expect("eof");
-  while decoder.receive_frame(&mut frame).is_ok() {
-    total += u64::from(frame.nb_samples());
+  support::accepted(decoder.send_eof(), "eof");
+  loop {
+    match decoder.receive_frame(&mut frame).expect("receive_frame") {
+      Received::Frame => total += u64::from(frame.nb_samples()),
+      Received::NeedsInput => panic!("a decoder at EOF asked for input"),
+      Received::Ended => break,
+    }
   }
   total
 }

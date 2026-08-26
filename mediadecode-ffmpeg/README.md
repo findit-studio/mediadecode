@@ -70,7 +70,7 @@ them through their own software decoder without re-demuxing.
 ```rust,no_run
 use ffmpeg_next as ffmpeg;
 use ffmpeg::{format, media};
-use mediadecode::{Timebase, decoder::VideoStreamDecoder};
+use mediadecode::{Received, Sent, Timebase, decoder::VideoStreamDecoder};
 use mediadecode_ffmpeg::{
   DecoderLimits, Error as FfmpegError, FfmpegVideoStreamDecoder, PacketLimits,
   VideoDecodeError, empty_video_frame, video_packet_from_ffmpeg_in,
@@ -118,7 +118,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     else { continue };
 
     match decoder.send_packet(&pkt) {
-      Ok(()) => {}
+      Ok(Sent::Accepted) => {}
+      // Back pressure, not a failure: nothing was consumed, so drain
+      // and offer this same packet again. The old idiom — submit
+      // twice and treat the second failure as real — is what this
+      // arm replaces.
+      Ok(Sent::MustDrain) => {
+        while decoder.receive_frame(&mut frame)? == Received::Frame {}
+        // (re-offer `pkt`; elided here for brevity)
+      }
       Err(VideoDecodeError::Decode(FfmpegError::AllBackendsFailed(p))) => {
         // Runtime exhaustion: rescued packets are the bytes the decoder
         // already consumed from `input`. Replay them through your own
@@ -127,17 +135,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _unconsumed_packets = p.into_unconsumed_packets();
         return Ok(());
       }
+      // `VideoDecodeError` is `#[non_exhaustive]`: a fault this code
+      // has never heard of takes the generic road, which is the right
+      // handling for one.
       Err(e) => return Err(e.into()),
     }
-    while decoder.receive_frame(&mut frame).is_ok() {
+    // `receive_frame` answers `Received`, so the loop stops on a state
+    // rather than on "whatever the last error was" — and a real
+    // receive-side failure leaves through `?` instead of ending the
+    // drain silently.
+    while decoder.receive_frame(&mut frame)? == Received::Frame {
       // frame.pixel_format(), frame.width(), frame.height(),
       // frame.planes() — view carriers: read them here and drop. A
       // frame held is a pool slot held. Use the `Owned*` family when a
       // frame has to outlive the loop.
     }
   }
-  decoder.send_eof()?;
-  while decoder.receive_frame(&mut frame).is_ok() { /* drain */ }
+  // The end-of-stream is offered on the same terms as a packet.
+  while decoder.send_eof()? == Sent::MustDrain {
+    while decoder.receive_frame(&mut frame)? == Received::Frame {}
+  }
+  // The tail, and its end has its own word.
+  while decoder.receive_frame(&mut frame)? != Received::Ended {}
   Ok(())
 }
 ```
@@ -161,9 +180,11 @@ for end-to-end demuxer-driven runs that cover all three streams.
   — `mediadecode`'s `AudioResampler` over `swresample`, built from two
   explicit `ResampleSpec`s (the source read off a track or off the
   opened decoder, the target the caller's). Plus `ResampleError`,
-  whose `Again` variant is the "needs more input" signal and whose
-  `SourceChanged` variant is the mid-stream refusal. Disabling the
-  feature drops the type and the `libswresample` link along with it.
+  which carries faults and the `SourceChanged` mid-stream refusal —
+  "needs more input" and "the tail is finished" are
+  `mediadecode::Received` states out of `receive_frame`, not error
+  variants. Disabling the feature drops the type and the
+  `libswresample` link along with it.
 - **`FfmpegImageDecoder`**: the one-shot `ImageDecoder` — cover art in,
   `ImageFrame` out. Opened from an attachment track's codec parameters,
   which the demuxer's cover-art reclassification retains in full. The

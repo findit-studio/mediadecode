@@ -15,6 +15,12 @@
 //! - **No `unsafe`** — wrappers like `video_packet_from_ffmpeg` and
 //!   `empty_video_frame` mean the caller never reads or constructs
 //!   raw FFmpeg buffer pointers.
+//! - **No errno either** — `receive_frame` answers
+//!   `mediadecode::Received`, so this generic loop distinguishes
+//!   *needs input* from *ended* from *broken* without naming an FFmpeg
+//!   type. Its non-generic sibling used to be the only one that could,
+//!   and only by matching `Error::Ffmpeg(Other { errno })` in user
+//!   code.
 //!
 //! Compare with `examples/decode.rs`, which uses the lower-level
 //! `VideoDecoder` (HW-probe wrapper) directly — no SW fallback,
@@ -26,7 +32,7 @@
 
 use ffmpeg::{format, media};
 use ffmpeg_next as ffmpeg;
-use mediadecode::{Timebase, decoder::VideoStreamDecoder};
+use mediadecode::{Received, Sent, Timebase, decoder::VideoStreamDecoder};
 use mediadecode_ffmpeg::{
   DecoderLimits, Ffmpeg, FfmpegBuffer, FfmpegVideoStreamDecoder, PacketLimits, VideoFrame,
   empty_video_frame, video_packet_from_ffmpeg_in,
@@ -91,18 +97,36 @@ where
   let mut dst = empty_video_frame();
   let mut count: u64 = 0;
 
-  let drain = |decoder: &mut D, dst: &mut VideoFrame, count: &mut u64| {
-    while decoder.receive_frame(dst).is_ok() {
-      *count += 1;
-      println!(
-        "frame#{count} pts={:?} {}x{} pix_fmt={}",
-        dst.pts().map(|t| t.pts()),
-        dst.width(),
-        dst.height(),
-        dst.pixel_format(),
-      );
+  /// Delivers every frame that is ready, and answers whether the
+  /// stream is over. A receive-side failure surfaces instead of being
+  /// swallowed — which the `while ….is_ok()` idiom this replaced could
+  /// not do, because it could not tell a drained decoder from a broken
+  /// one.
+  fn drain<D>(
+    decoder: &mut D,
+    dst: &mut VideoFrame,
+    count: &mut u64,
+  ) -> std::result::Result<bool, D::Error>
+  where
+    D: VideoStreamDecoder<Adapter = Ffmpeg, Buffer = FfmpegBuffer>,
+  {
+    loop {
+      match decoder.receive_frame(dst)? {
+        Received::Frame => {
+          *count += 1;
+          println!(
+            "frame#{count} pts={:?} {}x{} pix_fmt={}",
+            dst.pts().map(|t| t.pts()),
+            dst.width(),
+            dst.height(),
+            dst.pixel_format(),
+          );
+        }
+        Received::NeedsInput => return Ok(false),
+        Received::Ended => return Ok(true),
+      }
     }
-  };
+  }
 
   for (s, av_packet) in input.packets() {
     if s.index() != stream_index {
@@ -118,14 +142,31 @@ where
         Some(p) => p,
         None => continue,
       };
-    if let Err(e) = decoder.send_packet(&pkt) {
-      // EAGAIN: drain and retry.
-      drain(decoder, &mut dst, &mut count);
-      decoder.send_packet(&pkt).map_err(|_| e)?;
+    // **The two-offer rule, retired.** It used to read: submit, and if
+    // that fails drain and submit again, because "drain me first" and
+    // "this packet is damaged" arrived as the same `Err` and only a
+    // second attempt could tell them apart. The decoder says which it
+    // is now, so this offers until it is taken — however many drains
+    // that needs — and `?` gives up only on a real fault.
+    loop {
+      match decoder.send_packet(&pkt)? {
+        Sent::Accepted => break,
+        Sent::MustDrain => {
+          if drain(decoder, &mut dst, &mut count)? {
+            return Ok(count);
+          }
+        }
+      }
     }
-    drain(decoder, &mut dst, &mut count);
+    if drain(decoder, &mut dst, &mut count)? {
+      return Ok(count);
+    }
   }
-  let _ = decoder.send_eof();
-  drain(decoder, &mut dst, &mut count);
+  // The end-of-stream is offered on the same terms.
+  while decoder.send_eof()? == Sent::MustDrain {
+    drain(decoder, &mut dst, &mut count)?;
+  }
+  // The tail, and its end is a state rather than a guess.
+  drain(decoder, &mut dst, &mut count)?;
   Ok(count)
 }

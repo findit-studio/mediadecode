@@ -26,6 +26,7 @@ pub mod frame;
 pub mod packet;
 pub mod pixel_format;
 pub mod resampler;
+pub mod rhythm;
 pub mod subtitle;
 
 #[cfg(feature = "future")]
@@ -33,6 +34,7 @@ pub mod subtitle;
 pub mod future;
 
 pub use pixel_format::PixelFormat;
+pub use rhythm::{Received, Sent};
 
 // Re-export the time primitives so consumers don't have to add a
 // separate `mediatime` dependency.

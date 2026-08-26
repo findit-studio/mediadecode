@@ -11,7 +11,7 @@
 use core::num::NonZeroI32;
 
 use mediadecode::{
-  Timebase, Timestamp,
+  Received, Sent, Timebase, Timestamp,
   adapter::{AudioAdapter, SubtitleAdapter, VideoAdapter},
   color::{ChromaLocation, ColorInfo, ColorMatrix, ColorPrimaries, ColorRange, ColorTransfer},
   decoder::{
@@ -47,27 +47,33 @@ impl SubtitleAdapter for Loop {
   type FrameExtra = ();
 }
 
-#[derive(Debug)]
-pub struct Eof;
+/// The loopback's fault type. **Not** a home for end-of-stream: the
+/// protocol's states leave through [`Received`], so what an error type
+/// is left holding here is nothing at all.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Fault;
 
-/// Trivial push-style video decoder that accepts any packet and
-/// returns Eof from `receive_frame`.
+/// Trivial push-style video decoder that accepts any packet and reports
+/// an ended stream from `receive_frame`.
 pub struct VideoStream;
 
 impl VideoStreamDecoder for VideoStream {
   type Adapter = Loop;
   type Buffer = &'static [u8];
-  type Error = Eof;
-  fn send_packet(&mut self, _: &VideoPacket<(), &'static [u8]>) -> Result<(), Eof> {
-    Ok(())
+  type Error = Fault;
+  fn send_packet(&mut self, _: &VideoPacket<(), &'static [u8]>) -> Result<Sent, Fault> {
+    Ok(Sent::Accepted)
   }
-  fn receive_frame(&mut self, _: &mut VideoFrame<u32, (), &'static [u8]>) -> Result<(), Eof> {
-    Err(Eof)
+  fn receive_frame(
+    &mut self,
+    _: &mut VideoFrame<u32, (), &'static [u8]>,
+  ) -> Result<Received, Fault> {
+    Ok(Received::Ended)
   }
-  fn send_eof(&mut self) -> Result<(), Eof> {
-    Ok(())
+  fn send_eof(&mut self) -> Result<Sent, Fault> {
+    Ok(Sent::Accepted)
   }
-  fn flush(&mut self) -> Result<(), Eof> {
+  fn flush(&mut self) -> Result<(), Fault> {
     Ok(())
   }
 }
@@ -81,7 +87,7 @@ impl VideoFrameSource for VideoSource {
   type Adapter = Loop;
   type Buffer = &'static [u8];
   type ClipMeta = ();
-  type Error = Eof;
+  type Error = Fault;
   fn frame_count(&self) -> u64 {
     0
   }
@@ -98,8 +104,8 @@ impl VideoFrameSource for VideoSource {
     &mut self,
     _: u64,
     _: &mut VideoFrame<u32, (), &'static [u8]>,
-  ) -> Result<(), Eof> {
-    Err(Eof)
+  ) -> Result<(), Fault> {
+    Err(Fault)
   }
 }
 
@@ -107,17 +113,20 @@ pub struct AudioStream;
 impl AudioStreamDecoder for AudioStream {
   type Adapter = Loop;
   type Buffer = &'static [u8];
-  type Error = Eof;
-  fn send_packet(&mut self, _: &AudioPacket<(), &'static [u8]>) -> Result<(), Eof> {
-    Ok(())
+  type Error = Fault;
+  fn send_packet(&mut self, _: &AudioPacket<(), &'static [u8]>) -> Result<Sent, Fault> {
+    Ok(Sent::Accepted)
   }
-  fn receive_frame(&mut self, _: &mut AudioFrame<u32, u32, (), &'static [u8]>) -> Result<(), Eof> {
-    Err(Eof)
+  fn receive_frame(
+    &mut self,
+    _: &mut AudioFrame<u32, u32, (), &'static [u8]>,
+  ) -> Result<Received, Fault> {
+    Ok(Received::Ended)
   }
-  fn send_eof(&mut self) -> Result<(), Eof> {
-    Ok(())
+  fn send_eof(&mut self) -> Result<Sent, Fault> {
+    Ok(Sent::Accepted)
   }
-  fn flush(&mut self) -> Result<(), Eof> {
+  fn flush(&mut self) -> Result<(), Fault> {
     Ok(())
   }
 }
@@ -127,7 +136,7 @@ impl AudioFrameSource for AudioSource {
   type Adapter = Loop;
   type Buffer = &'static [u8];
   type ClipMeta = ();
-  type Error = Eof;
+  type Error = Fault;
   fn sample_count(&self) -> u64 {
     0
   }
@@ -145,8 +154,8 @@ impl AudioFrameSource for AudioSource {
     _: u64,
     _: u32,
     _: &mut AudioFrame<u32, u32, (), &'static [u8]>,
-  ) -> Result<(), Eof> {
-    Err(Eof)
+  ) -> Result<(), Fault> {
+    Err(Fault)
   }
 }
 
@@ -154,17 +163,17 @@ pub struct SubtitleStream;
 impl SubtitleDecoder for SubtitleStream {
   type Adapter = Loop;
   type Buffer = &'static [u8];
-  type Error = Eof;
-  fn send_packet(&mut self, _: &SubtitlePacket<(), &'static [u8]>) -> Result<(), Eof> {
-    Ok(())
+  type Error = Fault;
+  fn send_packet(&mut self, _: &SubtitlePacket<(), &'static [u8]>) -> Result<Sent, Fault> {
+    Ok(Sent::Accepted)
   }
-  fn receive_frame(&mut self, _: &mut SubtitleFrame<(), &'static [u8]>) -> Result<(), Eof> {
-    Err(Eof)
+  fn receive_frame(&mut self, _: &mut SubtitleFrame<(), &'static [u8]>) -> Result<Received, Fault> {
+    Ok(Received::Ended)
   }
-  fn send_eof(&mut self) -> Result<(), Eof> {
-    Ok(())
+  fn send_eof(&mut self) -> Result<Sent, Fault> {
+    Ok(Sent::Accepted)
   }
-  fn flush(&mut self) -> Result<(), Eof> {
+  fn flush(&mut self) -> Result<(), Fault> {
     Ok(())
   }
 }
@@ -180,7 +189,7 @@ fn video_stream_round_trip() {
       Timebase::new(1, NonZeroI32::new(1000).unwrap()),
     )))
     .with_flags(PacketFlags::KEY);
-  assert!(s.send_packet(&pkt).is_ok());
+  assert_eq!(s.send_packet(&pkt), Ok(Sent::Accepted));
 
   let planes = [
     Plane::new(&b"yyyy"[..], 4),
@@ -200,11 +209,12 @@ fn video_stream_round_trip() {
           .with_range(ColorRange::Limited)
           .with_chroma_location(ChromaLocation::Left),
       );
-  // Loopback's receive_frame returns Eof, but the call compiles
-  // and dst's color metadata is settable through the builders.
-  assert!(s.receive_frame(&mut dst).is_err());
+  // Loopback's receive_frame reports an ended stream — in the `Ok`
+  // arm, where a protocol state belongs — and dst's color metadata is
+  // settable through the builders.
+  assert_eq!(s.receive_frame(&mut dst), Ok(Received::Ended));
   assert!(dst.color().matrix().is_bt_709());
-  assert!(s.send_eof().is_ok());
+  assert_eq!(s.send_eof(), Ok(Sent::Accepted));
   assert!(s.flush().is_ok());
 }
 
@@ -235,7 +245,7 @@ fn video_source_round_trip() {
 fn audio_stream_round_trip() {
   let mut s = AudioStream;
   let pkt: AudioPacket<(), &'static [u8]> = AudioPacket::new(b"compressed" as &[u8], ());
-  assert!(s.send_packet(&pkt).is_ok());
+  assert_eq!(s.send_packet(&pkt), Ok(Sent::Accepted));
 
   let planes = [
     Plane::new(&b""[..], 0),
@@ -258,7 +268,7 @@ fn audio_stream_round_trip() {
     2,
     (),
   );
-  assert!(s.receive_frame(&mut dst).is_err());
+  assert_eq!(s.receive_frame(&mut dst), Ok(Received::Ended));
   assert_eq!(dst.sample_rate(), 48_000);
 }
 
@@ -274,10 +284,10 @@ fn audio_source_metadata() {
 fn subtitle_stream_round_trip() {
   let mut s = SubtitleStream;
   let pkt: SubtitlePacket<(), &'static [u8]> = SubtitlePacket::new(b"hi" as &[u8], ());
-  assert!(s.send_packet(&pkt).is_ok());
+  assert_eq!(s.send_packet(&pkt), Ok(Sent::Accepted));
 
   let payload: SubtitlePayload<&'static [u8]> =
     SubtitlePayload::Text(SubtitleText::new(b"hi", Some(*b"eng")));
   let mut dst: SubtitleFrame<(), &'static [u8]> = SubtitleFrame::new(payload, ());
-  assert!(s.receive_frame(&mut dst).is_err());
+  assert_eq!(s.receive_frame(&mut dst), Ok(Received::Ended));
 }

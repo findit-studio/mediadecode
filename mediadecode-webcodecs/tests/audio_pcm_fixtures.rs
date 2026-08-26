@@ -28,13 +28,12 @@
 #![cfg(target_arch = "wasm32")]
 
 use mediadecode::{
-  Timebase,
+  Received, Sent, Timebase,
   future::local::AudioStreamDecoder,
   packet::{AudioPacket, PacketFlags},
 };
 use mediadecode_webcodecs::{
-  AudioDecodeError, AudioPacketExtra, WebCodecsAudioStreamDecoder, WebCodecsBuffer,
-  empty_audio_frame,
+  AudioPacketExtra, WebCodecsAudioStreamDecoder, WebCodecsBuffer, empty_audio_frame,
 };
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
@@ -255,15 +254,20 @@ async fn decode_fixture(fix: &Fixture) {
     .with_flags(PacketFlags::KEY)
     .with_pts(Some(pts));
 
-    decoder
-      .send_packet(&packet)
-      .await
-      .unwrap_or_else(|e| panic!("{}: send_packet: {e:?}", fix.name));
+    assert_eq!(
+      decoder
+        .send_packet(&packet)
+        .await
+        .unwrap_or_else(|e| panic!("{}: send_packet: {e:?}", fix.name)),
+      Sent::Accepted,
+      "{}: the drain below empties the queue each chunk",
+      fix.name,
+    );
     total_samples_in += chunk_samples;
 
     loop {
       match decoder.receive_frame(&mut frame).await {
-        Ok(()) => {
+        Ok(Received::Frame) => {
           total_samples_out = total_samples_out.saturating_add(frame.nb_samples() as u64);
           frames_total = frames_total.saturating_add(1);
           assert_eq!(frame.sample_rate(), sample_rate, "{}", fix.name);
@@ -282,19 +286,24 @@ async fn decode_fixture(fix: &Fixture) {
           }
           last_pts = Some(pts_value);
         }
-        Err(AudioDecodeError::NoFrameReady) => break,
+        Ok(Received::NeedsInput | Received::Ended) => break,
         Err(e) => panic!("{}: receive_frame: {e:?}", fix.name),
       }
     }
   }
 
-  decoder
-    .send_eof()
-    .await
-    .unwrap_or_else(|e| panic!("{}: send_eof: {e:?}", fix.name));
+  assert_eq!(
+    decoder
+      .send_eof()
+      .await
+      .unwrap_or_else(|e| panic!("{}: send_eof: {e:?}", fix.name)),
+    Sent::Accepted,
+    "{}",
+    fix.name,
+  );
   loop {
     match decoder.receive_frame(&mut frame).await {
-      Ok(()) => {
+      Ok(Received::Frame) => {
         total_samples_out = total_samples_out.saturating_add(frame.nb_samples() as u64);
         frames_total = frames_total.saturating_add(1);
         let pts = frame
@@ -311,8 +320,8 @@ async fn decode_fixture(fix: &Fixture) {
         }
         last_pts = Some(pts_value);
       }
-      Err(AudioDecodeError::Eof) => break,
-      Err(AudioDecodeError::NoFrameReady) => continue,
+      Ok(Received::Ended) => break,
+      Ok(Received::NeedsInput) => continue,
       Err(e) => panic!("{}: post-EOF receive_frame: {e:?}", fix.name),
     }
   }

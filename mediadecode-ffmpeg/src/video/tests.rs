@@ -216,7 +216,7 @@ impl HwInner for FakeHw {
     true
   }
 
-  fn send_packet(&mut self, packet: &Packet) -> Result<(), Error> {
+  fn send_packet(&mut self, packet: &Packet) -> Result<Sent, Error> {
     let idx = self.sends;
     self.sends += 1;
     if idx == self.fail_at_send {
@@ -240,10 +240,10 @@ impl HwInner for FakeHw {
       av.set_pts(packet.pts());
       self.queued.push_back(av);
     }
-    Ok(())
+    Ok(Sent::Accepted)
   }
 
-  fn receive_frame(&mut self, frame: &mut Frame) -> Result<(), Error> {
+  fn receive_frame(&mut self, frame: &mut Frame) -> Result<Received, Error> {
     if self.fail_at_receive {
       // Once: the decoder falls back and never asks this seam again.
       self.fail_at_receive = false;
@@ -254,16 +254,14 @@ impl HwInner for FakeHw {
     match self.queued.pop_front() {
       Some(av) => {
         *frame.as_inner_mut() = av;
-        Ok(())
+        Ok(Received::Frame)
       }
-      None => Err(Error::Ffmpeg(ffmpeg_next::Error::Other {
-        errno: ffmpeg_next::error::EAGAIN,
-      })),
+      None => Ok(Received::NeedsInput),
     }
   }
 
-  fn send_eof(&mut self) -> Result<(), Error> {
-    Ok(())
+  fn send_eof(&mut self) -> Result<Sent, Error> {
+    Ok(Sent::Accepted)
   }
 
   fn flush(&mut self) -> Result<(), Error> {
@@ -307,27 +305,25 @@ impl HwInner for FakeHwEofFails {
     false
   }
 
-  fn send_packet(&mut self, packet: &Packet) -> Result<(), Error> {
+  fn send_packet(&mut self, packet: &Packet) -> Result<Sent, Error> {
     self.queued.push_back(packet.pts().unwrap_or(0));
-    Ok(())
+    Ok(Sent::Accepted)
   }
 
-  fn receive_frame(&mut self, frame: &mut Frame) -> Result<(), Error> {
+  fn receive_frame(&mut self, frame: &mut Frame) -> Result<Received, Error> {
     match self.queued.pop_front() {
       Some(pts) => {
         let mut av =
           frame::Video::new(ffmpeg_next::format::Pixel::YUV420P, self.width, self.height);
         av.set_pts(Some(pts));
         *frame.as_inner_mut() = av;
-        Ok(())
+        Ok(Received::Frame)
       }
-      None => Err(Error::Ffmpeg(ffmpeg_next::Error::Other {
-        errno: ffmpeg_next::error::EAGAIN,
-      })),
+      None => Ok(Received::NeedsInput),
     }
   }
 
-  fn send_eof(&mut self) -> Result<(), Error> {
+  fn send_eof(&mut self) -> Result<Sent, Error> {
     Err(Error::AllBackendsFailed(
       crate::error::AllBackendsFailed::new_post_commit(Vec::new()),
     ))
@@ -343,6 +339,62 @@ impl HwInner for FakeHwEofFails {
   }
 }
 
+/// A hardware seam whose `send_eof` answers back pressure rather than
+/// taking the end. Nothing else about it matters.
+struct FakeHwEofBackpressures;
+
+impl HwInner for FakeHwEofBackpressures {
+  fn records_submissions(&self) -> bool {
+    false
+  }
+  fn send_packet(&mut self, _: &Packet) -> Result<Sent, Error> {
+    Ok(Sent::Accepted)
+  }
+  fn receive_frame(&mut self, _: &mut Frame) -> Result<Received, Error> {
+    Ok(Received::NeedsInput)
+  }
+  fn send_eof(&mut self) -> Result<Sent, Error> {
+    Ok(Sent::MustDrain)
+  }
+  fn flush(&mut self) -> Result<(), Error> {
+    Ok(())
+  }
+  fn as_video_decoder(&self) -> Option<&VideoDecoder> {
+    None
+  }
+}
+
+/// **Class audit: `is_ok()` is not the commit test, and this is the
+/// ordering that proves it.**
+///
+/// `send_eof` answering `Ok(Sent::MustDrain)` means the end-of-stream
+/// was **not** recorded — but it is still an `Ok`. Committing
+/// `eof_sent` off `is_ok()` would mark the transaction done for a
+/// signal the decoder never took, and a *later* fallback would then
+/// inject an EOF into the freshly-opened software decoder on the
+/// strength of it. That is the same half-mutation the failed-fallback
+/// lane above guards from the error side; this guards it from the side
+/// the send-status vocabulary opened.
+#[test]
+fn back_pressured_eof_does_not_commit_the_eof_transaction() {
+  let mut dec = unopenable_sw_decoder(Box::new(FakeHwEofBackpressures));
+  assert!(
+    !dec.eof_sent_for_test(),
+    "precondition: eof_sent starts false"
+  );
+
+  for _ in 0..3 {
+    assert!(
+      matches!(dec.send_eof(), Ok(Sent::MustDrain)),
+      "the seam refuses the end until its output is drained",
+    );
+    assert!(
+      !dec.eof_sent_for_test(),
+      "an end-of-stream that was not taken must not commit the transaction",
+    );
+  }
+}
+
 /// Drive the decoder over `clip`, draining every available frame after each
 /// `send_packet` and after EOF. Returns the PTS of every delivered frame in
 /// order. A `None` PTS surfaces as `i64::MIN` so a hole is visible.
@@ -353,13 +405,8 @@ fn drive(dec: &mut FfmpegVideoStreamDecoder, clip: &SyntheticClip) -> Vec<i64> {
   let mut drain_frames = |dec: &mut FfmpegVideoStreamDecoder, out: &mut Vec<i64>| {
     loop {
       match dec.receive_frame(&mut dst) {
-        Ok(()) => out.push(dst.pts().map(|t| t.pts()).unwrap_or(i64::MIN)),
-        Err(VideoDecodeError::Decode(Error::Ffmpeg(ffmpeg_next::Error::Other { errno })))
-          if errno == ffmpeg_next::error::EAGAIN =>
-        {
-          break;
-        }
-        Err(VideoDecodeError::Decode(Error::Ffmpeg(ffmpeg_next::Error::Eof))) => break,
+        Ok(Received::Frame) => out.push(dst.pts().map(|t| t.pts()).unwrap_or(i64::MIN)),
+        Ok(Received::NeedsInput | Received::Ended) => break,
         Err(e) => panic!("receive_frame: {e:?}"),
       }
     }
@@ -369,10 +416,10 @@ fn drive(dec: &mut FfmpegVideoStreamDecoder, clip: &SyntheticClip) -> Vec<i64> {
     let vpkt = boundary::video_packet_from_ffmpeg(av_pkt)
       .expect("a wrappable payload")
       .expect("packet has a buffer");
-    dec.send_packet(&vpkt).expect("send_packet");
+    crate::accepted(dec.send_packet(&vpkt), "send_packet");
     drain_frames(dec, &mut out);
   }
-  dec.send_eof().expect("send_eof");
+  crate::accepted(dec.send_eof(), "send_eof");
   drain_frames(dec, &mut out);
   out
 }
@@ -448,13 +495,8 @@ fn post_commit_failure_degrades_and_resyncs_at_next_keyframe() {
   let mut dst = crate::empty_owned_video_frame();
   let mut drain = |dec: &mut FfmpegVideoStreamDecoder, out: &mut Vec<i64>| loop {
     match dec.receive_frame(&mut dst) {
-      Ok(()) => out.push(dst.pts().map(|t| t.pts()).unwrap_or(i64::MIN)),
-      Err(VideoDecodeError::Decode(Error::Ffmpeg(ffmpeg_next::Error::Other { errno })))
-        if errno == ffmpeg_next::error::EAGAIN =>
-      {
-        break;
-      }
-      Err(VideoDecodeError::Decode(Error::Ffmpeg(ffmpeg_next::Error::Eof))) => break,
+      Ok(Received::Frame) => out.push(dst.pts().map(|t| t.pts()).unwrap_or(i64::MIN)),
+      Ok(Received::NeedsInput | Received::Ended) => break,
       Err(e) => panic!("receive_frame: {e:?}"),
     }
   };
@@ -467,7 +509,7 @@ fn post_commit_failure_degrades_and_resyncs_at_next_keyframe() {
     let vpkt = boundary::video_packet_from_ffmpeg(av_pkt)
       .expect("a wrappable payload")
       .expect("packet has a buffer");
-    dec.send_packet(&vpkt).expect("send_packet");
+    crate::accepted(dec.send_packet(&vpkt), "send_packet");
     drain(&mut dec, &mut pts_out);
   }
   // (1) flipped to software at the post-commit failure.
@@ -493,10 +535,10 @@ fn post_commit_failure_degrades_and_resyncs_at_next_keyframe() {
     let vpkt = boundary::video_packet_from_ffmpeg(av_pkt)
       .expect("a wrappable payload")
       .expect("packet has a buffer");
-    dec.send_packet(&vpkt).expect("send_packet");
+    crate::accepted(dec.send_packet(&vpkt), "send_packet");
     drain(&mut dec, &mut pts_out);
   }
-  dec.send_eof().expect("send_eof");
+  crate::accepted(dec.send_eof(), "send_eof");
   drain(&mut dec, &mut pts_out);
 
   // (3) the keyframe-anchored resync cleared the guard — no escalation at EOF.
@@ -766,13 +808,8 @@ fn sw_replay_drain_surfaces_non_transient_decode_error() {
     }
     loop {
       match dec.receive_frame(&mut dst) {
-        Ok(()) => {}
-        Err(VideoDecodeError::Decode(Error::Ffmpeg(ffmpeg_next::Error::Other { errno })))
-          if errno == ffmpeg_next::error::EAGAIN =>
-        {
-          break;
-        }
-        Err(VideoDecodeError::Decode(Error::Ffmpeg(ffmpeg_next::Error::Eof))) => break,
+        Ok(Received::Frame) => {}
+        Ok(Received::NeedsInput | Received::Ended) => break,
         Err(e) => {
           err = Some(e);
           break;
@@ -866,17 +903,14 @@ fn sw_replay_deferred_error_surfaces_fallback_failed_at_commit() {
       .expect("a wrappable payload")
       .expect("packet has a buffer");
     match dec.send_packet(&vpkt) {
-      Ok(()) => {
+      // A full decoder would need draining first; here nothing is
+      // queued, so the two send answers are handled the same way.
+      Ok(Sent::Accepted | Sent::MustDrain) => {
         // Drain anything available (none expected pre-fallback — doom = 0).
         loop {
           match dec.receive_frame(&mut dst) {
-            Ok(()) => {}
-            Err(VideoDecodeError::Decode(Error::Ffmpeg(ffmpeg_next::Error::Other { errno })))
-              if errno == ffmpeg_next::error::EAGAIN =>
-            {
-              break;
-            }
-            Err(VideoDecodeError::Decode(Error::Ffmpeg(ffmpeg_next::Error::Eof))) => break,
+            Ok(Received::Frame) => {}
+            Ok(Received::NeedsInput | Received::Ended) => break,
             Err(e) => {
               surfaced = Some(e);
               break;
@@ -1025,13 +1059,8 @@ fn post_commit_fallback_never_resyncing_escalates_at_eof() {
                    escalation: &mut Option<VideoDecodeError>| {
     loop {
       match dec.receive_frame(&mut dst) {
-        Ok(()) => *delivered += 1,
-        Err(VideoDecodeError::Decode(Error::Ffmpeg(ffmpeg_next::Error::Other { errno })))
-          if errno == ffmpeg_next::error::EAGAIN =>
-        {
-          break;
-        }
-        Err(VideoDecodeError::Decode(Error::Ffmpeg(ffmpeg_next::Error::Eof))) => break,
+        Ok(Received::Frame) => *delivered += 1,
+        Ok(Received::NeedsInput | Received::Ended) => break,
         Err(e @ VideoDecodeError::PostCommitNeverResynced(_)) => {
           *escalation = Some(e);
           break;
@@ -1046,7 +1075,7 @@ fn post_commit_fallback_never_resyncing_escalates_at_eof() {
     let vpkt = boundary::video_packet_from_ffmpeg(av_pkt)
       .expect("a wrappable payload")
       .expect("packet has a buffer");
-    dec.send_packet(&vpkt).expect("send_packet");
+    crate::accepted(dec.send_packet(&vpkt), "send_packet");
     drain(&mut dec, &mut delivered, &mut escalation);
     assert!(
       escalation.is_none(),
@@ -1061,9 +1090,10 @@ fn post_commit_fallback_never_resyncing_escalates_at_eof() {
   );
 
   // EOF triggers the post-commit fallback; the cold SW decoder is fed only EOF.
-  dec
-    .send_eof()
-    .expect("send_eof drives the fallback but itself succeeds");
+  crate::accepted(
+    dec.send_eof(),
+    "send_eof drives the fallback but itself succeeds",
+  );
   assert!(
     dec.is_software(),
     "the EOF-time failure fell back to software"
@@ -1093,16 +1123,16 @@ fn post_commit_fallback_never_resyncing_escalates_at_eof() {
     dec.is_software(),
     "the decoder did fall back to software (it just never resynced)"
   );
-  // The flag is cleared after escalating so a follow-up poll sees plain EOF
-  // (not a repeated escalation).
+  // The flag is cleared after escalating so a follow-up poll sees the
+  // ordinary end of the stream (not a repeated escalation).
   assert!(
     !dec.degraded_resync_pending_for_test(),
     "the degraded-resync flag must be cleared after the escalation fires"
   );
   let mut after = crate::empty_owned_video_frame();
   match dec.receive_frame(&mut after) {
-    Err(VideoDecodeError::Decode(Error::Ffmpeg(ffmpeg_next::Error::Eof))) => {}
-    other => panic!("a poll after the escalation must be plain EOF, got {other:?}"),
+    Ok(Received::Ended) => {}
+    other => panic!("a poll after the escalation must be a clean end, got {other:?}"),
   }
 }
 
@@ -1150,7 +1180,7 @@ fn post_commit_gap_counter_tallies_then_clears_on_resync() {
     let vpkt = boundary::video_packet_from_ffmpeg(av_pkt)
       .expect("a wrappable payload")
       .expect("packet has a buffer");
-    dec.send_packet(&vpkt).expect("send_packet");
+    crate::accepted(dec.send_packet(&vpkt), "send_packet");
   }
   assert!(
     dec.is_software(),
@@ -1174,16 +1204,12 @@ fn post_commit_gap_counter_tallies_then_clears_on_resync() {
   // the resync keyframe (third_key) is fed counts. So we feed remaining packets,
   // draining as we go, and assert the guard stays pending until the keyframe is
   // reached, then clears once a frame is delivered after it. One poll per send:
-  // `true` if a frame was delivered, `false` on EAGAIN/EOF.
+  // `true` if a frame was delivered, `false` if the decoder wants input or has
+  // ended.
   let mut try_poll = |dec: &mut FfmpegVideoStreamDecoder| -> bool {
     match dec.receive_frame(&mut dst) {
-      Ok(()) => true,
-      Err(VideoDecodeError::Decode(Error::Ffmpeg(ffmpeg_next::Error::Other { errno })))
-        if errno == ffmpeg_next::error::EAGAIN =>
-      {
-        false
-      }
-      Err(VideoDecodeError::Decode(Error::Ffmpeg(ffmpeg_next::Error::Eof))) => false,
+      Ok(Received::Frame) => true,
+      Ok(Received::NeedsInput | Received::Ended) => false,
       Err(e) => panic!("unexpected drain error: {e:?}"),
     }
   };
@@ -1207,7 +1233,7 @@ fn post_commit_gap_counter_tallies_then_clears_on_resync() {
     let vpkt = boundary::video_packet_from_ffmpeg(av_pkt)
       .expect("a wrappable payload")
       .expect("packet has a buffer");
-    dec.send_packet(&vpkt).expect("send_packet");
+    crate::accepted(dec.send_packet(&vpkt), "send_packet");
     while try_poll(&mut dec) {}
     assert!(
       dec.degraded_resync_pending_for_test() && !dec.degraded_keyframe_seen_for_test(),
@@ -1224,7 +1250,7 @@ fn post_commit_gap_counter_tallies_then_clears_on_resync() {
   let key_vpkt = boundary::video_packet_from_ffmpeg(&clip.packets[third_key])
     .expect("a wrappable payload")
     .expect("packet has a buffer");
-  dec.send_packet(&key_vpkt).expect("send_packet");
+  crate::accepted(dec.send_packet(&key_vpkt), "send_packet");
   assert!(
     dec.degraded_keyframe_seen_for_test(),
     "feeding the keyframe across the gap must record it as the resync anchor"
@@ -1243,7 +1269,7 @@ fn post_commit_gap_counter_tallies_then_clears_on_resync() {
     let vpkt = boundary::video_packet_from_ffmpeg(av_pkt)
       .expect("a wrappable payload")
       .expect("packet has a buffer");
-    dec.send_packet(&vpkt).expect("send_packet");
+    crate::accepted(dec.send_packet(&vpkt), "send_packet");
     while !resynced && try_poll(&mut dec) {
       resynced = !dec.degraded_resync_pending_for_test();
     }
@@ -1318,13 +1344,8 @@ fn post_commit_concealed_p_frame_does_not_clear_resync_escalates_at_eof() {
                    concealed: &mut usize,
                    escalation: &mut Option<VideoDecodeError>| loop {
     match dec.receive_frame(&mut dst) {
-      Ok(()) => *concealed += 1,
-      Err(VideoDecodeError::Decode(Error::Ffmpeg(ffmpeg_next::Error::Other { errno })))
-        if errno == ffmpeg_next::error::EAGAIN =>
-      {
-        break;
-      }
-      Err(VideoDecodeError::Decode(Error::Ffmpeg(ffmpeg_next::Error::Eof))) => break,
+      Ok(Received::Frame) => *concealed += 1,
+      Ok(Received::NeedsInput | Received::Ended) => break,
       Err(e @ VideoDecodeError::PostCommitNeverResynced(_)) => {
         *escalation = Some(e);
         break;
@@ -1340,7 +1361,7 @@ fn post_commit_concealed_p_frame_does_not_clear_resync_escalates_at_eof() {
     let vpkt = boundary::video_packet_from_ffmpeg(av_pkt)
       .expect("a wrappable payload")
       .expect("packet has a buffer");
-    dec.send_packet(&vpkt).expect("send_packet");
+    crate::accepted(dec.send_packet(&vpkt), "send_packet");
     drain(&mut dec, &mut concealed_frames, &mut escalation);
     assert!(escalation.is_none(), "no escalation before EOF");
     if dec.is_software() {
@@ -1374,7 +1395,7 @@ fn post_commit_concealed_p_frame_does_not_clear_resync_escalates_at_eof() {
 
   // EOF with no keyframe ever fed: the guard is still pending → escalate, not a
   // silent clean end-of-stream.
-  dec.send_eof().expect("send_eof on the SW path");
+  crate::accepted(dec.send_eof(), "send_eof on the SW path");
   drain(&mut dec, &mut concealed_frames, &mut escalation);
   let esc = escalation.expect(
     "concealed P-frames must NOT have cleared the guard, so reaching EOF without a \
@@ -1444,7 +1465,7 @@ fn post_commit_retains_no_replay_frames() {
     let vpkt = boundary::video_packet_from_ffmpeg(av_pkt)
       .expect("a wrappable payload")
       .expect("packet has a buffer");
-    dec.send_packet(&vpkt).expect("send_packet");
+    crate::accepted(dec.send_packet(&vpkt), "send_packet");
     assert!(
       dec.sw_replay_frames_is_empty_for_test(),
       "the post-commit path must retain ZERO replay frames — nothing is drained \
@@ -1467,16 +1488,11 @@ fn post_commit_retains_no_replay_frames() {
     let vpkt = boundary::video_packet_from_ffmpeg(av_pkt)
       .expect("a wrappable payload")
       .expect("packet has a buffer");
-    dec.send_packet(&vpkt).expect("send_packet");
+    crate::accepted(dec.send_packet(&vpkt), "send_packet");
     loop {
       match dec.receive_frame(&mut dst) {
-        Ok(()) => {}
-        Err(VideoDecodeError::Decode(Error::Ffmpeg(ffmpeg_next::Error::Other { errno })))
-          if errno == ffmpeg_next::error::EAGAIN =>
-        {
-          break;
-        }
-        Err(VideoDecodeError::Decode(Error::Ffmpeg(ffmpeg_next::Error::Eof))) => break,
+        Ok(Received::Frame) => {}
+        Ok(Received::NeedsInput | Received::Ended) => break,
         Err(e) => panic!("unexpected drain error: {e:?}"),
       }
     }
@@ -1608,10 +1624,10 @@ fn fx3_high_422_10bit_falls_back_to_software_and_decodes_whole_stream() {
     let mut attempts = 0u32;
     loop {
       match dec.send_packet(&vpkt) {
-        Ok(()) => break,
-        Err(VideoDecodeError::Decode(Error::Ffmpeg(ffmpeg_next::Error::Other { errno })))
-          if errno == ffmpeg_next::error::EAGAIN =>
-        {
+        Ok(Sent::Accepted) => break,
+        // Back pressure, named. This loop is the two-offer rule's
+        // replacement: drain, then offer the same packet again.
+        Ok(Sent::MustDrain) => {
           if let Err(err) = obs.drain(&mut dec, &mut dst) {
             obs.abort = Some(format!("during send #{} EAGAIN-drain: {err}", obs.send_idx));
             break 'feed;
@@ -1648,10 +1664,13 @@ fn fx3_high_422_10bit_falls_back_to_software_and_decodes_whole_stream() {
   // EOF + final drain (only if we did not already abort mid-feed).
   if obs.abort.is_none() {
     match dec.send_eof() {
-      Ok(()) => {
+      Ok(Sent::Accepted) => {
         if let Err(err) = obs.drain(&mut dec, &mut dst) {
           obs.abort = Some(format!("during post-EOF drain: {err}"));
         }
+      }
+      Ok(Sent::MustDrain) => {
+        obs.abort = Some("send_eof asked for a drain after the feed loop drained".into());
       }
       Err(VideoDecodeError::PostCommitNeverResynced(p)) => {
         obs.escalated_never_resynced = Some(p.packets_lost());
@@ -1817,18 +1836,16 @@ impl Fx3Observation {
   ) -> Result<(), String> {
     loop {
       match dec.receive_frame(dst) {
-        Ok(()) => {
+        Ok(Received::Frame) => {
           self.note_transition(dec, true);
           let pts = VideoFrame::pts(dst).map(|t| t.pts()).unwrap_or(i64::MIN);
           self.pts_out.push(pts);
         }
-        Err(VideoDecodeError::Decode(Error::Ffmpeg(ffmpeg_next::Error::Other { errno })))
-          if errno == ffmpeg_next::error::EAGAIN =>
-        {
+        Ok(Received::NeedsInput) => {
           self.note_transition(dec, false);
           break;
         }
-        Err(VideoDecodeError::Decode(Error::Ffmpeg(ffmpeg_next::Error::Eof))) => break,
+        Ok(Received::Ended) => break,
         Err(VideoDecodeError::PostCommitNeverResynced(p)) => {
           let packets_lost = p.packets_lost();
           self.escalated_never_resynced = Some(packets_lost);
@@ -1975,7 +1992,7 @@ fn a_rescued_packet_never_aliases_a_view_carrier() {
       continue;
     };
     match dec.send_packet(&vpkt) {
-      Ok(()) => {}
+      Ok(Sent::Accepted | Sent::MustDrain) => {}
       Err(VideoDecodeError::Decode(Error::FallbackFailed(f))) => {
         retained.push(vpkt);
         rescued = f.into_unconsumed_packets();
@@ -1984,7 +2001,9 @@ fn a_rescued_packet_never_aliases_a_view_carrier() {
       Err(e) => panic!("send_packet: {e:?}"),
     }
     retained.push(vpkt);
-    while dec.receive_frame(&mut dst).is_ok() {}
+    // Exhaustive, not `.is_ok()`: "needs input" is a success now, so a
+    // predicate loop here would never leave.
+    while matches!(dec.receive_frame(&mut dst), Ok(Received::Frame)) {}
   }
 
   assert!(
@@ -2100,7 +2119,7 @@ fn the_receive_time_fallback_queue_survives_a_failed_carrier() {
             crate::fault_subprocess::uncap_ffmpeg_allocations();
           }
           match got {
-            Ok(()) => {
+            Ok(Received::Frame) => {
               planes.push(frame.planes()[0].data_ref().as_ref().to_vec());
               // The next receive will come off the queue, which is the
               // road this lane is for.
@@ -2108,6 +2127,8 @@ fn the_receive_time_fallback_queue_survives_a_failed_carrier() {
                 armed = true;
               }
             }
+            // Nothing more from this packet — feed the next one.
+            Ok(Received::NeedsInput | Received::Ended) => break,
             Err(VideoDecodeError::Convert(e)) => {
               assert!(capped, "no refusal was asked for here, got {e:?}");
               assert!(
@@ -2151,6 +2172,458 @@ fn the_receive_time_fallback_queue_survives_a_failed_carrier() {
   );
 }
 
+// ---------------------------------------------------------------------------
+//  R2: the end of the stream outranks the parked seat, on both send gates
+// ---------------------------------------------------------------------------
+
+/// The cross product this lane needs: a session that has **accepted**
+/// end-of-stream *and* has a frame parked in its seat.
+///
+/// Reaching it takes both halves at once — `send_eof` committed, then a
+/// delayed tail frame drained out of the decoder whose carrier
+/// allocation fails parkably. `hw` picks which scratch holds it.
+fn eof_with_a_parked_frame(
+  hw: bool,
+) -> (
+  crate::CarrierVideoStreamDecoder<crate::View>,
+  SyntheticClip,
+  Timebase,
+) {
+  use crate::{CarrierVideoStreamDecoder, View, boundary::video_packet_from_ffmpeg_in};
+  use mediadecode::decoder::VideoStreamDecoder;
+
+  let (w, h) = (64u32, 48u32);
+  let clip = encode_synthetic_clip(w, h, 8, 100);
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  // A seam that never fails keeps us on the hardware scratch; one that
+  // raises probe-era exhaustion drops us onto the real software decoder
+  // with the history replayed losslessly, so both scratches — the two
+  // the parked-seat gate exists for — are proved.
+  let seam: Box<dyn HwInner> = if hw {
+    Box::new(FakeHw::failing(
+      w,
+      h,
+      usize::MAX,
+      usize::MAX,
+      FailShape::PostCommit,
+    ))
+  } else {
+    Box::new(FakeHw::failing(w, h, 0, 2, FailShape::ProbeEra))
+  };
+  let mut dec =
+    CarrierVideoStreamDecoder::<View>::from_hw_inner_for_test(seam, clip.parameters.clone(), tb)
+      .expect("build test decoder");
+
+  let packet = |index: usize| {
+    video_packet_from_ffmpeg_in(
+      clip.packets[index].clone(),
+      tb,
+      crate::PacketLimits::default(),
+    )
+    .expect("a wrappable payload")
+    .expect("packet has a buffer")
+  };
+  let mut frame = crate::boundary::empty_video_frame();
+
+  // **The two roads need different feeds, and saying so is the point.**
+  // The hardware seam hands back exactly the frames it was given, so it
+  // must still be holding one at EOF. The software road arrives through
+  // a probe-era fallback, whose replayed history lands in a *queue*
+  // rather than the scratch — so that queue is drained to empty first,
+  // and only then is a real `sw.receive_frame` frame available to park.
+  if hw {
+    for index in 0..4 {
+      crate::accepted(dec.send_packet(&packet(index)), "send_packet");
+    }
+  } else {
+    for index in 0..3 {
+      crate::accepted(dec.send_packet(&packet(index)), "send_packet");
+    }
+    while matches!(dec.receive_frame(&mut frame), Ok(Received::Frame)) {}
+    // The feeder loop this reform made writable: the software decoder
+    // has real output now, so it exerts real back pressure, and the
+    // answer to that is to drain and re-offer the same packet.
+    for index in 3..clip.packets.len().min(6) {
+      let pkt = packet(index);
+      loop {
+        match dec.send_packet(&pkt).expect("no fault while feeding") {
+          Sent::Accepted => break,
+          Sent::MustDrain => while matches!(dec.receive_frame(&mut frame), Ok(Received::Frame)) {},
+        }
+      }
+    }
+  }
+  assert_eq!(dec.is_hardware(), hw, "the intended road");
+  assert!(
+    dec.sw_replay_frames_is_empty_for_test(),
+    "the replay queue must be empty, or the park below lands in it \
+     instead of the scratch seat this lane is about",
+  );
+
+  // The end, accepted — this is what sets `eof_sent`.
+  crate::accepted(dec.send_eof(), "send_eof");
+  assert!(
+    dec.eof_sent_for_test(),
+    "precondition: the end must be committed for this lane to mean anything",
+  );
+
+  // Now park a tail frame: the ceiling refuses the carrier, and the
+  // refusal is one another attempt could survive, so the seat keeps it.
+  crate::fault_subprocess::cap_ffmpeg_allocations(16);
+  let refused = dec.receive_frame(&mut frame);
+  crate::fault_subprocess::uncap_ffmpeg_allocations();
+  match refused {
+    Err(VideoDecodeError::Convert(e)) => assert!(
+      e.parks_in_decode(),
+      "the ceiling must produce a parkable refusal, got {e:?}",
+    ),
+    other => panic!("expected a parkable refusal after EOF, got {other:?}"),
+  }
+
+  (dec, clip, tb)
+}
+
+/// **Regression: `Sent::MustDrain` is a promise, and past end-of-stream
+/// it is one this face cannot keep.**
+///
+/// The arm's whole contract is *drain the output and this same offer
+/// becomes acceptable*. With `eof_sent` committed it never becomes
+/// acceptable — draining empties the seat and the retry faults anyway,
+/// until `flush`. So a caller that obeys the contract loops, drains,
+/// re-offers, and is refused: the same fault-under-back-pressure
+/// inversion the subtitle seam carried, one surface over.
+///
+/// Both send gates, and both **before and after** the drain that the
+/// bad answer would have sent the caller to do.
+fn a_post_eof_send_is_a_fault_not_backpressure(hw: bool) {
+  use crate::boundary::video_packet_from_ffmpeg_in;
+  use mediadecode::decoder::VideoStreamDecoder;
+
+  let (mut dec, clip, tb) = eof_with_a_parked_frame(hw);
+  let packet = |index: usize| {
+    video_packet_from_ffmpeg_in(
+      clip.packets[index].clone(),
+      tb,
+      crate::PacketLimits::default(),
+    )
+    .expect("a wrappable payload")
+    .expect("packet has a buffer")
+  };
+
+  let is_after_eof = |got: &Result<Sent, VideoDecodeError>| {
+    matches!(
+      got,
+      Err(VideoDecodeError::Decode(Error::Ffmpeg(
+        ffmpeg_next::Error::Eof
+      )))
+    )
+  };
+
+  // --- with the seat still parked -----------------------------------
+  let sent = dec.send_packet(&packet(4));
+  assert!(
+    is_after_eof(&sent),
+    "a packet after a committed EOF must be the fault even with the seat \
+     parked — `MustDrain` here promises a retry that can never succeed; got {sent:?}",
+  );
+  let eof_again = dec.send_eof();
+  assert!(
+    is_after_eof(&eof_again),
+    "the same for a repeated end-of-stream; got {eof_again:?}",
+  );
+
+  // --- the drain the bad answer would have prescribed ----------------
+  // It succeeds (the parked frame is still deliverable), and it changes
+  // nothing about the send side. That is the point: `MustDrain` would
+  // have sent the caller here for nothing.
+  let mut frame = crate::boundary::empty_video_frame();
+  let mut drained = 0u32;
+  for _ in 0..64 {
+    match dec.receive_frame(&mut frame) {
+      Ok(Received::Frame) => drained += 1,
+      Ok(Received::NeedsInput | Received::Ended) => break,
+      Err(e) => panic!("the parked frame must still be deliverable: {e:?}"),
+    }
+  }
+  assert!(drained > 0, "the parked frame was never recovered");
+
+  // --- with the seat free -------------------------------------------
+  let sent_after = dec.send_packet(&packet(5));
+  assert!(
+    is_after_eof(&sent_after),
+    "draining did not make the offer acceptable, which is exactly why the \
+     parked answer must not have been `MustDrain`; got {sent_after:?}",
+  );
+  assert!(
+    is_after_eof(&dec.send_eof()),
+    "and the same for the repeated end-of-stream",
+  );
+
+  // `flush` is the only way back, and it really is one.
+  dec.flush().expect("flush");
+  assert!(
+    !dec.eof_sent_for_test(),
+    "flush must retract the committed end",
+  );
+  crate::accepted(dec.send_packet(&packet(0)), "flush reopened the send side");
+}
+
+/// The hardware scratch holds the parked frame.
+#[test]
+fn a_post_eof_send_is_a_fault_not_backpressure_on_the_hardware_road() {
+  crate::fault_subprocess::in_subprocess(
+    "video::tests::a_post_eof_send_is_a_fault_not_backpressure_on_the_hardware_road",
+    || a_post_eof_send_is_a_fault_not_backpressure(true),
+  );
+}
+
+/// And the software scratch, after a post-commit fallback put us there —
+/// the two scratches are the reason the parked-seat gate exists at all,
+/// so the ordering is proved against both.
+#[test]
+fn a_post_eof_send_is_a_fault_not_backpressure_on_the_software_road() {
+  crate::fault_subprocess::in_subprocess(
+    "video::tests::a_post_eof_send_is_a_fault_not_backpressure_on_the_software_road",
+    || a_post_eof_send_is_a_fault_not_backpressure(false),
+  );
+}
+
+/// A hardware seam that accepts everything and then raises a
+/// **post-commit** exhaustion the first time a frame is asked for — the
+/// frame-time fallback road, entered on a session whose end is already
+/// committed.
+struct FakeHwPostCommitAtFrameTime {
+  raised: bool,
+}
+
+impl HwInner for FakeHwPostCommitAtFrameTime {
+  fn records_submissions(&self) -> bool {
+    false
+  }
+  fn send_packet(&mut self, _: &Packet) -> Result<Sent, Error> {
+    Ok(Sent::Accepted)
+  }
+  fn receive_frame(&mut self, _: &mut Frame) -> Result<Received, Error> {
+    if self.raised {
+      return Ok(Received::NeedsInput);
+    }
+    self.raised = true;
+    Err(Error::AllBackendsFailed(
+      crate::error::AllBackendsFailed::new_post_commit(Vec::new()),
+    ))
+  }
+  fn send_eof(&mut self) -> Result<Sent, Error> {
+    Ok(Sent::Accepted)
+  }
+  fn flush(&mut self) -> Result<(), Error> {
+    Ok(())
+  }
+  fn as_video_decoder(&self) -> Option<&VideoDecoder> {
+    None
+  }
+}
+
+/// **Regression: a protocol state with no satisfying operation must not
+/// reach the caller.**
+///
+/// The road: hardware accepts end-of-stream, so `eof_sent` commits;
+/// then a post-commit exhaustion arrives *while draining*, and the
+/// frame-time fallback opens software cold. If the committed end does
+/// not travel with that fallback, the cold decoder answers `EAGAIN`
+/// forever — [`Received::NeedsInput`], an instruction to send another
+/// packet — on a session where both send gates now refuse. The caller
+/// can only spin or quietly keep a truncated tail.
+///
+/// This is an **interlock**, not a plain bug: the gates are correct and
+/// the fallback was correct before them; together they closed every
+/// exit. Before the gates existed, a repeated `send_eof` would have
+/// re-armed the cold decoder by accident, which is the sort of luck a
+/// protocol should not depend on.
+///
+/// What must be true afterwards is stated as the property rather than
+/// the mechanism: **whatever the decoder answers, it is never
+/// `NeedsInput`,** and the drain terminates.
+#[test]
+fn a_post_eof_frame_time_fallback_never_strands_the_caller_in_needs_input() {
+  use crate::{CarrierVideoStreamDecoder, View, boundary::video_packet_from_ffmpeg_in};
+  use mediadecode::decoder::VideoStreamDecoder;
+
+  let (w, h) = (64u32, 48u32);
+  let clip = encode_synthetic_clip(w, h, 8, 100);
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let mut dec = CarrierVideoStreamDecoder::<View>::from_hw_inner_for_test(
+    Box::new(FakeHwPostCommitAtFrameTime { raised: false }),
+    clip.parameters.clone(),
+    tb,
+  )
+  .expect("build test decoder");
+
+  let pkt =
+    video_packet_from_ffmpeg_in(clip.packets[0].clone(), tb, crate::PacketLimits::default())
+      .expect("a wrappable payload")
+      .expect("packet has a buffer");
+  crate::accepted(dec.send_packet(&pkt), "send_packet");
+
+  // The end, accepted on the hardware seam — `eof_sent` commits here.
+  crate::accepted(dec.send_eof(), "send_eof");
+  assert!(
+    dec.eof_sent_for_test(),
+    "precondition: the end must be committed before the fallback fires",
+  );
+
+  // Drain. The first poll raises the post-commit exhaustion and takes
+  // the frame-time fallback road.
+  let mut frame = crate::boundary::empty_video_frame();
+  let mut terminal = false;
+  for _ in 0..64 {
+    match dec.receive_frame(&mut frame) {
+      Ok(Received::Frame) => {}
+      Ok(Received::NeedsInput) => panic!(
+        "stranded: the decoder asked for input on a session whose end is \
+         committed, and both send gates refuse — no legal operation can \
+         satisfy this answer",
+      ),
+      Ok(Received::Ended) => {
+        terminal = true;
+        break;
+      }
+      // The honest fault: the cold decoder was handed the end and had
+      // nothing to give, so the tail really was lost and says so.
+      Err(VideoDecodeError::PostCommitNeverResynced(_)) => {
+        terminal = true;
+        break;
+      }
+      Err(e) => panic!("unexpected fault while draining: {e:?}"),
+    }
+  }
+  assert!(terminal, "the drain never reached a terminal answer");
+  assert!(dec.is_software(), "the frame-time fallback did commit");
+
+  // **Isolating the forwarding from the guard that also covers it.**
+  //
+  // Two things keep the caller out of `NeedsInput` here: the committed
+  // end travelling with the fallback, and [`settle`] refusing to hand
+  // back an unsatisfiable state. That is deliberate depth, but it means
+  // the property above passes if only one of them is present — so this
+  // asks the cold decoder itself, past the wrapper, which of the two
+  // did the work. A decoder that was handed the end answers
+  // `AVERROR_EOF`; one still cold answers `EAGAIN`.
+  let DecodeState::Sw(sw) = &mut dec.state else {
+    panic!("the software decoder must be the one in the seat");
+  };
+  let mut scratch = alloc_av_video_frame().expect("frame slot");
+  let raw = sw
+    .receive_frame(&mut scratch)
+    .expect_err("a cold decoder handed only the end produces no frame");
+  assert!(
+    matches!(raw, ffmpeg_next::Error::Eof),
+    "the cold software decoder never received the committed end — it answered \
+     {raw:?}, which reaches a caller as `NeedsInput` and cannot be satisfied",
+  );
+
+  // And the session stays terminal: polling past the end keeps
+  // answering the end, never sending the caller back for input.
+  for _ in 0..3 {
+    assert_eq!(
+      dec
+        .receive_frame(&mut frame)
+        .expect("no fault past the end"),
+      Received::Ended,
+    );
+  }
+}
+
+/// **The synthesized fault, checked against the substrate — reaching
+/// both sides this time.**
+///
+/// The previous version of this lane was a tautology and passed for the
+/// wrong reason: it called `send_eof` on the *wrapper*, which commits
+/// `eof_sent`, so the later `send_packet` returned through the wrapper's
+/// own gate. It compared [`CarrierVideoStreamDecoder::after_eof`] with
+/// itself and would have passed had libavcodec diverged completely.
+///
+/// The lesson generalises past this one test: **revert-verification
+/// catches a deleted gate, not a comparison that never crossed the
+/// seam.** A parity pin has to reach both sides it claims to compare,
+/// and be written so that it fails if either moves.
+///
+/// So this one goes around the gate: it reaches the raw inner software
+/// decoder — the actual `ffmpeg::decoder::Video` — feeds it the flush
+/// packet directly, and reads what libavcodec really answers to a
+/// submission after end-of-stream.
+#[test]
+fn the_post_eof_fault_is_the_one_the_substrate_gives() {
+  use crate::{CarrierVideoStreamDecoder, View, boundary::video_packet_from_ffmpeg_in};
+  use mediadecode::decoder::VideoStreamDecoder;
+
+  let (w, h) = (64u32, 48u32);
+  let clip = encode_synthetic_clip(w, h, 8, 100);
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  // Probe-era exhaustion puts the real software decoder in the seat —
+  // the fake seam has no EOF state machine to interrogate.
+  let mut dec = CarrierVideoStreamDecoder::<View>::from_hw_inner_for_test(
+    Box::new(FakeHw::failing(w, h, 0, 2, FailShape::ProbeEra)),
+    clip.parameters.clone(),
+    tb,
+  )
+  .expect("build test decoder");
+
+  for index in 0..3 {
+    let pkt = video_packet_from_ffmpeg_in(
+      clip.packets[index].clone(),
+      tb,
+      crate::PacketLimits::default(),
+    )
+    .expect("a wrappable payload")
+    .expect("packet has a buffer");
+    crate::accepted(dec.send_packet(&pkt), "send_packet");
+  }
+  assert!(
+    dec.is_software(),
+    "the substrate under test is libavcodec's"
+  );
+
+  // **Past the wrapper entirely.** `tests` is a child module, so the
+  // private state is reachable; the point is that nothing below asks
+  // the wrapper anything.
+  let DecodeState::Sw(sw) = &mut dec.state else {
+    panic!("the software decoder must be the one in the seat");
+  };
+  sw.send_eof().expect("the substrate takes the end");
+
+  // What libavcodec actually answers a packet after the flush packet.
+  let substrate = sw
+    .send_packet(&clip.packets[3])
+    .expect_err("libavcodec must refuse a packet after end-of-stream");
+  assert!(
+    matches!(substrate, ffmpeg_next::Error::Eof),
+    "the substrate's post-EOF refusal moved: got {substrate:?}",
+  );
+
+  // Both wrapper roads wrap that value identically — the software road
+  // through `software_exit` (which passes it through when no refusal
+  // was recorded) and the hardware road through its own
+  // `Err(e @ Eof) => Err(Error::Ffmpeg(e))` arm. Pinning the funnel's
+  // output makes the hardware claim a checked identity rather than an
+  // assertion: it is the same `Error::Ffmpeg` construction, on a value
+  // the line above proved is what the substrate gives.
+  let wrapped = crate::decoder::software_exit(core::ptr::null(), substrate);
+  assert!(
+    matches!(wrapped, Error::Ffmpeg(ffmpeg_next::Error::Eof)),
+    "the funnel changed how a post-EOF refusal is wrapped: got {wrapped:?}",
+  );
+
+  // And that is exactly what the gates hand back without asking.
+  let synthesized = CarrierVideoStreamDecoder::<View>::after_eof();
+  assert!(
+    matches!(
+      synthesized,
+      VideoDecodeError::Decode(Error::Ffmpeg(ffmpeg_next::Error::Eof))
+    ),
+    "the synthesized post-EOF fault drifted from the substrate's: got {synthesized:?}",
+  );
+}
+
 #[test]
 fn a_parked_hardware_frame_is_delivered_before_any_fallback() {
   use crate::{CarrierVideoStreamDecoder, View, boundary::video_packet_from_ffmpeg_in};
@@ -2189,7 +2662,7 @@ fn a_parked_hardware_frame_is_delivered_before_any_fallback() {
         .expect("packet has a buffer")
       };
 
-      dec.send_packet(&packet(0)).expect("send_packet");
+      crate::accepted(dec.send_packet(&packet(0)), "send_packet");
       assert!(dec.is_hardware(), "the seam under test is the hardware one");
 
       // Park the hardware frame.
@@ -2207,20 +2680,23 @@ fn a_parked_hardware_frame_is_delivered_before_any_fallback() {
 
       // **Nothing may be sent while it is parked** — this is the send
       // that could otherwise have committed a fallback underneath it.
+      // The discipline is unchanged; it is spelled as back pressure
+      // now, which is what it always was: nothing was consumed, and
+      // the escape has always been `receive_frame` or `flush`.
       assert!(
-        matches!(
-          dec.send_packet(&packet(1)),
-          Err(VideoDecodeError::FramePending)
-        ),
-        "a send under a parked frame must be refused by name",
+        matches!(dec.send_packet(&packet(1)), Ok(Sent::MustDrain)),
+        "a send under a parked frame must be told to drain first",
       );
       assert!(
-        matches!(dec.send_eof(), Err(VideoDecodeError::FramePending)),
-        "EOF under a parked frame must be refused by name too",
+        matches!(dec.send_eof(), Ok(Sent::MustDrain)),
+        "EOF under a parked frame must be told to drain first too",
       );
 
       // The parked frame is still the hardware one, and it arrives.
-      dec.receive_frame(&mut frame).expect("the parked frame");
+      assert_eq!(
+        dec.receive_frame(&mut frame).expect("the parked frame"),
+        Received::Frame,
+      );
       assert!(
         dec.is_hardware(),
         "no fallback can have happened while the frame was parked",
@@ -2237,7 +2713,7 @@ fn a_parked_hardware_frame_is_delivered_before_any_fallback() {
       // *refused* is.
       let after = dec.send_packet(&packet(1));
       assert!(
-        !matches!(after, Err(VideoDecodeError::FramePending)),
+        !matches!(after, Ok(Sent::MustDrain)),
         "with the seat free the send must reach the seam, got {after:?}",
       );
     },
@@ -2294,7 +2770,7 @@ fn a_parked_recovery_frame_still_clears_the_resync_guard() {
 
       // Degrade post-commit, then walk to the resync keyframe.
       for index in 0..=fail_at {
-        dec.send_packet(&packet(index)).expect("send_packet");
+        crate::accepted(dec.send_packet(&packet(index)), "send_packet");
       }
       assert!(
         dec.is_software(),
@@ -2302,17 +2778,17 @@ fn a_parked_recovery_frame_still_clears_the_resync_guard() {
       );
       assert!(dec.degraded_resync_pending_for_test(), "the gap is open");
 
+      // `true` only while frames are actually coming out — the two
+      // non-frame states both stop the loop, and a fault still panics.
       let drain = |dec: &mut CarrierVideoStreamDecoder<View>,
                    dst: &mut crate::VideoFrame|
-       -> bool { dec.receive_frame(dst).is_ok() };
+       -> bool { matches!(dec.receive_frame(dst), Ok(Received::Frame)) };
       while drain(&mut dec, &mut dst) {}
       for index in (fail_at + 1)..third_key {
-        dec.send_packet(&packet(index)).expect("send_packet");
+        crate::accepted(dec.send_packet(&packet(index)), "send_packet");
         while drain(&mut dec, &mut dst) {}
       }
-      dec
-        .send_packet(&packet(third_key))
-        .expect("send the keyframe");
+      crate::accepted(dec.send_packet(&packet(third_key)), "send the keyframe");
       assert!(
         dec.degraded_keyframe_seen_for_test(),
         "the keyframe crossed the gap and is the resync anchor",
@@ -2334,19 +2810,19 @@ fn a_parked_recovery_frame_still_clears_the_resync_guard() {
             parked = true;
             break;
           }
-          Ok(()) => {
+          Ok(Received::Frame) => {
             assert!(
               dec.degraded_resync_pending_for_test(),
               "the guard cleared before the parked delivery — nothing left to test",
             );
           }
-          Err(_) => {
+          Ok(Received::NeedsInput | Received::Ended) | Err(_) => {
             // No frame ready under this packet; feed the next one.
             let index = third_key + 1 + attempt;
             if index >= clip.packets.len() {
               break;
             }
-            dec.send_packet(&packet(index)).expect("send_packet");
+            crate::accepted(dec.send_packet(&packet(index)), "send_packet");
           }
         }
       }
@@ -2357,9 +2833,12 @@ fn a_parked_recovery_frame_still_clears_the_resync_guard() {
       );
 
       // The retry delivers it — and the bookkeeping runs on that road.
-      dec
-        .receive_frame(&mut dst)
-        .expect("the parked recovery frame");
+      assert_eq!(
+        dec
+          .receive_frame(&mut dst)
+          .expect("the parked recovery frame"),
+        Received::Frame,
+      );
       assert!(
         !dec.degraded_resync_pending_for_test(),
         "the retried delivery must clear the keyframe-anchored resync guard",
@@ -2367,10 +2846,11 @@ fn a_parked_recovery_frame_still_clears_the_resync_guard() {
 
       // And EOF is clean: no false escalation over a gap that did
       // resync.
-      dec.send_eof().expect("send_eof");
+      crate::accepted(dec.send_eof(), "send_eof");
       loop {
         match dec.receive_frame(&mut dst) {
-          Ok(()) => {}
+          Ok(Received::Frame) => {}
+          Ok(Received::NeedsInput | Received::Ended) => break,
           Err(VideoDecodeError::PostCommitNeverResynced(p)) => {
             panic!("false escalation after a resync that did happen: {p:?}");
           }

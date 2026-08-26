@@ -35,8 +35,9 @@
 //! the JS-side `VideoFrame` (only available via async `copyTo`),
 //! pushes the result onto the queue, and wakes the receive
 //! future. `receive_frame` is a `poll_fn` that drains the queue,
-//! returns [`VideoDecodeError::Eof`] once `send_eof` has resolved
-//! and the drain is empty, or registers a waker and yields.
+//! answers [`Received::Ended`](mediadecode::Received) once
+//! `send_eof` has resolved and the drain is empty, or registers a
+//! waker and yields.
 //!
 //! # Subtitles
 //!

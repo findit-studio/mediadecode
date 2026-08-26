@@ -14,7 +14,10 @@
 
 mod support;
 
-use mediadecode::demuxer::{DemuxedPacket, Demuxer, TrackKind};
+use mediadecode::{
+  Received,
+  demuxer::{DemuxedPacket, Demuxer, TrackKind},
+};
 use mediadecode_ffmpeg::{
   DemuxError, DemuxLimits, FfmpegDemuxer, FfmpegOwnedDemuxer, PacketBufferError,
 };
@@ -695,12 +698,17 @@ fn a_resampled_view_frame_shares_the_resamplers_output_buffer() {
     Default::default(),
   );
 
-  resampler.send_frame(&input).expect("send");
-  resampler.send_eof().expect("eof");
+  support::accepted(resampler.send_frame(&input), "send");
+  support::accepted(resampler.send_eof(), "eof");
 
   let mut dst = mediadecode_ffmpeg::empty_audio_frame();
   let mut proved = 0usize;
-  while resampler.receive_frame(&mut dst).is_ok() {
+  while matches!(
+    resampler
+      .receive_frame(&mut dst)
+      .expect("no fault in the tail"),
+    Received::Frame
+  ) {
     if dst.nb_samples() == 0 || dst.plane_count() < 2 {
       continue;
     }
@@ -845,8 +853,11 @@ fn a_side_data_only_packet_reaches_a_view_decoder_without_a_buffer_behind_it() {
     let DemuxedPacket::Audio(p) = packet else {
       continue;
     };
-    decoder.send_packet(p.packet()).expect("send a real packet");
-    while decoder.receive_frame(&mut frame).is_ok() {
+    support::accepted(decoder.send_packet(p.packet()), "send a real packet");
+    while matches!(
+      decoder.receive_frame(&mut frame).expect("receive_frame"),
+      Received::Frame
+    ) {
       samples += u64::from(frame.nb_samples());
     }
     if samples > 0 {
@@ -1396,8 +1407,11 @@ fn a_failed_frame_conversion_parks_the_frame_instead_of_losing_it() {
         if p.track().get() != track {
           continue;
         }
-        decoder.send_packet(p.packet()).expect("send");
-        if decoder.receive_frame(&mut frame).is_ok() {
+        support::accepted(decoder.send_packet(p.packet()), "send");
+        if matches!(
+          decoder.receive_frame(&mut frame).expect("receive_frame"),
+          Received::Frame
+        ) {
           expected = Some((
             frame.nb_samples(),
             frame.planes()[0].data_ref().as_ref().to_vec(),
@@ -1418,17 +1432,18 @@ fn a_failed_frame_conversion_parks_the_frame_instead_of_losing_it() {
         if p.track().get() != track {
           continue;
         }
-        decoder.send_packet(p.packet()).expect("send");
+        support::accepted(decoder.send_packet(p.packet()), "send");
         cap_allocations(16);
         let got = decoder.receive_frame(&mut frame);
         cap_allocations(i32::MAX as usize);
         match got {
-          Ok(()) => panic!("the ceiling should have refused the carrier"),
+          Ok(Received::Frame) => panic!("the ceiling should have refused the carrier"),
+          // This packet produced nothing yet.
+          Ok(Received::NeedsInput | Received::Ended) => {}
           Err(e) if format!("{e:?}").contains("CarrierAllocFailed") => {
             refused = Some(e);
             break 'capped;
           }
-          // EAGAIN: this packet produced nothing yet.
           Err(_) => {}
         }
       }
@@ -1439,7 +1454,10 @@ fn a_failed_frame_conversion_parks_the_frame_instead_of_losing_it() {
 
       // The parked frame is delivered first — the same frame the
       // uncapped run saw, not the one after it.
-      decoder.receive_frame(&mut frame).expect("the parked frame");
+      assert_eq!(
+        decoder.receive_frame(&mut frame).expect("the parked frame"),
+        Received::Frame,
+      );
       assert_eq!(
         (
           frame.nb_samples(),
@@ -1495,8 +1513,11 @@ fn a_failed_video_frame_conversion_parks_the_frame_instead_of_losing_it() {
         if p.track().get() != track {
           continue;
         }
-        decoder.send_packet(p.packet()).expect("send");
-        if decoder.receive_frame(&mut frame).is_ok() {
+        support::accepted(decoder.send_packet(p.packet()), "send");
+        if matches!(
+          decoder.receive_frame(&mut frame).expect("receive_frame"),
+          Received::Frame
+        ) {
           expected = Some(frame.planes()[0].data_ref().as_ref().to_vec());
           break 'reference;
         }
@@ -1514,12 +1535,13 @@ fn a_failed_video_frame_conversion_parks_the_frame_instead_of_losing_it() {
         if p.track().get() != track {
           continue;
         }
-        decoder.send_packet(p.packet()).expect("send");
+        support::accepted(decoder.send_packet(p.packet()), "send");
         cap_allocations(16);
         let got = decoder.receive_frame(&mut frame);
         cap_allocations(i32::MAX as usize);
         match got {
-          Ok(()) => panic!("the ceiling should have refused the carrier"),
+          Ok(Received::Frame) => panic!("the ceiling should have refused the carrier"),
+          Ok(Received::NeedsInput | Received::Ended) => {}
           Err(e) if format!("{e:?}").contains("CarrierAllocFailed") => {
             refused = true;
             break 'capped;
@@ -1532,7 +1554,10 @@ fn a_failed_video_frame_conversion_parks_the_frame_instead_of_losing_it() {
         "the ceiling must refuse a frame carrier to test the seat",
       );
 
-      decoder.receive_frame(&mut frame).expect("the parked frame");
+      assert_eq!(
+        decoder.receive_frame(&mut frame).expect("the parked frame"),
+        Received::Frame,
+      );
       assert_eq!(
         frame.planes()[0].data_ref().as_ref().to_vec(),
         expected,
@@ -1589,9 +1614,12 @@ fn a_failed_cue_conversion_parks_the_cue_instead_of_losing_it() {
       // The reference: the cue's text when nothing fails.
       let (mut demuxer, mut decoder, track) = open(&path);
       let packet = first_cue(&mut demuxer, track);
-      decoder.send_packet(&packet).expect("send");
+      support::accepted(decoder.send_packet(&packet), "send");
       let mut frame = empty_subtitle_frame();
-      decoder.receive_frame(&mut frame).expect("the cue");
+      assert_eq!(
+        decoder.receive_frame(&mut frame).expect("the cue"),
+        Received::Frame,
+      );
       let expected = format!("{:?}", frame.payload());
       assert!(expected.contains("Text"), "the fixture must decode to text");
 
@@ -1600,7 +1628,7 @@ fn a_failed_cue_conversion_parks_the_cue_instead_of_losing_it() {
       // between the decode and the carrier, not the send.
       let (mut demuxer, mut decoder, track) = open(&path);
       let packet = first_cue(&mut demuxer, track);
-      decoder.send_packet(&packet).expect("send");
+      support::accepted(decoder.send_packet(&packet), "send");
       let mut frame = empty_subtitle_frame();
       cap_allocations(1024);
       let refused = decoder.receive_frame(&mut frame);
@@ -1612,7 +1640,10 @@ fn a_failed_cue_conversion_parks_the_cue_instead_of_losing_it() {
 
       // The parked cue is delivered on the next receive — the same cue,
       // not the next one.
-      decoder.receive_frame(&mut frame).expect("the parked cue");
+      assert_eq!(
+        decoder.receive_frame(&mut frame).expect("the parked cue"),
+        Received::Frame,
+      );
       assert_eq!(
         format!("{:?}", frame.payload()),
         expected,

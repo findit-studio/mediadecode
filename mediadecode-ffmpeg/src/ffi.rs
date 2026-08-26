@@ -233,6 +233,32 @@ pub(crate) fn take_frame_budget_declination(
   declined.then_some((bytes, limit, audio))
 }
 
+/// Latches an allocator-judge frame-budget refusal, as `judge_buffer`
+/// does when a decoded frame would cost more than the caller's ceiling.
+///
+/// # Safety
+///
+/// `state` must be null or a live [`CallbackState`] the caller owns.
+#[cfg(test)]
+pub(crate) fn declare_frame_budget_declined_for_test(state: *mut CallbackState, bytes: u64) {
+  use core::sync::atomic::Ordering;
+  if state.is_null() {
+    return;
+  }
+  // SAFETY: the caller guarantees `state` is live for the call.
+  unsafe {
+    (*state)
+      .declined_frame_bytes
+      .store(bytes, Ordering::Relaxed);
+    (*state)
+      .declined_frame_audio
+      .store(false, Ordering::Relaxed);
+    (*state)
+      .frame_budget_declined
+      .store(true, Ordering::Release);
+  }
+}
+
 /// `AVCodecContext::get_format` callback. FFmpeg invokes it with the list of
 /// pixel formats the codec is willing to output for the current stream.
 ///
@@ -503,6 +529,31 @@ pub(crate) fn codec_supports_hwaccel(
       return true;
     }
     i += 1;
+  }
+}
+
+/// Latches a coded-surface refusal exactly as the `get_format` callback
+/// does, so a lane can exercise the funnels that collect it without
+/// needing a hardware backend to decline a real surface.
+///
+/// # Safety
+///
+/// `state` must be null or a live [`CallbackState`] the caller owns.
+#[cfg(test)]
+pub(crate) fn declare_ceiling_declined_for_test(
+  state: *mut CallbackState,
+  pixels: i64,
+  limit: i64,
+) {
+  use core::sync::atomic::Ordering;
+  if state.is_null() {
+    return;
+  }
+  // SAFETY: the caller guarantees `state` is live for the call.
+  unsafe {
+    (*state).declined_pixels.store(pixels, Ordering::Relaxed);
+    (*state).declined_limit.store(limit, Ordering::Relaxed);
+    (*state).ceiling_declined.store(true, Ordering::Release);
   }
 }
 

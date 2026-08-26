@@ -23,8 +23,9 @@
 //!   pre-flush frames from leaking into the post-flush queue.
 //! - `pending_copies` counts copy tasks that have started but not
 //!   yet pushed their frame onto the queue. The async
-//!   `receive_frame` resolves with `Eof` only when the queue is
-//!   empty, `pending_copies == 0`, and `send_eof` has completed.
+//!   `receive_frame` answers [`Received::Ended`](mediadecode::Received)
+//!   only when the queue is empty, `pending_copies == 0`, and
+//!   `send_eof` has completed.
 //!
 //! Two wakers track the two distinct waiters:
 //!

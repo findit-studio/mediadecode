@@ -17,7 +17,9 @@
 
 use derive_more::{IsVariant, TryUnwrap, Unwrap};
 use ffmpeg_next::{codec::Parameters, frame};
-use mediadecode::{Timebase, decoder::AudioStreamDecoder, frame::AudioFrame, packet::AudioPacket};
+use mediadecode::{
+  Received, Sent, Timebase, decoder::AudioStreamDecoder, frame::AudioFrame, packet::AudioPacket,
+};
 use mediaframe::audio::ChannelLayoutDescription;
 
 use crate::{
@@ -59,6 +61,18 @@ pub struct CarrierAudioStreamDecoder<C: crate::FfmpegCarrier> {
   /// The same seat the demux session keeps for a packet, and the same
   /// discipline `flush` clears.
   scratch_pending: bool,
+  /// `true` once [`Self::send_eof_impl`] has been accepted, until
+  /// [`Self::flush_impl`].
+  ///
+  /// **This road kept no end of its own before, and that was the gap.**
+  /// It leans on libavcodec to refuse a post-EOF submission — which
+  /// libavcodec does — but leaning is not knowing: asked "where is this
+  /// session", it could only answer `Streaming`, which is false the
+  /// moment a caller signals the end. A phase that can be wrong is the
+  /// thing [`SessionPhase`](crate::decoder::SessionPhase) exists to
+  /// abolish, so the latch is here to make the answer true rather than
+  /// to add a gate. The substrate is still the one that refuses.
+  eof: bool,
   _carrier: core::marker::PhantomData<C>,
 }
 
@@ -97,6 +111,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierAudioStreamDecoder<C> {
       limits,
       _callback_state: callback_state,
       scratch_pending: false,
+      eof: false,
       _carrier: core::marker::PhantomData,
     })
   }
@@ -122,14 +137,42 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierAudioStreamDecoder<C> {
 }
 
 impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierAudioStreamDecoder<C> {
+  /// Where this session is. See
+  /// [`SessionPhase`](crate::decoder::SessionPhase) — one derivation,
+  /// no road reading the latch for itself. There is no probe on this
+  /// road, so only the committed pair is reachable.
+  const fn phase(&self) -> crate::decoder::SessionPhase {
+    if self.eof {
+      crate::decoder::SessionPhase::Draining
+    } else {
+      crate::decoder::SessionPhase::Streaming
+    }
+  }
+
+  /// **This road never refuses for a parked frame, and that asymmetry
+  /// is kept rather than papered over.** The video and subtitle
+  /// decoders answer [`Sent::MustDrain`] while their scratch holds an
+  /// undelivered frame; this one has a single scratch and cannot change
+  /// which is current, so a submission under a park loses nothing and
+  /// is simply taken. See
+  /// [`CarrierVideoStreamDecoder::scratch_pending`](crate::video::CarrierVideoStreamDecoder)
+  /// for the property that makes the refusal necessary over there.
+  ///
+  /// What it *does* answer `MustDrain` to is libavcodec's own back
+  /// pressure: `avcodec_send_packet` returning `EAGAIN` because its
+  /// output queue is full. That used to arrive as
+  /// `Decode(Ffmpeg(Other { errno: EAGAIN }))` — a fault-shaped value a
+  /// generic consumer could not recognise, which is what made the
+  /// two-offer rule necessary in the first place.
   pub(crate) fn send_packet_impl(
     &mut self,
     packet: &AudioPacket<AudioPacketExtra, C::Buffer>,
-  ) -> Result<(), AudioDecodeError> {
+  ) -> Result<Sent, AudioDecodeError> {
     // Scoped submission: the rebuilt `AVPacket` lives only inside this
     // call, which is what lets the view lane hand libavcodec its own
     // buffer instead of a copy. See `boundary::with_ffmpeg_audio_packet`.
     let state: *const crate::ffi::CallbackState = &*self._callback_state;
+    let phase = self.phase();
     let decoder = &mut self.decoder;
     boundary::with_ffmpeg_audio_packet::<C, _>(
       packet,
@@ -139,12 +182,16 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierAudioStreamDecoder<C> {
       // be shared.
       crate::carrier::BodyRoute::Submission,
       |av_pkt| {
-        // Through the software funnel: a frame the allocator judge
-        // refused surfaces named, not as the `EINVAL` a corrupt file
-        // also produces.
-        decoder
-          .send_packet(av_pkt)
-          .map_err(|e| AudioDecodeError::Decode(crate::decoder::software_exit(state, e)))
+        // Funnel, then gate — the same two steps the receive road
+        // takes. A frame the allocator judge refused surfaces named,
+        // not as the `EINVAL` a corrupt file also produces; whatever
+        // survives the funnel is read for back pressure.
+        match decoder.send_packet(av_pkt) {
+          Ok(()) => Ok(Sent::Accepted),
+          Err(e) => {
+            crate::decoder::software_send(state, e, phase).map_err(AudioDecodeError::Decode)
+          }
+        }
       },
     )
     .map_err(|e| AudioDecodeError::Decode(Error::PacketBuild(e)))?
@@ -153,15 +200,20 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierAudioStreamDecoder<C> {
   pub(crate) fn receive_frame_impl(
     &mut self,
     dst: &mut AudioFrame<SampleFormat, ChannelLayoutDescription, AudioFrameExtra, C::Buffer>,
-  ) -> Result<(), AudioDecodeError> {
+  ) -> Result<Received, AudioDecodeError> {
     let state: *const crate::ffi::CallbackState = &*self._callback_state;
+    let phase = self.phase();
     // A frame whose conversion did not commit is converted again before
     // another is asked for — see [`Self::scratch_pending`].
     if !self.scratch_pending {
-      self
-        .decoder
-        .receive_frame(&mut self.scratch)
-        .map_err(|e| AudioDecodeError::Decode(crate::decoder::software_exit(state, e)))?;
+      // Funnel first, classify second: the funnel is what turns a
+      // recorded budget refusal into its own name, and only what
+      // survives it is read as a drain state. `EAGAIN` and `Eof` are
+      // the protocol talking, so they leave through the `Ok` arm and
+      // the errno never reaches the caller.
+      if let Err(e) = self.decoder.receive_frame(&mut self.scratch) {
+        return crate::decoder::software_receive(state, e, phase).map_err(AudioDecodeError::Decode);
+      }
     }
     // SAFETY: the scratch holds a frame — either one `receive_frame`
     // just filled it with, or one it was left holding by a conversion
@@ -178,7 +230,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierAudioStreamDecoder<C> {
       Ok(new_frame) => {
         self.scratch_pending = false;
         *dst = new_frame;
-        Ok(())
+        Ok(Received::Frame)
       }
       Err(e) => {
         // Park only what another attempt could survive; a frame nothing
@@ -190,17 +242,23 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierAudioStreamDecoder<C> {
     }
   }
 
-  pub(crate) fn send_eof_impl(&mut self) -> Result<(), AudioDecodeError> {
+  pub(crate) fn send_eof_impl(&mut self) -> Result<Sent, AudioDecodeError> {
     let state: *const crate::ffi::CallbackState = &*self._callback_state;
-    self
-      .decoder
-      .send_eof()
-      .map_err(|e| AudioDecodeError::Decode(crate::decoder::software_exit(state, e)))
+    let phase = self.phase();
+    match self.decoder.send_eof() {
+      Ok(()) => {
+        self.eof = true;
+        Ok(Sent::Accepted)
+      }
+      Err(e) => crate::decoder::software_send(state, e, phase).map_err(AudioDecodeError::Decode),
+    }
   }
 
   pub(crate) fn flush_impl(&mut self) -> Result<(), AudioDecodeError> {
     // A parked frame belongs to the stream position being abandoned.
     self.scratch_pending = false;
+    // And so does the end it was told about.
+    self.eof = false;
     self.decoder.flush();
     Ok(())
   }
@@ -242,7 +300,7 @@ macro_rules! audio_lane_face {
       fn send_packet(
         &mut self,
         packet: &AudioPacket<AudioPacketExtra, Self::Buffer>,
-      ) -> Result<(), Self::Error> {
+      ) -> Result<Sent, Self::Error> {
         self.send_packet_impl(packet)
       }
 
@@ -254,11 +312,11 @@ macro_rules! audio_lane_face {
           AudioFrameExtra,
           Self::Buffer,
         >,
-      ) -> Result<(), Self::Error> {
+      ) -> Result<Received, Self::Error> {
         self.receive_frame_impl(dst)
       }
 
-      fn send_eof(&mut self) -> Result<(), Self::Error> {
+      fn send_eof(&mut self) -> Result<Sent, Self::Error> {
         self.send_eof_impl()
       }
 
@@ -271,10 +329,28 @@ macro_rules! audio_lane_face {
 
 audio_lane_face!(crate::View, crate::Owned);
 
-/// Errors from [`FfmpegAudioStreamDecoder`].
+/// Errors from [`FfmpegAudioStreamDecoder`] — **faults only**.
+///
+/// Both arms are real failures. The drain's other two answers never
+/// reached this type even before they had names: they rode in as
+/// `Decode(Ffmpeg(Other { errno: EAGAIN }))` and
+/// `Decode(Ffmpeg(Eof))`, which a generic consumer had no way to
+/// recognise. They are [`Received`] states now.
+///
+/// **Open fault taxonomy, so it is `#[non_exhaustive]`.** New ways to
+/// fail are discovered — a backend, a ceiling, a corruption a codec
+/// learns to report — and a consumer that meets one it has never heard
+/// of should take its generic-fault path. That is exactly what the
+/// wildcard arm this attribute forces is for. The two status
+/// vocabularies opposite it,
+/// [`Sent`](mediadecode::Sent) and [`Received`](mediadecode::Received),
+/// are exhaustive for the mirror-image reason: their arms are the
+/// substrate's fixed state set, and there the wildcard would be dead
+/// weight hiding a state a consumer forgot.
 #[derive(thiserror::Error, Debug, Clone, IsVariant, Unwrap, TryUnwrap)]
 #[unwrap(ref, ref_mut)]
 #[try_unwrap(ref, ref_mut)]
+#[non_exhaustive]
 pub enum AudioDecodeError {
   /// The wrapped `ffmpeg::decoder::Audio` reported an error.
   #[error(transparent)]

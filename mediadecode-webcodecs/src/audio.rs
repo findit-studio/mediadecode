@@ -16,7 +16,7 @@
 use std::num::NonZeroI32;
 
 use mediadecode::{
-  Timebase, Timestamp,
+  Received, Sent, Timebase, Timestamp,
   frame::{AudioFrame, Plane},
   future::local::AudioStreamDecoder,
   packet::{AudioPacket, PacketFlags},
@@ -62,10 +62,10 @@ pub const MAX_FRAME_ALLOCATION_BYTES: u32 = 1024 * 1024; // 1 MiB
 /// memory — generous for audio, still bounded.
 pub const MAX_INFLIGHT_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
 
-/// Output-queue cap. `send_packet` returns
-/// [`AudioDecodeError::OutputFull`] (no await) when the queue
-/// reaches this size — see the matching note on
-/// `MAX_QUEUED_OUTPUT` in `video.rs`.
+/// Output-queue cap. `send_packet` answers
+/// [`Sent::MustDrain`](mediadecode::Sent) (no await) when the queue
+/// reaches this size — see the matching note on `MAX_QUEUED_OUTPUT` in
+/// `video.rs`.
 pub const MAX_QUEUED_OUTPUT: u32 = 64;
 
 /// One CPU-side audio frame produced by the WebCodecs `output`
@@ -335,7 +335,7 @@ impl WebCodecsAudioStreamDecoder {
 
   /// Admission control for `send_packet`. See the matching
   /// helper in `video.rs` — same shape, same rationale.
-  async fn await_decode_room(&self) -> Result<(), AudioDecodeError> {
+  async fn await_decode_room(&self) -> Result<Sent, AudioDecodeError> {
     loop {
       {
         let inner = self.state.borrow();
@@ -343,7 +343,7 @@ impl WebCodecsAudioStreamDecoder {
           return Err(AudioDecodeError::Closed(err));
         }
         if inner.queue_len() >= MAX_QUEUED_OUTPUT as usize {
-          return Err(AudioDecodeError::OutputFull);
+          return Ok(Sent::MustDrain);
         }
         // Aggregate byte budget — exact tracked bytes plus
         // `last_measured_frame_bytes` headroom. See matching
@@ -359,10 +359,10 @@ impl WebCodecsAudioStreamDecoder {
         // matches the output-side enforcement (see the note
         // in `video.rs::await_decode_room`).
         if in_flight_bytes > MAX_INFLIGHT_BYTES {
-          return Err(AudioDecodeError::OutputFull);
+          return Ok(Sent::MustDrain);
         }
         if pending_decode(&self.decoder, &inner) < MAX_PENDING_DECODE as usize {
-          return Ok(());
+          return Ok(Sent::Accepted);
         }
       }
       let _guard = self.state.dequeue_waker_guard();
@@ -437,12 +437,16 @@ impl AudioStreamDecoder for WebCodecsAudioStreamDecoder {
   async fn send_packet(
     &mut self,
     packet: &AudioPacket<AudioPacketExtra, Self::Buffer>,
-  ) -> Result<(), Self::Error> {
+  ) -> Result<Sent, Self::Error> {
     self.check_closed()?;
     if self.eof {
-      return Err(AudioDecodeError::AtEof);
+      return Err(AudioDecodeError::AfterEof);
     }
-    self.await_decode_room().await?;
+    // Back pressure the caller has to relieve: nothing is submitted,
+    // and the same packet is offered again after a drain.
+    if self.await_decode_room().await?.is_must_drain() {
+      return Ok(Sent::MustDrain);
+    }
 
     // The user's `PacketFlags::KEY` is preserved for downstream
     // frame metadata (`AudioFrameExtra::key`), but the WebCodecs
@@ -579,14 +583,22 @@ impl AudioStreamDecoder for WebCodecsAudioStreamDecoder {
       self.state.borrow_mut().remove_pending_output(submission_id);
       return Err(AudioDecodeError::Js(Error::from_js(e)));
     }
-    Ok(())
+    Ok(Sent::Accepted)
   }
 
   async fn receive_frame(
     &mut self,
     dst: &mut AudioFrame<SampleFormat, ChannelLayoutDescription, AudioFrameExtra, Self::Buffer>,
-  ) -> Result<(), Self::Error> {
-    let frame = wait_for_frame(&self.state, &self.decoder, self.eof).await?;
+  ) -> Result<Received, Self::Error> {
+    // See `video.rs::receive_frame`: the wait reports presence, the
+    // session's EOF latch reports which absence.
+    let Some(frame) = wait_for_frame(&self.state, &self.decoder).await? else {
+      return Ok(if self.eof {
+        Received::Ended
+      } else {
+        Received::NeedsInput
+      });
+    };
 
     let sample_rate = frame.sample_rate();
     let nb_samples = frame.nb_samples();
@@ -624,10 +636,10 @@ impl AudioStreamDecoder for WebCodecsAudioStreamDecoder {
     )
     .with_pts(pts)
     .with_duration(duration);
-    Ok(())
+    Ok(Received::Frame)
   }
 
-  async fn send_eof(&mut self) -> Result<(), Self::Error> {
+  async fn send_eof(&mut self) -> Result<Sent, Self::Error> {
     self.check_closed()?;
     // Cancellation / failure poison — mirror of
     // `video.rs::send_eof`. The JS-side `flush()` is not
@@ -670,7 +682,7 @@ impl AudioStreamDecoder for WebCodecsAudioStreamDecoder {
     }
     self.eof = true;
     guard.completed = true;
-    Ok(())
+    Ok(Sent::Accepted)
   }
 
   /// Rebuild the underlying `AudioDecoder` from scratch.
@@ -738,8 +750,7 @@ impl AudioStreamDecoder for WebCodecsAudioStreamDecoder {
 async fn wait_for_frame(
   state: &SharedState<DecodedAudioFrame>,
   decoder: &web_sys::AudioDecoder,
-  eof: bool,
-) -> Result<DecodedAudioFrame, AudioDecodeError> {
+) -> Result<Option<DecodedAudioFrame>, AudioDecodeError> {
   loop {
     let popped = {
       let mut inner = state.borrow_mut();
@@ -758,11 +769,13 @@ async fn wait_for_frame(
         // `pending_outputs` deliberately excluded — see the
         // matching note in `video.rs::wait_for_frame`.
         let active_decode_work = inner.pending_copies() > 0 || decoder.decode_queue_size() > 0;
+        // No frame, and nothing in flight that could produce one
+        // without the caller acting. **Which of the two protocol
+        // answers that is belongs to the session, not to this
+        // helper** — it is the `eof` latch that decides, and
+        // `receive_frame` owns it.
         if !active_decode_work {
-          if eof {
-            return Err(AudioDecodeError::Eof);
-          }
-          return Err(AudioDecodeError::NoFrameReady);
+          return Ok(None);
         }
       }
       frame
@@ -771,7 +784,7 @@ async fn wait_for_frame(
       // Popping reduces `queue.len()`, which may unblock a
       // backpressured `send_packet`. Wake outside the borrow.
       state.wake_dequeue();
-      return Ok(frame);
+      return Ok(Some(frame));
     }
     let _guard = state.receiver_waker_guard();
     core::future::poll_fn(|cx| {
@@ -784,8 +797,9 @@ async fn wait_for_frame(
       let active_decode_work = inner.pending_copies() > 0 || decoder.decode_queue_size() > 0;
       // Resolve Ready when the queue has a frame, the decoder
       // has been closed, OR when no further JS work is queued
-      // (the outer loop translates the latter to `NoFrameReady`
-      // / `Eof`). Park otherwise.
+      // (the outer loop answers `None` for the latter, and
+      // `receive_frame` turns that into needs-input or ended).
+      // Park otherwise.
       if !inner.queue_is_empty() || inner.is_closed() || !active_decode_work {
         core::task::Poll::Ready(())
       } else {

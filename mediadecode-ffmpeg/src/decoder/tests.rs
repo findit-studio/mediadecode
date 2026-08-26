@@ -618,7 +618,7 @@ fn cap_overflow_does_not_consume_packet_and_preserves_pending() {
         hit_bailout = true;
         break;
       }
-      Ok(()) => panic!("send_packet must bail out when probe is at the byte cap"),
+      Ok(_) => panic!("send_packet must bail out when probe is at the byte cap"),
       Err(other) => panic!("expected AllBackendsFailed bailout, got {other:?}"),
     }
   }
@@ -1479,6 +1479,875 @@ fn the_pool_judge_fails_closed_and_prices_conservatively() {
           bound >= priced,
           "{w}x{h}: bound {bound} below {fmt} at {priced}"
         );
+      }
+    }
+  }
+}
+
+/// **The two errno gates disagree about `AVERROR_EOF`, and that
+/// disagreement is the design — now read against the session's phase.**
+///
+/// `avcodec_receive_frame` answers `EOF` for *"the stream is over"* — a
+/// protocol state. `avcodec_send_packet` answers it for *"you already
+/// told me the stream is over, and you sent something anyway"* — a
+/// caller usage fault. The old `is_transient` predicate collapsed the
+/// two, which is why the split had to happen before either gate could
+/// exist.
+///
+/// What the phase adds is the second axis: the same errno also means
+/// different things depending on where the session is, and every road
+/// that answered that question for itself answered it differently.
+/// This walks the whole table so no cell is a matter of opinion.
+#[test]
+fn the_gates_read_every_errno_against_every_phase() {
+  use SessionPhase::{Auditioning, AuditioningPastEnd, Draining, Streaming};
+
+  let eagain = || {
+    Error::Ffmpeg(ffmpeg_next::Error::Other {
+      errno: ffmpeg_next::error::EAGAIN,
+    })
+  };
+  let eof = || Error::Ffmpeg(ffmpeg_next::Error::Eof);
+
+  // --- back pressure, on the drain road ------------------------------
+  // Where more input can come, it is the instruction it looks like.
+  for phase in [Streaming, Auditioning] {
+    assert_eq!(
+      receive_status(eagain(), phase).expect("back pressure"),
+      Received::NeedsInput,
+      "{phase:?}",
+    );
+  }
+  // Past a recorded end on a committed backend there is nothing to send
+  // and the send gates refuse, so the instruction would be unsatisfiable
+  // — it is the end instead.
+  assert_eq!(
+    receive_status(eagain(), Draining).expect("a settled end"),
+    Received::Ended,
+  );
+  // **The arm that had no name.** A candidate handed the whole history
+  // including the end, still answering "nothing yet", has produced no
+  // frame and never will. Not the caller's problem to feed and not this
+  // backend's stream to end: it goes back for the probe road.
+  assert!(
+    matches!(
+      receive_status(eagain(), AuditioningPastEnd),
+      Err(Error::Ffmpeg(_))
+    ),
+    "a candidate past the end that produced nothing must reach the probe road, \
+     not be answered as a protocol state",
+  );
+
+  // --- the end, on the drain road ------------------------------------
+  // Only a committed backend speaks for the stream.
+  for phase in [Streaming, Draining] {
+    assert_eq!(
+      receive_status(eof(), phase).expect("the end of a stream"),
+      Received::Ended,
+      "{phase:?}",
+    );
+  }
+  // A candidate's exhaustion is its own — it never proved it could
+  // decode this content, so the probe must try the next backend.
+  for phase in [Auditioning, AuditioningPastEnd] {
+    assert!(
+      matches!(receive_status(eof(), phase), Err(Error::Ffmpeg(_))),
+      "{phase:?}: a candidate draining to EOF is a candidate failing",
+    );
+  }
+
+  // --- the send road -------------------------------------------------
+  // Back pressure is a promise that draining makes the offer acceptable.
+  for phase in [Streaming, Auditioning] {
+    assert_eq!(
+      send_status(eagain(), phase).expect("back pressure"),
+      Sent::MustDrain,
+      "{phase:?}",
+    );
+  }
+  // Past the end it is a promise nothing can keep, so it is not made.
+  for phase in [Draining, AuditioningPastEnd] {
+    assert!(
+      matches!(send_status(eagain(), phase), Err(Error::Ffmpeg(_))),
+      "{phase:?}: back pressure must not be promised past a recorded end",
+    );
+  }
+  // And a send after the end stays a fault in every phase.
+  for phase in [Streaming, Draining, Auditioning, AuditioningPastEnd] {
+    assert!(
+      matches!(
+        send_status(eof(), phase),
+        Err(Error::Ffmpeg(ffmpeg_next::Error::Eof))
+      ),
+      "{phase:?}: a send after end-of-stream must stay a fault, unlaundered",
+    );
+  }
+
+  // --- and a genuine failure passes through both, in every phase -----
+  for phase in [Streaming, Draining, Auditioning, AuditioningPastEnd] {
+    for gate in [
+      send_status(Error::Ffmpeg(ffmpeg_next::Error::InvalidData), phase).err(),
+      receive_status(Error::Ffmpeg(ffmpeg_next::Error::InvalidData), phase).err(),
+    ] {
+      assert!(
+        matches!(gate, Some(Error::Ffmpeg(ffmpeg_next::Error::InvalidData))),
+        "{phase:?}",
+      );
+    }
+  }
+}
+
+/// **Regression: the raw hardware decoder's own send arms, driven
+/// against real libavcodec.**
+///
+/// [`VideoDecoder`] is a public, hardware-only face — a caller can hold
+/// one directly, without the software-falling-back wrapper — and its
+/// send arms classify libavcodec's flow control themselves. Everything
+/// that reaches them through `open` needs a live GPU and a sample file,
+/// so every existing lane over them is `#[ignore]`d and runs nowhere;
+/// the wrapper's lanes short-circuit at its own `eof_sent` gate and
+/// never arrive. That left this arm's classification asserted by
+/// reading rather than by running, which is how the two roads were free
+/// to drift apart.
+///
+/// [`VideoDecoder::from_software_for_test`] closes that by swapping only
+/// the backend: the arms, the probe state and the funnels are exactly
+/// what production builds. What is exercised below is libavcodec's real
+/// `AVERROR_EOF` travelling the real arm.
+///
+/// The property: **a submission after end-of-stream is a fault.** Never
+/// [`Sent::MustDrain`], which would send a caller into a drain loop
+/// whose next offer can never succeed, and never [`Sent::Accepted`],
+/// which would silently drop the submission.
+#[test]
+fn the_raw_decoder_refuses_a_send_after_end_of_stream() {
+  ffmpeg_next::init().expect("ffmpeg init");
+  let mut parameters = ffmpeg_next::codec::Parameters::new();
+  // SAFETY: `parameters` owns a live, zeroed `AVCodecParameters`; both
+  // fields are plain scalars and MPEG-4 Part 2 opens with no extradata.
+  unsafe {
+    let raw = parameters.as_mut_ptr();
+    (*raw).codec_type = ffmpeg_next::ffi::AVMediaType::AVMEDIA_TYPE_VIDEO;
+    (*raw).codec_id = ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_MPEG4;
+  }
+  let mut dec = VideoDecoder::from_software_for_test(
+    parameters,
+    crate::limits::DecoderLimits::default(),
+    /*auditioning=*/ false,
+  )
+  .expect("a software-backed raw decoder");
+
+  // **The receive arm's own classification, first.** Its `EAGAIN` guard
+  // is narrower than the send road's — this road hands `AVERROR_EOF` to
+  // the probe machinery, because a candidate that drains to EOF without
+  // a frame is a candidate failing rather than a stream ending — so only
+  // back pressure short-circuits here, and it is [`receive_status`] that
+  // says what back pressure is called. A decoder that has been fed
+  // nothing is exactly that state.
+  let mut frame = crate::Frame::empty().expect("frame slot");
+  assert_eq!(
+    dec
+      .receive_frame(&mut frame)
+      .expect("an empty decoder is not a fault"),
+    Received::NeedsInput,
+  );
+
+  // The end, taken on a decoder that has been fed nothing — the shortest
+  // road to a committed EOF that involves no codec-specific decoding.
+  assert_eq!(dec.send_eof().expect("no fault"), Sent::Accepted);
+
+  // Drain to the settled end, so nothing below is confused with back
+  // pressure from undrained output.
+  loop {
+    match dec
+      .receive_frame(&mut frame)
+      .expect("no fault while draining")
+    {
+      Received::Frame => {}
+      Received::NeedsInput => panic!("a raw decoder at EOF asked for input"),
+      Received::Ended => break,
+    }
+  }
+
+  // The two roads a caller can take past the end, twice each — the
+  // answer is a state of the session, not a one-shot complaint.
+  for _ in 0..2 {
+    let packet = crate::boundary::try_packet_copy(&[0u8; 16]).expect("a submittable packet");
+    let sent = dec.send_packet(&packet);
+    assert!(
+      matches!(sent, Err(Error::Ffmpeg(ffmpeg_next::Error::Eof))),
+      "a packet after end-of-stream must be libavcodec's refusal, not back \
+       pressure and not silent acceptance; got {sent:?}",
+    );
+    let eof_again = dec.send_eof();
+    assert!(
+      matches!(eof_again, Err(Error::Ffmpeg(ffmpeg_next::Error::Eof))),
+      "a repeated end-of-stream must be the same refusal; got {eof_again:?}",
+    );
+  }
+
+  // And the end is still the end: the refused submissions changed
+  // nothing about what the decoder has left to give.
+  assert_eq!(
+    dec
+      .receive_frame(&mut frame)
+      .expect("no fault past the end"),
+    Received::Ended,
+  );
+}
+
+/// Builds a decoder with the probe window open and no backend left to
+/// advance to, so "the probe road was taken" is observable as
+/// [`Error::AllBackendsFailed`].
+#[cfg(test)]
+fn auditioning_decoder() -> VideoDecoder {
+  ffmpeg_next::init().expect("ffmpeg init");
+  let mut parameters = ffmpeg_next::codec::Parameters::new();
+  // SAFETY: `parameters` owns a live, zeroed `AVCodecParameters`; both
+  // fields are plain scalars and MPEG-4 Part 2 opens with no extradata.
+  unsafe {
+    let raw = parameters.as_mut_ptr();
+    (*raw).codec_type = ffmpeg_next::ffi::AVMediaType::AVMEDIA_TYPE_VIDEO;
+    (*raw).codec_id = ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_MPEG4;
+  }
+  VideoDecoder::from_software_for_test(
+    parameters,
+    crate::limits::DecoderLimits::default(),
+    /*auditioning=*/ true,
+  )
+  .expect("a software-backed candidate on trial")
+}
+
+/// **Regression: a candidate that has been handed the end and produced
+/// nothing is a candidate failing — never `NeedsInput`, never `Ended`.**
+///
+/// The arm that had no name until [`SessionPhase`] gave it one. The
+/// probe replays its buffered history *and* the recorded end into each
+/// candidate, so a candidate can be sitting on a stream that is already
+/// over. Asked for a frame it answers `EAGAIN`, and every reading of
+/// that was wrong: `NeedsInput` asks the caller for input it does not
+/// have and the send gates refuse, while `Ended` credits a backend that
+/// never decoded a thing and stops the probe from trying the next one.
+///
+/// It is the probe's business, and the probe says so: with no backend
+/// left to advance to, [`Error::AllBackendsFailed`] — the caller's cue
+/// to fall back to software, which is exactly what should happen when
+/// no hardware backend could decode this stream.
+///
+/// The decoder is software-backed so the lane actually runs; what is
+/// under test is the classification and the road it selects, neither of
+/// which is backend-specific.
+#[test]
+fn a_candidate_past_the_end_that_produced_nothing_fails_the_probe() {
+  let mut dec = auditioning_decoder();
+  assert_eq!(dec.phase(), SessionPhase::Auditioning);
+
+  // **The latch is set directly, and the reason matters.** Reaching
+  // this phase through `send_eof` would also hand the flush packet to
+  // libavcodec, which then answers `AVERROR_EOF` — a different arm,
+  // and one that already routed to the probe correctly. The arm under
+  // test is the *other* one: a candidate that has been replayed a
+  // history and an end and still answers `EAGAIN`, which is precisely
+  // the state `advance_probe` leaves a candidate in mid-replay. The
+  // phase is the subject here, so the phase is what is constructed.
+  dec.eof_sent = true;
+  assert_eq!(
+    dec.phase(),
+    SessionPhase::AuditioningPastEnd,
+    "a recorded end must move a session on trial into the phase that names it",
+  );
+
+  // A candidate with nothing in it answers `EAGAIN`.
+  let mut frame = crate::Frame::empty().expect("frame slot");
+  match dec.receive_frame(&mut frame) {
+    Ok(Received::NeedsInput) => panic!(
+      "asked the caller for input on a stream that is already over — and the \
+       send gates refuse, so nothing can satisfy it",
+    ),
+    Ok(Received::Ended) => panic!(
+      "credited a candidate that never decoded a frame with ending the stream, \
+       stopping the probe from trying the next backend",
+    ),
+    Ok(Received::Frame) => panic!("a candidate fed only the end produced a frame"),
+    Err(Error::AllBackendsFailed(_)) => {}
+    Err(other) => panic!("expected the probe road, got {other:?}"),
+  }
+
+  // **And then the session really has ended**, which is the other half
+  // of the answer being honest. The probe is spent — every backend was
+  // tried — so there is no candidate left to fail and the phase says so.
+  // A caller that reaches here has been told to fall back to software
+  // and can still drain what it holds.
+  assert_eq!(
+    dec.phase(),
+    SessionPhase::Draining,
+    "an exhausted probe leaves a committed session, not a candidate",
+  );
+  assert_eq!(
+    dec
+      .receive_frame(&mut frame)
+      .expect("no fault past the end"),
+    Received::Ended,
+  );
+}
+
+/// **The latched-refusal variant: the funnel is no longer bypassed.**
+///
+/// A `get_format` declination or an allocator-judge refusal is left in
+/// the callback state for a funnel to collect. The `EAGAIN`
+/// short-circuit used to return before `hw_exit` ran, so on this road
+/// the reason died unread and the candidate was recorded as having
+/// failed with a bare errno — this crate's own refusal, lost.
+///
+/// Every road out of the receive arm passes the funnel now. Here the
+/// refusal reaches the probe's attempt log, which is what a caller
+/// reads to find out why no backend worked.
+#[test]
+fn a_latched_refusal_reaches_the_probe_instead_of_dying_unread() {
+  let mut dec = auditioning_decoder();
+  // The same phase, constructed the same way and for the same reason —
+  // see the lane above.
+  dec.eof_sent = true;
+
+  // Latch a coded-surface refusal, exactly as the `get_format` callback
+  // does when it declines a surface over the ceiling.
+  crate::ffi::declare_ceiling_declined_for_test(dec.state.callback_state, 8_294_400, 2_073_600);
+
+  let mut frame = crate::Frame::empty().expect("frame slot");
+  let Err(Error::AllBackendsFailed(p)) = dec.receive_frame(&mut frame) else {
+    panic!("the candidate must fail the probe");
+  };
+  let reason = format!("{:?}", p.attempts());
+  assert!(
+    reason.contains("HwSurfaceTooLarge"),
+    "the latched refusal must be what the attempt log records, not a bare errno: {reason}",
+  );
+}
+
+/// **Regression: a latched refusal outranks the errno on the committed
+/// road too — every phase, both flow signals.**
+///
+/// The funnels exist because a `get_format` declination cannot be
+/// returned from the callback: it is left in the callback state for a
+/// funnel to collect, and libavcodec meanwhile reports whatever it saw.
+/// Classify that report first and the caller is told the stream ended,
+/// or that more input is wanted, for a frame **this crate declined** —
+/// the refusal dies unread and the ceiling looks like it did nothing.
+///
+/// The committed road lost that ordering in the phase restructure: it
+/// classified the raw errno and returned before `hw_exit` ever ran. The
+/// four cells below are the whole of the exposed surface — the two
+/// committed phases against the two flow signals — and each is built so
+/// the errno and the latched refusal disagree, which is the only
+/// arrangement where the ordering is observable at all.
+#[test]
+fn a_latched_refusal_outranks_the_errno_in_every_committed_phase() {
+  // (name, how the cell reaches its errno, expected phase)
+  let cells: [(&str, fn(&mut VideoDecoder), SessionPhase); 4] = [
+    // Nothing sent: libavcodec wants input.
+    ("streaming x EAGAIN", |_| {}, SessionPhase::Streaming),
+    // The flush packet goes to libavcodec but the session's own latch
+    // stays clear, so the phase is still `Streaming` while the errno is
+    // the end. Reaching in is the point: these two facts are separate,
+    // and the lane is about what happens when they disagree.
+    (
+      "streaming x EOF",
+      |dec: &mut VideoDecoder| {
+        dec
+          .state
+          .inner
+          .send_eof()
+          .expect("the substrate takes the end");
+      },
+      SessionPhase::Streaming,
+    ),
+    // The mirror: the session records the end, libavcodec is not told,
+    // so the phase is `Draining` while the errno is still back pressure.
+    (
+      "draining x EAGAIN",
+      |dec: &mut VideoDecoder| {
+        dec.eof_sent = true;
+      },
+      SessionPhase::Draining,
+    ),
+    // Both together, the ordinary tail drain.
+    (
+      "draining x EOF",
+      |dec: &mut VideoDecoder| {
+        assert_eq!(dec.send_eof().expect("no fault"), Sent::Accepted);
+      },
+      SessionPhase::Draining,
+    ),
+  ];
+
+  for (name, arrange, expected_phase) in cells {
+    let mut dec = committed_decoder();
+    arrange(&mut dec);
+    assert_eq!(dec.phase(), expected_phase, "{name}: the phase under test");
+
+    // The refusal the callback could not return, latched exactly as
+    // `get_format` leaves it when it declines a coded surface.
+    crate::ffi::declare_ceiling_declined_for_test(dec.state.callback_state, 8_294_400, 2_073_600);
+
+    let mut frame = crate::Frame::empty().expect("frame slot");
+    match dec.receive_frame(&mut frame) {
+      Ok(Received::Ended) => panic!(
+        "{name}: reported a clean end over a refusal this crate made — the \
+         ceiling declined the surface and the caller was told the stream was over",
+      ),
+      Ok(Received::NeedsInput) => panic!(
+        "{name}: asked for more input over a refusal this crate made — the \
+         caller would feed a decoder that already declined the frame",
+      ),
+      Ok(Received::Frame) => panic!("{name}: a declined surface produced a frame"),
+      // **Wrapped, and that is the point.** A declined coded surface
+      // means this hardware backend cannot take this stream, so it is a
+      // fallback signal and travels in the envelope that makes the
+      // wrapper open a software decoder — the same outcome the H.264
+      // spelling of the same fact has always produced. What must survive
+      // the envelope is the cause: the caller reads the attempts to find
+      // out *why*, and "a ceiling you configured" is the one answer it
+      // can act on.
+      Err(Error::AllBackendsFailed(p)) => {
+        let cause = format!("{:?}", p.attempts());
+        assert!(
+          cause.contains("HwSurfaceTooLarge") && cause.contains("8294400"),
+          "{name}: the refusal must reach the attempt log with its numbers: {cause}",
+        );
+      }
+      Err(other) => panic!("{name}: expected the latched refusal, got {other:?}"),
+    }
+  }
+}
+
+/// A committed decoder — probe collapsed, software-backed so the lane
+/// runs — for the phases that are only reachable after commit.
+#[cfg(test)]
+fn committed_decoder() -> VideoDecoder {
+  ffmpeg_next::init().expect("ffmpeg init");
+  let mut parameters = ffmpeg_next::codec::Parameters::new();
+  // SAFETY: `parameters` owns a live, zeroed `AVCodecParameters`; both
+  // fields are plain scalars and MPEG-4 Part 2 opens with no extradata.
+  unsafe {
+    let raw = parameters.as_mut_ptr();
+    (*raw).codec_type = ffmpeg_next::ffi::AVMediaType::AVMEDIA_TYPE_VIDEO;
+    (*raw).codec_id = ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_MPEG4;
+  }
+  VideoDecoder::from_software_for_test(
+    parameters,
+    crate::limits::DecoderLimits::default(),
+    /*auditioning=*/ false,
+  )
+  .expect("a software-backed committed decoder")
+}
+
+/// **The send road's half of the same law** — codex's next-step, and the
+/// same bypass in the same shape.
+///
+/// The raw hardware send arms classified their errno straight out of
+/// libavcodec, so a refusal latched during the submission — `get_format`
+/// declining a coded surface as the decoder configures on its first
+/// packet — was reported as whatever libavcodec said over the top of it.
+/// A caller reads "you already sent the end" and never learns the
+/// ceiling refused the surface.
+///
+/// A second `send_eof` is the deterministic way to a flow-control errno
+/// on this road: libavcodec answers `AVERROR_EOF` to a repeated flush
+/// packet, and the funnel must be what decides what the caller sees.
+#[test]
+fn a_latched_refusal_outranks_the_errno_on_the_send_road_too() {
+  let mut dec = committed_decoder();
+  assert_eq!(dec.send_eof().expect("no fault"), Sent::Accepted);
+
+  crate::ffi::declare_ceiling_declined_for_test(dec.state.callback_state, 8_294_400, 2_073_600);
+
+  match dec.send_eof() {
+    Ok(Sent::Accepted) => panic!("a repeated end silently accepted over a refusal"),
+    Ok(Sent::MustDrain) => panic!("back pressure promised over a refusal"),
+    // **Wrapped, and that is the second half of the fix.** Minting the
+    // refusal was never enough: returned plain it went nowhere, because
+    // the wrapper opens software only on `AllBackendsFailed`. A declined
+    // surface on the send road now takes the same road it takes on the
+    // receive road — the fallback — carrying its own numbers.
+    Err(Error::AllBackendsFailed(p)) => {
+      let cause = format!("{:?}", p.attempts());
+      assert!(
+        cause.contains("HwSurfaceTooLarge") && cause.contains("8294400"),
+        "the refusal must reach the attempt log with its numbers: {cause}",
+      );
+    }
+    Err(other) => panic!(
+      "the latched refusal must outrank libavcodec's report on the send road too, \
+       got {other:?}",
+    ),
+  }
+}
+
+/// **Regression: a verdict is minted once, and `post_commit_hw_failure`
+/// records the one it was given rather than reaching for another.**
+///
+/// It used to call [`VideoDecoder::hw_exit`] itself. That was right
+/// while it was the *first* funnel on its road and wrong the moment it
+/// was the second: the receive road mints at the top of its arm, and a
+/// funnel **consumes** the latch it reads, so the second call found
+/// nothing and recorded the errno libavcodec had reported over a coded
+/// surface this crate declined. A caller reading `AllBackendsFailed` to
+/// find out why no backend worked was told `InvalidData` — true about
+/// what FFmpeg saw, false about what happened, and not the actionable
+/// cause (a configured ceiling) the caller could have acted on.
+///
+/// Both halves are pinned here, because either alone would pass for the
+/// wrong reason: that the latch survives the call (nothing was
+/// consumed), and that what lands in the attempt log is the argument.
+#[test]
+fn the_post_commit_failure_records_the_verdict_it_was_given() {
+  let dec = committed_decoder();
+  crate::ffi::declare_ceiling_declined_for_test(dec.state.callback_state, 8_294_400, 2_073_600);
+
+  // Handed a raw error while a refusal sits latched: it must record the
+  // raw one. Reaching for the latch here is precisely the bug.
+  let recorded = dec.post_commit_hw_failure(Error::Ffmpeg(ffmpeg_next::Error::InvalidData));
+  let Error::AllBackendsFailed(p) = &recorded else {
+    panic!("expected AllBackendsFailed, got {recorded:?}");
+  };
+  let cause = format!("{:?}", p.attempts());
+  assert!(
+    cause.contains("Invalid data"),
+    "it must record the verdict it was handed: {cause}",
+  );
+  assert!(
+    !cause.contains("HwSurfaceTooLarge"),
+    "it must not mint a second verdict — that is the double-funnel: {cause}",
+  );
+
+  // And the latch is untouched, which is what makes the caller's own
+  // mint the only one. If this call had funnelled, the refusal would be
+  // gone and the road that minted first would have lost it.
+  let verdict = dec.hw_exit(Error::Ffmpeg(ffmpeg_next::Error::InvalidData));
+  assert!(
+    matches!(verdict, Error::HwSurfaceTooLarge(ref q) if q.bytes() == 8_294_400),
+    "the latch must survive an untouched `post_commit_hw_failure`: {verdict:?}",
+  );
+
+  // Threaded onward, the refusal is what a caller reads.
+  let threaded = dec.post_commit_hw_failure(verdict);
+  let Error::AllBackendsFailed(p) = &threaded else {
+    panic!("expected AllBackendsFailed, got {threaded:?}");
+  };
+  let cause = format!("{:?}", p.attempts());
+  assert!(
+    cause.contains("HwSurfaceTooLarge") && cause.contains("8294400"),
+    "the threaded verdict must reach the attempt log with its numbers: {cause}",
+  );
+}
+
+/// **The mechanism that makes re-derivation lossy, pinned on its own.**
+///
+/// The invariant on [`software_receive`] rests on one fact about the
+/// funnels: they *consume* what they collect, because a refusal reported
+/// twice would be a refusal invented once. That is what turns a second
+/// funnel call from redundant into destructive, and it is why "mint once
+/// and thread" is a rule rather than a preference.
+///
+/// The committed receive road's `is_hw_decode_failure` branch needs a
+/// hardware backend to reach in this harness — the errnos it selects on
+/// are what a HW backend produces, and a software decoder refuses the
+/// packets that would provoke them at `send_packet` instead. So the road
+/// is covered by the lanes above and this one rather than end to end,
+/// and saying so is better than implying otherwise.
+#[test]
+fn a_funnel_consumes_what_it_collects() {
+  let dec = committed_decoder();
+  crate::ffi::declare_ceiling_declined_for_test(dec.state.callback_state, 4_096, 1_024);
+
+  let first = dec.hw_exit(Error::Ffmpeg(ffmpeg_next::Error::InvalidData));
+  assert!(
+    matches!(first, Error::HwSurfaceTooLarge(ref p) if p.bytes() == 4_096),
+    "the first funnel mints the refusal: {first:?}",
+  );
+
+  let second = dec.hw_exit(Error::Ffmpeg(ffmpeg_next::Error::InvalidData));
+  assert!(
+    matches!(second, Error::Ffmpeg(ffmpeg_next::Error::InvalidData)),
+    "the second finds nothing and answers with its fallback — which is why a \
+     road that re-funnels reports the substrate's errno over its own refusal: \
+     {second:?}",
+  );
+}
+
+/// **Regression: the HEVC spelling of a declined surface reaches the
+/// caller, and takes the fallback with it.**
+///
+/// `get_hw_format` runs again on a **post-commit format change** — an
+/// HEVC SPS switch mid-stream — so the ceiling can decline a coded
+/// surface there, latch [`Error::HwSurfaceTooLarge`], and return
+/// `AV_PIX_FMT_NONE`. H.264 normalises that to `InvalidData` and was
+/// covered. FFmpeg 9's HEVC path propagates the `-1`, `ffmpeg-next` maps
+/// it to `Other { errno: 1 }`, and [`is_hw_decode_failure`] does not
+/// match it — so the road returned the raw errno unfunnelled: an
+/// EPERM-shaped red herring, no software fallback, and the latch left
+/// standing to be collected by whatever ran next.
+///
+/// The predicate widened to the truer condition rather than to one more
+/// errno. Enumerating spellings is a census of how each codec in each
+/// FFmpeg release happens to say one thing, and this was the missing
+/// entry; **a latched surface refusal is the signal itself**, whatever
+/// wrapper the codec put around it.
+#[test]
+fn a_declined_surface_reaches_the_caller_whatever_errno_the_codec_wrapped_it_in() {
+  // The spelling that was missed. Nothing about the lane depends on it
+  // beyond `is_hw_decode_failure` NOT matching it — which is the whole
+  // reason the old road fell through.
+  let hevc = ffmpeg_next::Error::Other { errno: 1 };
+  assert!(
+    !is_hw_decode_failure(&hevc),
+    "if the errno list ever grows to cover this, the lane below stops \
+     testing the widening and must be rebuilt on a spelling it misses",
+  );
+
+  let dec = committed_decoder();
+  crate::ffi::declare_ceiling_declined_for_test(dec.state.callback_state, 8_294_400, 2_073_600);
+
+  let out = reported(dec.hw_failure(hevc, BareVerdict::CandidateFailure));
+  let Error::AllBackendsFailed(p) = &out else {
+    panic!("a declined surface must ask for the software fallback, got {out:?}");
+  };
+  let cause = format!("{:?}", p.attempts());
+  assert!(
+    cause.contains("HwSurfaceTooLarge") && cause.contains("8294400"),
+    "the verdict must carry its own numbers, not the codec's errno: {cause}",
+  );
+
+  // And the latch is spent, so nothing downstream inherits it.
+  let after = dec.hw_exit(Error::Ffmpeg(hevc));
+  assert!(
+    matches!(after, Error::Ffmpeg(ffmpeg_next::Error::Other { errno: 1 })),
+    "the refusal must have been collected, not left standing: {after:?}",
+  );
+}
+
+/// The other answers the predicate must keep giving — **paired with the
+/// spellings their real producers use.**
+///
+/// The previous version of this lane paired the budget latch with a
+/// synthetic `Other { errno: 1 }` and passed while the bug was live,
+/// because that errno is one [`is_hw_decode_failure`] does not match —
+/// so the `or`'s second arm never fired and the exclusion was never
+/// tested. `judge_buffer` answers libavcodec `-EINVAL`, which it **does**
+/// match, and that is the pairing that mattered.
+///
+/// The lesson is older than this round: a regression is only worth its
+/// name if it is built from what the producer actually emits. A
+/// convenient value that happens to travel the same road proves the road
+/// works for convenient values.
+#[test]
+fn a_budget_refusal_never_triggers_the_fallback_whatever_errno_rides_with_it() {
+  // **The producer's own spelling, asserted rather than assumed.**
+  // `judge_buffer` refuses by returning `-EINVAL` — the only thing a
+  // `get_buffer2` callback can answer — and the predicate's errno arm
+  // matches it. If either fact ever changes, this lane says so instead
+  // of quietly testing nothing.
+  let einval = ffmpeg_next::Error::Other {
+    errno: libc::EINVAL,
+  };
+  assert!(
+    is_hw_decode_failure(&einval),
+    "the errno arm must match `judge_buffer`'s own answer, or this lane \
+     stops testing the exclusion it exists for",
+  );
+
+  // Both spellings a budget refusal can arrive with: the one it emits,
+  // and the one libavcodec uses for corrupt input on the same road.
+  for (name, raw) in [
+    ("judge_buffer's own -EINVAL", einval),
+    ("libavcodec's InvalidData", ffmpeg_next::Error::InvalidData),
+  ] {
+    let dec = committed_decoder();
+    crate::ffi::declare_frame_budget_declined_for_test(dec.state.callback_state, 12_582_912);
+
+    let out = reported(dec.hw_failure(raw, BareVerdict::CandidateFailure));
+    assert!(
+      matches!(out, Error::FrameBudgetExceeded(ref p) if p.bytes() == 12_582_912),
+      "{name}: a budget refusal must travel unwrapped, naming the action that \
+       can succeed — raise the ceiling — rather than sending the caller down a \
+       fallback that will be refused by the same ceiling: {out:?}",
+    );
+  }
+}
+
+/// The no-latch answer: an errno with nothing named behind it is judged
+/// on its own, which is the only arm where it gets a vote.
+#[test]
+fn an_unnamed_failure_is_still_judged_on_its_errno() {
+  // Recognised: a real hardware decode failure latches nothing, so the
+  // errno is all there is and it must still reach the fallback road.
+  let dec = committed_decoder();
+  let out = reported(dec.hw_failure(
+    ffmpeg_next::Error::InvalidData,
+    BareVerdict::CandidateFailure,
+  ));
+  assert!(
+    matches!(out, Error::AllBackendsFailed(_)),
+    "an unnamed hardware decode failure must still ask for the fallback: {out:?}",
+  );
+
+  // Unrecognised, and nothing named: it travels as itself. Inventing a
+  // hardware failure from every unknown errno would be the mirror of the
+  // bug this predicate just lost.
+  let dec = committed_decoder();
+  let out = reported(dec.hw_failure(
+    ffmpeg_next::Error::Other { errno: 1 },
+    BareVerdict::CandidateFailure,
+  ));
+  assert!(
+    matches!(out, Error::Ffmpeg(ffmpeg_next::Error::Other { errno: 1 })),
+    "an unrecognised errno with nothing latched must travel as itself: {out:?}",
+  );
+}
+
+/// The same exclusion on the **committed receive route**, where the
+/// verdict is minted by `hw_receive` and the predicate only routes it.
+///
+/// The route matters separately from the predicate: it is the one that
+/// holds an already-minted verdict, so a regression there could take the
+/// form of re-deriving instead of mis-judging. What a caller must see is
+/// the budget refusal itself — unwrapped, with its numbers, and no
+/// fallback envelope around it.
+#[test]
+fn the_committed_receive_route_lets_a_budget_refusal_travel_unwrapped() {
+  let mut dec = committed_decoder();
+  crate::ffi::declare_frame_budget_declined_for_test(dec.state.callback_state, 12_582_912);
+
+  let mut frame = crate::Frame::empty().expect("frame slot");
+  match dec.receive_frame(&mut frame) {
+    Ok(status) => panic!("a refused frame must not read as a protocol state: {status:?}"),
+    Err(Error::FrameBudgetExceeded(p)) => {
+      assert_eq!(p.bytes(), 12_582_912, "the refusal's own numbers");
+    }
+    Err(Error::AllBackendsFailed(p)) => panic!(
+      "a budget refusal took the fallback road — software will be refused by the \
+       same ceiling, and the actionable error is now buried: {:?}",
+      p.attempts(),
+    ),
+    Err(other) => panic!("expected the budget refusal, got {other:?}"),
+  }
+}
+
+/// A committed decoder cannot advance a probe it does not have, so every
+/// route it takes must be a report. Unwrapping here rather than in each
+/// lane keeps the assertions about the verdict.
+#[cfg(test)]
+#[track_caller]
+fn reported(route: HwRoute) -> Error {
+  match route {
+    HwRoute::Report(err) => err,
+    HwRoute::Advance(err) => {
+      panic!("a committed decoder has no candidate to advance to, got Advance({err:?})")
+    }
+  }
+}
+
+/// **The send road's cross product: both refusals, both flow signals,
+/// both phases, both send faces.**
+///
+/// The transient send arms returned their funnel's result the instant
+/// they had it. For a flow signal that is right; for anything else it
+/// was a dead end. `hw_send` can mint [`Error::HwSurfaceTooLarge`], and
+/// a minted refusal returned plain goes nowhere: the wrapper opens
+/// software only on [`Error::AllBackendsFailed`], so it simply stopped,
+/// and a probe still auditioning never advanced past the candidate that
+/// had just declined the surface.
+///
+/// Sixteen cells, and the two refusals must part company in every one:
+/// a **surface** refusal routes — the probe advances while auditioning,
+/// the fallback fires once committed — while a **budget** refusal exits
+/// direct and unwrapped, because software would meet the same ceiling.
+#[test]
+fn the_send_roads_route_a_surface_refusal_and_report_a_budget_one() {
+  #[derive(Clone, Copy)]
+  enum Latch {
+    Surface,
+    Budget,
+  }
+  #[derive(Clone, Copy)]
+  enum Face {
+    Packet,
+    Eof,
+  }
+
+  for latch in [Latch::Surface, Latch::Budget] {
+    for auditioning in [true, false] {
+      for face in [Face::Packet, Face::Eof] {
+        let mut dec = if auditioning {
+          auditioning_decoder()
+        } else {
+          committed_decoder()
+        };
+        // Reach a flow-signal errno on the send road: libavcodec answers
+        // `AVERROR_EOF` to a submission that follows a flush packet.
+        assert_eq!(dec.send_eof().expect("no fault"), Sent::Accepted);
+
+        match latch {
+          Latch::Surface => crate::ffi::declare_ceiling_declined_for_test(
+            dec.state.callback_state,
+            8_294_400,
+            2_073_600,
+          ),
+          Latch::Budget => {
+            crate::ffi::declare_frame_budget_declined_for_test(dec.state.callback_state, 12_582_912)
+          }
+        }
+
+        let packet = crate::boundary::try_packet_copy(&[0u8; 16]).expect("packet");
+        let out = match face {
+          Face::Packet => dec.send_packet(&packet),
+          Face::Eof => dec.send_eof(),
+        };
+        let name = format!(
+          "{} x {} x {}",
+          match latch {
+            Latch::Surface => "surface",
+            Latch::Budget => "budget",
+          },
+          if auditioning {
+            "auditioning"
+          } else {
+            "committed"
+          },
+          match face {
+            Face::Packet => "send_packet",
+            Face::Eof => "send_eof",
+          },
+        );
+
+        match (latch, out) {
+          // A declined surface is this backend's refusal to take the
+          // stream. Auditioning, the probe advances and — with no
+          // backend left — surfaces the exhaustion; committed, the
+          // fallback envelope is what makes the wrapper open software.
+          // Either way the shape is `AllBackendsFailed` and the cause
+          // survives inside it.
+          (Latch::Surface, Err(Error::AllBackendsFailed(p))) => {
+            let cause = format!("{:?}", p.attempts());
+            assert!(
+              cause.contains("HwSurfaceTooLarge") && cause.contains("8294400"),
+              "{name}: the refusal must reach the attempt log with its numbers: {cause}",
+            );
+          }
+          (Latch::Surface, other) => panic!(
+            "{name}: a declined surface must route, not exit plain — returned plain it \
+             reaches no fallback and advances no probe: {other:?}",
+          ),
+          // A budget refusal names the action that can succeed. Wrapping
+          // it would send the caller to a decoder the same ceiling will
+          // refuse.
+          (Latch::Budget, Err(Error::FrameBudgetExceeded(p))) => {
+            assert_eq!(p.bytes(), 12_582_912, "{name}: the refusal's own numbers");
+          }
+          (Latch::Budget, other) => {
+            panic!("{name}: a budget refusal must exit direct and unwrapped: {other:?}",)
+          }
+        }
       }
     }
   }

@@ -28,13 +28,12 @@
 #![cfg(target_arch = "wasm32")]
 
 use mediadecode::{
-  Timebase, Timestamp,
+  Received, Sent, Timebase, Timestamp,
   future::local::AudioStreamDecoder,
   packet::{AudioPacket, PacketFlags},
 };
 use mediadecode_webcodecs::{
-  AudioDecodeError, AudioPacketExtra, WebCodecsAudioStreamDecoder, WebCodecsBuffer,
-  empty_audio_frame,
+  AudioPacketExtra, WebCodecsAudioStreamDecoder, WebCodecsBuffer, empty_audio_frame,
 };
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
@@ -87,20 +86,24 @@ async fn flush_isolates_pre_and_post_flush_streams() {
   let mut frame = empty_audio_frame();
   let pre_flush_ptses: [i64; 4] = [0, 1024, 2048, 3072];
   for &pts in &pre_flush_ptses {
-    decoder
-      .send_packet(&silent_pcm_s16_packet(pts, time_base))
-      .await
-      .expect("pre-flush send_packet");
+    assert_eq!(
+      decoder
+        .send_packet(&silent_pcm_s16_packet(pts, time_base))
+        .await
+        .expect("pre-flush send_packet"),
+      Sent::Accepted,
+      "the queue is drained each iteration, so nothing should ask for a drain",
+    );
     loop {
       match decoder.receive_frame(&mut frame).await {
-        Ok(()) => {
+        Ok(Received::Frame) => {
           let observed = frame.pts().expect("pre-flush frame pts is Some").pts();
           assert!(
             pre_flush_ptses.contains(&observed),
             "pre-flush frame pts {observed} not in {pre_flush_ptses:?}"
           );
         }
-        Err(AudioDecodeError::NoFrameReady) => break,
+        Ok(Received::NeedsInput | Received::Ended) => break,
         Err(e) => panic!("pre-flush receive_frame: {e:?}"),
       }
     }
@@ -131,13 +134,16 @@ async fn flush_isolates_pre_and_post_flush_streams() {
   let post_flush_ptses: [i64; 4] = [1_000_000, 1_001_024, 1_002_048, 1_003_072];
   let mut post_flush_frames_observed: u32 = 0;
   for &pts in &post_flush_ptses {
-    decoder
-      .send_packet(&silent_pcm_s16_packet(pts, time_base))
-      .await
-      .expect("post-flush send_packet");
+    assert_eq!(
+      decoder
+        .send_packet(&silent_pcm_s16_packet(pts, time_base))
+        .await
+        .expect("post-flush send_packet"),
+      Sent::Accepted,
+    );
     loop {
       match decoder.receive_frame(&mut frame).await {
-        Ok(()) => {
+        Ok(Received::Frame) => {
           let observed = frame.pts().expect("post-flush frame pts is Some").pts();
           assert!(
             post_flush_ptses.contains(&observed),
@@ -147,7 +153,7 @@ async fn flush_isolates_pre_and_post_flush_streams() {
           );
           post_flush_frames_observed = post_flush_frames_observed.saturating_add(1);
         }
-        Err(AudioDecodeError::NoFrameReady) => break,
+        Ok(Received::NeedsInput | Received::Ended) => break,
         Err(e) => panic!("post-flush receive_frame: {e:?}"),
       }
     }
@@ -158,10 +164,13 @@ async fn flush_isolates_pre_and_post_flush_streams() {
   // EOF — Chrome's PCM decoder emits one AudioData per chunk
   // synchronously enough that the loop usually catches them
   // all, but we don't want to depend on that here.
-  decoder.send_eof().await.expect("post-flush send_eof");
+  assert_eq!(
+    decoder.send_eof().await.expect("post-flush send_eof"),
+    Sent::Accepted,
+  );
   loop {
     match decoder.receive_frame(&mut frame).await {
-      Ok(()) => {
+      Ok(Received::Frame) => {
         let observed = frame.pts().expect("eof-drain frame pts").pts();
         assert!(
           post_flush_ptses.contains(&observed),
@@ -169,8 +178,8 @@ async fn flush_isolates_pre_and_post_flush_streams() {
         );
         post_flush_frames_observed = post_flush_frames_observed.saturating_add(1);
       }
-      Err(AudioDecodeError::Eof) => break,
-      Err(AudioDecodeError::NoFrameReady) => continue,
+      Ok(Received::Ended) => break,
+      Ok(Received::NeedsInput) => continue,
       Err(e) => panic!("eof-drain receive_frame: {e:?}"),
     }
   }

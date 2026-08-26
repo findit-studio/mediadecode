@@ -95,6 +95,8 @@ pub(crate) mod c_shims {
   }
 }
 
+use mediadecode::{Received, Sent};
+
 use crate::{
   backend::{self, Backend},
   error::{AllBackendsFailed, Error, HwDeviceInitFailed, Result},
@@ -161,6 +163,17 @@ pub struct VideoDecoder {
   /// advance builds later — and a context's ceiling cannot be moved
   /// after `avcodec_open2`.
   frame_limits: crate::limits::DecoderLimits,
+  /// `true` once [`Self::send_eof`] has been accepted, until
+  /// [`Self::flush`].
+  ///
+  /// **It lives here rather than in [`ProbeState`], and that move is
+  /// the point.** It used to be a probe field, so it vanished the
+  /// moment the probe collapsed — a committed decoder could not tell
+  /// whether the caller had signalled the end, and therefore could not
+  /// answer the one question [`SessionPhase`] exists to answer without
+  /// guessing. The probe machinery still reads it for replay; it simply
+  /// no longer owns it.
+  eof_sent: bool,
 }
 
 /// Owned FFmpeg state for one open codec context. Has its own `Drop` so we
@@ -268,6 +281,98 @@ const MAX_PROBE_PENDING_FRAMES: usize = 16;
 /// the byte cap is raised. Out of scope for now.
 pub const DEFAULT_MAX_PROBE_PENDING_BYTES: usize = 256 * 1024 * 1024;
 
+/// Where a decoding session is in its life — **the one derived fact the
+/// classifiers read, and the only place the latches are interpreted.**
+///
+/// Every road that must decide what an errno *means* needs the same two
+/// questions answered, and answering them ad hoc at each road is what
+/// let them disagree. `EAGAIN` means "send me more" only where more can
+/// come; `AVERROR_EOF` means "the stream is over" only where a backend
+/// has committed to producing it. Read those wrong and a caller is
+/// handed a state with no satisfying operation, or a candidate that
+/// will never produce a frame is mistaken for a finished stream.
+///
+/// The two questions are exactly the two dimensions the machinery
+/// already keeps latches for — whether an end has been recorded, and
+/// whether a backend is still on trial — so this enum is a census of
+/// those latches rather than a new idea. Deriving it lives in
+/// [`VideoDecoder::phase`] and its siblings, one per session type;
+/// nothing else reads a latch to answer a classification question.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SessionPhase {
+  /// A committed backend, and no end-of-stream recorded. Both flow
+  /// signals mean what they say.
+  Streaming,
+  /// A committed backend draining its tail after a recorded end. "Send
+  /// me more" is no longer satisfiable here — the caller has nothing
+  /// left to send and the send gates refuse — so it reads as the end.
+  Draining,
+  /// A candidate backend on trial, no end recorded. It may legitimately
+  /// want more input; what it may not do is quietly end the stream on
+  /// the caller's behalf, which is the committed backend's privilege.
+  Auditioning,
+  /// A candidate on trial that has already been handed the whole
+  /// history, **end-of-stream included**.
+  ///
+  /// The arm that had no name. A candidate here has been given
+  /// everything there is and answers about a stream that is already
+  /// over: if it has produced no frame, it never will. That is a
+  /// candidate failing — the probe's business — and neither "send me
+  /// more" (nothing left to send) nor "the stream ended" (this backend
+  /// never decoded a thing) is a true reading of it.
+  AuditioningPastEnd,
+}
+
+impl SessionPhase {
+  /// Whether more input can still reach this session.
+  ///
+  /// The satisfiability question: [`Received::NeedsInput`] and
+  /// [`Sent::MustDrain`] are both instructions, and both are honest
+  /// only where the caller can carry them out.
+  pub(crate) const fn accepts_input(self) -> bool {
+    matches!(self, Self::Streaming | Self::Auditioning)
+  }
+
+  /// Whether a backend has committed, and so may speak for the stream.
+  ///
+  /// Only a committed backend's `AVERROR_EOF` is the stream's end. A
+  /// candidate's is its own: it drained to nothing without ever proving
+  /// it could decode this content.
+  pub(crate) const fn is_committed(self) -> bool {
+    matches!(self, Self::Streaming | Self::Draining)
+  }
+}
+
+/// How a funnel verdict routes. See [`VideoDecoder::verdict_routing`].
+enum VerdictRouting {
+  /// The name says this backend cannot decode this content.
+  CandidateFailed,
+  /// The name says retrying a backend cannot help — report it as it is.
+  Direct,
+  /// Nothing was named; the road's own reading decides.
+  Unnamed,
+}
+
+/// What an **unnamed** verdict means on the road that produced it — the
+/// one thing the shared routing policy cannot know for itself.
+enum BareVerdict {
+  /// A flow signal's own fault: `avcodec_send_packet` answering
+  /// `AVERROR_EOF` to a submission past the end. The probe must not
+  /// advance on it — the candidate did nothing wrong, the caller did.
+  Reported,
+  /// A real failure. While a candidate is on trial, that is the
+  /// candidate failing.
+  CandidateFailure,
+}
+
+/// What the caller should do with a routed hardware failure.
+enum HwRoute {
+  /// Hand this to the caller.
+  Report(Error),
+  /// The active candidate failed: advance the probe and retry.
+  Advance(Error),
+}
+
 /// State carried only during the probe window (before the first successful
 /// frame). Holds enough information to tear down the current decoder and
 /// retry with the next backend.
@@ -288,7 +393,6 @@ struct ProbeState {
   /// incrementally so we don't have to re-sum on every send.
   buffered_bytes: usize,
   /// Whether `send_eof` has been called; replayed alongside packets.
-  eof_sent: bool,
   /// Per-backend errors captured since the probe window opened. Pushed
   /// whenever a backend's failure triggers `advance_probe` (the active
   /// backend that just failed) or a candidate's build / replay rejects
@@ -446,7 +550,6 @@ impl VideoDecoder {
               remaining_backends: remaining,
               buffered_packets: Vec::new(),
               buffered_bytes: 0,
-              eof_sent: false,
               attempts: std::mem::take(&mut attempts),
             },
             Err(e) => {
@@ -465,6 +568,7 @@ impl VideoDecoder {
             pending_frames: VecDeque::new(),
             max_probe_pending_bytes: DEFAULT_MAX_PROBE_PENDING_BYTES,
             frame_limits: limits,
+            eof_sent: false,
           });
         }
         Err(e) => {
@@ -513,6 +617,72 @@ impl VideoDecoder {
       pending_frames: VecDeque::new(),
       max_probe_pending_bytes: DEFAULT_MAX_PROBE_PENDING_BYTES,
       frame_limits: limits,
+      eof_sent: false,
+    })
+  }
+
+  /// Builds a decoder around a **software** `ffmpeg::decoder::Video`,
+  /// for tests that need [`VideoDecoder`]'s own send/receive arms driven
+  /// against real libavcodec.
+  ///
+  /// **Why this exists.** Those arms classify libavcodec's flow control
+  /// themselves, and the only other way to reach them is
+  /// [`VideoDecoder::open`], which needs a working hardware backend and
+  /// a sample file — so every existing lane through them is
+  /// `#[ignore]`-gated and runs nowhere. A regression that never runs is
+  /// a claim, not a check. This keeps the arms, the probe state and the
+  /// funnels exactly as production builds them and swaps only the
+  /// backend behind `state.inner`, which is the one thing a test cannot
+  /// otherwise supply.
+  ///
+  /// `auditioning` opens the probe window with **no backends left to
+  /// try**, which is what makes the candidate-failure road observable:
+  /// `advance_probe` has nowhere to advance to, so it surfaces
+  /// [`Error::AllBackendsFailed`] and a lane can tell "the probe road
+  /// was taken" from "a status was answered". Passing `false` leaves the
+  /// probe collapsed, for lanes that mean to exercise a committed
+  /// backend.
+  ///
+  /// The `backend` label is cosmetic here — it is read only for the
+  /// attempt log and [`Self::backend`], neither of which a software
+  /// decoder reaches — and `hw_device_ref` is null, which
+  /// [`DecoderState`]'s `Drop` already handles.
+  #[cfg(test)]
+  pub(crate) fn from_software_for_test(
+    parameters: codec::Parameters,
+    limits: crate::limits::DecoderLimits,
+    auditioning: bool,
+  ) -> Result<Self> {
+    let codec = find_decoder(&parameters)?;
+    let (ctx, callback_state) = build_codec_context(&parameters, limits)?;
+    let opened = ctx.decoder().open_as(codec).map_err(Error::Ffmpeg)?;
+    ensure_video_codec_type(&opened)?;
+    let state = DecoderState {
+      inner: ManuallyDrop::new(ffmpeg_next::decoder::Video(opened)),
+      backend: backend::probe_order()
+        .first()
+        .copied()
+        .unwrap_or(Backend::VideoToolbox),
+      hw_device_ref: ptr::null_mut(),
+      callback_state: Box::into_raw(callback_state),
+    };
+    let probe = auditioning.then(|| ProbeState {
+      parameters: try_clone_parameters(&parameters, limits.max_codec_parameter_bytes())
+        .expect("a clonable parameter set"),
+      codec,
+      remaining_backends: Vec::new(),
+      buffered_packets: Vec::new(),
+      buffered_bytes: 0,
+      attempts: Vec::new(),
+    });
+    Ok(Self {
+      state,
+      hw_frame: alloc_av_frame().map_err(Error::Ffmpeg)?,
+      probe,
+      pending_frames: VecDeque::new(),
+      max_probe_pending_bytes: DEFAULT_MAX_PROBE_PENDING_BYTES,
+      frame_limits: limits,
+      eof_sent: false,
     })
   }
 
@@ -573,17 +743,123 @@ impl VideoDecoder {
   /// underlying FFmpeg error. `unconsumed_packets` is empty: the probe
   /// buffer is gone after commit, so the wrapper's rolling
   /// since-last-keyframe buffer supplies the replay set.
-  fn post_commit_hw_failure(&self, e: ffmpeg_next::Error) -> Error {
-    // Through the funnel: this is the exit a decoder with no probe
-    // takes, and it used to wrap FFmpeg's error raw.
-    let inner = self.hw_exit(Error::Ffmpeg(e));
+  ///
+  /// # `reason` is the funnel's verdict, and this does not mint another
+  ///
+  /// It used to call [`Self::hw_exit`] itself, which was right while it
+  /// was the *first* funnel on its road and wrong the moment it was the
+  /// second. On the receive road the verdict is minted at the top of the
+  /// arm, and `hw_exit` **consumes** the latch it reads — so a second
+  /// call finds nothing and records the raw errno libavcodec reported,
+  /// throwing away the refusal that had already been collected. A
+  /// caller's attempt log then blamed `InvalidData` for a coded surface
+  /// this crate declined over a configured ceiling.
+  ///
+  /// So the verdict is minted once, by whichever funnel is first on the
+  /// road, and threaded from there. See the doors' invariant on
+  /// [`software_receive`].
+  /// Mints a verdict for a road that holds none yet, then routes it.
+  ///
+  /// The funnel runs **exactly once** here, which is the law the doors
+  /// carry: see the invariant on [`software_receive`]. Roads that have
+  /// already minted (the receive arm) call [`Self::hw_route`] straight.
+  fn hw_failure(&self, e: ffmpeg_next::Error, bare: BareVerdict) -> HwRoute {
+    self.hw_route(self.hw_exit(Error::Ffmpeg(e)), e, bare)
+  }
+
+  /// How a funnel verdict routes, before the road's own reading of an
+  /// unnamed one applies.
+  ///
+  /// **Exhaustive on purpose, and with no wildcard.** A `_ => false`
+  /// stood here and was a hazard rather than a convenience: a future
+  /// named verdict that *did* require a fallback would inherit the
+  /// silence and be reported plain, which is a bug that compiles. The
+  /// match is total over this crate's own error vocabulary, so adding an
+  /// arm forces whoever adds it to say how it routes.
+  fn verdict_routing(reason: &Error) -> VerdictRouting {
+    match reason {
+      // The hardware pool declined the coded surface. Software is not
+      // subject to that ceiling, and neither is the next backend.
+      Error::HwSurfaceTooLarge(_) => VerdictRouting::CandidateFailed,
+      // Software would decode the same oversized frame and be refused
+      // by the same ceiling; so would the next backend. A fallback here
+      // invites an action that cannot succeed.
+      Error::FrameBudgetExceeded(_) => VerdictRouting::Direct,
+      // The funnel handed its fallback straight back: nothing was named,
+      // so the errno is all there is and the road decides.
+      Error::Ffmpeg(_) => VerdictRouting::Unnamed,
+      // None of these can leave a funnel — `hw_exit` mints only the two
+      // refusals above or returns its argument — and each is already a
+      // decided fact that did not ask for a backend to be retried. They
+      // are listed rather than swept up so a twelfth arm cannot join
+      // them silently.
+      Error::PacketBuild(_)
+      | Error::ParametersTooLarge(_)
+      | Error::NoCodec(_)
+      | Error::HwTransferTooLarge(_)
+      | Error::BackendUnsupportedByCodec(_)
+      | Error::HwDeviceInitFailed(_)
+      | Error::AllBackendsFailed(_)
+      | Error::FallbackFailed(_) => VerdictRouting::Direct,
+    }
+  }
+
+  /// Whether a post-commit failure means the hardware backend cannot
+  /// decode this content, so the wrapper must open a software decoder.
+  ///
+  /// A named verdict outranks the raw errno in **both** directions: a
+  /// name that says no is as binding as one that says yes, and the errno
+  /// is consulted only where nothing was named. See
+  /// [`Self::verdict_routing`].
+  fn fallback_required(reason: &Error, raw: ffmpeg_next::Error) -> bool {
+    match Self::verdict_routing(reason) {
+      VerdictRouting::CandidateFailed => true,
+      VerdictRouting::Direct => false,
+      VerdictRouting::Unnamed => is_hw_decode_failure(&raw),
+    }
+  }
+
+  /// **One policy for what a funnelled hardware failure means, shared by
+  /// every road that can produce one.**
+  ///
+  /// The send roads used to return their funnel's result the moment they
+  /// had it. That was right for a flow signal and wrong for anything
+  /// else: `hw_send` can mint [`Error::HwSurfaceTooLarge`], and returning
+  /// it plain meant the wrapper — which opens software only on
+  /// [`Error::AllBackendsFailed`] — simply stopped, and a probe still
+  /// auditioning never advanced past the candidate that had just
+  /// declined the surface.
+  ///
+  /// So minting and routing are one move now, and the receive road's
+  /// policy is the policy. What differs between roads is only what an
+  /// *unnamed* verdict means, which is why [`BareVerdict`] is a
+  /// parameter rather than an assumption.
+  fn hw_route(&self, reason: Error, raw: ffmpeg_next::Error, bare: BareVerdict) -> HwRoute {
+    let candidate_failed = match Self::verdict_routing(&reason) {
+      VerdictRouting::CandidateFailed => true,
+      VerdictRouting::Direct => false,
+      VerdictRouting::Unnamed => matches!(bare, BareVerdict::CandidateFailure),
+    };
+    if !candidate_failed {
+      return HwRoute::Report(reason);
+    }
+    if self.probe.is_some() {
+      return HwRoute::Advance(reason);
+    }
+    if Self::fallback_required(&reason, raw) {
+      return HwRoute::Report(self.post_commit_hw_failure(reason));
+    }
+    HwRoute::Report(reason)
+  }
+
+  fn post_commit_hw_failure(&self, reason: Error) -> Error {
     // `new_post_commit` stamps `FallbackOrigin::PostCommit`: the wrapper
     // routes its replay on that explicit signal, not on the (here-empty)
     // `unconsumed_packets`, which a probe-era first-packet cap trip also
     // leaves empty.
     Error::AllBackendsFailed(AllBackendsFailed::new_post_commit(vec![(
       self.state.backend,
-      Box::new(inner),
+      Box::new(reason),
     )]))
   }
 
@@ -602,12 +878,31 @@ impl VideoDecoder {
     self.probe.is_some()
   }
 
+  /// **Where this session is, derived here and nowhere else.**
+  ///
+  /// The two latches this reads — whether a backend is still on trial,
+  /// and whether an end has been recorded — are the only inputs any
+  /// classification question has ever needed. Reading them at the point
+  /// of a decision is what let the roads disagree; reading them once,
+  /// here, is what stops it.
+  pub(crate) const fn phase(&self) -> SessionPhase {
+    match (self.probe.is_some(), self.eof_sent) {
+      (false, false) => SessionPhase::Streaming,
+      (false, true) => SessionPhase::Draining,
+      (true, false) => SessionPhase::Auditioning,
+      (true, true) => SessionPhase::AuditioningPastEnd,
+    }
+  }
+
   /// Submit a packet to the decoder.
   ///
   /// On success — and only on success — the packet is buffered for potential
-  /// replay through a fallback backend while the probe is active. EAGAIN
-  /// (decoder needs `receive_frame` to drain output first) propagates as
-  /// normal backpressure; the caller drains then retries.
+  /// replay through a fallback backend while the probe is active. `EAGAIN`
+  /// (the decoder needs `receive_frame` to drain output first) is
+  /// [`Sent::MustDrain`]: nothing was consumed, so the caller drains and
+  /// offers the same packet again. `AVERROR_EOF` is **not** back pressure
+  /// on this face — it means this decoder was already told the stream
+  /// ended — so it stays a fault. See [`send_status`].
   ///
   /// While the probe is active, a non-transient error (e.g. the active HW
   /// backend rejecting this stream's geometry on first packet) advances the
@@ -632,8 +927,11 @@ impl VideoDecoder {
   /// software decoder of choice. The post-probe path (after the first
   /// frame, when `self.probe` is `None`) skips this pre-flight
   /// entirely.
-  pub fn send_packet(&mut self, packet: &Packet) -> Result<()> {
+  pub fn send_packet(&mut self, packet: &Packet) -> Result<Sent> {
     loop {
+      // Re-read each iteration: a probe advance moves this session from
+      // one phase to another underneath the loop.
+      let phase = self.phase();
       // Pre-flight while probe is active: prove we can record this
       // packet for replay BEFORE the active decoder consumes it.
       // `staged_clone` carries the refcounted clone and the new
@@ -720,34 +1018,59 @@ impl VideoDecoder {
               probe.buffered_bytes = new_bytes;
             }
           }
-          return Ok(());
+          return Ok(Sent::Accepted);
         }
-        Err(e) if is_transient(&e) => {
-          // EAGAIN / EOF backpressure — pass through unchanged. The
-          // staged clone drops; the caller will retry after draining
-          // and we'll re-clone at the top of the loop.
-          return Err(Error::Ffmpeg(e));
-        }
-        Err(e) => {
-          if self.probe.is_some() {
-            // advance_probe consumes the error into `attempts` and
-            // either installs a candidate (Ok — loop top re-clones for
-            // the new candidate) or surfaces AllBackendsFailed (Err —
-            // `?` propagates). Either way the staged clone we just
-            // built drops without entering history; the next iteration
-            // clones afresh against the new active state.
-            self.advance_probe(Error::Ffmpeg(e))?;
+        // **libavcodec's send-side flow control, guarded here and read
+        // through the funnel — the same door the software road uses.**
+        //
+        // The guard and the classification are two different questions
+        // and they get two different answers. `is_transient` decides
+        // *whether the probe may advance*: neither `EAGAIN` nor
+        // `AVERROR_EOF` is a candidate failing, so both are taken here,
+        // ahead of the failure road, exactly as this one guard always
+        // took them. `send_status` then decides *which* of the two this
+        // is — back pressure or the double-EOF fault — and that
+        // decision is not written here at all, so this arm cannot drift
+        // away from the road the software decoders take. The staged
+        // clone drops; the caller drains and re-offers, and we re-clone
+        // at the top of the loop.
+        //
+        // It reads the errno through [`Self::hw_send`] rather than
+        // classifying it raw: a refusal this crate latched during the
+        // submission — `get_format` declining a coded surface as the
+        // decoder configures on its first packet — must be what the
+        // caller is told, not the `EAGAIN` libavcodec reported over the
+        // top of it.
+        // **Mint, then route — not mint and return.** A flow signal
+        // leaves immediately; anything else is a verdict, and a verdict
+        // that names a declined surface has to reach the probe or the
+        // fallback rather than exiting plain. `BareVerdict::Reported`
+        // is the road's own reading of an *unnamed* verdict here: the
+        // double-EOF is the caller's fault, not the candidate's, so the
+        // probe must not advance on it.
+        Err(e) if is_transient(&e) => match self.hw_send(e, phase) {
+          Ok(status) => return Ok(status),
+          Err(reason) => match self.hw_route(reason, e, BareVerdict::Reported) {
+            HwRoute::Report(err) => return Err(err),
+            HwRoute::Advance(err) => {
+              self.advance_probe(err)?;
+              continue;
+            }
+          },
+        },
+        // A real failure. Minted once and routed by the shared policy:
+        // while a candidate is on trial this is that candidate failing,
+        // so `advance_probe` consumes the reason into `attempts` and
+        // either installs the next candidate or surfaces
+        // `AllBackendsFailed`. Any staged clone drops without entering
+        // history; the next iteration clones afresh.
+        Err(e) => match self.hw_failure(e, BareVerdict::CandidateFailure) {
+          HwRoute::Report(err) => return Err(err),
+          HwRoute::Advance(err) => {
+            self.advance_probe(err)?;
             continue;
           }
-          // Post-commit (probe gone): the committed HW backend just failed
-          // at runtime. A HW-only decoder's non-transient, non-EOF error
-          // means the backend can't decode this content — reclassify to
-          // AllBackendsFailed so the wrapper falls back to software.
-          if is_hw_decode_failure(&e) {
-            return Err(self.post_commit_hw_failure(e));
-          }
-          return Err(Error::Ffmpeg(e));
-        }
+        },
       }
     }
   }
@@ -757,29 +1080,40 @@ impl VideoDecoder {
   /// Recorded for replay only if the underlying `send_eof` succeeds. While
   /// the probe is active, non-transient errors trigger probe advance and
   /// retry, matching `send_packet`'s behaviour.
-  pub fn send_eof(&mut self) -> Result<()> {
+  ///
+  /// Answers [`Sent::MustDrain`] on `EAGAIN` — the end-of-stream was
+  /// **not** recorded, so drain and signal again. A second EOF is a
+  /// caller fault and stays one; see [`send_status`].
+  pub fn send_eof(&mut self) -> Result<Sent> {
     loop {
+      // Re-read each iteration: a probe advance moves this session from
+      // one phase to another underneath the loop.
+      let phase = self.phase();
       match self.state.inner.send_eof() {
         Ok(()) => {
-          if let Some(probe) = self.probe.as_mut() {
-            probe.eof_sent = true;
-          }
-          return Ok(());
+          self.eof_sent = true;
+          return Ok(Sent::Accepted);
         }
-        Err(e) if is_transient(&e) => return Err(Error::Ffmpeg(e)),
-        Err(e) => {
-          if self.probe.is_some() {
-            self.advance_probe(Error::Ffmpeg(e))?;
+        // The same guard, the same door and the same routing as
+        // `send_packet`; see the note there.
+        Err(e) if is_transient(&e) => match self.hw_send(e, phase) {
+          Ok(status) => return Ok(status),
+          Err(reason) => match self.hw_route(reason, e, BareVerdict::Reported) {
+            HwRoute::Report(err) => return Err(err),
+            HwRoute::Advance(err) => {
+              self.advance_probe(err)?;
+              continue;
+            }
+          },
+        },
+        // The same shared policy; see `send_packet`.
+        Err(e) => match self.hw_failure(e, BareVerdict::CandidateFailure) {
+          HwRoute::Report(err) => return Err(err),
+          HwRoute::Advance(err) => {
+            self.advance_probe(err)?;
             continue;
           }
-          // Post-commit: committed HW backend failed draining at EOF.
-          // Reclassify a HW-decode failure so the wrapper falls back to SW
-          // (the SW decoder will re-receive the buffered GOP + EOF).
-          if is_hw_decode_failure(&e) {
-            return Err(self.post_commit_hw_failure(e));
-          }
-          return Err(Error::Ffmpeg(e));
-        }
+        },
       }
     }
   }
@@ -806,58 +1140,79 @@ impl VideoDecoder {
   /// backend attempt log so the caller can branch into a software
   /// decoder of their choice.
   ///
-  /// Returns the same transient signals as `ffmpeg::decoder::Video`:
-  /// `Error::Ffmpeg(Other { errno: EAGAIN })` when no frame is ready and
-  /// more packets must be sent, and `Error::Ffmpeg(Eof)` once fully drained.
-  pub fn receive_frame(&mut self, frame: &mut Frame) -> Result<()> {
+  /// Answers the same three states `ffmpeg::decoder::Video` does, in
+  /// the shape the trait tier publishes: [`Received::NeedsInput`] where
+  /// libavcodec says `EAGAIN`, [`Received::Ended`] where it says `EOF`,
+  /// and [`Received::Frame`] when `frame` was written. **The errno
+  /// stops here** — the two flow signals never leave this crate as
+  /// `Error::Ffmpeg`, so a caller has nothing to decode.
+  pub fn receive_frame(&mut self, frame: &mut Frame) -> Result<Received> {
     // Pre-drain frames queued during probe replay. They are already CPU-side
     // (transferred at drain time, when the candidate's HW context was alive)
     // so we just move them into the caller's slot.
     if self.try_pop_pending(frame) {
-      return Ok(());
+      return Ok(Received::Frame);
     }
 
     loop {
+      // Re-read each iteration: a probe advance moves this session from
+      // one phase to another underneath the loop.
+      let phase = self.phase();
       let res = self.state.inner.receive_frame(&mut self.hw_frame);
       match res {
         Err(e) => {
-          // EAGAIN is normal backpressure — pass through unconditionally.
-          if is_eagain(&e) {
-            return Err(Error::Ffmpeg(e));
-          }
-          // EOF (and every other non-transient error): if we are still
-          // probing, treat it as candidate failure — a backend that drains
-          // to EOF without ever producing a frame should not silently
-          // present as "stream over" to the caller. Advance and retry; if
-          // every backend has been exhausted, advance_probe surfaces
-          // AllBackendsFailed and `?` propagates it.
-          if self.probe.is_some() {
-            self.advance_probe(Error::Ffmpeg(e))?;
-            // Probe advance may have populated `pending_frames`; deliver
-            // one of those before reading more from the new candidate.
-            if self.try_pop_pending(frame) {
-              return Ok(());
+          // **The phase decides whether this errno is a protocol state
+          // at all, and this arm holds no opinion of its own.**
+          //
+          // `EAGAIN` used to short-circuit here unconditionally, which
+          // was right for three of the four phases and quietly wrong for
+          // the fourth: a candidate that has been replayed the whole
+          // history *including the end* and still answers "nothing yet"
+          // has produced zero frames and never will. Answering the
+          // caller `NeedsInput` there asked for input nothing could
+          // supply; answering `Ended` would have credited a backend that
+          // never decoded a thing. It is a candidate failing, and the
+          // classifier says so by handing it back — straight into the
+          // probe road below, which is where candidate failures have
+          // always gone.
+          //
+          // **And it reads the errno through the funnel, which is the
+          // law this road lost and got back.** A `get_format`
+          // declination or an allocator-judge refusal sits in the
+          // callback state waiting to be collected; classifying the raw
+          // errno first answers `Ended` or `NeedsInput` for a frame this
+          // crate itself declined, and the reason dies unread. The
+          // funnel is no longer a step to remember — [`Self::hw_receive`]
+          // is the only way in, and the classifiers are private to this
+          // module so no road can take a shortcut past it.
+          let reason = match self.hw_receive(e, phase) {
+            Ok(status) => return Ok(status),
+            // The funnel's verdict: the latched refusal when there was
+            // one, the original error when there was not. It travels
+            // onward as it is — rebuilding `Error::Ffmpeg(e)` here would
+            // throw away the collection that just happened.
+            Err(reason) => reason,
+          };
+          // **The same shared policy every hardware road uses.** This
+          // road mints its own verdict (above), so it routes rather than
+          // minting again. `CandidateFailure` is its reading of an
+          // unnamed verdict: a candidate that drains to `EOF` without
+          // ever producing a frame is a candidate failing, not a stream
+          // ending — which is why this road hands `AVERROR_EOF` to the
+          // probe while the send roads report it.
+          match self.hw_route(reason, e, BareVerdict::CandidateFailure) {
+            HwRoute::Report(err) => return Err(err),
+            HwRoute::Advance(err) => {
+              self.advance_probe(err)?;
+              // Probe advance may have populated `pending_frames`;
+              // deliver one of those before reading more from the new
+              // candidate.
+              if self.try_pop_pending(frame) {
+                return Ok(Received::Frame);
+              }
+              continue;
             }
-            continue;
           }
-          // Probe collapsed already. A non-transient, non-EOF error from the
-          // committed HW backend is a runtime HW-decode failure — reclassify
-          // to AllBackendsFailed so the wrapper falls back to software.
-          // `is_hw_decode_failure` excludes EOF, so a genuine end-of-stream
-          // still propagates as `Error::Ffmpeg(Eof)` (never trapped in an
-          // infinite fallback-retry loop).
-          if is_hw_decode_failure(&e) {
-            return Err(self.post_commit_hw_failure(e));
-          }
-          // **Including EOF, which on this road can be a refusal.**
-          // `is_hw_decode_failure` deliberately excludes EOF so a
-          // genuinely drained stream is not trapped in a fallback loop
-          // — but a `get_format` declination leaves the decoder drained
-          // too, and reporting that as "stream over" is the quietest
-          // wrong answer of the set. The funnel tells the two apart:
-          // it answers with the recorded refusal when there is one, and
-          // with the end of the stream when there is not.
-          return Err(self.hw_exit(Error::Ffmpeg(e)));
         }
         Ok(()) => {
           // Always attempt the HW→CPU transfer. With strict `get_format`,
@@ -890,25 +1245,25 @@ impl VideoDecoder {
           match unsafe { transfer_hw_frame(frame, &mut self.hw_frame) } {
             Ok(()) => {
               self.probe = None;
-              return Ok(());
+              return Ok(Received::Frame);
             }
             Err(e) => {
-              if self.probe.is_some() {
-                self.advance_probe(Error::Ffmpeg(e))?;
-                unsafe { av_frame_unref(frame.as_inner_mut().as_mut_ptr()) };
-                if self.try_pop_pending(frame) {
-                  return Ok(());
+              // The same shared policy. A transfer failure is an
+              // HW-output problem — an unsupported CPU pix_fmt surfaces
+              // as `AVERROR(EINVAL)`, a context loss as Bug/Bug2/Unknown
+              // — never input corruption, so while a candidate is on
+              // trial it is that candidate failing.
+              match self.hw_failure(e, BareVerdict::CandidateFailure) {
+                HwRoute::Report(err) => return Err(err),
+                HwRoute::Advance(err) => {
+                  self.advance_probe(err)?;
+                  unsafe { av_frame_unref(frame.as_inner_mut().as_mut_ptr()) };
+                  if self.try_pop_pending(frame) {
+                    return Ok(Received::Frame);
+                  }
+                  continue;
                 }
-                continue;
               }
-              // Post-commit transfer failure: an unsupported CPU output
-              // pix_fmt surfaces as AVERROR(EINVAL) and a context-loss as
-              // Bug/Bug2/Unknown — all HW-output problems, never input
-              // corruption. Reclassify so the wrapper falls back to software.
-              if is_hw_decode_failure(&e) {
-                return Err(self.post_commit_hw_failure(e));
-              }
-              return Err(Error::Ffmpeg(e));
             }
           }
         }
@@ -948,10 +1303,11 @@ impl VideoDecoder {
     // for an already-empty frame.
     unsafe { av_frame_unref(self.hw_frame.as_mut_ptr()) };
     self.pending_frames.clear();
+    // The end belongs to the position being abandoned.
+    self.eof_sent = false;
     if let Some(probe) = self.probe.as_mut() {
       probe.buffered_packets.clear();
       probe.buffered_bytes = 0;
-      probe.eof_sent = false;
     }
   }
 
@@ -979,6 +1335,23 @@ impl VideoDecoder {
   /// restructured; a single funnel that every exit *must* call is the
   /// only version of this that stays true. The per-road table in
   /// `decoder/tests.rs` is what checks that it did.
+  /// The hardware road's funnel-and-classify entry — [`software_receive`]'s
+  /// twin, and the same law: what a caller reads is what the funnel
+  /// found, never the errno that reached it.
+  ///
+  /// Answers `Err` with the funnel's verdict, which is the latched
+  /// refusal when there was one. Callers route *that* value onward
+  /// rather than rebuilding the raw error, or the collection is undone
+  /// the moment it is used.
+  fn hw_receive(&self, e: ffmpeg_next::Error, phase: SessionPhase) -> Result<Received> {
+    receive_status(self.hw_exit(Error::Ffmpeg(e)), phase)
+  }
+
+  /// The send road's half of [`Self::hw_receive`].
+  fn hw_send(&self, e: ffmpeg_next::Error, phase: SessionPhase) -> Result<Sent> {
+    send_status(self.hw_exit(Error::Ffmpeg(e)), phase)
+  }
+
   fn hw_exit(&self, fallback: Error) -> Error {
     self
       .take_ceiling_declination()
@@ -1025,6 +1398,15 @@ impl VideoDecoder {
     // this crate declined it over the coded surface's size. The
     // callback leaves the real reason in its own state; this is where
     // it becomes the error the caller reads.
+    // **Mint or no-op, and never a re-derivation.** Three of this
+    // method's callers hand it a raw `Error::Ffmpeg` — no funnel has run
+    // on their roads — so this is where their verdict is minted. The
+    // receive road hands it one already minted, and this call then finds
+    // the latch empty and returns its argument unchanged: `hw_exit`
+    // answers with the recorded refusal when there is one and with its
+    // fallback when there is not, so a verdict passed in comes back out.
+    // Either way the caller's reason is what gets recorded. See the
+    // invariant on [`software_receive`].
     let last_error = self.hw_exit(last_error);
     match self.probe.as_mut() {
       Some(probe) => probe.attempts.push((active_backend, Box::new(last_error))),
@@ -1038,6 +1420,11 @@ impl VideoDecoder {
     // also keeps `pending_frames` from accumulating frames from multiple
     // rejected backends.)
     self.pending_frames.clear();
+    // Read before any `probe` borrow: the end is the *decoder's* fact
+    // now, not the probe's, and a candidate must be handed it along
+    // with the replayed history or it will sit at `EAGAIN` forever on a
+    // stream that is already over.
+    let eof_sent = self.eof_sent;
 
     loop {
       // Snapshot inputs without mutating probe state. Use the checked
@@ -1173,7 +1560,7 @@ impl VideoDecoder {
             }
           }
         }
-        if r.is_ok() && probe.eof_sent {
+        if r.is_ok() && eof_sent {
           // `avcodec_send_packet(NULL)` (which `send_eof` becomes) can
           // return EAGAIN with the same drain-output-first semantics as
           // a regular send_packet. Loop drain+retry instead of failing
@@ -1808,10 +2195,103 @@ unsafe fn copy_frame_props_minimal(
   Ok(())
 }
 
-/// `EAGAIN` and `EOF` are normal flow signals from `avcodec_receive_frame`
-/// and must not be treated as backend failures.
+/// `EAGAIN` and `EOF` together: "this decoder has no more output for
+/// now", either because it wants input or because it is finished.
+///
+/// **What is left of a predicate that used to guard both roads.** Both
+/// public faces classify at their boundary now — [`receive_status`] and
+/// [`send_status`] — and the send face had to stop treating the two
+/// alike, since `AVERROR_EOF` there is a caller fault rather than a
+/// state. The one caller that still wants them together is
+/// [`drain_into_pending`], the probe-replay drain: it reads a raw
+/// `ffmpeg_next::decoder::Video` that never crosses a public seam, and
+/// for it "wants input" and "finished" really are one answer — stop
+/// draining, the candidate produced everything it is going to.
 fn is_transient(e: &ffmpeg_next::Error) -> bool {
   is_eagain(e) || matches!(e, ffmpeg_next::Error::Eof)
+}
+
+/// **The receive road's single errno gate, and it cannot be spent
+/// without saying where the session is.**
+///
+/// Turns what a funnel (`software_exit` / `hw_exit`) handed back into
+/// the trait's status vocabulary, keeping the two flow signals inside
+/// this crate.
+///
+/// Takes the funnel's *output*, never libavcodec's raw error, and that
+/// ordering is the point: the funnels collect a `get_format` or
+/// allocator-judge refusal that the callback state is holding, and a
+/// classifier placed in front of them would answer "needs input" for a
+/// road that had a named refusal waiting. So every receive site funnels
+/// first and gates second.
+///
+/// # Why the phase is a parameter and not a guess
+///
+/// The same errno means different things at different points in a
+/// session's life, and every road that guessed guessed differently:
+///
+/// * `EAGAIN` is [`Received::NeedsInput`] only where more input can
+///   arrive. Past a recorded end it is an instruction the caller cannot
+///   carry out — the send gates refuse — so it is the end instead. And
+///   on a candidate that has already been handed the whole history
+///   including the end, it is neither: that candidate has produced no
+///   frame and never will, which is a candidate failing, so it goes
+///   back as an error for the probe machinery to act on.
+/// * `AVERROR_EOF` is [`Received::Ended`] only from a backend that has
+///   committed. A candidate's is its own exhaustion, not the stream's.
+///
+/// Making the phase an argument is what stops a road from having an
+/// opinion about this. A classification without it does not compile.
+fn receive_status(e: Error, phase: SessionPhase) -> Result<Received> {
+  match &e {
+    Error::Ffmpeg(f) if is_eagain(f) => {
+      if phase.accepts_input() {
+        Ok(Received::NeedsInput)
+      } else if phase.is_committed() {
+        // Draining. A committed backend with nothing more to give has
+        // ended, whichever errno it chose — libavcodec is not supposed
+        // to answer `EAGAIN` after a flush packet, but this crate has
+        // met a codec that does (see `ImageDecodeError::NoImage`), and
+        // the alternative is handing back a state nothing can satisfy.
+        Ok(Received::Ended)
+      } else {
+        // `AuditioningPastEnd`: a candidate that has been given
+        // everything and produced nothing. The probe road owns it.
+        Err(e)
+      }
+    }
+    Error::Ffmpeg(ffmpeg_next::Error::Eof) if phase.is_committed() => Ok(Received::Ended),
+    _ => Err(e),
+  }
+}
+
+/// **The send road's gate, and it is deliberately narrower than its
+/// sibling.** Only `EAGAIN` is back pressure here.
+///
+/// `avcodec_send_packet` answers `AVERROR_EOF` for a different fact than
+/// `avcodec_receive_frame` does: not "the stream is over" but *"this
+/// decoder has already been told the stream is over, and you sent
+/// something anyway"* — a caller usage fault rather than a session
+/// state, so it stays in `Err`. Reading it as `Accepted` would silently
+/// drop the submission; reading it as `MustDrain` would send the caller
+/// into a drain loop that can never make the next offer succeed.
+///
+/// The same line puts [`crate::ResampleError::AfterEof`] and the
+/// WebCodecs adapter's `AfterEof` on the error side.
+///
+/// # The phase, here too
+///
+/// [`Sent::MustDrain`] is a promise — *drain, and this same offer
+/// becomes acceptable* — and past a recorded end it is one no session
+/// can keep. The send gates refuse there first, so this is the second
+/// lock rather than the first; what it buys is that the classifier
+/// itself becomes incapable of making the promise, which is the whole
+/// point of moving the phase into the signature.
+fn send_status(e: Error, phase: SessionPhase) -> Result<Sent> {
+  match &e {
+    Error::Ffmpeg(f) if is_eagain(f) && phase.accepts_input() => Ok(Sent::MustDrain),
+    _ => Err(e),
+  }
 }
 
 /// Post-commit, a HW-only decoder's non-transient, non-EOF error means the
@@ -1821,12 +2301,15 @@ fn is_transient(e: &ffmpeg_next::Error) -> bool {
 /// Bug/Bug2/Unknown. Broad-by-design (decode-all-kinds); fixtures will let us
 /// narrow if a real backend proves a code should NOT trigger fallback.
 ///
-/// `EAGAIN`/`EOF` are deliberately excluded by the caller (each call site
-/// guards on `is_transient` first): `EAGAIN` is backpressure and `EOF` is a
-/// genuine end-of-stream that must propagate, never be trapped in an infinite
-/// fallback-retry loop. `Other { errno: EINVAL }` from the HW→CPU transfer
-/// path is also covered — an unsupported CPU output pix_fmt is a HW-output
-/// problem, never input corruption.
+/// `EAGAIN`/`EOF` are deliberately excluded by the caller, which guards on
+/// them first — on the send roads through [`is_transient`] into
+/// [`send_status`], and on `receive_frame` through [`is_eagain`] into
+/// [`receive_status`], plus the probe/`hw_exit` road for `EOF`. `EAGAIN` is back pressure and `EOF` is a
+/// genuine end-of-stream that must reach the caller as
+/// [`Received::Ended`], never be trapped in an infinite fallback-retry
+/// loop. `Other { errno: EINVAL }` from the HW→CPU transfer path is also
+/// covered — an unsupported CPU output pix_fmt is a HW-output problem,
+/// never input corruption.
 fn is_hw_decode_failure(e: &ffmpeg_next::Error) -> bool {
   matches!(
     e,
@@ -2697,6 +3180,68 @@ fn ceiling_declination_of(state: *const CallbackState) -> Option<Error> {
 /// `state` must be null or a live `CallbackState` the caller owns.
 pub(crate) fn software_exit(state: *const CallbackState, e: ffmpeg_next::Error) -> Error {
   frame_budget_declination_of(state).unwrap_or(Error::Ffmpeg(e))
+}
+
+/// **The software road's only way to read an errno — funnel and
+/// classify in one call, because the order between them is a law and
+/// laws that depend on remembering get broken.**
+///
+/// Every receive site used to write the two steps out: funnel, then
+/// classify. The R1 report called that ordering load-bearing and
+/// explained why — a `get_format` declination or an allocator-judge
+/// refusal sits in the callback state waiting to be collected, and a
+/// classifier that runs first reads the errno libavcodec reported
+/// instead of the refusal this crate made, answering `Ended` or
+/// `NeedsInput` for a frame that was declined. Then a restructure
+/// reordered one road and the law was simply gone, silently, because
+/// nothing enforced it.
+///
+/// So the classifiers are private to this module now and this is the
+/// door. A caller cannot classify a raw error because it cannot reach a
+/// classifier; the funnel is not something to remember to call first,
+/// it is the only thing there is to call.
+///
+/// # The verdict is minted once and threaded
+///
+/// **A funnel consumes what it collects.** `take_ceiling_declination`
+/// and `take_frame_budget_declination` both *clear* the latch they
+/// read, because a refusal reported twice would be a refusal invented
+/// once. That makes the verdict a one-shot value, and the rule that
+/// follows is the whole of this invariant:
+///
+/// > The first funnel on a road mints the verdict. Every later step on
+/// > that road **threads it**. A site that re-funnels, or that rebuilds
+/// > `Error::Ffmpeg(raw)` after a funnel has run, is the bug class —
+/// > the second call finds the latch empty and reports the errno the
+/// > substrate happened to give over the refusal this crate made.
+///
+/// A raw errno may still be *read* after minting — `is_hw_decode_failure`
+/// does, to decide whether a fallback is required — but reading it to
+/// decide a route is not the same as reporting it. What the caller is
+/// told is always the verdict.
+///
+/// # Safety
+///
+/// `state` must be null or a live [`CallbackState`] the caller owns.
+pub(crate) fn software_receive(
+  state: *const CallbackState,
+  e: ffmpeg_next::Error,
+  phase: SessionPhase,
+) -> Result<Received> {
+  receive_status(software_exit(state, e), phase)
+}
+
+/// The send road's half of [`software_receive`]. Same law, same door.
+///
+/// # Safety
+///
+/// `state` must be null or a live [`CallbackState`] the caller owns.
+pub(crate) fn software_send(
+  state: *const CallbackState,
+  e: ffmpeg_next::Error,
+  phase: SessionPhase,
+) -> Result<Sent> {
+  send_status(software_exit(state, e), phase)
 }
 
 /// Reads and clears a software frame-budget refusal left by

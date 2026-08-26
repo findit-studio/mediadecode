@@ -9,6 +9,7 @@
 
 use ffmpeg::{format, media};
 use ffmpeg_next as ffmpeg;
+use mediadecode::{Received, Sent};
 use mediadecode_ffmpeg::{Backend, Frame, VideoDecoder};
 
 const SAMPLE_ENV: &str = "HWDECODE_SAMPLE_VIDEO";
@@ -60,23 +61,22 @@ fn auto_probe_picks_hardware_backend() {
     // then retry send_packet.
     loop {
       match decoder.send_packet(&packet) {
-        Ok(()) => break,
-        Err(mediadecode_ffmpeg::Error::Ffmpeg(ffmpeg::Error::Other { errno }))
-          if errno == ffmpeg::error::EAGAIN =>
-        {
+        Ok(Sent::Accepted) => break,
+        // The two-offer rule, retired: the decoder says which it is,
+        // so this drains and re-offers the same packet instead of
+        // guessing that a second failure means damage.
+        Ok(Sent::MustDrain) => {
           match decoder.receive_frame(&mut frame) {
-            Ok(()) => {
+            Ok(Received::Frame) => {
               got_frame = true;
               log_first(&frame, &decoder);
               break 'outer;
             }
-            Err(mediadecode_ffmpeg::Error::Ffmpeg(ffmpeg::Error::Other { errno }))
-              if errno == ffmpeg::error::EAGAIN =>
-            {
-              // Defensive: per FFmpeg's send/receive contract, if
-              // send_packet returns EAGAIN then receive_frame should
-              // not. Retry send_packet anyway rather than spinning.
-            }
+            // Defensive: per FFmpeg's send/receive contract, if
+            // send_packet returns EAGAIN then receive_frame should not
+            // want input. Retry send_packet anyway rather than spinning.
+            Ok(Received::NeedsInput) => {}
+            Ok(Received::Ended) => break 'outer,
             Err(e) => panic!("receive_frame (drain): {e}"),
           }
         }
@@ -84,16 +84,13 @@ fn auto_probe_picks_hardware_backend() {
       }
     }
     match decoder.receive_frame(&mut frame) {
-      Ok(()) => {
+      Ok(Received::Frame) => {
         got_frame = true;
         log_first(&frame, &decoder);
         break;
       }
-      Err(mediadecode_ffmpeg::Error::Ffmpeg(ffmpeg::Error::Other { errno }))
-        if errno == ffmpeg::error::EAGAIN =>
-      {
-        continue;
-      }
+      Ok(Received::NeedsInput) => continue,
+      Ok(Received::Ended) => break,
       Err(e) => panic!("receive_frame: {e}"),
     }
   }

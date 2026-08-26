@@ -19,7 +19,7 @@ pub use super::local::{
 mod tests {
   use super::*;
   use crate::{
-    Timebase, Timestamp,
+    Received, Sent, Timebase, Timestamp,
     adapter::{AudioAdapter, ImageAdapter, SubtitleAdapter, VideoAdapter},
     demuxer::AttachmentPacket,
     frame::{AudioFrame, ImageFrame, SubtitleFrame, VideoFrame},
@@ -68,17 +68,17 @@ mod tests {
     type Buffer = &'static [u8];
     type Error = LoopError;
 
-    async fn send_packet(&mut self, _: &VideoPacket<(), &'static [u8]>) -> Result<(), LoopError> {
-      Ok(())
+    async fn send_packet(&mut self, _: &VideoPacket<(), &'static [u8]>) -> Result<Sent, LoopError> {
+      Ok(Sent::Accepted)
     }
     async fn receive_frame(
       &mut self,
       _: &mut VideoFrame<u32, (), &'static [u8]>,
-    ) -> Result<(), LoopError> {
-      Err(LoopError)
+    ) -> Result<Received, LoopError> {
+      Ok(Received::NeedsInput)
     }
-    async fn send_eof(&mut self) -> Result<(), LoopError> {
-      Ok(())
+    async fn send_eof(&mut self) -> Result<Sent, LoopError> {
+      Ok(Sent::Accepted)
     }
     async fn flush(&mut self) -> Result<(), LoopError> {
       Ok(())
@@ -118,17 +118,17 @@ mod tests {
     type Adapter = ALoop;
     type Buffer = &'static [u8];
     type Error = LoopError;
-    async fn send_packet(&mut self, _: &AudioPacket<(), &'static [u8]>) -> Result<(), LoopError> {
-      Ok(())
+    async fn send_packet(&mut self, _: &AudioPacket<(), &'static [u8]>) -> Result<Sent, LoopError> {
+      Ok(Sent::Accepted)
     }
     async fn receive_frame(
       &mut self,
       _: &mut AudioFrame<u32, u32, (), &'static [u8]>,
-    ) -> Result<(), LoopError> {
-      Err(LoopError)
+    ) -> Result<Received, LoopError> {
+      Ok(Received::NeedsInput)
     }
-    async fn send_eof(&mut self) -> Result<(), LoopError> {
-      Ok(())
+    async fn send_eof(&mut self) -> Result<Sent, LoopError> {
+      Ok(Sent::Accepted)
     }
     async fn flush(&mut self) -> Result<(), LoopError> {
       Ok(())
@@ -171,17 +171,17 @@ mod tests {
     async fn send_packet(
       &mut self,
       _: &SubtitlePacket<(), &'static [u8]>,
-    ) -> Result<(), LoopError> {
-      Ok(())
+    ) -> Result<Sent, LoopError> {
+      Ok(Sent::Accepted)
     }
     async fn receive_frame(
       &mut self,
       _: &mut SubtitleFrame<(), &'static [u8]>,
-    ) -> Result<(), LoopError> {
-      Err(LoopError)
+    ) -> Result<Received, LoopError> {
+      Ok(Received::NeedsInput)
     }
-    async fn send_eof(&mut self) -> Result<(), LoopError> {
-      Ok(())
+    async fn send_eof(&mut self) -> Result<Sent, LoopError> {
+      Ok(Sent::Accepted)
     }
     async fn flush(&mut self) -> Result<(), LoopError> {
       Ok(())

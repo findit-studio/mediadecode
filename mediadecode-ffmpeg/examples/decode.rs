@@ -6,6 +6,7 @@
 
 use ffmpeg::{format, media};
 use ffmpeg_next as ffmpeg;
+use mediadecode::{Received, Sent};
 use mediadecode_ffmpeg::{Frame, VideoDecoder};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -50,7 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
   let drain = |decoder: &mut VideoDecoder, frame: &mut Frame, count: &mut u64| loop {
     match decoder.receive_frame(frame) {
-      Ok(()) => {
+      Ok(Received::Frame) => {
         *count += 1;
         println!(
           "frame#{count} pts={:?} {}x{} pix_fmt={:?}",
@@ -60,12 +61,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
           frame.pix_fmt(),
         );
       }
-      Err(mediadecode_ffmpeg::Error::Ffmpeg(ffmpeg::Error::Other { errno }))
-        if errno == ffmpeg::error::EAGAIN =>
-      {
-        break;
-      }
-      Err(mediadecode_ffmpeg::Error::Ffmpeg(ffmpeg::Error::Eof)) => break,
+      // No errno to decode: the two flow signals arrive as states.
+      Ok(Received::NeedsInput | Received::Ended) => break,
       Err(e) => {
         eprintln!("decode error: {e}");
         break;
@@ -79,10 +76,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     loop {
       match decoder.send_packet(&packet) {
-        Ok(()) => break,
-        Err(mediadecode_ffmpeg::Error::Ffmpeg(ffmpeg::Error::Other { errno }))
-          if errno == ffmpeg::error::EAGAIN =>
-        {
+        Ok(Sent::Accepted) => break,
+        // Back pressure, named: drain and offer again. No errno
+        // to decode, and no second offer needed to find out.
+        Ok(Sent::MustDrain) => {
           drain(&mut decoder, &mut frame, &mut count);
         }
         Err(e) => return Err(e.into()),
@@ -92,10 +89,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   }
   loop {
     match decoder.send_eof() {
-      Ok(()) => break,
-      Err(mediadecode_ffmpeg::Error::Ffmpeg(ffmpeg::Error::Other { errno }))
-        if errno == ffmpeg::error::EAGAIN =>
-      {
+      Ok(Sent::Accepted) => break,
+      // Back pressure, named: drain and offer again. No errno
+      // to decode, and no second offer needed to find out.
+      Ok(Sent::MustDrain) => {
         drain(&mut decoder, &mut frame, &mut count);
       }
       Err(e) => return Err(e.into()),

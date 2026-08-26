@@ -16,6 +16,15 @@
 //! All four are mirrored under [`crate::future`] with `async fn`
 //! methods, in both the `!Send` and the `Send`-bounded variant.
 //!
+//! # What the two calls answer
+//!
+//! Every `send_packet` / `send_eof` here answers [`Sent`] — *accepted*
+//! or *must drain* — and every `receive_frame` answers [`Received`] —
+//! *a frame*, *needs input*, or *ended*. `Err` is reserved for faults
+//! on both faces. The rationale, and the reason those two vocabularies
+//! are exhaustive while the backends' error types are not, is on the
+//! [`rhythm`](crate::rhythm) module.
+//!
 //! # The buffer seat
 //!
 //! Every trait here carries a `Buffer` associated type bounded only by
@@ -34,7 +43,7 @@
 //! stance [`crate::demuxer::Demuxer`] takes for the same reason.
 
 use crate::{
-  Timebase, Timestamp,
+  Received, Sent, Timebase, Timestamp,
   adapter::{AudioAdapter, ImageAdapter, SubtitleAdapter, VideoAdapter},
   demuxer::AttachmentPacket,
   frame::{AudioFrame, ImageFrame, SubtitleFrame, VideoFrame},
@@ -55,13 +64,23 @@ pub trait VideoStreamDecoder {
   type Error;
 
   /// Submits one compressed packet.
+  ///
+  /// [`Sent::Accepted`] means the packet was consumed.
+  /// [`Sent::MustDrain`] means it was **not** — the session's output
+  /// must be drained through [`receive_frame`](Self::receive_frame)
+  /// and the same packet offered again. That is back pressure, not a
+  /// refusal, and it is why `Err` here can be read as a fault without
+  /// a second attempt.
   fn send_packet(
     &mut self,
     packet: &VideoPacket<<Self::Adapter as VideoAdapter>::PacketExtra, Self::Buffer>,
-  ) -> Result<(), Self::Error>;
+  ) -> Result<Sent, Self::Error>;
 
-  /// Drains one decoded frame into `dst`. Backends signal "no
-  /// frame ready" via a backend-specific `Error` variant.
+  /// Drains one decoded frame into `dst`.
+  ///
+  /// [`Received::Frame`] means `dst` was written.
+  /// [`Received::NeedsInput`] and [`Received::Ended`] are the protocol's
+  /// other two answers, and neither is an error — `Err` is a fault.
   fn receive_frame(
     &mut self,
     dst: &mut VideoFrame<
@@ -69,12 +88,19 @@ pub trait VideoStreamDecoder {
       <Self::Adapter as VideoAdapter>::FrameExtra,
       Self::Buffer,
     >,
-  ) -> Result<(), Self::Error>;
+  ) -> Result<Received, Self::Error>;
 
   /// Signals end-of-stream.
-  fn send_eof(&mut self) -> Result<(), Self::Error>;
+  ///
+  /// Answers [`Sent`] for the same reason
+  /// [`send_packet`](Self::send_packet) does: a session with undrained
+  /// output can be unable to take the signal yet, and
+  /// [`Sent::MustDrain`] means the end-of-stream was **not** recorded.
+  /// Drain and signal again.
+  fn send_eof(&mut self) -> Result<Sent, Self::Error>;
 
-  /// Flushes internal state.
+  /// Flushes internal state. Not a submission — nothing is offered, so
+  /// there is nothing to be back-pressured.
   fn flush(&mut self) -> Result<(), Self::Error>;
 }
 
@@ -122,12 +148,16 @@ pub trait AudioStreamDecoder {
   type Buffer: AsRef<[u8]>;
   /// Decoder-specific error.
   type Error;
-  /// Submits a compressed audio packet.
+  /// Submits a compressed audio packet. See
+  /// [`VideoStreamDecoder::send_packet`] — the two answers are the same
+  /// on every push face here.
   fn send_packet(
     &mut self,
     packet: &AudioPacket<<Self::Adapter as AudioAdapter>::PacketExtra, Self::Buffer>,
-  ) -> Result<(), Self::Error>;
-  /// Drains a decoded frame.
+  ) -> Result<Sent, Self::Error>;
+  /// Drains a decoded frame into `dst`. See
+  /// [`VideoStreamDecoder::receive_frame`] — the three answers are the
+  /// same on every push face here.
   fn receive_frame(
     &mut self,
     dst: &mut AudioFrame<
@@ -136,9 +166,9 @@ pub trait AudioStreamDecoder {
       <Self::Adapter as AudioAdapter>::FrameExtra,
       Self::Buffer,
     >,
-  ) -> Result<(), Self::Error>;
+  ) -> Result<Received, Self::Error>;
   /// Signals EOF.
-  fn send_eof(&mut self) -> Result<(), Self::Error>;
+  fn send_eof(&mut self) -> Result<Sent, Self::Error>;
   /// Flushes internal state.
   fn flush(&mut self) -> Result<(), Self::Error>;
 }
@@ -187,18 +217,26 @@ pub trait SubtitleDecoder {
   type Buffer: AsRef<[u8]>;
   /// Decoder-specific error.
   type Error;
-  /// Submits a compressed subtitle packet.
+  /// Submits a compressed subtitle packet. See
+  /// [`VideoStreamDecoder::send_packet`].
   fn send_packet(
     &mut self,
     packet: &SubtitlePacket<<Self::Adapter as SubtitleAdapter>::PacketExtra, Self::Buffer>,
-  ) -> Result<(), Self::Error>;
-  /// Drains a decoded subtitle frame.
+  ) -> Result<Sent, Self::Error>;
+  /// Drains a decoded subtitle frame into `dst`.
+  ///
+  /// A backend whose underlying API produces a cue inline with the
+  /// packet still answers all three: [`Received::NeedsInput`] until a
+  /// packet has produced one, and [`Received::Ended`] once
+  /// [`send_eof`](Self::send_eof) has been signalled and no cue is
+  /// held. A subtitle decoder with no tail to drain is still a session
+  /// with an end, and saying so is what lets a generic drain loop stop.
   fn receive_frame(
     &mut self,
     dst: &mut SubtitleFrame<<Self::Adapter as SubtitleAdapter>::FrameExtra, Self::Buffer>,
-  ) -> Result<(), Self::Error>;
+  ) -> Result<Received, Self::Error>;
   /// Signals EOF.
-  fn send_eof(&mut self) -> Result<(), Self::Error>;
+  fn send_eof(&mut self) -> Result<Sent, Self::Error>;
   /// Flushes internal state.
   fn flush(&mut self) -> Result<(), Self::Error>;
 }
@@ -250,7 +288,11 @@ pub trait ImageDecoder {
   ///
   /// Backends signal "these bytes are not a picture this decoder can
   /// read" through a backend-specific `Error` variant, never by
-  /// returning an empty frame.
+  /// returning an empty frame. That is **not** the receive-path
+  /// convention wearing different clothes: [`Received`] names the
+  /// states of a *session* — nothing yet, over — and a one-shot decode
+  /// has neither. "These bytes are not a picture" is a fact about the
+  /// payload the caller handed over, which is what an error is for.
   fn decode(
     &mut self,
     packet: &AttachmentPacket<<Self::Adapter as ImageAdapter>::PacketExtra, Self::Buffer>,
@@ -289,17 +331,17 @@ mod tests {
     type Buffer = &'static [u8];
     type Error = LoopError;
 
-    fn send_packet(&mut self, _: &VideoPacket<(), &'static [u8]>) -> Result<(), LoopError> {
-      Ok(())
+    fn send_packet(&mut self, _: &VideoPacket<(), &'static [u8]>) -> Result<Sent, LoopError> {
+      Ok(Sent::Accepted)
     }
     fn receive_frame(
       &mut self,
       _: &mut VideoFrame<u32, (), &'static [u8]>,
-    ) -> Result<(), LoopError> {
-      Err(LoopError)
+    ) -> Result<Received, LoopError> {
+      Ok(Received::NeedsInput)
     }
-    fn send_eof(&mut self) -> Result<(), LoopError> {
-      Ok(())
+    fn send_eof(&mut self) -> Result<Sent, LoopError> {
+      Ok(Sent::Accepted)
     }
     fn flush(&mut self) -> Result<(), LoopError> {
       Ok(())
@@ -358,17 +400,17 @@ mod tests {
     type Adapter = ALoop;
     type Buffer = &'static [u8];
     type Error = LoopError;
-    fn send_packet(&mut self, _: &AudioPacket<(), &'static [u8]>) -> Result<(), LoopError> {
-      Ok(())
+    fn send_packet(&mut self, _: &AudioPacket<(), &'static [u8]>) -> Result<Sent, LoopError> {
+      Ok(Sent::Accepted)
     }
     fn receive_frame(
       &mut self,
       _: &mut AudioFrame<u32, u32, (), &'static [u8]>,
-    ) -> Result<(), LoopError> {
-      Err(LoopError)
+    ) -> Result<Received, LoopError> {
+      Ok(Received::NeedsInput)
     }
-    fn send_eof(&mut self) -> Result<(), LoopError> {
-      Ok(())
+    fn send_eof(&mut self) -> Result<Sent, LoopError> {
+      Ok(Sent::Accepted)
     }
     fn flush(&mut self) -> Result<(), LoopError> {
       Ok(())
@@ -425,14 +467,17 @@ mod tests {
     type Adapter = SLoop;
     type Buffer = &'static [u8];
     type Error = LoopError;
-    fn send_packet(&mut self, _: &SubtitlePacket<(), &'static [u8]>) -> Result<(), LoopError> {
-      Ok(())
+    fn send_packet(&mut self, _: &SubtitlePacket<(), &'static [u8]>) -> Result<Sent, LoopError> {
+      Ok(Sent::Accepted)
     }
-    fn receive_frame(&mut self, _: &mut SubtitleFrame<(), &'static [u8]>) -> Result<(), LoopError> {
-      Err(LoopError)
+    fn receive_frame(
+      &mut self,
+      _: &mut SubtitleFrame<(), &'static [u8]>,
+    ) -> Result<Received, LoopError> {
+      Ok(Received::NeedsInput)
     }
-    fn send_eof(&mut self) -> Result<(), LoopError> {
-      Ok(())
+    fn send_eof(&mut self) -> Result<Sent, LoopError> {
+      Ok(Sent::Accepted)
     }
     fn flush(&mut self) -> Result<(), LoopError> {
       Ok(())

@@ -482,3 +482,20 @@ pub fn raw_packet_order(path: &Path) -> Vec<(usize, Option<i64>)> {
   }
   out
 }
+
+/// Asserts a submission was taken, and answers nothing.
+///
+/// The `#[must_use]` on [`mediadecode::Sent`] is deliberate teeth: a
+/// test that submits and ignores the answer would not notice a decoder
+/// quietly asking to be drained. These lanes submit into a session they
+/// have just emptied, where
+/// [`Sent::MustDrain`](mediadecode::Sent::MustDrain) is a real
+/// surprise — so they say so here rather than dropping it.
+#[track_caller]
+pub fn accepted<E: std::fmt::Debug>(status: Result<mediadecode::Sent, E>, what: &str) {
+  assert_eq!(
+    status.unwrap_or_else(|e| panic!("{what}: {e:?}")),
+    mediadecode::Sent::Accepted,
+    "{what}: the session asked to be drained where the test expected room",
+  );
+}
