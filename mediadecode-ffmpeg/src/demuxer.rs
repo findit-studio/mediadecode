@@ -1024,9 +1024,21 @@ impl ReaderPanic {
 }
 
 /// Errors from [`FfmpegDemuxer`].
+///
+/// **Open fault taxonomy, so it is `#[non_exhaustive]`.** New ways to
+/// fail are discovered — a backend, a ceiling, a corruption a codec
+/// learns to report — and a consumer that meets one it has never heard
+/// of should take its generic-fault path. That is exactly what the
+/// wildcard arm this attribute forces is for. The two status
+/// vocabularies opposite it,
+/// [`Sent`](mediadecode::Sent) and [`Received`](mediadecode::Received),
+/// are exhaustive for the mirror-image reason: their arms are the
+/// substrate's fixed state set, and there the wildcard would be dead
+/// weight hiding a state a consumer forgot.
 #[derive(thiserror::Error, Debug, Clone, IsVariant, Unwrap, TryUnwrap)]
 #[unwrap(ref, ref_mut)]
 #[try_unwrap(ref, ref_mut)]
+#[non_exhaustive]
 pub enum DemuxError {
   /// The wrapped libavformat call reported an error — open, read or
   /// seek.

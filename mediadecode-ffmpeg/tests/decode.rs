@@ -6,6 +6,7 @@
 
 use ffmpeg::{format, media};
 use ffmpeg_next as ffmpeg;
+use mediadecode::{Received, Sent};
 use mediadecode_ffmpeg::{Frame, VideoDecoder};
 
 const SAMPLE_ENV: &str = "HWDECODE_SAMPLE_VIDEO";
@@ -54,35 +55,30 @@ fn auto_open_decodes_at_least_one_frame() {
     }
     loop {
       match decoder.send_packet(&packet) {
-        Ok(()) => break,
-        Err(mediadecode_ffmpeg::Error::Ffmpeg(ffmpeg::Error::Other { errno }))
-          if errno == ffmpeg::error::EAGAIN =>
-        {
-          loop {
-            match decoder.receive_frame(&mut frame) {
-              Ok(()) => {
-                assert_eq!(frame.width(), expected_w);
-                assert_eq!(frame.height(), expected_h);
-                count += 1;
-                if count >= target {
-                  break 'outer;
-                }
+        Ok(Sent::Accepted) => break,
+        // The two-offer rule, retired: the decoder says which it is,
+        // so this drains and re-offers the same packet instead of
+        // guessing that a second failure means damage.
+        Ok(Sent::MustDrain) => loop {
+          match decoder.receive_frame(&mut frame) {
+            Ok(Received::Frame) => {
+              assert_eq!(frame.width(), expected_w);
+              assert_eq!(frame.height(), expected_h);
+              count += 1;
+              if count >= target {
+                break 'outer;
               }
-              Err(mediadecode_ffmpeg::Error::Ffmpeg(ffmpeg::Error::Other { errno }))
-                if errno == ffmpeg::error::EAGAIN =>
-              {
-                break;
-              }
-              Err(e) => panic!("receive_frame: {e}"),
             }
+            Ok(Received::NeedsInput | Received::Ended) => break,
+            Err(e) => panic!("receive_frame: {e}"),
           }
-        }
+        },
         Err(e) => panic!("send packet: {e}"),
       }
     }
     loop {
       match decoder.receive_frame(&mut frame) {
-        Ok(()) => {
+        Ok(Received::Frame) => {
           assert_eq!(frame.width(), expected_w);
           assert_eq!(frame.height(), expected_h);
           count += 1;
@@ -90,11 +86,7 @@ fn auto_open_decodes_at_least_one_frame() {
             break 'outer;
           }
         }
-        Err(mediadecode_ffmpeg::Error::Ffmpeg(ffmpeg::Error::Other { errno }))
-          if errno == ffmpeg::error::EAGAIN =>
-        {
-          break;
-        }
+        Ok(Received::NeedsInput | Received::Ended) => break,
         Err(e) => panic!("receive_frame: {e}"),
       }
     }

@@ -265,31 +265,33 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierImageDecoder<C> {
       .decoder
       .send_eof()
       .map_err(|e| ImageDecodeError::Decode(crate::decoder::software_exit(state, e)))?;
-    match self.decoder.receive_frame(&mut self.scratch) {
-      Ok(()) => {}
-      // The bytes were accepted and yielded nothing. Named rather than
-      // passed through as an FFmpeg errno: `EOF` from a decoder that
-      // never produced a picture, and `EAGAIN` from one that has
-      // already been told the stream ended, are the same fact about the
-      // payload — it is not an image this codec reads. (`EAGAIN` after
-      // `send_eof` is not a state `avcodec` documents; it is caught
-      // here so that a codec which does it cannot surface as a raw
-      // errno the caller has to decode.) Spelled through
-      // `ffmpeg_next::error::EAGAIN`, as the rest of this crate does.
-      Err(e)
-        if matches!(e, ffmpeg_next::Error::Eof)
-          || matches!(e, ffmpeg_next::Error::Other { errno }
-            if errno == ffmpeg_next::error::EAGAIN) =>
-      {
-        self.decoder.flush();
-        return Err(ImageDecodeError::NoImage);
-      }
-      Err(e) => {
-        self.decoder.flush();
-        return Err(ImageDecodeError::Decode(crate::decoder::software_exit(
-          state, e,
-        )));
-      }
+    if let Err(e) = self.decoder.receive_frame(&mut self.scratch) {
+      self.decoder.flush();
+      // Funnelled, then classified — the same two steps every receive
+      // road in this crate takes, so a recorded budget refusal is named
+      // rather than mistaken for a payload that held no picture.
+      //
+      // **And then the classification collapses, which is the one thing
+      // this road does differently.** A one-shot decode has no session
+      // states to report: there is no more input the caller could send
+      // and no stream to be at the end of. `EOF` from a decoder that
+      // never produced a picture, and `EAGAIN` from one that has already
+      // been told the stream ended, are therefore the same fact about
+      // the *payload* — it is not an image this codec reads — and that
+      // fact is an error, not a rhythm. (`EAGAIN` after `send_eof` is
+      // not a state `avcodec` documents; it is caught here so a codec
+      // that does it cannot surface as a raw errno the caller has to
+      // decode.)
+      return Err(
+        // `Draining` is the literal truth of this road: `send_eof` ran
+        // three lines up, and a one-shot decoder has no probe. Both
+        // flow signals therefore read as the end — which is exactly the
+        // collapse this road has always made by hand.
+        match crate::decoder::software_receive(state, e, crate::decoder::SessionPhase::Draining) {
+          Ok(_) => ImageDecodeError::NoImage,
+          Err(fault) => ImageDecodeError::Decode(fault),
+        },
+      );
     }
     // **The other road the same fact arrives on.** A decoder is entitled
     // to hand back a picture and mark it corrupt — that is libavcodec
@@ -419,9 +421,21 @@ impl InputTooLarge {
 }
 
 /// Errors from [`FfmpegImageDecoder`].
+///
+/// **Open fault taxonomy, so it is `#[non_exhaustive]`.** New ways to
+/// fail are discovered — a backend, a ceiling, a corruption a codec
+/// learns to report — and a consumer that meets one it has never heard
+/// of should take its generic-fault path. That is exactly what the
+/// wildcard arm this attribute forces is for. The two status
+/// vocabularies opposite it,
+/// [`Sent`](mediadecode::Sent) and [`Received`](mediadecode::Received),
+/// are exhaustive for the mirror-image reason: their arms are the
+/// substrate's fixed state set, and there the wildcard would be dead
+/// weight hiding a state a consumer forgot.
 #[derive(thiserror::Error, Debug, Clone, IsVariant, Unwrap, TryUnwrap)]
 #[unwrap(ref, ref_mut)]
 #[try_unwrap(ref, ref_mut)]
+#[non_exhaustive]
 pub enum ImageDecodeError {
   /// The compressed payload is larger than the ceiling allows. Refused
   /// **before** it is copied into an `AVPacket`.

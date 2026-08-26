@@ -294,3 +294,24 @@ pub type TrackInfo = mediadecode::demuxer::TrackInfo<Ffmpeg>;
 
 /// A track's per-kind codec parameters, as [`TrackInfo`] carries them.
 pub type TrackParams = mediadecode::demuxer::TrackParams<Ffmpeg>;
+
+/// Asserts a submission was taken, and answers nothing.
+///
+/// The `#[must_use]` on [`mediadecode::Sent`] is deliberate teeth: a
+/// test that submits and ignores the answer is a test that would not
+/// notice a decoder quietly asking to be drained. Most of this crate's
+/// tests submit into a session they have just emptied, where
+/// [`Sent::MustDrain`](mediadecode::Sent::MustDrain) is a real
+/// surprise — so they say so here rather than dropping it.
+#[cfg(test)]
+#[track_caller]
+pub(crate) fn accepted<E: core::fmt::Debug>(
+  status: core::result::Result<mediadecode::Sent, E>,
+  what: &str,
+) {
+  assert_eq!(
+    status.unwrap_or_else(|e| panic!("{what}: {e:?}")),
+    mediadecode::Sent::Accepted,
+    "{what}: the session asked to be drained where the test expected room",
+  );
+}

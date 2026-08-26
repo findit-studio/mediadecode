@@ -11,6 +11,313 @@ The backend-agnostic core it adapts has its own log at
 
 ## [Unreleased]
 
+### Fixed
+
+- **A terminal `Received::Ended` was reversible without `flush` on the
+  subtitle seam.** The new `eof` latch gated the receive side only, and
+  `avcodec_decode_subtitle2` — unlike every send/receive decoder in the
+  family — has no state machine of its own to refuse for it: it decodes
+  whatever it is handed, every time. So a valid packet sent after
+  `send_eof` was accepted, filled the seat, and made the next
+  `receive_frame` answer `Frame` on a session the caller had already
+  seen end. `send_packet` now refuses with the new
+  `SubtitleDecodeError::AfterEof`, and the check sits **before** the
+  held-cue check: the other order would answer `Sent::MustDrain`, and
+  the drained retry would then be accepted — the same reversal, one
+  call later. Only `flush` reopens the session.
+
+  Named `AfterEof` after the seam one road over
+  (`ResampleError::AfterEof`) rather than minting a third spelling; the
+  arm is additive, since these enums are now `#[non_exhaustive]`.
+
+  **And the video wrapper carried the same ordering, at both of its
+  gates.** `send_packet` and `send_eof` checked the parked-seat flag
+  before `eof_sent`, so a session that had accepted end-of-stream *and*
+  had a frame parked — reachable when a delayed tail frame's carrier
+  allocation fails parkably after EOF — answered `Sent::MustDrain` to a
+  submission nothing could ever accept. That breaks the arm's contract
+  rather than merely misnaming a fault: `MustDrain` promises that
+  draining makes the same offer acceptable, and past end-of-stream the
+  drained retry faults anyway, until `flush`. Both gates check
+  `eof_sent` first now.
+
+  The fault they answer is **censused, not invented**: with the seat
+  free, a post-EOF submission reaches libavcodec and comes back as
+  `Decode(Ffmpeg(Eof))` on all four roads (hardware and software, packet
+  and EOF), so the gates short out to exactly that. Unlike the subtitle
+  seam — which had to mint a word because `avcodec_decode_subtitle2` has
+  no state machine to refuse for it — this face already had an answer,
+  and a second spelling for one fault on one surface would be the
+  disease this release is curing. A regression pins the synthesized
+  value against the substrate's so the two roads cannot drift apart.
+
+  **And the gates then interlocked with a fallback that predates them.**
+  When hardware accepts end-of-stream and a post-commit exhaustion
+  arrives *while draining*, the frame-time fallback opens software cold
+  — and it forwarded the committed EOF only through the `Eof` failure
+  arm, so this road did not. The cold decoder then answered `EAGAIN`
+  forever, which reaches a caller as `Received::NeedsInput`: an
+  instruction to send another packet, on a session where both send
+  gates now refuse. Every exit was closed; before the gates, a repeated
+  `send_eof` would have re-armed the decoder by accident.
+  `degrade_to_sw` carries `eof_pending` now, exactly as the probe-era
+  `fall_back_to_sw` beside it always has — one question, one mechanism
+  on both fallback roads — and the EOF forward is one place rather than
+  one arm.
+
+  **The invariant behind it is now structural, not inherited.** A
+  protocol state with no satisfying operation must not reach a caller,
+  so `receive_frame` reads every drain answer against the session's own
+  committed end: past `eof_sent`, a `NeedsInput` becomes the end. That
+  does not rest on libavcodec honouring "no `EAGAIN` after a flush
+  packet" — a contract this crate already documents a codec breaking,
+  on the image road, and folds together there for the same reason. The
+  end-of-stream escalation moved with it, so a post-commit gap that
+  never closed is still reported as a lost tail when the end arrives
+  spelled `EAGAIN`.
+
+  **And the last of the class: a candidate on trial, past the end,
+  producing nothing.** The probe replays its buffered history *and* the
+  recorded end into each candidate, so a candidate can be sitting on a
+  stream that is already over. Asked for a frame it answers `EAGAIN`,
+  and both readings of that were wrong: "send me more" asks the caller
+  for input the send gates refuse to accept, and "the stream ended"
+  credits a backend that never decoded a frame — stopping the probe from
+  trying the next one, which is the whole reason the probe exists.
+  **Observable change: a post-EOF `EAGAIN` from a candidate now advances
+  the probe instead of ending the stream**, so a hardware backend that
+  cannot decode a clip falls through to the next one (and ultimately to
+  software) rather than presenting an empty decode as a clean end.
+
+  The fix is the shape rather than the case. `SessionPhase` is derived
+  once per session type from the latches that were already there —
+  whether an end has been recorded, whether a backend is still on trial
+  — and both classifiers now take it, so a classification that does not
+  say where the session is *does not compile*. `VideoDecoder`'s end
+  latch moved out of `ProbeState` to make that derivation honest: it
+  used to vanish when the probe collapsed, leaving a committed decoder
+  unable to say whether the caller had signalled the end. The audio seam
+  gained the same latch for the same reason — it had none, so its phase
+  could only have been a guess.
+
+  **Observable with it: a refusal this crate latched now surfaces where
+  it used to be swallowed.** A `get_format` declination cannot be
+  returned from the callback — it is left in the callback state for a
+  funnel to collect, while libavcodec reports whatever it saw. Reading
+  that report first answers `Ended` or `NeedsInput` for a frame the
+  ceiling declined, and the reason dies unread. The committed hardware
+  receive road did exactly that, and so did both raw hardware send arms.
+  Callers that set `FrameLimits` and saw a clean end where a surface had
+  been refused now get `HwSurfaceTooLarge`.
+
+  **And the attempt log keeps that cause too.** A funnel *consumes* the
+  refusal it collects, so a road that funnels twice reports the errno
+  FFmpeg happened to give over the one this crate made:
+  `post_commit_hw_failure` ran its own `hw_exit` after the receive road
+  had already minted, and `AllBackendsFailed` recorded `InvalidData` for
+  a coded surface declined over a configured ceiling. The software
+  fallback still fired, so nothing broke — but a caller reading the
+  attempts to find out *why* no backend worked was told the wrong thing,
+  and told the one thing it could not act on. The verdict is minted once
+  and threaded now; the raw errno keeps exactly one job, deciding whether
+  a fallback is required.
+
+  **And a declined coded surface now reaches the caller whatever the
+  codec called it.** `get_hw_format` runs again on a post-commit format
+  change — an HEVC SPS switch mid-stream — so the ceiling can decline a
+  surface there. H.264 normalises that to `InvalidData`, which the
+  fallback predicate matched; FFmpeg 9's HEVC path propagates the `-1`
+  and `ffmpeg-next` maps it to `Other { errno: 1 }`, which it did not.
+  The caller got an EPERM-shaped errno, no software fallback, and a
+  latched refusal left standing to be collected by whatever ran next.
+  The predicate widened to the truer condition rather than to one more
+  spelling: **a latched `HwSurfaceTooLarge` is the fallback signal
+  itself**, and enumerating errnos is a census of how each codec in each
+  release happens to say one thing. A frame-budget refusal deliberately
+  still does not count — software would decode the same oversized frame
+  and be refused by the same ceiling. Observable: HEVC ceiling declines
+  now fall back to software and surface `HwSurfaceTooLarge`, as the
+  H.264 spelling always has.
+
+  **And a budget refusal no longer mis-triggers that fallback.** The
+  widened predicate was written as an `or`, and the `or` reached past its
+  own exclusion: `judge_buffer` refuses a software allocation by latching
+  `FrameBudgetExceeded` and answering libavcodec `-EINVAL` — the only
+  thing a `get_buffer2` callback can answer — and `EINVAL` is on the
+  hardware-decode-failure list. So the second arm fired and a frame the
+  caller's own ceiling declined took the fallback road: a cold software
+  decoder, a degraded resync, a bounded span of dropped frames, and the
+  one actionable error buried inside `AllBackendsFailed`. A named verdict
+  now outranks the raw errno in **both** directions — the errno is
+  consulted only where nothing was named. Observable: a frame-budget
+  refusal travels unwrapped again on the `EINVAL` spelling, naming the
+  action that can succeed (raise the ceiling) rather than one that
+  cannot.
+
+  **And a latched surface refusal on the send road now goes somewhere.**
+  The transient send arms returned their funnel's result the instant they
+  had it, which is right for a flow signal and a dead end for anything
+  else: `hw_send` can mint `HwSurfaceTooLarge`, and a minted refusal
+  returned plain reaches nothing — the wrapper opens software only on
+  `AllBackendsFailed`, so it stopped, and a probe still auditioning never
+  advanced past the candidate that had just declined the surface. Every
+  hardware road — both send faces, the receive face and the HW→CPU
+  transfer — now mints once and routes through one shared policy.
+  Observable: a declined coded surface met while sending advances the
+  probe when a candidate is on trial, and falls back to software when one
+  has committed, instead of surfacing as a plain error nobody acts on.
+
+- **The resampler's `Again` meant two opposite things, and a caller that
+  believed it spun forever.** `receive_frame` returned
+  `ResampleError::Again` pre-EOF with nothing ready **and** post-EOF
+  with the tail exhausted. Those are "send me more" and "there is no
+  more"; a caller could tell them apart only by remembering whether it
+  had itself called `send_eof`, and a drain written against the seam
+  alone could not. It is now `Received::NeedsInput` and
+  `Received::Ended`, and the confusion is unrepresentable.
+
+  The regression that proves it —
+  `a_drained_tail_says_ended_instead_of_asking_for_input_that_cannot_come`
+  in `tests/resample.rs` — is a generic drain with no input left to
+  offer and an iteration cap, so a `NeedsInput` after EOF fails the test
+  instead of hanging it.
+
+- **And the end of the tail is now latched.** `swr_get_delay` stands at
+  a residue `swr_convert_frame` will never emit — 16 samples on the test
+  corpus — so every poll past the end used to re-enter the flush road,
+  allocating an output frame and asking `swr` again. Harmless while
+  allocation succeeds and wrong when it does not: a session that had
+  already answered `Ended` would start answering with an allocation
+  error, turning a settled protocol state back into a fault. A `drained`
+  latch makes the end cheap and unconditional; `flush` clears it with
+  the rest of the session.
+
+- **`SubtitleDecodeError::NoFrameReady` covered both conditions too, and
+  worse.** This backend's `send_eof` is a documented no-op — the legacy
+  `avcodec_decode_subtitle2` API buffers nothing — so "no cue yet" and
+  "there will be no more cues" were *literally the same value*, and a
+  caller draining a subtitle track to its end had no terminating
+  condition at all. The session now keeps an `eof` latch (set by
+  `send_eof`, cleared by `flush`) purely so `receive_frame` can tell the
+  two apart. A held cue is still delivered after EOF: the latch ends the
+  session, it does not discard what the session already made.
+
+### Changed
+
+- **BREAKING: every `receive_frame` on this crate's faces returns
+  `mediadecode::Received`, and every `send_packet` / `send_frame` /
+  `send_eof` returns `mediadecode::Sent`** — the three `mediadecode`
+  decoder impls, the resampler impl, and the raw hardware
+  `VideoDecoder`.
+
+  **The FFmpeg errno stops inside this crate.** `VideoDecoder::receive_frame`
+  documented itself as returning "the same transient signals as
+  `ffmpeg::decoder::Video`: `Error::Ffmpeg(Other { errno: EAGAIN })` …
+  and `Error::Ffmpeg(Eof)`"; it now answers `Received::NeedsInput` and
+  `Received::Ended`, so no caller has an errno to decode.
+
+  Both mappings go through one gate, `decoder::receive_status`, and it
+  takes the *funnel's output* rather than libavcodec's raw error. That
+  ordering is load-bearing: `software_exit` / `hw_exit` collect a
+  `get_format` or allocator-judge refusal the callback state is holding,
+  and a classifier placed in front of them would read a road with a
+  named refusal waiting as "needs input". Every receive site funnels
+  first and gates second.
+
+- **BREAKING: four arms are gone.** `ResampleError::Again`,
+  `SubtitleDecodeError::NoFrameReady`, `VideoDecodeError::FramePending`
+  and `SubtitleDecodeError::FramePending` were never faults; they are
+  `Received` and `Sent` states now. Every one of these enums carries
+  faults only.
+
+  `ResampleError::AfterEof` **stays an error**, and the line it sits on
+  is the one this release drew: a resampler that has been told the
+  stream ended will refuse the frame however much is drained first, so
+  answering `MustDrain` would send the caller into a loop with no exit.
+  Back pressure is "not now"; this is "not ever, until you flush".
+
+- **The park refusal is now spelled as back pressure, and the parking
+  discipline is byte-for-byte unchanged.** `FramePending` already
+  documented its own escape — "call `receive_frame`, or `flush` to
+  abandon it" — which is to say it was back pressure wearing an error's
+  clothes. What moved is the spelling; what did not move is the seat,
+  the two scratches it protects, or the fallback it prevents committing
+  underneath a parked frame.
+
+  The **audio** road still has no park refusal, and now that asymmetry
+  is visible instead of hidden: it is one vocabulary with one backend
+  answering it differently (single scratch, so a submission under a park
+  costs nothing) rather than an arm two error types had and a third did
+  not. `the_audio_face_answers_the_same_vocabulary_without_a_park_refusal`
+  pins it.
+
+- **`is_transient` had to stop treating `EAGAIN` and `EOF` alike on the
+  send road, and that is a finding rather than a refactor.**
+  `avcodec_send_packet` answers `AVERROR_EOF` for a different fact than
+  `avcodec_receive_frame` does: not "the stream is over" but *"this
+  decoder was already told the stream is over, and you sent something
+  anyway"*. The old predicate collapsed the two, so a caller could not
+  tell "drain and retry" from "you already sent EOF" — and under the new
+  vocabulary reading the second as `MustDrain` would have sent it into a
+  drain loop that can never make the next offer succeed. The send gate
+  (`send_status`) therefore admits `EAGAIN` alone; `EOF` stays a fault.
+
+  What is left of `is_transient` is the probe-replay drain, which reads
+  a raw `ffmpeg_next::decoder::Video` that never crosses a public seam
+  and for which "wants input" and "finished" really are one answer.
+
+- **`send_eof`'s commit test is no longer `is_ok()`.** `Ok(Sent::MustDrain)`
+  means the decoder did not take the end-of-stream; recording
+  `eof_sent` there would make a later fallback inject an EOF into the
+  software decoder for a signal that was never accepted — the exact
+  half-mutation the local `eof_pending` argument exists to prevent on
+  the failure road. The type change is what surfaced it.
+
+- The one-shot `FfmpegImageDecoder` keeps `ImageDecodeError::NoImage`,
+  and its internal `EOF`/post-`send_eof`-`EAGAIN` collapse now routes
+  through the same `receive_status` gate — so the crate has exactly one
+  place that knows the errno spellings. The *collapse* is the point: a
+  one-shot decode has no session states, so both conditions really are
+  the same fact about the payload, and that fact is an error.
+
+- **All nine boundary error enums gain `#[non_exhaustive]`** — this
+  crate's seven (`Error`, `VideoDecodeError`, `AudioDecodeError`,
+  `SubtitleDecodeError`, `ImageDecodeError`, `DemuxError`,
+  `ResampleError`) plus the two in the WebCodecs adapter. **This is the
+  purchase the 0.10 window pays for:** adding the attribute is itself
+  breaking, so it can only be done in a release that is already
+  breaking, and doing it once makes every future arm additive forever.
+
+  The counterpart decision is the status enums' — `Sent` and `Received`
+  stay exhaustive. Closed protocol vocabulary versus open fault
+  taxonomy: a consumer that meets an unknown *fault* should take its
+  generic-fault path, and a consumer that missed a *protocol state*
+  should not compile.
+
+  Mechanically, the attribute binds across crate boundaries and
+  integration-test binaries are separate crates, so an exhaustive match
+  on one of these enums in `tests/` needs a rest arm. Exactly one did
+  (`owned_carriers.rs`, the audio pre-allocation ordering proof), and
+  the arm earns its place: a third refusal shape there would mean the
+  ceiling was enforced by a road the test has never seen, which is worth
+  failing on rather than absorbing.
+
+- Every drain **and feed** loop in the crate's tests, examples, benches
+  and README is rewritten to the exhaustive match. The
+  `while …receive_frame(…).is_ok()` idiom is not merely discouraged now
+  — under the new signature it is an infinite loop, because "needs
+  input" is a success — and the two-offer dance is replaced by a loop
+  that offers until the session says it took the packet.
+
+  `examples/decode_via_trait.rs` is the one worth naming: the crate's own
+  trait-generic example previously drained blind and could not
+  distinguish the conditions its own comment named (`// EAGAIN: drain and
+  retry`). Its non-generic sibling could, but only by matching
+  `Error::Ffmpeg(Other { errno })` in user code. Both now read the same
+  states on both faces, and the generic one surfaces receive-side
+  failures instead of swallowing them.
+
+
 ## [0.9.0] - 2026-08-26
 
 ### Fixed

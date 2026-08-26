@@ -37,7 +37,7 @@ use ffmpeg_next::{
   software::resampling,
 };
 use mediadecode::{
-  Timebase, Timestamp,
+  Received, Sent, Timebase, Timestamp,
   frame::{AudioFrame, Plane},
   resampler::AudioResampler,
 };
@@ -253,6 +253,20 @@ pub struct CarrierResampler<C: crate::FfmpegCarrier> {
   /// first input frame anchors it.
   next_pts: Option<i64>,
   eof: bool,
+  /// `true` once the post-EOF tail has been drained to its end.
+  ///
+  /// **The terminal answer has to be terminal.** Without this latch,
+  /// every poll past the end re-enters the flush road — allocating an
+  /// output frame and asking `swr` again — because `swr_get_delay` can
+  /// keep reporting residual samples that `swr_convert_frame` will
+  /// never emit (observed: 16 samples left standing after the tail is
+  /// genuinely exhausted). That is harmless while allocation succeeds
+  /// and wrong when it does not: a session that has already answered
+  /// `Ended` would start answering with an allocation error instead,
+  /// turning a settled protocol state back into a fault. The latch
+  /// makes the end cheap and unconditional. `flush` clears it with the
+  /// rest of the session.
+  drained: bool,
   /// What one converted frame may cost. See
   /// [`Self::check_output_bytes`] for why a resampler needs a ceiling
   /// of its own even when its input already had one.
@@ -340,6 +354,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierResampler<C> {
       ready: VecDeque::new(),
       next_pts: None,
       eof: false,
+      drained: false,
       limits,
       _carrier: core::marker::PhantomData,
     })
@@ -774,7 +789,21 @@ struct PreparedOutput<C: crate::FfmpegCarrier + crate::CarrierOps> {
 }
 
 impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierResampler<C> {
-  pub(crate) fn send_frame_impl(&mut self, frame: &Frame<C>) -> Result<(), ResampleError> {
+  /// **Always [`Sent::Accepted`] when it accepts at all.** The
+  /// converted-frame queue this type keeps is unbounded — every frame a
+  /// conversion produces is built before `swr` is asked and pushed
+  /// straight onto it — so there is no state in which draining first
+  /// would let a submission through that is refused now. A bounded
+  /// implementation of the same face would answer
+  /// [`Sent::MustDrain`] here; this one has nothing to say it about.
+  ///
+  /// [`ResampleError::AfterEof`] stays an error rather than becoming
+  /// that arm, and the line is the same one the decoders draw: a
+  /// resampler that has been told the stream ended will refuse this
+  /// frame however much is drained first, so sending the caller into a
+  /// drain loop would be sending it nowhere. `flush` is the way back,
+  /// and the message says so.
+  pub(crate) fn send_frame_impl(&mut self, frame: &Frame<C>) -> Result<Sent, ResampleError> {
     if self.eof {
       return Err(ResampleError::AfterEof);
     }
@@ -784,7 +813,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierResampler<C> {
     // refuses a zero-sample allocation, so staging one would hand `swr`
     // an unbacked `AVFrame` for no gain.
     if frame.nb_samples() == 0 {
-      return Ok(());
+      return Ok(Sent::Accepted);
     }
 
     // Nothing below touches the session's state until the conversion
@@ -822,7 +851,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierResampler<C> {
     if let Some(converted) = self.finish_output(prepared) {
       self.ready.push_back(converted);
     }
-    Ok(())
+    Ok(Sent::Accepted)
   }
 
   /// **No parked-frame seat here, and none is needed.** The queue holds
@@ -834,19 +863,33 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierResampler<C> {
   /// queue, so nothing can be lost between the two. That is the
   /// property the reserve-then-commit seam was built for, stated where
   /// the sibling roads state their seats.
-  pub(crate) fn receive_frame_impl(&mut self, dst: &mut Frame<C>) -> Result<(), ResampleError> {
+  pub(crate) fn receive_frame_impl(
+    &mut self,
+    dst: &mut Frame<C>,
+  ) -> Result<Received, ResampleError> {
     if let Some(frame) = self.ready.pop_front() {
       *dst = frame;
-      return Ok(());
+      return Ok(Received::Frame);
     }
     if !self.eof {
-      return Err(ResampleError::Again);
+      return Ok(Received::NeedsInput);
+    }
+    if self.drained {
+      return Ok(Received::Ended);
     }
     // EOF: drain the conversion tail. Without this every file loses the
     // tens of milliseconds sitting inside the filter.
+    //
+    // **This is where the two answers used to be one.** Pre-EOF nothing
+    // ready and post-EOF tail exhausted both returned `Again`, so a
+    // caller that did not itself remember whether it had called
+    // `send_eof` could not tell "send more" from "there is no more" —
+    // and a drain loop written against the seam alone spun forever on
+    // a resampler that was already finished.
     let remaining = self.delay_impl();
     if remaining <= 0 {
-      return Err(ResampleError::Again);
+      self.drained = true;
+      return Ok(Received::Ended);
     }
     let capacity = remaining.min(i64::from(i32::MAX)) as usize;
     // Same discipline as `send_frame`, and for the same reason: the
@@ -863,15 +906,24 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierResampler<C> {
     match self.finish_output(prepared) {
       Some(frame) => {
         *dst = frame;
-        Ok(())
+        Ok(Received::Frame)
       }
-      None => Err(ResampleError::Again),
+      // The delay line reported samples and the flush produced none.
+      // Another flush would report the same and produce the same — this
+      // really happens, `swr_get_delay` standing at a residue the
+      // converter will not emit — so this is the end of the tail and
+      // not a pause in it. Saying otherwise is the spin this reform
+      // removes.
+      None => {
+        self.drained = true;
+        Ok(Received::Ended)
+      }
     }
   }
 
-  pub(crate) fn send_eof_impl(&mut self) -> Result<(), ResampleError> {
+  pub(crate) fn send_eof_impl(&mut self) -> Result<Sent, ResampleError> {
     self.eof = true;
-    Ok(())
+    Ok(Sent::Accepted)
   }
 
   /// Resets the resampler for another stream on the same two specs.
@@ -899,6 +951,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierResampler<C> {
     self.ready.clear();
     self.next_pts = None;
     self.eof = false;
+    self.drained = false;
     debug_assert_eq!(self.delay_impl(), 0, "a fresh swr context holds nothing");
     Ok(())
   }
@@ -944,15 +997,15 @@ macro_rules! resampler_lane_face {
       type Buffer = <$lane as crate::FfmpegCarrier>::Buffer;
       type Error = ResampleError;
 
-      fn send_frame(&mut self, frame: &Frame<$lane>) -> Result<(), ResampleError> {
+      fn send_frame(&mut self, frame: &Frame<$lane>) -> Result<Sent, ResampleError> {
         self.send_frame_impl(frame)
       }
 
-      fn receive_frame(&mut self, dst: &mut Frame<$lane>) -> Result<(), ResampleError> {
+      fn receive_frame(&mut self, dst: &mut Frame<$lane>) -> Result<Received, ResampleError> {
         self.receive_frame_impl(dst)
       }
 
-      fn send_eof(&mut self) -> Result<(), ResampleError> {
+      fn send_eof(&mut self) -> Result<Sent, ResampleError> {
         self.send_eof_impl()
       }
 
@@ -1476,25 +1529,34 @@ impl OutputBuffer {
   }
 }
 
-/// Errors from [`FfmpegResampler`].
+/// Errors from [`FfmpegResampler`] — **faults and the two send-side
+/// refusals** ([`Self::SourceChanged`], [`Self::AfterEof`]).
+///
+/// `Again` used to be here and meant two opposite things: pre-EOF
+/// "nothing ready, send more" and post-EOF "the tail is exhausted".
+/// A caller polling the seam could tell them apart only by remembering
+/// whether it had itself called `send_eof`; one that did not spun
+/// forever. Both are [`Received`] states now, and they are distinct.
+///
+/// **Open fault taxonomy, so it is `#[non_exhaustive]`.** New ways to
+/// fail are discovered — a backend, a ceiling, a corruption a codec
+/// learns to report — and a consumer that meets one it has never heard
+/// of should take its generic-fault path. That is exactly what the
+/// wildcard arm this attribute forces is for. The two status
+/// vocabularies opposite it,
+/// [`Sent`](mediadecode::Sent) and [`Received`](mediadecode::Received),
+/// are exhaustive for the mirror-image reason: their arms are the
+/// substrate's fixed state set, and there the wildcard would be dead
+/// weight hiding a state a consumer forgot.
 #[derive(thiserror::Error, Debug, Clone, IsVariant, Unwrap, TryUnwrap)]
 #[unwrap(ref, ref_mut)]
 #[try_unwrap(ref, ref_mut)]
+#[non_exhaustive]
 pub enum ResampleError {
   /// The conversion would produce a frame larger than the ceiling
   /// allows. Refused **before** the output frame is allocated.
   #[error(transparent)]
   OutputTooLarge(#[from] OutputTooLarge),
-
-  /// No converted frame is ready yet — send more input, or
-  /// [`send_eof`](AudioResampler::send_eof) and drain the tail.
-  ///
-  /// This is the "needs more" signal, carried in the error type exactly
-  /// as
-  /// [`AudioStreamDecoder::receive_frame`](mediadecode::decoder::AudioStreamDecoder::receive_frame)
-  /// carries it.
-  #[error("no converted frame ready")]
-  Again,
 
   /// A frame arrived whose shape is not the source spec this resampler
   /// was built with — the mid-stream refusal.
@@ -1990,6 +2052,19 @@ mod tests {
     )))
   }
 
+  /// Takes every frame that is ready *right now* and stops — the
+  /// pre-EOF half of a drain, written as the exhaustive match the face
+  /// now requires. A `.is_ok()` loop here would never end: "needs
+  /// input" is a success.
+  fn drain_ready(resampler: &mut FfmpegResampler, dst: &mut Frame) {
+    loop {
+      match resampler.receive_frame(dst).expect("a fault-free drain") {
+        Received::Frame => {}
+        Received::NeedsInput | Received::Ended => return,
+      }
+    }
+  }
+
   fn stereo_to_mono() -> FfmpegResampler {
     FfmpegResampler::new(
       ResampleSpec::new(
@@ -2014,9 +2089,9 @@ mod tests {
     // newly-wired `derive_more` dependency.
     let err = ResampleError::OutputBuffer(OutputBuffer::new(2));
     assert!(err.is_output_buffer());
-    assert!(!err.is_again());
+    assert!(!err.is_queue_alloc());
     assert_eq!(err.unwrap_output_buffer_ref().plane(), 2);
-    assert!(err.try_unwrap_again().is_err());
+    assert!(err.try_unwrap_queue_alloc().is_err());
   }
 
   #[test]
@@ -2033,8 +2108,8 @@ mod tests {
         let mut resampler = stereo_to_mono();
         let frame = stereo_frame(4_800);
         let mut dst = crate::boundary::empty_owned_audio_frame();
-        resampler.send_frame(&frame).expect("a first frame");
-        while resampler.receive_frame(&mut dst).is_ok() {}
+        crate::accepted(resampler.send_frame(&frame), "a first frame");
+        drain_ready(&mut resampler, &mut dst);
         let delay = resampler.delay();
         assert!(delay > 0, "the filter has to be holding something");
 
@@ -2052,15 +2127,16 @@ mod tests {
           "the frame went into the filter anyway",
         );
         assert!(
-          resampler.receive_frame(&mut dst).unwrap_err().is_again(),
+          matches!(resampler.receive_frame(&mut dst), Ok(Received::NeedsInput)),
           "a failed send left output ready",
         );
 
         // And the session is still a session: the same frame converts.
-        resampler
-          .send_frame(&frame)
-          .expect("the failure cost nothing");
-        assert!(resampler.receive_frame(&mut dst).is_ok());
+        crate::accepted(resampler.send_frame(&frame), "the failure cost nothing");
+        assert!(matches!(
+          resampler.receive_frame(&mut dst),
+          Ok(Received::Frame)
+        ));
       },
     );
   }
@@ -2077,10 +2153,10 @@ mod tests {
         let frame = stereo_frame(4_800);
         let mut dst = crate::boundary::empty_owned_audio_frame();
         for _ in 0..3 {
-          resampler.send_frame(&frame).expect("send_frame");
-          while resampler.receive_frame(&mut dst).is_ok() {}
+          crate::accepted(resampler.send_frame(&frame), "send_frame");
+          drain_ready(&mut resampler, &mut dst);
         }
-        resampler.send_eof().expect("eof");
+        crate::accepted(resampler.send_eof(), "eof");
         let tail = resampler.delay();
         assert!(tail > 0, "there has to be a tail to lose");
 
@@ -2089,9 +2165,15 @@ mod tests {
         crate::fault_subprocess::uncap_ffmpeg_allocations();
 
         let refused = refused.expect_err("the drain cannot have succeeded");
+        // No arm of this enum can say "send me more input" any more —
+        // that answer left the error type — so an allocation failure has
+        // nowhere to be mistaken for one.
         assert!(
-          !refused.is_again(),
-          "an allocation failure is not `send me more input`: {refused:?}",
+          matches!(
+            refused,
+            ResampleError::Resample(_) | ResampleError::OutputBuffer(_)
+          ),
+          "an allocation failure surfaced as something else: {refused:?}",
         );
         assert_eq!(
           resampler.delay(),
@@ -2100,9 +2182,12 @@ mod tests {
         );
 
         // And it is still drainable, which is the whole point.
-        resampler
-          .receive_frame(&mut dst)
-          .expect("the tail survived the failure");
+        assert_eq!(
+          resampler
+            .receive_frame(&mut dst)
+            .expect("the tail survived the failure"),
+          Received::Frame,
+        );
       },
     );
   }

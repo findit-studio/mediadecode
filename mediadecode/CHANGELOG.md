@@ -11,10 +11,122 @@ The sibling FFmpeg adapter has its own log at
 
 ## [Unreleased]
 
-### Fixed
+### Added
 
-- **The `serde` feature now forwards `mediaframe/serde`**, so re-exported
-  mediaframe vocabulary types serialize too.
+- **`Sent` and `Received` — the push rhythm's vocabulary**, in a new
+  `rhythm` module and re-exported at the crate root. `Sent` is
+  `Accepted` / `MustDrain`; `Received` is `Frame` / `NeedsInput` /
+  `Ended`. Both are carried in the `Ok` arm, on every submission and
+  every drain in the crate.
+
+  The module is named `rhythm` because that is
+  [already this crate's word][rhythm] for the thing both enums describe
+  — packets in over time, frames out over time, the two not in step —
+  and because one law with two faces belongs in one place rather than
+  in a `send` module and a `receive` module that would each carry half
+  the rationale and drift.
+
+  [rhythm]: https://docs.rs/mediadecode/latest/mediadecode/decoder/#what-the-names-say
+
+  The facade published **no** vocabulary for any of the three non-frame
+  conditions before this, and said so in prose: "backends signal 'no
+  frame ready' via a backend-specific `Error` variant". Three things
+  followed from that, and all three are why this is worth a breaking
+  release:
+
+  - **`?` did not mean what it says.** A function that propagated a
+    drain error propagated end-of-stream as a failure, and one that
+    propagated a send error propagated *back pressure* as a failure — so
+    every correct caller had to *avoid* `?` and hand-write a classifier
+    instead.
+  - **The classifier could not be written generically.** The conditions
+    lived in `Self::Error`, a type the traits leave entirely to the
+    backend. A consumer bounded on the trait alone had no way to ask.
+    On the receive side what survived was
+    `while d.receive_frame(&mut f).is_ok()` — which cannot tell
+    *drained* from *broken*, and therefore swallows every receive-side
+    failure it meets; that idiom appeared **24 times** in this
+    repository's own tests, examples and benches. On the send side what
+    survived was the **two-offer rule**: submit, and if that fails drain
+    and submit again, treating the second failure as real — because
+    "drain me first" and "this packet is damaged" arrived as the same
+    `Err` and only a second attempt could separate them. Twice, because
+    once meant nothing. It is a guess, and it is wrong whenever one
+    drain is not enough.
+  - **Backends of the same trait disagreed completely.** WebCodecs named
+    all four conditions; the FFmpeg video and audio decoders named none,
+    passing `Other { errno: EAGAIN }` and `Eof` straight through. A
+    caller generic over `VideoStreamDecoder` observed a different
+    protocol depending on which backend it was instantiated with — the
+    exact thing a trait exists to prevent.
+
+  **`Sent` and `Received` are deliberately not `#[non_exhaustive]`, and
+  every backend error type in the family deliberately now is.** The two
+  decisions are the same decision seen from its two ends. A status enum
+  is a *closed protocol vocabulary*: its arms are the state set of the
+  substrate every push decoder is built on, there is no further answer
+  to discover, so a permanent wildcard arm would be dead weight hiding a
+  state a consumer forgot. An error type is an *open fault taxonomy*:
+  new ways to fail really are discovered, and a consumer that meets one
+  it has never heard of should take its generic-fault path — which is
+  exactly what a wildcard arm is for.
+
+### Changed
+
+- **BREAKING: `receive_frame` returns `Received`, and
+  `send_packet` / `send_frame` / `send_eof` return `Sent`** on
+  `decoder::{VideoStreamDecoder, AudioStreamDecoder, SubtitleDecoder}`,
+  on `resampler::AudioResampler`, and on the `future::local` /
+  `future::send` mirrors of all three decoder faces. `Err` is now
+  **fault only** on every one of them, and the `#[must_use]` on both
+  enums is what stops an answer being dropped. `flush` is unchanged:
+  nothing is offered to it, so there is nothing to be back-pressured.
+
+- **`send_eof` answers `Sent` too, and that is not symmetry for its own
+  sake.** A session with undrained output can be unable to record the
+  end-of-stream yet, and `Sent::MustDrain` there means it was **not**
+  recorded — a distinction `is_ok()` cannot make, and one this release
+  had to act on inside the FFmpeg backend (see its log).
+
+- **The async mirrors keep `Sent::MustDrain`**, which is the one kind of
+  pressure awaiting cannot resolve: only the caller's own
+  `receive_frame` relieves it, and both methods hold `&mut self`, so a
+  `send_packet` that parked instead of answering would deadlock. Host
+  pressure the browser drains by itself is still awaited; pressure that
+  needs the caller is reported.
+
+- **`AudioResampler::Error`'s doc no longer claims to carry "nothing
+  ready yet"**, and the trait states that the tail's end arrives as
+  `Received::Ended` and never as `Received::NeedsInput` — the
+  distinction that lets a drain loop be written without the caller
+  remembering whether it called `send_eof`.
+
+- **`SubtitleDecoder::receive_frame` documents that a backend with no
+  tail still has an end.** A decoder whose underlying API produces its
+  cue inline still answers all three states: `NeedsInput` until a packet
+  has produced one, `Ended` once `send_eof` has been signalled.
+
+### Unchanged, and deliberately
+
+- **`Demuxer::next_packet` keeps `Result<Option<_>, E>`.** It has no
+  needs-input state — a demuxer is pulled, not fed — so a three-state
+  word here would declare an arm no backend can produce and every
+  consumer would still have to match. It also carries its packet in the
+  `Ok` arm rather than into a `dst`, so folding it onto `Received` would
+  need either a generic payload (making every decoder write
+  `Received<()>`) or a second enum. The two faces share the law, not the
+  type: **a protocol state never travels in `Err`.** The trait docs now
+  say so.
+
+- **`ImageDecoder::decode` is untouched.** A one-shot decode has no
+  session states: "these bytes are not a picture" is a fact about the
+  payload the caller handed over, which is what an error is for. Its doc
+  now draws that line explicitly.
+
+- **`VideoFrameSource` / `AudioFrameSource` are untouched.** They are
+  index-addressed pull faces; the caller names the frame, so there is no
+  rhythm to report.
+
 
 ## [0.9.0] - 2026-08-26
 
@@ -49,6 +161,11 @@ The sibling FFmpeg adapter has its own log at
   The principle is homed here because it binds every backend, not only
   the FFmpeg one; the concrete knob enumeration belongs to whichever
   crate owns the substrate.
+
+### Fixed
+
+- **The `serde` feature now forwards `mediaframe/serde`**, so re-exported
+  mediaframe vocabulary types serialize too.
 
 
 ## [0.9.0] - 2026-08-24

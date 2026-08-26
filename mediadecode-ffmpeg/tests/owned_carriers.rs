@@ -28,6 +28,7 @@
 mod support;
 
 use mediadecode::{
+  Received,
   decoder::ImageDecoder,
   demuxer::{DemuxedPacket, Demuxer, TrackKind},
 };
@@ -859,19 +860,25 @@ fn an_amplifying_conversion_is_refused_before_the_output_frame_exists() {
   // The other direction — a large downsample — is not amplification and
   // must not be refused by the same ceiling.
   let mut down = FfmpegResampler::new(packed(192_000), packed(8_000), tight).expect("open");
-  down
-    .send_frame(&stereo_f32_frame(192_000, 1_024))
-    .expect("a downsample produces less, and must pass the same ceiling");
+  support::accepted(
+    down.send_frame(&stereo_f32_frame(192_000, 1_024)),
+    "a downsample produces less, and must pass the same ceiling",
+  );
 
   // And a legitimately amplifying conversion under a ceiling that
   // allows it still works: 8 kHz to 48 kHz is a real resample.
   let mut up =
     FfmpegResampler::new(packed(8_000), packed(48_000), FrameLimits::default()).expect("open");
-  up.send_frame(&stereo_f32_frame(8_000, 8_000))
-    .expect("a 6x upsample of one second is ordinary work");
+  support::accepted(
+    up.send_frame(&stereo_f32_frame(8_000, 8_000)),
+    "a 6x upsample of one second is ordinary work",
+  );
   let mut converted = mediadecode_ffmpeg::empty_owned_audio_frame();
-  up.receive_frame(&mut converted)
-    .expect("the conversion produced a frame");
+  assert_eq!(
+    up.receive_frame(&mut converted)
+      .expect("the conversion produced a frame"),
+    Received::Frame,
+  );
   assert_eq!(converted.sample_rate(), 48_000);
   assert!(converted.nb_samples() > 0);
 }
@@ -1290,7 +1297,10 @@ fn an_audio_plane_exports_valid_samples_not_alignment_padding() {
       continue;
     }
     let mut frame = mediadecode_ffmpeg::empty_owned_audio_frame();
-    while decoder.receive_frame(&mut frame).is_ok() {
+    while matches!(
+      decoder.receive_frame(&mut frame).expect("receive_frame"),
+      Received::Frame
+    ) {
       let samples = frame.nb_samples() as usize;
       if samples == 0 {
         continue;
@@ -2387,11 +2397,18 @@ fn audio_gets_a_pre_allocation_ceiling_too() {
         FfmpegBytes::copy_from_slice(&body),
         mediadecode_ffmpeg::extras::AudioPacketExtra::new(0),
       );
-      decoder.send_packet(&audio)?;
+      // **The send's answer is deliberately dropped on these ceiling
+      // probes.** They feed one packet, drain immediately, and are
+      // looking for *which refusal* the ceiling produces — not for a
+      // complete decode. A `MustDrain` here would mean the decoder
+      // already had output waiting, which the very next line takes; the
+      // un-consumed packet is simply not re-offered, and there are more.
+      let _ = decoder.send_packet(&audio)?;
       match decoder.receive_frame(&mut frame) {
-        Ok(()) => return Ok(()),
+        Ok(Received::Frame) => return Ok(()),
         // Not enough input yet: feed the next packet.
-        Err(e) if format!("{e}").contains("Resource temporarily unavailable") => continue,
+        Ok(Received::NeedsInput) => continue,
+        Ok(Received::Ended) => break,
         Err(e) => return Err(e),
       }
     }
@@ -2414,6 +2431,12 @@ fn audio_gets_a_pre_allocation_ceiling_too() {
     Err(AudioDecodeError::Convert(_)) => {
       panic!("audio had no pre-allocation guard: the frame was allocated, then refused")
     }
+    // `AudioDecodeError` is `#[non_exhaustive]`, so from this crate the
+    // match needs a rest arm. It is not a formality here: a *third*
+    // kind of refusal would mean the ceiling was enforced by some road
+    // this test has never seen, and the whole point of the lane is
+    // which of the two roads answered.
+    Err(other) => panic!("an unexpected refusal shape: {other:?}"),
     Ok(()) => panic!("an oversized audio frame passed a 4080-byte ceiling"),
   }
 
@@ -2462,10 +2485,11 @@ fn decode_first_audio(
           FfmpegBytes::copy_from_slice(&body),
           mediadecode_ffmpeg::extras::AudioPacketExtra::new(0),
         );
-        decoder.send_packet(&audio)?;
+        // Answer dropped: see the note on the first ceiling probe above.
+        let _ = decoder.send_packet(&audio)?;
         match decoder.receive_frame(&mut frame) {
-          Ok(()) => return Ok(frame),
-          Err(e) if format!("{e}").contains("Resource temporarily unavailable") => continue,
+          Ok(Received::Frame) => return Ok(frame),
+          Ok(Received::NeedsInput | Received::Ended) => continue,
           Err(e) => return Err(e),
         }
       }
@@ -2512,7 +2536,7 @@ fn the_hardware_road_still_delivers_frames_through_its_new_seat() {
         if decoder.send_packet(&packet).is_err() {
           continue;
         }
-        if decoder.receive_frame(&mut frame).is_ok() {
+        if matches!(decoder.receive_frame(&mut frame), Ok(Received::Frame)) {
           delivered = true;
           break 'outer;
         }
@@ -2572,10 +2596,11 @@ fn a_cropped_stream_is_judged_on_what_it_allocates_not_what_it_displays() {
       let mut packet = ffmpeg_next::Packet::empty();
       match packet.read(&mut input) {
         Ok(()) if packet.stream() == index => {
-          decoder.send_packet(&packet)?;
+          // Answer dropped: see the note on the first ceiling probe above.
+          let _ = decoder.send_packet(&packet)?;
           match decoder.receive_frame(&mut frame) {
-            Ok(()) => return Ok(()),
-            Err(e) if format!("{e}").contains("Resource temporarily unavailable") => continue,
+            Ok(Received::Frame) => return Ok(()),
+            Ok(Received::NeedsInput | Received::Ended) => continue,
             Err(e) => return Err(e),
           }
         }
@@ -2758,12 +2783,17 @@ fn every_hardware_exit_names_the_coded_surface_refusal() {
     let mut packet = ffmpeg_next::Packet::empty();
     match packet.read(&mut input) {
       Ok(()) if packet.stream() == index => {
+        // `and_then` still composes: the send's answer is discarded
+        // deliberately, because this lane only cares whether the
+        // *receive* is refused by the ceiling. A `MustDrain` here
+        // simply means the decoder had output waiting, which the
+        // receive below is about to take.
         let outcome = decoder
           .send_packet(&packet)
-          .and_then(|()| decoder.receive_frame(&mut frame));
+          .and_then(|_| decoder.receive_frame(&mut frame));
         match outcome {
-          Ok(()) => panic!("a 2 Mpx coded surface passed a 1 Mpx ceiling"),
-          Err(e) if format!("{e}").contains("Resource temporarily unavailable") => continue,
+          Ok(Received::Frame) => panic!("a 2 Mpx coded surface passed a 1 Mpx ceiling"),
+          Ok(Received::NeedsInput | Received::Ended) => continue,
           Err(e) => {
             refusal = named(&e);
             break;
@@ -2826,10 +2856,11 @@ fn a_cheap_format_is_not_charged_the_worst_formats_price() {
       let mut packet = ffmpeg_next::Packet::empty();
       match packet.read(&mut input) {
         Ok(()) if packet.stream() == index => {
-          decoder.send_packet(&packet)?;
+          // Answer dropped: see the note on the first ceiling probe above.
+          let _ = decoder.send_packet(&packet)?;
           match decoder.receive_frame(&mut frame) {
-            Ok(()) => return Ok(()),
-            Err(e) if format!("{e}").contains("Resource temporarily unavailable") => continue,
+            Ok(Received::Frame) => return Ok(()),
+            Ok(Received::NeedsInput | Received::Ended) => continue,
             Err(e) => return Err(e),
           }
         }
@@ -2929,12 +2960,17 @@ fn a_byte_refused_frame_is_named_on_every_software_road() {
     let mut packet = ffmpeg_next::Packet::empty();
     match packet.read(&mut input) {
       Ok(()) if packet.stream() == index => {
+        // `and_then` still composes: the send's answer is discarded
+        // deliberately, because this lane only cares whether the
+        // *receive* is refused by the ceiling. A `MustDrain` here
+        // simply means the decoder had output waiting, which the
+        // receive below is about to take.
         let outcome = decoder
           .send_packet(&packet)
-          .and_then(|()| decoder.receive_frame(&mut frame));
+          .and_then(|_| decoder.receive_frame(&mut frame));
         match outcome {
-          Ok(()) => panic!("a 3.1 MB frame passed a 1 MiB ceiling"),
-          Err(e) if format!("{e}").contains("Resource temporarily unavailable") => continue,
+          Ok(Received::Frame) => panic!("a 3.1 MB frame passed a 1 MiB ceiling"),
+          Ok(Received::NeedsInput | Received::Ended) => continue,
           Err(e) => {
             video_named = named(&e);
             break;
@@ -3035,10 +3071,11 @@ fn the_software_video_road_names_its_budget_refusals() {
             FfmpegBytes::copy_from_slice(&body),
             mediadecode_ffmpeg::extras::VideoPacketExtra::new(0),
           );
-          decoder.send_packet(&video)?;
+          // Answer dropped: see the note on the first ceiling probe above.
+          let _ = decoder.send_packet(&video)?;
           match decoder.receive_frame(&mut frame) {
-            Ok(()) => return Ok(()),
-            Err(e) if format!("{e}").contains("Resource temporarily unavailable") => continue,
+            Ok(Received::Frame) => return Ok(()),
+            Ok(Received::NeedsInput | Received::Ended) => continue,
             Err(e) => return Err(e),
           }
         }

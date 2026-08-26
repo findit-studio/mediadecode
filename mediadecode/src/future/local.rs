@@ -5,7 +5,7 @@
 //! are mechanically identical apart from the auto-trait bounds.
 
 use crate::{
-  Timebase, Timestamp,
+  Received, Sent, Timebase, Timestamp,
   adapter::{AudioAdapter, ImageAdapter, SubtitleAdapter, VideoAdapter},
   demuxer::AttachmentPacket,
   frame::{AudioFrame, ImageFrame, SubtitleFrame, VideoFrame},
@@ -27,16 +27,27 @@ pub trait VideoStreamDecoder {
   type Error;
 
   /// Submits one compressed packet, awaiting any host-side back
-  /// pressure (e.g. WebCodecs `decodeQueueSize` saturation).
+  /// pressure it *can* wait out (e.g. WebCodecs `decodeQueueSize`
+  /// saturation, which the host drains on its own).
+  ///
+  /// Answers the same [`Sent`] the sync face answers, and
+  /// [`Sent::MustDrain`] is the pressure that awaiting cannot resolve:
+  /// only the caller's own `receive_frame` can relieve it, and this
+  /// method holds `&mut self`, so parking here would deadlock. The
+  /// `async` decides *when* an answer arrives, never which answers
+  /// exist.
   async fn send_packet(
     &mut self,
     packet: &VideoPacket<<Self::Adapter as VideoAdapter>::PacketExtra, Self::Buffer>,
-  ) -> Result<(), Self::Error>;
+  ) -> Result<Sent, Self::Error>;
 
   /// Awaits the next decoded frame and writes it to `dst`.
-  /// Resolves when a frame is ready; backends that hit
-  /// end-of-stream signal it via a backend-specific `Error`
-  /// variant.
+  ///
+  /// Answers the same [`Received`] the sync face answers. The `await`
+  /// changes when the answer arrives, never which answers exist: a
+  /// backend that parks on a host completion event still resolves to
+  /// [`Received::NeedsInput`] rather than parking forever when nothing
+  /// is in flight and only the caller can supply more.
   async fn receive_frame(
     &mut self,
     dst: &mut VideoFrame<
@@ -44,10 +55,10 @@ pub trait VideoStreamDecoder {
       <Self::Adapter as VideoAdapter>::FrameExtra,
       Self::Buffer,
     >,
-  ) -> Result<(), Self::Error>;
+  ) -> Result<Received, Self::Error>;
 
   /// Signals end-of-stream and waits for the backend to drain.
-  async fn send_eof(&mut self) -> Result<(), Self::Error>;
+  async fn send_eof(&mut self) -> Result<Sent, Self::Error>;
 
   /// Flushes / resets internal state.
   async fn flush(&mut self) -> Result<(), Self::Error>;
@@ -98,13 +109,15 @@ pub trait AudioStreamDecoder {
   /// Decoder-specific error.
   type Error;
 
-  /// Submits a compressed audio packet.
+  /// Submits a compressed audio packet. See
+  /// [`VideoStreamDecoder::send_packet`].
   async fn send_packet(
     &mut self,
     packet: &AudioPacket<<Self::Adapter as AudioAdapter>::PacketExtra, Self::Buffer>,
-  ) -> Result<(), Self::Error>;
+  ) -> Result<Sent, Self::Error>;
 
-  /// Awaits the next decoded frame.
+  /// Awaits the next decoded frame. See
+  /// [`VideoStreamDecoder::receive_frame`].
   async fn receive_frame(
     &mut self,
     dst: &mut AudioFrame<
@@ -113,10 +126,10 @@ pub trait AudioStreamDecoder {
       <Self::Adapter as AudioAdapter>::FrameExtra,
       Self::Buffer,
     >,
-  ) -> Result<(), Self::Error>;
+  ) -> Result<Received, Self::Error>;
 
   /// Signals EOF and waits for drain.
-  async fn send_eof(&mut self) -> Result<(), Self::Error>;
+  async fn send_eof(&mut self) -> Result<Sent, Self::Error>;
 
   /// Flushes internal state.
   async fn flush(&mut self) -> Result<(), Self::Error>;
@@ -169,20 +182,22 @@ pub trait SubtitleDecoder {
   /// Decoder-specific error.
   type Error;
 
-  /// Submits a compressed subtitle packet.
+  /// Submits a compressed subtitle packet. See
+  /// [`VideoStreamDecoder::send_packet`].
   async fn send_packet(
     &mut self,
     packet: &SubtitlePacket<<Self::Adapter as SubtitleAdapter>::PacketExtra, Self::Buffer>,
-  ) -> Result<(), Self::Error>;
+  ) -> Result<Sent, Self::Error>;
 
-  /// Awaits the next decoded subtitle frame.
+  /// Awaits the next decoded subtitle frame. See
+  /// [`VideoStreamDecoder::receive_frame`].
   async fn receive_frame(
     &mut self,
     dst: &mut SubtitleFrame<<Self::Adapter as SubtitleAdapter>::FrameExtra, Self::Buffer>,
-  ) -> Result<(), Self::Error>;
+  ) -> Result<Received, Self::Error>;
 
   /// Signals EOF.
-  async fn send_eof(&mut self) -> Result<(), Self::Error>;
+  async fn send_eof(&mut self) -> Result<Sent, Self::Error>;
 
   /// Flushes internal state.
   async fn flush(&mut self) -> Result<(), Self::Error>;
@@ -269,17 +284,17 @@ mod tests {
     type Buffer = &'static [u8];
     type Error = LoopError;
 
-    async fn send_packet(&mut self, _: &VideoPacket<(), &'static [u8]>) -> Result<(), LoopError> {
-      Ok(())
+    async fn send_packet(&mut self, _: &VideoPacket<(), &'static [u8]>) -> Result<Sent, LoopError> {
+      Ok(Sent::Accepted)
     }
     async fn receive_frame(
       &mut self,
       _: &mut VideoFrame<u32, (), &'static [u8]>,
-    ) -> Result<(), LoopError> {
-      Err(LoopError)
+    ) -> Result<Received, LoopError> {
+      Ok(Received::NeedsInput)
     }
-    async fn send_eof(&mut self) -> Result<(), LoopError> {
-      Ok(())
+    async fn send_eof(&mut self) -> Result<Sent, LoopError> {
+      Ok(Sent::Accepted)
     }
     async fn flush(&mut self) -> Result<(), LoopError> {
       Ok(())
@@ -319,17 +334,17 @@ mod tests {
     type Adapter = ALoop;
     type Buffer = &'static [u8];
     type Error = LoopError;
-    async fn send_packet(&mut self, _: &AudioPacket<(), &'static [u8]>) -> Result<(), LoopError> {
-      Ok(())
+    async fn send_packet(&mut self, _: &AudioPacket<(), &'static [u8]>) -> Result<Sent, LoopError> {
+      Ok(Sent::Accepted)
     }
     async fn receive_frame(
       &mut self,
       _: &mut AudioFrame<u32, u32, (), &'static [u8]>,
-    ) -> Result<(), LoopError> {
-      Err(LoopError)
+    ) -> Result<Received, LoopError> {
+      Ok(Received::NeedsInput)
     }
-    async fn send_eof(&mut self) -> Result<(), LoopError> {
-      Ok(())
+    async fn send_eof(&mut self) -> Result<Sent, LoopError> {
+      Ok(Sent::Accepted)
     }
     async fn flush(&mut self) -> Result<(), LoopError> {
       Ok(())
@@ -372,17 +387,17 @@ mod tests {
     async fn send_packet(
       &mut self,
       _: &SubtitlePacket<(), &'static [u8]>,
-    ) -> Result<(), LoopError> {
-      Ok(())
+    ) -> Result<Sent, LoopError> {
+      Ok(Sent::Accepted)
     }
     async fn receive_frame(
       &mut self,
       _: &mut SubtitleFrame<(), &'static [u8]>,
-    ) -> Result<(), LoopError> {
-      Err(LoopError)
+    ) -> Result<Received, LoopError> {
+      Ok(Received::NeedsInput)
     }
-    async fn send_eof(&mut self) -> Result<(), LoopError> {
-      Ok(())
+    async fn send_eof(&mut self) -> Result<Sent, LoopError> {
+      Ok(Sent::Accepted)
     }
     async fn flush(&mut self) -> Result<(), LoopError> {
       Ok(())

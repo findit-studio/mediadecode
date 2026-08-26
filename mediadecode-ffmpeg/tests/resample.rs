@@ -26,6 +26,7 @@ use ffmpeg_next::{
   format::{Sample, sample::Type},
 };
 use mediadecode::{
+  Received,
   decoder::AudioStreamDecoder,
   demuxer::{DemuxedPacket, Demuxer, TrackKind},
   resampler::AudioResampler,
@@ -39,6 +40,19 @@ use mediadecode_ffmpeg::{
   empty_owned_audio_frame as empty_audio_frame,
 };
 use support::Corpus;
+
+/// `true` while frames are still coming out, panicking on a fault.
+///
+/// The pre-EOF half of a drain, and the reason it is a named helper: a
+/// `.is_ok()` loop cannot be written any more — "needs input" is a
+/// success — and writing the match out at each of the dozen drain sites
+/// in this file would bury what each test is actually about.
+fn frame_ready<E: core::fmt::Debug>(status: Result<Received, E>) -> bool {
+  match status.expect("a fault-free drain") {
+    Received::Frame => true,
+    Received::NeedsInput | Received::Ended => false,
+  }
+}
 
 /// Everything one run of the pipeline produced.
 struct Converted {
@@ -128,27 +142,40 @@ fn run(path: &std::path::Path, target: ResampleSpec) -> Converted {
     if t.get() != track {
       continue;
     }
-    decoder.send_packet(&packet).expect("send_packet");
-    while decoder.receive_frame(&mut decoded).is_ok() {
-      resampler.send_frame(&decoded).expect("send_frame");
-      while resampler.receive_frame(&mut out).is_ok() {
+    support::accepted(decoder.send_packet(&packet), "send_packet");
+    while frame_ready(decoder.receive_frame(&mut decoded)) {
+      support::accepted(resampler.send_frame(&decoded), "send_frame");
+      while frame_ready(resampler.receive_frame(&mut out)) {
         collect(&mut converted, &out);
       }
     }
   }
-  decoder.send_eof().expect("decoder eof");
-  while decoder.receive_frame(&mut decoded).is_ok() {
-    resampler.send_frame(&decoded).expect("send_frame");
-    while resampler.receive_frame(&mut out).is_ok() {
+  support::accepted(decoder.send_eof(), "decoder eof");
+  while frame_ready(decoder.receive_frame(&mut decoded)) {
+    support::accepted(resampler.send_frame(&decoded), "send_frame");
+    while frame_ready(resampler.receive_frame(&mut out)) {
       collect(&mut converted, &out);
     }
   }
 
-  // The tail. Everything after this point is what would be lost.
-  resampler.send_eof().expect("resampler eof");
-  while resampler.receive_frame(&mut out).is_ok() {
-    converted.tail_frames += 1;
-    collect(&mut converted, &out);
+  // The tail. Everything after this point is what would be lost — and
+  // the loop that collects it terminates on `Ended`, not on a refusal
+  // it has to guess the meaning of.
+  support::accepted(resampler.send_eof(), "resampler eof");
+  loop {
+    match resampler
+      .receive_frame(&mut out)
+      .expect("no fault in the tail")
+    {
+      Received::Frame => {
+        converted.tail_frames += 1;
+        collect(&mut converted, &out);
+      }
+      Received::NeedsInput => {
+        panic!("a resampler at EOF asked for input the caller does not have")
+      }
+      Received::Ended => break,
+    }
   }
   converted
 }
@@ -292,9 +319,7 @@ fn a_mid_stream_format_change_is_refused_by_name() {
     1,
     Default::default(),
   );
-  resampler
-    .send_frame(&good)
-    .expect("the declared source spec");
+  support::accepted(resampler.send_frame(&good), "the declared source spec");
 
   // Same everything but the rate.
   let changed = mediadecode_ffmpeg::OwnedAudioFrame::new(
@@ -339,7 +364,7 @@ fn a_mid_stream_format_change_is_refused_by_name() {
 }
 
 #[test]
-fn the_needs_more_signal_is_an_error_variant() {
+fn the_needs_more_signal_lives_in_the_ok_arm() {
   support::init_ffmpeg();
   let source = ResampleSpec::new(48_000, Sample::I16(Type::Packed), ChannelLayout::STEREO);
   let mut resampler = FfmpegResampler::new(
@@ -350,19 +375,21 @@ fn the_needs_more_signal_is_an_error_variant() {
   .expect("open resampler");
   let mut dst = empty_audio_frame();
 
-  let err = resampler
-    .receive_frame(&mut dst)
-    .expect_err("nothing has been sent");
-  assert!(err.is_again(), "got {err:?}");
-
-  // After EOF with nothing inside, the drain is empty and says so the
-  // same way.
-  resampler.send_eof().expect("eof");
-  assert!(
+  assert_eq!(
     resampler
       .receive_frame(&mut dst)
-      .expect_err("an empty tail")
-      .is_again()
+      .expect("an empty session is not a fault"),
+    Received::NeedsInput,
+  );
+
+  // After EOF with nothing inside, the drain is empty — and says the
+  // *other* thing, which is the distinction that did not exist before.
+  support::accepted(resampler.send_eof(), "eof");
+  assert_eq!(
+    resampler
+      .receive_frame(&mut dst)
+      .expect("an empty tail is not a fault"),
+    Received::Ended,
   );
 
   // `send_frame` after EOF is refused rather than silently accepted.
@@ -386,7 +413,101 @@ fn the_needs_more_signal_is_an_error_variant() {
   // Flush is the way back: the resampler is reusable for another
   // stream on the same two specs.
   resampler.flush().expect("flush");
-  resampler.send_frame(&frame).expect("reusable after flush");
+  support::accepted(resampler.send_frame(&frame), "reusable after flush");
+}
+
+/// **The spin-forever regression, on the real `swresample` road.**
+///
+/// The conflation this proves gone: `ResampleError::Again` was returned
+/// *pre-EOF with nothing ready* and *post-EOF with the tail exhausted*.
+/// Those are opposite instructions — "send me more" and "there is no
+/// more" — and a caller polling the seam could tell them apart only by
+/// remembering whether it had itself called `send_eof`. A generic drain,
+/// which does not know, therefore either stopped early (losing the tail)
+/// or asked forever.
+///
+/// The loop below is that generic drain: it has no input left to offer,
+/// so treating `NeedsInput` as "feed it" would hang. It terminates
+/// because the end of the tail has its own word. The iteration cap turns
+/// what would have been a hanging test into a failing one.
+#[test]
+fn a_drained_tail_says_ended_instead_of_asking_for_input_that_cannot_come() {
+  support::init_ffmpeg();
+  let mut resampler = FfmpegResampler::new(
+    ResampleSpec::new(48_000, Sample::I16(Type::Packed), ChannelLayout::STEREO),
+    mono_16k(),
+    mediadecode_ffmpeg::FrameLimits::default(),
+  )
+  .expect("open resampler");
+
+  // Enough input for the 48k->16k filter to hold a real tail back.
+  let samples = 4_800u32;
+  for index in 0..4 {
+    support::accepted(
+      resampler.send_frame(&stereo_frame(
+        samples,
+        samples as usize * 2 * 2,
+        Some(i64::from(index) * i64::from(samples)),
+      )),
+      "send_frame",
+    );
+  }
+  support::accepted(resampler.send_eof(), "send_eof");
+  assert!(
+    resampler.delay() > 0,
+    "there has to be a tail inside the filter for this to prove anything",
+  );
+
+  let mut out = empty_audio_frame();
+  let mut tail_frames = 0u32;
+  let mut ended = false;
+  for _ in 0..256 {
+    match resampler
+      .receive_frame(&mut out)
+      .expect("a clean drain raises no fault")
+    {
+      Received::Frame => tail_frames += 1,
+      Received::NeedsInput => panic!(
+        "the resampler asked for input after being told the stream ended —          the caller has nothing left to send, so this is the hang the old          `Again` arm produced",
+      ),
+      Received::Ended => {
+        ended = true;
+        break;
+      }
+    }
+  }
+  assert!(ended, "the drain never reached the end of the tail");
+  assert!(
+    tail_frames > 0,
+    "no tail was drained, so nothing was proved"
+  );
+  // **`delay()` is deliberately not asserted to be zero here.**
+  // `swr_get_delay` stands at a small residue (16 samples on this
+  // corpus) that `swr_convert_frame` will never emit — which is exactly
+  // why the old code spun: `delay > 0` sent it back into the flush road,
+  // the flush produced nothing, and the answer was the same `Again` that
+  // means "send more input" before EOF. The end of a tail is what the
+  // converter will still produce, not what the delay counter says.
+
+  // And it is a settled answer, not a momentary one: polling past the
+  // end keeps saying the same thing rather than sending the caller back
+  // for input it does not have.
+  for _ in 0..4 {
+    assert_eq!(
+      resampler
+        .receive_frame(&mut out)
+        .expect("no fault past the end"),
+      Received::Ended,
+    );
+  }
+
+  // `flush` is the only thing that retracts it — the end is a session
+  // state, and a new stream on the same specs starts over.
+  resampler.flush().expect("flush");
+  assert_eq!(
+    resampler.receive_frame(&mut out).expect("no fault"),
+    Received::NeedsInput,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -574,8 +695,8 @@ fn converted_rms(
   let mut energy = 0f64;
   let mut count = 0usize;
   for _ in 0..3 {
-    resampler.send_frame(frame).expect("send_frame");
-    while resampler.receive_frame(&mut out).is_ok() {
+    support::accepted(resampler.send_frame(frame), "send_frame");
+    while frame_ready(resampler.receive_frame(&mut out)) {
       let valid = out.nb_samples() as usize * out.channel_count() as usize * 2;
       for chunk in out.planes()[0].data_ref().as_ref()[..valid]
         .as_chunks::<2>()
@@ -1025,9 +1146,10 @@ fn a_forged_frame_geometry_is_refused_before_it_can_allocate() {
 
   // And an honest frame still goes through afterwards: the refusals
   // above left nothing broken behind them.
-  resampler
-    .send_frame(&stereo_frame(480, 480 * 2 * 2, Some(0)))
-    .expect("an honest frame");
+  support::accepted(
+    resampler.send_frame(&stereo_frame(480, 480 * 2 * 2, Some(0))),
+    "an honest frame",
+  );
 }
 
 #[test]
@@ -1051,12 +1173,16 @@ fn a_refused_frame_does_not_stamp_the_next_good_one() {
   ));
 
   // Then the real first frame, at zero.
-  resampler
-    .send_frame(&stereo_frame(4_800, 4_800 * 2 * 2, Some(0)))
-    .expect("an honest frame");
+  support::accepted(
+    resampler.send_frame(&stereo_frame(4_800, 4_800 * 2 * 2, Some(0))),
+    "an honest frame",
+  );
 
   let mut out = empty_audio_frame();
-  resampler.receive_frame(&mut out).expect("converted output");
+  assert_eq!(
+    resampler.receive_frame(&mut out).expect("converted output"),
+    Received::Frame,
+  );
   assert_eq!(
     out.pts().expect("stamped").pts(),
     0,
@@ -1096,21 +1222,25 @@ fn a_timestamp_that_cannot_be_rescaled_is_refused_before_anything_moves() {
       "a refused timestamp left input inside the filter",
     );
     let mut dst = empty_audio_frame();
-    assert!(
+    assert_eq!(
       resampler
         .receive_frame(&mut dst)
-        .expect_err("nothing was converted")
-        .is_again(),
+        .expect("nothing was converted, and that is not a fault"),
+      Received::NeedsInput,
     );
   }
 
   // And the anchor never moved: the first frame the session accepts is
   // still the one that fixes where the stream starts.
-  resampler
-    .send_frame(&stereo_frame(samples, bytes, Some(0)))
-    .expect("an honest frame");
+  support::accepted(
+    resampler.send_frame(&stereo_frame(samples, bytes, Some(0))),
+    "an honest frame",
+  );
   let mut out = empty_audio_frame();
-  resampler.receive_frame(&mut out).expect("converted output");
+  assert_eq!(
+    resampler.receive_frame(&mut out).expect("converted output"),
+    Received::Frame,
+  );
   assert_eq!(
     out.pts().expect("stamped").pts(),
     0,
@@ -1151,22 +1281,26 @@ fn the_output_timeline_refuses_to_overflow() {
     "the refused frame was consumed before the timeline was checked",
   );
   let mut dst = empty_audio_frame();
-  assert!(
+  assert_eq!(
     resampler
       .receive_frame(&mut dst)
-      .expect_err("nothing was converted")
-      .is_again(),
+      .expect("nothing was converted, and that is not a fault"),
+    Received::NeedsInput,
     "a refused frame left output ready",
   );
 
   // A session refused this way is still usable: the very next honest
   // frame converts, and anchors the timeline itself.
-  resampler
-    .send_frame(&stereo_frame(samples, samples as usize * 2 * 2, Some(0)))
-    .expect("the session survived the refusal");
-  resampler
-    .receive_frame(&mut dst)
-    .expect("and converts the next frame");
+  support::accepted(
+    resampler.send_frame(&stereo_frame(samples, samples as usize * 2 * 2, Some(0))),
+    "the session survived the refusal",
+  );
+  assert_eq!(
+    resampler
+      .receive_frame(&mut dst)
+      .expect("and converts the next frame"),
+    Received::Frame,
+  );
   assert_eq!(dst.pts().expect("stamped").pts(), 0);
 }
 
@@ -1186,10 +1320,11 @@ fn flush_leaves_nothing_of_the_previous_stream_behind() {
   let mut out = empty_audio_frame();
   for index in 0..4 {
     let pts = index * 4_410;
-    resampler
-      .send_frame(&mono_frame(44_100, 4_410, 20_000, Some(pts)))
-      .expect("send_frame");
-    while resampler.receive_frame(&mut out).is_ok() {}
+    support::accepted(
+      resampler.send_frame(&mono_frame(44_100, 4_410, 20_000, Some(pts))),
+      "send_frame",
+    );
+    while frame_ready(resampler.receive_frame(&mut out)) {}
   }
   assert!(
     resampler.delay() > 0,
@@ -1208,10 +1343,11 @@ fn flush_leaves_nothing_of_the_previous_stream_behind() {
   let mut loudest = 0i16;
   let mut first_pts = None;
   for index in 0..4 {
-    resampler
-      .send_frame(&mono_frame(44_100, 4_410, 0, Some(index * 4_410)))
-      .expect("send_frame");
-    while resampler.receive_frame(&mut out).is_ok() {
+    support::accepted(
+      resampler.send_frame(&mono_frame(44_100, 4_410, 0, Some(index * 4_410))),
+      "send_frame",
+    );
+    while frame_ready(resampler.receive_frame(&mut out)) {
       first_pts.get_or_insert(out.pts().expect("stamped").pts());
       let valid = out.nb_samples() as usize * 2;
       for chunk in out.planes()[0].data_ref().as_ref()[..valid]
@@ -1285,5 +1421,85 @@ fn a_packed_spec_above_255_channels_is_refused_at_construction() {
       Err(ResampleError::UnsupportedChannelCount(_)),
     ),
     "255 is inside the seat; whatever refuses it, it is not this ceiling",
+  );
+}
+
+/// **Class audit: the resampler's post-EOF orderings, pinned.**
+///
+/// The subtitle seam's `Ended` turned out to be reversible by a send
+/// (its latch gated the receive side only). This face keeps two latches
+/// — `eof`, set by `send_eof`, and the internal `drained` one that
+/// closes the tail — so the same question has to be asked of both:
+/// *can any submission move either backwards?*
+///
+/// It cannot. `send_frame` refuses before touching anything, `send_eof`
+/// is idempotent and never clears, and only `flush` resets. The tail's
+/// end is therefore terminal in the way the subtitle seam's was not.
+#[test]
+fn no_submission_can_reverse_the_end_of_a_resampler() {
+  support::init_ffmpeg();
+  let mut resampler = FfmpegResampler::new(
+    ResampleSpec::new(48_000, Sample::I16(Type::Packed), ChannelLayout::STEREO),
+    mono_16k(),
+    mediadecode_ffmpeg::FrameLimits::default(),
+  )
+  .expect("open resampler");
+
+  let samples = 4_800u32;
+  let frame = || stereo_frame(samples, samples as usize * 2 * 2, Some(0));
+  support::accepted(resampler.send_frame(&frame()), "a first frame");
+  support::accepted(resampler.send_eof(), "send_eof");
+
+  // Drain to the settled end.
+  let mut out = empty_audio_frame();
+  let mut ended = false;
+  for _ in 0..256 {
+    match resampler.receive_frame(&mut out).expect("no fault") {
+      Received::Frame => {}
+      Received::NeedsInput => panic!("a resampler at EOF asked for input"),
+      Received::Ended => {
+        ended = true;
+        break;
+      }
+    }
+  }
+  assert!(ended, "the drain never reached the end of the tail");
+
+  // **A second `send_eof` is taken and changes nothing.** Re-declaring
+  // the end is not a fault — the family's line is that sending *data*
+  // after the end is. The subtitle seam agrees one tier over.
+  for _ in 0..3 {
+    support::accepted(resampler.send_eof(), "a repeated end-of-stream");
+    assert_eq!(
+      resampler.receive_frame(&mut out).expect("no fault"),
+      Received::Ended,
+      "a repeated end-of-stream must not reopen the tail",
+    );
+  }
+
+  // **A frame after the end is the fault, and it stays the fault.**
+  // Never `MustDrain`: draining changes nothing, so that answer would
+  // be a loop with no exit.
+  for _ in 0..2 {
+    assert!(
+      matches!(resampler.send_frame(&frame()), Err(ResampleError::AfterEof)),
+      "a frame after end-of-stream must be a usage fault",
+    );
+    assert_eq!(
+      resampler.receive_frame(&mut out).expect("no fault"),
+      Received::Ended,
+      "the refused frame must not have re-armed the tail",
+    );
+  }
+
+  // And `flush` is the only way back — for both latches at once.
+  resampler.flush().expect("flush");
+  assert_eq!(
+    resampler.receive_frame(&mut out).expect("no fault"),
+    Received::NeedsInput,
+  );
+  support::accepted(
+    resampler.send_frame(&frame()),
+    "flush reopened the send side",
   );
 }

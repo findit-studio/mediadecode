@@ -66,37 +66,47 @@ impl Error {
   }
 }
 
-/// Errors from [`crate::WebCodecsVideoStreamDecoder`].
+/// Errors from [`crate::WebCodecsVideoStreamDecoder`] — **faults
+/// only**.
+///
+/// Three arms used to live here that were not faults at all.
+/// `NoFrameReady` and `Eof` are
+/// [`Received::NeedsInput`](mediadecode::Received) and
+/// [`Received::Ended`](mediadecode::Received) now, and `OutputFull` is
+/// [`Sent::MustDrain`](mediadecode::Sent) — so a consumer generic over
+/// the traits reads the same protocol from this backend as from any
+/// other. This adapter had the family's only complete four-arm
+/// vocabulary, and that was the problem rather than the fix: the
+/// vocabulary belonged one tier up, where every backend answers it.///
+/// **Open fault taxonomy, so it is `#[non_exhaustive]`.** New ways to
+/// fail are discovered — a browser version, a codec, a DOM exception
+/// nobody has met — and a consumer that meets one it has never heard of
+/// should take its generic-fault path, which is exactly what the
+/// wildcard arm this attribute forces is for. The status vocabularies
+/// opposite it, [`Sent`](mediadecode::Sent) and
+/// [`Received`](mediadecode::Received), are exhaustive for the
+/// mirror-image reason: their arms are the substrate's fixed state set,
+/// and there the wildcard would be dead weight hiding a state a
+/// consumer forgot.
 #[derive(Debug, Clone, Error)]
+#[non_exhaustive]
 pub enum VideoDecodeError {
-  /// `send_packet` cannot admit another chunk because the
-  /// adapter's output queue is full — the consumer must call
-  /// `receive_frame` to drain at least one frame before
-  /// retrying. Returned **without** awaiting so the caller's
-  /// `&mut self` is released; awaiting under the borrow would
-  /// deadlock since only `receive_frame` (which also takes
-  /// `&mut self`) can shrink the output queue.
-  #[error("output queue full; drain via receive_frame and retry")]
-  OutputFull,
-
-  /// `receive_frame` was called with nothing in flight: empty
-  /// queue, no chunks submitted to the decoder, no copy tasks
-  /// pending, and `send_eof` has not been called. Returned
-  /// **without** awaiting because there is no source of new
-  /// frames — only `send_packet` (also `&mut self`) can supply
-  /// one, and awaiting here would deadlock the caller.
-  #[error("no video frame available; submit packets via send_packet")]
-  NoFrameReady,
-
   /// `send_packet` was called after `send_eof` resolved. The
   /// stream is over; call `flush()` first to reset for reuse.
+  ///
+  /// **A caller usage fault, not back pressure**, which is the line
+  /// that keeps it here while `OutputFull` left. Draining changes
+  /// nothing about it: this decoder will refuse every packet until
+  /// `flush()`, so answering [`Sent::MustDrain`](mediadecode::Sent)
+  /// would send the caller into a loop with no exit.
+  ///
+  /// Spelled `AfterEof` to match the rest of the family — the FFmpeg
+  /// adapter's resampler and subtitle seams name the same condition the
+  /// same way. It was `AtEof`, and one condition wearing two words
+  /// across two backends of one trait is the disease this release is
+  /// curing.
   #[error("decoder is at EOF; flush() before sending new packets")]
-  AtEof,
-
-  /// Decoder reached end of stream — `receive_frame` will not
-  /// produce any more frames until `flush` resets it.
-  #[error("decoder exhausted; call flush to reuse")]
-  Eof,
+  AfterEof,
 
   /// The codec was not supported by the host browser, or
   /// `VideoDecoder.isConfigSupported(...)` returned false.
@@ -123,27 +133,25 @@ pub enum VideoDecodeError {
   Js(#[from] Error),
 }
 
-/// Errors from [`crate::WebCodecsAudioStreamDecoder`].
+/// Errors from [`crate::WebCodecsAudioStreamDecoder`] — **faults
+/// only**. See [`VideoDecodeError`] for what left and why.///
+/// **Open fault taxonomy, so it is `#[non_exhaustive]`.** New ways to
+/// fail are discovered — a browser version, a codec, a DOM exception
+/// nobody has met — and a consumer that meets one it has never heard of
+/// should take its generic-fault path, which is exactly what the
+/// wildcard arm this attribute forces is for. The status vocabularies
+/// opposite it, [`Sent`](mediadecode::Sent) and
+/// [`Received`](mediadecode::Received), are exhaustive for the
+/// mirror-image reason: their arms are the substrate's fixed state set,
+/// and there the wildcard would be dead weight hiding a state a
+/// consumer forgot.
 #[derive(Debug, Clone, Error)]
+#[non_exhaustive]
 pub enum AudioDecodeError {
-  /// `send_packet` cannot admit another chunk because the
-  /// adapter's output queue is full. See the matching variant
-  /// on [`VideoDecodeError`].
-  #[error("output queue full; drain via receive_frame and retry")]
-  OutputFull,
-
-  /// `receive_frame` was called with nothing in flight. See
-  /// the matching variant on [`VideoDecodeError`].
-  #[error("no audio frame available; submit packets via send_packet")]
-  NoFrameReady,
-
-  /// `send_packet` was called after `send_eof` resolved.
+  /// `send_packet` was called after `send_eof` resolved. See the
+  /// matching variant on [`VideoDecodeError`].
   #[error("decoder is at EOF; flush() before sending new packets")]
-  AtEof,
-
-  /// Decoder reached end of stream.
-  #[error("decoder exhausted; call flush to reuse")]
-  Eof,
+  AfterEof,
 
   /// Codec is not supported by the host browser.
   #[error("unsupported codec: {0}")]

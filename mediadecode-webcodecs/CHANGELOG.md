@@ -11,6 +11,54 @@ The backend-agnostic core it adapts has its own log at
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING: `receive_frame` returns `mediadecode::Received` and
+  `send_packet` / `send_eof` return `mediadecode::Sent`** on both async
+  decoder faces. `VideoDecodeError` and `AudioDecodeError` lose their
+  `NoFrameReady`, `Eof` and `OutputFull` arms — three of the four
+  conditions they named were never faults.
+
+  This adapter had the family's only complete four-arm vocabulary — and
+  that was the problem, not the fix: the FFmpeg backend's video and
+  audio decoders named none of the four, so a consumer generic over
+  `mediadecode`'s traits observed a different protocol depending on
+  which backend it held. The vocabulary now lives one tier up, where
+  both backends answer it.
+
+- **`wait_for_frame` no longer takes `eof`**, and answers
+  `Ok(None)` for "no frame, and nothing in flight that could produce one
+  without the caller acting". Which of the two protocol answers that is
+  belongs to the session's own EOF latch, which `receive_frame` owns —
+  so there is exactly one place in the adapter that decides between
+  "send another packet" and "there will be no more", and it is the place
+  that holds the fact.
+
+- **`await_decode_room` answers `Sent`**, and the two kinds of pressure
+  part company there. The decoder-side cap drains by itself as the
+  browser works, so it is still awaited; the *output* cap drains only
+  when the caller calls `receive_frame`, which needs the `&mut self`
+  that `send_packet` is holding — so awaiting it would deadlock, and it
+  is reported as `Sent::MustDrain` instead. That distinction is why the
+  arm survives the move to `async` at all.
+
+- **BREAKING: `AtEof` is renamed `AfterEof`.** It **stays** an error —
+  a caller usage fault, not back pressure: draining changes nothing, and
+  this decoder refuses every packet until `flush()`, so `MustDrain`
+  would be a loop with no exit. What changed is only the word. The
+  FFmpeg adapter names the identical condition `AfterEof` on its
+  resampler and (as of this release) its subtitle seam, and one
+  condition wearing two words across two backends of one trait is the
+  disease this release is curing.
+
+- **`VideoDecodeError` and `AudioDecodeError` gain `#[non_exhaustive]`**,
+  with the family's other seven. This is what the breaking window buys:
+  adding the attribute is itself breaking, so it can only ride a release
+  that already is, and afterwards every new fault arm is additive
+  forever. The status enums stay exhaustive for the opposite reason —
+  closed protocol vocabulary against open fault taxonomy.
+
+
 ## [0.9.0] - 2026-08-26
 
 ## [0.9.0] - 2026-08-24

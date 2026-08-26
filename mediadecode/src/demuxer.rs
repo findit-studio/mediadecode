@@ -1317,6 +1317,22 @@ where
 /// it is returned it stays returned until a [`seek`](Self::seek) moves
 /// the session somewhere else.
 ///
+/// # Why `Option` and not [`Received`](crate::Received)
+///
+/// The decoders' three-state answer has a state this face does not:
+/// **needs-input cannot happen to a demuxer.** A demuxer is pulled, not
+/// fed — there is no caller-supplied input it could be waiting on, so a
+/// `NeedsInput` arm here would be a state no backend can ever produce
+/// and every consumer would still have to write a `match` arm for.
+/// `Ok(None)` is the same fact in the shape that fits: two states, two
+/// values, and the packet itself riding in the `Ok` arm rather than
+/// into a `dst`.
+///
+/// What the two faces share is the law, not the type: **a protocol
+/// state never travels in `Err`.** End of file is not a failure here
+/// for the same reason [`Received::Ended`](crate::Received::Ended) is
+/// not one there.
+///
 /// # The attachment contract
 ///
 /// An [`Attachment`](TrackKind::Attachment) track delivers **exactly

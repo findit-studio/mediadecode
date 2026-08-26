@@ -14,6 +14,7 @@ use std::{path::PathBuf, time::Duration};
 use criterion::{Criterion, criterion_group, criterion_main};
 use ffmpeg::{codec::Context as CodecContext, format, frame, media};
 use ffmpeg_next as ffmpeg;
+use mediadecode::{Received, Sent};
 use mediadecode_ffmpeg::{Frame, VideoDecoder};
 
 const SAMPLE_ENV: &str = "HWDECODE_SAMPLE_VIDEO";
@@ -42,13 +43,8 @@ fn decode_all_hw(path: &PathBuf) -> Result<usize, mediadecode_ffmpeg::Error> {
     |decoder: &mut VideoDecoder, count: &mut usize| -> Result<(), mediadecode_ffmpeg::Error> {
       loop {
         match decoder.receive_frame(&mut frame) {
-          Ok(()) => *count += 1,
-          Err(mediadecode_ffmpeg::Error::Ffmpeg(ffmpeg::Error::Other { errno }))
-            if errno == ffmpeg::error::EAGAIN =>
-          {
-            return Ok(());
-          }
-          Err(mediadecode_ffmpeg::Error::Ffmpeg(ffmpeg::Error::Eof)) => return Ok(()),
+          Ok(Received::Frame) => *count += 1,
+          Ok(Received::NeedsInput | Received::Ended) => return Ok(()),
           Err(e) => return Err(e),
         }
       }
@@ -61,10 +57,10 @@ fn decode_all_hw(path: &PathBuf) -> Result<usize, mediadecode_ffmpeg::Error> {
 
     loop {
       match decoder.send_packet(&packet) {
-        Ok(()) => break,
-        Err(mediadecode_ffmpeg::Error::Ffmpeg(ffmpeg::Error::Other { errno }))
-          if errno == ffmpeg::error::EAGAIN =>
-        {
+        Ok(Sent::Accepted) => break,
+        // Back pressure, named: drain and offer again. No errno
+        // to decode, and no second offer needed to find out.
+        Ok(Sent::MustDrain) => {
           drain(&mut decoder, &mut count)?;
         }
         Err(e) => return Err(e),
@@ -76,10 +72,10 @@ fn decode_all_hw(path: &PathBuf) -> Result<usize, mediadecode_ffmpeg::Error> {
 
   loop {
     match decoder.send_eof() {
-      Ok(()) => break,
-      Err(mediadecode_ffmpeg::Error::Ffmpeg(ffmpeg::Error::Other { errno }))
-        if errno == ffmpeg::error::EAGAIN =>
-      {
+      Ok(Sent::Accepted) => break,
+      // Back pressure, named: drain and offer again. No errno
+      // to decode, and no second offer needed to find out.
+      Ok(Sent::MustDrain) => {
         drain(&mut decoder, &mut count)?;
       }
       Err(e) => return Err(e),
@@ -185,20 +181,15 @@ fn bench_decode(c: &mut Criterion) {
           // space), then retry send_packet.
           loop {
             match dec.send_packet(&packet) {
-              Ok(()) => break,
-              Err(mediadecode_ffmpeg::Error::Ffmpeg(ffmpeg::Error::Other { errno }))
-                if errno == ffmpeg::error::EAGAIN =>
-              {
+              Ok(Sent::Accepted) => break,
+              Ok(Sent::MustDrain) => {
                 match dec.receive_frame(&mut frame) {
-                  Ok(()) => break 'probe,
-                  Err(mediadecode_ffmpeg::Error::Ffmpeg(ffmpeg::Error::Other { errno }))
-                    if errno == ffmpeg::error::EAGAIN =>
-                  {
-                    // Defensive: per FFmpeg's send/receive contract, if
-                    // send_packet returns EAGAIN then receive_frame
-                    // should not. Retry send_packet anyway rather than
-                    // spinning.
-                  }
+                  Ok(Received::Frame) => break 'probe,
+                  // Defensive: per FFmpeg's send/receive contract, a
+                  // decoder that asked to be drained has something to
+                  // give. Retry the send anyway rather than spinning.
+                  Ok(Received::NeedsInput) => {}
+                  Ok(Received::Ended) => break 'probe,
                   Err(e) => panic!("probe receive_frame (drain): {e}"),
                 }
               }
@@ -206,12 +197,9 @@ fn bench_decode(c: &mut Criterion) {
             }
           }
           match dec.receive_frame(&mut frame) {
-            Ok(()) => break 'probe,
-            Err(mediadecode_ffmpeg::Error::Ffmpeg(ffmpeg::Error::Other { errno }))
-              if errno == ffmpeg::error::EAGAIN =>
-            {
-              continue;
-            }
+            Ok(Received::Frame) => break 'probe,
+            Ok(Received::NeedsInput) => continue,
+            Ok(Received::Ended) => break 'probe,
             Err(e) => panic!("probe receive_frame: {e}"),
           }
         }
