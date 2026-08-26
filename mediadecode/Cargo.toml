@@ -31,7 +31,7 @@ future = ["dep:trait-variant"]
 # `PacketFlags` does not carry) and its wire shape is a flag *grammar*
 # — `"KEY | CORRUPT"` — in any human-readable format. `PacketFlags`
 # serializes as its bits instead, hand-written in `packet::serde_impls`.
-serde      = ["dep:serde", "mediatime/serde"]
+serde      = ["dep:serde", "mediatime/serde", "mediaframe/serde"]
 arbitrary  = ["dep:arbitrary", "mediatime/arbitrary"]
 quickcheck = ["dep:quickcheck", "mediatime/quickcheck"]
 

@@ -11,6 +11,11 @@ The sibling FFmpeg adapter has its own log at
 
 ## [Unreleased]
 
+### Fixed
+
+- **The `serde` feature now forwards `mediaframe/serde`**, so re-exported
+  mediaframe vocabulary types serialize too.
+
 ## [0.9.0] - 2026-08-26
 
 ### Added
