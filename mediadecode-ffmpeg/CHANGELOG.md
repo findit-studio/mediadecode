@@ -11,6 +11,8 @@ The backend-agnostic core it adapts has its own log at
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-08-27
+
 ### Fixed
 
 - **A terminal `Received::Ended` was reversible without `flush` on the

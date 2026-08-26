@@ -11,6 +11,8 @@ The sibling FFmpeg adapter has its own log at
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-08-27
+
 ### Added
 
 - **`Sent` and `Received` — the push rhythm's vocabulary**, in a new
@@ -127,6 +129,11 @@ The sibling FFmpeg adapter has its own log at
   index-addressed pull faces; the caller names the frame, so there is no
   rhythm to report.
 
+### Fixed
+
+- **The `serde` feature now forwards `mediaframe/serde`**, so re-exported
+  mediaframe vocabulary types serialize too.
+
 
 ## [0.9.0] - 2026-08-26
 
@@ -161,11 +168,6 @@ The sibling FFmpeg adapter has its own log at
   The principle is homed here because it binds every backend, not only
   the FFmpeg one; the concrete knob enumeration belongs to whichever
   crate owns the substrate.
-
-### Fixed
-
-- **The `serde` feature now forwards `mediaframe/serde`**, so re-exported
-  mediaframe vocabulary types serialize too.
 
 
 ## [0.9.0] - 2026-08-24
