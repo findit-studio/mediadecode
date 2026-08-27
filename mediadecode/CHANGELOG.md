@@ -11,6 +11,44 @@ The sibling FFmpeg adapter has its own log at
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-08-28
+
+Both public dependencies cross a breaking minor at once: `mediatime`
+0.3 → 0.4 and `mediaframe` 0.6 → 0.7. `mediatime::{Timebase, Timestamp,
+TimeRange}` and the re-exported `mediaframe` vocabulary (`color`,
+`pixel_format`, `frame`) are this crate's own public surface — the same
+reasoning as the 0.4.0 and 0.5.0 crossings — so a consumer holding a
+`mediatime 0.3` or `mediaframe 0.6` value no longer type-checks against
+this release. `mediaframe` 0.7.0 is itself the family's third instance
+of this exact maneuver, after `mediatime` 0.1 → 0.2 and 0.2 → 0.3: a
+public dependency crossing an incompatible 0.x minor is Breaking
+regardless of how much of its surface actually moved. The upstream
+notes are the authority
+([mediatime](https://github.com/findit-studio/mediatime/blob/main/CHANGELOG.md),
+[mediaframe](https://github.com/findit-studio/mediaframe/blob/main/CHANGELOG.md));
+what follows is only what changes **here**.
+
+No `mediadecode` source line changed: the whole diff is the two pins,
+the version and this note.
+
+### Changed (BREAKING)
+
+- **`mediatime` 0.3 → 0.4.** Upstream is additive only — one commit,
+  adding `Duration` (the unsigned counterpart to `SignedDuration`) plus
+  its `core::time::Duration` and `SignedDuration` conversions.
+  `Timebase`'s public surface is unchanged, and `Duration` does not
+  appear in any `mediadecode` signature, so nothing here moves for it.
+- **`mediaframe` 0.6 → 0.7.** Upstream's 0.7.0 is entirely the
+  `mediatime` 0.3 → 0.4 crossing above — no `mediaframe` API moved.
+  Same pin as before (`default-features = false`, `features =
+  ["frame"]` — the no-alloc tier).
+
+Verified empirically, not just argued: `cargo check` (default
+features, `--all-features`, `--no-default-features`), `cargo test`
+(default features and `--all-features`), and `cargo clippy
+--all-features -- -D warnings` all pass — zero fallout in this crate's
+own source.
+
 ## [0.10.0] - 2026-08-27
 
 ### Added
