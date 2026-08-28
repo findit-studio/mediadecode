@@ -11,6 +11,24 @@ The backend-agnostic core it adapts has its own log at
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-08-28
+
+Tracks `mediadecode` 0.11.0, which crosses `mediatime` 0.3 → 0.4 and
+`mediaframe` 0.6 → 0.7 — two breaking minors. Both are public
+dependencies of the core crate, and `mediaframe`'s `PixelFormat` and
+`color` types appear in this adapter's own signatures (`convert`,
+`pixdesc`, `frame`), so this adapter's re-exported surface moves with
+them. See [`mediadecode` 0.11.0](../mediadecode/CHANGELOG.md#0110).
+
+Nothing about the FFmpeg boundary's behaviour changes and no source
+line moved: `mediatime` 0.4 is additive only and this workspace calls
+none of the new surface; `mediaframe` 0.7 is itself entirely the
+`mediatime` crossing, so no pixel-format or colour variant moved
+either. Verified, not just argued: `cargo check` / `cargo clippy -- -D
+warnings` (default features, `--all-features`, `--no-default-features`)
+and the full `cargo test` suite — including the submodule-backed
+fixture tests — all pass with zero source change.
+
 ## [0.10.0] - 2026-08-27
 
 ### Fixed

@@ -11,6 +11,22 @@ The backend-agnostic core it adapts has its own log at
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-08-28
+
+Tracks `mediadecode` 0.11.0, which crosses `mediatime` 0.3 → 0.4 and
+`mediaframe` 0.6 → 0.7 — two breaking minors in public dependencies
+whose `PixelFormat` and `color` types this adapter re-exports. See
+[`mediadecode` 0.11.0](../mediadecode/CHANGELOG.md#0110). No adapter
+source line moved and no adapter behaviour changes — `mediatime` 0.4 is
+additive only, and `mediaframe` 0.7 is itself entirely the `mediatime`
+crossing.
+
+Verified on the real dependency graph (native builds this crate
+empty): `cargo check` / `cargo clippy -- -D warnings --all-features`
+on `--target wasm32-unknown-unknown`, both clean. The browser
+`wasm-bindgen-test` lane needing headless Chromium is CI-only and was
+not run locally.
+
 ## [0.10.0] - 2026-08-27
 
 ### Changed
