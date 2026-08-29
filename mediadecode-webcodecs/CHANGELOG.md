@@ -11,6 +11,14 @@ The backend-agnostic core it adapts has its own log at
 
 ## [Unreleased]
 
+### Changed
+
+- **`mediaframe` 0.7 → 0.8** (tracks `mediadecode`'s own pin, see
+  [`mediadecode` Unreleased](../mediadecode/CHANGELOG.md#unreleased)).
+  This adapter reaches only `mediaframe::audio`, untouched by 0.8.0's
+  `image::Format` / `container::Format` / `audio::ContainerFormat`
+  changes. No source change.
+
 ## [0.11.0] - 2026-08-28
 
 Tracks `mediadecode` 0.11.0, which crosses `mediatime` 0.3 → 0.4 and

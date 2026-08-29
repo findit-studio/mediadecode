@@ -11,6 +11,16 @@ The sibling FFmpeg adapter has its own log at
 
 ## [Unreleased]
 
+### Changed
+
+- **`mediaframe` 0.7 → 0.8.** Upstream 0.8.0 adds a new `image::Format`
+  vocabulary household and widens `container::Format` /
+  `audio::ContainerFormat` with an `extensions()` face and a matching
+  `FromStr` alias expansion — three surfaces this crate re-exports none
+  of (`mediadecode` reaches `mediaframe::audio`, `::color`, `::frame`,
+  `::pixel_format` and `TrackDisposition` only). Zero fallout: no
+  source line moved.
+
 ## [0.11.0] - 2026-08-28
 
 Both public dependencies cross a breaking minor at once: `mediatime`
