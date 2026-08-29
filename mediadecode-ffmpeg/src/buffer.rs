@@ -60,7 +60,11 @@
 //! and the wholesale FFI copy that used to duplicate them took every
 //! one — including any this crate had never enumerated. That copy is
 //! gone; see
-//! [`bounded_clone_parameters`](crate::extras::bounded_clone_parameters).
+//! [`bounded_clone_parameters`](crate::extras::bounded_clone_parameters),
+//! and [`CodecTicket`](crate::CodecTicket), which took the track row's
+//! copy one step further: those three seats are now owned Rust, and
+//! `extradata` lands in an `FfmpegBytes` like every other file-sized
+//! buffer here.
 //!
 //! | construction site | what it carries | what bounds it |
 //! |---|---|---|
@@ -80,17 +84,20 @@
 //!
 //! # The other heap this crate copies
 //!
-//! `AVCodecParameters` is not an [`FfmpegBytes`] and never passes
-//! through this module, but it is the same class of exposure — three
-//! heap seats, all sized by the file — so its rows belong in the same
-//! accounting.
+//! `AVCodecParameters` is the same class of exposure — three heap
+//! seats, all sized by the file — so its rows belong in the same
+//! accounting. Since the track row went owned, one of those seats
+//! *is* an [`FfmpegBytes`]: [`CodecTicket`](crate::CodecTicket) holds
+//! `extradata` in one, and each `coded_side_data` payload in another.
 //!
 //! | construction site | what it carries | what bounds it |
 //! |---|---|---|
-//! | [`bounded_clone_parameters`](crate::extras::bounded_clone_parameters), `extradata` | SPS/PPS and codec headers | [`DemuxLimits::max_codec_parameter_bytes`](crate::DemuxLimits::max_codec_parameter_bytes), measured by `measure_parameters` before the copy |
-//! | …, `coded_side_data` | the descriptor array and each entry's payload — a MOV `prof` atom's ICC profile among them | the same seat, counting the array as well as the payloads |
-//! | …, `ch_layout` custom map | a channel map | the same seat; the one FFmpeg call left on this path (`av_channel_layout_copy`) copies exactly this field, at a size measured first |
-//! | `demuxer::admit_streams` | nothing — it only measures | runs over **every** stream before the track loop clones anything, and charges the whole-file [`max_total_codec_parameter_bytes`](crate::DemuxLimits::max_total_codec_parameter_bytes) |
+//! | [`CodecTicket::mirror`](crate::CodecTicket::mirror), `extradata` | SPS/PPS and codec headers, into an [`FfmpegBytes`] | [`DemuxLimits::max_codec_parameter_bytes`](crate::DemuxLimits::max_codec_parameter_bytes), measured by `measure_parameters` before a byte is read |
+//! | …, `coded_side_data` | the descriptor array and each entry's payload — a MOV `prof` atom's ICC profile among them — into owned entries | the same seat, counting the array as well as the payloads |
+//! | …, `ch_layout` custom map | a channel map, into owned entries | the same seat |
+//! | [`CodecTicket::rebuild`](crate::CodecTicket::rebuild) | the same three seats, back into a fresh `AVCodecParameters` for a decoder to open from | nothing further, and nothing further is needed: it allocates exactly [`CodecTicket::footprint_bytes`](crate::CodecTicket::footprint_bytes), which is the number the mirror already admitted — no file-controlled input reaches it |
+//! | [`bounded_clone_parameters`](crate::extras::bounded_clone_parameters) | the same three seats, `AVCodecParameters` to `AVCodecParameters` | the same measurement. Off the demux road since the track row went owned; it is the decoder's own re-clone (`decoder::try_clone_parameters`), bounded by [`DecoderLimits::max_codec_parameter_bytes`](crate::DecoderLimits::max_codec_parameter_bytes) |
+//! | `demuxer::admit_streams` | nothing — it only measures | runs over **every** stream before the track loop mirrors anything, and charges the whole-file [`max_total_codec_parameter_bytes`](crate::DemuxLimits::max_total_codec_parameter_bytes) |
 //! | `decoder::build_codec_context` → `avcodec_parameters_to_context` | the same three seats, copied *into* an `AVCodecContext` | **the choke point**: measured and admitted against [`DecoderLimits::max_codec_parameter_bytes`](crate::DecoderLimits::max_codec_parameter_bytes) right there. Every decoder in this crate opens through this function — the four session `open`s, the HW probe's `build_state`, its per-backend advances, the software fallback — and none of them reaches `avcodec_parameters_to_context` any other way |
 //! | `image::FfmpegImageDecoder::decode` → `boundary::try_packet_copy` | the caller's compressed bytes, duplicated into an `AVPacket` | [`DecoderLimits::max_image_input_bytes`](crate::DecoderLimits::max_image_input_bytes), defaulting to the attachment family so the direct road is no more permissive than the demuxed one |
 //! | `boundary::ffmpeg_packet_from_{video,audio,subtitle}_packet` → `try_packet_copy` | the caller's compressed bytes, duplicated into an `AVPacket` — **the send leg** | [`DecoderLimits::max_packet_bytes`](crate::DecoderLimits::max_packet_bytes), judged before the allocation. The same seat the receive leg (`payload_of`) judges, so a byte count refused coming out of a container is refused going into a decoder |

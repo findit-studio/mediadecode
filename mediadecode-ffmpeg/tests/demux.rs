@@ -121,10 +121,12 @@ fn a_track_row_carries_its_codec_parameters_and_attachment_identity() {
     Some("application/x-truetype-font"),
   );
 
-  // The parameters seat is what opens a decoder for the track.
+  // The ticket seat is what opens a decoder for the track. Its medium
+  // is read as the raw `AVMediaType` it is on the wire — no bindgen
+  // enum is materialised out of a value a container controls.
   assert_eq!(
-    audio.extra().parameters().medium(),
-    ffmpeg_next::media::Type::Audio,
+    audio.extra().ticket().codec_type(),
+    ffmpeg_next::ffi::AVMediaType::AVMEDIA_TYPE_AUDIO as i32,
   );
   assert_eq!(audio.extra().stream_index(), 1);
 

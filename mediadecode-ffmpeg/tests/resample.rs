@@ -94,7 +94,7 @@ fn run(path: &std::path::Path, target: ResampleSpec) -> Converted {
   // (PCM), and the lane below checks that they do.
   let source = ResampleSpec::from_decoder(decoder.inner()).expect("the decoder names its shape");
   assert_eq!(
-    ResampleSpec::from_parameters(info.extra().parameters()),
+    ResampleSpec::from_ticket(info.extra().ticket()),
     Some(source),
     "for PCM the declared spec and the decoder's own spec are the same",
   );
@@ -251,7 +251,7 @@ fn stereo_folds_to_mono() {
 
   let source = {
     let demuxer = FfmpegDemuxer::open(&path).expect("open");
-    ResampleSpec::from_parameters(demuxer.tracks()[0].extra().parameters()).expect("audio spec")
+    ResampleSpec::from_ticket(demuxer.tracks()[0].extra().ticket()).expect("audio spec")
   };
   assert_eq!(source.channels(), 2, "the file really is stereo");
 

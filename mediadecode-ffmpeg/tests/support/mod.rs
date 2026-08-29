@@ -66,6 +66,17 @@ impl Corpus {
     self.dir.path().join(name)
   }
 
+  /// The corpus directory itself, for a lane that mints its own
+  /// fixture and wants it to live and die with the run.
+  ///
+  /// `tests/codec_ticket_parity.rs` is that lane: stream-level
+  /// `coded_side_data` has no `ffmpeg` CLI recipe, so it assembles a
+  /// MOV carrying a `colr`/`prof` ICC atom byte by byte and drops it in
+  /// here.
+  pub fn dir(&self) -> &Path {
+    self.dir.path()
+  }
+
   /// A Matroska file with one track of each of four kinds: H.264
   /// video, 48 kHz stereo AAC, a SubRip subtitle track, and an attached
   /// "font" whose payload lives in codec extradata and never appears in

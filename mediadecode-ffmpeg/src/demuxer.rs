@@ -957,6 +957,118 @@ impl ParametersCopy {
   }
 }
 
+/// Payload for [`DemuxError::ParametersOpaque`].
+///
+/// A channel layout arrived carrying `opaque` — a raw pointer FFmpeg
+/// documents as "private data of the user".
+///
+/// [`CodecTicket`](crate::ticket::CodecTicket) is an **owned** mirror:
+/// it outlives the `AVCodecParameters` it was read from, and it may
+/// cross threads, so a pointer into somebody else's data is exactly
+/// what it cannot carry. libavformat sets neither
+/// `AVChannelLayout::opaque` nor `AVChannelCustom::opaque`, so no
+/// demuxed stream reaches the mirror with one; if one ever does, the
+/// mirror refuses rather than dropping the pointer in silence. That is
+/// the same fail-closed answer `extras::measure_parameters` gives a
+/// channel order it has never heard of, and for the same reason:
+/// carrying on would be a guess about memory nobody here owns.
+#[derive(thiserror::Error, Debug, Clone)]
+#[error(
+  "the channel layout for stream {stream_index} carries user-private data \
+   ({}) that an owned codec ticket cannot mirror",
+  match channel { Some(i) => format!("custom channel {i}"), None => "the layout".to_owned() },
+)]
+pub struct ParametersOpaque {
+  stream_index: usize,
+  channel: Option<usize>,
+}
+
+impl ParametersOpaque {
+  /// Constructs a `ParametersOpaque` payload. `channel` names the
+  /// custom-map entry when the pointer was on one, and is `None` when
+  /// it was on the layout itself.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(stream_index: usize, channel: Option<usize>) -> Self {
+    Self {
+      stream_index,
+      channel,
+    }
+  }
+  /// The `AVStream.index` whose layout carried the pointer.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn stream_index(&self) -> usize {
+    self.stream_index
+  }
+  /// The custom-map entry the pointer was on, or `None` when it was on
+  /// the layout itself.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn channel(&self) -> Option<usize> {
+    self.channel
+  }
+}
+
+/// Payload for [`DemuxError::ParametersChannelMap`].
+///
+/// A channel layout declared `AV_CHANNEL_ORDER_CUSTOM` without the map
+/// that order requires.
+///
+/// **This one is a crash, not a curiosity.** For a custom order,
+/// `av_channel_layout_copy` — which is how
+/// `avcodec_parameters_to_context` moves a layout into a decoder's
+/// context — does
+///
+/// ```c
+/// dst->u.map = av_malloc_array(src->nb_channels, sizeof(*dst->u.map));
+/// if (!dst->u.map)
+///     return AVERROR(ENOMEM);
+/// memcpy(dst->u.map, src->u.map, src->nb_channels * sizeof(*src->u.map));
+/// ```
+///
+/// with **no null check on `src->u.map`** — verified against FFmpeg
+/// n9.0. A layout that names channels it has no map for therefore makes
+/// libavcodec `memcpy` from a null pointer the moment a decoder opens
+/// from it.
+///
+/// So the mirror refuses such a layout at the door rather than
+/// reproducing it. An earlier draft carried it through, on the argument
+/// that a malformed layout in should be a malformed layout out — the
+/// round trip is faithful either way, and the parity comparator agreed.
+/// That symmetry was the wrong test: faithfully reproducing a shape
+/// whose only consumer dereferences null is not fidelity, it is
+/// forwarding a crash. Refusing is the same fail-closed answer
+/// `extras::measure_parameters` gives a channel order it has never
+/// heard of.
+#[derive(thiserror::Error, Debug, Clone)]
+#[error(
+  "the custom channel layout for stream {stream_index} declares {channels} channels \
+   but carries no map for them"
+)]
+pub struct ParametersChannelMap {
+  stream_index: usize,
+  channels: i32,
+}
+
+impl ParametersChannelMap {
+  /// Constructs a `ParametersChannelMap` payload.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(stream_index: usize, channels: i32) -> Self {
+    Self {
+      stream_index,
+      channels,
+    }
+  }
+  /// The `AVStream.index` whose layout was malformed.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn stream_index(&self) -> usize {
+    self.stream_index
+  }
+  /// The `nb_channels` the layout declared with no map to describe them.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn channels(&self) -> i32 {
+    self.channels
+  }
+}
+
 /// Payload for [`DemuxError::PacketBuffer`].
 ///
 /// A packet's payload could not be referenced — the bytes are there
@@ -1084,6 +1196,17 @@ pub enum DemuxError {
   #[error(transparent)]
   ParametersCopy(#[from] ParametersCopy),
 
+  /// A channel layout arrived carrying user-private data an owned
+  /// codec ticket cannot mirror.
+  #[error(transparent)]
+  ParametersOpaque(#[from] ParametersOpaque),
+
+  /// A channel layout declared a custom order without the map that
+  /// order requires — a shape `av_channel_layout_copy` would `memcpy`
+  /// from null.
+  #[error(transparent)]
+  ParametersChannelMap(#[from] ParametersChannelMap),
+
   /// A packet's payload could not be referenced — the bytes are there
   /// and this layer could not carry them.
   #[error(transparent)]
@@ -1200,7 +1323,7 @@ fn build_tracks<C: crate::FfmpegCarrier + crate::CarrierOps>(
       }
     };
 
-    // The parameter copy. For an `AVMEDIA_TYPE_ATTACHMENT` stream its
+    // The parameter mirror. For an `AVMEDIA_TYPE_ATTACHMENT` stream its
     // `extradata` **is** the attachment's payload — the same bytes the
     // carrier below already holds — so it is left behind rather than
     // copied. Censused before it was: nothing can use it. libavcodec
@@ -1226,13 +1349,19 @@ fn build_tracks<C: crate::FfmpegCarrier + crate::CarrierOps>(
     } else {
       crate::extras::ExtradataPolicy::Copy
     };
-    let parameters_copy = crate::extras::bounded_clone_parameters_with(
+    // Straight from the stream's own parameters into the owned ticket.
+    // The row used to reach here through an intermediate
+    // `avcodec_parameters_copy` — one ffmpeg-native deep copy per
+    // track, whose only purpose was to sever the tie to the format
+    // context. The mirror severs it by being owned Rust, so that copy
+    // is gone rather than moved.
+    let ticket = crate::ticket::CodecTicket::mirror_with(
       &parameters,
       index,
       limits.max_codec_parameter_bytes(),
       extradata_policy,
     )?;
-    let extra = TrackExtra::new(index as i32, parameters_copy)?
+    let extra = TrackExtra::new(index as i32, ticket)
       .with_disposition(disposition)
       .with_start_time((raw_start != AV_NOPTS_VALUE).then_some(raw_start))
       .with_frame_count((frames > 0).then_some(frames));
@@ -1937,39 +2066,47 @@ mod tests {
   }
 
   #[test]
-  fn the_public_track_extra_copies_are_checked_too() {
-    // The helper protected `build_tracks` and nothing else: `TrackExtra`
-    // derived `Clone` and `Default` over `ffmpeg_next`'s `Parameters`,
-    // whose clone dereferences an unchecked allocation — so safe public
-    // code could still reach the SIGSEGV by copying a track row. The
-    // derives are gone; what replaces them answers.
+  fn the_public_track_extra_handoffs_still_answer_the_allocator() {
+    // The lane this replaces guarded a hazard that no longer exists:
+    // `TrackExtra` derived `Clone` over `ffmpeg_next`'s `Parameters`,
+    // whose clone dereferences an unchecked allocation, so safe public
+    // code reached a SIGSEGV by copying a track row. The row holds no
+    // `Parameters` at all now, and the two public handoffs have split
+    // in kind because of it:
+    //
+    // * `Clone` allocates **nothing from FFmpeg** — it copies an
+    //   owned mirror, which is a `Vec` spine and a refcount bump — so
+    //   it survives a capped allocator rather than reporting through
+    //   one. That is what makes the derive honest under the carrier
+    //   law, and a capped allocator is the only way to pin it.
+    // * `clone_parameters` is the rebuild, and it is where FFmpeg
+    //   allocation moved to. It still answers.
     crate::fault_subprocess::in_subprocess(
-      "demuxer::tests::the_public_track_extra_copies_are_checked_too",
+      "demuxer::tests::the_public_track_extra_handoffs_still_answer_the_allocator",
       || {
         let source = Parameters::new();
         assert!(!unsafe { source.as_ptr() }.is_null(), "allocated uncapped");
         let extra = TrackExtra::new(
           6,
-          crate::extras::bounded_clone_parameters(&source, 6, usize::MAX).expect("uncapped"),
-        )
-        .expect("real parameters");
+          crate::ticket::CodecTicket::mirror(&source, 6, usize::MAX).expect("uncapped"),
+        );
 
         crate::fault_subprocess::cap_ffmpeg_allocations(1);
-        let cloned = extra.try_clone().map(|_| ());
+        let cloned = extra.clone();
         let handed = extra.clone_parameters().map(|_| ());
         crate::fault_subprocess::uncap_ffmpeg_allocations();
 
-        assert!(
-          matches!(cloned, Err(DemuxError::ParametersAlloc(ref p)) if p.stream_index() == 6),
-          "TrackExtra::try_clone: {cloned:?}",
+        assert_eq!(
+          cloned.parameter_bytes(),
+          extra.parameter_bytes(),
+          "the row cloned under an allocator that refuses everything",
         );
         assert!(
           matches!(handed, Err(DemuxError::ParametersAlloc(ref p)) if p.stream_index() == 6),
           "TrackExtra::clone_parameters: {handed:?}",
         );
 
-        // And both work once the allocator does.
-        extra.try_clone().expect("an uncapped row copy");
+        // And the rebuild works once the allocator does.
         extra.clone_parameters().expect("an uncapped handoff");
       },
     );
@@ -1997,11 +2134,14 @@ mod tests {
           "the safe constructor really does hand back a null-backed value",
         );
 
-        // The door: a `TrackExtra` cannot exist over it, so the copy
-        // methods have nothing to be asked on.
-        let refused = TrackExtra::new(9, never_allocated);
+        // The door moved with the handle. `TrackExtra::new` no longer
+        // takes a `Parameters` at all, so the only way a null-backed
+        // one reaches a track row is through the mirror — which is
+        // where the check now lives, and where it belongs: beside the
+        // raw pointer rather than one type downstream of it.
+        let refused = crate::ticket::CodecTicket::mirror(&never_allocated, 9, usize::MAX);
         let Err(DemuxError::ParametersMissing(p)) = refused.map(|_| ()) else {
-          panic!("a null-backed source must not become a track row");
+          panic!("a null-backed source must not become a codec ticket");
         };
         assert_eq!(p.stream_index(), 9);
 
@@ -2018,11 +2158,14 @@ mod tests {
           Err(DemuxError::ParametersMissing(p)) if p.stream_index() == 9,
         ));
 
-        // A row built over real parameters still copies both ways, so
-        // the refusal is about the null and nothing else.
+        // A row built over real parameters still hands off both ways,
+        // so the refusal is about the null and nothing else.
         let real = Parameters::new();
-        let extra = TrackExtra::new(9, real).expect("real parameters");
-        extra.try_clone().expect("row copy");
+        let extra = TrackExtra::new(
+          9,
+          crate::ticket::CodecTicket::mirror(&real, 9, usize::MAX).expect("real parameters"),
+        );
+        let _ = extra.clone();
         extra.clone_parameters().expect("handoff");
       },
     );

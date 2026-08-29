@@ -29,8 +29,9 @@ use crate::FfmpegBytes;
 use derive_more::IsVariant;
 use ffmpeg_next::codec::Parameters;
 
-use crate::demuxer::{
-  DemuxError, ParametersAlloc, ParametersCopy, ParametersMissing, ParametersTooLarge,
+use crate::{
+  demuxer::{DemuxError, ParametersAlloc, ParametersCopy, ParametersMissing, ParametersTooLarge},
+  ticket::CodecTicket,
 };
 
 /// Per-`VideoPacket` extras.
@@ -1467,14 +1468,21 @@ impl ParameterFootprint {
   }
 }
 
-/// `AVCodecParameters` has thirty-three fields in FFmpeg n9.0 and
+/// `AVCodecParameters` has thirty-two fields in FFmpeg n9.0 and
 /// exactly three of them reach the heap. This tripwire fires if the
 /// struct changes shape, because [`measure_parameters`] and
 /// [`bounded_clone_parameters`] enumerate those three **by hand** and a
 /// fourth would silently go uncounted and uncopied.
 ///
+/// [`CodecTicket`](crate::ticket::CodecTicket) raises the stake: it
+/// enumerates **every** field by hand, heap and scalar alike, so a new
+/// *scalar* — which the bounded clone's bytewise sweep would have
+/// carried for free — is now a seat the mirror would drop. A field
+/// that is removed fails the build on its own; a field that is added
+/// fails it here.
+///
 /// A size assertion is a tripwire, not a proof: it catches a struct
-/// that grew or was reordered, which is how a new heap seat arrives in
+/// that grew or was reordered, which is how a new seat arrives in
 /// practice. Gated to 64-bit because the number is pointer-width
 /// dependent and every target this crate links FFmpeg on is 64-bit;
 /// elsewhere the hand-written clone still runs, it just loses the
@@ -1483,8 +1491,9 @@ impl ParameterFootprint {
 const _: () = {
   assert!(
     core::mem::size_of::<ffmpeg_next::ffi::AVCodecParameters>() == 184,
-    "AVCodecParameters changed shape — re-census its heap fields against \
-     `measure_parameters` and `bounded_clone_parameters` before raising this",
+    "AVCodecParameters changed shape — re-census its fields against \
+     `measure_parameters`, `bounded_clone_parameters` and `ticket::CodecTicket` \
+     before raising this",
   );
 };
 
@@ -1853,148 +1862,140 @@ pub(crate) fn bounded_clone_parameters_with(
 
 /// Per-`TrackInfo` extras — the FFmpeg side of one track-table row.
 ///
-/// Carries the stream's [`Parameters`], which is what opens a decoder
-/// for the track — through [`Self::clone_parameters`], which is a deep
-/// `avcodec_parameters_copy` with no tie back to the format context, so
-/// a decoder outlives the demuxer that named it.
+/// Carries the stream's [`CodecTicket`] — the owned mirror of its
+/// `AVCodecParameters` — which is what opens a decoder for the track,
+/// through [`Self::clone_parameters`]. That call rebuilds a fresh
+/// `AVCodecParameters` from the ticket with no tie back to the format
+/// context, so a decoder outlives the demuxer that named it.
 ///
-/// **No `Clone`, and no `Default`.** Both would have to go through
-/// `ffmpeg_next`'s `Clone` / `Default` for [`Parameters`], which check
-/// neither the allocation nor the copy: safe public code could
-/// dereference a null destination or receive parameters that are
-/// quietly incomplete. `Clone` cannot report either, so this type does
-/// not implement it; [`Self::try_clone`] is the same copy with the
-/// answer a caller can act on, and [`Self::clone_parameters`] is the
-/// handoff a decoder actually needs. This crate shipped a derived
-/// `Clone` over the unchecked path once, reachable from safe code
-/// that just copied a track row, and closed it by removing the
-/// derive (see
-/// `demuxer::tests::the_public_track_extra_copies_are_checked_too`).
+/// # The handle is gone, and `Sync` arrived with it
 ///
-/// The message-carrier law is the second, independent reason `Clone`
-/// stays off: messages may be `Clone`, but `Clone` is always a
-/// refcount bump, never a deep copy, and `avcodec_parameters_copy` is
-/// not that. This crate shipped a *hand-written*, checked `Clone`
-/// here once too — through [`Self::try_clone`], to satisfy a channel
-/// bound — and it came back out for the same reason: a consumer that
-/// needs to share the [`TrackInfo`](mediadecode::demuxer::TrackInfo)
-/// this type lives inside wraps it in `Arc` once, at the door,
-/// instead of paying a deep copy per consumer. [`Self::try_clone`]
-/// remains for the one caller that genuinely wants an owned duplicate
-/// of the codec parameters, which sharing a message is not.
+/// This type used to hold an `ffmpeg_next::codec::Parameters` — a
+/// `*mut AVCodecParameters` behind a `Send`-but-not-`Sync` wrapper.
+/// It was the row's only non-`Sync` field, and through it the whole
+/// track table was `!Sync`: `TrackInfo<Ffmpeg>` could not be shared,
+/// `Arc<TrackInfo<Ffmpeg>>` was not `Send`, and every consumer that
+/// hands a track row to more than one task stopped compiling — for a
+/// struct FFmpeg documents as a plain descriptor with no thread
+/// affinity at all.
+///
+/// The answer is the mirror this crate already lives by rather than an
+/// `unsafe impl` over FFI: [`CodecTicket`] holds every seat as owned
+/// bytes and plain integers, so `Send + Sync` are structural facts and
+/// there is no safety argument to get wrong. See
+/// `crate::ticket::tests::the_ticket_is_send_and_sync` for the pins,
+/// and the ticket's own docs for the parity the rebuild is held to.
+///
+/// # `Clone`, and the ruling that banned it
+///
+/// This type refused `Clone` for two releases, on two arguments. Both
+/// were about the raw handle, and both died with it.
+///
+/// The first was safety. A derived `Clone` went through
+/// `ffmpeg_next`'s `Clone` for `Parameters`, which checks neither the
+/// allocation nor the copy — so safe public code that merely copied a
+/// track row could dereference a null destination or receive
+/// parameters that were quietly incomplete, and `Clone` has no way to
+/// report either. That derive really did ship once, and really was
+/// reachable.
+///
+/// The second was the message-carrier law: a `Clone` is a refcount
+/// bump, never a deep copy, and `avcodec_parameters_copy` is not that.
+///
+/// Neither survives the mirror. There is no `Parameters` left to clone
+/// unchecked, so there is nothing for a `Clone` to fail to report; and
+/// a copy is now plain owned Rust — a `Vec` spine and refcount bumps
+/// over `Arc<[u8]>` — with no FFmpeg allocator anywhere near it, which
+/// is exactly what the carrier law asks of a `Clone`. A ban whose
+/// whole rationale is spent is ceremony, so the ban is gone, together
+/// with the fallible `try_clone` and the infallible `duplicate` that
+/// stood in for it.
+///
+/// **This does not make a track row cheap to copy by accident.**
+/// [`TrackInfo`](mediadecode::demuxer::TrackInfo) and its
+/// `TrackParams` still have no `Clone` of their own, so the
+/// row-sharing law is untouched: a consumer that needs to share a row
+/// still wraps it in `Arc` once, at the door — which is now a thing it
+/// can actually do, because the row finally became `Sync`.
+///
+/// No `Default`, though. A track row with no codec parameters
+/// describes no track.
 ///
 /// `disposition` is the raw `AV_DISPOSITION_*` bit set, not
 /// `ffmpeg_next::format::stream::Disposition`. That type's
 /// `from_bits_truncate` drops bits the linked build has no constant
 /// for, and this crate's stance on bit sets is that every pattern is a
 /// value — the same reason `PacketFlags` reaches the wire as a number.
+///
+/// [`CodecTicket`]: crate::ticket::CodecTicket
+#[derive(Clone)]
 pub struct TrackExtra {
   stream_index: i32,
   disposition: i32,
   start_time: Option<i64>,
   frame_count: Option<i64>,
-  parameters: Parameters,
-  /// The measured heap size of [`Self::parameters`] — see
-  /// [`Self::parameter_bytes`].
-  parameter_bytes: usize,
+  ticket: CodecTicket,
 }
 
 impl TrackExtra {
-  /// Constructs a `TrackExtra` from the stream index and its codec
-  /// parameters. Everything else starts absent.
+  /// Constructs a `TrackExtra` from the stream index and the owned
+  /// codec ticket. Everything else starts absent.
   ///
-  /// **Fallible, and that is the point.** `Parameters::new()` and
-  /// `Parameters::default()` are safe constructors that hand back a
-  /// null-backed value when `avcodec_parameters_alloc` fails, saying
-  /// nothing; accepting one here would store a landmine that goes off
-  /// later, in a copy, on a thread that has forgotten the allocator
-  /// ever failed. Refusing it at the door is what lets every other
-  /// method on this type — and every reader of
-  /// [`Self::parameters`] — rely on there being parameters at all.
+  /// **Infallible, and that is the news.** The old constructor
+  /// returned a `Result` for one reason: `Parameters::new()` and
+  /// `Parameters::default()` are safe constructors over an unchecked
+  /// `avcodec_parameters_alloc`, so a caller could hand this type a
+  /// null-backed value having never been told. A [`CodecTicket`] has
+  /// no such state — it cannot be null-backed and it cannot be
+  /// unmeasurable, because [`CodecTicket::mirror`] refused both before
+  /// it existed. The check moved to where the raw pointer is, and the
+  /// row stopped carrying an error it could no longer raise.
   ///
-  /// Not `const fn`: [`Parameters`] owns a heap allocation.
-  pub fn new(stream_index: i32, parameters: Parameters) -> Result<Self, DemuxError> {
-    // SAFETY: reading the pointer without dereferencing it.
-    let par = unsafe { parameters.as_ptr() };
-    if par.is_null() {
-      return Err(DemuxError::ParametersMissing(ParametersMissing::new(
-        stream_index.max(0) as usize,
-      )));
-    }
-    // The heap size of what this row is about to hold, measured once.
-    // It is the budget every later re-clone is judged against: those
-    // copy *these* parameters, which have already been admitted, so the
-    // honest ceiling for them is exactly what they were admitted at —
-    // no policy to consult, and a copy that somehow grew is refused
-    // rather than silently paid for.
-    //
-    // SAFETY: `par` is a live `AVCodecParameters` owned by
-    // `parameters`; the measurement allocates nothing and dereferences
-    // only what it counts.
-    let parameter_bytes = unsafe { measure_parameters(par) }
-      .and_then(|footprint| footprint.total())
-      .ok_or_else(|| {
-        DemuxError::ParametersTooLarge(ParametersTooLarge::new(
-          stream_index.max(0) as usize,
-          usize::MAX,
-          usize::MAX,
-        ))
-      })?;
-    Ok(Self {
+  /// Not `const fn`: the ticket owns heap.
+  ///
+  /// [`CodecTicket`]: crate::ticket::CodecTicket
+  /// [`CodecTicket::mirror`]: crate::ticket::CodecTicket::mirror
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn new(stream_index: i32, ticket: CodecTicket) -> Self {
+    Self {
       stream_index,
       disposition: 0,
       start_time: None,
       frame_count: None,
-      parameters,
-      parameter_bytes,
-    })
+      ticket,
+    }
   }
 
-  /// The heap bytes this row's codec parameters hold — `extradata`,
-  /// `coded_side_data` and a custom channel map together.
+  /// The heap bytes a rebuild of this row's codec parameters allocates
+  /// — `extradata` with its padding, the `coded_side_data` descriptor
+  /// array and every entry's payload, and a custom channel map.
   ///
-  /// The number the session admitted at open, and the ceiling every
-  /// copy [`Self::clone_parameters`] hands out is judged against.
+  /// The number the session admitted this stream at, and the ceiling
+  /// `DemuxLimits::max_codec_parameter_bytes` was judged against — so
+  /// a row that opened is a row whose every
+  /// [`Self::clone_parameters`] fits the ceiling it opened under.
+  ///
+  /// Not the row's own residency: the ticket holds the payload without
+  /// FFmpeg's trailing padding and shares its buffers by refcount.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn parameter_bytes(&self) -> usize {
-    self.parameter_bytes
+    self.ticket.footprint_bytes()
   }
 
-  /// A deep copy of this row, with the codec-parameter copy checked.
-  ///
-  /// The fallible counterpart of the `Clone` this type deliberately
-  /// does not implement — see the type's own documentation for why.
-  pub fn try_clone(&self) -> Result<Self, DemuxError> {
-    // No re-check: `self` cannot exist over null-backed parameters, and
-    // `clone_parameters` never returns one.
-    Ok(Self {
-      stream_index: self.stream_index,
-      disposition: self.disposition,
-      start_time: self.start_time,
-      frame_count: self.frame_count,
-      parameters: self.clone_parameters()?,
-      parameter_bytes: self.parameter_bytes,
-    })
-  }
-
-  /// An owned deep copy of the track's codec parameters — the handoff
+  /// A live `AVCodecParameters`, rebuilt from the ticket — the handoff
   /// that opens a decoder for this track.
   ///
   /// `FfmpegAudioStreamDecoder::open(track.extra().clone_parameters()?,
-  /// track.timebase())`. Fallible because the copy is: an allocation
+  /// track.timebase(), limits)`. Fallible because allocation is: a
   /// failure here is the difference between a decoder that is not
   /// opened and one opened on parameters that are not the file's.
+  ///
+  /// Every seat the file declared is written back, so what a decoder
+  /// receives is what the demuxer read — proved field by field, per
+  /// codec, by `tests/codec_ticket_parity.rs`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn clone_parameters(&self) -> Result<Parameters, DemuxError> {
-    // Through the bounded clone, like every other parameter copy in
-    // this crate — see [`bounded_clone_parameters`] for the rule. The
-    // budget is this row's own admitted footprint: these parameters
-    // passed the session's ceiling at open, so a copy of them that
-    // needs more than they hold is a bug rather than a policy question.
-    bounded_clone_parameters(
-      &self.parameters,
-      self.stream_index.max(0) as usize,
-      self.parameter_bytes,
-    )
+    self.ticket.rebuild()
   }
 
   /// Returns the source `AVStream.index`.
@@ -2018,11 +2019,12 @@ impl TrackExtra {
   pub const fn frame_count(&self) -> Option<i64> {
     self.frame_count
   }
-  /// Returns the stream's codec parameters — the handle a decoder is
-  /// opened from.
+  /// Returns the stream's owned codec ticket — every seat of its
+  /// `AVCodecParameters`, and what [`Self::clone_parameters`] rebuilds
+  /// a decoder's parameters from.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn parameters(&self) -> &Parameters {
-    &self.parameters
+  pub const fn ticket(&self) -> &CodecTicket {
+    &self.ticket
   }
 
   /// Sets the disposition bits (consuming builder).
@@ -2068,20 +2070,16 @@ impl TrackExtra {
 }
 
 impl std::fmt::Debug for TrackExtra {
-  /// Hand-written because [`Parameters`] does not derive `Debug`. The
-  /// medium and codec id are the two fields worth printing; the rest of
-  /// `AVCodecParameters` is per-kind detail the track row already
-  /// carries in typed form.
+  /// Hand-written so the ticket prints as its own summary rather than
+  /// as a wall of bytes — see [`CodecTicket`](crate::ticket::CodecTicket)'s
+  /// `Debug`, which prints sizes for the same reason.
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     f.debug_struct("TrackExtra")
       .field("stream_index", &self.stream_index)
       .field("disposition", &format_args!("{:#x}", self.disposition))
       .field("start_time", &self.start_time)
       .field("frame_count", &self.frame_count)
-      .field(
-        "parameters",
-        &format_args!("{:?}", crate::boundary::media_kind_of(&self.parameters)),
-      )
+      .field("ticket", &self.ticket)
       .finish()
   }
 }
