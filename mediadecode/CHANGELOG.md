@@ -11,6 +11,68 @@ The sibling FFmpeg adapter has its own log at
 
 ## [Unreleased]
 
+### Changed (BREAKING)
+
+- **`mediaframe` 0.7 → 0.9**, at the same pin as before
+  (`default-features = false`, `features = ["frame"]` — the no-alloc
+  tier). Two breaking minors crossed at once, and `mediaframe` is a
+  **public** dependency: `color`, `pixel_format` and the structural
+  primitives in `frame` are re-export modules, so a consumer still
+  holding a `mediaframe 0.7` value no longer type-checks against this
+  release. Same reasoning as the 0.5.0, 0.6.0 and 0.11.0 crossings —
+  a public dependency crossing an incompatible 0.x minor is Breaking
+  regardless of how much of its surface actually moved.
+
+  **No `mediadecode` source line changed**, and that is a census result
+  rather than a hope. What upstream moved, against what this crate
+  names:
+
+  - **0.8.0 is additive to rosters this crate does not name.** It adds
+    the `image::Format` household, a plural `extensions()` face on
+    `container::Format` and `audio::ContainerFormat`, four promoted
+    variants (`container::Format::{M2ts, Threeg2}`,
+    `audio::ContainerFormat::Aifc`, `image::Format::Heic`) and a
+    widened, ignore-case `FromStr` on the two pre-existing container
+    rosters — a real, observable parsing-result change upstream flags
+    in its own log. None of the three roster households is named
+    anywhere in this workspace: container/audio-container/image formats
+    are a *directory-walk* vocabulary, and `mediadecode` starts one
+    tier past the file, at a demuxer that has already been handed one.
+    The `FromStr` change therefore has no site here.
+  - **0.9.0 retires the lossy `lang::Language` triple** — the wrapper
+    over `icu_locale_core` that kept only language/script/region and
+    discarded every variant, extension and private-use subtag — and
+    replaces it with a four-type `lang` family (`LanguageId`,
+    `Language`, `ScriptSubtag`, `Region`) over a vendored BCP 47
+    registry, moving `audio::Tags`'s language seat and `LanguageError`
+    with it. **Neither the retired type, nor its successors, nor
+    `audio::Tags` is named anywhere in this workspace.** The language
+    tag this crate does carry is its own and always was:
+    `subtitle::SubtitlePayload::Text`'s
+    `Option<[u8; 3]>` ISO 639-2/T seat, a raw three-byte array minted
+    here, which `mediaframe` never typed and 0.9 does not reach.
+    Whether that seat should become a `lang::LanguageId` is a design
+    question this bump does not force and does not answer.
+
+  The consumed surface, swept item by item, is unchanged in 0.9:
+  `color::{ChromaLocation, DynamicRange, Info, Matrix, Primaries,
+  Transfer}` (re-exported here under the disambiguated `Color*`
+  aliases), `pixel_format::PixelFormat`, and
+  `frame::{BayerPattern, Dimensions, Plane, Rect}` — plus the `serde`
+  feature's `mediaframe/serde` forwarding entry, which the `packet`
+  module's own forwarding tests still prove end to end. Verified
+  empirically, not just argued: `cargo check` / `cargo test` /
+  `cargo clippy -- -D warnings` (`--workspace --all-features`) are all
+  clean with zero source change.
+
+  One dependency-graph note, upstream's and inherited rather than
+  chosen here: `mediaframe` 0.9 drops `icu_locale_core` (and with it
+  `tinystr`, `zerovec`, `writeable`, `litemap`, `potential_utf`) and
+  takes on `smol-bytes` and `simdutf8` at its **`alloc` tier**. This
+  crate's own pin is the no-alloc `frame` tier, where neither new crate
+  is reachable; they enter the graph only through the adapters, which
+  pin `mediaframe` with `alloc`. Net, the graph shrinks.
+
 ## [0.11.0] - 2026-08-28
 
 Both public dependencies cross a breaking minor at once: `mediatime`
