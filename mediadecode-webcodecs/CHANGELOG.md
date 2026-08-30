@@ -11,6 +11,27 @@ The backend-agnostic core it adapts has its own log at
 
 ## [Unreleased]
 
+### Changed (BREAKING)
+
+- **`mediaframe` 0.7 → 0.9**, tracking the core's own crossing (see
+  [`mediadecode`](../mediadecode/CHANGELOG.md#unreleased)) — two
+  breaking minors in a public dependency whose `PixelFormat`, `color`
+  and `audio::ChannelLayoutDescription` types this adapter re-exports
+  and names in its own signatures.
+
+  **No adapter source line moved and no behaviour changes.** Upstream
+  0.8.0 is additive to the container / audio-container / image roster
+  households, which this adapter never names, and 0.9.0 is the `lang`
+  family — the retirement of the lossy `lang::Language` triple, its
+  `LanguageError` and `audio::Tags`'s language seat, none of which
+  appears anywhere in this crate.
+
+  Verified on the real dependency graph (native builds this crate
+  empty): `cargo check` and `cargo clippy --all-features -- -D
+  warnings` on `--target wasm32-unknown-unknown`, both clean with zero
+  source change. The browser `wasm-bindgen-test` lane needing headless
+  Chromium is CI-only and was not run locally.
+
 ## [0.11.0] - 2026-08-28
 
 Tracks `mediadecode` 0.11.0, which crosses `mediatime` 0.3 → 0.4 and

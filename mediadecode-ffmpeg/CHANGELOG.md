@@ -186,6 +186,34 @@ The backend-agnostic core it adapts has its own log at
   the clone — a font's extradata *is* the payload the carrier holds, and
   it is neither allocated nor charged.
 
+### Changed (BREAKING)
+
+- **`mediaframe` 0.7 → 0.9**, tracking the core's own crossing (see
+  [`mediadecode`](../mediadecode/CHANGELOG.md#unreleased)). Two breaking
+  minors at once. `mediaframe` is a public dependency of the core *and*
+  a direct one here (pinned with `alloc`), and its `PixelFormat`,
+  `color` and `audio` types appear in this adapter's own signatures
+  (`convert`, `pixdesc`, `channel_layout`, `boundary`), so this
+  adapter's surface moves with it.
+
+  **No adapter source line moved and no behaviour changes.** The census
+  behind that: upstream 0.8.0 is additive to the container /
+  audio-container / image roster households, which this adapter never
+  names — it takes its formats from FFmpeg's own descriptors, not from
+  a filename — and 0.9.0 is the `lang` family, which retires the lossy
+  `lang::Language` triple, its `LanguageError`, and `audio::Tags`'s
+  language seat. None of the three appears anywhere in this crate. The
+  ISO 639-2/T tag `extras`'s subtitle-track seat carries is this
+  workspace's own raw `Option<[u8; 3]>`, untouched by either release.
+
+  The surface this adapter actually consumes is unchanged in 0.9:
+  `audio::{ChannelLayout, ChannelLayoutDescription, ChannelOrder,
+  ChannelSpec}`, `frame::Rotation`, `pixel_format::PixelFormat` and the
+  `color` household. Verified, not just argued: `cargo check`,
+  `cargo test` (including the submodule-backed audio fixture lane) and
+  `cargo clippy -- -D warnings`, all `--workspace --all-features`, are
+  clean with zero source change.
+
 ## [0.11.0] - 2026-08-28
 
 Tracks `mediadecode` 0.11.0, which crosses `mediatime` 0.3 → 0.4 and
