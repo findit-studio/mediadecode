@@ -116,8 +116,9 @@ pub const DEFAULT_MAX_TOTAL_ATTACHMENT_BYTES: usize = 256 * 1024 * 1024;
 ///
 /// **What it bounds.** `AVCodecParameters` has three heap seats and all
 /// three come from the file: `extradata`, every entry of
-/// `coded_side_data`, and a custom `ch_layout` channel map. Copying a
-/// track row's parameters copies all of them.
+/// `coded_side_data`, and a custom `ch_layout` channel map. A track
+/// row's codec ticket mirrors all three, and rebuilding one for a
+/// decoder allocates all three again.
 ///
 /// **Why this number.** The honest end of the range is small — H.264
 /// SPS/PPS extradata is tens of bytes, HEVC's a few hundred, FLAC and
@@ -141,7 +142,7 @@ pub const DEFAULT_MAX_CODEC_PARAMETER_BYTES: usize = 16 * 1024 * 1024;
 ///
 /// Charged over **all** streams, not just the ones a caller will
 /// decode: the track table is built eagerly at open, so every stream's
-/// parameters are copied whether or not anybody asks for them.
+/// parameters are mirrored whether or not anybody asks for them.
 pub const DEFAULT_MAX_TOTAL_CODEC_PARAMETER_BYTES: usize = 64 * 1024 * 1024;
 
 /// The defaults have to hold together, and these say how — at compile

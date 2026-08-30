@@ -38,6 +38,7 @@ mod reader_guard;
 mod resampler;
 mod sample_format;
 mod subtitle;
+pub mod ticket;
 mod video;
 mod view;
 
@@ -150,6 +151,7 @@ pub type FfmpegOwnedResampler = resampler::CarrierResampler<Owned>;
 
 pub use sample_format::SampleFormat;
 pub use subtitle::{CarrierSubtitleStreamDecoder, SubtitleDecodeError};
+pub use ticket::{ChannelLayoutTicket, CodecTicket, CustomChannel, Ratio};
 pub use video::{CarrierVideoStreamDecoder, VideoDecodeError};
 
 // Every bare alias below binds [`FfmpegBuffer`] in the `D` seat — the

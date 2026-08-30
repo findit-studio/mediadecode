@@ -95,16 +95,46 @@ impl ResampleSpec {
     }
   }
 
-  /// The spec a track *declares*, read off the codec parameters a
+  /// The spec a track *declares*, read off the owned codec ticket a
   /// [`crate::FfmpegDemuxer`] track row carries
-  /// (`track.extra().parameters()`) — the "source from `TrackInfo`"
-  /// path.
+  /// (`track.extra().ticket()`) — the "source from `TrackInfo`" path.
+  ///
+  /// Reads the ticket directly rather than rebuilding an
+  /// `AVCodecParameters` to read three fields out of: the seats are
+  /// already owned, and a rebuild here would allocate `extradata` a
+  /// resampler has no use for.
   ///
   /// Returns `None` for a non-audio track, for one whose declared
   /// sample format is `AV_SAMPLE_FMT_NONE` (a codec whose format is
   /// only known once its decoder opens), and for a custom or ambisonic
   /// channel layout — see [`Self::from_decoder`] for the first case and
   /// the note on [`unspecified_layout`] for the last.
+  pub fn from_ticket(ticket: &crate::ticket::CodecTicket) -> Option<Self> {
+    if !crate::boundary::media_kind_from_raw(ticket.codec_type()).is_audio() {
+      return None;
+    }
+    let rate = ticket.sample_rate().max(0) as u32;
+    if rate == 0 {
+      return None;
+    }
+    let format = SampleFormat::from_raw(ticket.format()).to_ffmpeg()?;
+    // Through the same decision [`layout_from_raw`] makes — the same
+    // function, in fact, so the two roads cannot drift into admitting
+    // different layouts from the same file.
+    let owned = ticket.ch_layout();
+    let layout = layout_from_parts(owned.order(), owned.channels(), owned.mask())?;
+    Some(Self::new(rate, format, layout))
+  }
+
+  /// [`Self::from_ticket`], over a live `AVCodecParameters` — the road
+  /// for a caller holding one straight off `stream.parameters()`.
+  ///
+  /// Returns `None` in every case [`Self::from_ticket`] does, and also
+  /// for null-backed parameters: `Parameters`' safe constructors hand
+  /// one back when FFmpeg's allocation failed and report nothing, so a
+  /// caller can arrive here holding one without ever having been told.
+  /// Parameters that were never allocated describe no audio, which
+  /// this function already has a word for.
   pub fn from_parameters(parameters: &Parameters) -> Option<Self> {
     // Before `medium()`, which dereferences the pointer inside
     // ffmpeg-next. `Parameters`' safe constructors hand back a
@@ -1974,13 +2004,31 @@ fn initialized_layout(layout: ChannelLayout) -> ChannelLayout {
 unsafe fn layout_from_raw(ptr: *const ffmpeg_next::ffi::AVChannelLayout) -> Option<ChannelLayout> {
   let order = unsafe { read_unaligned(addr_of!((*ptr).order).cast::<i32>()) };
   let channels = unsafe { (*ptr).nb_channels };
+  // The union's `mask` arm is only read for the order that names it —
+  // for `CUSTOM` those eight bytes are a pointer. `layout_from_parts`
+  // refuses that order anyway, so a zero is the honest thing to hand
+  // it and reading the pointer would be the dishonest one.
+  let mask = if order == AVChannelOrder::AV_CHANNEL_ORDER_NATIVE as i32 {
+    // SAFETY: `u.mask` is the union's variant for NATIVE, and the
+    // order was checked against our own constant before the read.
+    unsafe { (*ptr).u.mask }
+  } else {
+    0
+  };
+  layout_from_parts(order, channels, mask)
+}
+
+/// The layout roster, over parts rather than a pointer.
+///
+/// One function so the two roads into a source spec —
+/// [`ResampleSpec::from_parameters`] over a live `AVCodecParameters`
+/// and [`ResampleSpec::from_ticket`] over an owned mirror — cannot
+/// drift into admitting different layouts from the same file.
+fn layout_from_parts(order: i32, channels: i32, mask: u64) -> Option<ChannelLayout> {
   if channels <= 0 {
     return None;
   }
   if order == AVChannelOrder::AV_CHANNEL_ORDER_NATIVE as i32 {
-    // SAFETY: `u.mask` is the union's variant for NATIVE, and the
-    // order was checked against our own constant before the read.
-    let mask = unsafe { (*ptr).u.mask };
     if mask != 0 {
       return Some(layout_from_mask(mask));
     }

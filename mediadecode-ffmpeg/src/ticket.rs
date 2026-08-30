@@ -1,0 +1,1131 @@
+//! The owned codec ticket — one stream's `AVCodecParameters`, mirrored
+//! into plain Rust and rebuilt on demand.
+//!
+//! # Why the mirror exists
+//!
+//! [`ffmpeg_next::codec::Parameters`] is a `*mut AVCodecParameters`
+//! behind a `Send`-but-not-`Sync` wrapper. A track row that stores one
+//! is `!Sync`, an `Arc` of that row is `!Send`, and every consumer that
+//! shares a track table across tasks stops compiling — for a struct
+//! FFmpeg documents as a plain *descriptor* with no thread affinity at
+//! all. The auto-trait is missing, not the safety.
+//!
+//! The crate already answers that class one way: it mirrors what a
+//! consumer needs into owned Rust —
+//! [`TrackParams`](mediadecode::demuxer::TrackParams) mirrors the
+//! common seats, [`SideDataEntry`] mirrors a frame's metadata,
+//! [`FfmpegBytes`] mirrors its pixels. [`CodecTicket`] walks that road
+//! its last mile: **every** seat of an `AVCodecParameters`, held as
+//! owned bytes and plain integers, with `Sync` arriving by
+//! construction rather than by an `unsafe impl` over FFI.
+//!
+//! # The two halves
+//!
+//! * [`CodecTicket::mirror`] reads a live `AVCodecParameters` into the
+//!   ticket. It is the only place that reads one.
+//! * [`CodecTicket::rebuild`] allocates a fresh `AVCodecParameters` and
+//!   writes every seat back. It is the only place in this crate's
+//!   track-row road that allocates one, and what it hands back is what
+//!   `avcodec_parameters_to_context` is fed — unchanged from before the
+//!   mirror existed.
+//!
+//! The pair is proved in `tests/codec_ticket_parity.rs`: for every
+//! stream of every fixture the corpus can mint, the rebuilt struct is
+//! compared with the original **field by field**, including
+//! `extradata` bytes, the `AV_INPUT_BUFFER_PADDING_SIZE` zeroes past
+//! their end, every `coded_side_data` entry's type id and payload, and
+//! the channel layout down to a custom map's per-channel names. The
+//! shapes no container will hand over — a custom map, an unnamed
+//! side-data kind, every scalar set off its default — are built by
+//! hand in the same file, and a decoder is opened through a rebuilt
+//! ticket and made to produce a frame.
+//!
+//! # The reading discipline, inherited
+//!
+//! Not one bindgen enum is materialised out of FFmpeg memory. Every
+//! open C enum seat — the media type, the codec id, the field order,
+//! the five colour seats, the alpha mode, the channel order, a custom
+//! channel's id, a side-data type id — travels as **the raw 32-bit
+//! pattern it is on the wire**, read and written through the same
+//! `i32` cast, so a value this build's bindings cannot name is still a
+//! value this ticket carries. That is the same rule
+//! [`crate::extras::bounded_clone_parameters`] is written to, for the
+//! same reason: forming a typed reference to a struct whose enum field
+//! holds an unnamed discriminant is undefined behaviour before a
+//! single field is read.
+//!
+//! [`SideDataEntry`]: crate::extras::SideDataEntry
+//! [`FfmpegBytes`]: crate::FfmpegBytes
+
+use core::ptr::{addr_of, addr_of_mut, copy_nonoverlapping, read_unaligned, write_unaligned};
+
+use ffmpeg_next::{
+  codec::Parameters,
+  ffi::{
+    AV_INPUT_BUFFER_PADDING_SIZE, AVChannelCustom, AVChannelOrder, AVCodecParameters,
+    AVPacketSideData, av_mallocz,
+  },
+};
+
+use crate::{
+  FfmpegBytes,
+  demuxer::{
+    DemuxError, ParametersAlloc, ParametersChannelMap, ParametersCopy, ParametersMissing,
+    ParametersOpaque, ParametersTooLarge,
+  },
+  extras::{ExtradataPolicy, SideDataEntry, measure_parameters},
+};
+
+/// A verbatim `AVRational` seat.
+///
+/// Its own type rather than a [`mediatime::Timebase`] because the two
+/// seats it carries — `sample_aspect_ratio` and `framerate` — are not
+/// timebases and are not always valid ratios: FFmpeg spells "unknown"
+/// as a zero numerator (`sample_aspect_ratio`) or as `0/1`
+/// (`framerate`), and a mirror that normalised either would fail its
+/// own parity test. Nothing here reduces, validates or interprets;
+/// the numbers cross unchanged.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Ratio {
+  num: i32,
+  den: i32,
+}
+
+impl Ratio {
+  /// Constructs a `Ratio` from a numerator and denominator, verbatim.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(num: i32, den: i32) -> Self {
+    Self { num, den }
+  }
+  /// The numerator.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn num(&self) -> i32 {
+    self.num
+  }
+  /// The denominator.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn den(&self) -> i32 {
+    self.den
+  }
+}
+
+/// One entry of a custom channel map — the `AV_CHANNEL_ORDER_CUSTOM`
+/// arm of [`ChannelLayoutTicket`].
+///
+/// `name` is FFmpeg's inline `char[16]`, carried as the sixteen bytes
+/// it is. It is a NUL-padded label, not a Rust string: FFmpeg's own
+/// contract is "may be filled with a 0-terminated string … otherwise
+/// it must be zeroed", so the bytes cross verbatim and any decoding
+/// into text is the consumer's choice, not the mirror's.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct CustomChannel {
+  id: i32,
+  name: [u8; 16],
+}
+
+impl CustomChannel {
+  /// Constructs a `CustomChannel` from a raw `AVChannel` id and the
+  /// sixteen name bytes.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(id: i32, name: [u8; 16]) -> Self {
+    Self { id, name }
+  }
+  /// The raw `AVChannel` id. Negative values are real: `AV_CHAN_NONE`
+  /// is `-1`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn id(&self) -> i32 {
+    self.id
+  }
+  /// The sixteen name bytes, NUL-padded, exactly as FFmpeg holds them.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn name_bytes(&self) -> &[u8; 16] {
+    &self.name
+  }
+}
+
+/// The owned mirror of an `AVChannelLayout`.
+///
+/// The union is discriminated by `order`, and this type keeps that
+/// discrimination honest: `mask` is read and written **only** for the
+/// orders whose union arm is the bitmask, and `map` **only** for
+/// `AV_CHANNEL_ORDER_CUSTOM`, whose arm is a pointer. Reading the
+/// pointer arm as a mask would put a raw address in an owned mirror,
+/// which is the whole thing this type exists to stop.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ChannelLayoutTicket {
+  order: i32,
+  channels: i32,
+  mask: u64,
+  map: Vec<CustomChannel>,
+}
+
+impl ChannelLayoutTicket {
+  /// The raw `AVChannelOrder`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn order(&self) -> i32 {
+    self.order
+  }
+  /// `nb_channels`, verbatim.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn channels(&self) -> i32 {
+    self.channels
+  }
+  /// The channel bitmask, meaningful for every order but
+  /// `AV_CHANNEL_ORDER_CUSTOM`, where it reads zero and [`Self::map`]
+  /// carries the layout instead.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn mask(&self) -> u64 {
+    self.mask
+  }
+  /// The custom channel map — empty for every order but
+  /// `AV_CHANNEL_ORDER_CUSTOM`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn map(&self) -> &[CustomChannel] {
+    self.map.as_slice()
+  }
+
+  /// Whether this layout's union arm is the custom map.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  fn is_custom(&self) -> bool {
+    self.order == AVChannelOrder::AV_CHANNEL_ORDER_CUSTOM as i32
+  }
+}
+
+/// Every seat of one stream's `AVCodecParameters`, owned.
+///
+/// # The roster
+///
+/// All thirty-two fields FFmpeg n9.0 declares, in that struct's own
+/// order. Nothing is elided as "video only" or "audio only":
+/// `avcodec_parameters_to_context` reads a different subset per medium
+/// but the *file* carries whatever it carries, and a mirror that kept
+/// only one medium's subset would lose a seat the moment a container
+/// declared something unusual.
+///
+/// They land in three kinds. Three seats own heap and become owned
+/// Rust: `extradata`, `coded_side_data`, and `ch_layout`'s custom map.
+/// Two are lengths of those — `extradata_size` and
+/// `nb_coded_side_data` — and are **not stored**: a carrier already
+/// knows its own length, and a second copy of it is a second thing to
+/// keep in agreement. The remaining twenty-seven are scalars, held as
+/// the integers (or, for the two `AVRational` seats, the [`Ratio`])
+/// they are.
+///
+/// # `Send + Sync`, by construction
+///
+/// Every field is an integer, an [`FfmpegBytes`](crate::FfmpegBytes)
+/// (an `Arc<[u8]>`), or a `Vec` of those. There is no raw pointer, so
+/// there is no `unsafe impl` and no safety argument to get wrong —
+/// which is exactly the point of the road this type is on. See
+/// `tests::the_ticket_is_send_and_sync`.
+///
+/// # What it does not carry, and why that is a refusal rather than a
+/// loss
+///
+/// `AVChannelLayout::opaque` and `AVChannelCustom::opaque` are
+/// documented as "private data of the user": raw pointers, set by
+/// nobody but the caller who owns them, and unreadable to a mirror
+/// that must outlive the pointer's owner. libavformat never sets
+/// either, so no demuxed stream reaches this type carrying one. If one
+/// ever did, [`CodecTicket::mirror`] refuses with
+/// [`DemuxError::ParametersOpaque`] rather than dropping it in
+/// silence — the same fail-closed answer
+/// [`measure_parameters`](crate::extras) gives a channel order it has
+/// never heard of.
+#[derive(Clone)]
+pub struct CodecTicket {
+  /// The `AVStream.index` this mirror was taken at.
+  ///
+  /// Carried for one reason: so [`Self::rebuild`]'s errors can name
+  /// the stream they are about. A rebuild that reports `ENOMEM`
+  /// without saying which track it was opening is a log line nobody
+  /// can act on, and the mirror is the last place that knows.
+  stream_index: usize,
+  codec_type: i32,
+  codec_id: i32,
+  codec_tag: u32,
+  extradata: FfmpegBytes,
+  coded_side_data: Vec<SideDataEntry>,
+  format: i32,
+  bit_rate: i64,
+  bits_per_coded_sample: i32,
+  bits_per_raw_sample: i32,
+  profile: i32,
+  level: i32,
+  width: i32,
+  height: i32,
+  sample_aspect_ratio: Ratio,
+  framerate: Ratio,
+  field_order: i32,
+  color_range: i32,
+  color_primaries: i32,
+  color_trc: i32,
+  color_space: i32,
+  chroma_location: i32,
+  video_delay: i32,
+  ch_layout: ChannelLayoutTicket,
+  sample_rate: i32,
+  block_align: i32,
+  frame_size: i32,
+  initial_padding: i32,
+  trailing_padding: i32,
+  seek_preroll: i32,
+  alpha_mode: i32,
+  /// What [`Self::rebuild`] will ask FFmpeg's allocator for — see
+  /// [`Self::footprint_bytes`].
+  footprint_bytes: usize,
+}
+
+impl CodecTicket {
+  /// Mirrors a live set of codec parameters into an owned ticket.
+  ///
+  /// `budget` is the ceiling the mirror's heap seats must fit under,
+  /// measured before a byte is copied — the same admission
+  /// [`crate::extras::bounded_clone_parameters`] performs and the same
+  /// number `admit_streams` charges against the session's total. A set
+  /// of parameters over the ceiling is refused with
+  /// [`DemuxError::ParametersTooLarge`], never truncated.
+  ///
+  /// Fails with [`DemuxError::ParametersMissing`] when `source` is
+  /// null-backed — `Parameters::new()` and `Parameters::default()` are
+  /// safe constructors over an unchecked `avcodec_parameters_alloc`,
+  /// so a caller can hold one without ever having been told.
+  pub fn mirror(
+    source: &Parameters,
+    stream_index: usize,
+    budget: usize,
+  ) -> Result<Self, DemuxError> {
+    Self::mirror_with(source, stream_index, budget, ExtradataPolicy::Copy)
+  }
+
+  /// [`Self::mirror`], with the `extradata` policy named.
+  pub(crate) fn mirror_with(
+    source: &Parameters,
+    stream_index: usize,
+    budget: usize,
+    extradata_policy: ExtradataPolicy,
+  ) -> Result<Self, DemuxError> {
+    // SAFETY: reading the pointer without dereferencing it — which is
+    // what the null check exists for.
+    let par = unsafe { source.as_ptr() };
+    if par.is_null() {
+      return Err(DemuxError::ParametersMissing(ParametersMissing::new(
+        stream_index,
+      )));
+    }
+    // SAFETY: `par` is a live `AVCodecParameters` owned by `source`
+    // for the duration of this call.
+    unsafe { Self::from_raw(par, stream_index, budget, extradata_policy) }
+  }
+
+  /// [`Self::mirror`] over a raw pointer.
+  ///
+  /// # Safety
+  ///
+  /// `par` must be a non-null, live `*const AVCodecParameters` for the
+  /// duration of this call.
+  pub(crate) unsafe fn from_raw(
+    par: *const AVCodecParameters,
+    stream_index: usize,
+    budget: usize,
+    extradata_policy: ExtradataPolicy,
+  ) -> Result<Self, DemuxError> {
+    let too_large = |bytes: usize| {
+      DemuxError::ParametersTooLarge(ParametersTooLarge::new(stream_index, bytes, budget))
+    };
+
+    // Measured before a byte is copied, exactly as the bounded clone
+    // does it: the footprint enumerates the same three heap seats this
+    // mirror is about to read, and refusing here is what keeps an
+    // attacker-sized `extradata` or ICC profile from being copied into
+    // Rust memory just to be refused afterwards.
+    //
+    // SAFETY: `par` is live per this function's contract; the
+    // measurement allocates nothing and dereferences only what it
+    // counts.
+    let footprint = unsafe { measure_parameters(par) }.ok_or_else(|| too_large(usize::MAX))?;
+    let footprint_bytes = match extradata_policy {
+      ExtradataPolicy::Copy => footprint.total(),
+      ExtradataPolicy::Omit => footprint.total_without_extradata(),
+    }
+    .ok_or_else(|| too_large(usize::MAX))?;
+    if footprint_bytes > budget {
+      return Err(too_large(footprint_bytes));
+    }
+
+    // SAFETY: `par` is live; every read below either takes a scalar
+    // field by value or reaches one through `addr_of!`, and no enum
+    // field is read as anything but the `i32` pattern it is on the
+    // wire. See the module docs for why that distinction is
+    // load-bearing rather than stylistic.
+    let ticket = unsafe {
+      Self {
+        stream_index,
+        codec_type: read_unaligned(addr_of!((*par).codec_type).cast::<i32>()),
+        codec_id: read_unaligned(addr_of!((*par).codec_id).cast::<i32>()),
+        codec_tag: (*par).codec_tag,
+        extradata: extradata_of(par, extradata_policy),
+        coded_side_data: side_data_of(par),
+        format: (*par).format,
+        bit_rate: (*par).bit_rate,
+        bits_per_coded_sample: (*par).bits_per_coded_sample,
+        bits_per_raw_sample: (*par).bits_per_raw_sample,
+        profile: (*par).profile,
+        level: (*par).level,
+        width: (*par).width,
+        height: (*par).height,
+        sample_aspect_ratio: Ratio::new(
+          (*par).sample_aspect_ratio.num,
+          (*par).sample_aspect_ratio.den,
+        ),
+        framerate: Ratio::new((*par).framerate.num, (*par).framerate.den),
+        field_order: read_unaligned(addr_of!((*par).field_order).cast::<i32>()),
+        color_range: read_unaligned(addr_of!((*par).color_range).cast::<i32>()),
+        color_primaries: read_unaligned(addr_of!((*par).color_primaries).cast::<i32>()),
+        color_trc: read_unaligned(addr_of!((*par).color_trc).cast::<i32>()),
+        color_space: read_unaligned(addr_of!((*par).color_space).cast::<i32>()),
+        chroma_location: read_unaligned(addr_of!((*par).chroma_location).cast::<i32>()),
+        video_delay: (*par).video_delay,
+        ch_layout: channel_layout_of(par, stream_index)?,
+        sample_rate: (*par).sample_rate,
+        block_align: (*par).block_align,
+        frame_size: (*par).frame_size,
+        initial_padding: (*par).initial_padding,
+        trailing_padding: (*par).trailing_padding,
+        seek_preroll: (*par).seek_preroll,
+        alpha_mode: read_unaligned(addr_of!((*par).alpha_mode).cast::<i32>()),
+        footprint_bytes,
+      }
+    };
+    Ok(ticket)
+  }
+
+  /// Rebuilds a live `AVCodecParameters` from the ticket.
+  ///
+  /// **The one ffmpeg-native allocation on the track row's road**, and
+  /// the handoff a decoder is opened from:
+  ///
+  /// ```ignore
+  /// FfmpegAudioStreamDecoder::open(
+  ///   track.extra().clone_parameters()?,
+  ///   track.timebase(),
+  ///   limits,
+  /// )
+  /// ```
+  ///
+  /// Every seat that can hold a non-default value is written, so the
+  /// result depends on the ticket rather than on what
+  /// `avcodec_parameters_alloc` happened to leave behind. Stated
+  /// exactly, because the difference is load-bearing:
+  ///
+  /// * The **twenty-seven scalars** are written unconditionally. Those
+  ///   are the seats `avcodec_parameters_alloc` gives non-zero defaults
+  ///   to — `format` is `-1`, `profile` and `level` are
+  ///   `AV_PROFILE_UNKNOWN` / `AV_LEVEL_UNKNOWN`, both rationals are
+  ///   `0/1`, and so on — so leaving any of them would let a default
+  ///   masquerade as the file's own value.
+  /// * The **four descriptor seats** — `extradata` and
+  ///   `extradata_size`, `coded_side_data` and `nb_coded_side_data` —
+  ///   are written only when the ticket has something to put there. On
+  ///   the empty path they keep the allocator's zero, and that is
+  ///   correct rather than an omission: `codec_parameters_reset`
+  ///   `memset`s the whole struct to zero and then assigns non-zero
+  ///   defaults to a named list that contains none of these four. A
+  ///   null pointer with a zero length is exactly what "no extradata"
+  ///   and "no side data" mean, and it is what the source had.
+  /// * `ch_layout` is always written — order, channel count, and either
+  ///   the mask or the map.
+  ///
+  /// That is what makes field-by-field parity with the original
+  /// provable rather than hopeful, and
+  /// `tests/codec_ticket_parity.rs::every_scalar_seat_is_written_back`
+  /// is the assertion that a seat quietly relying on a default cannot
+  /// pass.
+  ///
+  /// Fallible because allocation is: `ParametersAlloc` when the struct
+  /// itself cannot be allocated, `ParametersCopy` carrying `ENOMEM`
+  /// when one of the heap seats cannot. Nothing here consults a
+  /// budget — the bytes are already resident and were admitted at
+  /// [`Self::mirror`]; what this allocates is exactly
+  /// [`Self::footprint_bytes`].
+  pub fn rebuild(&self) -> Result<Parameters, DemuxError> {
+    let stream_index = self.stream_index;
+    let mut out = Parameters::new();
+    // SAFETY: reading the pointer the constructor stored without
+    // dereferencing it — `Parameters::new` does not check
+    // `avcodec_parameters_alloc` and hands back a null on failure.
+    let dst = unsafe { out.as_mut_ptr() };
+    if dst.is_null() {
+      return Err(DemuxError::ParametersAlloc(ParametersAlloc::new(
+        stream_index,
+      )));
+    }
+
+    // SAFETY: `dst` is a live, freshly allocated `AVCodecParameters`
+    // whose heap seats are still null. Every write below is a scalar
+    // store, or an `addr_of_mut!` store of the same 32-bit pattern the
+    // mirror read, into a struct nothing else holds a reference to.
+    unsafe {
+      write_unaligned(
+        addr_of_mut!((*dst).codec_type).cast::<i32>(),
+        self.codec_type,
+      );
+      write_unaligned(addr_of_mut!((*dst).codec_id).cast::<i32>(), self.codec_id);
+      (*dst).codec_tag = self.codec_tag;
+      (*dst).format = self.format;
+      (*dst).bit_rate = self.bit_rate;
+      (*dst).bits_per_coded_sample = self.bits_per_coded_sample;
+      (*dst).bits_per_raw_sample = self.bits_per_raw_sample;
+      (*dst).profile = self.profile;
+      (*dst).level = self.level;
+      (*dst).width = self.width;
+      (*dst).height = self.height;
+      (*dst).sample_aspect_ratio.num = self.sample_aspect_ratio.num();
+      (*dst).sample_aspect_ratio.den = self.sample_aspect_ratio.den();
+      (*dst).framerate.num = self.framerate.num();
+      (*dst).framerate.den = self.framerate.den();
+      write_unaligned(
+        addr_of_mut!((*dst).field_order).cast::<i32>(),
+        self.field_order,
+      );
+      write_unaligned(
+        addr_of_mut!((*dst).color_range).cast::<i32>(),
+        self.color_range,
+      );
+      write_unaligned(
+        addr_of_mut!((*dst).color_primaries).cast::<i32>(),
+        self.color_primaries,
+      );
+      write_unaligned(addr_of_mut!((*dst).color_trc).cast::<i32>(), self.color_trc);
+      write_unaligned(
+        addr_of_mut!((*dst).color_space).cast::<i32>(),
+        self.color_space,
+      );
+      write_unaligned(
+        addr_of_mut!((*dst).chroma_location).cast::<i32>(),
+        self.chroma_location,
+      );
+      (*dst).video_delay = self.video_delay;
+      (*dst).sample_rate = self.sample_rate;
+      (*dst).block_align = self.block_align;
+      (*dst).frame_size = self.frame_size;
+      (*dst).initial_padding = self.initial_padding;
+      (*dst).trailing_padding = self.trailing_padding;
+      (*dst).seek_preroll = self.seek_preroll;
+      write_unaligned(
+        addr_of_mut!((*dst).alpha_mode).cast::<i32>(),
+        self.alpha_mode,
+      );
+    }
+
+    // The three heap seats, each allocated from FFmpeg's allocator so
+    // `avcodec_parameters_free` releases them with the struct — the
+    // same allocator discipline `bounded_clone_parameters` uses, and
+    // the same one `avcodec_parameters_copy` would have used.
+    //
+    // SAFETY: `dst` is live and its heap seats are null; each
+    // allocation below is checked, and each is attached to `dst`
+    // before the next one is attempted, so a failure part way leaves
+    // `out`'s own destructor a well-formed struct to free.
+    unsafe {
+      write_extradata(dst, self.extradata.as_slice(), stream_index)?;
+      write_side_data(dst, &self.coded_side_data, stream_index)?;
+      write_channel_layout(dst, &self.ch_layout, stream_index)?;
+    }
+
+    Ok(out)
+  }
+
+  /// What [`Self::rebuild`] asks FFmpeg's allocator for: `extradata`
+  /// with the `AV_INPUT_BUFFER_PADDING_SIZE` decoders read past the
+  /// end into, the `coded_side_data` descriptor array and every
+  /// entry's payload, and a custom channel map.
+  ///
+  /// The number the session admitted this stream at, and the number
+  /// `DemuxLimits::max_codec_parameter_bytes` was judged against — so
+  /// a row that opened is a row whose every rebuild fits the ceiling
+  /// it opened under.
+  ///
+  /// Not the ticket's own residency: the owned mirror holds the
+  /// payload without FFmpeg's trailing padding, and shares its buffers
+  /// by refcount.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn footprint_bytes(&self) -> usize {
+    self.footprint_bytes
+  }
+
+  /// The `AVStream.index` this mirror was taken at — what
+  /// [`Self::rebuild`]'s errors name.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn stream_index(&self) -> usize {
+    self.stream_index
+  }
+  /// The raw `AVMediaType`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn codec_type(&self) -> i32 {
+    self.codec_type
+  }
+  /// The raw `AVCodecID`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn codec_id(&self) -> i32 {
+    self.codec_id
+  }
+  /// The codec tag — the AVI FOURCC, when the container carries one.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn codec_tag(&self) -> u32 {
+    self.codec_tag
+  }
+  /// The decoder-initialisation bytes — SPS/PPS for H.264, the
+  /// `AudioSpecificConfig` for AAC, a font's payload for an
+  /// attachment. Empty when the stream carries none, or when the row
+  /// was built on the attachment road that leaves them to the carrier.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn extradata(&self) -> &[u8] {
+    self.extradata.as_slice()
+  }
+  /// The extradata's carrier, for a consumer that wants the bytes
+  /// without copying them again.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn extradata_ref(&self) -> &FfmpegBytes {
+    &self.extradata
+  }
+  /// Stream-level side data — where a MOV `prof` atom's ICC profile
+  /// arrives, among others.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn coded_side_data(&self) -> &[SideDataEntry] {
+    self.coded_side_data.as_slice()
+  }
+  /// The pixel format (video) or sample format (audio), as the raw
+  /// integer both enums share this seat as.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn format(&self) -> i32 {
+    self.format
+  }
+  /// Average bitrate in bits per second.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn bit_rate(&self) -> i64 {
+    self.bit_rate
+  }
+  /// Bits per sample in the coded bitstream.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn bits_per_coded_sample(&self) -> i32 {
+    self.bits_per_coded_sample
+  }
+  /// Valid bits in each output sample.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn bits_per_raw_sample(&self) -> i32 {
+    self.bits_per_raw_sample
+  }
+  /// The codec profile.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn profile(&self) -> i32 {
+    self.profile
+  }
+  /// The codec level.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn level(&self) -> i32 {
+    self.level
+  }
+  /// Frame width in pixels — video, and the subtitle canvas.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn width(&self) -> i32 {
+    self.width
+  }
+  /// Frame height in pixels — video, and the subtitle canvas.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn height(&self) -> i32 {
+    self.height
+  }
+  /// The sample aspect ratio. A zero numerator means unknown.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn sample_aspect_ratio(&self) -> Ratio {
+    self.sample_aspect_ratio
+  }
+  /// The codec-level frame rate. `0/1` when frames differ in duration
+  /// or the value is not known.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn framerate(&self) -> Ratio {
+    self.framerate
+  }
+  /// The raw `AVFieldOrder`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn field_order(&self) -> i32 {
+    self.field_order
+  }
+  /// The raw `AVColorRange`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn color_range(&self) -> i32 {
+    self.color_range
+  }
+  /// The raw `AVColorPrimaries`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn color_primaries(&self) -> i32 {
+    self.color_primaries
+  }
+  /// The raw `AVColorTransferCharacteristic`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn color_trc(&self) -> i32 {
+    self.color_trc
+  }
+  /// The raw `AVColorSpace`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn color_space(&self) -> i32 {
+    self.color_space
+  }
+  /// The raw `AVChromaLocation`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn chroma_location(&self) -> i32 {
+    self.chroma_location
+  }
+  /// Number of delayed frames — the decoder's `has_b_frames`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn video_delay(&self) -> i32 {
+    self.video_delay
+  }
+  /// The channel layout.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn ch_layout(&self) -> &ChannelLayoutTicket {
+    &self.ch_layout
+  }
+  /// Audio samples per second.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn sample_rate(&self) -> i32 {
+    self.sample_rate
+  }
+  /// Bytes per coded audio frame — `nBlockAlign` in `WAVEFORMATEX`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn block_align(&self) -> i32 {
+    self.block_align
+  }
+  /// Audio frame size, when the format fixes one.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn frame_size(&self) -> i32 {
+    self.frame_size
+  }
+  /// Leading padding samples the encoder inserted.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn initial_padding(&self) -> i32 {
+    self.initial_padding
+  }
+  /// Trailing padding samples the encoder appended.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn trailing_padding(&self) -> i32 {
+    self.trailing_padding
+  }
+  /// Samples to skip after a discontinuity.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn seek_preroll(&self) -> i32 {
+    self.seek_preroll
+  }
+  /// The raw `AVAlphaMode` — how an alpha channel relates to the
+  /// colour values, and the last field `AVCodecParameters` declares.
+  ///
+  /// New in FFmpeg n9.0, and the seat this mirror's first draft
+  /// dropped: video-only, left at its zero by every fixture the corpus
+  /// can mint, and therefore reading back identically whether it is
+  /// mirrored or forgotten. The parity comparator names every field
+  /// for exactly that reason.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn alpha_mode(&self) -> i32 {
+    self.alpha_mode
+  }
+}
+
+impl core::fmt::Debug for CodecTicket {
+  /// Sizes rather than payloads. An `extradata` blob and an ICC
+  /// profile are both megabyte-scale and neither is readable; what a
+  /// reader of a log wants is the stream's identity and whether the
+  /// heap seats are populated.
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.debug_struct("CodecTicket")
+      .field(
+        "medium",
+        &crate::boundary::media_kind_from_raw(self.codec_type),
+      )
+      .field("codec_id", &self.codec_id)
+      .field("codec_tag", &format_args!("{:#010x}", self.codec_tag))
+      .field("format", &self.format)
+      .field("width", &self.width)
+      .field("height", &self.height)
+      .field("sample_rate", &self.sample_rate)
+      .field("channels", &self.ch_layout.channels)
+      .field("extradata_len", &self.extradata.len())
+      .field("coded_side_data", &self.coded_side_data.len())
+      .field("footprint_bytes", &self.footprint_bytes)
+      .finish_non_exhaustive()
+  }
+}
+
+// ---------------------------------------------------------------------------
+//  Reading the three heap seats.
+// ---------------------------------------------------------------------------
+
+/// Copies `extradata` into an owned carrier — the payload only.
+///
+/// FFmpeg's `AV_INPUT_BUFFER_PADDING_SIZE` trailing zeroes are an
+/// allocation contract, not content: decoders read past the end of the
+/// buffer and the padding is what makes that defined. Carrying them in
+/// the mirror would store zeroes an owned `Arc<[u8]>` needs no reader
+/// to be safe past; [`write_extradata`] mints them again on the way
+/// back out, which is where they mean something.
+///
+/// # Safety
+///
+/// `par` must be a live `*const AVCodecParameters`.
+unsafe fn extradata_of(par: *const AVCodecParameters, policy: ExtradataPolicy) -> FfmpegBytes {
+  if matches!(policy, ExtradataPolicy::Omit) {
+    return FfmpegBytes::empty();
+  }
+  // SAFETY: `par` is live per the contract; both fields are a pointer
+  // and an integer.
+  let (ptr, size) = unsafe { ((*par).extradata, (*par).extradata_size) };
+  let Ok(len) = usize::try_from(size) else {
+    return FfmpegBytes::empty();
+  };
+  if ptr.is_null() || len == 0 {
+    return FfmpegBytes::empty();
+  }
+  // SAFETY: libavformat guarantees `extradata` is readable for
+  // `extradata_size` bytes while the parameters live, and the slice is
+  // consumed before this function returns.
+  FfmpegBytes::copy_from_slice(unsafe { core::slice::from_raw_parts(ptr, len) })
+}
+
+/// Copies every `coded_side_data` entry into owned entries.
+///
+/// # Safety
+///
+/// `par` must be a live `*const AVCodecParameters`.
+unsafe fn side_data_of(par: *const AVCodecParameters) -> Vec<SideDataEntry> {
+  // SAFETY: `par` is live per the contract.
+  let (array, count) = unsafe { ((*par).coded_side_data, (*par).nb_coded_side_data) };
+  let Ok(count) = usize::try_from(count) else {
+    return Vec::new();
+  };
+  if array.is_null() || count == 0 {
+    return Vec::new();
+  }
+  let mut entries = Vec::with_capacity(count);
+  for index in 0..count {
+    // **Never `&*entry`.** `AVPacketSideData::type` is an open C enum
+    // and an ABI-compatible FFmpeg newer than these bindings emits
+    // kinds absent from the generated Rust enum; forming a typed
+    // reference asserts every field inhabits its declared type, which
+    // is undefined behaviour before a single field is read.
+    //
+    // SAFETY: the array is valid for `nb_coded_side_data` contiguous
+    // entries per FFmpeg's contract, `index` is below that count, and
+    // `addr_of!` computes a field address without forming a reference
+    // to the struct containing it.
+    let (kind, data, size) = unsafe {
+      let entry = array.add(index);
+      (
+        read_unaligned(addr_of!((*entry).type_).cast::<i32>()),
+        read_unaligned(addr_of!((*entry).data)),
+        read_unaligned(addr_of!((*entry).size)),
+      )
+    };
+    let payload = if data.is_null() || size == 0 {
+      FfmpegBytes::empty()
+    } else {
+      // SAFETY: the descriptor declares `size` readable bytes at
+      // `data`, and the slice is consumed before the loop advances.
+      FfmpegBytes::copy_from_slice(unsafe { core::slice::from_raw_parts(data, size) })
+    };
+    entries.push(SideDataEntry::new(kind, payload));
+  }
+  entries
+}
+
+/// Mirrors the embedded `AVChannelLayout`.
+///
+/// # Safety
+///
+/// `par` must be a live `*const AVCodecParameters`.
+unsafe fn channel_layout_of(
+  par: *const AVCodecParameters,
+  stream_index: usize,
+) -> Result<ChannelLayoutTicket, DemuxError> {
+  // SAFETY: `ch_layout` is embedded by value; `addr_of!` reaches each
+  // field without forming a reference to the layout, and `order` has
+  // the layout of a `c_int`.
+  let (order, channels, opaque) = unsafe {
+    (
+      read_unaligned(addr_of!((*par).ch_layout.order).cast::<i32>()),
+      (*par).ch_layout.nb_channels,
+      (*par).ch_layout.opaque,
+    )
+  };
+  if !opaque.is_null() {
+    return Err(DemuxError::ParametersOpaque(ParametersOpaque::new(
+      stream_index,
+      None,
+    )));
+  }
+
+  let mut layout = ChannelLayoutTicket {
+    order,
+    channels,
+    mask: 0,
+    map: Vec::new(),
+  };
+  if !layout.is_custom() {
+    // Every order but `CUSTOM` describes its channels with the union's
+    // `mask` arm. Reading it for `CUSTOM` would read a pointer.
+    //
+    // SAFETY: the union is eight bytes either way and this arm is the
+    // one the order names.
+    layout.mask = unsafe { (*par).ch_layout.u.mask };
+    return Ok(layout);
+  }
+
+  // A custom order without a full map is **refused**, not reproduced.
+  // `av_channel_layout_copy` — the call
+  // `avcodec_parameters_to_context` moves this field through —
+  // allocates `nb_channels` entries and then `memcpy`s from
+  // `src->u.map` with no null check of its own, so a layout that names
+  // channels it has no map for makes libavcodec read from null the
+  // moment a decoder opens. Carrying it across would be a faithful
+  // round trip of a crash. See
+  // [`DemuxError::ParametersChannelMap`](crate::DemuxError).
+  //
+  // Refusing here is also what lets [`write_channel_layout`] rely on
+  // `map.len() == nb_channels` for a custom order.
+  //
+  // SAFETY: the order names the `map` arm.
+  let map = unsafe { (*par).ch_layout.u.map };
+  let malformed = || {
+    Err(DemuxError::ParametersChannelMap(ParametersChannelMap::new(
+      stream_index,
+      channels,
+    )))
+  };
+  let Ok(count) = usize::try_from(channels) else {
+    return malformed();
+  };
+  if map.is_null() || count == 0 {
+    return malformed();
+  }
+  layout.map.reserve_exact(count);
+  for index in 0..count {
+    // Field pointers again, never `&AVChannelCustom`: `id` is an open
+    // enum with the same hazard as a side-data type id.
+    //
+    // SAFETY: FFmpeg's contract makes the map `nb_channels` entries
+    // long, `index` is below that count, and every read goes through
+    // `addr_of!`.
+    let (id, name, opaque) = unsafe {
+      let entry = map.add(index);
+      (
+        read_unaligned(addr_of!((*entry).id).cast::<i32>()),
+        read_unaligned(addr_of!((*entry).name).cast::<[u8; 16]>()),
+        read_unaligned(addr_of!((*entry).opaque)),
+      )
+    };
+    if !opaque.is_null() {
+      return Err(DemuxError::ParametersOpaque(ParametersOpaque::new(
+        stream_index,
+        Some(index),
+      )));
+    }
+    layout.map.push(CustomChannel::new(id, name));
+  }
+  Ok(layout)
+}
+
+// ---------------------------------------------------------------------------
+//  Writing the three heap seats.
+// ---------------------------------------------------------------------------
+
+/// The `ENOMEM` a heap seat's allocation reports when it fails.
+fn seat_alloc_failed(stream_index: usize) -> DemuxError {
+  DemuxError::ParametersCopy(ParametersCopy::new(
+    stream_index,
+    ffmpeg_next::Error::Other {
+      errno: libc::ENOMEM,
+    },
+  ))
+}
+
+/// Allocates `extradata` and its padding, and copies the payload in.
+///
+/// # Safety
+///
+/// `dst` must be a live `*mut AVCodecParameters` whose `extradata` is
+/// null.
+unsafe fn write_extradata(
+  dst: *mut AVCodecParameters,
+  payload: &[u8],
+  stream_index: usize,
+) -> Result<(), DemuxError> {
+  if payload.is_empty() {
+    return Ok(());
+  }
+  let size = i32::try_from(payload.len()).map_err(|_| seat_alloc_failed(stream_index))?;
+  let padded = payload
+    .len()
+    .checked_add(AV_INPUT_BUFFER_PADDING_SIZE as usize)
+    .ok_or_else(|| seat_alloc_failed(stream_index))?;
+  // SAFETY: `av_mallocz` returns zeroed memory or null; the copy
+  // writes exactly `payload.len()` bytes into an allocation that is
+  // `AV_INPUT_BUFFER_PADDING_SIZE` longer, leaving the padding zero —
+  // which is the contract decoders read past the end under.
+  unsafe {
+    let buffer = av_mallocz(padded).cast::<u8>();
+    if buffer.is_null() {
+      return Err(seat_alloc_failed(stream_index));
+    }
+    copy_nonoverlapping(payload.as_ptr(), buffer, payload.len());
+    (*dst).extradata = buffer;
+    (*dst).extradata_size = size;
+  }
+  Ok(())
+}
+
+/// Allocates the `coded_side_data` descriptor array and each payload.
+///
+/// # Safety
+///
+/// `dst` must be a live `*mut AVCodecParameters` whose
+/// `coded_side_data` is null.
+unsafe fn write_side_data(
+  dst: *mut AVCodecParameters,
+  entries: &[SideDataEntry],
+  stream_index: usize,
+) -> Result<(), DemuxError> {
+  if entries.is_empty() {
+    return Ok(());
+  }
+  let count = i32::try_from(entries.len()).map_err(|_| seat_alloc_failed(stream_index))?;
+  let bytes = entries
+    .len()
+    .checked_mul(core::mem::size_of::<AVPacketSideData>())
+    .ok_or_else(|| seat_alloc_failed(stream_index))?;
+
+  // SAFETY: `dst` is live with a null `coded_side_data`. The array is
+  // attached before any payload is filled in, so a failure part way
+  // leaves the destructor a well-formed array to walk: the entries it
+  // has not reached are zeroed, and freeing a null payload is a no-op.
+  unsafe {
+    let array = av_mallocz(bytes).cast::<AVPacketSideData>();
+    if array.is_null() {
+      return Err(seat_alloc_failed(stream_index));
+    }
+    (*dst).coded_side_data = array;
+    (*dst).nb_coded_side_data = count;
+
+    for (index, entry) in entries.iter().enumerate() {
+      let into = array.add(index);
+      // The type id travels as the raw bits it is on the wire, for the
+      // reason the read did: a kind these bindings cannot name is
+      // still a kind the file carries and a decoder may want.
+      write_unaligned(addr_of_mut!((*into).type_).cast::<i32>(), entry.kind());
+      let payload = entry.data();
+      if payload.is_empty() {
+        continue;
+      }
+      let buffer = av_mallocz(payload.len()).cast::<u8>();
+      if buffer.is_null() {
+        return Err(seat_alloc_failed(stream_index));
+      }
+      copy_nonoverlapping(payload.as_ptr(), buffer, payload.len());
+      write_unaligned(addr_of_mut!((*into).data), buffer);
+      write_unaligned(addr_of_mut!((*into).size), payload.len());
+    }
+  }
+  Ok(())
+}
+
+/// Writes the channel layout, allocating a custom map when the order
+/// names one.
+///
+/// Written field by field rather than through
+/// `av_channel_layout_copy`, because the source it would copy from is
+/// the thing this road has abolished: there is no live
+/// `AVChannelLayout` to copy, only owned Rust. The one allocation is
+/// the custom map, which [`CodecTicket::mirror`] already measured and
+/// admitted.
+///
+/// # Safety
+///
+/// `dst` must be a live `*mut AVCodecParameters` whose `ch_layout` is
+/// the zeroed (`AV_CHANNEL_ORDER_UNSPEC`) state
+/// `avcodec_parameters_alloc` leaves, owning no map.
+unsafe fn write_channel_layout(
+  dst: *mut AVCodecParameters,
+  layout: &ChannelLayoutTicket,
+  stream_index: usize,
+) -> Result<(), DemuxError> {
+  // SAFETY: `dst` is live and its layout owns nothing yet; `order` is
+  // written as the same 32-bit pattern the mirror read.
+  unsafe {
+    write_unaligned(
+      addr_of_mut!((*dst).ch_layout.order).cast::<i32>(),
+      layout.order(),
+    );
+    (*dst).ch_layout.opaque = core::ptr::null_mut();
+  }
+
+  if !layout.is_custom() {
+    // SAFETY: the order names the `mask` arm.
+    unsafe {
+      (*dst).ch_layout.nb_channels = layout.channels();
+      (*dst).ch_layout.u.mask = layout.mask();
+    }
+    return Ok(());
+  }
+
+  // **`nb_channels` comes from the map, not from the stored field.**
+  // The two are equal — [`channel_layout_of`] refuses a custom layout
+  // it cannot map in full, and the fields are private, so no other
+  // value can exist. Writing the count from the array anyway is what
+  // makes that structural rather than remembered: the layout handed to
+  // libavcodec can never declare more channels than the array it points
+  // at, which is precisely the shape `av_channel_layout_copy` would
+  // `memcpy` past the end of.
+  debug_assert_eq!(
+    layout.map().len(),
+    layout.channels().max(0) as usize,
+    "a custom layout's map length is its channel count",
+  );
+  let count = layout.map().len();
+  if count == 0 {
+    // Unreachable through `mirror`, and fail-closed if a future
+    // constructor ever makes it reachable.
+    return Err(DemuxError::ParametersChannelMap(ParametersChannelMap::new(
+      stream_index,
+      layout.channels(),
+    )));
+  }
+
+  let declared = i32::try_from(count).map_err(|_| seat_alloc_failed(stream_index))?;
+  let bytes = count
+    .checked_mul(core::mem::size_of::<AVChannelCustom>())
+    .ok_or_else(|| seat_alloc_failed(stream_index))?;
+  // SAFETY: `av_mallocz` returns zeroed memory or null. The map and the
+  // count it describes are attached together, before the entries are
+  // filled in, so a later failure leaves a well-formed (zeroed) map for
+  // the destructor to free, and every write goes through
+  // `addr_of_mut!` rather than a typed reference.
+  unsafe {
+    let map = av_mallocz(bytes).cast::<AVChannelCustom>();
+    if map.is_null() {
+      return Err(seat_alloc_failed(stream_index));
+    }
+    (*dst).ch_layout.u.map = map;
+    (*dst).ch_layout.nb_channels = declared;
+    for (index, channel) in layout.map().iter().enumerate() {
+      let into = map.add(index);
+      write_unaligned(addr_of_mut!((*into).id).cast::<i32>(), channel.id());
+      write_unaligned(
+        addr_of_mut!((*into).name).cast::<[u8; 16]>(),
+        *channel.name_bytes(),
+      );
+      write_unaligned(addr_of_mut!((*into).opaque), core::ptr::null_mut());
+    }
+  }
+  Ok(())
+}
+
+#[cfg(test)]
+mod tests;

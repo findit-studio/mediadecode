@@ -11,6 +11,181 @@ The backend-agnostic core it adapts has its own log at
 
 ## [Unreleased]
 
+### Added
+
+- **`ticket::CodecTicket` — the owned mirror of an `AVCodecParameters`.**
+  Every one of the thirty-two seats FFmpeg n9.0 declares, held as plain
+  integers and owned bytes: `extradata` as an `FfmpegBytes`,
+  `coded_side_data` as a `Vec<SideDataEntry>`, and the channel layout as
+  a `ChannelLayoutTicket` whose union arm follows its own `order` — a
+  bitmask, or a `CustomChannel` map with each channel's raw id and its
+  sixteen NUL-padded name bytes. The two length seats
+  (`extradata_size`, `nb_coded_side_data`) are not stored: a carrier
+  knows its own length, and a second copy of it is a second thing to
+  keep in agreement.
+
+  `CodecTicket::mirror` reads a live `AVCodecParameters` under the same
+  ceiling `bounded_clone_parameters` enforces, measured before a byte is
+  copied. `CodecTicket::rebuild` allocates a fresh one and writes the
+  seats back, minting `extradata`'s `AV_INPUT_BUFFER_PADDING_SIZE`
+  trailing zeroes as it goes; it is the one place the track-row road now
+  allocates an `AVCodecParameters`, and what it hands back is what
+  `avcodec_parameters_to_context` is fed, unchanged.
+
+  Stated exactly, because the difference is load-bearing: the
+  twenty-seven scalars and `ch_layout` are written unconditionally —
+  those are the seats `avcodec_parameters_alloc` gives *non-zero*
+  defaults to (`format` is `-1`, `profile`/`level` are the `UNKNOWN`
+  sentinels, both rationals are `0/1`), so leaving any of them would let
+  a default masquerade as the file's own value. The four descriptor
+  seats — `extradata`/`extradata_size` and
+  `coded_side_data`/`nb_coded_side_data` — are written only when there
+  is something to put there, and on the empty path keep the allocator's
+  zero. That is correct rather than an omission: `codec_parameters_reset`
+  `memset`s the struct to zero and then assigns non-zero defaults to a
+  named list containing none of those four, so a null pointer with a
+  zero length is exactly what the source had.
+
+  Not one bindgen enum is materialised out of FFmpeg memory in either
+  direction: every open C enum seat — the media type, the codec id, the
+  field order, the five colour seats, the alpha mode, the channel order,
+  a custom channel's id, a side-data type id — crosses as the raw 32-bit
+  pattern it is on the wire, so a value these bindings cannot name is
+  still a value the ticket carries.
+
+  `tests/codec_ticket_parity.rs` is the proof: a comparator naming all
+  thirty-two fields, swept over 16 streams — every container the corpus
+  can mint (8 of them carrying real `extradata`: H.264 SPS/PPS, AAC
+  `AudioSpecificConfig`, a font's payload) plus one MOV assembled byte
+  by byte in the test itself, whose `colr`/`prof` atom libavformat turns
+  into an `AV_PKT_DATA_ICC_PROFILE` entry of `coded_side_data`. That
+  last seat has no `ffmpeg` CLI recipe — censused: `-metadata:s:v
+  rotate=` no longer writes a display matrix and MOV, MP4 and Matroska
+  emit no stream-level side data of their own — so minting it is what
+  lets the suite prove a *demuxer* populates it rather than only that an
+  absent seat crosses. Nothing binary is committed, and that fixture
+  needs no CLI, so the lane runs everywhere.
+
+  Then the shapes no container will hand over at all, and a decoder
+  opened *through* a rebuilt ticket and made to produce both a video and
+  an audio frame.
+
+- `ResampleSpec::from_ticket` — the source spec off a track row's owned
+  ticket, replacing `ResampleSpec::from_parameters(track.extra()
+  .parameters())`. Both roads now decide through one shared layout
+  roster, so they cannot drift into admitting different layouts from the
+  same file. `from_parameters` remains for a caller holding a live
+  `stream.parameters()`.
+
+- `DemuxError::ParametersChannelMap`. A channel layout that declares
+  `AV_CHANNEL_ORDER_CUSTOM` without the map that order requires is
+  refused rather than mirrored. This one is a crash, not a curiosity:
+  `av_channel_layout_copy` — how `avcodec_parameters_to_context` moves
+  the layout into a decoder's context — allocates `nb_channels` entries
+  and then `memcpy`s from `src->u.map` with **no null check of its own**
+  (verified against FFmpeg n9.0), so a layout naming channels it has no
+  map for makes libavcodec read from null the moment a decoder opens.
+  Reproducing that shape faithfully would pass a parity comparator and
+  forward the crash, so the mirror fails closed instead; and the rebuild
+  writes `nb_channels` **from** the map rather than from the stored
+  field, so the struct handed to libavcodec can never declare more
+  channels than the array it points at.
+
+- `DemuxError::ParametersOpaque`. `AVChannelLayout::opaque` and
+  `AVChannelCustom::opaque` are raw pointers FFmpeg documents as "private
+  data of the user"; an owned mirror outlives the pointer's owner and may
+  cross threads, so it refuses one rather than dropping it in silence.
+  libavformat sets neither, so no demuxed stream reaches it — this is a
+  tripwire, and the same fail-closed answer `measure_parameters` gives a
+  channel order it has never heard of.
+
+### Changed
+
+- **BREAKING: `TrackExtra` no longer carries an
+  `ffmpeg_next::codec::Parameters`.** It carries a `CodecTicket`, and
+  with the raw handle gone the whole track table became `Sync`.
+
+  That was the defect. `Parameters` is a `*mut AVCodecParameters` behind
+  a `Send`-but-not-`Sync` wrapper, and it was the row's only non-`Sync`
+  field: `TrackInfo<Ffmpeg>` was therefore `!Sync`,
+  `Arc<TrackInfo<Ffmpeg>>` was not `Send`, and a consumer sharing a
+  track row across tasks did not compile — for a struct FFmpeg documents
+  as a plain descriptor with no thread affinity at all. The auto-trait
+  was missing, not the safety. It is answered with the mirror this crate
+  already lives by rather than an `unsafe impl` over FFI, so `Send +
+  Sync` are now structural facts with no safety argument to get wrong.
+  `src/ticket/tests.rs` pins them on `CodecTicket`, `TrackExtra`,
+  `TrackInfo<Ffmpeg>` and `Arc<TrackInfo<Ffmpeg>>`.
+
+  The surface that moved:
+
+  | before | after |
+  |---|---|
+  | `TrackExtra::parameters() -> &Parameters` | `TrackExtra::ticket() -> &CodecTicket` |
+  | `TrackExtra::new(i32, Parameters) -> Result<Self, DemuxError>` | `TrackExtra::new(i32, CodecTicket) -> Self` |
+  | `TrackExtra::try_clone() -> Result<Self, DemuxError>` | `impl Clone for TrackExtra` |
+
+  `TrackExtra::clone_parameters() -> Result<Parameters, DemuxError>` is
+  **unchanged** — it rebuilds from the ticket, so every decoder-open call
+  site (`FfmpegAudioStreamDecoder::open(track.extra()
+  .clone_parameters()?, …)`) is untouched.
+
+  `TrackExtra::new` lost a fallibility it no longer had a way to use. It
+  returned a `Result` for exactly one reason: `Parameters`' safe
+  constructors hand back a null-backed value when
+  `avcodec_parameters_alloc` fails and report nothing, so a caller could
+  hand the row one having never been told. That check moved to
+  `CodecTicket::mirror`, beside the raw pointer where it belongs.
+
+- **`TrackExtra` implements `Clone` again, and `try_clone` is gone.**
+  This reverses a standing ruling, so it is recorded rather than
+  slipped in.
+
+  The type refused `Clone` for two releases, on two arguments, and both
+  were about the raw handle. The first was safety: a derived `Clone`
+  went through `ffmpeg_next`'s `Clone` for `Parameters`, which checks
+  neither the allocation nor the copy, so safe public code that merely
+  copied a track row could dereference a null destination or receive
+  quietly incomplete parameters — and `Clone` has no way to report
+  either. That derive shipped once and was genuinely reachable. The
+  second was the message-carrier law: a `Clone` is a refcount bump,
+  never a deep copy, and `avcodec_parameters_copy` is not that.
+
+  Neither survives the mirror. There is no `Parameters` left to clone
+  unchecked, and a copy is now plain owned Rust — a `Vec` spine and
+  refcount bumps over `Arc<[u8]>` — with no FFmpeg allocator anywhere
+  near it, which is precisely what the carrier law asks of a `Clone`.
+  A ban whose whole rationale is spent is ceremony, so the ban is gone
+  along with both stand-ins it had accumulated (the fallible
+  `try_clone` and, briefly, an infallible `duplicate`). No deprecation
+  ceremony: this release is breaking already.
+  `demuxer::tests::the_public_track_extra_handoffs_still_answer_the_allocator`
+  pins the property the derive rests on, by cloning a row under an
+  FFmpeg allocator capped to refuse everything.
+
+  This does **not** make a track row cheap to copy by accident:
+  `TrackInfo` and `TrackParams` still have no `Clone` of their own, so
+  the row-sharing law is untouched — a consumer that needs to share a
+  row still wraps it in `Arc` once, at the door, which is now something
+  it can actually do.
+
+- `TrackExtra::parameter_bytes` now reports what a *rebuild* allocates
+  rather than what the row holds. The number is the same one the session
+  admitted the stream at and the same one
+  `DemuxLimits::max_codec_parameter_bytes` was judged against, so no
+  budget changed meaning; but the owned mirror holds its payload without
+  FFmpeg's trailing padding and shares its buffers by refcount, so it is
+  no longer a statement about the row's own residency.
+
+- The demux path builds the ticket straight from the stream's
+  parameters. Opening a file used to perform one full
+  `avcodec_parameters_copy` per track whose only purpose was to sever the
+  tie to the format context; the mirror severs it by being owned Rust, so
+  that copy is gone rather than moved. The attachment road's
+  `ExtradataPolicy::Omit` is honoured by the mirror exactly as it was by
+  the clone — a font's extradata *is* the payload the carrier holds, and
+  it is neither allocated nor charged.
+
 ## [0.11.0] - 2026-08-28
 
 Tracks `mediadecode` 0.11.0, which crosses `mediatime` 0.3 → 0.4 and
