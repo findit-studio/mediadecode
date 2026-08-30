@@ -11,6 +11,8 @@ The sibling FFmpeg adapter has its own log at
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-08-30
+
 ### Changed (BREAKING)
 
 - **`mediaframe` 0.7 → 0.9**, at the same pin as before
