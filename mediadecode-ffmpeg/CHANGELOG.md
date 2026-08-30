@@ -11,6 +11,8 @@ The backend-agnostic core it adapts has its own log at
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-08-30
+
 ### Added
 
 - **`ticket::CodecTicket` — the owned mirror of an `AVCodecParameters`.**
