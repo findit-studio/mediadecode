@@ -1,8 +1,14 @@
 //! [`mediadecode::demuxer::Demuxer`] impl backed by `libavformat`.
 //!
 //! Opens a container — from a path, or from any `Read + Seek` reader
-//! through a custom `AVIOContext` — reads its track table once, and
+//! through a custom `AVIOContext` — builds its track table once, and
 //! then hands packets out one at a time in interleaved file order.
+//!
+//! The table is built at open and **kept for the life of the session**:
+//! it is what every packet is classified against, so reading it takes
+//! nothing away and may happen at any point. Rows are handed out as
+//! `Arc<TrackInfo<Ffmpeg>>` handles — see
+//! [`Demuxer::TrackHandle`](mediadecode::demuxer::Demuxer::TrackHandle).
 //!
 //! # What normalization this layer does
 //!
@@ -47,7 +53,6 @@ use std::{
   collections::VecDeque,
   ffi::{CStr, c_int},
   io::{Read, Seek},
-  mem,
   num::NonZeroI32,
   path::Path,
   ptr::{addr_of, read_unaligned},
@@ -96,7 +101,19 @@ fn av_time_base_q() -> Timebase {
 /// and [`Self::open_reader`].
 pub struct CarrierDemuxer<C: crate::FfmpegCarrier> {
   input: Input,
-  tracks: Vec<TrackInfo<Ffmpeg>>,
+  /// The track table, built once at open and held for the life of the
+  /// session — **this is the table `next_packet` classifies against**,
+  /// so nothing may take it away.
+  ///
+  /// Rows are `Arc`-wrapped at the door rather than by each consumer:
+  /// [`TrackInfo`] is not `Clone` (the message-carrier law), so a
+  /// consumer that needs a row past a borrow of this session needs a
+  /// shared handle, and one allocation per track at open is the whole
+  /// cost of every fan-out afterwards. `Arc` and not `Rc` because
+  /// [`CodecTicket`](crate::ticket::CodecTicket) made these rows
+  /// `Send + Sync` by construction precisely so a track table could
+  /// cross tasks.
+  tracks: Vec<Arc<TrackInfo<Ffmpeg>>>,
   pending: VecDeque<(
     TrackIndex,
     AttachmentPacket<AttachmentPacketExtra, C::Buffer>,
@@ -106,6 +123,18 @@ pub struct CarrierDemuxer<C: crate::FfmpegCarrier> {
   /// unconditionally would also erase a genuine sticky I/O error, which
   /// `Input::seek` goes out of its way to preserve.
   eof: bool,
+  /// `true` once this session has reported a packet whose stream the
+  /// track table does not describe.
+  ///
+  /// The diagnostic is **once per session, not once per packet**. A
+  /// format that adds an `AVStream` mid-read (`AVFMTCTX_NOHEADER`:
+  /// MPEG-TS, RTP) then delivers packets on it at the wire's own rate,
+  /// and a line each would be an unbounded log on healthy input — a
+  /// live stream could fill a disk with it. One line names the
+  /// condition; the rest of the session stays quiet. Never cleared,
+  /// including across a seek: it records that this session has said
+  /// its piece, which a seek does not undo.
+  unplaceable_reported: bool,
   /// Set for a session opened over a caller's reader: where a panic
   /// raised inside that reader is recorded. `None` for a path-opened
   /// session, which runs no caller code.
@@ -284,12 +313,16 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
 
   fn from_input(input: Input, limits: DemuxLimits) -> Result<Self, DemuxError> {
     let (tracks, pending) = build_tracks::<C>(&input, limits)?;
+    // One allocation per track, here and never again: the session
+    // keeps these handles and hands out clones of them.
+    let tracks = tracks.into_iter().map(Arc::new).collect();
     Ok(Self {
       input,
       tracks,
       pending,
       unconverted: None,
       eof: false,
+      unplaceable_reported: false,
       reader_panic: None,
       limits,
     })
@@ -376,12 +409,8 @@ fn reader_panic(latch: &PanicLatch) -> Option<DemuxError> {
 }
 
 impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
-  pub(crate) fn tracks_impl(&self) -> &[TrackInfo<Ffmpeg>] {
+  pub(crate) fn tracks_impl(&self) -> &[Arc<TrackInfo<Ffmpeg>>] {
     &self.tracks
-  }
-
-  pub(crate) fn take_tracks_impl(&mut self) -> Vec<TrackInfo<Ffmpeg>> {
-    mem::take(&mut self.tracks)
   }
 
   pub(crate) fn next_packet_impl(
@@ -441,9 +470,40 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
 
       let index = packet.stream();
       // A packet for a stream the table does not describe cannot be
-      // placed. libavformat does not produce these, but the index comes
-      // from C and indexes a `Vec`.
+      // placed, so it is passed by — the same answer the `Unknown` arm
+      // below gives a track nothing can name.
+      //
+      // **Neither an assertion nor an error.** The arm is reachable on
+      // healthy input: a format flagged `AVFMTCTX_NOHEADER` — MPEG-TS,
+      // RTP and the rest that carry no up-front stream list — may add
+      // an `AVStream` in the middle of `av_read_frame`, and this
+      // session's table was fixed at open, which is the contract
+      // `TrackIndex` needs (position in `tracks()`, dense and stable
+      // for the life of the session). A `debug_assert` would fire on a
+      // transport stream, and an `Err` would end a session over a
+      // stream the caller never asked about.
+      //
+      // It is no longer the *every* packet path. It was, for one
+      // release: the take-the-table door emptied this very `Vec`, so
+      // every index fell out of range at once and a healthy file
+      // demuxed to nothing (issue #51). The table cannot be taken
+      // away any more; what is left here is the genuinely
+      // out-of-range index the arm was written for. Reported rather
+      // than silent, because silence is what made the old failure
+      // invisible — and reported **once**, because the very case that
+      // makes the arm reachable is a live stream that would otherwise
+      // log a line per packet for as long as it runs. See
+      // [`Self::unplaceable_reported`].
       let Some(info) = self.tracks.get(index) else {
+        if !self.unplaceable_reported {
+          self.unplaceable_reported = true;
+          tracing::debug!(
+            stream = index,
+            tracks = self.tracks.len(),
+            "demux: no track row describes this packet's stream; passing it and any further \
+             such packet by, without repeating this line",
+          );
+        }
         continue;
       };
       let track = TrackIndex::new(index);
@@ -657,14 +717,18 @@ macro_rules! demuxer_lane_face {
     impl Demuxer for CarrierDemuxer<$lane> {
       type Adapter = Ffmpeg;
       type Buffer = <$lane as crate::FfmpegCarrier>::Buffer;
+      type TrackHandle = Arc<TrackInfo<Ffmpeg>>;
       type Error = DemuxError;
 
-      fn tracks(&self) -> &[TrackInfo<Ffmpeg>] {
+      /// The track table, held for the life of the session.
+      ///
+      /// Reading it takes nothing away — clone the handles worth
+      /// keeping. `Arc` is the carrier because
+      /// [`CodecTicket`](crate::ticket::CodecTicket) mirrors an
+      /// `AVCodecParameters` into owned Rust, which is what makes a
+      /// row `Send + Sync` and a table shareable across tasks.
+      fn tracks(&self) -> &[Arc<TrackInfo<Ffmpeg>>] {
         self.tracks_impl()
-      }
-
-      fn take_tracks(&mut self) -> Vec<TrackInfo<Ffmpeg>> {
-        self.take_tracks_impl()
       }
 
       /// Pulls the next packet.
