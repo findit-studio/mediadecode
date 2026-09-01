@@ -39,7 +39,10 @@
 //! [`next_packet`]: Demuxer::next_packet
 //! [`seek`]: Demuxer::seek
 
-use core::fmt::{self, Debug};
+use core::{
+  fmt::{self, Debug},
+  ops::Deref,
+};
 
 use derive_more::{IsVariant, TryUnwrap, Unwrap};
 
@@ -49,11 +52,16 @@ use crate::{
   packet::{AudioPacket, PacketFlags, SubtitlePacket, VideoPacket},
 };
 
-// `Demuxer::take_tracks` is the only item in this module that owns an
-// allocation (`Vec<TrackInfo<_>>`); everything else is `core`-only.
-// Scoped here rather than pulled in at the crate root, so a reader
-// can see exactly which module needs the heap.
-#[cfg(any(feature = "std", feature = "alloc"))]
+// Nothing in this module owns an allocation: the whole demux tier,
+// `Demuxer` included, is `core`-only. What a session's track table
+// costs is the backend's own choice, made at `Demuxer::TrackHandle`
+// — a heap-backed backend binds a refcounted handle, one that parses
+// in place binds a borrow.
+//
+// `alloc` is bound here for the test mock alone, whose table is a
+// `Vec`, and is scoped to this module so a reader can see exactly
+// what needs the heap and when.
+#[cfg(all(test, any(feature = "std", feature = "alloc")))]
 extern crate alloc;
 
 /// A track's position in the table [`Demuxer::tracks`] returns.
@@ -739,11 +747,19 @@ impl<E: DemuxAdapter> Debug for TrackParams<E> {
 /// message-carrier law: messages may be `Clone`, but `Clone` is
 /// always a refcount bump, never a deep copy — and a track row,
 /// backend metadata down to codec parameters, is not cheap to
-/// duplicate. A consumer that needs to share a row wraps it in `Arc`
-/// once, at the door, instead of paying a deep copy per consumer.
-/// [`Demuxer::take_tracks`] is that door: it moves the whole table
-/// out in one call, meant to be taken exactly once, right after a
-/// session opens, before any row needs to be shared further.
+/// duplicate. A consumer that needs to share a row shares a *handle*
+/// on it instead: [`Demuxer::tracks`] hands out
+/// [`Demuxer::TrackHandle`]s over rows the session keeps for its
+/// whole life, so a row is built once and every consumer after that
+/// shares it by refcount.
+///
+/// The absence is load-bearing, not incidental. It is what leaves
+/// `TrackHandle`'s `Clone` bound with no cheap deep-copying carrier
+/// to admit: there is no `#[derive(Clone)]` road over a row that has
+/// none, and `Box<TrackInfo<_>>` is not `Clone` either. A shared
+/// handle or a borrow is what an implementor reaches for; a deep copy
+/// would have to be hand-written, field by field, against the law
+/// this paragraph states.
 pub struct TrackInfo<E: DemuxAdapter> {
   timebase: Timebase,
   duration: Option<Timestamp>,
@@ -1367,6 +1383,30 @@ where
 ///    session — a seek moves the *timeline*, and attachments are not on
 ///    it.
 ///
+/// # The track table
+///
+/// [`tracks`](Self::tracks) is a **non-destructive** read, and a
+/// session holds its table for its whole life: the rows a caller reads
+/// before the first pull are the same rows the session classifies
+/// every packet against, and they are still there after end of file.
+/// Reading the table therefore has no ordering rule at all — before
+/// the first packet, between two of them, after EOF, twice, never.
+///
+/// The table is *shared*, not handed over. `TrackInfo` has no `Clone`
+/// (see its own doc for the message-carrier law), so a caller that
+/// needs a row beyond a borrow of `&self` — to fan it out, or simply
+/// to hold it across the `&mut self` of the pull loop — clones a
+/// [`TrackHandle`](Self::TrackHandle) instead.
+///
+/// This face used to carry a `take_tracks` that *moved* the table out
+/// of the session. It is gone, root and branch: a demuxer that has
+/// given its table away can no longer say which track a packet
+/// belongs to, and the one backend that implemented it classified
+/// against the very `Vec` the move emptied — so following the
+/// documented order made every packet in a healthy file vanish. A
+/// read that costs the session the state it runs on is not a door
+/// worth having.
+///
 /// # What is not here
 ///
 /// Opening. See the [module docs](self#construction-is-not-on-the-trait).
@@ -1375,6 +1415,26 @@ pub trait Demuxer {
   type Adapter: DemuxAdapter;
   /// Buffer type held by the packets this session produces.
   type Buffer: AsRef<[u8]>;
+  /// A shareable handle on one row of the track table.
+  ///
+  /// The row is read *through* the handle, and a consumer that needs
+  /// to keep a row past a borrow of the session clones the handle.
+  /// The backend picks the carrier, the same way it picks
+  /// [`Buffer`](Self::Buffer): a heap-backed, thread-crossing backend
+  /// binds `Arc<TrackInfo<..>>`, a single-threaded one binds `Rc`,
+  /// and one whose rows live in memory it already borrows binds
+  /// `&TrackInfo<..>` — which is what keeps this whole tier
+  /// allocator-free.
+  ///
+  /// **`Clone` on a handle must be a refcount bump or a copied
+  /// borrow, never a deep copy of the row** — the message-carrier law
+  /// [`TrackInfo`] states. An implementor is what upholds it; the
+  /// bound is what makes upholding it the path of least resistance,
+  /// since `TrackInfo` is not `Clone`, `Box<TrackInfo<_>>` therefore
+  /// is not either, and no `#[derive(Clone)]` reaches a carrier that
+  /// owns a row outright. A deep copy here would have to be
+  /// hand-written against the law.
+  type TrackHandle: Clone + Deref<Target = TrackInfo<Self::Adapter>>;
   /// Demuxer-specific error type.
   type Error;
 
@@ -1382,26 +1442,10 @@ pub trait Demuxer {
   ///
   /// Position `i` describes [`TrackIndex::new(i)`](TrackIndex::new) —
   /// the coordinate every [`DemuxedPacket`] carries.
-  fn tracks(&self) -> &[TrackInfo<Self::Adapter>];
-
-  /// Moves the whole track table out, once.
   ///
-  /// The **owned-tracks door**: [`TrackInfo`] has no `Clone` (see its
-  /// own doc), so a caller that needs to hold onto track rows beyond
-  /// a borrow of `&self` cannot clone its way to one. This is the
-  /// door instead. The **first call** moves every row out and returns
-  /// it; after that call, [`tracks`](Self::tracks) answers the empty
-  /// slice — the rows are gone, not duplicated. A second call to
-  /// `take_tracks` returns an empty `Vec` too, for the same reason.
-  ///
-  /// The intended caller takes the table exactly once, right after
-  /// opening a session and before pulling any packet, and wraps each
-  /// row in `Arc` for fan-out to whatever downstream consumers need
-  /// their own handle on it — one allocation per track, ever, and
-  /// every consumer after that shares by refcount.
-  #[cfg(any(feature = "std", feature = "alloc"))]
-  #[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
-  fn take_tracks(&mut self) -> alloc::vec::Vec<TrackInfo<Self::Adapter>>;
+  /// Non-destructive, and callable whenever: see [the track
+  /// table](Self#the-track-table) on the trait.
+  fn tracks(&self) -> &[Self::TrackHandle];
 
   /// Pulls the next packet in interleaved file order, or `Ok(None)` at
   /// end of file.
@@ -1424,12 +1468,11 @@ mod tests {
   // `Vec` is not in the prelude in the alloc-without-std tier (the
   // crate is `#![no_std]` there; the crate-root `alloc`-as-`std` alias
   // only makes `std::`-qualified paths resolve, it does not inject
-  // prelude items) — same reason the trait's own `take_tracks` above
-  // spells its return type `alloc::vec::Vec`. `format!` needs the same
-  // bridge. Unconditional whenever this arm runs: the enclosing `alloc`
+  // prelude items). `format!` and `Rc` need the same bridge.
+  // Unconditional whenever this arm runs: the enclosing `alloc`
   // binding above is gated the same way.
   #[cfg(any(feature = "std", feature = "alloc"))]
-  use alloc::{format, vec, vec::Vec};
+  use alloc::{format, rc::Rc, vec, vec::Vec};
 
   struct VLoop;
   impl VideoAdapter for VLoop {
@@ -1665,16 +1708,19 @@ mod tests {
   /// Trivial loopback session — proves the trait is implementable and
   /// that its associated types resolve through the adapter bundle.
   ///
-  /// `Vec`-backed, so the whole mock (and the two tests that construct
-  /// it, below) is gated on the same tier `take_tracks` itself needs —
-  /// see the `Vec`/`format!` import note above `VLoop`.
+  /// Binds `Rc` rather than `Arc` at the [`Demuxer::TrackHandle`] seat
+  /// on purpose: the seat is a backend's choice, and a single-threaded
+  /// session should not be made to pay for atomics. `Vec`-backed, so
+  /// the mock and the tests that construct it are gated on the
+  /// allocating tier — see the `Vec`/`format!` import note above
+  /// `VLoop`. [`BorrowedDemuxer`], below, is the same face with no
+  /// allocator at all.
   #[cfg(any(feature = "std", feature = "alloc"))]
   struct LoopDemuxer {
-    tracks: Vec<TrackInfo<Loopback>>,
+    tracks: Vec<Rc<TrackInfo<Loopback>>>,
     drained: bool,
   }
 
-  #[cfg(any(feature = "std", feature = "alloc"))]
   #[derive(Debug)]
   struct LoopError;
 
@@ -1682,14 +1728,11 @@ mod tests {
   impl Demuxer for LoopDemuxer {
     type Adapter = Loopback;
     type Buffer = &'static [u8];
+    type TrackHandle = Rc<TrackInfo<Loopback>>;
     type Error = LoopError;
 
-    fn tracks(&self) -> &[TrackInfo<Loopback>] {
+    fn tracks(&self) -> &[Rc<TrackInfo<Loopback>>] {
       &self.tracks
-    }
-
-    fn take_tracks(&mut self) -> Vec<TrackInfo<Loopback>> {
-      core::mem::take(&mut self.tracks)
     }
 
     fn next_packet(&mut self) -> Result<Option<DemuxedPacket<Loopback, &'static [u8]>>, LoopError> {
@@ -1716,11 +1759,11 @@ mod tests {
     _accepts::<LoopDemuxer>();
 
     let mut d = LoopDemuxer {
-      tracks: vec![TrackInfo::new(
+      tracks: vec![Rc::new(TrackInfo::new(
         ms_tb(),
         TrackParams::Audio(AudioTrackParams::new(1, 48_000, 2, 0, 0)),
         (),
-      )],
+      ))],
       drained: false,
     };
     assert_eq!(d.tracks().len(), 1);
@@ -1735,38 +1778,118 @@ mod tests {
     assert!(d.next_packet().expect("pull").is_some());
   }
 
+  /// Reading the table is non-destructive, and a handle taken before
+  /// the first pull is still the session's own row after EOF.
+  ///
+  /// This is the unit half of the regression behind
+  /// [issue #51](https://github.com/findit-studio/mediadecode/issues/51):
+  /// the face this replaced moved the table out of the session, and
+  /// the backend that classified packets against that same table
+  /// answered a clean end-of-file to every caller who followed the
+  /// documented order.
   #[cfg(any(feature = "std", feature = "alloc"))]
   #[test]
-  fn take_tracks_moves_every_row_out_once_and_leaves_the_table_empty() {
+  fn the_table_survives_the_session_and_the_handles_stay_the_rows() {
     let mut d = LoopDemuxer {
       tracks: vec![
-        TrackInfo::new(
+        Rc::new(TrackInfo::new(
           ms_tb(),
           TrackParams::Audio(AudioTrackParams::new(1, 48_000, 2, 0, 0)),
           (),
-        ),
-        TrackInfo::new(
+        )),
+        Rc::new(TrackInfo::new(
           ms_tb(),
           TrackParams::Subtitle(SubtitleTrackParams::new(2)),
           (),
-        ),
+        )),
       ],
       drained: false,
     };
-    let expected: Vec<TrackKind> = d.tracks().iter().map(|t| t.kind()).collect();
 
-    let taken = d.take_tracks();
+    // The documented order: take the handles first, pull afterwards.
+    let held: Vec<Rc<TrackInfo<Loopback>>> = d.tracks().to_vec();
+    let expected: Vec<TrackKind> = held.iter().map(|t| t.kind()).collect();
+    assert_eq!(expected, vec![TrackKind::Audio, TrackKind::Subtitle]);
+
+    let mut pulled = 0;
+    while d.next_packet().expect("pull").is_some() {
+      pulled += 1;
+      assert_eq!(d.tracks().len(), 2, "the table is not spent by a pull");
+    }
+    assert_eq!(pulled, 1, "the mock's one packet, not an empty session");
+
+    // After EOF the table is the same table, row for row, and the
+    // handles taken before the first pull address those very rows.
+    assert_eq!(d.tracks().len(), held.len());
+    for (before, after) in held.iter().zip(d.tracks()) {
+      assert!(Rc::ptr_eq(before, after), "the same row, not a copy");
+    }
     assert_eq!(
-      taken.iter().map(|t| t.kind()).collect::<Vec<_>>(),
+      d.tracks().iter().map(|t| t.kind()).collect::<Vec<_>>(),
       expected,
-      "every row comes out, in table order",
     );
-    assert!(
-      d.tracks().is_empty(),
-      "the table is empty after the first take"
-    );
+    // The rows the handles address are readable, not dangling.
+    assert_eq!(held[0].timebase(), ms_tb());
+  }
 
-    // The door does not reopen: a second call has nothing left to give.
-    assert!(d.take_tracks().is_empty(), "a second take yields nothing");
+  /// The same session face with **no allocator**: the row handle is a
+  /// borrow, so the demux tier stays `core`-only.
+  ///
+  /// The seat [`Demuxer::TrackHandle`] opens is the reason this
+  /// compiles at all — the table's carrier is the backend's choice,
+  /// exactly as [`Demuxer::Buffer`] already was. Deliberately outside
+  /// the `alloc` gate: if the tier ever grew a hard dependency on the
+  /// heap, this mock would stop compiling first.
+  struct BorrowedDemuxer<'a> {
+    tracks: &'a [&'a TrackInfo<Loopback>],
+    drained: bool,
+  }
+
+  impl<'a> Demuxer for BorrowedDemuxer<'a> {
+    type Adapter = Loopback;
+    type Buffer = &'static [u8];
+    type TrackHandle = &'a TrackInfo<Loopback>;
+    type Error = LoopError;
+
+    fn tracks(&self) -> &[&'a TrackInfo<Loopback>] {
+      self.tracks
+    }
+
+    fn next_packet(&mut self) -> Result<Option<DemuxedPacket<Loopback, &'static [u8]>>, LoopError> {
+      if self.drained {
+        return Ok(None);
+      }
+      self.drained = true;
+      Ok(Some(DemuxedPacket::Subtitle(SubtitleTrackPacket::new(
+        TrackIndex::new(0),
+        SubtitlePacket::new(&[][..], ()),
+      ))))
+    }
+
+    fn seek(&mut self, _target: Timestamp) -> Result<(), LoopError> {
+      self.drained = false;
+      Ok(())
+    }
+  }
+
+  #[test]
+  fn a_borrowed_table_binds_the_handle_seat_without_an_allocator() {
+    let row = TrackInfo::<Loopback>::new(
+      ms_tb(),
+      TrackParams::Subtitle(SubtitleTrackParams::new(7)),
+      (),
+    );
+    let rows = [&row];
+    let mut d = BorrowedDemuxer {
+      tracks: &rows,
+      drained: false,
+    };
+
+    let held: &TrackInfo<Loopback> = d.tracks()[0];
+    assert!(d.next_packet().expect("pull").is_some());
+    assert!(d.next_packet().expect("pull").is_none());
+    assert_eq!(d.tracks().len(), 1, "the table outlives the pull loop");
+    assert_eq!(held.kind(), TrackKind::Subtitle);
+    assert!(core::ptr::eq(held, d.tracks()[0]));
   }
 }

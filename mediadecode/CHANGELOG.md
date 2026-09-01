@@ -11,6 +11,86 @@ The sibling FFmpeg adapter has its own log at
 
 ## [Unreleased]
 
+### Added (BREAKING)
+
+- **`Demuxer::TrackHandle`** — a new associated type, and the carrier a
+  session's track rows are handed out over:
+
+  ```rust
+  type TrackHandle: Clone + Deref<Target = TrackInfo<Self::Adapter>>;
+  ```
+
+  A backend picks it the same way it already picks `Buffer`: a
+  heap-backed, thread-crossing session binds `Arc<TrackInfo<..>>`, a
+  single-threaded one binds `Rc`, and one whose rows live in memory it
+  already borrows binds `&TrackInfo<..>`. That last binding is why the
+  seat exists rather than an `Arc` written into the trait — **the demux
+  tier stays `core`-only**, with no item in the module owning an
+  allocation, which an `Arc` in the signature would have ended for
+  every implementor including the ones that never allocate.
+
+  `Clone` on the handle is required to be a refcount bump or a copied
+  borrow, never a deep copy of the row — the message-carrier law, which
+  the implementor upholds. The bound is what makes upholding it the
+  path of least resistance rather than a discipline: `TrackInfo` has no
+  `Clone`, so `Box<TrackInfo<..>>` has none either and no derive
+  reaches a carrier that owns a row outright. A deep copy would have to
+  be hand-written against the law.
+
+  Breaking for implementors, who must name the type; source-compatible
+  for callers that only *read* rows, since the handle derefs to the row.
+
+### Changed (BREAKING)
+
+- **`Demuxer::tracks` hands out handles, and the session keeps its
+  table for life.**
+
+  ```rust
+  // before
+  fn tracks(&self) -> &[TrackInfo<Self::Adapter>];
+  // after
+  fn tracks(&self) -> &[Self::TrackHandle];
+  ```
+
+  There is no ordering rule left on this face: read the table before
+  the first pull, between two packets, after end of file, twice, or
+  never. A caller that needs a row beyond a borrow of the session — to
+  fan it out, or simply to hold it across the `&mut self` of the pull
+  loop — clones a handle.
+
+### Removed (BREAKING)
+
+- **`Demuxer::take_tracks` is gone**, root and branch, with no
+  deprecation alias
+  ([#51](https://github.com/findit-studio/mediadecode/issues/51)).
+
+  It was a *destructive read of state the session needs for its whole
+  life*. The track table is what a demuxer classifies packets against,
+  and this method moved it out — so a caller who followed the method's
+  own documented order ("takes the table exactly once, right after
+  opening a session and before pulling any packet") left the session
+  unable to place a single packet. At the FFmpeg backend, which
+  classified against the very `Vec` the `mem::take` emptied, that made
+  every packet in a healthy file take the "no row describes this
+  stream" arm: the documented order demuxed a full file to `Ok(None)`,
+  with no error, no assertion and no log. The failing order was the
+  documented one.
+
+  The three obvious patches — keep a shadow classification table,
+  classify off the `AVFormatContext` instead, or invert the
+  documentation and make the violation loud — all leave a face whose
+  contract is "reading this costs the session the state it runs on".
+  So the shape went instead of the symptom. Nothing takes the table
+  away any more, and nothing can: the door that removed it does not
+  exist, and the accessor that replaced it borrows.
+
+  **Migration.** `let rows = demuxer.take_tracks();` becomes
+  `let rows: Vec<_> = demuxer.tracks().to_vec();` — a vector of
+  handles, each one a refcount bump, addressing the session's own rows
+  rather than rows moved out of it. Callers that were already wrapping
+  each taken row in an `Arc` for fan-out can drop that step: the
+  backend does it once, at open.
+
 ## [0.12.0] - 2026-08-30
 
 ### Changed (BREAKING)

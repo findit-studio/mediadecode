@@ -11,6 +11,67 @@ The backend-agnostic core it adapts has its own log at
 
 ## [Unreleased]
 
+### Fixed — the documented order demuxed a healthy file to nothing
+
+- **`take_tracks()` before `next_packet()` yielded zero packets**
+  ([#51](https://github.com/findit-studio/mediadecode/issues/51)).
+
+  `take_tracks_impl` was a `mem::take` of `self.tracks` — the same
+  `Vec` `next_packet_impl` classified every packet against. After the
+  take, `self.tracks.get(index)` answered `None` for every packet in
+  the file, each one took the "no row describes this stream" arm, the
+  loop read to EOF and the session reported a clean end of file. No
+  error, no assertion, no log. And the order that triggered it was the
+  order the trait's own documentation prescribed.
+
+  Measured on a one-second `testsrc2` H.264 clip: 25 packets when the
+  table was read *after* the pull loop, 0 when it was read before.
+
+  The fix is the core's, and it is structural rather than local: the
+  destructive door is gone from the trait (see
+  [`mediadecode`'s CHANGELOG](../mediadecode/CHANGELOG.md)), so this
+  session can no longer be asked to give its table away. Nothing here
+  guards against the state; the state cannot occur.
+
+### Changed (BREAKING)
+
+- **The track table is `Arc`-wrapped at open and kept for the life of
+  the session.** `CarrierDemuxer` now holds
+  `Vec<Arc<TrackInfo<Ffmpeg>>>`, binds
+  `Demuxer::TrackHandle = Arc<TrackInfo<Ffmpeg>>`, and
+  `tracks()` returns `&[Arc<TrackInfo<Ffmpeg>>]`. `take_tracks()` is
+  gone with the trait method it implemented.
+
+  `Arc` rather than `Rc` because these rows were *made* shareable
+  across tasks: `ticket::CodecTicket` exists precisely so a track row
+  holds no raw `AVCodecParameters` pointer and is therefore
+  `Send + Sync` by construction. One allocation per track at open is
+  now the whole cost of every fan-out afterwards, and it is paid at
+  the door instead of by each consumer.
+
+  Reading a row is source-compatible — `tracks()[i].kind()`,
+  `.timebase()`, `.extra()` all still resolve, through the handle's
+  `Deref`. Code that named the element type
+  (`let row: &TrackInfo = &demuxer.tracks()[0]`) or that called
+  `take_tracks()` does not compile; see the core log for the
+  one-line migration.
+
+### Changed
+
+- **A packet whose stream the table does not describe is reported once
+  per session rather than dropped in silence.** The arm still passes the
+  packet by — it is reachable on healthy input, since a format flagged
+  `AVFMTCTX_NOHEADER` (MPEG-TS, RTP) may add an `AVStream` in the middle
+  of `av_read_frame` while this session's table was fixed at open — but
+  a `debug_assert` would fire on a transport stream and an `Err` would
+  end a session over a stream the caller never asked about. It gets a
+  `tracing::debug!` instead, naming the stream index and the table's
+  size, latched behind a session flag so the very case that makes the
+  arm reachable — a live stream delivering on that index for as long as
+  it runs — cannot turn the diagnostic into an unbounded log. Its
+  previous comment, "libavformat does not produce these", was not true
+  even before #51 made it the path every packet took.
+
 ## [0.12.0] - 2026-08-30
 
 ### Added

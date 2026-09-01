@@ -20,13 +20,15 @@
 //! - a seek lands on a keyframe at or before the target, and replays no
 //!   attachment;
 //! - `None` means EOF and stays meaning it;
-//! - timestamps carry their track's timebase, not a placeholder.
+//! - timestamps carry their track's timebase, not a placeholder;
+//! - reading the track table costs no packet, whenever it is read.
 
 mod support;
 
 use std::{
   fs::File,
   io::{Read, Seek},
+  sync::Arc,
 };
 
 use mediadecode::{
@@ -37,7 +39,7 @@ use mediadecode::{
 // The owned family under the names this suite was written with — the
 // bare aliases mean the view lane now. Import block only; the
 // assertions below are unchanged.
-use mediadecode_ffmpeg::{DemuxError, FfmpegOwnedDemuxer as FfmpegDemuxer};
+use mediadecode_ffmpeg::{DemuxError, FfmpegOwnedDemuxer as FfmpegDemuxer, TrackInfo};
 use support::Corpus;
 
 /// Drains a session, returning `(track, kind, pts)` for every delivered
@@ -93,7 +95,7 @@ fn the_five_kinds_map_to_the_five_arms() {
 #[test]
 fn a_track_row_carries_its_codec_parameters_and_attachment_identity() {
   let Some(corpus) = Corpus::new() else { return };
-  let mut demuxer = FfmpegDemuxer::open(&corpus.multi_track_mkv()).expect("open mkv");
+  let demuxer = FfmpegDemuxer::open(&corpus.multi_track_mkv()).expect("open mkv");
 
   let video = &demuxer.tracks()[0];
   match video.params() {
@@ -130,20 +132,22 @@ fn a_track_row_carries_its_codec_parameters_and_attachment_identity() {
   );
   assert_eq!(audio.extra().stream_index(), 1);
 
-  // The owned-tracks door: the first call moves every row out, and
-  // `tracks()` answers empty afterward — the shape a fan-out consumer
-  // relies on to wrap each row in `Arc` once, right after open.
+  // The shared-row door: reading the table hands out handles over the
+  // session's own rows, and a fan-out consumer keeps the ones it wants
+  // by cloning a refcount rather than by taking the table away.
   let expected_kinds: Vec<_> = demuxer.tracks().iter().map(|t| t.kind()).collect();
-  let taken = demuxer.take_tracks();
+  let held: Vec<Arc<TrackInfo>> = demuxer.tracks().to_vec();
   assert_eq!(
-    taken.iter().map(|t| t.kind()).collect::<Vec<_>>(),
+    held.iter().map(|t| t.kind()).collect::<Vec<_>>(),
     expected_kinds,
-    "take_tracks hands out every row, in table order",
+    "every row is reachable, in table order",
   );
-  assert!(
-    demuxer.tracks().is_empty(),
-    "the table is empty after the first take",
-  );
+  for (before, after) in held.iter().zip(demuxer.tracks()) {
+    assert!(
+      Arc::ptr_eq(before, after),
+      "a handle addresses the session's own row, not a copy",
+    );
+  }
 }
 
 #[test]
@@ -169,6 +173,82 @@ fn packets_arrive_in_interleaved_file_order() {
     observed, expected,
     "the delivered order is the container's own order, packet for packet",
   );
+}
+
+/// **Issue #51.** Reading the track table before the first pull costs
+/// no packet, and both orders deliver the file's whole content.
+///
+/// The face this replaced *moved* the table out of the session, and the
+/// session classified every packet against that same table — so the
+/// order its own documentation prescribed (rows first, then pull) put
+/// every stream index out of range at once and demuxed a healthy file
+/// to `Ok(None)`, while the reverse order delivered all of it. The A/B
+/// is the regression: same file, same process, only the order differs,
+/// and the yardstick is a bare `av_read_frame` loop over the same file
+/// rather than a hand-written number.
+#[test]
+fn reading_the_track_table_first_costs_no_packet() {
+  let Some(corpus) = Corpus::new() else { return };
+
+  // `(fixture, packets the session adds to the container's own count)`.
+  // The Matroska font's payload lives in codec extradata and appears in
+  // no packet, so the session synthesizes the attachment's one packet;
+  // the QuickTime file has no attachment at all, and its delivered
+  // count must equal the container's exactly.
+  let fixtures = [
+    (corpus.multi_track_mkv(), 1usize),
+    (corpus.timecode_mov(), 0),
+  ];
+
+  for (path, synthesized) in fixtures {
+    let raw = support::raw_packet_order(&path).len();
+    assert!(raw > 0, "{}: the fixture holds packets", path.display());
+
+    // (A) the order the retired door documented: table first, pull after.
+    let mut first = FfmpegDemuxer::open(&path).expect("open");
+    let rows: Vec<Arc<TrackInfo>> = first.tracks().to_vec();
+    assert!(
+      !rows.is_empty(),
+      "{}: the table is not empty",
+      path.display()
+    );
+    let after_reading = drain(&mut first);
+
+    // (B) pull first, read the table afterwards.
+    let mut second = FfmpegDemuxer::open(&path).expect("open");
+    let before_reading = drain(&mut second);
+
+    assert_eq!(
+      after_reading.len(),
+      raw + synthesized,
+      "{}: reading the table first must not cost a packet",
+      path.display(),
+    );
+    assert_eq!(
+      after_reading,
+      before_reading,
+      "{}: the two orders deliver the same packets, in the same order",
+      path.display(),
+    );
+
+    // The handles read before the first pull still address the
+    // session's own rows after end of file, and those rows are
+    // readable — not a copy taken before the table was spent.
+    assert_eq!(first.tracks().len(), rows.len());
+    for (before, after) in rows.iter().zip(first.tracks()) {
+      assert!(
+        Arc::ptr_eq(before, after),
+        "{}: the row a handle addresses is the session's own",
+        path.display(),
+      );
+    }
+    assert_eq!(
+      rows.iter().map(|t| t.kind()).collect::<Vec<_>>(),
+      second.tracks().iter().map(|t| t.kind()).collect::<Vec<_>>(),
+      "{}: the table reads the same after EOF as before the first pull",
+      path.display(),
+    );
+  }
 }
 
 #[test]

@@ -71,6 +71,11 @@ bytes. Adapter implementations live in sibling crates such as
   `DemuxedPacket` envelope, the `TrackInfo` / `TrackParams` /
   `TrackKind` table, and the `DemuxAdapter` vocabulary bundle. Opening
   is each backend's own, so the trait covers only the opened session.
+  A session keeps its track table for life: `tracks()` is a
+  non-destructive read that hands out `TrackHandle`s — the backend's
+  own row carrier, `Arc` / `Rc` / a plain borrow — so a consumer that
+  needs a row past the pull loop clones a refcount rather than taking
+  the table away from the session that classifies against it.
 - **The resample seam** — `AudioResampler`, the `AudioStreamDecoder`
   push pair one tier along, converting rate, sample format and channel
   layout between a source spec read off `TrackInfo` and a target spec
