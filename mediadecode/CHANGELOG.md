@@ -11,6 +11,82 @@ The sibling FFmpeg adapter has its own log at
 
 ## [Unreleased]
 
+### Added
+
+- **A track row carries the language its container declares**
+  ([#44](https://github.com/findit-studio/mediadecode/issues/44)).
+
+  ```rust
+  impl<E: DemuxAdapter> TrackInfo<E> {
+    pub const fn language(&self) -> Option<&E::Text>;
+    pub fn with_language(self, v: Option<E::Text>) -> Self;
+    pub fn set_language(&mut self, v: Option<E::Text>) -> &mut Self;
+  }
+  ```
+
+  The seat `filename` and `mime_type` already have, for the third piece
+  of identity a container writes about a track. Additive: a row built
+  by an existing backend defaults it to `None`, as `new` does for the
+  other two.
+
+  **It carries the declaration and nothing else.** An MKV writes ISO
+  639-2/B `ger`, an MP4 writes 639-2/T `deu`, a decades-old muxer
+  writes `iw` for a language the registry renamed `he`, and Matroska
+  can write a BCP 47 `zh-Hans`. Each is a different string for
+  something a vocabulary may well call one language, and none of them
+  is folded here. Folding them takes two published registries — the
+  IANA subtag registry, plus ISO 639-2's own for the alpha-3 space BCP
+  47 does not register — and the crate that owns one of those is where
+  the fold belongs. A demux tier that folded early would be a *second*
+  authority on the question, disagreeing with the first in exactly the
+  cases the registries exist for.
+
+  A narrower seat was considered and refused for the same reason: a
+  three-letter code has nowhere to put `zh-Hans`, and dropping a tag
+  because it does not fit is a guess wearing an absence's clothes.
+
+  `Option`, and both answers are real. Matroska omits the element for
+  an untagged track, so the row says nothing; an ISOBMFF `mdhd` has a
+  language field it must fill, so an untagged MP4 track says `und` —
+  *undetermined*, which the file really does declare. Neither is folded
+  into the other.
+
+- **An optional `ingraph` feature: this crate's types grant themselves
+  citizenship in the indexing framework**
+  ([#49](https://github.com/findit-studio/mediadecode/issues/49)).
+
+  Off by default and purely additive. With it,
+  [`packet::PacketFlags`] carries the faces `ingraph` reads a flags
+  column through — `FlagsValue`, `FlagsFilterMarker`, `DefaultMarker`,
+  `DefaultVecMarker`, `CursorValue`, `ColumnKind` and `ColumnEq` — so a
+  declaration downstream can hold a column of it directly.
+
+  The roster is one type because a census says so: `PacketFlags` is
+  the only type of this crate's that a consumer mirrors today
+  (`mediagraph`'s `types::packet::PacketFlags`, declared
+  `#[ingraph::flags(u8, remote = "mediadecode::packet::PacketFlags")]`).
+  Everything else here is packets, frames and sessions — values a graph
+  moves *through* a node rather than values a row stores.
+
+  What it replaces is a **restatement**. A mirror is a local enum
+  repeating this crate's bits with a crossing in each direction and a
+  drift pin over the pair, edited every time the upstream grows a bit,
+  in a crate with no reason to know the bit exists. These rows sit on
+  `bitflags::Flags` — the table `PacketFlags` already has — so a bit
+  added here reaches the framework with nothing to edit anywhere.
+
+  What the feature does **not** carry, deliberately: the per-backend
+  storage bind (`sqlx`) and the two GraphQL wire seats. Both ride
+  features of `ingraph`'s that name a backend or a wire library, and a
+  media decoder that pulled a SQL driver and a GraphQL runtime into its
+  dependency graph to describe three bits would be paying for a build
+  it never runs. `ingraph` publishes `if_sqlite!` / `if_postgres!` /
+  `if_mysql!` / `if_mongo!` for exactly that half, so the rows are
+  reachable when a consumer asks for them.
+
+  The feature implies `std` — `ingraph` is a `std` framework — and
+  nothing in the default build changes. See `mediadecode::ingraph`.
+
 ### Added (BREAKING)
 
 - **`Demuxer::TrackHandle`** — a new associated type, and the carrier a

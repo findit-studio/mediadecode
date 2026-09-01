@@ -10,10 +10,32 @@
 use core::fmt;
 
 use ffmpeg_next::ffi::AVCodecID;
+use smol_str::SmolStr;
+
+/// Upper bound on the NUL search in [`CodecId::name`] and
+/// [`CodecId::long_name`].
+///
+/// FFmpeg's longest codec name is a couple of dozen bytes and its
+/// longest description a couple of hundred; the cap is generous for
+/// both and exists only so that a version-skewed descriptor table
+/// cannot turn the walk into an unbounded read — the discipline the
+/// rest of this crate's FFI text handling follows.
+const DESCRIPTOR_TEXT_MAX_BYTES: usize = 1024;
 
 /// Codec identifier. Wraps the integer value of an `AVCodecID` enum
 /// variant; comparisons and storage work without ever transmuting back
 /// into the bindgen enum.
+///
+/// # The number is the identity; the name is a rendering of it
+///
+/// [`raw`](Self::raw) is what this type *is* — what FFmpeg passed, what
+/// a store keys on, what equality compares. [`name`](Self::name) and
+/// [`long_name`](Self::long_name) read libavcodec's descriptor table for
+/// the word beside that number, so a consumer can cross into a typed
+/// codec vocabulary (`mediaframe`'s, say) or write a human row without
+/// this crate owning a second table that could come to disagree with
+/// FFmpeg's. Neither is a key: two builds of FFmpeg agree on the number
+/// long before they agree on every string.
 #[repr(transparent)]
 #[derive(Copy, Clone, Eq, PartialEq, Hash)]
 pub struct CodecId(i32);
@@ -33,6 +55,95 @@ impl CodecId {
   #[inline]
   pub const fn raw(self) -> i32 {
     self.0
+  }
+
+  // --- The descriptor's words ------------------------------------------
+
+  /// FFmpeg's own short name for this codec — `"h264"`, `"aac"`,
+  /// `"subrip"` — or `None` where this build's libavcodec has no
+  /// descriptor for the id.
+  ///
+  /// **An open vocabulary, deliberately.** The answer is whatever the
+  /// linked libavcodec's `codec_descriptors[]` says, not a set this
+  /// crate enumerates: a codec FFmpeg learns in its next release names
+  /// itself here with no change on this side, which an `enum` of codecs
+  /// could never do. The constants above are the ids this crate has
+  /// reason to *compare* against; they are not the roster of what this
+  /// method can answer.
+  ///
+  /// **`None` is a real answer**, and it is why the descriptor table is
+  /// read rather than `avcodec_get_name`: that function never fails, and
+  /// for an id it cannot place it hands back the string
+  /// `"unknown_codec"` — a sentinel a consumer would store as if it were
+  /// a codec's word. Here an id with no descriptor has no name, said
+  /// plainly.
+  ///
+  /// The word is the one FFmpeg's CLI and its containers use, which is
+  /// what makes it the right thing to cross a typed vocabulary with;
+  /// [`raw`](Self::raw) stays the identity.
+  pub fn name(self) -> Option<SmolStr> {
+    let descriptor = self.descriptor();
+    if descriptor.is_null() {
+      return None;
+    }
+    // SAFETY: `descriptor` is non-null and points into libavcodec's
+    // `static const codec_descriptors[]`, so the field read is in
+    // bounds; `addr_of!` reaches it **without forming a reference** —
+    // see [`Self::descriptor`] for why that matters here. The pointer
+    // it yields is null or a NUL-terminated string literal in that same
+    // table, which is the reader's contract.
+    let name = unsafe { core::ptr::addr_of!((*descriptor).name).read() };
+    // SAFETY: as above — the name is a static, NUL-terminated literal.
+    unsafe { crate::ffi::table_text(name, DESCRIPTOR_TEXT_MAX_BYTES) }
+  }
+
+  /// FFmpeg's human description for this codec — `"H.264 / AVC / MPEG-4
+  /// AVC / MPEG-4 part 10"` — or `None` where the build has no
+  /// descriptor, or the descriptor carries no description.
+  ///
+  /// A display string and nothing more: it is FFmpeg's prose, it is not
+  /// stable across releases, and nothing should key on it. Use
+  /// [`name`](Self::name) to cross vocabularies and [`raw`](Self::raw)
+  /// to identify.
+  pub fn long_name(self) -> Option<SmolStr> {
+    let descriptor = self.descriptor();
+    if descriptor.is_null() {
+      return None;
+    }
+    // SAFETY: as [`Self::name`], for the same table and the same
+    // reason. `long_name` is independently nullable — a descriptor may
+    // carry a name and no description — which the reader answers with
+    // `None`.
+    let long_name = unsafe { core::ptr::addr_of!((*descriptor).long_name).read() };
+    // SAFETY: as above.
+    unsafe { crate::ffi::table_text(long_name, DESCRIPTOR_TEXT_MAX_BYTES) }
+  }
+
+  /// libavcodec's descriptor for this id, or null where this build
+  /// names no codec for it.
+  ///
+  /// # Two enum hazards, and both are kept out
+  ///
+  /// **Going in**, the id crosses as the `c_int` it is — through the
+  /// crate's own `avcodec_descriptor_get` redeclaration in
+  /// `decoder::c_shims` — so no `AVCodecID` is ever constructed from a
+  /// value that may not be in this build's discriminant set. libavcodec
+  /// bounds-checks the id itself and answers null for anything outside
+  /// its table, so every `i32` this type can hold is a defined call.
+  ///
+  /// **Coming back**, the pointer is left raw and the callers read
+  /// their one field through `addr_of!`. `AVCodecDescriptor` embeds an
+  /// `AVCodecID` and an `AVMediaType`, and forming a
+  /// `&AVCodecDescriptor` would assert every field valid — including
+  /// those two, which come from the *linked* library and need not lie
+  /// inside the discriminant set the *bindings* were generated from.
+  /// That is the same skew `crate::ffi`'s module note is about, met on
+  /// the way out of C rather than on the way in.
+  fn descriptor(self) -> *const ffmpeg_next::ffi::AVCodecDescriptor {
+    // SAFETY: the redeclared shim takes a plain `c_int`, so no bindgen
+    // enum is formed from `self.0`, and libavcodec answers null for an
+    // id it cannot place.
+    unsafe { crate::decoder::c_shims::avcodec_descriptor_get(self.0) }
   }
 
   // --- Sentinels -------------------------------------------------------
@@ -201,5 +312,65 @@ mod tests {
   fn equality_is_value_based() {
     assert_eq!(CodecId::H264, CodecId::from_raw(CodecId::H264.raw()));
     assert_ne!(CodecId::H264, CodecId::HEVC);
+  }
+
+  /// **The name producer, against the linked libavcodec** — the whole of
+  /// issue #43's ask: a codec id two crates deep now renders as the word
+  /// FFmpeg itself spells it with.
+  ///
+  /// The three arms span the media kinds, because the descriptor table
+  /// is one table and a consumer crossing into a typed vocabulary
+  /// crosses on all three.
+  #[test]
+  fn known_codecs_name_themselves() {
+    assert_eq!(CodecId::H264.name().as_deref(), Some("h264"));
+    assert_eq!(CodecId::AAC.name().as_deref(), Some("aac"));
+    assert_eq!(CodecId::SUBRIP.name().as_deref(), Some("subrip"));
+  }
+
+  /// The long name is prose and is only asked to *be* there — pinning
+  /// FFmpeg's wording would pin a string its next release may reword,
+  /// which is exactly why nothing should key on it.
+  #[test]
+  fn a_known_codec_carries_a_description_too() {
+    let long = CodecId::H264.long_name().expect("h264 has a description");
+    assert!(
+      long.contains("H.264"),
+      "libavcodec's description for h264 should name the standard, got {long:?}",
+    );
+  }
+
+  /// **An id with no descriptor has no name**, which is the reason the
+  /// descriptor table is read rather than `avcodec_get_name` — that
+  /// function answers `"unknown_codec"` here, a sentinel a consumer
+  /// would store as though it were a codec's word.
+  ///
+  /// Two shapes, both reachable through the public `from_raw` door: a
+  /// negative id, and one far past the end of any table.
+  #[test]
+  fn an_id_with_no_descriptor_has_no_name() {
+    for unknown in [CodecId::from_raw(-99_999), CodecId::from_raw(i32::MAX)] {
+      assert_eq!(unknown.name(), None, "{unknown:?} named itself");
+      assert_eq!(unknown.long_name(), None, "{unknown:?} described itself");
+    }
+  }
+
+  /// `AV_CODEC_ID_NONE` is a **sentinel, not a codec**, and libavcodec
+  /// keeps no descriptor for it — so the "no codec" row reads as absent
+  /// rather than as a track coded with something called `none`.
+  #[test]
+  fn the_none_sentinel_names_no_codec() {
+    assert_eq!(CodecId::NONE.name(), None);
+  }
+
+  /// The number stays the key. A name is read *off* the id and never
+  /// back into it: two ids that name differently are two ids, and the
+  /// identity a store writes is [`CodecId::raw`].
+  #[test]
+  fn the_name_is_a_rendering_and_the_number_is_the_identity() {
+    let from_number = CodecId::from_raw(CodecId::H264.raw());
+    assert_eq!(from_number, CodecId::H264);
+    assert_eq!(from_number.name(), CodecId::H264.name());
+    assert_ne!(CodecId::H264.name(), CodecId::HEVC.name());
   }
 }

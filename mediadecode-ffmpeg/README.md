@@ -172,10 +172,26 @@ for end-to-end demuxer-driven runs that cover all three streams.
   `FfmpegAudioStreamDecoder`, `FfmpegSubtitleStreamDecoder`. Plus
   their error types: `VideoDecodeError`, `AudioDecodeError`,
   `SubtitleDecodeError`.
+- **Decode path**: `DecodePath` and `FfmpegVideoStreamDecoder::open_as`
+  — `Auto` (what `open` does: probe hardware, fall back to software),
+  `Hardware(Backend)` or `Software`. The two named arms are **pins**:
+  a session opened on one stays on it, so a backend that fails at open
+  fails the call and one that fails mid-stream reports rather than
+  degrading behind the caller. `is_hardware()` / `is_software()` stay
+  the live reading of where a session is.
 - **Demuxer**: `FfmpegDemuxer` — `mediadecode`'s `Demuxer` over
   `libavformat`, opened from a path (`open`) or from any
   `Read + Seek` byte source through a custom `AVIOContext`
-  (`open_reader`). Plus `DemuxError`.
+  (`open_reader`). Plus `DemuxError`, and `format()` → `ContainerFormat`
+  — libavformat's own identification of the bytes (`"matroska,webm"`,
+  `"mov,mp4,m4a,3gp,3g2,mj2"`), read from the container rather than
+  guessed from a path.
+- **Codec identity**: `CodecId` — the number FFmpeg keys on, with
+  `name()` / `long_name()` reading libavcodec's own descriptor table
+  for the word beside it (`"h264"`, `"aac"`), so a stored track row can
+  cross into a typed codec vocabulary. The number stays the identity;
+  an id libavcodec has no descriptor for has no name, rather than a
+  `"unknown_codec"` sentinel.
 - **Resampler** (`resample` feature, on by default): `FfmpegResampler`
   — `mediadecode`'s `AudioResampler` over `swresample`, built from two
   explicit `ResampleSpec`s (the source read off a track or off the

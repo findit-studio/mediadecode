@@ -50,6 +50,24 @@ pub(crate) mod c_shims {
     /// `AVCodecID` as `c_int`.
     pub fn avcodec_find_decoder(id: c_int) -> *const AVCodec;
 
+    /// `AVCodecID` as `c_int`, answering the descriptor libavcodec keeps
+    /// for that id — or null where this build names no codec for it.
+    ///
+    /// The pointer is into `codec_descriptors[]`, a `static const` table
+    /// compiled into libavcodec, so the strings it names are live and
+    /// unwritten for the process — the contract `crate::ffi`'s bounded
+    /// reader is given. It is left **raw** at every call site: the
+    /// struct embeds an `AVCodecID` and an `AVMediaType`, and forming a
+    /// reference to it would assert two bindgen enums valid on a table
+    /// that belongs to the linked library rather than to the bindings.
+    /// See `crate::CodecId::descriptor`.
+    ///
+    /// Preferred over `avcodec_get_name`, which never answers null: for
+    /// an id it cannot place it returns the string `"unknown_codec"`,
+    /// a sentinel wearing a name's clothes. A descriptor that is absent
+    /// is `None` here, and a consumer can tell the two apart.
+    pub fn avcodec_descriptor_get(id: c_int) -> *const ffmpeg_next::ffi::AVCodecDescriptor;
+
     /// Returns `AVPixelFormat` as `c_int` — the id of a descriptor that
     /// may well name a format this build's bindings do not.
     pub fn av_pix_fmt_desc_get_id(desc: *const ffmpeg_next::ffi::AVPixFmtDescriptor) -> c_int;

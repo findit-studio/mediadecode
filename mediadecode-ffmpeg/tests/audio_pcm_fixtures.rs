@@ -17,7 +17,10 @@
 //! with a hint instead of failing — keeps `cargo test` welcoming
 //! for contributors who haven't run `git submodule update --init`
 //! yet, while CI (always-`submodules: recursive`) exercises the
-//! full sweep.
+//! full sweep. The guard asks about a **fixture file**, never
+//! about the directory: an uninitialised submodule still has its
+//! mount point, so a directory test answers "present" for a tree
+//! that holds nothing. See [`probe_fixture`].
 //!
 //! [1]: https://github.com/findit-studio/audio-fixtures
 
@@ -104,6 +107,26 @@ fn fixtures_root() -> PathBuf {
     .parent()
     .expect("workspace root")
     .join("tests/fixtures/audio")
+}
+
+/// A clip this suite is about to read, used as the availability probe.
+///
+/// **Not `fixtures_root().exists()`.** `git clone` without `--recursive`
+/// leaves `tests/fixtures/audio` as an *empty directory* — the submodule
+/// mount point is created either way — so a directory test passes on a
+/// tree that holds no fixtures at all, and the sweep below then panicked
+/// on the first `ffmpeg::format::input` instead of skipping (issue #34).
+/// A skip guard that cannot tell "not fetched" from "fetched" is not a
+/// guard.
+///
+/// The probe is the **first row of [`FIXTURES`]** rather than a path
+/// written out again here, so the file the guard asks about is by
+/// construction one the sweep really opens: a fixture renamed upstream
+/// moves both at once, where a second hard-coded path would rot into a
+/// guard that skips a corpus that is present, or admits one that is not.
+fn probe_fixture() -> PathBuf {
+  let (codec_dir, name, ..) = FIXTURES.first().expect("the fixture table is not empty");
+  fixtures_root().join(codec_dir).join(name)
 }
 
 fn decode_clip(path: &std::path::Path, expected: (u32, u8, u64)) {
@@ -200,16 +223,17 @@ fn decode_clip(path: &std::path::Path, expected: (u32, u8, u64)) {
 
 #[test]
 fn decode_all_audio_fixtures() {
-  let root = fixtures_root();
-  if !root.exists() {
+  let probe = probe_fixture();
+  if !probe.is_file() {
     eprintln!(
       "skip: {} not found — run `git submodule update --init --depth=1` \
        to fetch the audio-fixtures submodule, then re-run this test.",
-      root.display()
+      probe.display()
     );
     return;
   }
 
+  let root = fixtures_root();
   ffmpeg::init().expect("ffmpeg init");
 
   for (codec_dir, name, sample_rate, channels, samples) in FIXTURES {
@@ -220,6 +244,38 @@ fn decode_all_audio_fixtures() {
   eprintln!(
     "decoded {} fixtures end-to-end through the trait surface",
     FIXTURES.len(),
+  );
+}
+
+/// **The skip guard's question, asked of the state that used to defeat
+/// it** (issue #34).
+///
+/// A `git clone` without `--recursive` leaves the submodule's mount
+/// point as an empty directory, so `root.exists()` — the guard this
+/// suite shipped with — answered *present* and the sweep then panicked
+/// opening a file that was never fetched, on exactly the fresh worktree
+/// the skip exists to welcome.
+///
+/// The two assertions are the whole finding: the directory question says
+/// yes and the fixture question says no, on one tree. Built here rather
+/// than measured against the real checkout, because the bug's state is
+/// *the corpus absent* and a suite that has it cannot reproduce that.
+#[test]
+fn an_empty_submodule_directory_does_not_read_as_a_present_corpus() {
+  let scratch = tempfile::tempdir().expect("a temp dir");
+  let root = scratch.path().join("audio");
+  std::fs::create_dir(&root).expect("the submodule mount point");
+
+  assert!(
+    root.exists(),
+    "an uninitialised submodule leaves the directory, which is why a directory test cannot \
+     be the guard",
+  );
+
+  let (codec_dir, name, ..) = FIXTURES.first().expect("the fixture table is not empty");
+  assert!(
+    !root.join(codec_dir).join(name).is_file(),
+    "the guard asks about a clip the sweep opens, and an empty mount point has none",
   );
 }
 

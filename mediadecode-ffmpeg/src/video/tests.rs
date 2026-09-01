@@ -2860,3 +2860,291 @@ fn a_parked_recovery_frame_still_clears_the_resync_guard() {
     },
   );
 }
+
+// ---------------------------------------------------------------------------
+//  The decode-path pin (issue #50)
+// ---------------------------------------------------------------------------
+
+/// **The software door, open at last.**
+///
+/// Before `open_as` the only way to reach the software decoder as a
+/// session was to pick a codec no hardware backend carries — which
+/// changes the stream, and therefore compares nothing. This opens it on
+/// the stream the caller actually has, and the session decodes.
+#[test]
+fn the_software_path_opens_without_probing_anything() {
+  let (w, h) = (64u32, 48u32);
+  let clip = encode_synthetic_clip(w, h, 12, 6);
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+
+  let mut dec = FfmpegVideoStreamDecoder::open_as(
+    clip.parameters.clone(),
+    tb,
+    DecoderLimits::default(),
+    DecodePath::Software,
+  )
+  .expect("the software path opens for a stream libavcodec can decode");
+
+  assert!(dec.is_software(), "the pin put the session on software");
+  assert!(!dec.is_hardware());
+  assert!(
+    dec.hardware_inner().is_none(),
+    "there is no hardware decoder in this session to borrow",
+  );
+
+  // And it really decodes — a door that opened onto nothing would pass
+  // every assertion above.
+  let mut dst = crate::empty_owned_video_frame();
+  let mut delivered = 0usize;
+  for av_pkt in &clip.packets {
+    let vpkt = boundary::video_packet_from_ffmpeg(av_pkt)
+      .expect("a wrappable payload")
+      .expect("packet has a buffer");
+    crate::accepted(dec.send_packet(&vpkt), "send_packet");
+    while let Ok(Received::Frame) = dec.receive_frame(&mut dst) {
+      delivered += 1;
+    }
+  }
+  crate::accepted(dec.send_eof(), "send_eof");
+  while let Ok(Received::Frame) = dec.receive_frame(&mut dst) {
+    delivered += 1;
+  }
+  assert_eq!(
+    delivered,
+    clip.packets.len(),
+    "the pinned software session decoded every packet of the clip",
+  );
+}
+
+/// `Auto` is the old constructor, unmoved — the promise `open_as` is
+/// built on. Both sessions are asked the same questions and answer the
+/// same way, on whatever path this machine's probe lands them.
+#[test]
+fn the_auto_path_is_the_bare_constructor() {
+  let (w, h) = (64u32, 48u32);
+  let clip = encode_synthetic_clip(w, h, 8, 4);
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+
+  let bare = FfmpegVideoStreamDecoder::open(clip.parameters.clone(), tb, DecoderLimits::default())
+    .expect(
+      "the bare constructor opens: it falls back to software when no backend takes the stream",
+    );
+  let named = FfmpegVideoStreamDecoder::open_as(
+    clip.parameters.clone(),
+    tb,
+    DecoderLimits::default(),
+    DecodePath::Auto,
+  )
+  .expect("the Auto arm opens wherever the bare constructor does");
+
+  assert_eq!(bare.is_software(), named.is_software());
+  assert_eq!(bare.is_hardware(), named.is_hardware());
+}
+
+/// A backend this platform does not probe, **named anyway**: the pin
+/// fails the open rather than quietly handing back a software session.
+///
+/// That is the whole difference between a preference and a pin at open
+/// time, and it is the failure a caller most needs to see — a
+/// determinism run that silently got software twice would report that
+/// the two paths agree.
+#[test]
+fn a_hardware_pin_on_an_absent_backend_fails_instead_of_falling_back() {
+  let (w, h) = (64u32, 48u32);
+  let clip = encode_synthetic_clip(w, h, 8, 4);
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+
+  // Whatever this platform's probe order is, at least one of the four
+  // backends is not in it — a single-backend platform leaves three, and
+  // a platform with no order at all leaves four.
+  let order = crate::backend::probe_order();
+  let absent = [
+    Backend::VideoToolbox,
+    Backend::Vaapi,
+    Backend::Cuda,
+    Backend::D3d11va,
+  ]
+  .into_iter()
+  .find(|backend| !order.contains(backend))
+  .expect("no platform probes all four backends");
+
+  let refused = FfmpegVideoStreamDecoder::open_as(
+    clip.parameters.clone(),
+    tb,
+    DecoderLimits::default(),
+    DecodePath::Hardware(absent),
+  );
+
+  assert!(
+    refused.is_err(),
+    "a pin to {absent:?} must fail rather than open the software decoder the Auto arm \
+     would have reached for",
+  );
+}
+
+/// **The pin survives the mid-stream failure**, on the send road.
+///
+/// A hardware backend that opens and then cannot decode raises exactly
+/// the exhaustion `Auto` reads as its cue to degrade. Under a pin that
+/// cue is reported instead — the session stays on hardware, and the
+/// caller learns the backend failed rather than silently receiving
+/// software pixels for the rest of the stream.
+#[test]
+fn a_hardware_pin_reports_a_mid_stream_exhaustion_instead_of_degrading() {
+  let (w, h) = (64u32, 48u32);
+  let clip = encode_synthetic_clip(w, h, 12, 6);
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+
+  for shape in [FailShape::PostCommit, FailShape::ProbeEra] {
+    let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test_as(
+      Box::new(FakeHw::failing(w, h, 1, 1, shape)),
+      clip.parameters.clone(),
+      tb,
+      DecodePath::Hardware(Backend::VideoToolbox),
+    )
+    .expect("build a pinned test decoder");
+
+    let mut dst = crate::empty_owned_video_frame();
+    let mut refusal = None;
+    for av_pkt in &clip.packets {
+      let vpkt = boundary::video_packet_from_ffmpeg(av_pkt)
+        .expect("a wrappable payload")
+        .expect("packet has a buffer");
+      match dec.send_packet(&vpkt) {
+        Ok(_) => while let Ok(Received::Frame) = dec.receive_frame(&mut dst) {},
+        Err(e) => {
+          refusal = Some(e);
+          break;
+        }
+      }
+    }
+
+    let refusal = refusal.expect("the seam fails on the second packet, so a refusal must arrive");
+    assert!(
+      matches!(
+        &refusal,
+        VideoDecodeError::Decode(Error::AllBackendsFailed(_)),
+      ),
+      "the pinned session must report the exhaustion with its payload intact, got {refusal:?}",
+    );
+    assert!(
+      dec.is_hardware(),
+      "the pin holds after the refusal: nothing opened a software decoder behind it",
+    );
+    assert!(!dec.is_software());
+  }
+}
+
+/// The same promise on the **receive** road, where the exhaustion
+/// arrives with no packet in hand.
+#[test]
+fn a_hardware_pin_reports_a_frame_time_exhaustion_too() {
+  let (w, h) = (64u32, 48u32);
+  let clip = encode_synthetic_clip(w, h, 8, 4);
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+
+  let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test_as(
+    Box::new(FakeHw::failing_at_receive(w, h)),
+    clip.parameters.clone(),
+    tb,
+    DecodePath::Hardware(Backend::VideoToolbox),
+  )
+  .expect("build a pinned test decoder");
+
+  let vpkt = boundary::video_packet_from_ffmpeg(&clip.packets[0])
+    .expect("a wrappable payload")
+    .expect("packet has a buffer");
+  crate::accepted(dec.send_packet(&vpkt), "send_packet");
+
+  let mut dst = crate::empty_owned_video_frame();
+  let refusal = dec
+    .receive_frame(&mut dst)
+    .expect_err("the seam fails the first time a frame is asked for");
+  assert!(
+    matches!(
+      &refusal,
+      VideoDecodeError::Decode(Error::AllBackendsFailed(_)),
+    ),
+    "got {refusal:?}",
+  );
+  assert!(dec.is_hardware(), "the pin holds on the receive road too");
+}
+
+/// And on the **EOF** road, the third and last place a hardware
+/// exhaustion can reach the wrapper.
+///
+/// Covering all three is the point: the pin is one promise, and a road
+/// that forgot to ask would break it in a way no caller could see.
+#[test]
+fn a_hardware_pin_reports_an_exhaustion_raised_at_eof() {
+  let (w, h) = (64u32, 48u32);
+  let clip = encode_synthetic_clip(w, h, 8, 4);
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+
+  let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test_as(
+    Box::new(FakeHwEofFails::new(w, h)),
+    clip.parameters.clone(),
+    tb,
+    DecodePath::Hardware(Backend::VideoToolbox),
+  )
+  .expect("build a pinned test decoder");
+
+  let vpkt = boundary::video_packet_from_ffmpeg(&clip.packets[0])
+    .expect("a wrappable payload")
+    .expect("packet has a buffer");
+  crate::accepted(dec.send_packet(&vpkt), "send_packet");
+
+  let refusal = dec
+    .send_eof()
+    .expect_err("this seam raises its exhaustion from send_eof");
+  assert!(
+    matches!(
+      &refusal,
+      VideoDecodeError::Decode(Error::AllBackendsFailed(_)),
+    ),
+    "got {refusal:?}",
+  );
+  assert!(dec.is_hardware(), "the pin holds on the EOF road too");
+}
+
+/// **`Auto` still degrades**, checked beside the pin rather than
+/// assumed: the guard added for the pin must not have quietened the
+/// arm it was written around.
+///
+/// The same seam, the same failure packet and the same send road as the
+/// pinned lane above — only the [`DecodePath`] differs, which is what
+/// makes this a control rather than a second scenario. Probe-era,
+/// because that road replays the keyframe history into the cold
+/// software decoder and so commits on a two-packet prefix; the
+/// post-commit road's own degrade is pinned by
+/// `post_commit_failure_degrades_and_resyncs_at_next_keyframe`, which
+/// gives it the mid-GOP failure point a cold decoder can accept.
+#[test]
+fn the_auto_path_still_degrades_where_a_pin_would_not() {
+  let (w, h) = (64u32, 48u32);
+  let clip = encode_synthetic_clip(w, h, 12, 6);
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+
+  let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test_as(
+    Box::new(FakeHw::failing(w, h, 1, 1, FailShape::ProbeEra)),
+    clip.parameters.clone(),
+    tb,
+    DecodePath::Auto,
+  )
+  .expect("build an auto test decoder");
+
+  let mut dst = crate::empty_owned_video_frame();
+  for av_pkt in clip.packets.iter().take(2) {
+    let vpkt = boundary::video_packet_from_ffmpeg(av_pkt)
+      .expect("a wrappable payload")
+      .expect("packet has a buffer");
+    crate::accepted(dec.send_packet(&vpkt), "send_packet");
+    while let Ok(Received::Frame) = dec.receive_frame(&mut dst) {}
+  }
+
+  assert!(
+    dec.is_software(),
+    "the same seam, the same failure, and the Auto arm degrades — which is what makes the \
+     pin's refusal a choice rather than a breakage",
+  );
+}

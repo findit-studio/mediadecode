@@ -75,7 +75,11 @@ bytes. Adapter implementations live in sibling crates such as
   non-destructive read that hands out `TrackHandle`s — the backend's
   own row carrier, `Arc` / `Rc` / a plain borrow — so a consumer that
   needs a row past the pull loop clones a refcount rather than taking
-  the table away from the session that classifies against it.
+  the table away from the session that classifies against it. A row
+  carries the identity the container declares about a track, its
+  `language` among it — as the file wrote it, unfolded, because the
+  registries that reconcile an MKV's `ger` with an MP4's `deu` belong
+  to whoever owns the language vocabulary.
 - **The resample seam** — `AudioResampler`, the `AudioStreamDecoder`
   push pair one tier along, converting rate, sample format and channel
   layout between a source spec read off `TrackInfo` and a target spec
@@ -108,6 +112,13 @@ the rest of the findit-studio workspace uses:
 | `serde`      |    —    | Every type below on the wire, plus `mediatime`.               |
 | `arbitrary`  |    —    | `Arbitrary` impls for fuzzing, same coverage.                 |
 | `quickcheck` |    —    | The same coverage again, for `quickcheck`.                    |
+| `ingraph`    |    —    | This crate's vocabulary types as `ingraph` citizens (implies `std`). |
+
+`ingraph` grants `packet::PacketFlags` the faces the indexing framework
+reads a flags column through, so a declaration downstream holds one
+directly instead of restating its bits in a local mirror. Additive, off
+by default, and carrying no storage backend and no wire binding — the
+`ingraph` module has the roster and says where that line is drawn.
 
 The three optional matrices cover the same type, and its wire shape
 follows what it *is*:

@@ -114,6 +114,16 @@ pub struct CarrierDemuxer<C: crate::FfmpegCarrier> {
   /// `Send + Sync` by construction precisely so a track table could
   /// cross tasks.
   tracks: Vec<Arc<TrackInfo<Ffmpeg>>>,
+  /// What libavformat decided the bytes are wrapped in, read once at
+  /// open — see [`CarrierDemuxer::format`].
+  ///
+  /// Held rather than re-derived because it is a property of the
+  /// session: `avformat_open_input` picks the demuxer and never changes
+  /// it, so the answer cannot move and a second read could only cost
+  /// more. `None` only where libavformat left `iformat` null or its
+  /// name is not readable text — neither of which a successful open
+  /// produces.
+  format: Option<crate::ContainerFormat>,
   pending: VecDeque<(
     TrackIndex,
     AttachmentPacket<AttachmentPacketExtra, C::Buffer>,
@@ -311,14 +321,25 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
     self.limits
   }
 
+  /// What libavformat decided this session's bytes are wrapped in.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub(crate) const fn format_impl(&self) -> Option<&crate::ContainerFormat> {
+    self.format.as_ref()
+  }
+
   fn from_input(input: Input, limits: DemuxLimits) -> Result<Self, DemuxError> {
     let (tracks, pending) = build_tracks::<C>(&input, limits)?;
     // One allocation per track, here and never again: the session
     // keeps these handles and hands out clones of them.
     let tracks = tracks.into_iter().map(Arc::new).collect();
+    // SAFETY: `input` owns a live `AVFormatContext` for the whole of
+    // this call, and the read takes copies of the two static-table
+    // strings rather than borrowing from it.
+    let format = unsafe { crate::ContainerFormat::from_context(input.as_ptr()) };
     Ok(Self {
       input,
       tracks,
+      format,
       pending,
       unconverted: None,
       eof: false,
@@ -711,6 +732,28 @@ macro_rules! demuxer_lane_face {
       /// The budgets this session was opened with.
       pub const fn limits(&self) -> DemuxLimits {
         self.limits_impl()
+      }
+
+      /// **What the container IS**, as libavformat identified it from
+      /// the bytes — the demuxer it chose, with the short names that
+      /// demuxer handles and its description.
+      ///
+      /// Decided during the open and fixed for the life of the
+      /// session, so this answers the same thing at any point and
+      /// costs nothing to ask.
+      ///
+      /// `None` only where libavformat left `iformat` null or its name
+      /// is not readable text; neither happens on a session that
+      /// opened successfully.
+      ///
+      /// **Nothing here looked at a path.** A file's extension is a
+      /// claim about its bytes, and this is a reading of them — which
+      /// is what makes the answer usable on a content-addressed row,
+      /// where the same bytes under two names are one content. See
+      /// [`ContainerFormat`](crate::ContainerFormat) for what the
+      /// demuxer's name does and does not narrow to.
+      pub const fn format(&self) -> Option<&crate::ContainerFormat> {
+        self.format_impl()
       }
     }
 
@@ -1438,7 +1481,16 @@ fn build_tracks<C: crate::FfmpegCarrier + crate::CarrierOps>(
     let info = TrackInfo::new(time_base, params, extra)
       .with_duration(duration)
       .with_filename(unsafe { metadata_text(metadata, c"filename") })
-      .with_mime_type(unsafe { metadata_text(metadata, c"mimetype") });
+      .with_mime_type(unsafe { metadata_text(metadata, c"mimetype") })
+      // **`language` is where every container's tag lands.** libavformat
+      // normalises the *key*, not the value: Matroska's `Language`
+      // element, MP4's `mdhd` language code and an `elng`/ISO 639-2
+      // atom, Matroska's BCP 47 `LanguageBCP47`, an ASF descriptor and
+      // an ID3 `TLAN` frame all arrive on this one entry. What each
+      // wrote is what is read — see
+      // [`TrackInfo::language`](mediadecode::demuxer::TrackInfo::language)
+      // for why nothing folds it here.
+      .with_language(unsafe { metadata_text(metadata, c"language") });
 
     // Capture the attachment payload now, so the queue is complete
     // before a single timed packet has been read. Every attachment
