@@ -150,6 +150,148 @@ fn a_track_row_carries_its_codec_parameters_and_attachment_identity() {
   }
 }
 
+/// **The container word reaches a door** (issue #42) — libavformat's own
+/// identification of the bytes, on the session, in the shape a
+/// content-addressed row can store.
+///
+/// Two containers, because one demuxer per *family* is the shape that
+/// makes the answer a list rather than a word, and a door that hid the
+/// list would be lying about what libavformat decided.
+#[test]
+fn the_session_carries_the_container_libavformat_identified() {
+  let Some(corpus) = Corpus::new() else { return };
+
+  let mkv = FfmpegDemuxer::open(&corpus.multi_track_mkv()).expect("open mkv");
+  let format = mkv.format().expect("an opened session has a format");
+  assert_eq!(format.name(), "matroska,webm");
+  assert_eq!(format.long_name(), Some("Matroska / WebM"));
+  assert_eq!(format.names().collect::<Vec<_>>(), ["matroska", "webm"]);
+
+  let mov = FfmpegDemuxer::open(&corpus.timecode_mov()).expect("open mov");
+  let format = mov.format().expect("an opened session has a format");
+  assert_eq!(format.name(), "mov,mp4,m4a,3gp,3g2,mj2");
+  assert_eq!(
+    format.names().collect::<Vec<_>>(),
+    ["mov", "mp4", "m4a", "3gp", "3g2", "mj2"],
+    "the ISOBMFF demuxer handles a family, and the door hands over the whole list rather \
+     than picking one of them",
+  );
+}
+
+/// **The identification is of the BYTES**, which is the property that
+/// makes it usable on a content row: the same content under a name that
+/// contradicts it answers the same thing.
+///
+/// The `.mkv` here is copied to a `.mp4` path — nothing re-muxed, the
+/// same bytes — and libavformat still says Matroska. An extension guess
+/// would have said the opposite, which is the census finding issue #42
+/// opens with.
+#[test]
+fn the_container_word_follows_the_bytes_and_not_the_path() {
+  let Some(corpus) = Corpus::new() else { return };
+
+  let honest = corpus.multi_track_mkv();
+  let misnamed = corpus.dir().join("actually-matroska.mp4");
+  std::fs::copy(&honest, &misnamed).expect("copy the same bytes under another name");
+
+  let demuxer = FfmpegDemuxer::open(&misnamed).expect("open the misnamed file");
+  assert_eq!(
+    demuxer.format().map(|f| f.name()),
+    Some("matroska,webm"),
+    "the extension said mp4 and the bytes said Matroska; the door reports the bytes",
+  );
+}
+
+/// **A track's declared language reaches the row** (issue #44), exactly
+/// as the container wrote it.
+///
+/// Three of the four shapes are in this one file: a tag, a tag in the
+/// 639-2/B alphabet an MKV uses, and a track the container tagged not at
+/// all.
+#[test]
+fn a_track_row_carries_the_language_the_container_declares() {
+  let Some(corpus) = Corpus::new() else { return };
+  let demuxer = FfmpegDemuxer::open(&corpus.language_tagged_mkv()).expect("open mkv");
+
+  let language = |index: usize| {
+    demuxer.tracks()[index]
+      .language()
+      .map(|tag| tag.as_str().to_owned())
+  };
+
+  assert_eq!(
+    language(0),
+    None,
+    "Matroska omits the element for an untagged track, so the row says nothing rather than \
+     guessing",
+  );
+  assert_eq!(language(1).as_deref(), Some("jpn"));
+  assert_eq!(
+    language(2).as_deref(),
+    Some("ger"),
+    "639-2/B is what the file wrote, so 639-2/B is what the row carries — the fold onto a \
+     canonical spelling belongs to whoever owns the language vocabulary",
+  );
+}
+
+/// **`und` is a declaration and `None` is the absence of one**, and the
+/// seat keeps them apart.
+///
+/// An ISOBMFF `mdhd` has a language field it must fill, so an untagged
+/// MP4 track is written `und` — *undetermined*, which the file really
+/// does say. The Matroska lane above shows the other answer on an
+/// equally untagged track. Folding either into the other would erase a
+/// difference the containers themselves make.
+#[test]
+fn an_undetermined_declaration_is_not_a_missing_one() {
+  let Some(corpus) = Corpus::new() else { return };
+  let demuxer = FfmpegDemuxer::open(&corpus.language_tagged_mp4()).expect("open mp4");
+
+  assert_eq!(
+    demuxer.tracks()[0].language().map(|tag| tag.as_str()),
+    Some("und"),
+    "the MP4 declared its video track undetermined, which is not the same as declaring \
+     nothing",
+  );
+  assert_eq!(
+    demuxer.tracks()[1].language().map(|tag| tag.as_str()),
+    Some("ger"),
+  );
+}
+
+/// **The codec name producer, through the door a track row is read at**
+/// (issue #43): the id stays the identity and the word comes off
+/// libavcodec's own descriptor table, so a stored row can carry both.
+#[test]
+fn a_track_row_names_its_codec() {
+  let Some(corpus) = Corpus::new() else { return };
+  let demuxer = FfmpegDemuxer::open(&corpus.multi_track_mkv()).expect("open mkv");
+
+  let named: Vec<_> = demuxer
+    .tracks()
+    .iter()
+    .take(3)
+    .map(|track| {
+      let codec = track.params().codec();
+      (codec.name().map(|n| n.as_str().to_owned()), codec.raw())
+    })
+    .collect();
+
+  assert_eq!(
+    named
+      .iter()
+      .map(|(name, _)| name.as_deref())
+      .collect::<Vec<_>>(),
+    [Some("h264"), Some("aac"), Some("subrip")],
+  );
+  for (name, raw) in &named {
+    assert!(
+      name.is_some() && *raw != mediadecode_ffmpeg::CodecId::NONE.raw(),
+      "a coded track carries both readings — the number to key on and the word to cross with",
+    );
+  }
+}
+
 #[test]
 fn packets_arrive_in_interleaved_file_order() {
   let Some(corpus) = Corpus::new() else { return };

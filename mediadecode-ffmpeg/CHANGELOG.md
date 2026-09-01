@@ -11,6 +11,137 @@ The backend-agnostic core it adapts has its own log at
 
 ## [Unreleased]
 
+### Added — three producers a consumer had no door onto
+
+- **`DecodePath` and `open_as`: a video session's decode path can be
+  pinned** ([#50](https://github.com/findit-studio/mediadecode/issues/50)).
+
+  ```rust
+  pub enum DecodePath { Auto, Hardware(Backend), Software }
+
+  impl CarrierVideoStreamDecoder<Lane> {
+    pub fn open_as(
+      parameters: Parameters,
+      time_base: Timebase,
+      limits: DecoderLimits,
+      path: DecodePath,
+    ) -> Result<Self, Error>;
+  }
+  ```
+
+  On both lane faces. `open` is unchanged and is now
+  `open_as(.., DecodePath::Auto)` — the same probe, the same fallback,
+  the same behaviour down to the arm it takes.
+
+  Before this there was **no door at any name** onto the software
+  decoder as a session: `open_sw_decoder` was private and
+  `VideoDecoder::from_software_for_test` was `#[cfg(test)]`. The only
+  way to reach software was to pick a codec no hardware backend
+  carries — which changes the stream, and therefore compares nothing.
+  `VideoDecoder::open_with` reached a named backend but not as a
+  session: it does not implement `mediadecode::decoder::VideoStreamDecoder`,
+  and wrapping it in a consumer would mean a second copy of the
+  probe/fallback state machine this crate already owns.
+
+  **The two named arms are pins, not preferences**, and that is the
+  half of this that is behaviour rather than surface. `Auto` may end on
+  software, at open or mid-stream. `Hardware(backend)` may not: a
+  backend that will not open fails the `open_as` call where `Auto`
+  would have gone on to software, and a backend that opens and then
+  cannot decode surfaces `Error::AllBackendsFailed` from the road that
+  met it — on all three of the send, receive and EOF roads — instead of
+  degrading behind the caller's back. A pin a mid-stream failure could
+  quietly undo would not be one, and both consumers this door exists
+  for need the promise rather than the preference: a determinism
+  comparison that silently got software twice would report that the
+  two paths agree.
+
+  Observability is untouched. `is_hardware()` / `is_software()` remain
+  live readings.
+
+- **`ContainerFormat` and `CarrierDemuxer::format`: libavformat's own
+  identification of the container reaches a door**
+  ([#42](https://github.com/findit-studio/mediadecode/issues/42)).
+
+  ```rust
+  impl CarrierDemuxer<Lane> {
+    pub const fn format(&self) -> Option<&ContainerFormat>;
+  }
+
+  impl ContainerFormat {
+    pub fn name(&self) -> &str;                        // "mov,mp4,m4a,3gp,3g2,mj2"
+    pub fn long_name(&self) -> Option<&str>;           // "QuickTime / MOV"
+    pub fn names(&self) -> impl Iterator<Item = &str>; // the six words
+  }
+  ```
+
+  Read once from `AVFormatContext.iformat` while the session opens and
+  kept for its life — libavformat picks the demuxer during
+  `avformat_open_input` and never changes it.
+
+  **It is a reading of the bytes, not of a path**, which is what makes
+  it usable on a content-addressed row where an extension guess is
+  incoherent: the same content under `.mov` and `.mp4` answers
+  identically, and a Matroska file copied to an `.mp4` path still
+  answers `matroska,webm`.
+
+  The name is a **list** because FFmpeg registers one demuxer per
+  family, and the door hands over the whole list rather than picking
+  one of the words. Which brand inside a family a file is — an `.mp4`
+  against an `.m4a` — is a question libavformat did not answer, and a
+  door that returned a single word would have had to guess it. An open
+  vocabulary, never an enum: a container FFmpeg learns to demux in its
+  next release names itself here with nothing to change on this side.
+
+- **`CodecId::name` and `CodecId::long_name`: a track's codec has a
+  word, not only a number**
+  ([#43](https://github.com/findit-studio/mediadecode/issues/43)).
+
+  ```rust
+  impl CodecId {
+    pub fn name(self) -> Option<SmolStr>;      // "h264", "aac", "subrip"
+    pub fn long_name(self) -> Option<SmolStr>; // FFmpeg's description
+  }
+  ```
+
+  Read off libavcodec's own `codec_descriptors[]`, so the vocabulary is
+  open the way `ContainerFormat`'s is: a codec FFmpeg learns names
+  itself here with nothing to change. `CodecId::raw` stays the
+  identity — the name is a rendering, and it is what lets a stored
+  track row cross into a typed codec vocabulary instead of holding a
+  bare integer.
+
+  **`None` is a real answer.** The descriptor table is read rather than
+  `avcodec_get_name`, which never fails: for an id it cannot place that
+  function returns the string `"unknown_codec"` — a sentinel a consumer
+  would store as though it were a codec's word. `AV_CODEC_ID_NONE` has
+  no descriptor either, so the "no codec" row reads as absent rather
+  than as a track coded with something called `none`.
+
+- **A track row carries its container's language declaration**
+  ([#44](https://github.com/findit-studio/mediadecode/issues/44)).
+
+  The adapter fills the core's new `TrackInfo::language` seat from the
+  `AVStream` metadata `language` entry, where libavformat lands every
+  container's tag: Matroska's `Language` element, an MP4 `mdhd`
+  language code, an ASF descriptor, an ID3 `TLAN` frame. The value is
+  what the file wrote — see the core's changelog for why nothing here
+  folds it.
+
+### Fixed
+
+- **`tests/audio_pcm_fixtures.rs` skipped on a fetched corpus and
+  panicked on an empty one**
+  ([#34](https://github.com/findit-studio/mediadecode/issues/34)).
+
+  The sweep guarded availability with `root.exists()`. A `git clone`
+  without `--recursive` leaves the submodule's mount point as an
+  *empty directory*, so the guard answered "present" and the lane
+  panicked opening a file that was never fetched — on exactly the fresh
+  worktree the skip exists to welcome. The guard now asks about a
+  fixture file, taken from the first row of the sweep's own table so
+  the file it asks about is by construction one the sweep opens.
+
 ### Fixed — the documented order demuxed a healthy file to nothing
 
 - **`take_tracks()` before `next_packet()` yielded zero packets**

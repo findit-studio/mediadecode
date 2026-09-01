@@ -33,6 +33,15 @@ pub mod subtitle;
 #[cfg_attr(docsrs, doc(cfg(feature = "future")))]
 pub mod future;
 
+// The framework faces this crate's own vocabulary types carry — impls
+// and their reasoning, no items of its own. A module rather than a set
+// of `#[cfg]`s scattered beside the types, because what a citizenship
+// costs and what it deliberately leaves out is one argument and belongs
+// in one place.
+#[cfg(feature = "ingraph")]
+#[cfg_attr(docsrs, doc(cfg(feature = "ingraph")))]
+pub mod ingraph;
+
 pub use pixel_format::PixelFormat;
 pub use rhythm::{Received, Sent};
 

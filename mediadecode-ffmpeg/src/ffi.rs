@@ -101,6 +101,57 @@ pub(crate) const fn side_data_type_count() -> i32 {
 /// the rest of the crate's FFI text handling follows.
 const PIX_FMT_NAME_MAX_BYTES: usize = 64;
 
+/// One of FFmpeg's own static-table strings, copied into text this crate
+/// owns — or `None` for a null pointer, a walk that found no terminator
+/// within `max_bytes`, or bytes that are not UTF-8.
+///
+/// **The one bounded C-string reader for FFmpeg's static tables**, and
+/// the three roads onto it are the pixel-format namer below, the codec
+/// descriptor behind [`crate::CodecId::name`] and the container word
+/// behind [`crate::ContainerFormat`]. A bounded search rather than
+/// `CStr::from_ptr`: a missing terminator violates that function's
+/// precondition outright, and this crate does not hand FFmpeg's word on
+/// string lengths to a function that cannot survive being wrong.
+///
+/// **Copied, not borrowed.** Every one of these pointers really does
+/// name a `static const` table entry that outlives any session, so a
+/// `&'static str` would be sound today — and it would rest the whole
+/// surface on a provenance argument about FFmpeg's internals rather
+/// than on this crate's own memory. [`SmolStr`] keeps a codec name or a
+/// format word *inline* (up to 22 bytes, which every one of these is
+/// bar the longest comma list), so the safe answer is also the free
+/// one.
+///
+/// **Refused, not replaced.** These are FFmpeg's own compiled-in
+/// identifiers — ASCII by construction — so a non-UTF-8 read means the
+/// pointer was not what it claimed, and `None` says so. That is the
+/// opposite of the container *metadata* road, where invalid bytes are
+/// replaced (`U+FFFD`) because the bytes there are the *file's* and a
+/// legacy codepage is still a fact worth surfacing. Two roads, two
+/// answers, because the byte's author is different.
+///
+/// # Safety
+///
+/// `ptr` must be null, or point at a NUL-terminated byte string that
+/// stays live and unmodified for the duration of the call.
+pub(crate) unsafe fn table_text(ptr: *const c_char, max_bytes: usize) -> Option<SmolStr> {
+  if ptr.is_null() {
+    return None;
+  }
+  for len in 0..max_bytes {
+    // SAFETY: `ptr` is non-null and NUL-terminated per the contract, so
+    // the walk reads at most one byte past the last value byte and
+    // stops at the terminator.
+    if unsafe { *ptr.add(len).cast::<u8>() } == 0 {
+      // SAFETY: the `len` bytes below the terminator were just walked,
+      // so the slice is in bounds and initialised.
+      let bytes = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len) };
+      return std::str::from_utf8(bytes).ok().map(SmolStr::new);
+    }
+  }
+  None
+}
+
 /// FFmpeg's own name for a raw `AVFrame.format` integer — `"yuv420p"`,
 /// `"vaapi"` — or `None` when libavutil has no descriptor for it.
 ///
@@ -117,28 +168,11 @@ pub(crate) fn pix_fmt_name(raw: i32) -> Option<SmolStr> {
   // returns null for anything outside its table, so every `i32` —
   // negative, `AV_PIX_FMT_NONE`, or past the end — is a defined call.
   let ptr = unsafe { av_get_pix_fmt_name(raw) };
-  if ptr.is_null() {
-    return None;
-  }
-
-  // A bounded NUL search rather than `CStr::from_ptr`: a missing
-  // terminator violates that function's precondition outright, and
-  // this crate does not hand FFmpeg's word on string lengths to a
-  // function that cannot survive being wrong.
-  for i in 0..PIX_FMT_NAME_MAX_BYTES {
-    // SAFETY: `ptr` is non-null, and libavutil's format names are
-    // string literals in its static `av_pix_fmt_descriptors` table —
-    // NUL-terminated and valid for the process lifetime. We read at
-    // most one byte past the last name byte.
-    let byte = unsafe { *(ptr.add(i) as *const u8) };
-    if byte == 0 {
-      // SAFETY: the `i` bytes below the NUL were just walked, so the
-      // slice is in bounds and initialized.
-      let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, i) };
-      return std::str::from_utf8(bytes).ok().map(SmolStr::new);
-    }
-  }
-  None
+  // SAFETY: libavutil's format names are string literals in its static
+  // `av_pix_fmt_descriptors` table — NUL-terminated and valid for the
+  // process lifetime — and a null answer is what the reader expects for
+  // an id it has no descriptor for.
+  unsafe { table_text(ptr, PIX_FMT_NAME_MAX_BYTES) }
 }
 
 /// State pointed to by `AVCodecContext::opaque` so [`get_hw_format`] can pick

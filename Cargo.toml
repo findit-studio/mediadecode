@@ -41,6 +41,37 @@ serde       = { version = "1", default-features = false, features = ["derive"] }
 arbitrary   = { version = "1", default-features = false }
 quickcheck  = { version = "1", default-features = false }
 
+# The indexing framework this workspace's vocabulary types grant
+# themselves citizenship in, behind `mediadecode`'s optional `ingraph`
+# feature. See `mediadecode::ingraph` for what the citizenship is.
+#
+# **`flags` is what the rows need**; `runtime` is what they COMPILE
+# against, and the difference is measured rather than assumed.
+#
+# `flags` is the declaration word's own engine — `FlagsValue`, the
+# filter, the two lowerings and the seats a flags column shows a client
+# — and it is the only tier a citizenship reads. Every tier above it
+# (`derive`, a storage backend, a wire binding) belongs to the build
+# that DECLARES a graph, which a decode crate never does: it only says
+# how its own types are read when somebody else declares one. Those
+# stay off, and the module's own note says which rows go with them.
+#
+# `runtime` is here because `ingraph` 0.1.0 does not build without it.
+# `default-features = false, features = ["flags"]` fails to compile in
+# `store/fulltext.rs`, which names `crate::BoxedError` — an item that
+# crate re-exports only under `#[cfg(feature = "runtime")]` — so the
+# leanest configuration that compiles is this pair. That is upstream's
+# feature matrix rather than a need of ours, and it is stated here so a
+# later `ingraph` release can drop the second word without anyone
+# having to rediscover why it was written.
+#
+# What the word costs, measured on this pin: 25 crates in
+# `cargo tree -p mediadecode --features ingraph`, against 24 of them
+# arriving with `runtime` (flume, cronp, agnostic-lite, jiff, the
+# futures leaves and their transitive set). All of it is optional and
+# none of it is in the default build.
+ingraph     = { version = "0.1", default-features = false, features = ["flags", "runtime"] }
+
 # Generates `Send`-bounded variants of `async fn`-in-trait
 # definitions; used by `mediadecode::future` to expose both
 # `local::*` (`!Send`) and `send::*` (`+ Send`) trait variants

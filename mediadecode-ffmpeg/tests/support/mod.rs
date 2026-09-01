@@ -137,6 +137,72 @@ impl Corpus {
     out
   }
 
+  /// A Matroska file whose audio and subtitle tracks carry **language
+  /// tags** and whose video track carries none.
+  ///
+  /// The three shapes issue #44 is about, in one file:
+  ///
+  /// - `jpn` on the audio — an ordinary ISO 639-2 declaration;
+  /// - `ger` on the subtitles — 639-2/**B**, which is what an MKV
+  ///   writes where an MP4 writes the /T spelling `deu`. The pair is
+  ///   the reason a demux tier must not fold: they are one language
+  ///   under two codes, and the table that knows so lives downstream;
+  /// - **nothing** on the video, because Matroska omits the element
+  ///   rather than writing a placeholder — which is what makes `None`
+  ///   a real answer here.
+  ///
+  /// See [`Self::language_tagged_mp4`] for the fourth shape, which
+  /// Matroska cannot produce.
+  #[rustfmt::skip]
+  pub fn language_tagged_mkv(&self) -> PathBuf {
+    let out = self.path("language.mkv");
+    if out.exists() {
+      return out;
+    }
+    let subs = self.subrip();
+
+    run_ffmpeg(&[
+      "-f", "lavfi", "-i", "testsrc2=size=64x48:rate=25:duration=1",
+      "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=1",
+      "-i", subs.to_str().expect("utf-8 path"),
+      "-map", "0:v", "-map", "1:a", "-map", "2:s",
+      "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+      "-c:a", "aac", "-c:s", "srt",
+      "-metadata:s:a:0", "language=jpn",
+      "-metadata:s:s:0", "language=ger",
+      out.to_str().expect("utf-8 path"),
+    ]);
+    out
+  }
+
+  /// The same declaration in an **MP4**, where the untagged track says
+  /// `und` instead of saying nothing.
+  ///
+  /// This is the fourth shape, and the one that makes the seat's
+  /// `Option` mean something: an ISOBMFF `mdhd` has a language field it
+  /// must fill, so a track nobody tagged is written `und` —
+  /// *undetermined*, which the file really does say. Matroska simply
+  /// omits the element. A door that folded `und` into `None`, or `None`
+  /// into `und`, would erase the difference between a file that
+  /// declined to say and one that said it did not know.
+  #[rustfmt::skip]
+  pub fn language_tagged_mp4(&self) -> PathBuf {
+    let out = self.path("language.mp4");
+    if out.exists() {
+      return out;
+    }
+    run_ffmpeg(&[
+      "-f", "lavfi", "-i", "testsrc2=size=64x48:rate=25:duration=1",
+      "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=1",
+      "-map", "0:v", "-map", "1:a",
+      "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+      "-c:a", "aac",
+      "-metadata:s:a:0", "language=ger",
+      out.to_str().expect("utf-8 path"),
+    ]);
+    out
+  }
+
   /// A SubRip file, written by hand.
   ///
   /// **The queue-backed demuxer family.** `srtdec` — like SubViewer,

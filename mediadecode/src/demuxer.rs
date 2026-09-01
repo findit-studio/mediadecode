@@ -737,8 +737,9 @@ impl<E: DemuxAdapter> Debug for TrackParams<E> {
 /// Carries what a consumer needs to decide whether it wants the track
 /// and how to open a decoder for it: the kind, the timebase every
 /// timestamp on that track is expressed in, the duration when the
-/// container knows it, the per-kind codec parameters, and — for
-/// attachments — the identity the file was attached under.
+/// container knows it, the per-kind codec parameters, the language the
+/// container declares for the track, and — for attachments — the
+/// identity the file was attached under.
 ///
 /// Everything a particular backend knows and this row has no seat for
 /// rides [`DemuxAdapter::TrackExtra`].
@@ -766,6 +767,7 @@ pub struct TrackInfo<E: DemuxAdapter> {
   params: TrackParams<E>,
   filename: Option<E::Text>,
   mime_type: Option<E::Text>,
+  language: Option<E::Text>,
   extra: E::TrackExtra,
 }
 
@@ -779,6 +781,7 @@ impl<E: DemuxAdapter> TrackInfo<E> {
       params,
       filename: None,
       mime_type: None,
+      language: None,
       extra,
     }
   }
@@ -816,6 +819,42 @@ impl<E: DemuxAdapter> TrackInfo<E> {
   pub const fn mime_type(&self) -> Option<&E::Text> {
     self.mime_type.as_ref()
   }
+  /// Returns the language the **container declares** for this track,
+  /// exactly as it is written there — `None` where the file declares
+  /// none.
+  ///
+  /// # The file's word, unfolded
+  ///
+  /// This is a reading, never a reckoning. `None` means the container
+  /// said nothing, and a `Some` is the tag as written: an MKV's ISO
+  /// 639-2/B `ger`, an MP4's 639-2/T `deu`, a decades-old muxer's `iw`,
+  /// a BCP 47 `zh-Hans`, or `und` where a file declares its language
+  /// unknown. Each of those is a different string for something a
+  /// vocabulary may well call one language, and none of them is
+  /// normalised here.
+  ///
+  /// **Deliberately, and the alternative was measured.** Folding those
+  /// spellings together takes registry tables — the IANA subtag
+  /// registry for BCP 47 and ISO 639-2's own for the alpha-3 space BCP
+  /// 47 does not register — and a crate that owns one is where that
+  /// fold belongs. A demux tier that folded early would be a *second*
+  /// authority on the same question, disagreeing with the first in
+  /// exactly the cases the registries exist for; and a narrower seat —
+  /// a three-letter code, say — would have had nowhere to put
+  /// `zh-Hans`, which is a tag Matroska really writes. So the seat
+  /// carries the declaration whole and leaves the fold downstream,
+  /// where one door can apply it once.
+  ///
+  /// # Every kind, not only subtitles
+  ///
+  /// Containers tag audio tracks as readily as subtitle ones — a dub
+  /// and its captions are the same question asked twice — so the seat
+  /// is on the row rather than on one arm of
+  /// [`TrackParams`](crate::demuxer::TrackParams).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn language(&self) -> Option<&E::Text> {
+    self.language.as_ref()
+  }
   /// Returns the backend-specific extras.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn extra(&self) -> &E::TrackExtra {
@@ -848,6 +887,16 @@ impl<E: DemuxAdapter> TrackInfo<E> {
     self.mime_type = v;
     self
   }
+  /// Sets the container's declared language (consuming builder).
+  ///
+  /// Pass the tag as the container writes it — see
+  /// [`language`](Self::language) for why nothing normalises it.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
+  pub fn with_language(mut self, v: Option<E::Text>) -> Self {
+    self.language = v;
+    self
+  }
 
   /// Sets the duration in place.
   #[cfg_attr(not(tarpaulin), inline(always))]
@@ -865,6 +914,12 @@ impl<E: DemuxAdapter> TrackInfo<E> {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn set_mime_type(&mut self, v: Option<E::Text>) -> &mut Self {
     self.mime_type = v;
+    self
+  }
+  /// Sets the container's declared language in place.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn set_language(&mut self, v: Option<E::Text>) -> &mut Self {
+    self.language = v;
     self
   }
 }
@@ -887,6 +942,7 @@ where
       .field("params", &self.params)
       .field("filename", &self.filename)
       .field("mime_type", &self.mime_type)
+      .field("language", &self.language)
       .field("extra", &self.extra)
       .finish()
   }
@@ -1571,6 +1627,65 @@ mod tests {
       Some("application/x-truetype-font")
     );
     assert_eq!(info.duration(), None);
+  }
+
+  /// **The language seat carries the declaration, whatever shape it is
+  /// in** — and says nothing where the container said nothing.
+  ///
+  /// The four tags are the four real spellings a container writes for
+  /// one question, and the row keeps each verbatim: an MKV's 639-2/B
+  /// against an MP4's 639-2/T, a BCP 47 tag with a script subtag, and
+  /// the explicit `und` an ISOBMFF writes for a track nobody tagged.
+  /// Folding any pair together is a downstream vocabulary's job, and a
+  /// row that folded here would have made the pair indistinguishable
+  /// before that vocabulary ever saw them.
+  #[test]
+  fn the_language_seat_keeps_the_containers_own_spelling() {
+    let row = |language| {
+      TrackInfo::<Loopback>::new(
+        ms_tb(),
+        TrackParams::Subtitle(SubtitleTrackParams::new(3)),
+        (),
+      )
+      .with_language(language)
+    };
+
+    assert_eq!(
+      row(None).language().copied(),
+      None,
+      "a container that declares no language leaves the seat empty",
+    );
+    for tag in ["ger", "deu", "zh-Hans", "und"] {
+      assert_eq!(
+        row(Some(tag)).language().copied(),
+        Some(tag),
+        "{tag} must survive the row unchanged",
+      );
+    }
+    assert_ne!(
+      row(Some("ger")).language().copied(),
+      row(Some("deu")).language().copied(),
+      "two spellings of one language stay two values here; reconciling them belongs to \
+       whoever owns the language registry",
+    );
+  }
+
+  /// The seat has both mutators the row's other identity fields have,
+  /// and the in-place one can take a declaration back off a row.
+  #[test]
+  fn the_language_seat_can_be_set_and_cleared_in_place() {
+    let mut info = TrackInfo::<Loopback>::new(
+      ms_tb(),
+      TrackParams::Audio(AudioTrackParams::new(2, 48_000, 2, 3, 4)),
+      (),
+    );
+    assert_eq!(info.language().copied(), None);
+
+    info.set_language(Some("jpn"));
+    assert_eq!(info.language().copied(), Some("jpn"));
+
+    info.set_language(None);
+    assert_eq!(info.language().copied(), None);
   }
 
   #[test]

@@ -20,6 +20,7 @@ mod buffer;
 mod carrier;
 pub mod channel_layout;
 mod codec_id;
+mod container;
 pub mod convert;
 mod decoder;
 mod demuxer;
@@ -111,6 +112,7 @@ pub use channel_layout::{
   channel_layout_description_from_ffmpeg, channel_layout_from_ffmpeg, channel_order_from_ffmpeg,
 };
 pub use codec_id::CodecId;
+pub use container::ContainerFormat;
 pub use decoder::VideoDecoder;
 pub use demuxer::{CarrierDemuxer, DemuxError, ProbeBudgetExhausted};
 pub use error::{
@@ -152,7 +154,7 @@ pub type FfmpegOwnedResampler = resampler::CarrierResampler<Owned>;
 pub use sample_format::SampleFormat;
 pub use subtitle::{CarrierSubtitleStreamDecoder, SubtitleDecodeError};
 pub use ticket::{ChannelLayoutTicket, CodecTicket, CustomChannel, Ratio};
-pub use video::{CarrierVideoStreamDecoder, VideoDecodeError};
+pub use video::{CarrierVideoStreamDecoder, DecodePath, VideoDecodeError};
 
 // Every bare alias below binds [`FfmpegBuffer`] in the `D` seat — the
 // view lane, the ordinary road: a decoder's output read where it lands

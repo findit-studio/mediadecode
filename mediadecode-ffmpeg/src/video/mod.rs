@@ -88,7 +88,7 @@ use mediadecode::{
 };
 
 use crate::{
-  DecoderLimits, Error, Ffmpeg, Frame, VideoDecoder, boundary,
+  Backend, DecoderLimits, Error, Ffmpeg, Frame, VideoDecoder, boundary,
   convert::{self, ConvertError},
   decoder::{build_codec_context, try_clone_parameters},
   error::FallbackFailed,
@@ -96,10 +96,79 @@ use crate::{
   frame::alloc_av_video_frame,
 };
 
+/// Which decode path a video session takes — the choice
+/// [`CarrierVideoStreamDecoder::open_as`] is given.
+///
+/// # The arms differ in what they PERMIT, not only in where they start
+///
+/// [`Auto`](Self::Auto) is a preference: it starts on hardware and is
+/// free to end on software, at open or mid-stream. The other two are
+/// **pins**, and a pin that a mid-stream failure could quietly undo
+/// would not be one — so a session opened on either of them stays on
+/// the path it was opened on for its whole life, and a hardware failure
+/// that `Auto` would degrade through is reported instead.
+///
+/// That is the difference the two consumers of this door need. A
+/// determinism comparison decodes *one stream* both ways and compares
+/// the pixels; a run that silently swapped paths halfway would compare
+/// nothing and say it had. An operator turning hardware off for a lane
+/// over a driver that produces wrong pixels needs it to stay off.
+///
+/// # Observability is unchanged
+///
+/// [`is_hardware`](CarrierVideoStreamDecoder::is_hardware) and
+/// [`is_software`](CarrierVideoStreamDecoder::is_software) read where a
+/// session **is**, which stays a live reading — under
+/// [`Auto`](Self::Auto) it can still change once, and under the pins it
+/// answers what was pinned because nothing can move it.
+///
+/// This type deliberately grows **no** `is_*` predicates of its own,
+/// where most vocabularies in this crate do. They would spell the
+/// decoder's two questions a second time with a different meaning —
+/// `path.is_software()` is *what was asked for* and
+/// `decoder.is_software()` is *where it ended up*, and under
+/// [`Auto`](Self::Auto) those genuinely differ. A caller that needs to
+/// branch on the choice it made already holds the value and can
+/// `match` it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DecodePath {
+  /// Probe the platform's hardware backends in order and fall back to
+  /// software — at open, and again on a mid-stream hardware failure.
+  ///
+  /// What [`CarrierVideoStreamDecoder::open`] has always done, and what
+  /// it still does.
+  Auto,
+  /// **This hardware backend, or nothing.** No other backend is probed
+  /// and software is never opened.
+  ///
+  /// A backend that cannot be opened for the stream fails the
+  /// [`open_as`](CarrierVideoStreamDecoder::open_as) call. A backend
+  /// that opens and then fails to decode surfaces
+  /// [`Error::AllBackendsFailed`] from the send or receive road that
+  /// met it, carrying that backend and what it said — the same error
+  /// [`Auto`](Self::Auto) treats as its cue to degrade, reported here
+  /// because degrading is what this arm declines.
+  Hardware(Backend),
+  /// **Software, with no probe at all.**
+  ///
+  /// Opens `libavcodec`'s own decoder for the stream directly. There is
+  /// no hardware in this session to fail, so there is nothing for it to
+  /// fall back from — the terminal state [`Auto`](Self::Auto) reaches
+  /// by degrading, entered on purpose.
+  Software,
+}
+
 /// `mediadecode::VideoStreamDecoder` impl with transparent HW → SW
 /// fallback.
 pub struct CarrierVideoStreamDecoder<C: crate::FfmpegCarrier> {
   state: DecodeState,
+  /// The path this session was opened on — see [`DecodePath`].
+  ///
+  /// Read for exactly one question, [`Self::may_open_software`]: whether
+  /// a hardware exhaustion is this session's cue to degrade or its cue
+  /// to report. Kept as the whole choice rather than reduced to that
+  /// bit so a session can say what it *is*, not only what it allows.
+  path: DecodePath,
   /// Codec parameters retained so we can open a software
   /// `ffmpeg::decoder::Video` if the HW probe exhausts.
   parameters: Parameters,
@@ -339,6 +408,17 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     time_base: Timebase,
     limits: DecoderLimits,
   ) -> Result<Self, Error> {
+    Self::open_as_impl(parameters, time_base, limits, DecodePath::Auto)
+  }
+
+  /// [`Self::open_impl`], with the decode path chosen rather than
+  /// probed. `DecodePath::Auto` is the constructor above, verbatim.
+  pub(crate) fn open_as_impl(
+    parameters: Parameters,
+    time_base: Timebase,
+    limits: DecoderLimits,
+    path: DecodePath,
+  ) -> Result<Self, Error> {
     // ffmpeg-next's `Parameters` carries an optional `owner: Rc<dyn Any>`
     // (when constructed from `stream.parameters()` it points back at
     // the demuxer's `AVStream`). Upstream marks the type `Send`
@@ -359,21 +439,38 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     let owned_parameters = try_clone_parameters(&parameters, limits.max_codec_parameter_bytes())?;
     let hw_scratch = Frame::empty()?;
     let sw_scratch = alloc_av_video_frame()?;
-    let state = match VideoDecoder::open_with_frame_limits(
-      try_clone_parameters(&owned_parameters, limits.max_codec_parameter_bytes())?,
-      limits,
-    ) {
-      Ok(hw) => DecodeState::Hw(Box::new(hw)),
-      Err(Error::AllBackendsFailed(_)) => {
-        // Open-time HW exhaustion: no rescued packets (open didn't
-        // see any). Just open SW directly from our owned copy.
-        let sw = open_sw_decoder(&owned_parameters, limits)?;
-        DecodeState::Sw(sw)
-      }
-      Err(other) => return Err(other),
+    let state = match path {
+      DecodePath::Auto => match VideoDecoder::open_with_frame_limits(
+        try_clone_parameters(&owned_parameters, limits.max_codec_parameter_bytes())?,
+        limits,
+      ) {
+        Ok(hw) => DecodeState::Hw(Box::new(hw)),
+        Err(Error::AllBackendsFailed(_)) => {
+          // Open-time HW exhaustion: no rescued packets (open didn't
+          // see any). Just open SW directly from our owned copy.
+          let sw = open_sw_decoder(&owned_parameters, limits)?;
+          DecodeState::Sw(sw)
+        }
+        Err(other) => return Err(other),
+      },
+      // **The named backend, and no probe order at all.** Nothing is
+      // tried before it and nothing after it, which is what makes the
+      // arm a pin: an open that fails is the answer, where `Auto` would
+      // have read the same failure as a reason to look elsewhere.
+      DecodePath::Hardware(backend) => DecodeState::Hw(Box::new(VideoDecoder::open_with_limits(
+        try_clone_parameters(&owned_parameters, limits.max_codec_parameter_bytes())?,
+        backend,
+        limits,
+      )?)),
+      // The software decoder, opened on purpose rather than reached by
+      // degrading. `DecodeState::Sw` is terminal, so this session has
+      // nothing to keep it on its path but the shape of the state
+      // machine itself.
+      DecodePath::Software => DecodeState::Sw(open_sw_decoder(&owned_parameters, limits)?),
     };
     Ok(Self {
       state,
+      path,
       parameters: owned_parameters,
       hw_scratch,
       sw_scratch,
@@ -417,6 +514,26 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub(crate) const fn time_base_impl(&self) -> Timebase {
     self.time_base
+  }
+
+  /// Whether this session may open a software decoder in answer to a
+  /// hardware exhaustion.
+  ///
+  /// **The one place the pin is enforced**, consulted by all three
+  /// roads that can meet [`Error::AllBackendsFailed`] — the two send
+  /// arms and the receive arm. It is one predicate rather than three
+  /// conditions because the pin is one promise: a session opened on
+  /// [`DecodePath::Hardware`] ends on hardware or ends in an error, and
+  /// a road that forgot to ask would break that promise silently,
+  /// which is the failure mode a caller cannot see.
+  ///
+  /// [`DecodePath::Software`] answers `true` and it costs nothing:
+  /// `DecodeState::Sw` is terminal, so no hardware exhaustion can
+  /// reach a road that asks. Answering for it by state rather than by
+  /// pin would make the predicate say something it does not mean.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  const fn may_open_software(&self) -> bool {
+    !matches!(self.path, DecodePath::Hardware(_))
   }
 
   /// Internal: **probe-era** transition from HW to SW. Replays the rescued
@@ -931,10 +1048,28 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     parameters: Parameters,
     time_base: Timebase,
   ) -> Result<Self, Error> {
+    Self::from_hw_inner_for_test_as(hw, parameters, time_base, DecodePath::Auto)
+  }
+
+  /// [`Self::from_hw_inner_for_test`], with the session's
+  /// [`DecodePath`] named.
+  ///
+  /// The seam a **pinned** session's mid-stream behaviour is driven
+  /// through: a pin's promise is about what happens when the hardware
+  /// fails after opening, and the only way to reach that on a machine
+  /// whose GPU works is to inject a seam that fails on demand. See
+  /// `a_hardware_pin_reports_a_mid_stream_exhaustion_instead_of_degrading`.
+  pub(crate) fn from_hw_inner_for_test_as(
+    hw: Box<dyn HwInner>,
+    parameters: Parameters,
+    time_base: Timebase,
+    path: DecodePath,
+  ) -> Result<Self, Error> {
     let limits = DecoderLimits::default();
     let owned_parameters = try_clone_parameters(&parameters, limits.max_codec_parameter_bytes())?;
     Ok(Self {
       state: DecodeState::Hw(hw),
+      path,
       parameters: owned_parameters,
       hw_scratch: Frame::empty()?,
       sw_scratch: alloc_av_video_frame()?,
@@ -1063,6 +1198,15 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
           // both states travel on unchanged.
           Ok(status) => Ok(status),
           Err(Error::AllBackendsFailed(p)) => {
+            // **A pinned hardware session reports rather than degrades.**
+            // See [`Self::may_open_software`]: this is the exhaustion
+            // `DecodePath::Auto` reads as its cue to open software, and
+            // the pin's whole content is that it is not that cue here.
+            // Reported with the payload intact, so the caller keeps the
+            // backend, its error, and any rescued packets.
+            if !self.may_open_software() {
+              return Err(VideoDecodeError::Decode(Error::AllBackendsFailed(p)));
+            }
             // Route on the EXPLICIT origin, never on whether `rescued` is empty (a
             // probe-era first-packet cap trip is *also* empty).
             if p.origin().is_post_commit() {
@@ -1204,6 +1348,12 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
           // They still pass the session's own end: see [`Self::settle`].
           Ok(status) => return self.settle(status),
           Err(Error::AllBackendsFailed(p)) => {
+            // The pin, on the receive road — see
+            // [`Self::may_open_software`] and the identical gate on the
+            // two send roads.
+            if !self.may_open_software() {
+              return Err(VideoDecodeError::Decode(Error::AllBackendsFailed(p)));
+            }
             // HW exhausted at frame-time. There is no current packet here.
             // Route on the explicit origin.
             if p.origin().is_post_commit() {
@@ -1352,6 +1502,14 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
         // The seam classified libavcodec's back pressure already.
         Ok(status) => Ok(status),
         Err(Error::AllBackendsFailed(p)) => {
+          // The pin, on the EOF road — see [`Self::may_open_software`].
+          // Returned rather than folded into `outcome`: the commit below
+          // fires only on `Ok(Sent::Accepted)`, so the two roads agree,
+          // and leaving early keeps the fallback body at the nesting it
+          // was written at.
+          if !self.may_open_software() {
+            return Err(VideoDecodeError::Decode(Error::AllBackendsFailed(p)));
+          }
           // EOF is pending for this transaction, so the SW decoder must also
           // receive `send_eof` (codecs that delay tail frames hang otherwise).
           // We pass that intent locally rather than pre-setting `self.eof_sent`:
@@ -1447,12 +1605,63 @@ macro_rules! video_lane_face {
     impl CarrierVideoStreamDecoder<$lane> {
       /// Opens a video decoder for `parameters`, probing hardware
       /// backends in order and falling back to software.
+      ///
+      /// [`open_as`](Self::open_as)`(.., DecodePath::Auto)`, which is
+      /// what this has always done.
       pub fn open(
         parameters: Parameters,
         time_base: Timebase,
         limits: DecoderLimits,
       ) -> Result<Self, Error> {
         Self::open_impl(parameters, time_base, limits)
+      }
+
+      /// Opens a video decoder on a **named decode path**.
+      ///
+      /// [`DecodePath::Auto`] is [`open`](Self::open) exactly; the
+      /// other two arms pin the session to hardware or to software for
+      /// its whole life. See [`DecodePath`] for what a pin promises and
+      /// what it costs.
+      ///
+      /// Everything else about the session is unchanged — the same
+      /// [`VideoStreamDecoder`] face, the same frames, the same
+      /// [`is_hardware`](Self::is_hardware) / [`is_software`](Self::is_software)
+      /// readings. The choice is *which decoder is behind them*, which
+      /// is what a determinism comparison and a deployment policy each
+      /// need and neither could reach.
+      ///
+      /// # Errors
+      ///
+      /// [`DecodePath::Hardware`] fails here when the named backend
+      /// cannot be opened for the stream — where [`DecodePath::Auto`]
+      /// would have gone on to software. [`DecodePath::Software`] fails
+      /// only where libavcodec has no decoder for the stream, or the
+      /// context cannot be built.
+      ///
+      /// # Examples
+      ///
+      /// ```no_run
+      /// use mediadecode_ffmpeg::{DecodePath, DecoderLimits, FfmpegVideoStreamDecoder};
+      /// # fn f(parameters: ffmpeg_next::codec::Parameters, time_base: mediadecode::Timebase)
+      /// # -> Result<(), Box<dyn std::error::Error>> {
+      /// // The same stream, decoded without a GPU anywhere in the story.
+      /// let decoder = FfmpegVideoStreamDecoder::open_as(
+      ///   parameters,
+      ///   time_base,
+      ///   DecoderLimits::default(),
+      ///   DecodePath::Software,
+      /// )?;
+      /// assert!(decoder.is_software());
+      /// # Ok(())
+      /// # }
+      /// ```
+      pub fn open_as(
+        parameters: Parameters,
+        time_base: Timebase,
+        limits: DecoderLimits,
+        path: DecodePath,
+      ) -> Result<Self, Error> {
+        Self::open_as_impl(parameters, time_base, limits, path)
       }
 
       /// Whether this decoder is currently running on software.
