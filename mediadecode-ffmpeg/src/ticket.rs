@@ -63,7 +63,7 @@ use ffmpeg_next::{
   codec::Parameters,
   ffi::{
     AV_INPUT_BUFFER_PADDING_SIZE, AVChannelCustom, AVChannelOrder, AVCodecParameters,
-    AVPacketSideData, av_mallocz,
+    AVPacketSideData, AVPacketSideDataType, av_mallocz,
   },
 };
 
@@ -107,6 +107,80 @@ impl Ratio {
   pub const fn den(&self) -> i32 {
     self.den
   }
+}
+
+/// The Dolby Vision decoder configuration record's two routing seats —
+/// the profile number and the base-layer signal-compatibility id —
+/// read from the container's `dvcC`/`dvvC`/`dwvC` box when present.
+///
+/// **Numbers, not interpretation.** This crate does not map `profile`
+/// onto a named Dolby Vision profile (5, 7, 8.1, …) or `compatibility_id`
+/// onto "HDR10-compatible" / "SDR-compatible" / etc. — those tables are
+/// Dolby's own and change independently of this crate's release cycle;
+/// the consumer that already routes base-layer-vs-refuse on this value
+/// (per the sealed ground this type answers to) owns that table. What
+/// crosses here is exactly what the box declared, unchanged.
+///
+/// `Copy`: two bytes, nothing owned.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct DolbyVisionConfig {
+  profile: u8,
+  compatibility_id: u8,
+}
+
+impl DolbyVisionConfig {
+  /// Constructs a `DolbyVisionConfig` from its two routing numbers.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(profile: u8, compatibility_id: u8) -> Self {
+    Self {
+      profile,
+      compatibility_id,
+    }
+  }
+  /// The Dolby Vision profile number (`dv_profile`), verbatim.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn profile(&self) -> u8 {
+    self.profile
+  }
+  /// The base-layer signal-compatibility id (`dv_bl_signal_
+  /// compatibility_id`), verbatim — what the consumer this record was
+  /// sealed for routes base-layer-vs-refuse on.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn compatibility_id(&self) -> u8 {
+    self.compatibility_id
+  }
+}
+
+/// Byte offset of `dv_profile` in FFmpeg's in-process
+/// `AVDOVIDecoderConfigurationRecord` (`libavutil/dovi_meta.h`): two
+/// leading version bytes, then the profile.
+const DOVI_CONFIG_PROFILE_OFFSET: usize = 2;
+/// Byte offset of `dv_bl_signal_compatibility_id`: version (2) +
+/// profile (1) + level (1) + three one-byte presence flags (3).
+const DOVI_CONFIG_COMPATIBILITY_ID_OFFSET: usize = 7;
+/// Minimum payload length [`parse_dolby_vision_config`] needs — enough
+/// to read the compatibility id, the later of the two seats. The full
+/// struct FFmpeg n9.0 allocates is nine bytes (a ninth,
+/// `dv_md_compression`, follows); this function reads neither that
+/// byte nor relies on the struct's total size, which its own header
+/// documents as **not** part of the public ABI.
+const DOVI_CONFIG_MIN_BYTES: usize = DOVI_CONFIG_COMPATIBILITY_ID_OFFSET + 1;
+
+/// Parses an `AV_PKT_DATA_DOVI_CONF` payload — a byte-for-byte copy of
+/// FFmpeg's `AVDOVIDecoderConfigurationRecord` (`dv_version_major,
+/// dv_version_minor, dv_profile, dv_level, rpu_present_flag,
+/// el_present_flag, bl_present_flag, dv_bl_signal_compatibility_id,
+/// [dv_md_compression]`, every seat one byte) — into the two routing
+/// numbers. `None` when the payload is shorter than
+/// [`DOVI_CONFIG_MIN_BYTES`] — a version-skew or corrupt entry.
+fn parse_dolby_vision_config(bytes: &[u8]) -> Option<DolbyVisionConfig> {
+  if bytes.len() < DOVI_CONFIG_MIN_BYTES {
+    return None;
+  }
+  Some(DolbyVisionConfig::new(
+    bytes[DOVI_CONFIG_PROFILE_OFFSET],
+    bytes[DOVI_CONFIG_COMPATIBILITY_ID_OFFSET],
+  ))
 }
 
 /// One entry of a custom channel map — the `AV_CHANNEL_ORDER_CUSTOM`
@@ -594,6 +668,32 @@ impl CodecTicket {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub fn coded_side_data(&self) -> &[SideDataEntry] {
     self.coded_side_data.as_slice()
+  }
+  /// The Dolby Vision configuration record — profile number and base-
+  /// layer compatibility id — from the container's `dvcC` / `dvvC` /
+  /// `dwvC` box, when the stream carries one.
+  ///
+  /// `None` when [`Self::coded_side_data`] holds no
+  /// `AV_PKT_DATA_DOVI_CONF` entry (an ordinary, non-Dolby-Vision
+  /// stream — the overwhelming majority) or the entry's payload is too
+  /// short to hold both seats. Absent configuration answers absent,
+  /// same as every other seat this crate exposes as an `Option`.
+  ///
+  /// This is the **configuration-record** half of Dolby Vision — the
+  /// two numbers a consumer routes base-layer-vs-refuse on before a
+  /// single frame decodes. The **per-frame** half — the RPU buffer
+  /// (`AV_FRAME_DATA_DOVI_RPU_BUFFER`) and parsed dynamic metadata
+  /// (`AV_FRAME_DATA_DOVI_METADATA`), plus HDR10+ dynamic metadata
+  /// (`AV_FRAME_DATA_DYNAMIC_HDR_PLUS`) — is not exposed by this crate
+  /// yet: [mediadecode#54](https://github.com/findit-studio/mediadecode/issues/54).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn dolby_vision_config(&self) -> Option<DolbyVisionConfig> {
+    let kind = AVPacketSideDataType::AV_PKT_DATA_DOVI_CONF as i32;
+    self
+      .coded_side_data
+      .iter()
+      .find(|entry| entry.kind() == kind)
+      .and_then(|entry| parse_dolby_vision_config(entry.data()))
   }
   /// The pixel format (video) or sample format (audio), as the raw
   /// integer both enums share this seat as.

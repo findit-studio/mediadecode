@@ -222,3 +222,358 @@ fn an_unnameable_format_still_reports_its_raw_id() {
     "the absent-name case is not spelled out in {rendered:?}"
   );
 }
+
+// ---------------------------------------------------------------------------
+//  Static HDR metadata: `AV_FRAME_DATA_MASTERING_DISPLAY_METADATA` /
+//  `AV_FRAME_DATA_CONTENT_LIGHT_LEVEL`, parsed off the raw side-data bytes.
+// ---------------------------------------------------------------------------
+
+/// Packs an `AVMasteringDisplayMetadata`-shaped payload: ten
+/// `AVRational`s (native-endian `i32` num, `i32` den) — R's x then y,
+/// G's x then y, B's x then y, white point's x then y, min luminance,
+/// max luminance — then two `int` presence flags, matching
+/// `libavutil/mastering_display_metadata.h` field by field. Each `x`/
+/// `y` is its own independent rational; a primary's chromaticity is
+/// two of them, not one.
+#[allow(clippy::too_many_arguments)]
+fn mastering_display_bytes(
+  r_x: (i32, i32),
+  r_y: (i32, i32),
+  g_x: (i32, i32),
+  g_y: (i32, i32),
+  b_x: (i32, i32),
+  b_y: (i32, i32),
+  wp_x: (i32, i32),
+  wp_y: (i32, i32),
+  min_luminance: (i32, i32),
+  max_luminance: (i32, i32),
+  has_primaries: i32,
+  has_luminance: i32,
+) -> Vec<u8> {
+  let mut out = Vec::with_capacity(MASTERING_DISPLAY_METADATA_BYTES);
+  for (num, den) in [
+    r_x,
+    r_y,
+    g_x,
+    g_y,
+    b_x,
+    b_y,
+    wp_x,
+    wp_y,
+    min_luminance,
+    max_luminance,
+  ] {
+    out.extend_from_slice(&num.to_ne_bytes());
+    out.extend_from_slice(&den.to_ne_bytes());
+  }
+  out.extend_from_slice(&has_primaries.to_ne_bytes());
+  out.extend_from_slice(&has_luminance.to_ne_bytes());
+  out
+}
+
+/// A zeroed `(0, 1)` rational — the filler this file's negative/short-
+/// payload tests use for every seat that is not the one under test.
+const ZERO_RATIONAL: (i32, i32) = (0, 1);
+
+/// The exact numbers a real HDR10 mastering-display SEI decodes to on
+/// this host — cross-checked with `ffprobe -show_frames` against an
+/// `libx265`-encoded clip (`master-display=G(13250,34500)B(7500,3000)
+/// R(34000,16000)WP(15635,16450)L(10000000,1)`):
+///
+/// ```text
+/// red_x=34000/50000    red_y=16000/50000
+/// green_x=13250/50000  green_y=34500/50000
+/// blue_x=7500/50000    blue_y=3000/50000
+/// white_point_x=15635/50000  white_point_y=16450/50000
+/// min_luminance=1/10000      max_luminance=10000000/10000
+/// ```
+///
+/// So this is not an invented fixture: it is what FFmpeg's own SEI
+/// parser actually produces, transcribed.
+#[test]
+fn parse_mastering_display_reads_a_real_hdr10_payload() {
+  let bytes = mastering_display_bytes(
+    (34_000, 50_000),     // red_x
+    (16_000, 50_000),     // red_y
+    (13_250, 50_000),     // green_x
+    (34_500, 50_000),     // green_y
+    (7_500, 50_000),      // blue_x
+    (3_000, 50_000),      // blue_y
+    (15_635, 50_000),     // white_point_x
+    (16_450, 50_000),     // white_point_y
+    (1, 10_000),          // min_luminance
+    (10_000_000, 10_000), // max_luminance
+    1,
+    1,
+  );
+  // The x265 recipe above interleaves G/B/R; the struct's own order is
+  // R, G, B — `ffprobe`'s `red_x`/`green_x`/`blue_x` naming is the
+  // struct order, and what `mastering_display_bytes` is called with.
+  let md = parse_mastering_display(&bytes).expect("a full 88-byte payload parses");
+  assert_eq!(
+    md.display_primaries(),
+    [(34_000, 16_000), (13_250, 34_500), (7_500, 3_000)],
+    "R, G, B chromaticities in ST 2086 fixed-point units"
+  );
+  assert_eq!(md.white_point(), (15_635, 16_450));
+  assert_eq!(md.min_luminance(), (1, 10_000));
+  assert_eq!(md.max_luminance(), (10_000_000, 10_000));
+}
+
+/// A denominator other than 50000 is rescaled exactly, not truncated —
+/// `17/200` (0.085) becomes `4250/50000`.
+#[test]
+fn parse_mastering_display_rescales_a_non_standard_chroma_denominator() {
+  let bytes = mastering_display_bytes(
+    (17, 200), // red_x — the one non-standard seat under test
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    1,
+    1,
+  );
+  let md = parse_mastering_display(&bytes).expect("parses");
+  assert_eq!(md.display_primaries()[0].0, 4_250, "17/200 == 4250/50000");
+}
+
+/// Shorter than the fixed 88-byte struct — a version-skew or corrupt
+/// entry — answers `None` rather than reading past the end.
+#[test]
+fn parse_mastering_display_refuses_a_short_payload() {
+  let bytes = mastering_display_bytes(
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    1,
+    1,
+  );
+  assert_eq!(bytes.len(), MASTERING_DISPLAY_METADATA_BYTES);
+  assert!(parse_mastering_display(&bytes[..bytes.len() - 1]).is_none());
+  assert!(parse_mastering_display(&[]).is_none());
+}
+
+/// A negative chromaticity or luminance component is unrepresentable
+/// in the physical quantity it names — refused rather than silently
+/// cast into a huge `u32`. Every other seat is otherwise-valid (`ZERO_
+/// RATIONAL` or the real HDR10 numbers), so the refusal is provably
+/// about the one negative seat and not an incidental short payload.
+#[test]
+fn parse_mastering_display_refuses_a_negative_component() {
+  let negative_primary = mastering_display_bytes(
+    (-1, 50_000), // red_x — negative
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    1,
+    1,
+  );
+  assert_eq!(negative_primary.len(), MASTERING_DISPLAY_METADATA_BYTES);
+  assert!(parse_mastering_display(&negative_primary).is_none());
+
+  let negative_luminance = mastering_display_bytes(
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    (-1, 10_000), // min_luminance — negative
+    ZERO_RATIONAL,
+    1,
+    1,
+  );
+  assert_eq!(negative_luminance.len(), MASTERING_DISPLAY_METADATA_BYTES);
+  assert!(parse_mastering_display(&negative_luminance).is_none());
+}
+
+/// `av_mastering_display_metadata_alloc`'s own default-initialized
+/// record: ten zeroed `AVRational`s with both `has_primaries` and
+/// `has_luminance` at `0`. Every numeric component is otherwise
+/// "valid" (zero is a fine `u32`), so only the flags distinguish this
+/// from a real all-zero-chromaticity record — and this is the
+/// regression a flags-blind parser would silently accept as `Some`.
+#[test]
+fn parse_mastering_display_refuses_the_flags_unset_default_record() {
+  let bytes = mastering_display_bytes(
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    0, // has_primaries
+    0, // has_luminance
+  );
+  assert_eq!(bytes.len(), MASTERING_DISPLAY_METADATA_BYTES);
+  assert!(
+    parse_mastering_display(&bytes).is_none(),
+    "an unset-flags record must not be reported as real HDR metadata"
+  );
+}
+
+/// Every other combination of the two flags — real numbers behind
+/// both, but only one declared present — is refused too:
+/// [`MasteringDisplay`] cannot represent "primaries but no luminance"
+/// or vice versa, so a partial record is `None` rather than a value
+/// with a fabricated half.
+#[test]
+fn parse_mastering_display_refuses_every_partial_flag_combination() {
+  let real = (
+    (34_000, 50_000),
+    (16_000, 50_000),
+    (13_250, 50_000),
+    (34_500, 50_000),
+    (7_500, 50_000),
+    (3_000, 50_000),
+    (15_635, 50_000),
+    (16_450, 50_000),
+    (1, 10_000),
+    (10_000_000, 10_000),
+  );
+  for (has_primaries, has_luminance) in [(1, 0), (0, 1)] {
+    let bytes = mastering_display_bytes(
+      real.0,
+      real.1,
+      real.2,
+      real.3,
+      real.4,
+      real.5,
+      real.6,
+      real.7,
+      real.8,
+      real.9,
+      has_primaries,
+      has_luminance,
+    );
+    assert!(
+      parse_mastering_display(&bytes).is_none(),
+      "has_primaries={has_primaries} has_luminance={has_luminance} must refuse, \
+       real numbers behind an unset flag notwithstanding"
+    );
+  }
+  // The control: identical numbers with both flags set parse fine, so
+  // the refusals above are about the flags and not the fixture itself.
+  let bytes = mastering_display_bytes(
+    real.0, real.1, real.2, real.3, real.4, real.5, real.6, real.7, real.8, real.9, 1, 1,
+  );
+  assert!(parse_mastering_display(&bytes).is_some());
+}
+
+/// A zero (or negative) luminance denominator is a degenerate rational
+/// no real encoder emits — refused rather than stored as a ratio that
+/// means nothing to a caller who evaluates it.
+#[test]
+fn parse_mastering_display_refuses_a_non_positive_luminance_denominator() {
+  let zero_min_den = mastering_display_bytes(
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    (1, 0), // min_luminance — zero denominator
+    ZERO_RATIONAL,
+    1,
+    1,
+  );
+  assert!(parse_mastering_display(&zero_min_den).is_none());
+
+  let negative_max_den = mastering_display_bytes(
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    ZERO_RATIONAL,
+    (1, -1), // max_luminance — negative denominator
+    1,
+    1,
+  );
+  assert!(parse_mastering_display(&negative_max_den).is_none());
+}
+
+/// `AVContentLightMetadata` is two `unsigned` seats — `MaxCLL` then
+/// `MaxFALL` — read verbatim. `1000, 400` is what the same real
+/// `libx265 -x265-params max-cll=1000,400` clip decodes to.
+#[test]
+fn parse_content_light_level_reads_max_cll_and_max_fall() {
+  let mut bytes = Vec::with_capacity(CONTENT_LIGHT_METADATA_BYTES);
+  bytes.extend_from_slice(&1000u32.to_ne_bytes());
+  bytes.extend_from_slice(&400u32.to_ne_bytes());
+  let cll = parse_content_light_level(&bytes).expect("an 8-byte payload parses");
+  assert_eq!(cll.max_cll(), 1000);
+  assert_eq!(cll.max_fall(), 400);
+}
+
+/// Shorter than the fixed 8-byte struct answers `None`.
+#[test]
+fn parse_content_light_level_refuses_a_short_payload() {
+  assert!(parse_content_light_level(&[0u8; 7]).is_none());
+  assert!(parse_content_light_level(&[]).is_none());
+}
+
+/// [`find_mastering_display`] / [`find_content_light_level`] answer
+/// `None` on an empty side-data list — the "absent metadata answers
+/// absent" contract, at the seat a caller actually reads.
+#[test]
+fn absent_side_data_answers_none_for_both_hdr_seats() {
+  let side_data: Vec<SideDataEntry> = Vec::new();
+  assert!(find_mastering_display(&side_data).is_none());
+  assert!(find_content_light_level(&side_data).is_none());
+}
+
+/// The two entries are found by kind among unrelated side data, not by
+/// position — an SEI/timecode entry ahead of them does not hide them.
+#[test]
+fn hdr_seats_are_found_by_kind_among_unrelated_side_data() {
+  let cll_bytes = {
+    let mut b = Vec::with_capacity(CONTENT_LIGHT_METADATA_BYTES);
+    b.extend_from_slice(&500u32.to_ne_bytes());
+    b.extend_from_slice(&100u32.to_ne_bytes());
+    b
+  };
+  let side_data = vec![
+    SideDataEntry::new(
+      0xDEAD_BEEFu32 as i32,
+      FfmpegBytes::copy_from_slice(&[1, 2, 3]),
+    ),
+    SideDataEntry::new(
+      AVFrameSideDataType::AV_FRAME_DATA_CONTENT_LIGHT_LEVEL as i32,
+      FfmpegBytes::copy_from_slice(&cll_bytes),
+    ),
+  ];
+  assert!(find_mastering_display(&side_data).is_none());
+  let cll = find_content_light_level(&side_data).expect("the CLL entry is present");
+  assert_eq!(cll.max_cll(), 500);
+  assert_eq!(cll.max_fall(), 100);
+}

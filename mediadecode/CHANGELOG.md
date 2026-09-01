@@ -13,6 +13,46 @@ The sibling FFmpeg adapter has its own log at
 
 ### Added
 
+- **`ScaledOutputCapability`: a platform-neutral capability word for
+  decode-time output scaling, on `VideoStreamDecoder`.**
+
+  ```rust
+  pub enum ScaledOutputCapability { Unsupported, Supported }
+
+  pub trait VideoStreamDecoder {
+    // ...existing seats...
+    fn scaled_output_capability(&self) -> ScaledOutputCapability { .. }
+    fn request_scaled_output(&mut self, size: (u32, u32)) -> ScaledOutputCapability { .. }
+  }
+  ```
+
+  A backend answers whether it can emit decoded pictures at a
+  caller-requested size, and a caller requests one and reads back
+  whether it took effect. Both default to `Unsupported` / a no-op, so
+  every existing implementor of `VideoStreamDecoder` keeps compiling —
+  additive. Refusal is never an error: a backend that cannot honor the
+  request leaves the session decoding at full coded size, and the
+  caller falls back to resampling it.
+
+  **The determinism trade.** A backend's own scaler is not the ordinary
+  area-resample kernel used elsewhere in this ecosystem — enabling
+  scaled output trades cross-backend byte-determinism for bandwidth.
+  Recommended together with a pinned backend
+  (`mediadecode-ffmpeg`'s `DecodePath`, [#50]) rather than the auto
+  probe, for a caller that needs the same picture bytes run to run.
+
+  `mediadecode-ffmpeg`'s `CarrierVideoStreamDecoder` implements both
+  seats and answers `Unsupported` on every path it opens today — see
+  its own `CHANGELOG` entry and doc comments for the census, and the
+  per-backend follow-ups: VideoToolbox ([#55]), NVDEC/CUVID ([#56]),
+  VAAPI ([#57]), D3D11 Video Processor ([#58]).
+
+  [#50]: https://github.com/findit-studio/mediadecode/issues/50
+  [#55]: https://github.com/findit-studio/mediadecode/issues/55
+  [#56]: https://github.com/findit-studio/mediadecode/issues/56
+  [#57]: https://github.com/findit-studio/mediadecode/issues/57
+  [#58]: https://github.com/findit-studio/mediadecode/issues/58
+
 - **A track row carries the language its container declares**
   ([#44](https://github.com/findit-studio/mediadecode/issues/44)).
 

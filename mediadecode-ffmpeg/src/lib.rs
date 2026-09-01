@@ -153,7 +153,7 @@ pub type FfmpegOwnedResampler = resampler::CarrierResampler<Owned>;
 
 pub use sample_format::SampleFormat;
 pub use subtitle::{CarrierSubtitleStreamDecoder, SubtitleDecodeError};
-pub use ticket::{ChannelLayoutTicket, CodecTicket, CustomChannel, Ratio};
+pub use ticket::{ChannelLayoutTicket, CodecTicket, CustomChannel, DolbyVisionConfig, Ratio};
 pub use video::{CarrierVideoStreamDecoder, DecodePath, VideoDecodeError};
 
 // Every bare alias below binds [`FfmpegBuffer`] in the `D` seat — the
