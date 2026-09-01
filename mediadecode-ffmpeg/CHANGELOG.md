@@ -11,6 +11,8 @@ The backend-agnostic core it adapts has its own log at
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-09-01
+
 ### Added — three producers a consumer had no door onto
 
 - **`DecodePath` and `open_as`: a video session's decode path can be

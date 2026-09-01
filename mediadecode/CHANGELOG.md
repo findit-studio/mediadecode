@@ -11,6 +11,8 @@ The sibling FFmpeg adapter has its own log at
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-09-01
+
 ### Added
 
 - **`ScaledOutputCapability`: a platform-neutral capability word for
