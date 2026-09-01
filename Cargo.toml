@@ -92,6 +92,12 @@ single_use_lifetimes    = "warn"
 unexpected_cfgs         = { level = "warn", check-cfg = [
   'cfg(all_tests)',
   'cfg(tarpaulin)',
+  # Emitted by `mediadecode-ffmpeg/build.rs` when the FFmpeg this build
+  # links was compiled with VideoToolbox — i.e. when
+  # `libavutil/hwcontext_videotoolbox.h` is installed, which is what
+  # decides whether `AVVTFramesContext` reaches the bindings at all.
+  # `src/vtscale` compiles its VideoToolbox body only then.
+  'cfg(ffmpeg_videotoolbox)',
   # Set by `.cargo/config.toml` for `wasm32-*` targets and by
   # CI's `RUSTFLAGS`. `web-sys` gates WebCodecs APIs behind it.
   'cfg(web_sys_unstable_apis)',

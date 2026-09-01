@@ -282,6 +282,26 @@ pub(crate) trait HwInner: Send {
   /// that could be recorded. See
   /// [`CarrierVideoStreamDecoder::send_packet_impl`].
   fn records_submissions(&self) -> bool;
+
+  /// See [`VideoDecoder::scaled_output_capability`].
+  ///
+  /// Defaulted to the refusal so a test fake — which has no
+  /// VideoToolbox road behind it, and therefore no stage — answers
+  /// honestly without having to say so.
+  fn scaled_output_capability(&self) -> ScaledOutputCapability {
+    ScaledOutputCapability::Unsupported
+  }
+
+  /// See [`VideoDecoder::request_scaled_output`]. Defaulted to the
+  /// refusal, for the same reason as above.
+  fn request_scaled_output(&mut self, size: (u32, u32)) -> ScaledOutputCapability {
+    let _ = size;
+    ScaledOutputCapability::Unsupported
+  }
+
+  /// See [`VideoDecoder::cancel_scaled_output`]. Defaulted to nothing,
+  /// because a seat that never accepts a request has none to withdraw.
+  fn cancel_scaled_output(&mut self) {}
 }
 
 impl HwInner for VideoDecoder {
@@ -310,6 +330,18 @@ impl HwInner for VideoDecoder {
   #[inline]
   fn as_video_decoder(&self) -> Option<&VideoDecoder> {
     Some(self)
+  }
+  #[inline]
+  fn scaled_output_capability(&self) -> ScaledOutputCapability {
+    VideoDecoder::scaled_output_capability(self)
+  }
+  #[inline]
+  fn request_scaled_output(&mut self, size: (u32, u32)) -> ScaledOutputCapability {
+    VideoDecoder::request_scaled_output(self, size)
+  }
+  #[inline]
+  fn cancel_scaled_output(&mut self) {
+    VideoDecoder::cancel_scaled_output(self);
   }
 }
 
@@ -507,59 +539,98 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// [`ScaledOutputCapability`] for the determinism trade a caller
   /// takes on by requesting one.
   ///
-  /// **Always [`ScaledOutputCapability::Unsupported`] today, on every
-  /// path this crate opens — hardware included.** That is a census
-  /// finding, not an oversight this seam papers over:
+  /// **[`ScaledOutputCapability::Supported`] on exactly one road: a
+  /// live VideoToolbox session on an Apple target.** There, a
+  /// `VTPixelTransferSession` sits between the decoded hardware frame
+  /// and `av_hwframe_transfer_data` and resizes the `CVPixelBuffer` on
+  /// the GPU, so the fitted picture is what crosses to the CPU — see
+  /// [`crate::vtscale`] for the design, and
+  /// [mediadecode#55](https://github.com/findit-studio/mediadecode/issues/55)
+  /// for the ruling that chose it. Everything else answers
+  /// `Unsupported`, and each refusal has its own reason rather than a
+  /// shared shrug:
   ///
-  /// - **Hardware.** This crate's hardware backends (see [`Backend`])
-  ///   open through FFmpeg's *generic* hwaccel negotiation —
-  ///   `av_hwdevice_ctx_create` + a strict `get_format` callback — the
-  ///   same road every `Backend` variant takes. That road hands the
-  ///   destination size to libavcodec unconditionally
-  ///   (`AVHWFramesContext.width/height` are set from the coded
-  ///   dimensions during `avcodec_open2`, not from anything a caller
-  ///   supplies), and the one FFmpeg API built for a caller-owned
-  ///   VideoToolbox session with its own destination size —
-  ///   `AVVideotoolboxContext` / `av_videotoolbox_default_init`,
-  ///   `libavcodec/videotoolbox.h` — is not part of `ffmpeg-sys-next`'s
-  ///   bound surface (only the generic `hwcontext_videotoolbox.h` is).
-  ///   The download step confirms the same ceiling from the other
-  ///   side: `av_hwframe_transfer_data`'s own contract requires "the
-  ///   two frames must have matching allocated dimensions … since not
-  ///   all device types support transferring a sub-rectangle" — so
-  ///   even a downscale applied only at the CPU-transfer step is
-  ///   outside what this crate's FFmpeg-mediated hardware path can do.
-  ///   VideoToolbox is the one hardware backend this crate can prove
-  ///   real and wired on the host that built it (see
-  ///   [`Self::is_hardware_impl`]'s neighbours), and the finding above
-  ///   is exactly as true for it as for [`Backend::Vaapi`] /
-  ///   [`Backend::Cuda`] / [`Backend::D3d11va`], which this crate wires
-  ///   in source (`Backend::av_hwdevice_type`, `probe_order`) but
-  ///   cannot compile, run, or verify on a non-Linux, non-Windows host.
-  ///   A real decompression-session-level (or `VTPixelTransferSession`-
-  ///   level) implementation for VideoToolbox is
-  ///   [mediadecode#55](https://github.com/findit-studio/mediadecode/issues/55);
-  ///   the native scaling seam each of the other three backends has —
-  ///   NVDEC/CUVID in-decode scaling
+  /// - **A session that has degraded to software.** The stage is the
+  ///   hardware road's; this answer follows the session, so it flips to
+  ///   `Unsupported` the moment a fallback commits, and a caller that
+  ///   asks again learns it.
+  /// - **The other hardware backends.** [`Backend::Vaapi`],
+  ///   [`Backend::Cuda`] and [`Backend::D3d11va`] are wired in source
+  ///   (`Backend::av_hwdevice_type`, `probe_order`) but cannot be
+  ///   compiled, run or verified on a non-Linux, non-Windows host, and
+  ///   each has a native scaling seam of its own that this crate has
+  ///   not built: NVDEC/CUVID in-decode scaling
   ///   ([#56](https://github.com/findit-studio/mediadecode/issues/56)),
   ///   VAAPI VPP
   ///   ([#57](https://github.com/findit-studio/mediadecode/issues/57)),
   ///   the D3D11 Video Processor
-  ///   ([#58](https://github.com/findit-studio/mediadecode/issues/58))
-  ///   — is filed the same way, rather than fabricated here.
+  ///   ([#58](https://github.com/findit-studio/mediadecode/issues/58)).
+  ///   Filed rather than fabricated.
   /// - **Software.** See [`Self::request_scaled_output_impl`] for the
   ///   software road's own, separate refusal.
+  ///
+  /// What the VideoToolbox road did **not** get is decode-time
+  /// scaling, and the distinction is worth keeping: inter prediction
+  /// needs full-resolution reference frames, so every road decodes full
+  /// size internally. What this seam saves is the GPU→CPU crossing and
+  /// the CPU frame at the end of it — roughly thirtyfold on a 4K stream
+  /// fitted to a 512-class box. A caller-owned `VTDecompressionSession`
+  /// would save the same crossing and no more, which is why it stays
+  /// #55's standing future enhancement rather than this release's work.
+  ///
+  /// A pure query: calling it requests nothing and changes nothing
+  /// about what [`Self::receive_frame`] delivers.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub(crate) const fn scaled_output_capability_impl(&self) -> ScaledOutputCapability {
-    ScaledOutputCapability::Unsupported
+  pub(crate) fn scaled_output_capability_impl(&self) -> ScaledOutputCapability {
+    match &self.state {
+      DecodeState::Hw(hw) => hw.scaled_output_capability(),
+      DecodeState::Sw(_) => ScaledOutputCapability::Unsupported,
+    }
   }
 
-  /// Requests decode-time output scaling to `size`; always refuses.
-  /// See [`Self::scaled_output_capability_impl`] for the hardware-side
-  /// finding this shares.
+  /// Requests that this session emit pictures at `size` from the next
+  /// frame on. See [`Self::scaled_output_capability_impl`] for which
+  /// road can honor it at all.
   ///
-  /// **The software road's refusal has its own, different shape**,
-  /// worth naming rather than folding into "no backend does this yet":
+  /// # A parked frame refuses
+  ///
+  /// While [`Self::scratch_pending`] holds a decoded picture whose
+  /// conversion did not commit, this refuses. That frame is already
+  /// decided — the retry delivers it from the scratch without
+  /// consulting the stage — so accepting a new size would promise an
+  /// extent the very next frame cannot have. Drain it and ask again;
+  /// the same escape every other seat guarded by that flag offers.
+  ///
+  /// The refusal carries the same meaning as every other: the session
+  /// returns to full coded size, so any request already standing is
+  /// withdrawn. The parked picture keeps the extent it was decoded at.
+  ///
+  /// # When a mid-stream request takes effect
+  ///
+  /// On the **next** picture [`Self::receive_frame`] produces. The
+  /// stage is consulted per frame, on the way out of the hardware
+  /// decoder and before the GPU→CPU download, so a request never
+  /// reaches back to a picture already decoded and never waits longer
+  /// than the one being decoded now.
+  ///
+  /// # The two refusals this seat mints itself
+  ///
+  /// Neither is an error, and each **returns the session to full coded
+  /// size**, dropping any request already standing — what the trait
+  /// says this answer means, and the only reading a caller can act on
+  /// without risking a second resample of an already-fitted picture:
+  ///
+  /// - **A zero extent.** A zero-extent picture is not a smaller
+  ///   picture.
+  /// - **An upscale.** The stage exists to move fewer bytes across the
+  ///   GPU→CPU bus; enlarging moves more, and inventing detail the
+  ///   decoder did not produce is the caller's business rather than a
+  ///   decode session's. An *equal* size is not an upscale: it is
+  ///   accepted, and the stage simply has nothing to do.
+  ///
+  /// # The software road's refusal has its own, different shape
+  ///
+  /// Worth naming rather than folding into "no backend does this yet":
   /// FFmpeg's software decoders have no *general* decode-time scaling
   /// seam. The one option that comes close — `AVCodecContext.lowres`
   /// (the CLI's `-lowres`) — falls short on three separate counts, any
@@ -582,16 +653,46 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   ///    different (and worse) contract than "the same picture, smaller".
   ///
   /// So the software road's answer is not "unimplemented" the way the
-  /// hardware road's is — it is "full-size decode, then the fused
-  /// conform walk downstream", by design, on every codec this crate
-  /// decodes in software.
+  /// other hardware backends' is — it is "full-size decode, then the
+  /// fused conform walk downstream", by design, on every codec this
+  /// crate decodes in software.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub(crate) const fn request_scaled_output_impl(
-    &mut self,
-    size: (u32, u32),
-  ) -> ScaledOutputCapability {
-    let _ = size;
-    ScaledOutputCapability::Unsupported
+  pub(crate) fn request_scaled_output_impl(&mut self, size: (u32, u32)) -> ScaledOutputCapability {
+    // **A parked frame is already decided, so it may not be
+    // re-promised.** [`Self::scratch_pending`] means a picture came out
+    // of the decoder and its conversion did not commit; the retry
+    // delivers *that* frame from the scratch without going back through
+    // the stage, so it will arrive at whatever extent it already has.
+    // Accepting a new size here would answer `Supported` and then hand
+    // the caller a frame the new request never touched — the exact
+    // silent mismatch [`Self::scaled_output_capability_impl`]'s promise
+    // exists to rule out. Refusing changes nothing, which is the
+    // contract for a refusal, and the caller's escape is the one this
+    // seat already documents everywhere else: drain the frame, then ask
+    // again.
+    if self.scratch_pending {
+      tracing::debug!(
+        requested_width = size.0,
+        requested_height = size.1,
+        "mediadecode-ffmpeg: scaled-output request refused while a decoded frame is parked; \
+         the session returns to full size — drain it and ask again"
+      );
+      // **A refusal means the same thing here as anywhere else.**
+      // Returning `Unsupported` while an earlier request stayed armed
+      // would leave the caller resampling pictures this session went on
+      // fitting — the very double-scale the word exists to prevent. So
+      // the standing request goes, and with it what was built for it.
+      // The parked picture keeps the extent it was decoded at, which is
+      // the same rule an *acceptance* has always carried.
+      if let DecodeState::Hw(hw) = &mut self.state {
+        hw.cancel_scaled_output();
+      }
+      return ScaledOutputCapability::Unsupported;
+    }
+    match &mut self.state {
+      DecodeState::Hw(hw) => hw.request_scaled_output(size),
+      DecodeState::Sw(_) => ScaledOutputCapability::Unsupported,
+    }
   }
 
   /// Borrow the inner [`VideoDecoder`] when this decoder is still on the
@@ -1773,18 +1874,25 @@ macro_rules! video_lane_face {
       /// caller-requested output size. See
       /// [`ScaledOutputCapability`] and
       /// [`Self::request_scaled_output`].
-      pub const fn scaled_output_capability(&self) -> ScaledOutputCapability {
+      ///
+      /// `Supported` on a live VideoToolbox session on an Apple
+      /// target, `Unsupported` everywhere else — including on a
+      /// session that has degraded to software, which is why this
+      /// reads the session's live state rather than a fact recorded
+      /// once at open.
+      pub fn scaled_output_capability(&self) -> ScaledOutputCapability {
         self.scaled_output_capability_impl()
       }
 
-      /// Requests decode-time output scaling to `size` (width, height)
-      /// and reports whether it took effect. See
+      /// Requests that this session emit pictures at `size` (width,
+      /// height) from the next frame on, and reports whether the
+      /// request was recorded. See
       /// [`VideoStreamDecoder::request_scaled_output`] for the full
       /// contract (never an error) and
-      /// [`Self::scaled_output_capability`]'s documentation for why
-      /// every path this crate opens answers
-      /// [`ScaledOutputCapability::Unsupported`] today.
-      pub const fn request_scaled_output(&mut self, size: (u32, u32)) -> ScaledOutputCapability {
+      /// [`Self::scaled_output_capability`]'s documentation for which
+      /// road can honor one, what a mid-stream request means, and the
+      /// zero / upscale refusals this seat mints itself.
+      pub fn request_scaled_output(&mut self, size: (u32, u32)) -> ScaledOutputCapability {
         self.request_scaled_output_impl(size)
       }
 
