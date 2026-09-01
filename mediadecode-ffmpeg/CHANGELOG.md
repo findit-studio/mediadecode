@@ -11,6 +11,233 @@ The backend-agnostic core it adapts has its own log at
 
 ## [Unreleased]
 
+### Added — the seat 0.13 built gets its first occupant
+
+- **Scaled output on the VideoToolbox road: a `VTPixelTransferSession`
+  resizes the picture on the GPU, before it crosses to the CPU**
+  ([#55](https://github.com/findit-studio/mediadecode/issues/55)).
+
+  `scaled_output_capability()` answers
+  `ScaledOutputCapability::Supported` on a live VideoToolbox session on
+  an Apple target, and `request_scaled_output(size)` is honored there:
+  pictures come back at the requested extent from the next frame on.
+  0.13 shipped both methods answering `Unsupported` everywhere with a
+  census explaining why; this fills the seat on the one backend this
+  crate can compile, run and verify on the host that builds it.
+
+  **FFmpeg's hwaccel decode is untouched.** The decode still negotiates
+  through `av_hwdevice_ctx_create` + the strict `get_format` callback
+  and still produces a full-size `CVPixelBuffer` — inter prediction
+  needs full-resolution reference frames, so every road decodes full
+  size internally and no design changes that. What changed is the
+  **crossing**: between the decoded hardware frame and
+  `av_hwframe_transfer_data`, a `VTPixelTransferSession` resizes the
+  `CVPixelBuffer` into a fitted one, and *that* is what moves to the
+  CPU. A 4K stream fitted to a 512-class box moves roughly thirty times
+  fewer bytes over the bus, and allocates a CPU frame of the same
+  reduced size.
+
+  A caller-owned `VTDecompressionSession` with its own
+  `destinationImageBufferAttributes` — decode and scale in one session
+  — saves the same bandwidth and no more, and costs a second, parallel
+  VideoToolbox integration path plus an async output-callback
+  trampoline. It stays #55's standing future enhancement; the reopen
+  trigger is a measurement showing a gap this stage cannot close.
+
+  **The destination buffers are FFmpeg's, not this crate's.** A second
+  `AVHWFramesContext` is built over the decode session's own
+  VideoToolbox device at the fitted size, and every destination comes
+  out of it through `av_hwframe_get_buffer` — so each fitted
+  `CVPixelBuffer` arrives owned by an `AVFrame`, recycled through
+  libavutil's pool, and released by `av_frame_unref` exactly as the
+  decoder's own frames are. The only Core Foundation object this crate
+  owns on the road is the transfer session itself: one per stream and
+  requested size, cached, and retired when either changes.
+
+  **Nothing about it can fail a decode.** Every condition the stage
+  cannot honor makes it *stand down* for that frame — the full-size
+  picture goes to the CPU download exactly as before. That covers a
+  source that is not a VideoToolbox surface, a pixel buffer whose
+  extent is not the picture's, a standing request a mid-stream
+  resolution change turned into an upscale, a frame carrying a crop
+  rectangle a resize would invalidate, and a session, pool or transfer
+  that fails to build or run. It covers the case *after* the stage's own
+  work too: a fitted surface that is produced perfectly and then will
+  not cross to the CPU is the stage's failure, not the backend's, so the
+  decoder latches that size off, resets the destination and downloads
+  the original full-size frame — the path it took before any of this
+  existed — rather than reporting a hardware failure and degrading a
+  session that was working. No new error variant, no new failure mode
+  on the decode road.
+
+  **And the capability word stops promising the moment the stage stops
+  delivering.** The trait's contract is that a `Supported` answer lets a
+  caller skip its own resampler, so a session that quietly reverted to
+  full-size pictures under that answer would hand it mixed extents with
+  nothing to notice them by. The first frame that goes out at anything
+  other than a standing request's extent therefore flips
+  `scaled_output_capability` to `Unsupported` — the explicit transition
+  a caller is told to look for, one query away — **and stops the stage
+  with it**. That second half is what makes the word usable: a caller
+  told `Unsupported` resumes resampling for itself, so a session that
+  quietly fitted a later frame would have it resample an already-fitted
+  picture. The answer and the behaviour move together, and only an
+  accepted `request_scaled_output` restarts either — which also retires
+  what was built, since a stage that will not run has no business
+  holding a pooled surface and a session. A request the stream
+  already satisfies is not a broken promise: the picture arrives at
+  exactly the size asked for — and that is settled from the frame's own
+  extent *before* any of the stage's other refusals, so a frame that
+  merely cannot be scaled but is already the requested size does not
+  break anything either.
+
+  Three more places the promise and the resources are kept honest. A
+  request placed while a decoded frame is **parked** in the scratch (a
+  conversion that did not commit) is refused: that frame is delivered
+  from the scratch without consulting the stage, so accepting a new size
+  would promise an extent the very next picture cannot have — drain it
+  and ask again, the same escape every seat guarded by that flag offers.
+  And the refusal carries the same meaning there as everywhere, through
+  the same clearing operation: the session returns to full coded size,
+  so any request already standing is withdrawn and what was built for it
+  retired. The parked picture keeps the extent it was decoded at. An accepted request **always retires**
+  what is cached, including at an unchanged size, because a latched
+  build or transfer failure would otherwise survive an explicit
+  re-request and turn a transient failure permanent behind a renewed
+  promise. And the moment a frame's stream shape is known, anything
+  cached for a *different* one is retired — before the upscale and
+  aspect-ratio stand-downs, each of which returns early and would
+  otherwise leave a 4K surface, its frames context and its session
+  retained for a whole lower-resolution run.
+
+  **What it refuses, and what it keeps honest.** A zero extent and an
+  upscale are refused — downscale-or-equal only, per the pixel-budget
+  law this serves. A refusal is not an error, and it **returns the
+  session to full coded size**, dropping any request already standing:
+  that is what the trait says an `Unsupported` answer from this seat
+  means, and the only reading a caller can act on, since one told
+  `Unsupported` resamples for itself and a session still quietly fitting
+  to an older request would have it resample an already-fitted picture.
+  Like an acceptance, a refusal takes effect from the next picture; one
+  already decoded keeps the extent it was decoded at. The destination `CVPixelBuffer`'s format
+  is derived from the source's, so the transfer is a resize and not a
+  colour conversion, and the pixel format the CPU download reports is
+  the one the unscaled road reports. The sample aspect ratio is
+  corrected for the scale, so the display geometry a stream declared
+  survives a non-uniform fit. `served()` / acceleration observability
+  is unchanged, and a session that degrades to software answers
+  `Unsupported` again from that moment.
+
+  **The determinism trade is unchanged and still applies**: a backend's
+  scaler is not pixon's, so enabling scaled output trades cross-backend
+  byte-determinism for bandwidth. Pair it with the `DecodePath` pin
+  ([#50](https://github.com/findit-studio/mediadecode/issues/50)) when
+  a caller needs the same picture bytes run to run — the paired shape
+  is exercised end to end in `tests/scaled_output.rs`.
+
+  The other three backends still answer `Unsupported`, each with its
+  own filed native scaling seam: NVDEC/CUVID
+  ([#56](https://github.com/findit-studio/mediadecode/issues/56)),
+  VAAPI VPP
+  ([#57](https://github.com/findit-studio/mediadecode/issues/57)), the
+  D3D11 Video Processor
+  ([#58](https://github.com/findit-studio/mediadecode/issues/58)). So
+  does every software session, for the separately documented `lowres`
+  reasons.
+
+  **macOS and visionOS only, and the boundary is an availability
+  window rather than a preference.** `VTPixelTransferSessionCreate` and
+  its two companions are `API_AVAILABLE(macos(10.8), ios(16.0),
+  tvos(16.0), visionos(1.0))` and `API_UNAVAILABLE(watchos)`. Rust has
+  no availability attribute and no weak-import spelling for a plain
+  `extern "C"` declaration, so an iOS or tvOS binary with a deployment
+  target below 16.0 would carry a *strong* import of a symbol its
+  runtime does not export and fail in the dynamic loader at launch —
+  before any of the stage's stand-down logic could answer
+  `Unsupported`. macOS 10.8 and visionOS 1.0 sit below every deployment
+  target Rust supports there, so on those two the symbols are always
+  present. iOS, tvOS and watchOS answer `Unsupported`; reaching iOS/tvOS
+  16 and above would need a `dlopen`/`dlsym` resolution path, which is
+  not this change.
+
+  **And nothing about the FFmpeg build, deliberately.** The stage names
+  no FFmpeg symbol whose presence depends on how FFmpeg was configured:
+  the `AVHWFramesContext` it builds and the frames it draws are generic
+  libavutil, and the VideoToolbox calls are Apple's own. In particular
+  it does **not** steer the destination pool's pixel format through
+  `AVVTFramesContext.color_range`, which FFmpeg compiles only under
+  `CONFIG_VIDEOTOOLBOX` — depending on it would put a build script in
+  the business of predicting what `bindgen` will generate from headers
+  it has not seen, across include overlays, cross sysroots and
+  `BINDGEN_EXTRA_CLANG_ARGS`, and being wrong there is a crate that
+  will not compile. Instead the stage **verifies** the pool's `OSType`
+  on the very buffer it is about to write, every frame: a mismatch means
+  the transfer would convert rather than resize, and it stands down.
+  That is a stronger guarantee than steering was, and it needs nothing
+  from the build.
+
+  So an FFmpeg compiled without VideoToolbox is handled where it
+  belongs, at run time — no VideoToolbox device opens, the session takes
+  another backend or software, and the stage never sees a frame. The
+  narrowing this buys is one case: a full-range source (`420f`-class)
+  meets a video-range pool and is delivered full size instead of fitted.
+  VideoToolbox's H.264 and HEVC decode paths produce video-range
+  buffers, which is why the road this serves is unaffected in practice.
+
+  The two targets that pass the gate link `VideoToolbox`, `CoreVideo`
+  and `CoreFoundation` (`build.rs`), and
+  `MEDIADECODE_FFMPEG_NO_VIDEOTOOLBOX` compiles the stage out by
+  request. No new Cargo feature and no new dependency: the runtime
+  opt-in is `request_scaled_output` itself.
+
+  **A session never crosses a thread.** `VideoToolbox.framework` marks
+  `VTPixelTransferSessionRef` `CM_SWIFT_NONSENDABLE` and publishes no
+  cross-thread mobility guarantee, and `VideoDecoder` is `Send` — so
+  rather than assume one, the stage records the `std::thread::ThreadId`
+  each session was created on and retires and rebuilds when the decoder
+  has moved. A `ThreadId` rather than a `pthread_t` on purpose: Darwin
+  recycles POSIX handles, so a thread created after the owner exited can
+  be handed the same one and `pthread_equal` would call the two
+  identical — the exact off-owner reuse the guard exists to stop.
+  `ThreadId` is documented never to be reused for the process's
+  lifetime. The one call the stage cannot avoid making off-thread, the
+  release in `Drop`, is narrowed to the half the framework documents as
+  sufficient by itself: "when a pixel transfer session's retain count
+  reaches zero, it is automatically invalidated", so the optional
+  `VTPixelTransferSessionInvalidate` is made only on the owning thread
+  and the atomic `CFRelease` is what actually tears the session down.
+
+  **Two more stand-downs the metadata demands**, alongside the crop
+  rectangle. A frame carrying side data whose payload is expressed in
+  the picture's own grid — a pan-scan window in 1/16-pel units, a
+  spherical mapping, regions of interest in source pixel coordinates —
+  is delivered full size rather than fitted: a resize strands that
+  payload on a grid that no longer exists, and quietly dropping it is
+  the failure mode `copy_frame_props_minimal`'s own OOM arm already
+  rejects. The kinds are named rather than asked of FFmpeg 8's
+  `av_frame_side_data_desc`, which half the FFmpeg releases this crate
+  builds against do not have; the list is FFmpeg 9's own
+  size-dependent table intersected with the crate's copy whitelist, so
+  the four size-dependent kinds it never copies need no entry. Side-data
+  bookkeeping the walk cannot trust — a negative count, a positive count
+  with no array, a null entry, a count past the copy path's own
+  64-entry cap — stands down for the same reason. And a scale whose
+  corrected sample aspect ratio will not fit in `AVRational`'s `c_int`
+  pair stands down too: after the grid moves, republishing the source's
+  ratio is a wrong answer rather than a conservative one.
+
+### Changed
+
+- **`CarrierVideoStreamDecoder::scaled_output_capability` and
+  `::request_scaled_output` are no longer `const fn`.** Both now read
+  the session's live state — which road it is on, and what the stream's
+  coded extent is — rather than answering a compile-time constant, and
+  that is what lets the capability follow a session which degrades to
+  software instead of describing the machine it runs on. The
+  `mediadecode::VideoStreamDecoder` trait methods they implement were
+  never `const`, and neither is callable in a const context (both need
+  a live decoder), so no working caller can observe the change.
+
 ## [0.13.0] - 2026-09-01
 
 ### Added — three producers a consumer had no door onto

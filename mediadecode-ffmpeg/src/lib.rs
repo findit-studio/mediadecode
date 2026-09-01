@@ -42,6 +42,7 @@ mod subtitle;
 pub mod ticket;
 mod video;
 mod view;
+mod vtscale;
 
 pub use adapter::Ffmpeg;
 pub use audio::{AudioDecodeError, CarrierAudioStreamDecoder};

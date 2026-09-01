@@ -113,7 +113,7 @@ pub(crate) mod c_shims {
   }
 }
 
-use mediadecode::{Received, Sent};
+use mediadecode::{Received, Sent, decoder::ScaledOutputCapability};
 
 use crate::{
   backend::{self, Backend},
@@ -192,6 +192,24 @@ pub struct VideoDecoder {
   /// guessing. The probe machinery still reads it for replay; it simply
   /// no longer owns it.
   eof_sent: bool,
+  /// The GPU-side scaled-output stage — see [`crate::vtscale`]. Carries
+  /// the caller's standing [`Self::request_scaled_output`] and, on the
+  /// VideoToolbox road, the cached pixel-transfer session and fitted
+  /// frames context the CPU download reads from.
+  ///
+  /// **It rides the decoder rather than the wrapper** because the seam
+  /// it inserts itself into is here: between the decoded hardware frame
+  /// and `av_hwframe_transfer_data`, the one point at which a picture is
+  /// still a GPU surface and can still be resized without a
+  /// full-resolution round-trip through main memory.
+  ///
+  /// Declared last, so it drops **after** the [`DecoderState`] holding
+  /// the VideoToolbox device its fitted frames context was built over —
+  /// and that order is safe by the FFmpeg contract rather than by luck:
+  /// `av_hwframe_ctx_alloc` "will make a new reference for internal
+  /// use", so the device outlives the decoder that opened it for exactly
+  /// as long as this stage still holds a context over it.
+  scaled_output: crate::vtscale::ScaledOutput,
 }
 
 /// Owned FFmpeg state for one open codec context. Has its own `Drop` so we
@@ -423,6 +441,17 @@ struct ProbeState {
 // shared. `ffmpeg::decoder::Video` is itself `Send` (its `Context` carries an
 // `unsafe impl Send`). The decoder is not safe for concurrent use, hence not
 // `Sync`.
+//
+// `VideoDecoder`'s claim additionally covers what `crate::vtscale` holds on
+// Apple targets: a `VTPixelTransferSessionRef` and an `AVBufferRef` to a
+// fitted `AVHWFramesContext`. Both are exclusively owned by the stage — no
+// `Clone`, no handing out — and every use of the session goes through
+// `&mut ScaledOutput`, so the one-transfer-at-a-time protocol
+// `VTPixelTransferSessionTransferImage` expects is serialized by the borrow
+// rather than by a lock. VideoToolbox sessions are Core Foundation objects
+// with no thread affinity (unlike the UI-framework types that have one), so
+// moving one between threads is exactly as sound as moving the codec context
+// beside it. Still not `Sync`, for the same reason nothing else here is.
 unsafe impl Send for DecoderState {}
 unsafe impl Send for VideoDecoder {}
 
@@ -587,6 +616,7 @@ impl VideoDecoder {
             max_probe_pending_bytes: DEFAULT_MAX_PROBE_PENDING_BYTES,
             frame_limits: limits,
             eof_sent: false,
+            scaled_output: crate::vtscale::ScaledOutput::new(),
           });
         }
         Err(e) => {
@@ -636,6 +666,7 @@ impl VideoDecoder {
       max_probe_pending_bytes: DEFAULT_MAX_PROBE_PENDING_BYTES,
       frame_limits: limits,
       eof_sent: false,
+      scaled_output: crate::vtscale::ScaledOutput::new(),
     })
   }
 
@@ -701,6 +732,7 @@ impl VideoDecoder {
       max_probe_pending_bytes: DEFAULT_MAX_PROBE_PENDING_BYTES,
       frame_limits: limits,
       eof_sent: false,
+      scaled_output: crate::vtscale::ScaledOutput::new(),
     })
   }
 
@@ -731,6 +763,109 @@ impl VideoDecoder {
   /// actually produced it. Once stable, never changes again.
   pub fn backend(&self) -> Backend {
     self.state.backend
+  }
+
+  /// Whether this decoder can emit pictures at a caller-requested size
+  /// instead of full coded size.
+  ///
+  /// [`ScaledOutputCapability::Supported`] on exactly one road: the
+  /// VideoToolbox backend on an Apple target, where
+  /// [`crate::vtscale`]'s `VTPixelTransferSession` sits between the
+  /// decoded hardware frame and the CPU download. Every other backend
+  /// this crate wires — [`Backend::Vaapi`], [`Backend::Cuda`],
+  /// [`Backend::D3d11va`] — answers `Unsupported`, each with its own
+  /// filed native scaling seam.
+  ///
+  /// # And it stops saying `Supported` the moment the promise breaks
+  ///
+  /// The trait's contract is that a `Supported` answer lets a caller
+  /// skip its own resampler, so a session that quietly went back to
+  /// full-size pictures under that answer would hand the caller mixed
+  /// extents with nothing to notice them by. The stage can stand down
+  /// per frame — a padded pixel buffer, a crop rectangle, side data a
+  /// resize would strand, a resolution change that turns the standing
+  /// request into an upscale, a transfer that fails — and the **first**
+  /// frame that goes out at anything other than the requested extent
+  /// flips this answer to [`ScaledOutputCapability::Unsupported`]. That
+  /// is the explicit transition a caller is told to look for: query
+  /// again and learn that resampling is theirs once more. A fresh
+  /// [`Self::request_scaled_output`] buys a fresh promise.
+  ///
+  /// A request the stream already satisfies is not a broken promise:
+  /// the picture arrives at exactly the size asked for.
+  ///
+  /// A pure query: it neither requests anything nor changes what
+  /// [`Self::receive_frame`] delivers.
+  pub fn scaled_output_capability(&self) -> ScaledOutputCapability {
+    if crate::vtscale::ScaledOutput::supported()
+      && self.state.backend.is_video_toolbox()
+      && self.scaled_output.promise_stands()
+    {
+      ScaledOutputCapability::Supported
+    } else {
+      ScaledOutputCapability::Unsupported
+    }
+  }
+
+  /// Asks this decoder to emit pictures at `size` from the next frame
+  /// on, and reports whether the request was recorded.
+  ///
+  /// # What "from the next frame on" means, exactly
+  ///
+  /// The stage is consulted per frame, on the way out of the decoder
+  /// and before the GPU→CPU download. So a request placed mid-stream
+  /// takes effect on the next picture `receive_frame` produces — never
+  /// retroactively on one already decoded and queued, and never later
+  /// than that.
+  ///
+  /// # Refusal is not an error
+  ///
+  /// [`ScaledOutputCapability::Unsupported`] comes back when this road
+  /// has no stage at all (see [`Self::scaled_output_capability`]), when
+  /// either requested extent is zero, or when the request is an
+  /// **upscale** of the stream's coded size — the stage exists to move
+  /// fewer bytes across the GPU→CPU bus, and enlarging a picture moves
+  /// more. Nothing about [`Self::send_packet`] or
+  /// [`Self::receive_frame`] can fail because of it.
+  ///
+  /// **A refusal returns the session to full coded size**, dropping any
+  /// request already standing. That is what the trait says this answer
+  /// means, and the only reading a caller can act on: told
+  /// `Unsupported` it resamples for itself, and a session that went on
+  /// quietly fitting to an older request would have it resample an
+  /// already-fitted picture. Like an acceptance, it takes effect from
+  /// the next picture; one already decoded keeps the extent it was
+  /// decoded at.
+  ///
+  /// See [`ScaledOutputCapability`] for the determinism trade a caller
+  /// takes on by acting on a `Supported` answer.
+  pub fn request_scaled_output(&mut self, size: (u32, u32)) -> ScaledOutputCapability {
+    // **The road, not the standing promise.** A session whose promise
+    // broke on an earlier request answers `Unsupported` from
+    // [`Self::scaled_output_capability`] until somebody asks again —
+    // and asking again is exactly this, so gating it on that answer
+    // would make the break permanent and unrecoverable. What is checked
+    // here is what cannot change: whether this build and this backend
+    // have a stage at all.
+    if !crate::vtscale::ScaledOutput::supported() || !self.state.backend.is_video_toolbox() {
+      return ScaledOutputCapability::Unsupported;
+    }
+    let coded = (self.width(), self.height());
+    self.scaled_output.request(size, coded)
+  }
+
+  /// Withdraws any standing scaled-output request, returning this
+  /// decoder to full coded size from the next frame.
+  ///
+  /// The refusal road that does not go through
+  /// [`Self::request_scaled_output`]: the wrapper refuses a request
+  /// placed while a decoded picture is parked, and a refusal has to
+  /// mean the same thing there as everywhere else — the session is
+  /// returning to full coded size. Without this the old request would
+  /// stay armed behind an `Unsupported` answer, and a caller acting on
+  /// that answer would resample pictures that were already fitted.
+  pub fn cancel_scaled_output(&mut self) {
+    self.scaled_output.cancel();
   }
 
   /// Decoder width in pixels.
@@ -1260,7 +1395,59 @@ impl VideoDecoder {
           {
             return Err(Error::HwTransferTooLarge(e));
           }
-          match unsafe { transfer_hw_frame(frame, &mut self.hw_frame) } {
+          // **The scaled-output stage, and the one place it sits.** A
+          // standing request turns this into a GPU resize followed by a
+          // download of the *fitted* surface; with no request, or on any
+          // condition the stage cannot honor, `stage` answers `None` and
+          // the full-size hardware frame is downloaded exactly as
+          // before. It cannot fail — see [`crate::vtscale`].
+          //
+          // The byte ceiling above is deliberately **not** re-priced
+          // against the fitted size. `judge_hw_transfer` bounds what
+          // this road may allocate, and pricing the full-size frame is
+          // the conservative reading of that bound: a stream refused
+          // without scaled output is refused identically with it, so
+          // turning the stage on can never widen what the ceiling lets
+          // through. What it saves is the bus traffic and the CPU
+          // allocation actually paid, which is the trade #55 is about.
+          //
+          // **And a fitted surface that will not download is the
+          // stage's failure, not the backend's.** The scale can succeed
+          // and the crossing still fail — an unsupported destination
+          // pixel format, a metadata copy that runs out of memory — and
+          // routing that into the arms below would let an optional
+          // bandwidth optimisation reject a VideoToolbox decode that
+          // was working, or degrade the session to software. So the
+          // fitted attempt is made first and separately: if it fails,
+          // the stage latches the key off, the destination is reset,
+          // and the original full-size frame — still live in
+          // `hw_frame`, still the path this crate took before any of
+          // this existed — is downloaded instead. Only *that* failing
+          // is a hardware failure.
+          let scaled = self
+            .scaled_output
+            .stage(&self.hw_frame)
+            .map(|fitted| unsafe { transfer_hw_frame(frame, fitted) });
+          match scaled {
+            Some(Ok(())) => {
+              self.probe = None;
+              return Ok(Received::Frame);
+            }
+            Some(Err(e)) => {
+              tracing::warn!(
+                error = %e,
+                "hwdecode: the fitted surface would not download; retiring scaled output for \
+                 this size and delivering the full-size frame instead"
+              );
+              self.scaled_output.latch_failure();
+              // SAFETY: `frame` is the caller's slot; unreferencing it
+              // discards whatever the failed transfer left behind
+              // before the retry writes it again.
+              unsafe { av_frame_unref(frame.as_inner_mut().as_mut_ptr()) };
+            }
+            None => {}
+          }
+          match unsafe { transfer_hw_frame(frame, &self.hw_frame) } {
             Ok(()) => {
               self.probe = None;
               return Ok(Received::Frame);
@@ -1646,6 +1833,16 @@ impl VideoDecoder {
       // Commit: install the candidate, clear residual hw_frame, queue the
       // drained frames for the caller, and pop the now-active backend.
       self.state = candidate_state;
+      // **The scaled-output stage's session belongs to the device that
+      // just went away.** Its fitted frames context was built over the
+      // outgoing backend's hardware device; the caller's standing
+      // request outlives the advance, but nothing built for the old
+      // device may. Unreachable on the one platform where the stage has
+      // a body — `probe_order` names a single backend on Apple targets,
+      // so this method never reaches a commit there — and written all
+      // the same, because "unreachable today" is not a property a
+      // resource-owning cache should depend on.
+      self.scaled_output.retire();
       unsafe { av_frame_unref(self.hw_frame.as_mut_ptr()) };
       self.pending_frames.append(&mut local_pending);
       self
@@ -1843,6 +2040,14 @@ impl Drop for PartialBuildState {
 /// Download a HW frame into a CPU [`Frame`]. Always unrefs the destination
 /// first so reuse across resolution changes is safe.
 ///
+/// `src` is whichever surface the scaled-output stage nominated: the
+/// decoder's own hardware frame in the ordinary case, or the fitted
+/// surface [`crate::vtscale`] scaled it into when a request is standing.
+/// Both are VideoToolbox frames carrying their own `AVHWFramesContext`,
+/// and the fitted one already carries this frame's metadata — so this
+/// function's contract is unchanged either way, and the CPU frame's
+/// extent is the nominated surface's.
+///
 /// Deliberately does **not** call `av_frame_copy_props`. That FFmpeg
 /// helper deep-copies AVFrame side data (SEI, mastering display, ICC
 /// profiles, dynamic HDR, etc.), the metadata dict, and bumps both
@@ -1858,7 +2063,7 @@ impl Drop for PartialBuildState {
 /// time.
 unsafe fn transfer_hw_frame(
   dst: &mut Frame,
-  src: &mut frame::Video,
+  src: &frame::Video,
 ) -> std::result::Result<(), ffmpeg_next::Error> {
   unsafe {
     av_frame_unref(dst.as_inner_mut().as_mut_ptr());
@@ -1969,7 +2174,7 @@ unsafe fn sum_side_data_bytes(frame: *const AVFrame) -> usize {
 /// HW source frame to CPU destination frame on the HW transfer
 /// path. Mirrors `convert::SIDE_DATA_MAX_ENTRIES`; the public
 /// converter re-enforces the same cap so this is defense in depth.
-const HW_COPY_SIDE_DATA_MAX_ENTRIES: usize = 64;
+pub(crate) const HW_COPY_SIDE_DATA_MAX_ENTRIES: usize = 64;
 /// Hard cap on the total side-data byte budget per HW transfer.
 /// Mirrors `convert::SIDE_DATA_MAX_TOTAL_BYTES`.
 const HW_COPY_SIDE_DATA_MAX_TOTAL_BYTES: usize = 256 * 1024;
@@ -1995,7 +2200,9 @@ const HW_COPY_SIDE_DATA_MAX_TOTAL_BYTES: usize = 256 * 1024;
 /// params, RPU buffers, …) but are either decoder-internal or
 /// rarely useful through the public mediadecode API; dropping them
 /// is the safe default.
-fn whitelisted_side_data_kind(kind_raw: i32) -> Option<ffmpeg_next::ffi::AVFrameSideDataType> {
+pub(crate) fn whitelisted_side_data_kind(
+  kind_raw: i32,
+) -> Option<ffmpeg_next::ffi::AVFrameSideDataType> {
   use ffmpeg_next::ffi::AVFrameSideDataType;
   // Each match arm compares `kind_raw` against the i32 cast of a
   // known constant, then returns the constant itself — we never
@@ -2063,7 +2270,7 @@ fn whitelisted_side_data_kind(kind_raw: i32) -> Option<ffmpeg_next::ffi::AVFrame
   Some(kind)
 }
 
-unsafe fn copy_frame_props_minimal(
+pub(crate) unsafe fn copy_frame_props_minimal(
   dst: *mut AVFrame,
   src: *const AVFrame,
 ) -> std::result::Result<(), ffmpeg_next::Error> {

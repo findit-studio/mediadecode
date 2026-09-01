@@ -401,6 +401,31 @@ impl Corpus {
     out
   }
 
+  /// A plain 1920x1080 H.264 clip: uncropped, square-pixel, a second
+  /// of frames long.
+  ///
+  /// The shape the scaled-output lane needs and no other fixture here
+  /// has. `multi_track_mkv`'s video is 160x120 — fittable, but it
+  /// proves nothing about a GPU→CPU crossing worth saving — and
+  /// `cropped_h264`'s display and coded extents diverge on purpose,
+  /// which is a different question. This one is deliberately ordinary,
+  /// so a fitted output extent is the only thing about it that can
+  /// differ from an unfitted one.
+  #[rustfmt::skip]
+  pub fn plain_h264_1080p(&self) -> PathBuf {
+    let out = self.path("plain1080p.mp4");
+    if out.exists() {
+      return out;
+    }
+    run_ffmpeg(&[
+      "-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=25:d=1",
+      "-c:v", "libx264", "-preset", "ultrafast", "-g", "25",
+      "-pix_fmt", "yuv420p",
+      out.to_str().expect("utf-8 path"),
+    ]);
+    out
+  }
+
   /// A 6-channel FLAC, whose blocks are the shape the over-divided
   /// sample ruler refused: 65,535 samples x 6 channels is 393,210
   /// channel-samples of ordinary surround media.
