@@ -11,6 +11,34 @@ The backend-agnostic core it adapts has its own log at
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-09-01
+
+Tracks `mediadecode` 0.13.0 and `mediadecode-ffmpeg` 0.13.0. Neither
+touches a surface this adapter uses. The core release removes
+`Demuxer::take_tracks` and replaces `Demuxer::tracks`'s return with a
+handle (see
+[`mediadecode` 0.13.0](../mediadecode/CHANGELOG.md#0130)) and adds
+`ScaledOutputCapability` to `decoder::VideoStreamDecoder` — the
+**sync** trait. This crate implements neither `Demuxer` nor any
+demux-tier type — `WebCodecsVideoStreamDecoder` /
+`WebCodecsAudioStreamDecoder` are fed packets by something else — and
+it implements only the `future::local` async mirror of the decoder
+traits, which carries exactly the four methods it always has
+(`send_packet` / `receive_frame` / `send_eof` / `flush`); the new
+capability word was not added there. The FFmpeg-only additions
+(`DecodePath` / `open_as`, `ContainerFormat`, `CodecId::name` /
+`::long_name`, `DolbyVisionConfig`, `mediadecode-ffmpeg`'s own
+`scaled_output_capability` impl) live one crate over, on a dependency
+this crate does not carry.
+
+No adapter source line moved.
+
+Verified on the real dependency graph (native builds this crate
+empty): `cargo check` / `cargo clippy --all-features -- -D warnings`
+on `--target wasm32-unknown-unknown`, both clean with zero source
+change. The browser `wasm-bindgen-test` lane needing headless Chromium
+is CI-only and was not run locally.
+
 ## [0.12.0] - 2026-08-30
 
 ### Changed (BREAKING)
