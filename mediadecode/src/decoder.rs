@@ -50,6 +50,51 @@ use crate::{
   packet::{AudioPacket, SubtitlePacket, VideoPacket},
 };
 
+/// Whether a decode session can emit decoded pictures at a caller-
+/// requested output size instead of full coded size.
+///
+/// A platform-neutral **capability word** on the video decode session
+/// family: every [`VideoStreamDecoder`] answers it, and a backend that
+/// cannot honor a smaller output size answers
+/// [`Self::Unsupported`] — never an error. See
+/// [`VideoStreamDecoder::scaled_output_capability`] and
+/// [`VideoStreamDecoder::request_scaled_output`].
+///
+/// # The determinism trade, verbatim
+///
+/// A backend's scaler is not pixon's — enabling scaled output trades
+/// cross-backend byte-determinism for bandwidth; recommended together
+/// with a pinned backend (`#50`'s face — [`DecodePath::Hardware`] /
+/// [`DecodePath::Software`] in `mediadecode-ffmpeg`, or the equivalent
+/// pin on any other backend). A caller that resamples with the ordinary
+/// area-resample kernel elsewhere in this ecosystem, and needs the same
+/// picture bytes regardless of which decode path served the stream,
+/// should leave scaled output unrequested and pin the backend instead —
+/// two different decoders' hardware scalers do not agree bit-for-bit,
+/// where two runs of the same pinned software path do.
+///
+/// [`DecodePath::Hardware`]: https://docs.rs/mediadecode-ffmpeg/latest/mediadecode_ffmpeg/enum.DecodePath.html
+/// [`DecodePath::Software`]: https://docs.rs/mediadecode-ffmpeg/latest/mediadecode_ffmpeg/enum.DecodePath.html
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ScaledOutputCapability {
+  /// This backend has no decode-time output-size seam. Every picture
+  /// comes back at full coded size regardless of what was requested —
+  /// the caller decides whether to resample it afterwards.
+  Unsupported,
+  /// This backend can decode directly to the size most recently
+  /// accepted by [`VideoStreamDecoder::request_scaled_output`].
+  Supported,
+}
+
+impl ScaledOutputCapability {
+  /// `true` for [`Self::Supported`].
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn is_supported(&self) -> bool {
+    matches!(self, Self::Supported)
+  }
+}
+
 /// Push-style video decoder. Caller submits compressed packets and
 /// drains decoded frames.
 ///
@@ -102,6 +147,44 @@ pub trait VideoStreamDecoder {
   /// Flushes internal state. Not a submission — nothing is offered, so
   /// there is nothing to be back-pressured.
   fn flush(&mut self) -> Result<(), Self::Error>;
+
+  /// Whether this session can currently emit pictures at a caller-
+  /// requested output size instead of full coded size. See
+  /// [`ScaledOutputCapability`] for what a `Self::Supported` answer
+  /// costs a caller who acts on it.
+  ///
+  /// A pure query — it does not itself request anything, and calling
+  /// it has no effect on what [`receive_frame`](Self::receive_frame)
+  /// delivers. Defaults to [`ScaledOutputCapability::Unsupported`] so
+  /// every existing implementor of this trait keeps compiling; a
+  /// backend that can honor a request overrides both this and
+  /// [`request_scaled_output`](Self::request_scaled_output) to say so.
+  fn scaled_output_capability(&self) -> ScaledOutputCapability {
+    ScaledOutputCapability::Unsupported
+  }
+
+  /// Requests that this session emit decoded pictures at `size`
+  /// (width, height) from here on, and reports whether the request was
+  /// honored.
+  ///
+  /// Refusal is **not an error**: a backend that cannot honor the
+  /// request answers [`ScaledOutputCapability::Unsupported`] and
+  /// leaves the session decoding at full coded size — nothing about
+  /// [`send_packet`](Self::send_packet) or
+  /// [`receive_frame`](Self::receive_frame) can fail because a
+  /// requested size was refused. The caller reads the return value (or
+  /// calls [`scaled_output_capability`](Self::scaled_output_capability)
+  /// again) to learn which happened, and falls back to resampling the
+  /// full-size picture itself when it did not take effect.
+  ///
+  /// Defaults to a no-op that always answers
+  /// [`ScaledOutputCapability::Unsupported`], matching
+  /// [`scaled_output_capability`](Self::scaled_output_capability)'s
+  /// default — every existing implementor keeps compiling.
+  fn request_scaled_output(&mut self, size: (u32, u32)) -> ScaledOutputCapability {
+    let _ = size;
+    ScaledOutputCapability::Unsupported
+  }
 }
 
 /// Pull-style video frame source. Caller requests frames by integer
@@ -383,6 +466,34 @@ mod tests {
     fn _source<D: VideoFrameSource>() {}
     _stream::<LoopVideoStream>();
     _source::<LoopVideoSource>();
+  }
+
+  /// An implementor that overrides neither new method keeps compiling
+  /// (the whole point of a default) and answers the honest "no seam"
+  /// value — never an error, and requesting a size has no effect on
+  /// what [`VideoStreamDecoder::receive_frame`] would deliver.
+  #[test]
+  fn scaled_output_defaults_to_unsupported_and_never_errors() {
+    let mut decoder = LoopVideoStream;
+    assert_eq!(
+      decoder.scaled_output_capability(),
+      ScaledOutputCapability::Unsupported
+    );
+    assert_eq!(
+      decoder.request_scaled_output((64, 64)),
+      ScaledOutputCapability::Unsupported
+    );
+    // The query is unaffected by the request that just ran.
+    assert_eq!(
+      decoder.scaled_output_capability(),
+      ScaledOutputCapability::Unsupported
+    );
+  }
+
+  #[test]
+  fn scaled_output_capability_is_supported_predicate_agrees_with_the_variant() {
+    assert!(ScaledOutputCapability::Supported.is_supported());
+    assert!(!ScaledOutputCapability::Unsupported.is_supported());
   }
 
   pub(crate) struct ALoop;

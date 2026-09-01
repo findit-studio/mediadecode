@@ -84,7 +84,10 @@ const SW_REPLAY_FRAME_CAP: usize = 64;
 use derive_more::{IsVariant, TryUnwrap, Unwrap};
 use ffmpeg_next::{Packet, codec::Parameters, frame};
 use mediadecode::{
-  Received, Sent, Timebase, decoder::VideoStreamDecoder, frame::VideoFrame, packet::VideoPacket,
+  Received, Sent, Timebase,
+  decoder::{ScaledOutputCapability, VideoStreamDecoder},
+  frame::VideoFrame,
+  packet::VideoPacket,
 };
 
 use crate::{
@@ -497,6 +500,98 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub(crate) const fn is_hardware_impl(&self) -> bool {
     matches!(self.state, DecodeState::Hw(_))
+  }
+
+  /// Whether this session can currently honor a
+  /// [`Self::request_scaled_output_impl`] request. See
+  /// [`ScaledOutputCapability`] for the determinism trade a caller
+  /// takes on by requesting one.
+  ///
+  /// **Always [`ScaledOutputCapability::Unsupported`] today, on every
+  /// path this crate opens — hardware included.** That is a census
+  /// finding, not an oversight this seam papers over:
+  ///
+  /// - **Hardware.** This crate's hardware backends (see [`Backend`])
+  ///   open through FFmpeg's *generic* hwaccel negotiation —
+  ///   `av_hwdevice_ctx_create` + a strict `get_format` callback — the
+  ///   same road every `Backend` variant takes. That road hands the
+  ///   destination size to libavcodec unconditionally
+  ///   (`AVHWFramesContext.width/height` are set from the coded
+  ///   dimensions during `avcodec_open2`, not from anything a caller
+  ///   supplies), and the one FFmpeg API built for a caller-owned
+  ///   VideoToolbox session with its own destination size —
+  ///   `AVVideotoolboxContext` / `av_videotoolbox_default_init`,
+  ///   `libavcodec/videotoolbox.h` — is not part of `ffmpeg-sys-next`'s
+  ///   bound surface (only the generic `hwcontext_videotoolbox.h` is).
+  ///   The download step confirms the same ceiling from the other
+  ///   side: `av_hwframe_transfer_data`'s own contract requires "the
+  ///   two frames must have matching allocated dimensions … since not
+  ///   all device types support transferring a sub-rectangle" — so
+  ///   even a downscale applied only at the CPU-transfer step is
+  ///   outside what this crate's FFmpeg-mediated hardware path can do.
+  ///   VideoToolbox is the one hardware backend this crate can prove
+  ///   real and wired on the host that built it (see
+  ///   [`Self::is_hardware_impl`]'s neighbours), and the finding above
+  ///   is exactly as true for it as for [`Backend::Vaapi`] /
+  ///   [`Backend::Cuda`] / [`Backend::D3d11va`], which this crate wires
+  ///   in source (`Backend::av_hwdevice_type`, `probe_order`) but
+  ///   cannot compile, run, or verify on a non-Linux, non-Windows host.
+  ///   A real decompression-session-level (or `VTPixelTransferSession`-
+  ///   level) implementation for VideoToolbox is
+  ///   [mediadecode#55](https://github.com/findit-studio/mediadecode/issues/55);
+  ///   the native scaling seam each of the other three backends has —
+  ///   NVDEC/CUVID in-decode scaling
+  ///   ([#56](https://github.com/findit-studio/mediadecode/issues/56)),
+  ///   VAAPI VPP
+  ///   ([#57](https://github.com/findit-studio/mediadecode/issues/57)),
+  ///   the D3D11 Video Processor
+  ///   ([#58](https://github.com/findit-studio/mediadecode/issues/58))
+  ///   — is filed the same way, rather than fabricated here.
+  /// - **Software.** See [`Self::request_scaled_output_impl`] for the
+  ///   software road's own, separate refusal.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub(crate) const fn scaled_output_capability_impl(&self) -> ScaledOutputCapability {
+    ScaledOutputCapability::Unsupported
+  }
+
+  /// Requests decode-time output scaling to `size`; always refuses.
+  /// See [`Self::scaled_output_capability_impl`] for the hardware-side
+  /// finding this shares.
+  ///
+  /// **The software road's refusal has its own, different shape**,
+  /// worth naming rather than folding into "no backend does this yet":
+  /// FFmpeg's software decoders have no *general* decode-time scaling
+  /// seam. The one option that comes close — `AVCodecContext.lowres`
+  /// (the CLI's `-lowres`) — falls short on three separate counts, any
+  /// one of which would disqualify it as this seam's software answer:
+  ///
+  /// 1. **Narrow codec coverage.** `lowres` is wired only into the
+  ///    legacy MPEG-family decoders (MPEG-1/2/4 part 2, H.263) that
+  ///    still carry the low-resolution IDCT machinery it depends on.
+  ///    HEVC, AV1 and VP9 — the codecs a modern HDR pipeline actually
+  ///    decodes — implement no `lowres` support at all.
+  /// 2. **The one codec that is wired is broken.** `lowres` on H.264
+  ///    (also nominally covered) has been non-functional for years —
+  ///    the decoder does not honor it correctly — so even the "old
+  ///    family" half of the promise does not hold across the board.
+  /// 3. **It is not a resize, it is reduced reconstruction.** Where it
+  ///    does work, `lowres` decodes at a coarser IDCT precision
+  ///    (`1<<lowres`), skipping reconstruction detail rather than
+  ///    decoding in full and scaling the result — later inter frames
+  ///    drift from a reference the decoder itself degraded, which is a
+  ///    different (and worse) contract than "the same picture, smaller".
+  ///
+  /// So the software road's answer is not "unimplemented" the way the
+  /// hardware road's is — it is "full-size decode, then the fused
+  /// conform walk downstream", by design, on every codec this crate
+  /// decodes in software.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub(crate) const fn request_scaled_output_impl(
+    &mut self,
+    size: (u32, u32),
+  ) -> ScaledOutputCapability {
+    let _ = size;
+    ScaledOutputCapability::Unsupported
   }
 
   /// Borrow the inner [`VideoDecoder`] when this decoder is still on the
@@ -1674,6 +1769,25 @@ macro_rules! video_lane_face {
         self.is_hardware_impl()
       }
 
+      /// Whether this session can currently emit pictures at a
+      /// caller-requested output size. See
+      /// [`ScaledOutputCapability`] and
+      /// [`Self::request_scaled_output`].
+      pub const fn scaled_output_capability(&self) -> ScaledOutputCapability {
+        self.scaled_output_capability_impl()
+      }
+
+      /// Requests decode-time output scaling to `size` (width, height)
+      /// and reports whether it took effect. See
+      /// [`VideoStreamDecoder::request_scaled_output`] for the full
+      /// contract (never an error) and
+      /// [`Self::scaled_output_capability`]'s documentation for why
+      /// every path this crate opens answers
+      /// [`ScaledOutputCapability::Unsupported`] today.
+      pub const fn request_scaled_output(&mut self, size: (u32, u32)) -> ScaledOutputCapability {
+        self.request_scaled_output_impl(size)
+      }
+
       /// The hardware wrapper, when one is in use.
       pub fn hardware_inner(&self) -> Option<&VideoDecoder> {
         self.hardware_inner_impl()
@@ -1710,6 +1824,14 @@ macro_rules! video_lane_face {
 
       fn flush(&mut self) -> Result<(), Self::Error> {
         self.flush_impl()
+      }
+
+      fn scaled_output_capability(&self) -> ScaledOutputCapability {
+        self.scaled_output_capability_impl()
+      }
+
+      fn request_scaled_output(&mut self, size: (u32, u32)) -> ScaledOutputCapability {
+        self.request_scaled_output_impl(size)
       }
     }
   )+ };

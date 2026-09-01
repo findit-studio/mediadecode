@@ -456,6 +456,63 @@ impl Corpus {
     out
   }
 
+  /// A tiny HEVC clip carrying real HDR10 static metadata: PQ transfer
+  /// (`smpte2084`), BT.2020 primaries, and both mastering-display and
+  /// content-light-level SEI messages — `libx265`'s own `hdr10=1`
+  /// bitstream writer, not a hand-rolled approximation.
+  ///
+  /// `ffmpeg`'s CLI has no flag to attach `AV_FRAME_DATA_MASTERING_
+  /// DISPLAY_METADATA` / `AV_FRAME_DATA_CONTENT_LIGHT_LEVEL` directly
+  /// (`hevc_metadata` only reaches the VUI colour tags); `libx265`'s
+  /// `-x265-params master-display=…:max-cll=…` is the one encoder path
+  /// available here that writes the SEI, and it is a real HEVC decode
+  /// FFmpeg's own parser reads back — cross-checked with
+  /// `ffprobe -show_frames` before these exact numbers went into
+  /// `convert::tests`' unit fixtures. Like every other codec this
+  /// module's recipes name (`libx264`, `aac`, `flac`, …), `libx265` is
+  /// assumed present rather than separately probed — the same stance
+  /// [`run_ffmpeg`] takes everywhere else; it ships in the Homebrew
+  /// `ffmpeg` formula this crate's own CI installs.
+  #[rustfmt::skip]
+  pub fn hdr10_hevc(&self) -> PathBuf {
+    let out = self.path("hdr10.mp4");
+    if out.exists() {
+      return out;
+    }
+    run_ffmpeg(&[
+      "-f", "lavfi", "-i", "testsrc2=size=64x48:rate=5:duration=1",
+      "-c:v", "libx265", "-pix_fmt", "yuv420p10le",
+      "-x265-params",
+      "hdr10=1:repeat-headers=1:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:\
+       master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1):\
+       max-cll=1000,400",
+      out.to_str().expect("utf-8 path"),
+    ]);
+    out
+  }
+
+  /// A tiny HEVC clip tagged HLG (`arib-std-b67`) / BT.2020, carrying
+  /// **no** mastering-display or content-light-level side data — the
+  /// paired "absent metadata answers absent" fixture to
+  /// [`Self::hdr10_hevc`]: a different, real transfer characteristic,
+  /// decoded through the same path, with the HDR10-only seats reading
+  /// `None` rather than a leftover default.
+  #[rustfmt::skip]
+  pub fn hlg_hevc(&self) -> PathBuf {
+    let out = self.path("hlg.mp4");
+    if out.exists() {
+      return out;
+    }
+    run_ffmpeg(&[
+      "-f", "lavfi", "-i", "testsrc2=size=64x48:rate=5:duration=1",
+      "-c:v", "libx265", "-pix_fmt", "yuv420p10le",
+      "-x265-params",
+      "repeat-headers=1:colorprim=bt2020:transfer=arib-std-b67:colormatrix=bt2020nc",
+      out.to_str().expect("utf-8 path"),
+    ]);
+    out
+  }
+
   /// A signed-16-bit PCM WAV holding `seconds` of a `hz` sine at
   /// `rate` Hz across `channels` channels. PCM so the decode step adds
   /// no error of its own to whatever the resample lane measures.

@@ -128,6 +128,82 @@ The backend-agnostic core it adapts has its own log at
   what the file wrote — see the core's changelog for why nothing here
   folds it.
 
+### Added — the HDR/colour faces, and a scaled-output capability word
+
+- **HDR10 static metadata now actually crosses.** `VideoFrameExtra`
+  has carried `mastering_display` / `content_light_level` seats
+  (`Option<MasteringDisplay>` / `Option<ContentLightLevel>`) since
+  before this release, but nothing populated them from a real decoded
+  frame — every session answered `None` regardless of what the stream
+  carried. Wired at the one place a `VideoFrameExtra` is built: an
+  `AV_FRAME_DATA_MASTERING_DISPLAY_METADATA` / `AV_FRAME_DATA_CONTENT_
+  LIGHT_LEVEL` side-data entry on the decoded `AVFrame`, when present,
+  is now parsed onto the matching seat; absent, the seat reads `None`,
+  same as before. Cross-checked against a real `libx265` HDR10 encode
+  on this host — `ffprobe -show_frames` and this crate's own decode
+  agree on every number.
+
+  Color transfer characteristic and primaries (`ColorTransfer` /
+  `ColorPrimaries`, both open-vocabulary with an `Other` escape) and
+  the rest of `ColorInfo` were already fully wired end to end before
+  this release, via the shared `mediaframe::color` vocabulary — this
+  release adds no new words there, only proves PQ and HLG each decode
+  correctly (see the `hdr_metadata` integration test) alongside the
+  now-wired static HDR seats.
+
+- **`CodecTicket::dolby_vision_config`: the Dolby Vision configuration
+  record's two routing numbers.**
+
+  ```rust
+  pub struct DolbyVisionConfig { .. }
+  impl DolbyVisionConfig {
+    pub const fn profile(&self) -> u8;
+    pub const fn compatibility_id(&self) -> u8;
+  }
+  impl CodecTicket {
+    pub fn dolby_vision_config(&self) -> Option<DolbyVisionConfig>;
+  }
+  ```
+
+  Reads the `dv_profile` / `dv_bl_signal_compatibility_id` seats of the
+  container's `dvcC` / `dvvC` / `dwvC` box, when
+  `AV_PKT_DATA_DOVI_CONF` side data is present on the stream's codec
+  parameters — `None` otherwise. Numbers only, no interpretation: this
+  crate does not map a profile number onto a named Dolby Vision profile
+  or a compatibility id onto "HDR10-compatible" / "SDR-compatible" —
+  that table belongs to the consumer that already routes
+  base-layer-vs-refuse on it.
+
+  The per-frame half of Dolby Vision — the RPU buffer
+  (`AV_FRAME_DATA_DOVI_RPU_BUFFER`) and parsed dynamic metadata
+  (`AV_FRAME_DATA_DOVI_METADATA`), plus HDR10+ dynamic metadata
+  (`AV_FRAME_DATA_DYNAMIC_HDR_PLUS`) — is not exposed by this release;
+  filed as [#54](https://github.com/findit-studio/mediadecode/issues/54).
+
+- **`scaled_output_capability` / `request_scaled_output` implemented**
+  on `CarrierVideoStreamDecoder` (both lanes), answering the core's new
+  `VideoStreamDecoder` capability word. **Both answer `Unsupported` on
+  every path this crate opens today** — hardware included. That is a
+  documented census finding, not an oversight: every hardware backend
+  here negotiates through FFmpeg's generic hwaccel machinery, which
+  hands the destination size to libavcodec unconditionally, and
+  `av_hwframe_transfer_data`'s own contract requires the source and
+  destination frames to share their allocated dimensions — so even a
+  downscale at the CPU-transfer step is out of reach. Software decoders
+  have no general decode-time scaling seam either; the legacy `lowres`
+  option covers only the old MPEG family (and is broken even there for
+  H.264), skipping reconstruction detail rather than decoding in full
+  and resizing. See `CarrierVideoStreamDecoder::scaled_output_
+  capability`'s doc comment for the full census and the per-backend
+  enhancement issues: VideoToolbox
+  ([#55](https://github.com/findit-studio/mediadecode/issues/55)),
+  NVDEC/CUVID
+  ([#56](https://github.com/findit-studio/mediadecode/issues/56)),
+  VAAPI
+  ([#57](https://github.com/findit-studio/mediadecode/issues/57)),
+  D3D11 Video Processor
+  ([#58](https://github.com/findit-studio/mediadecode/issues/58)).
+
 ### Fixed
 
 - **`tests/audio_pcm_fixtures.rs` skipped on a fetched corpus and

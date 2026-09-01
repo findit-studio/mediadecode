@@ -327,3 +327,111 @@ fn the_debug_prints_sizes_rather_than_payloads() {
   assert!(text.contains("coded_side_data: 1"), "{text}");
   assert!(!text.contains("171"), "the bytes themselves leaked: {text}");
 }
+
+// ---------------------------------------------------------------------------
+//  The Dolby Vision configuration record — `AV_PKT_DATA_DOVI_CONF`.
+// ---------------------------------------------------------------------------
+
+/// Builds an `AVCodecParameters` carrying one `AV_PKT_DATA_DOVI_CONF`
+/// entry whose payload is a byte-for-byte
+/// `AVDOVIDecoderConfigurationRecord` (`dv_version_major,
+/// dv_version_minor, dv_profile, dv_level, rpu_present_flag,
+/// el_present_flag, bl_present_flag, dv_bl_signal_compatibility_id,
+/// dv_md_compression` — nine one-byte seats, per
+/// `libavutil/dovi_meta.h`).
+///
+/// No `ffmpeg` CLI recipe mints a `dvcC`/`dvvC` box (real Dolby Vision
+/// encoding needs Dolby's own tools, which this workspace does not
+/// carry), so — the same road [`parameters_with`]'s ICC-profile arm and
+/// `codec_ticket_parity.rs`'s minted MOV both take for a seat no
+/// container the CLI can produce — the side-data entry is built by
+/// hand, at the `AVCodecParameters` boundary [`CodecTicket::mirror`]
+/// actually reads.
+fn parameters_with_dovi_config(record: [u8; 9]) -> Parameters {
+  let mut out = Parameters::new();
+  // SAFETY: `out` owns a live `AVCodecParameters`; both allocations
+  // come from FFmpeg's allocator and are handed to it, so
+  // `avcodec_parameters_free` releases them with the struct.
+  unsafe {
+    let par = out.as_mut_ptr();
+    let array = av_mallocz(core::mem::size_of::<AVPacketSideData>()).cast::<AVPacketSideData>();
+    assert!(!array.is_null(), "av_mallocz side-data array");
+    let payload = av_mallocz(record.len()).cast::<u8>();
+    assert!(!payload.is_null(), "av_mallocz the dovi config record");
+    core::ptr::copy_nonoverlapping(record.as_ptr(), payload, record.len());
+    (*array).data = payload;
+    (*array).size = record.len();
+    core::ptr::write_unaligned(
+      core::ptr::addr_of_mut!((*array).type_).cast::<i32>(),
+      ffmpeg_next::ffi::AVPacketSideDataType::AV_PKT_DATA_DOVI_CONF as i32,
+    );
+    (*par).coded_side_data = array;
+    (*par).nb_coded_side_data = 1;
+  }
+  out
+}
+
+/// Profile 8.1 (`dv_profile = 8`), base-layer compatibility id 1
+/// ("HDR10 base layer") — a realistic streaming-service shape, read
+/// through the whole mirror path a real MOV demuxer would also drive
+/// `coded_side_data` through.
+#[test]
+fn dolby_vision_config_crosses_through_the_mirror() {
+  // major=1 minor=0 profile=8 level=6 rpu=1 el=0 bl=1 compat_id=1 md_compression=0
+  let record = [1u8, 0, 8, 6, 1, 0, 1, 1, 0];
+  let parameters = parameters_with_dovi_config(record);
+  let ticket = CodecTicket::mirror(&parameters, 9, usize::MAX).expect("mirror");
+
+  let dovi = ticket
+    .dolby_vision_config()
+    .expect("the minted dvcC-shaped entry parses");
+  assert_eq!(dovi.profile(), 8);
+  assert_eq!(dovi.compatibility_id(), 1);
+}
+
+/// A stream with no `AV_PKT_DATA_DOVI_CONF` entry at all — the
+/// overwhelming majority of real files — answers `None`, not a
+/// default-valued record.
+#[test]
+fn dolby_vision_config_is_none_when_the_stream_carries_no_dovi_box() {
+  let parameters = parameters_with(0, 0);
+  let ticket = CodecTicket::mirror(&parameters, 10, usize::MAX).expect("mirror");
+  assert!(ticket.dolby_vision_config().is_none());
+}
+
+/// An `AV_PKT_DATA_DOVI_CONF` entry present but too short to hold the
+/// compatibility id (offset 7) is a version-skew or corrupt shape —
+/// refused rather than read past the end.
+#[test]
+fn dolby_vision_config_refuses_a_short_payload() {
+  // Minted directly rather than through the 9-byte helper: the
+  // record's `profile`/`level`/flags are set but the array is shrunk
+  // to 6 bytes — before the compatibility id at offset 7.
+  let mut truncated = Parameters::new();
+  unsafe {
+    let par = truncated.as_mut_ptr();
+    let array = av_mallocz(core::mem::size_of::<AVPacketSideData>()).cast::<AVPacketSideData>();
+    assert!(!array.is_null(), "av_mallocz side-data array");
+    let payload = av_mallocz(6).cast::<u8>();
+    assert!(!payload.is_null(), "av_mallocz the short payload");
+    core::ptr::copy_nonoverlapping([1u8, 0, 8, 6, 1, 0].as_ptr(), payload, 6);
+    (*array).data = payload;
+    (*array).size = 6;
+    core::ptr::write_unaligned(
+      core::ptr::addr_of_mut!((*array).type_).cast::<i32>(),
+      ffmpeg_next::ffi::AVPacketSideDataType::AV_PKT_DATA_DOVI_CONF as i32,
+    );
+    (*par).coded_side_data = array;
+    (*par).nb_coded_side_data = 1;
+  }
+  let ticket = CodecTicket::mirror(&truncated, 11, usize::MAX).expect("mirror");
+  assert!(
+    ticket.dolby_vision_config().is_none(),
+    "a 6-byte payload has no compatibility_id seat (offset 7)"
+  );
+  // The un-truncated sibling parses, so the refusal above is about the
+  // length and not some other mistake in the fixture.
+  let full = parameters_with_dovi_config([1, 0, 8, 6, 1, 0, 1, 1, 0]);
+  let full_ticket = CodecTicket::mirror(&full, 12, usize::MAX).expect("mirror");
+  assert!(full_ticket.dolby_vision_config().is_some());
+}

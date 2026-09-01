@@ -1107,13 +1107,26 @@ impl MasteringDisplay {
     }
   }
 
-  /// Display primary chromaticities `(x, y)` for R, G, B in CIE 1931
-  /// (each as `(num, den)` rational, with `den` non-zero).
+  /// Display primary chromaticities `(x, y)` for R, G, B in CIE 1931,
+  /// each coordinate normalized to SMPTE ST 2086 fixed-point units —
+  /// 0.00002 increments, so a floating value is `raw / 50000.0`. The
+  /// same units [`mediaframe::color::ChromaCoord`] uses, so a `(x, y)`
+  /// pair here constructs one directly.
+  ///
+  /// A tuple has room for one denominator, not two, so it cannot hold
+  /// `x` and `y` each as an independent `AVRational` the way the
+  /// source `AVMasteringDisplayMetadata` does — `parse_mastering_
+  /// display` (`mediadecode-ffmpeg`'s `convert` module) is the one
+  /// place that resolves each coordinate's own rational to this
+  /// shared fixed-point unit, exactly rather than by rounding, for
+  /// every producer this crate has observed (which all emit a
+  /// denominator of `50000` already).
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn display_primaries(&self) -> [(u32, u32); 3] {
     self.display_primaries
   }
-  /// White-point chromaticity `(x, y)` as rationals.
+  /// White-point chromaticity `(x, y)`, in the same SMPTE ST 2086
+  /// fixed-point units as [`Self::display_primaries`].
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn white_point(&self) -> (u32, u32) {
     self.white_point

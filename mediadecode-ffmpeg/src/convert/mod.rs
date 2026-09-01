@@ -161,8 +161,8 @@ use crate::{
   boundary,
   buffer::FfmpegBytes,
   extras::{
-    AudioFrameExtra, ImageFrameExtra, ImageOrientation, PictureType, SideDataEntry,
-    SubtitleFrameExtra, VideoFrameExtra,
+    AudioFrameExtra, ContentLightLevel, ImageFrameExtra, ImageOrientation, MasteringDisplay,
+    PictureType, SideDataEntry, SubtitleFrameExtra, VideoFrameExtra,
   },
   limits::FrameLimits,
   pixdesc,
@@ -1610,9 +1610,170 @@ unsafe fn build_video_frame_extra(av_frame: *const AVFrame) -> VideoFrameExtra {
   if bet != AV_NOPTS_VALUE {
     out.set_best_effort_timestamp(Some(bet));
   }
-  // Side data — passthrough as raw bytes.
-  out.set_side_data(unsafe { collect_side_data(av_frame) });
+  // Side data — passthrough as raw bytes, and the two statically-
+  // shaped HDR entries additionally parsed onto their own seats.
+  // Parsed from the already-copied `SideDataEntry` bytes rather than
+  // re-walking `av_frame` a second time — one unsafe walk, two uses.
+  let side_data = unsafe { collect_side_data(av_frame) };
+  out.set_mastering_display(find_mastering_display(&side_data));
+  out.set_content_light_level(find_content_light_level(&side_data));
+  out.set_side_data(side_data);
   out
+}
+
+/// Byte length of FFmpeg's in-process `AVMasteringDisplayMetadata`:
+/// ten `AVRational`s (six chromaticities, two white-point, min and max
+/// luminance) plus two `int` presence flags, each seat four bytes wide
+/// and none of them padded — `10 * 8 + 2 * 4 = 88`. Not part of
+/// `AVMasteringDisplayMetadata`'s own ABI contract (its header says so
+/// explicitly), but true for every FFmpeg this crate has linked; a
+/// payload shorter than this is refused rather than partially read.
+const MASTERING_DISPLAY_METADATA_BYTES: usize = 88;
+/// Byte length of FFmpeg's in-process `AVContentLightMetadata`: two
+/// `unsigned` seats, `MaxCLL` then `MaxFALL`.
+const CONTENT_LIGHT_METADATA_BYTES: usize = 8;
+/// SMPTE ST 2086 chromaticity fixed-point unit: `raw / 50000.0` is the
+/// CIE 1931 coordinate. Shared with [`mediaframe::color::ChromaCoord`].
+const CHROMA_FIXED_POINT_DENOM: i64 = 50_000;
+
+/// Reads one native-endian `AVRational` (`{ i32 num; i32 den; }`) at
+/// `offset`, or `None` if `bytes` is too short to hold it.
+fn read_rational(bytes: &[u8], offset: usize) -> Option<(i32, i32)> {
+  let num = i32::from_ne_bytes(bytes.get(offset..offset + 4)?.try_into().ok()?);
+  let den = i32::from_ne_bytes(bytes.get(offset + 4..offset + 8)?.try_into().ok()?);
+  Some((num, den))
+}
+
+/// Resolves one CIE 1931 chromaticity coordinate's own `AVRational` to
+/// the shared SMPTE ST 2086 fixed-point unit (`raw / 50000`), by exact
+/// rescaling rather than truncating float math. `None` on a negative
+/// component (chromaticity is physically non-negative — SMPTE ST 2086
+/// and every producer this crate has observed agree) or a zero/negative
+/// denominator, either of which marks the entry unreadable rather than
+/// a value to carry through.
+fn rescale_chroma_coord(num: i32, den: i32) -> Option<u32> {
+  if num < 0 || den <= 0 {
+    return None;
+  }
+  let scaled = (i64::from(num) * CHROMA_FIXED_POINT_DENOM + i64::from(den) / 2) / i64::from(den);
+  u32::try_from(scaled).ok()
+}
+
+/// A rational's `(num, den)`, verbatim as `(u32, u32)`. `None` when
+/// `num` reads negative — [`MasteringDisplay::max_luminance`] /
+/// [`MasteringDisplay::min_luminance`] are physical quantities and a
+/// negative seat marks the payload corrupt rather than a value to
+/// keep — or when `den` is not strictly positive: FFmpeg's own
+/// `AVRational` documents a non-positive denominator as an invalid
+/// value (`av_cmp_q`/`av_q2d` treat it as such), and `0` specifically
+/// would make the ratio this ships as "verbatim, uninterpreted" mean
+/// nothing at all to a caller who does go on to divide.
+fn rational_as_u32_pair(num: i32, den: i32) -> Option<(u32, u32)> {
+  if den <= 0 {
+    return None;
+  }
+  Some((u32::try_from(num).ok()?, u32::try_from(den).ok()?))
+}
+
+/// Byte offset of the `has_primaries` presence flag (`int`) in
+/// `AVMasteringDisplayMetadata` — after the ten `AVRational`s.
+const MASTERING_DISPLAY_HAS_PRIMARIES_OFFSET: usize = 80;
+/// Byte offset of the `has_luminance` presence flag.
+const MASTERING_DISPLAY_HAS_LUMINANCE_OFFSET: usize = 84;
+
+/// Reads one native-endian `int` (`i32`) presence flag at `offset`.
+fn read_presence_flag(bytes: &[u8], offset: usize) -> Option<bool> {
+  let raw = i32::from_ne_bytes(bytes.get(offset..offset + 4)?.try_into().ok()?);
+  Some(raw != 0)
+}
+
+/// Parses an `AV_FRAME_DATA_MASTERING_DISPLAY_METADATA` payload — a
+/// byte-for-byte copy of FFmpeg's `AVMasteringDisplayMetadata` — into a
+/// [`MasteringDisplay`]. `None` when `bytes` is shorter than
+/// [`MASTERING_DISPLAY_METADATA_BYTES`] (a version-skew or corrupt
+/// entry), when the struct's own `has_primaries` / `has_luminance`
+/// presence flags (offsets [`MASTERING_DISPLAY_HAS_PRIMARIES_OFFSET`] /
+/// [`MASTERING_DISPLAY_HAS_LUMINANCE_OFFSET`]) say either half is
+/// unset, or when a component this function cannot make sense of.
+///
+/// **Both flags are required, not merely read.** `av_mastering_
+/// display_metadata_alloc`'s own default-initialized record is ten
+/// zeroed `AVRational`s with both flags `0` — indistinguishable, byte
+/// for byte, from "primaries and luminance all at the coordinate
+/// origin" unless the flags gate construction. [`MasteringDisplay`]
+/// has no seat for reporting one half present and the other absent, so
+/// the honest answer to a record where either flag is unset is `None`
+/// for the whole struct, not a value with a fabricated half.
+fn parse_mastering_display(bytes: &[u8]) -> Option<MasteringDisplay> {
+  if bytes.len() < MASTERING_DISPLAY_METADATA_BYTES {
+    return None;
+  }
+  let has_primaries = read_presence_flag(bytes, MASTERING_DISPLAY_HAS_PRIMARIES_OFFSET)?;
+  let has_luminance = read_presence_flag(bytes, MASTERING_DISPLAY_HAS_LUMINANCE_OFFSET)?;
+  if !has_primaries || !has_luminance {
+    return None;
+  }
+  let coord = |offset: usize| -> Option<u32> {
+    let (num, den) = read_rational(bytes, offset)?;
+    rescale_chroma_coord(num, den)
+  };
+  // Offsets mirror `AVMasteringDisplayMetadata`'s field order exactly:
+  // display_primaries[3][2] (R, G, B; each x then y), white_point[2],
+  // min_luminance, max_luminance — verified against the linked
+  // FFmpeg's own `libavutil/mastering_display_metadata.h` and cross-
+  // checked with `ffprobe -show_frames` on a real HDR10 mastering
+  // side-data entry (red_x=34000/50000, …, min_luminance=1/10000,
+  // max_luminance=10000000/10000).
+  let display_primaries = [
+    (coord(0)?, coord(8)?),
+    (coord(16)?, coord(24)?),
+    (coord(32)?, coord(40)?),
+  ];
+  let white_point = (coord(48)?, coord(56)?);
+  let (min_num, min_den) = read_rational(bytes, 64)?;
+  let (max_num, max_den) = read_rational(bytes, 72)?;
+  let min_luminance = rational_as_u32_pair(min_num, min_den)?;
+  let max_luminance = rational_as_u32_pair(max_num, max_den)?;
+  Some(MasteringDisplay::new(
+    display_primaries,
+    white_point,
+    max_luminance,
+    min_luminance,
+  ))
+}
+
+/// Parses an `AV_FRAME_DATA_CONTENT_LIGHT_LEVEL` payload — a byte-for-
+/// byte copy of FFmpeg's `AVContentLightMetadata` (`{ unsigned MaxCLL;
+/// unsigned MaxFALL; }`) — into a [`ContentLightLevel`]. `None` when
+/// `bytes` is shorter than [`CONTENT_LIGHT_METADATA_BYTES`].
+fn parse_content_light_level(bytes: &[u8]) -> Option<ContentLightLevel> {
+  if bytes.len() < CONTENT_LIGHT_METADATA_BYTES {
+    return None;
+  }
+  let max_cll = u32::from_ne_bytes(bytes.get(0..4)?.try_into().ok()?);
+  let max_fall = u32::from_ne_bytes(bytes.get(4..8)?.try_into().ok()?);
+  Some(ContentLightLevel::new(max_cll, max_fall))
+}
+
+/// Finds the first `AV_FRAME_DATA_MASTERING_DISPLAY_METADATA` entry
+/// among `side_data` and parses it. `None` when the frame carries no
+/// such entry — absent metadata answers absent, not a default.
+fn find_mastering_display(side_data: &[SideDataEntry]) -> Option<MasteringDisplay> {
+  let kind = AVFrameSideDataType::AV_FRAME_DATA_MASTERING_DISPLAY_METADATA as i32;
+  side_data
+    .iter()
+    .find(|entry| entry.kind() == kind)
+    .and_then(|entry| parse_mastering_display(entry.data()))
+}
+
+/// Finds the first `AV_FRAME_DATA_CONTENT_LIGHT_LEVEL` entry among
+/// `side_data` and parses it. `None` when the frame carries none.
+fn find_content_light_level(side_data: &[SideDataEntry]) -> Option<ContentLightLevel> {
+  let kind = AVFrameSideDataType::AV_FRAME_DATA_CONTENT_LIGHT_LEVEL as i32;
+  side_data
+    .iter()
+    .find(|entry| entry.kind() == kind)
+    .and_then(|entry| parse_content_light_level(entry.data()))
 }
 
 /// Maximum number of `AVFrameSideData` entries we will copy out of
