@@ -11,6 +11,50 @@ The backend-agnostic core it adapts has its own log at
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-09-02
+
+Tracks `mediadecode` 0.14.0 and `mediadecode-ffmpeg` 0.14.0. Neither
+touches a surface this adapter uses. The core release drops the
+optional `ingraph` feature whole (see
+[`mediadecode` 0.14.0](../mediadecode/CHANGELOG.md#0140)) — this
+crate's own `mediadecode` pin requests only `features = ["alloc",
+"future"]` and never enabled it. The FFmpeg release fills in
+`ScaledOutputCapability`'s VideoToolbox implementation (a
+`VTPixelTransferSession`) and a companion MSRV-driven refactor with no
+behaviour change (see
+[`mediadecode-ffmpeg` 0.14.0](../mediadecode-ffmpeg/CHANGELOG.md#0140));
+the capability word itself was already added to
+`decoder::VideoStreamDecoder` — the **sync** trait — back in 0.13.0,
+and this crate implements only the `future::local` async mirror, which
+carries exactly the four methods it always has (`send_packet` /
+`receive_frame` / `send_eof` / `flush`). Both changes live one crate
+over, on surfaces this adapter does not touch.
+
+No adapter source line moved.
+
+**`mediaframe` 0.9 → 0.10 crosses too**, tracking the core's own pin —
+a public dependency whose `audio`, `color`, `frame` and
+`pixel_format` types this adapter re-exports and names in its own
+signatures. Upstream 0.10.0 is a `pub(crate)` case-sensitivity axis (no
+public API moved) and an `other()` fix — every escape constructor now
+runs the ignore-case `FromStr` lookup first, and a genuine stranger's
+spelling is preserved verbatim rather than ASCII-folded — reachable
+only where `Other(SmolStr)` is constructed from an unrecognised
+string, which this crate never does: it reads WebCodecs' own typed
+enums (`VideoPixelFormat`, `VideoColorPrimaries`,
+`VideoTransferCharacteristics`, `VideoMatrixCoefficients`, …) through
+hand-written match arms onto the named vocabulary variants — an
+unrecognised WebCodecs value is refused with an error, never carried
+into `Other`.
+No `.other(...)` call and no `FromStr` onto a `mediaframe` vocabulary
+type appears anywhere in this crate's source.
+
+Verified on the real dependency graph (native builds this crate
+empty): `cargo check` / `cargo clippy --all-features -- -D warnings`
+on `--target wasm32-unknown-unknown`, both clean with zero source
+change. The browser `wasm-bindgen-test` lane needing headless Chromium
+is CI-only and was not run locally.
+
 ## [0.13.0] - 2026-09-01
 
 Tracks `mediadecode` 0.13.0 and `mediadecode-ffmpeg` 0.13.0. Neither
