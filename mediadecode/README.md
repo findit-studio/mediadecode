@@ -112,13 +112,6 @@ the rest of the findit-studio workspace uses:
 | `serde`      |    —    | Every type below on the wire, plus `mediatime`.               |
 | `arbitrary`  |    —    | `Arbitrary` impls for fuzzing, same coverage.                 |
 | `quickcheck` |    —    | The same coverage again, for `quickcheck`.                    |
-| `ingraph`    |    —    | This crate's vocabulary types as `ingraph` citizens (implies `std`). |
-
-`ingraph` grants `packet::PacketFlags` the faces the indexing framework
-reads a flags column through, so a declaration downstream holds one
-directly instead of restating its bits in a local mirror. Additive, off
-by default, and carrying no storage backend and no wire binding — the
-`ingraph` module has the roster and says where that line is drawn.
 
 The three optional matrices cover the same type, and its wire shape
 follows what it *is*:

@@ -35,19 +35,6 @@ serde      = ["dep:serde", "mediatime/serde", "mediaframe/serde"]
 arbitrary  = ["dep:arbitrary", "mediatime/arbitrary"]
 quickcheck = ["dep:quickcheck", "mediatime/quickcheck"]
 
-# **Self-granted `ingraph` citizenship** — the faces `ingraph` reads
-# this crate's vocabulary types through, written here because this crate
-# is where those types live. Purely additive: nothing outside
-# `src/ingraph.rs` changes shape, no other feature implies it, and the
-# default build is untouched. See that module for the roster, and for
-# what a citizenship deliberately does not carry.
-#
-# It implies `std`, and that is honest rather than incidental: `ingraph`
-# is a `std` framework, and the rows this feature writes name `Vec` in
-# a signature that is `std`'s. A `no_std` build has no framework to be a
-# citizen of, so the implication costs nothing that was reachable.
-ingraph    = ["dep:ingraph", "std"]
-
 [dependencies]
 mediatime   = { workspace = true }
 bitflags    = { workspace = true }
@@ -58,7 +45,6 @@ mediaframe  = { workspace = true }
 serde      = { workspace = true, optional = true }
 arbitrary  = { workspace = true, optional = true }
 quickcheck = { workspace = true, optional = true }
-ingraph    = { workspace = true, optional = true }
 
 trait-variant = { workspace = true, optional = true }
 

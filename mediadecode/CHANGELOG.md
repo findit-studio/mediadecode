@@ -11,6 +11,41 @@ The sibling FFmpeg adapter has its own log at
 
 ## [Unreleased]
 
+### Removed (BREAKING)
+
+- **The optional `ingraph` feature is gone, whole** — the feature
+  itself, its `dep:ingraph` row, the `mediadecode::ingraph` module it
+  gated, and that module's tests. Deleted, not deprecated: this is the
+  0.x line, and no alias survives.
+
+  The feature self-granted [`packet::PacketFlags`] citizenship in the
+  indexing framework ([#49]), which put the dependency edge backwards —
+  a vocabulary crate depending on the framework that reads it, rather
+  than the framework depending on the vocabulary crate the way it
+  already does for `mediaframe` and `mediatime`. The direction is
+  reversed now: `PacketFlags`' citizenship lives behind **`ingraph`'s
+  own `mediadecode` feature** instead ([ingraph#524]), carrying six of
+  this module's seven rows — `FlagsValue`, `FlagsFilterMarker`,
+  `DefaultMarker`, `DefaultVecMarker`, `ColumnKind`, `ColumnEq`. A
+  consumer reading, defaulting or comparing a `PacketFlags` column
+  turns this crate's `ingraph` feature off and `ingraph`'s own
+  `mediadecode` feature on instead — nothing about `PacketFlags` itself
+  changed shape.
+
+  **`CursorValue` does not cross, and that is not an oversight.**
+  `ingraph`'s bare-seat citizenship deliberately withholds the
+  keyset-cursor row: a flags column's cursor domain is the declared bit
+  mask, which is a storage-tier precondition the read-side citizenship
+  this feature (and its replacement) grants does not carry — the
+  module's own note argues this at length, and a dedicated test on that
+  side asserts the absence rather than leaving it implicit. A consumer
+  that paged a `PacketFlags` column by keyset cursor loses that
+  capability here; it returns only if and when `ingraph` grows the
+  storage half for this citizen.
+
+  [#49]: https://github.com/findit-studio/mediadecode/issues/49
+  [ingraph#524]: https://github.com/findit-studio/ingraph/pull/524
+
 ## [0.13.0] - 2026-09-01
 
 ### Added
