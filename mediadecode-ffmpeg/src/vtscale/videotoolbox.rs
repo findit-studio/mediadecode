@@ -733,11 +733,29 @@ impl ScaledOutput {
       self.stand_down();
       return None;
     }
-    let Cache::Built(built) = &self.cache else {
+    // Not `let Cache::Built(built) = &self.cache else { self.stand_down(); ... };
+    // Some(&built.fitted)`: that shares one borrow of `self.cache` across
+    // both the returning arm and `stand_down`'s `&mut self`, and because
+    // the returning arm ties the borrow to this function's output
+    // lifetime, 1.95's NLL treats it as live across the whole `let else`
+    // — including the arm that never returns it — and rejects the
+    // mutation (E0502; NLL "Problem Case #3", rust-lang/rfcs#2094, the
+    // same shape as that RFC's `map.get_mut` / `map.insert` example).
+    // `matches!` here borrows only long enough to answer a `bool`, never
+    // touching the output lifetime, so by the time `stand_down` can run
+    // no borrow of `self.cache` is outstanding; the `match` below then
+    // borrows fresh, only on the path that returns it. `self.cache`
+    // cannot actually be anything but `Built` here — nothing since the
+    // `&mut` match above replaces it — so `Cache::Empty => None` is
+    // defensive, not reachable in practice, same as the arm it replaces.
+    if !matches!(self.cache, Cache::Built(_)) {
       self.stand_down();
       return None;
-    };
-    Some(&built.fitted)
+    }
+    match &self.cache {
+      Cache::Built(built) => Some(&built.fitted),
+      Cache::Empty => None,
+    }
   }
 }
 

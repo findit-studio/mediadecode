@@ -226,6 +226,12 @@ The backend-agnostic core it adapts has its own log at
   pair stands down too: after the grid moves, republishing the source's
   ratio is a wrong answer rather than a conservative one.
 
+  `stage()`'s final projection of `Cache::Built` into the returned
+  frame is a bool pre-check followed by a fresh match, not one borrow
+  shared with the `&mut self` stand-down path — the shape the crate's
+  MSRV floor (1.95) needs from the borrow checker (NLL "Problem Case
+  #3", rust-lang/rfcs#2094). No change to what `stage()` answers.
+
 ### Changed
 
 - **`CarrierVideoStreamDecoder::scaled_output_capability` and
