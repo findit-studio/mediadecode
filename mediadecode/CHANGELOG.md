@@ -46,6 +46,42 @@ The sibling FFmpeg adapter has its own log at
   [#49]: https://github.com/findit-studio/mediadecode/issues/49
   [ingraph#524]: https://github.com/findit-studio/ingraph/pull/524
 
+## [0.14.0] - 2026-09-02
+
+### Changed (BREAKING)
+
+- **`mediaframe` 0.9 → 0.10**, at the same pin as before
+  (`default-features = false`, `features = ["frame"]` — the no-alloc
+  tier). A public dependency crossing an incompatible 0.x minor is
+  Breaking regardless of how much of its surface actually moved — same
+  reasoning as the 0.5.0, 0.6.0, 0.11.0 and 0.7 → 0.9 crossings.
+
+  **No `mediadecode` source line changed.** Upstream 0.10.0 is two
+  changes, swept against what this crate names:
+
+  - **A case-sensitivity axis for every vocabulary's parse table** is
+    `pub(crate)` — upstream's own note is no public API changes, and
+    all 22 `Other(SmolStr)` households (`pixel_format::PixelFormat` and
+    the `color` household among them) declare `Insensitive`. Zero
+    behaviour change, no site here regardless of visibility.
+  - **`Type::other(slug)` now runs the ignore-case `FromStr` lookup
+    first, and a genuine stranger's spelling is preserved verbatim in
+    `Other` rather than ASCII-folded** — across all 22 households. This
+    crate's own `mediaframe` pin is the no-alloc `frame` tier;
+    `Other(SmolStr)` lives behind mediaframe's `alloc` feature and is
+    not reachable through it (see `pixel_format.rs`'s own note). No
+    `.other(...)` call and no `FromStr` onto a `mediaframe` vocabulary
+    type appears anywhere in this crate's source.
+
+  The consumed surface, swept item by item, is unchanged in 0.10:
+  `color::{ChromaLocation, DynamicRange, Info, Matrix, Primaries,
+  Transfer}` (re-exported here under the disambiguated `Color*`
+  aliases), `pixel_format::PixelFormat`, and `frame::{BayerPattern,
+  Dimensions, Plane, Rect}`. Verified empirically, not just argued:
+  `cargo hack clippy / build / test -p mediadecode --feature-powerset
+  --exclude-no-default-features` and `cargo fmt --check`, stable
+  toolchain, all clean with zero source change.
+
 ## [0.13.0] - 2026-09-01
 
 ### Added

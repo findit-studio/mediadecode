@@ -11,6 +11,8 @@ The backend-agnostic core it adapts has its own log at
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-09-02
+
 ### Added — the seat 0.13 built gets its first occupant
 
 - **Scaled output on the VideoToolbox road: a `VTPixelTransferSession`
@@ -243,6 +245,40 @@ The backend-agnostic core it adapts has its own log at
   `mediadecode::VideoStreamDecoder` trait methods they implement were
   never `const`, and neither is callable in a const context (both need
   a live decoder), so no working caller can observe the change.
+
+### Changed (BREAKING)
+
+- **`mediaframe` 0.9 → 0.10**, tracking the core's own crossing (see
+  [`mediadecode`](../mediadecode/CHANGELOG.md#0140)). `mediaframe` is a
+  public dependency of the core *and* a direct one here (pinned with
+  `alloc`), and its `audio` and `frame` types appear in this adapter's
+  own signatures, so this adapter's surface moves with it.
+
+  **No adapter source line moved and no behaviour changes.** Upstream
+  0.10.0 is two changes. The case-sensitivity axis is `pub(crate)` — no
+  public API moved, and all 22 households (`audio::ChannelLayout` and
+  its siblings included) declare `Insensitive`, zero behaviour change
+  regardless. The `other()` fix — every escape constructor now runs the
+  ignore-case `FromStr` lookup first, and a genuine stranger's spelling
+  is preserved verbatim rather than ASCII-folded — has exactly one
+  reachable site in this crate:
+  [`channel_layout_from_describe`](src/channel_layout.rs), which turns
+  FFmpeg's own rendering of an unrecognised layout into `ChannelLayout`
+  via `FromStr` and then **explicitly filters out any `Other(_)`
+  result**, collapsing it to the absent sentinel before any caller
+  sees it — `ChannelLayoutDescription::text` already carries the
+  verbatim FFmpeg rendering, separately. Whatever bytes `FromStr` would
+  now put in that discarded `Other` never reach a caller either way: no
+  behaviour change at the one site that could have shown one. No other
+  `.other(...)` call and no other `FromStr` site onto a `mediaframe`
+  vocabulary type exists in this crate.
+
+  The surface this adapter actually consumes is unchanged in 0.10:
+  `audio::{ChannelLayout, ChannelLayoutDescription, ChannelOrder,
+  ChannelSpec}` and `frame::Rotation`. Verified, not just argued:
+  `cargo hack clippy / build / test -p mediadecode-ffmpeg
+  --feature-powerset --exclude-no-default-features` and `cargo fmt
+  --check`, stable toolchain, all clean with zero source change.
 
 ## [0.13.0] - 2026-09-01
 
