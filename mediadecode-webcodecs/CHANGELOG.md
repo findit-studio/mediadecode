@@ -11,6 +11,28 @@ The backend-agnostic core it adapts has its own log at
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-09-11
+
+**No changes; released in lockstep.** Tracks `mediadecode` 0.15.0 and
+`mediadecode-ffmpeg` 0.15.0, which carry a container's chapter table
+across the demux seam — a `demuxer::Chapter` row and a **provided**
+`Demuxer::chapters` answering an empty slice — and repair a set of
+open-time and timestamp defects a product-wide audit turned up in the
+FFmpeg adapter (see
+[`mediadecode` 0.15.0](../mediadecode/CHANGELOG.md#0150) and
+[`mediadecode-ffmpeg` 0.15.0](../mediadecode-ffmpeg/CHANGELOG.md#0150)).
+
+Nothing reaches this adapter. It implements no `Demuxer` at all — a
+WebCodecs `VideoDecoder` / `AudioDecoder` is fed packets a caller has
+already demuxed elsewhere — so the new door's provided body is the
+whole of this crate's relationship to the release, and it is a door
+nothing here can be asked through. Everything else the FFmpeg release
+carries lives behind an FFI this crate does not have: container
+rationals, `AVDictionary` metadata, `AVCodecContext.pkt_timebase`,
+`AVSubtitle`, `AVPacket`.
+
+No adapter source line moved.
+
 ## [0.14.0] - 2026-09-02
 
 Tracks `mediadecode` 0.14.0 and `mediadecode-ffmpeg` 0.14.0. Neither

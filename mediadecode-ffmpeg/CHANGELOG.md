@@ -11,10 +11,12 @@ The backend-agnostic core it adapts has its own log at
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-09-11
+
 ### Added
 
 - **The backend reads `AVFormatContext.chapters`**, filling the
-  `Demuxer::chapters` seat `mediadecode` 0.14.1 opens.
+  `Demuxer::chapters` seat `mediadecode` 0.15.0 opens.
 
   The table is mirrored once at open — after
   `avformat_find_stream_info`, beside the track table — and held for
