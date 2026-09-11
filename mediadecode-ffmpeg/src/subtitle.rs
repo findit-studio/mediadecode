@@ -135,8 +135,8 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierSubtitleStreamDecoder<C
   ) -> Result<Self, SubtitleDecodeError> {
     // Use the checked codec-context builder — `Context::from_parameters`
     // is OOM-UB-prone (see `crate::decoder::build_codec_context`).
-    let (ctx, callback_state) =
-      build_codec_context(&parameters, limits).map_err(SubtitleDecodeError::Decode)?;
+    let (ctx, callback_state) = build_codec_context(&parameters, limits, Some(time_base))
+      .map_err(SubtitleDecodeError::Decode)?;
     // Opened without forming a bindgen enum from FFmpeg memory: the codec
     // is resolved off a raw `codec_id`, and the medium is proved off a raw
     // `codec_type`. See `crate::decoder::ensure_codec_type`.
@@ -265,9 +265,8 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierSubtitleStreamDecoder<C
     // takes — `AVSubtitleRect` has no refcounted buffer, so both lanes
     // copy — and the FFmpeg-side allocations are released below, once
     // there is something to release them in favour of.
-    let converted = unsafe {
-      convert::av_subtitle_to_subtitle_frame_as::<C>(self.scratch.inner.as_ptr(), self.time_base)
-    };
+    let converted =
+      unsafe { convert::av_subtitle_to_subtitle_frame_as::<C>(self.scratch.inner.as_ptr()) };
     match converted {
       Ok(frame) => {
         self.scratch.clear();

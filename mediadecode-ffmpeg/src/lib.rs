@@ -110,22 +110,29 @@ pub type FfmpegVideoStreamDecoder = video::CarrierVideoStreamDecoder<View>;
 /// The video stream decoder on the **owned** lane.
 pub type FfmpegOwnedVideoStreamDecoder = video::CarrierVideoStreamDecoder<Owned>;
 pub use channel_layout::{
-  channel_layout_description_from_ffmpeg, channel_layout_from_ffmpeg, channel_order_from_ffmpeg,
+  ChannelLayoutFault, channel_layout_description_from_ffmpeg, channel_layout_from_ffmpeg,
+  channel_order_from_ffmpeg,
 };
 pub use codec_id::CodecId;
 pub use container::ContainerFormat;
 pub use decoder::VideoDecoder;
-pub use demuxer::{CarrierDemuxer, DemuxError, ProbeBudgetExhausted};
+pub use demuxer::{
+  CarrierDemuxer, ChapterAlloc, ChapterTimebaseInvalid, ChapterTitleAlloc,
+  ChapterTitleBudgetExhausted, ChapterTitleTooLong, DemuxError, ParametersChannelMap,
+  ParametersLayoutShape, ProbeBudgetExhausted, TooManyChapters, TrackMetadataAlloc,
+  TrackMetadataBudgetExhausted, TrackMetadataTooLong, TrackTableAlloc, TrackTimebaseInvalid,
+};
 pub use error::{
   Error, FrameBudgetExceeded, FrameMedium, HwSurfaceTooLarge, HwTransferTooLarge, Result,
 };
 pub use frame::Frame;
 pub use image::{CarrierImageDecoder, Corrupt, CorruptSource, ImageDecodeError, InputTooLarge};
 pub use limits::{
-  DEFAULT_MAX_ATTACHMENT_BYTES, DEFAULT_MAX_CODEC_PARAMETER_BYTES, DEFAULT_MAX_FRAME_BYTES,
-  DEFAULT_MAX_IMAGE_INPUT_BYTES, DEFAULT_MAX_IMAGE_SIDE_DATA_BYTES, DEFAULT_MAX_PACKET_BYTES,
-  DEFAULT_MAX_PIXELS, DEFAULT_MAX_PROBE_BYTES, DEFAULT_MAX_STREAMS,
-  DEFAULT_MAX_TOTAL_ATTACHMENT_BYTES, DEFAULT_MAX_TOTAL_CODEC_PARAMETER_BYTES, DecoderLimits,
+  DEFAULT_MAX_ATTACHMENT_BYTES, DEFAULT_MAX_CHAPTERS, DEFAULT_MAX_CODEC_PARAMETER_BYTES,
+  DEFAULT_MAX_FRAME_BYTES, DEFAULT_MAX_IMAGE_INPUT_BYTES, DEFAULT_MAX_IMAGE_SIDE_DATA_BYTES,
+  DEFAULT_MAX_PACKET_BYTES, DEFAULT_MAX_PIXELS, DEFAULT_MAX_PROBE_BYTES, DEFAULT_MAX_STREAMS,
+  DEFAULT_MAX_TOTAL_ATTACHMENT_BYTES, DEFAULT_MAX_TOTAL_CHAPTER_TITLE_BYTES,
+  DEFAULT_MAX_TOTAL_CODEC_PARAMETER_BYTES, DEFAULT_MAX_TOTAL_STREAM_METADATA_BYTES, DecoderLimits,
   DemuxLimits, FrameLimits, PacketLimits,
 };
 #[cfg(feature = "resample")]
@@ -299,6 +306,11 @@ pub type TrackInfo = mediadecode::demuxer::TrackInfo<Ffmpeg>;
 
 /// A track's per-kind codec parameters, as [`TrackInfo`] carries them.
 pub type TrackParams = mediadecode::demuxer::TrackParams<Ffmpeg>;
+
+/// One row of the chapter table [`FfmpegDemuxer::chapters`] returns.
+///
+/// [`FfmpegDemuxer::chapters`]: mediadecode::demuxer::Demuxer::chapters
+pub type Chapter = mediadecode::demuxer::Chapter<Ffmpeg>;
 
 /// Asserts a submission was taken, and answers nothing.
 ///

@@ -81,7 +81,10 @@ fn the_carrier_is_opaque_and_a_consumer_can_still_build_one() {
   // coercion rather than a comment so that changing the carrier fails
   // here rather than in a consumer's build.
   fn takes_the_carrier(_: &FfmpegBytes) {}
-  let packet = VideoPacket::new(FfmpegBytes::copy_from_slice(&[1, 2, 3]), Default::default());
+  let packet = VideoPacket::new(
+    FfmpegBytes::try_copy_from_slice(&[1, 2, 3]).expect("a test payload"),
+    Default::default(),
+  );
   takes_the_carrier(packet.data());
   assert_eq!(packet.data().as_ref(), &[1, 2, 3]);
   assert_eq!(packet.data().len(), 3);
@@ -98,12 +101,14 @@ fn the_carrier_is_opaque_and_a_consumer_can_still_build_one() {
 
   // The empty carrier is shared, and a zero-length copy joins it
   // rather than allocating.
-  assert!(FfmpegBytes::empty().ptr_eq(&FfmpegBytes::copy_from_slice(&[])));
+  assert!(
+    FfmpegBytes::empty().ptr_eq(&FfmpegBytes::try_copy_from_slice(&[]).expect("a test payload"))
+  );
 }
 
 #[test]
 fn side_data_round_trips_through_the_carrier_and_clones_by_refcount() {
-  let payload = FfmpegBytes::copy_from_slice(&[7u8; 128]);
+  let payload = FfmpegBytes::try_copy_from_slice(&[7u8; 128]).expect("a test payload");
   let entry = SideDataEntry::new(42, payload.clone());
   assert_eq!(entry.kind(), 42);
   assert_eq!(entry.data(), &[7u8; 128]);
@@ -260,7 +265,7 @@ fn an_attachment_with_no_bytes_is_refused_by_name() {
   // Bytes that are not a picture at all: accepted or refused, never a
   // frame — and whichever it is, the decoder is still usable after.
   let garbage = AttachmentPacket::new(
-    FfmpegBytes::copy_from_slice(&[0xABu8; 64]),
+    FfmpegBytes::try_copy_from_slice(&[0xABu8; 64]).expect("a test payload"),
     Default::default(),
   );
   let _ = decoder.decode(&garbage);
@@ -288,7 +293,10 @@ fn decode_still(path: &std::path::Path) -> ImageFrame {
 
   let mut decoder =
     FfmpegImageDecoder::open(parameters, DecoderLimits::default()).expect("open image decoder");
-  let packet = AttachmentPacket::new(FfmpegBytes::copy_from_slice(&bytes), Default::default());
+  let packet = AttachmentPacket::new(
+    FfmpegBytes::try_copy_from_slice(&bytes).expect("a test payload"),
+    Default::default(),
+  );
   decoder.decode(&packet).expect("decode the still")
 }
 
@@ -630,7 +638,10 @@ fn decode_still_with(
   drop(input);
 
   let mut decoder = FfmpegImageDecoder::open(parameters, limits)?;
-  let packet = AttachmentPacket::new(FfmpegBytes::copy_from_slice(&bytes), Default::default());
+  let packet = AttachmentPacket::new(
+    FfmpegBytes::try_copy_from_slice(&bytes).expect("a test payload"),
+    Default::default(),
+  );
   decoder.decode(&packet)
 }
 
@@ -891,7 +902,7 @@ fn an_amplifying_conversion_is_refused_before_the_output_frame_exists() {
 fn stereo_f32_frame(rate: u32, samples: u32) -> AudioFrame {
   use mediadecode::frame::Plane;
   let bytes = samples as usize * 2 * 4;
-  let plane = FfmpegBytes::copy_from_slice(&vec![0u8; bytes]);
+  let plane = FfmpegBytes::try_copy_from_slice(&vec![0u8; bytes]).expect("a test payload");
   let planes = std::array::from_fn(|index| {
     Plane::new(
       if index == 0 {
@@ -907,7 +918,8 @@ fn stereo_f32_frame(rate: u32, samples: u32) -> AudioFrame {
     samples,
     2,
     mediadecode_ffmpeg::SampleFormat::FLT,
-    mediadecode_ffmpeg::channel_layout_description_from_ffmpeg(&ffmpeg_next::ChannelLayout::STEREO),
+    mediadecode_ffmpeg::channel_layout_description_from_ffmpeg(&ffmpeg_next::ChannelLayout::STEREO)
+      .expect("a well-formed layout describes"),
     planes,
     1,
     Default::default(),
@@ -1139,7 +1151,10 @@ fn an_oversized_image_input_is_refused_before_the_packet_copy() {
 
   let tight = DecoderLimits::new().with_max_image_input_bytes(8);
   let mut decoder = FfmpegImageDecoder::open(parameters, tight).expect("open");
-  let packet = AttachmentPacket::new(FfmpegBytes::copy_from_slice(&bytes), Default::default());
+  let packet = AttachmentPacket::new(
+    FfmpegBytes::try_copy_from_slice(&bytes).expect("a test payload"),
+    Default::default(),
+  );
   match decoder.decode(&packet) {
     Err(ImageDecodeError::InputTooLarge(p)) => {
       assert_eq!(p.limit(), 8);
@@ -1290,7 +1305,9 @@ fn an_audio_plane_exports_valid_samples_not_alignment_padding() {
     if packet.stream() != index {
       continue;
     }
-    let Ok(Some(portable)) = mediadecode_ffmpeg::audio_packet_from_ffmpeg(&packet) else {
+    let Ok(Some(portable)) =
+      mediadecode_ffmpeg::audio_packet_from_ffmpeg(&packet, mediadecode::Timebase::SECONDS)
+    else {
       continue;
     };
     if decoder.send_packet(&portable).is_err() {
@@ -1350,7 +1367,7 @@ fn the_send_leg_judges_the_packet_budget_on_all_three_families() {
   support::init_ffmpeg();
 
   let body = vec![3u8; 2_048];
-  let bytes = FfmpegBytes::copy_from_slice(&body);
+  let bytes = FfmpegBytes::try_copy_from_slice(&body).expect("a test payload");
   let at_cap = PacketLimits::new().with_max_packet_bytes(2_048);
   let under = PacketLimits::new().with_max_packet_bytes(2_047);
 
@@ -2333,7 +2350,7 @@ fn open_still_and_decode(path: &std::path::Path, bytes: usize) -> Result<(), Ima
       .with_max_image_input_bytes(usize::MAX),
   )?;
   let packet = AttachmentPacket::new(
-    FfmpegBytes::copy_from_slice(&payload),
+    FfmpegBytes::try_copy_from_slice(&payload).expect("a test payload"),
     mediadecode_ffmpeg::extras::AttachmentPacketExtra::new(0),
   );
   decoder.decode(&packet).map(|_| ())
@@ -2394,7 +2411,7 @@ fn audio_gets_a_pre_allocation_ceiling_too() {
     let mut frame = mediadecode_ffmpeg::empty_owned_audio_frame();
     for body in bodies {
       let audio = AudioPacket::new(
-        FfmpegBytes::copy_from_slice(&body),
+        FfmpegBytes::try_copy_from_slice(&body).expect("a test payload"),
         mediadecode_ffmpeg::extras::AudioPacketExtra::new(0),
       );
       // **The send's answer is deliberately dropped on these ceiling
@@ -2482,7 +2499,7 @@ fn decode_first_audio(
       Ok(()) if packet.stream() == index => {
         let body = packet.data().unwrap_or(&[]).to_vec();
         let audio = AudioPacket::new(
-          FfmpegBytes::copy_from_slice(&body),
+          FfmpegBytes::try_copy_from_slice(&body).expect("a test payload"),
           mediadecode_ffmpeg::extras::AudioPacketExtra::new(0),
         );
         // Answer dropped: see the note on the first ceiling probe above.
@@ -2694,7 +2711,7 @@ fn the_send_side_side_data_list_is_capped_in_both_directions() {
 
   let build = |entries: Vec<SideDataEntry>| {
     let packet = VideoPacket::new(
-      FfmpegBytes::copy_from_slice(&[1u8, 2, 3, 4]),
+      FfmpegBytes::try_copy_from_slice(&[1u8, 2, 3, 4]).expect("a test payload"),
       VideoPacketExtra::new(0).with_side_data(entries),
     )
     .with_flags(PacketFlags::KEY);
@@ -2704,7 +2721,7 @@ fn the_send_side_side_data_list_is_capped_in_both_directions() {
   let entry = |bytes: usize| {
     SideDataEntry::new(
       NEW_EXTRADATA,
-      FfmpegBytes::copy_from_slice(&vec![7u8; bytes]),
+      FfmpegBytes::try_copy_from_slice(&vec![7u8; bytes]).expect("a test payload"),
     )
   };
 
@@ -3068,7 +3085,7 @@ fn the_software_video_road_names_its_budget_refusals() {
         Ok(()) if packet.stream() == index => {
           let body = packet.data().unwrap_or(&[]).to_vec();
           let video = VideoPacket::new(
-            FfmpegBytes::copy_from_slice(&body),
+            FfmpegBytes::try_copy_from_slice(&body).expect("a test payload"),
             mediadecode_ffmpeg::extras::VideoPacketExtra::new(0),
           );
           // Answer dropped: see the note on the first ceiling probe above.

@@ -10,7 +10,7 @@
 use core::fmt;
 
 use ffmpeg_next::ffi::AVCodecID;
-use smol_str::SmolStr;
+use smol_bytes::Utf8Bytes;
 
 /// Upper bound on the NUL search in [`CodecId::name`] and
 /// [`CodecId::long_name`].
@@ -81,7 +81,7 @@ impl CodecId {
   /// The word is the one FFmpeg's CLI and its containers use, which is
   /// what makes it the right thing to cross a typed vocabulary with;
   /// [`raw`](Self::raw) stays the identity.
-  pub fn name(self) -> Option<SmolStr> {
+  pub fn name(self) -> Option<Utf8Bytes> {
     let descriptor = self.descriptor();
     if descriptor.is_null() {
       return None;
@@ -94,7 +94,9 @@ impl CodecId {
     // table, which is the reader's contract.
     let name = unsafe { core::ptr::addr_of!((*descriptor).name).read() };
     // SAFETY: as above — the name is a static, NUL-terminated literal.
-    unsafe { crate::ffi::table_text(name, DESCRIPTOR_TEXT_MAX_BYTES) }
+    // `from_static` stores the borrow rather than copying it; see
+    // [`crate::ffi::table_text`].
+    unsafe { crate::ffi::table_text(name, DESCRIPTOR_TEXT_MAX_BYTES) }.map(Utf8Bytes::from_static)
   }
 
   /// FFmpeg's human description for this codec — `"H.264 / AVC / MPEG-4
@@ -105,7 +107,7 @@ impl CodecId {
   /// stable across releases, and nothing should key on it. Use
   /// [`name`](Self::name) to cross vocabularies and [`raw`](Self::raw)
   /// to identify.
-  pub fn long_name(self) -> Option<SmolStr> {
+  pub fn long_name(self) -> Option<Utf8Bytes> {
     let descriptor = self.descriptor();
     if descriptor.is_null() {
       return None;
@@ -117,6 +119,7 @@ impl CodecId {
     let long_name = unsafe { core::ptr::addr_of!((*descriptor).long_name).read() };
     // SAFETY: as above.
     unsafe { crate::ffi::table_text(long_name, DESCRIPTOR_TEXT_MAX_BYTES) }
+      .map(Utf8Bytes::from_static)
   }
 
   /// libavcodec's descriptor for this id, or null where this build

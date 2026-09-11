@@ -203,6 +203,58 @@ impl Corpus {
     out
   }
 
+  /// A Matroska file carrying a **chapter table**: two titled
+  /// chapters, mixed in from an FFMETADATA sidecar.
+  ///
+  /// The `ffmpeg` CLI has no chapter flag. Chapters reach a muxer as a
+  /// metadata-only *input* mapped over the media's own
+  /// (`-map_metadata 1`), which is the recipe FFmpeg's own
+  /// documentation gives; the stream copy beside it keeps the media a
+  /// bit-for-bit copy of the base clip, so the only thing this fixture
+  /// adds to it is the table.
+  ///
+  /// # What the round trip does to the numbers
+  ///
+  /// Measured on this build rather than assumed, and both facts are
+  /// the *container's* — which is exactly what a chapter row carries:
+  ///
+  /// - **Matroska counts chapter time in nanoseconds**, whatever its
+  ///   tracks use, so the `1/1000` written below comes back as
+  ///   `1/1000000000` with the ticks rescaled to match. A chapter
+  ///   therefore has to carry a timebase of its own, and does.
+  /// - **The UIDs are offset by one.** The sidecar's two chapters
+  ///   parse at ids 0 and 1, and Matroska forbids the UID zero, so the
+  ///   muxer writes — and the demuxer reads back — 1 and 2. The id is
+  ///   the file's, not the table position.
+  #[rustfmt::skip]
+  pub fn chaptered_mkv(&self) -> PathBuf {
+    let out = self.path("chaptered.mkv");
+    if out.exists() {
+      return out;
+    }
+    let base = self.path("chaptered-src.mkv");
+    if !base.exists() {
+      run_ffmpeg(&[
+        "-f", "lavfi", "-i", "testsrc2=size=64x48:rate=25:duration=3",
+        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=3",
+        "-map", "0:v", "-map", "1:a",
+        "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        base.to_str().expect("utf-8 path"),
+      ]);
+    }
+    let sidecar = self.path("chapters.ffmeta");
+    std::fs::write(&sidecar, FFMETADATA_CHAPTERS).expect("writing the chapter sidecar");
+
+    run_ffmpeg(&[
+      "-i", base.to_str().expect("utf-8 path"),
+      "-i", sidecar.to_str().expect("utf-8 path"),
+      "-map_metadata", "1", "-map", "0", "-codec", "copy",
+      out.to_str().expect("utf-8 path"),
+    ]);
+    out
+  }
+
   /// A SubRip file, written by hand.
   ///
   /// **The queue-backed demuxer family.** `srtdec` — like SubViewer,
@@ -599,6 +651,25 @@ pub const FONT_PAYLOAD: &[u8] = b"FAKE-TTF-PAYLOAD-0123456789";
 
 const SUBRIP: &str = "1\n00:00:00,000 --> 00:00:01,000\nhello\n\n\
                       2\n00:00:01,000 --> 00:00:02,000\nworld\n\n";
+
+/// The table [`Corpus::chaptered_mkv`] mixes in, in FFmpeg's own
+/// metadata format: two chapters, back to back, each with a title and
+/// a span written in milliseconds.
+///
+/// The second chapter is deliberately 1.5 s long against the first's
+/// 1 s, so a lane that read one span and assumed the other would say
+/// so.
+const FFMETADATA_CHAPTERS: &str = ";FFMETADATA1\n\
+                                   [CHAPTER]\n\
+                                   TIMEBASE=1/1000\n\
+                                   START=0\n\
+                                   END=1000\n\
+                                   title=Opening\n\n\
+                                   [CHAPTER]\n\
+                                   TIMEBASE=1/1000\n\
+                                   START=1000\n\
+                                   END=2500\n\
+                                   title=Closing\n";
 
 fn ffmpeg_cli_available() -> bool {
   Command::new("ffmpeg")

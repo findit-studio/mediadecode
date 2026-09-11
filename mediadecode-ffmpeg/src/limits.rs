@@ -326,6 +326,65 @@ pub const DEFAULT_MAX_PROBE_BYTES: u64 = 5 * 1024 * 1024;
 /// crate's per-track budgets are downstream of.
 pub const DEFAULT_MAX_STREAMS: u32 = 1000;
 
+/// Default ceiling on the number of chapters a container may declare —
+/// 4096.
+///
+/// **Why this number.** A DVD's chapter count tops out at 99, a
+/// Matroska edition rarely reaches three figures, and the fattest real
+/// table anyone ships is an audiobook filing each of its tracks as a
+/// chapter — a few thousand at the far end. 4096 clears all of that and
+/// still bounds this crate's mirror at a few hundred kibibytes.
+///
+/// **Why a ceiling exists at all.** A chapter costs libavformat almost
+/// nothing — an `AVChapter` is four scalars and a dictionary pointer —
+/// so a header can declare an enormous table for very few bytes, and
+/// [`DEFAULT_MAX_STREAMS`] does not reach it: chapters are not streams.
+/// The mirror this crate builds is the larger of the two (an owned
+/// title, a `Timebase`, two `Timestamp`s per row), so the count is
+/// judged before a byte of it is reserved.
+pub const DEFAULT_MAX_CHAPTERS: u32 = 4096;
+
+/// Default ceiling on the bytes every chapter title in one file may
+/// hold together — 1 MiB.
+///
+/// **Why this number.** A chapter title is a line of prose: tens of
+/// bytes, a few hundred at the outside. 1 MiB is 256 bytes for each of
+/// [`DEFAULT_MAX_CHAPTERS`] chapters, so every real table passes with
+/// room to spare.
+///
+/// **Why an aggregate rather than a per-title cap.** A per-title cap
+/// already exists one layer down: the metadata reader refuses any
+/// single dictionary value past 64 KiB rather than truncating it. On
+/// its own that leaves the table's total at the count times that cap —
+/// 256 MiB at the two defaults. This seat is what turns those two
+/// finite numbers into a small one.
+pub const DEFAULT_MAX_TOTAL_CHAPTER_TITLE_BYTES: usize = 1024 * 1024;
+
+/// Default ceiling on the bytes every **stream's** retained metadata in
+/// one file may hold together — 4 MiB.
+///
+/// **What it bounds.** A track row keeps three values off each
+/// stream's metadata dictionary: the `filename` an attachment was
+/// attached under, its declared `mimetype`, and the track's
+/// `language`. All three are mirrored eagerly, for every admitted
+/// stream, before the first packet is read.
+///
+/// **Why a ceiling exists at all.** [`DEFAULT_MAX_STREAMS`] bounds how
+/// many streams a header may declare and says nothing about what each
+/// one may carry. At that ceiling, three values of the 64 KiB a single
+/// metadata value may reach — in bytes that are not UTF-8, so each one
+/// triples on the way through lossy decoding — is roughly 562 MiB
+/// retained during an open that has not been asked for a single
+/// packet. The path entrypoint has no hard read meter to fall back on,
+/// either.
+///
+/// **Why this number.** Real metadata is tiny: a filename is tens of
+/// bytes, a MIME type forty, a language tag three. A file with a full
+/// ASS font set — thirty attachments, each with a name and a type —
+/// spends a few kilobytes. 4 MiB clears every real file by orders of
+/// magnitude and turns the hostile one into a named refusal.
+pub const DEFAULT_MAX_TOTAL_STREAM_METADATA_BYTES: usize = 4 * 1024 * 1024;
+
 /// Default ceiling on the side data one decoded **still** may carry —
 /// the same 16 MiB as [`DEFAULT_MAX_CODEC_PARAMETER_BYTES`], and the
 /// same reason.
@@ -541,7 +600,8 @@ impl DecoderLimits {
 }
 
 /// What one demux session may spend: on any single packet, on any
-/// single attachment, and on every attachment in the file together.
+/// single attachment, on every attachment in the file together, and on
+/// the container's chapter table.
 ///
 /// Handed to [`FfmpegDemuxer::open_with`](crate::FfmpegDemuxer::open_with)
 /// rather than set afterwards, because the attachment budget is spent
@@ -557,6 +617,9 @@ pub struct DemuxLimits {
   max_total_codec_parameter_bytes: usize,
   max_probe_bytes: u64,
   max_streams: u32,
+  max_chapters: u32,
+  max_total_chapter_title_bytes: usize,
+  max_total_stream_metadata_bytes: usize,
 }
 
 impl Default for DemuxLimits {
@@ -580,6 +643,9 @@ impl DemuxLimits {
       max_total_codec_parameter_bytes: DEFAULT_MAX_TOTAL_CODEC_PARAMETER_BYTES,
       max_probe_bytes: DEFAULT_MAX_PROBE_BYTES,
       max_streams: DEFAULT_MAX_STREAMS,
+      max_chapters: DEFAULT_MAX_CHAPTERS,
+      max_total_chapter_title_bytes: DEFAULT_MAX_TOTAL_CHAPTER_TITLE_BYTES,
+      max_total_stream_metadata_bytes: DEFAULT_MAX_TOTAL_STREAM_METADATA_BYTES,
     }
   }
 
@@ -633,6 +699,93 @@ impl DemuxLimits {
   #[must_use]
   pub const fn with_max_streams(mut self, value: u32) -> Self {
     self.max_streams = value;
+    self
+  }
+
+  /// The ceiling on chapters a container may declare.
+  ///
+  /// Judged **before** the chapter table is reserved, so a header
+  /// claiming an enormous table is refused rather than mirrored. Unlike
+  /// [`Self::max_streams`], which is handed to libavformat and enforced
+  /// inside it, this one is this crate's own: libavformat has no
+  /// `max_chapters` knob, and an `AVChapter` is cheap enough there that
+  /// the probe budget does not reach the count either.
+  ///
+  /// A file over the ceiling **fails to open**, with
+  /// [`TooManyChapters`](crate::TooManyChapters) naming the declared
+  /// count.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn max_chapters(&self) -> u32 {
+    self.max_chapters
+  }
+  /// The ceiling on bytes every chapter title in the file may hold
+  /// together.
+  ///
+  /// Charged title by title as the table is mirrored, and the open
+  /// fails with
+  /// [`ChapterTitleBudgetExhausted`](crate::ChapterTitleBudgetExhausted)
+  /// at the title that crosses it. The charge is made **after** that
+  /// one title is read rather than before, the same way
+  /// [`Self::max_total_attachment_bytes`] is charged: what bounds the
+  /// overshoot is the 64 KiB the metadata reader already refuses any
+  /// single value past.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn max_total_chapter_title_bytes(&self) -> usize {
+    self.max_total_chapter_title_bytes
+  }
+  /// Sets the declared-chapter ceiling (consuming builder).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
+  pub const fn with_max_chapters(mut self, value: u32) -> Self {
+    self.max_chapters = value;
+    self
+  }
+  /// Sets the whole-file chapter-title budget (consuming builder).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
+  pub const fn with_max_total_chapter_title_bytes(mut self, value: usize) -> Self {
+    self.max_total_chapter_title_bytes = value;
+    self
+  }
+  /// Sets the declared-chapter ceiling in place.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn set_max_chapters(&mut self, value: u32) -> &mut Self {
+    self.max_chapters = value;
+    self
+  }
+  /// Sets the whole-file chapter-title budget in place.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn set_max_total_chapter_title_bytes(&mut self, value: usize) -> &mut Self {
+    self.max_total_chapter_title_bytes = value;
+    self
+  }
+
+  /// The ceiling on bytes every stream's retained metadata may hold
+  /// together — the `filename`, `mimetype` and `language` a track row
+  /// keeps, across every admitted stream.
+  ///
+  /// Charged value by value as the track table is built, and the open
+  /// fails with
+  /// [`TrackMetadataBudgetExhausted`](crate::TrackMetadataBudgetExhausted)
+  /// at the value that crosses it — **before** that value is copied.
+  /// The charge is the *decoded* size, because lossy decoding expands
+  /// bytes that are not UTF-8 threefold, so the raw length would
+  /// under-charge exactly the hostile case.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn max_total_stream_metadata_bytes(&self) -> usize {
+    self.max_total_stream_metadata_bytes
+  }
+  /// Sets the whole-file stream-metadata budget (consuming builder).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
+  pub const fn with_max_total_stream_metadata_bytes(mut self, value: usize) -> Self {
+    self.max_total_stream_metadata_bytes = value;
+    self
+  }
+  /// Sets the whole-file stream-metadata budget in place.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn set_max_total_stream_metadata_bytes(&mut self, value: usize) -> &mut Self {
+    self.max_total_stream_metadata_bytes = value;
     self
   }
 

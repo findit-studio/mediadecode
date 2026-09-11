@@ -6,7 +6,7 @@
 //! `avformat_open_input` and never changes it, so re-reading could only
 //! answer the same thing more expensively.
 
-use smol_str::SmolStr;
+use smol_bytes::Utf8Bytes;
 
 /// Upper bound on the NUL search over an `AVInputFormat`'s strings.
 ///
@@ -59,8 +59,8 @@ const FORMAT_TEXT_MAX_BYTES: usize = 1024;
 /// is the whole reason the identity is carried as text.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ContainerFormat {
-  name: SmolStr,
-  long_name: Option<SmolStr>,
+  name: Utf8Bytes,
+  long_name: Option<Utf8Bytes>,
 }
 
 impl ContainerFormat {
@@ -70,7 +70,7 @@ impl ContainerFormat {
   /// Public so a consumer can build the value in a test or a fake; a
   /// session builds its own from `AVFormatContext.iformat`.
   #[inline]
-  pub const fn new(name: SmolStr, long_name: Option<SmolStr>) -> Self {
+  pub const fn new(name: Utf8Bytes, long_name: Option<Utf8Bytes>) -> Self {
     Self { name, long_name }
   }
 
@@ -133,8 +133,16 @@ impl ContainerFormat {
     let (name, long_name) = unsafe { ((*iformat).name, (*iformat).long_name) };
     // SAFETY: both are null or NUL-terminated string literals in that
     // same static table; the reader answers `None` for null.
-    let name = unsafe { crate::ffi::table_text(name, FORMAT_TEXT_MAX_BYTES) }?;
-    let long_name = unsafe { crate::ffi::table_text(long_name, FORMAT_TEXT_MAX_BYTES) };
+    // `from_static` rather than `from`: the reader borrows out of
+    // libavformat's static table, and this stores that borrow instead
+    // of copying it. FFmpeg has long names past the inline window — the
+    // SER demuxer's is sixty-five bytes — so the copy was a real
+    // allocation on an ordinary open, for a string the process already
+    // owns.
+    let name =
+      Utf8Bytes::from_static(unsafe { crate::ffi::table_text(name, FORMAT_TEXT_MAX_BYTES) }?);
+    let long_name = unsafe { crate::ffi::table_text(long_name, FORMAT_TEXT_MAX_BYTES) }
+      .map(Utf8Bytes::from_static);
     Some(Self::new(name, long_name))
   }
 }

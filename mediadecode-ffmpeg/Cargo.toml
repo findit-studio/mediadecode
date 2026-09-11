@@ -40,7 +40,8 @@ mediadecode = { workspace = true, features = ["alloc"] }
 mediaframe  = { workspace = true, features = ["alloc"] }
 ffmpeg-next = { workspace = true }
 derive_more = { workspace = true, features = ["is_variant", "try_unwrap", "unwrap"] }
-smol_str    = { workspace = true }
+smol-bytes  = { workspace = true }
+triomphe    = { workspace = true }
 thiserror   = { workspace = true }
 tracing     = { workspace = true }
 libc        = { workspace = true }

@@ -155,7 +155,6 @@ use mediadecode::{
   subtitle::{Bitmap as SubtitleBitmap, SubtitlePayload, Text as SubtitleText},
 };
 use mediaframe::audio::ChannelLayoutDescription;
-use smol_str::SmolStr;
 
 use crate::{
   boundary,
@@ -173,30 +172,41 @@ use crate::{
 ///
 /// The frame's pixel format isn't in the closed CPU-format set this
 /// crate supports for safe per-plane access.
-#[derive(Debug, Clone)]
+/// # A compact tag, and why it is not a `PixelFormat`
+///
+/// This payload used to carry the vocabulary's `PixelFormat` beside the
+/// raw id. mediaframe 0.11 widened that type's text arm, which made
+/// this the biggest arm of [`ConvertError`] at 144 bytes — a cost every
+/// `Result` on the convert road pays on its *success* path. Boxing the
+/// format fixed the size and introduced a worse thing: an **infallible
+/// allocation on the refusal path**, so a container-selected
+/// unsupported format could abort the process precisely while the
+/// converter was trying to report it. An error that says "this is
+/// unsupported" must not depend on the allocator agreeing.
+///
+/// So the payload is a tag: the raw `AVPixelFormat` integer, and
+/// libavutil's own name for it **borrowed** from the static descriptor
+/// table. Twenty-four bytes, no allocation, no lifetime that can
+/// dangle — the table outlives the process. The `PixelFormat` field is
+/// gone rather than boxed, and its own documentation is why that costs
+/// nothing: it said the vocabulary answer "is deliberately not made to
+/// carry the integer: `raw` and `name` are where the identity
+/// survives". A caller that wants the vocabulary's word for a raw id
+/// can ask for it; a caller reading an error wants to know which format
+/// was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UnsupportedPixelFormat {
-  format: PixelFormat,
   raw: i32,
-  name: Option<SmolStr>,
+  name: Option<&'static str>,
 }
 
 impl UnsupportedPixelFormat {
   /// Constructs an `UnsupportedPixelFormat` payload.
-  #[inline]
-  pub const fn new(format: PixelFormat, raw: i32, name: Option<SmolStr>) -> Self {
-    Self { format, raw, name }
-  }
-
-  /// The unified vocabulary's answer for [`Self::raw`].
   ///
-  /// [`PixelFormat::None`] whenever the raw integer has no mapping — a
-  /// hardware surface, a Bayer mosaic, a format FFmpeg gained after
-  /// this build. That is a *value*, not a failed lookup, and it is
-  /// deliberately not made to carry the integer: [`Self::raw`] and
-  /// [`Self::name`] are where the identity survives.
+  /// `const` again, and allocation-free: see the type's own note.
   #[inline]
-  pub const fn format(&self) -> &PixelFormat {
-    &self.format
+  pub const fn new(raw: i32, name: Option<&'static str>) -> Self {
+    Self { raw, name }
   }
   /// The raw `AVFrame.format` integer, exactly as FFmpeg wrote it.
   ///
@@ -214,23 +224,23 @@ impl UnsupportedPixelFormat {
   /// `None` for an integer libavutil does not describe — a corrupt
   /// read, or a format from a newer library than the one linked.
   #[inline]
-  pub fn name(&self) -> Option<&str> {
-    self.name.as_deref()
+  pub const fn name(&self) -> Option<&'static str> {
+    self.name
   }
 }
 
 impl core::fmt::Display for UnsupportedPixelFormat {
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-    match &self.name {
+    match self.name {
       Some(name) => write!(
         f,
-        "convert: unsupported pixel format {:?} (AVPixelFormat {} = {name:?})",
-        self.format, self.raw
+        "convert: unsupported pixel format {name:?} (AVPixelFormat {})",
+        self.raw
       ),
       None => write!(
         f,
-        "convert: unsupported pixel format {:?} (AVPixelFormat {}, unnamed by libavutil)",
-        self.format, self.raw
+        "convert: unsupported pixel format (AVPixelFormat {}, unnamed by libavutil)",
+        self.raw
       ),
     }
   }
@@ -288,6 +298,41 @@ impl BufferAcquireFailed {
   #[inline]
   pub const fn plane(&self) -> usize {
     self.plane
+  }
+}
+
+/// Payload for [`ConvertError::MalformedChannelLayout`].
+///
+/// A frame declares a custom channel layout FFmpeg cannot be asked to
+/// describe: a null map, a non-positive channel count, or a name with
+/// no NUL inside its sixteen bytes. Structural, and therefore
+/// **permanent** — a retry produces the same answer, so the decoder
+/// releases the frame rather than holding it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MalformedChannelLayout {
+  channels: i32,
+}
+
+impl MalformedChannelLayout {
+  /// Constructs a `MalformedChannelLayout` payload.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(channels: i32) -> Self {
+    Self { channels }
+  }
+  /// `nb_channels`, as the layout declared it.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn channels(&self) -> i32 {
+    self.channels
+  }
+}
+
+impl core::fmt::Display for MalformedChannelLayout {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    write!(
+      f,
+      "convert: a custom channel layout declaring {} channels carries no describable map",
+      self.channels,
+    )
   }
 }
 
@@ -711,6 +756,9 @@ pub enum ConvertError {
   /// The plane's extent was proved and the carrier still could not be
   /// made. See [`CarrierAllocFailed`].
   CarrierAllocFailed(CarrierAllocFailed),
+  /// A frame's custom channel layout cannot be described — structural,
+  /// and therefore permanent. See [`MalformedChannelLayout`].
+  MalformedChannelLayout(MalformedChannelLayout),
 }
 
 impl ConvertError {
@@ -746,6 +794,7 @@ impl core::fmt::Display for ConvertError {
       Self::InvalidPlaneLayout(p) => core::fmt::Display::fmt(p, f),
       Self::BufferAcquireFailed(p) => core::fmt::Display::fmt(p, f),
       Self::CarrierAllocFailed(p) => core::fmt::Display::fmt(p, f),
+      Self::MalformedChannelLayout(p) => core::fmt::Display::fmt(p, f),
     }
   }
 }
@@ -757,11 +806,10 @@ impl core::error::Error for ConvertError {}
 ///
 /// Both refusal sites go through here so the raw id and the name are
 /// never gathered at one of them and forgotten at the other.
-fn unsupported_pixel_format(format: PixelFormat, raw: i32) -> ConvertError {
+fn unsupported_pixel_format(raw: i32) -> ConvertError {
   ConvertError::UnsupportedPixelFormat(UnsupportedPixelFormat::new(
-    format,
     raw,
-    crate::ffi::pix_fmt_name(raw),
+    crate::ffi::pix_fmt_name_static(raw),
   ))
 }
 
@@ -842,11 +890,10 @@ pub fn audio_frame_from(
 /// here the restriction costs a caller nothing at all.
 pub fn subtitle_frame_from(
   subtitle: &ffmpeg_next::Subtitle,
-  time_base: Timebase,
 ) -> Result<SubtitleFrame<SubtitleFrameExtra, FfmpegBytes>, ConvertError> {
   // SAFETY: `&subtitle` keeps the AVSubtitle alive for the duration
   // of this call.
-  unsafe { av_subtitle_to_subtitle_frame_as::<crate::Owned>(subtitle.as_ptr(), time_base) }
+  unsafe { av_subtitle_to_subtitle_frame_as::<crate::Owned>(subtitle.as_ptr()) }
 }
 
 /// Converts an FFmpeg `AVFrame` (CPU-side, post-`av_hwframe_transfer_data`
@@ -966,7 +1013,7 @@ pub(crate) unsafe fn av_frame_to_video_frame_as<C: crate::FfmpegCarrier + crate:
     .with_chroma_location(map_chroma_loc(chroma_location_raw));
 
   // Backend-specific extras.
-  let extra = unsafe { build_video_frame_extra(av_frame) };
+  let extra = unsafe { build_video_frame_extra(av_frame) }?;
 
   // pix_fmt is already mediadecode::PixelFormat thanks to the boundary
   // function above, so we just pass it through.
@@ -1246,7 +1293,7 @@ unsafe fn copy_out_planes<C: crate::FfmpegCarrier + crate::CarrierOps>(
   // packings — before touching plane memory. Without a deliverable
   // layout we'd be reading garbage `linesize * height` bytes.
   if !road.is_deliverable(pix_fmt) {
-    return Err(unsupported_pixel_format(pix_fmt.clone(), format_raw));
+    return Err(unsupported_pixel_format(format_raw));
   }
   // The per-plane row count and visible (tight) byte width come from
   // `pixdesc::plane_geometry`, which derives them from libavutil's own
@@ -1257,7 +1304,7 @@ unsafe fn copy_out_planes<C: crate::FfmpegCarrier + crate::CarrierOps>(
   // unsupported frame rather than guessing a layout.
   let geom = match road.plane_geometry(pix_fmt, width as usize, height as usize) {
     Some(g) => g,
-    None => return Err(unsupported_pixel_format(pix_fmt.clone(), format_raw)),
+    None => return Err(unsupported_pixel_format(format_raw)),
   };
 
   // The byte ceiling, before a single plane is allocated. Totalled over
@@ -1583,7 +1630,9 @@ unsafe fn build_visible_rect(av_frame: *const AVFrame, width: u32, height: u32) 
 /// `av_frame` must be a live `*const AVFrame` for the duration of this
 /// call. Reads each individual field through the raw pointer; never
 /// forms a `&AVFrame` reference.
-unsafe fn build_video_frame_extra(av_frame: *const AVFrame) -> VideoFrameExtra {
+unsafe fn build_video_frame_extra(
+  av_frame: *const AVFrame,
+) -> Result<VideoFrameExtra, ConvertError> {
   let mut out = VideoFrameExtra::default();
   // SAR.
   let sar_num = unsafe { (*av_frame).sample_aspect_ratio.num };
@@ -1614,11 +1663,11 @@ unsafe fn build_video_frame_extra(av_frame: *const AVFrame) -> VideoFrameExtra {
   // shaped HDR entries additionally parsed onto their own seats.
   // Parsed from the already-copied `SideDataEntry` bytes rather than
   // re-walking `av_frame` a second time — one unsafe walk, two uses.
-  let side_data = unsafe { collect_side_data(av_frame) };
+  let side_data = unsafe { collect_side_data(av_frame) }?;
   out.set_mastering_display(find_mastering_display(&side_data));
   out.set_content_light_level(find_content_light_level(&side_data));
   out.set_side_data(side_data);
-  out
+  Ok(out)
 }
 
 /// Byte length of FFmpeg's in-process `AVMasteringDisplayMetadata`:
@@ -1857,9 +1906,17 @@ unsafe fn bounded_cstr_bytes<'a>(ptr: *const core::ffi::c_char, cap: usize) -> O
 /// [`SIDE_DATA_MAX_ENTRIES`] entries and [`SIDE_DATA_MAX_TOTAL_BYTES`]
 /// total bytes; once either cap is reached we stop copying further
 /// entries and a `tracing::warn!` is emitted at most once per call.
-/// Allocations use `try_reserve_exact` so OOM surfaces as a dropped
-/// entry rather than a process abort.
-unsafe fn collect_side_data(av_frame: *const AVFrame) -> std::vec::Vec<SideDataEntry> {
+/// Allocation failure is **reported, never absorbed**: the table's
+/// reservation and each payload copy are fallible, and both answer
+/// with [`ConvertError::CarrierAllocFailed`], which a timed decoder
+/// parks and retries. Dropping an entry and returning `Ok` would make
+/// a frame that lost its mastering-display metadata to a moment of
+/// memory pressure indistinguishable from one whose file never carried
+/// any — the caps above are the only reason an entry is ever left out,
+/// and they are a property of the file rather than of the machine.
+unsafe fn collect_side_data(
+  av_frame: *const AVFrame,
+) -> Result<std::vec::Vec<SideDataEntry>, ConvertError> {
   // Read `nb_side_data` as the bindgen `c_int` and clamp non-
   // positive values BEFORE casting to `usize`. A negative value
   // (corrupt / version-skew decoder output) cast directly to
@@ -1868,7 +1925,7 @@ unsafe fn collect_side_data(av_frame: *const AVFrame) -> std::vec::Vec<SideDataE
   let nb_side_data_raw = unsafe { (*av_frame).nb_side_data };
   let side_data = unsafe { (*av_frame).side_data };
   if nb_side_data_raw <= 0 || side_data.is_null() {
-    return Vec::new();
+    return Ok(Vec::new());
   }
   let count_raw = nb_side_data_raw as usize;
   let count = count_raw.min(SIDE_DATA_MAX_ENTRIES);
@@ -1880,9 +1937,12 @@ unsafe fn collect_side_data(av_frame: *const AVFrame) -> std::vec::Vec<SideDataE
     );
   }
   let mut out: Vec<SideDataEntry> = Vec::new();
-  if out.try_reserve_exact(count).is_err() {
-    return Vec::new();
-  }
+  // The descriptor table's own reservation is reportable too: dropping
+  // the whole table on a refusal used to look like a frame that simply
+  // carried no side data.
+  out
+    .try_reserve_exact(count)
+    .map_err(|_| ConvertError::CarrierAllocFailed(CarrierAllocFailed::new(0)))?;
   let mut total_bytes: usize = 0;
   for i in 0..count {
     let sd = unsafe { *side_data.add(i) };
@@ -1911,28 +1971,36 @@ unsafe fn collect_side_data(av_frame: *const AVFrame) -> std::vec::Vec<SideDataE
         break;
       }
       total_bytes = projected;
-      // Staged through a `Vec` first, so `try_reserve_exact` keeps
-      // *one* of the two payload-sized allocations a dropped entry
-      // rather than a process abort. The carrier copy that follows is a
-      // second full allocation of the same size — not a header — and it
-      // is infallible; what the staging buys is that the first and
-      // larger risk is reportable and the second is asked for a size
-      // the allocator has just proved it has. Affordable only because
-      // side data is capped at `SIDE_DATA_MAX_TOTAL_BYTES`; the plane
-      // path next door is not small and uses the one-allocation road.
-      let mut buf: Vec<u8> = Vec::new();
-      if buf.try_reserve_exact(size).is_err() {
-        continue;
-      }
+      // **One fallible allocation, and its failure is reported.**
+      //
+      // Two shapes lived here before and both were wrong. The first
+      // staged the payload into a `try_reserve_exact`ed `Vec` and then
+      // copied it again into a carrier that allocated infallibly — two
+      // full-size allocations, the second of which aborted. The
+      // second kept that staging `Vec` after the carrier had been made
+      // fallible, so the reservation bought nothing and its `continue`
+      // **silently dropped the entry**: this function still returned
+      // `Ok`, the decoder released the scratch frame, and a
+      // mastering-display or content-light annotation vanished under
+      // memory pressure with nothing said. A caption that disappears
+      // because the machine was briefly short of memory is the worst
+      // of the three outcomes, because nothing downstream can tell it
+      // from a file that never carried one.
+      //
+      // The carrier allocates fallibly itself, so there is one
+      // allocation and a refusal is `CarrierAllocFailed` — which
+      // `parks_in_decode` calls transient, so the frame is parked and
+      // the whole conversion is retried rather than delivered short.
+      //
       // SAFETY: `data_ptr` is documented as valid for `size` bytes
       // per FFmpeg's AVFrameSideData contract.
       let src = unsafe { core::slice::from_raw_parts(data_ptr, size) };
-      buf.extend_from_slice(src);
-      FfmpegBytes::copy_from_slice(&buf)
+      FfmpegBytes::try_copy_from_slice(src)
+        .ok_or(ConvertError::CarrierAllocFailed(CarrierAllocFailed::new(0)))?
     };
     out.push(SideDataEntry::new(kind, data_slice));
   }
-  out
+  Ok(out)
 }
 
 /// Totals a still's declared side data and judges it, **allocating
@@ -2024,20 +2092,23 @@ unsafe fn collect_image_side_data(
     return Ok(Vec::new());
   }
   let count = nb_side_data_raw as usize;
-  let budget = limits.max_image_side_data_bytes();
   // **The measuring pass, re-run.** It runs earlier too — before the
   // planes are bought — and this is the copying pass. Repeating a pair
   // of comparisons that guard an allocation is defence in depth, not
   // duplication: it keeps this function correct on its own terms rather
   // than only in the order it happens to be called in.
-  let total = unsafe { measure_image_side_data(av_frame, limits) }?;
+  let _total = unsafe { measure_image_side_data(av_frame, limits) }?;
 
   let mut out: Vec<SideDataEntry> = Vec::new();
-  if out.try_reserve_exact(count).is_err() {
-    return Err(ConvertError::ImageSideDataTooLarge(
-      ImageSideDataTooLarge::new(total, budget),
-    ));
-  }
+  // **An allocator refusal is not an oversized image.** The budget
+  // already passed — the measuring pass above proved it — so reporting
+  // this as
+  // `ImageSideDataTooLarge` told a caller its file was too big when
+  // the machine was simply out of memory, and that verdict is
+  // permanent where this one is not.
+  out
+    .try_reserve_exact(count)
+    .map_err(|_| ConvertError::CarrierAllocFailed(CarrierAllocFailed::new(0)))?;
   for i in 0..count {
     let sd = unsafe { *side_data.add(i) };
     if sd.is_null() {
@@ -2053,7 +2124,8 @@ unsafe fn collect_image_side_data(
       // FFmpeg's `AVFrameSideData` contract, and the total was proved
       // to fit the budget above.
       let src = unsafe { core::slice::from_raw_parts(data_ptr, size) };
-      FfmpegBytes::copy_from_slice(src)
+      FfmpegBytes::try_copy_from_slice(src)
+        .ok_or(ConvertError::CarrierAllocFailed(CarrierAllocFailed::new(0)))?
     };
     out.push(SideDataEntry::new(kind, payload));
   }
@@ -2394,8 +2466,39 @@ pub(crate) unsafe fn av_frame_to_audio_frame_as<C: crate::FfmpegCarrier + crate:
   // proved to be one this crate can carry. Because the raw field is in
   // `0..=255`, the description's own `nb_channels.max(0)` is the
   // identity here and its `channels()` equals `channel_count_full`.
+  // **The two faults are not the same kind of thing.** An allocator
+  // refusal is transient, and `parks_in_decode` keeps the scratch
+  // frame so the next pull retries it. A malformed custom map is
+  // structural: retrying it returns the same error forever and the
+  // decoder never releases the frame. They are classified apart.
+  //
+  // SAFETY: (1) `ch_layout_ptr` is `addr_of!((*av_frame).ch_layout)` on
+  // a live `AVFrame` this function holds for its whole body, so it is a
+  // live, aligned `*const AVChannelLayout`. (2) For a `CUSTOM` order,
+  // `u.map` is FFmpeg's own allocation of exactly `nb_channels`
+  // `AVChannelCustom` entries: the frame came out of libavcodec, which
+  // fills `ch_layout` through `av_channel_layout_copy`, and no caller
+  // of this crate supplies a layout here. The `unsafe` road is the only
+  // one that reads a custom map at all — the safe conversion refuses
+  // one, because the extent this comment supplies is exactly what a
+  // safe signature cannot demand.
   let channel_layout =
-    unsafe { crate::channel_layout::channel_layout_description_from_raw_ptr(ch_layout_ptr) };
+    unsafe { crate::channel_layout::channel_layout_description_from_raw_ptr(ch_layout_ptr) }
+      .map_err(|fault| match fault {
+        crate::channel_layout::ChannelLayoutFault::Alloc => {
+          ConvertError::CarrierAllocFailed(CarrierAllocFailed::new(0))
+        }
+        // The second cannot arrive from the pointer road — it is how
+        // the *safe* conversion refuses a custom layout whose extent it
+        // cannot establish — but both are structural faults of this
+        // frame's layout, so one arm keeps the match total without an
+        // `unreachable!`.
+        crate::channel_layout::ChannelLayoutFault::MalformedCustomMap { channels }
+        | crate::channel_layout::ChannelLayoutFault::UnverifiableCustomMap { channels }
+        | crate::channel_layout::ChannelLayoutFault::MalformedLayout { channels, .. } => {
+          ConvertError::MalformedChannelLayout(MalformedChannelLayout::new(channels))
+        }
+      })?;
   debug_assert_eq!(
     channel_layout.channels(),
     channel_count_full,
@@ -2604,7 +2707,7 @@ pub(crate) unsafe fn av_frame_to_audio_frame_as<C: crate::FfmpegCarrier + crate:
   // SAFETY: caller upholds liveness for the duration of the call;
   // collect_side_data reads enum-typed `type_` raw and bounds-checks
   // each entry's data slice.
-  extra.set_side_data(unsafe { collect_side_data(av_frame) });
+  extra.set_side_data(unsafe { collect_side_data(av_frame) }?);
 
   Ok(
     AudioFrame::new(
@@ -2697,7 +2800,6 @@ pub(crate) unsafe fn av_subtitle_to_subtitle_frame_as<
   C: crate::FfmpegCarrier + crate::CarrierOps,
 >(
   av_subtitle: *const ffmpeg_next::ffi::AVSubtitle,
-  time_base: Timebase,
 ) -> Result<SubtitleFrame<SubtitleFrameExtra, C::Buffer>, ConvertError> {
   if av_subtitle.is_null() {
     return Err(ConvertError::NullFrame);
@@ -2706,6 +2808,13 @@ pub(crate) unsafe fn av_subtitle_to_subtitle_frame_as<
   // or `&AVSubtitleRect` (both contain `type_: AVSubtitleType` enum
   // fields). Read every field through the raw pointer.
 
+  // **Staged fallibly.** Both of these grow on numbers a decoder
+  // controls — the rect count, each rect's text length — and the caps
+  // below bound how large they may get without making the growth
+  // itself reportable. An abort here is the one outcome the pull loop
+  // cannot recover from: `parks_in_decode` exists so a transient
+  // refusal keeps the pending cue for another attempt, and an
+  // allocator that aborts takes the cue and the process with it.
   let mut text_chunks: std::vec::Vec<u8> = std::vec::Vec::new();
   let mut bitmap_regions: std::vec::Vec<mediadecode::subtitle::BitmapRegion<C::Buffer>> =
     std::vec::Vec::new();
@@ -2727,6 +2836,11 @@ pub(crate) unsafe fn av_subtitle_to_subtitle_frame_as<
   // job is to bound a malicious / corrupt stream's allocation
   // budget, not to limit legitimate use.
   let count = count_raw.min(SUBTITLE_MAX_RECTS);
+  // The rect table, reserved against the capped count rather than the
+  // declared one.
+  bitmap_regions
+    .try_reserve(count)
+    .map_err(|_| ConvertError::CarrierAllocFailed(CarrierAllocFailed::new(0)))?;
   if count_raw > SUBTITLE_MAX_RECTS {
     tracing::warn!(
       cap = SUBTITLE_MAX_RECTS,
@@ -2793,8 +2907,14 @@ pub(crate) unsafe fn av_subtitle_to_subtitle_frame_as<
           return Err(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(0)));
         }
         if separator == 1 {
+          text_chunks
+            .try_reserve(1)
+            .map_err(|_| ConvertError::CarrierAllocFailed(CarrierAllocFailed::new(0)))?;
           text_chunks.push(b'\n');
         }
+        text_chunks
+          .try_reserve(bytes.len())
+          .map_err(|_| ConvertError::CarrierAllocFailed(CarrierAllocFailed::new(0)))?;
         text_chunks.extend_from_slice(bytes);
         text_total_bytes = projected;
       }
@@ -2814,8 +2934,14 @@ pub(crate) unsafe fn av_subtitle_to_subtitle_frame_as<
           return Err(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(0)));
         }
         if separator == 1 {
+          text_chunks
+            .try_reserve(1)
+            .map_err(|_| ConvertError::CarrierAllocFailed(CarrierAllocFailed::new(0)))?;
           text_chunks.push(b'\n');
         }
+        text_chunks
+          .try_reserve(bytes.len())
+          .map_err(|_| ConvertError::CarrierAllocFailed(CarrierAllocFailed::new(0)))?;
         text_chunks.extend_from_slice(bytes);
         text_total_bytes = projected;
       }
@@ -2891,9 +3017,26 @@ pub(crate) unsafe fn av_subtitle_to_subtitle_frame_as<
     SubtitlePayload::Text(SubtitleText::new(C::empty(), None))
   };
 
+  // **`AVSubtitle.pts` is in `AV_TIME_BASE` units — microseconds —
+  // whatever the stream's own timebase is.** FFmpeg's own
+  // documentation says so on the field, and libavcodec's generic
+  // subtitle path fills it by rescaling the packet's PTS out of
+  // `pkt_timebase` into `AV_TIME_BASE_Q`.
+  //
+  // This used to be labelled with the *stream* timebase and not
+  // rescaled, so a cue at 5,000,000 microseconds on a 1/1000 stream
+  // reported itself as 5,000 seconds instead of 5.
+  //
+  // **Labelled, not rescaled.** A [`Timestamp`] carries its own
+  // timebase and compares by the instant it names, so a microsecond
+  // label is already directly comparable with a packet timestamp in
+  // any other ruler — and it is exact, where a rescale into a coarser
+  // stream timebase would round a cue boundary for no one's benefit. A
+  // consumer that wants the stream's ruler asks for it by name, with
+  // `Timestamp::rescale_to`.
   let sub_pts = unsafe { (*av_subtitle).pts };
   let pts = if sub_pts != AV_NOPTS_VALUE {
-    Some(Timestamp::new(sub_pts, time_base))
+    Some(Timestamp::new(sub_pts, Timebase::MICROS))
   } else {
     None
   };
@@ -3032,11 +3175,10 @@ pub unsafe fn av_frame_to_owned_audio_frame(
 /// may outlive the returned carriers.
 pub unsafe fn av_subtitle_to_subtitle_frame(
   av_subtitle: *const ffmpeg_next::ffi::AVSubtitle,
-  time_base: Timebase,
 ) -> Result<SubtitleFrame<SubtitleFrameExtra, crate::FfmpegBuffer>, ConvertError> {
   // SAFETY: forwarded verbatim; the caller's obligations are the
   // worker's.
-  unsafe { av_subtitle_to_subtitle_frame_as::<crate::View>(av_subtitle, time_base) }
+  unsafe { av_subtitle_to_subtitle_frame_as::<crate::View>(av_subtitle) }
 }
 
 /// [`av_subtitle_to_subtitle_frame`] on the **owned** lane, which copies every byte it
@@ -3047,8 +3189,7 @@ pub unsafe fn av_subtitle_to_subtitle_frame(
 /// The source must be live for the duration of the call.
 pub unsafe fn av_subtitle_to_owned_subtitle_frame(
   av_subtitle: *const ffmpeg_next::ffi::AVSubtitle,
-  time_base: Timebase,
 ) -> Result<SubtitleFrame<SubtitleFrameExtra, FfmpegBytes>, ConvertError> {
   // SAFETY: forwarded verbatim.
-  unsafe { av_subtitle_to_subtitle_frame_as::<crate::Owned>(av_subtitle, time_base) }
+  unsafe { av_subtitle_to_subtitle_frame_as::<crate::Owned>(av_subtitle) }
 }

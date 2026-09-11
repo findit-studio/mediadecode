@@ -313,13 +313,21 @@ unsafe fn compare(src: *const AVCodecParameters, dst: *const AVCodecParameters) 
           }
         }
       }
-    } else {
-      // SAFETY: every other order names the `mask` arm.
+    } else if a_order == AVChannelOrder::AV_CHANNEL_ORDER_NATIVE as i32
+      || a_order == AVChannelOrder::AV_CHANNEL_ORDER_AMBISONIC as i32
+    {
+      // SAFETY: these two orders — and only these two — name the
+      // `mask` arm.
       let (a_mask, b_mask) = unsafe { ((*src).ch_layout.u.mask, (*dst).ch_layout.u.mask) };
       if a_mask != b_mask {
         bad.push(format!("ch_layout.u.mask: {a_mask:#x} != {b_mask:#x}"));
       }
     }
+    // `UNSPEC`, and any order this build does not name: the union is
+    // undefined for them, so there is nothing here to compare. This
+    // comparator used to read the mask for every non-`CUSTOM` order and
+    // would have called a correct rebuild broken over a field that
+    // means nothing — the same defect the mirror itself carried.
   }
 
   // 26-32. the audio seats, and the alpha mode
@@ -748,17 +756,22 @@ fn a_custom_layout_without_a_map_is_refused() {
     Err(DemuxError::ParametersChannelMap(_)),
   ));
 
-  // A *negative* count is refused too, but by the gate one step
-  // earlier and under its own name — recorded rather than papered
-  // over, because which gate answers is the difference between two
-  // true statements about the same file.
+  // A *negative* count is the same refusal, and it did not used to be.
   //
-  // `mirror` measures the footprint before it reads a single seat, and
+  // `mirror` measured the footprint before it read a single seat, and
   // for a custom order that measurement is
-  // `nb_channels * size_of::<AVChannelCustom>()`. A count that will not
-  // convert to a `usize` is a footprint that cannot be computed, and
-  // `measure_parameters` fails closed on it — so the answer is
-  // `ParametersTooLarge`, and `channel_layout_of` is never reached.
+  // `nb_channels * size_of::<AVChannelCustom>()` — a count that will
+  // not convert to a `usize` is a footprint that cannot be computed, so
+  // `measure_parameters` failed closed and the answer was
+  // `ParametersTooLarge`. Two true statements about one file, and the
+  // less useful one won because it was asked first.
+  //
+  // The structural validator runs before the measurement now, so the
+  // answer is the one that describes the file: a custom layout
+  // declaring minus one channels is a malformed map, not an oversized
+  // one. The reordering is what puts every structural refusal ahead of
+  // the copies, and this lane is where its one visible consequence is
+  // recorded.
   let mut negative = Parameters::new();
   // SAFETY: as above; a negative channel count is a value a hostile
   // file can declare.
@@ -771,8 +784,11 @@ fn a_custom_layout_without_a_map_is_refused() {
     (*par).ch_layout.nb_channels = -1;
   }
   match CodecTicket::mirror(&negative, 7, usize::MAX) {
-    Err(DemuxError::ParametersTooLarge(ref p)) => assert_eq!(p.stream_index(), 7),
-    Err(other) => panic!("expected ParametersTooLarge, got {other:?}"),
+    Err(DemuxError::ParametersChannelMap(ref p)) => {
+      assert_eq!(p.stream_index(), 7);
+      assert_eq!(p.channels(), -1, "the count is reported as declared");
+    }
+    Err(other) => panic!("expected ParametersChannelMap, got {other:?}"),
     Ok(_) => panic!("a custom layout declaring -1 channels was mirrored"),
   }
 }
@@ -878,6 +894,12 @@ fn a_layout_carrying_user_private_data_is_refused() {
   // null below so `avcodec_parameters_free` never sees the borrow.
   unsafe {
     let par = parameters.as_mut_ptr();
+    // A mask means something only under an order that defines it —
+    // see the scalar-seat fixture's note.
+    core::ptr::write_unaligned(
+      core::ptr::addr_of_mut!((*par).ch_layout.order).cast::<i32>(),
+      AVChannelOrder::AV_CHANNEL_ORDER_NATIVE as i32,
+    );
     (*par).ch_layout.nb_channels = 2;
     (*par).ch_layout.u.mask = 3;
     (*par).ch_layout.opaque = core::ptr::addr_of_mut!(anything).cast();
@@ -1289,6 +1311,14 @@ fn every_scalar_seat_is_written_back() {
     );
     (*par).video_delay = 3;
     core::ptr::write_unaligned(core::ptr::addr_of_mut!((*par).alpha_mode).cast::<i32>(), 1);
+    // The order is what makes the mask mean anything: FFmpeg defines
+    // `u.mask` for `NATIVE` and `AMBISONIC` only, and this fixture used
+    // to leave the order at the `UNSPEC` zero the allocator wrote while
+    // setting a mask anyway — a shape libavformat never produces.
+    core::ptr::write_unaligned(
+      core::ptr::addr_of_mut!((*par).ch_layout.order).cast::<i32>(),
+      AVChannelOrder::AV_CHANNEL_ORDER_NATIVE as i32,
+    );
     (*par).ch_layout.nb_channels = 6;
     (*par).ch_layout.u.mask = 0x3f;
     (*par).sample_rate = 48_000;

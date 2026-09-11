@@ -6,7 +6,7 @@ use super::*;
 /// [`ContainerFormat::name`] would store a string no vocabulary parses.
 #[test]
 fn a_family_demuxer_walks_every_word_it_handles() {
-  let format = ContainerFormat::new(SmolStr::new("mov,mp4,m4a,3gp,3g2,mj2"), None);
+  let format = ContainerFormat::new(Utf8Bytes::from("mov,mp4,m4a,3gp,3g2,mj2"), None);
 
   assert_eq!(format.name(), "mov,mp4,m4a,3gp,3g2,mj2");
   assert_eq!(
@@ -19,7 +19,7 @@ fn a_family_demuxer_walks_every_word_it_handles() {
 /// no caller needs a second road for it.
 #[test]
 fn a_single_format_demuxer_walks_one_word() {
-  let format = ContainerFormat::new(SmolStr::new("flac"), Some(SmolStr::new("raw FLAC")));
+  let format = ContainerFormat::new(Utf8Bytes::from("flac"), Some(Utf8Bytes::from("raw FLAC")));
 
   assert_eq!(format.names().collect::<Vec<_>>(), ["flac"]);
   assert_eq!(format.long_name(), Some("raw FLAC"));
@@ -30,7 +30,7 @@ fn a_single_format_demuxer_walks_one_word() {
 /// which is what [`ContainerFormat::from_context`] enforces at the door.
 #[test]
 fn a_format_without_a_description_is_still_a_format() {
-  let format = ContainerFormat::new(SmolStr::new("matroska,webm"), None);
+  let format = ContainerFormat::new(Utf8Bytes::from("matroska,webm"), None);
 
   assert_eq!(format.long_name(), None);
   assert_eq!(format.names().collect::<Vec<_>>(), ["matroska", "webm"]);
@@ -41,7 +41,7 @@ fn a_format_without_a_description_is_still_a_format() {
 /// try against a vocabulary that can only refuse it.
 #[test]
 fn empty_words_are_not_names() {
-  let format = ContainerFormat::new(SmolStr::new("mp4,,mov,"), None);
+  let format = ContainerFormat::new(Utf8Bytes::from("mp4,,mov,"), None);
 
   assert_eq!(format.names().collect::<Vec<_>>(), ["mp4", "mov"]);
 }
@@ -54,7 +54,7 @@ fn empty_words_are_not_names() {
 /// crossed.
 #[test]
 fn the_words_are_what_a_typed_vocabulary_parses() {
-  let format = ContainerFormat::new(SmolStr::new("mov,mp4,m4a,3gp,3g2,mj2"), None);
+  let format = ContainerFormat::new(Utf8Bytes::from("mov,mp4,m4a,3gp,3g2,mj2"), None);
 
   let recognised: Vec<_> = format
     .names()

@@ -28,7 +28,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// are exhaustive for the mirror-image reason: their arms are the
 /// substrate's fixed state set, and there the wildcard would be dead
 /// weight hiding a state a consumer forgot.
-#[derive(Debug, Clone, thiserror::Error, IsVariant, Unwrap, TryUnwrap)]
+#[derive(Debug, thiserror::Error, IsVariant, Unwrap, TryUnwrap)]
 #[unwrap(ref, ref_mut)]
 #[try_unwrap(ref, ref_mut)]
 #[non_exhaustive]
@@ -52,6 +52,31 @@ pub enum Error {
   /// [`DemuxLimits`](crate::DemuxLimits) carries the seat.
   #[error(transparent)]
   ParametersTooLarge(#[from] crate::demuxer::ParametersTooLarge),
+
+  /// A stream's channel layout is not a shape FFmpeg's own helpers can
+  /// be given, so the decoder was not opened over it.
+  ///
+  /// **Structural and permanent, never an allocation failure.**
+  /// `avcodec_parameters_to_context` reaches `av_channel_layout_copy`,
+  /// whose `memcpy` reads the custom map with no null check of its own,
+  /// and FFmpeg's describe and compare helpers compute
+  /// `nb_channels - popcount(mask)` — and take an integer square root
+  /// of it — without checking either. None of that is a shortage of
+  /// memory and none of it will be different on the next attempt, which
+  /// is why it does not share the allocation arm.
+  ///
+  /// See
+  /// [`layout_preflight`](crate::channel_layout::layout_preflight) for
+  /// the rule, which the demux admission pass and the outbound clone
+  /// apply too.
+  #[error(transparent)]
+  MalformedChannelLayout(#[from] crate::demuxer::ParametersLayoutShape),
+
+  /// A stream's channel layout declares a custom order without the map
+  /// that order requires — the shape `av_channel_layout_copy` would
+  /// `memcpy` from null. Structural and permanent, as above.
+  #[error(transparent)]
+  ChannelMapMissing(#[from] crate::demuxer::ParametersChannelMap),
 
   /// `avcodec_find_decoder` returned null for the input codec id. The id
   /// is reported as the raw integer (`AVCodecID` discriminant) — we do not
@@ -214,7 +239,7 @@ pub enum FallbackOrigin {
 /// `Debug` is hand-written: [`ffmpeg_next::Packet`] does not derive
 /// `Debug`, so we print `[N packets]` instead of dumping per-packet
 /// bytes, which would be both noisy and useless for triage.
-#[derive(Clone, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[error("all hardware backends failed; attempts: {attempts:?}")]
 pub struct AllBackendsFailed {
   /// Per-backend errors collected during probing, in the order tried.
@@ -317,7 +342,7 @@ impl std::fmt::Debug for AllBackendsFailed {
 /// `Debug` is hand-written for the same reason as
 /// [`AllBackendsFailed`]: [`ffmpeg_next::Packet`] does not derive
 /// `Debug`.
-#[derive(Clone, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[error("HW->SW fallback failed: {source}")]
 pub struct FallbackFailed {
   /// Underlying error that aborted the fallback transition.

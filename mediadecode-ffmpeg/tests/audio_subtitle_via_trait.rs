@@ -258,6 +258,12 @@ fn a_subtitle_session_that_was_told_the_stream_ended_says_so() {
 /// Opens a text-subtitle decoder with no fixture file. The states under
 /// test are the session's, not any container's.
 fn subrip_decoder() -> FfmpegSubtitleStreamDecoder {
+  subrip_decoder_in(Timebase::default())
+}
+
+/// [`subrip_decoder`], with the stream timebase the decoder is opened
+/// against named — which is what reaches `AVCodecContext.pkt_timebase`.
+fn subrip_decoder_in(time_base: Timebase) -> FfmpegSubtitleStreamDecoder {
   ffmpeg::init().expect("ffmpeg init");
   let mut parameters = ffmpeg::codec::Parameters::new();
   // SAFETY: `parameters` owns a live, zeroed `AVCodecParameters`; both
@@ -268,13 +274,65 @@ fn subrip_decoder() -> FfmpegSubtitleStreamDecoder {
     (*raw).codec_type = ffmpeg::ffi::AVMediaType::AVMEDIA_TYPE_SUBTITLE;
     (*raw).codec_id = ffmpeg::ffi::AVCodecID::AV_CODEC_ID_SUBRIP;
   }
-  FfmpegSubtitleStreamDecoder::open(parameters, Timebase::default(), DecoderLimits::default())
+  FfmpegSubtitleStreamDecoder::open(parameters, time_base, DecoderLimits::default())
     .expect("open a subrip decoder")
+}
+
+/// **A decoded cue names the right instant, in the timebase FFmpeg
+/// defines for it.**
+///
+/// Two defects met here, and one lane catches both:
+///
+/// 1. The shared codec-context builder never wrote
+///    `AVCodecContext.pkt_timebase`. libavcodec's generic subtitle path
+///    fills `AVSubtitle.pts` by rescaling the packet's PTS out of that
+///    field, and skips it entirely when the field is unset — so before
+///    the fix this cue came back with **no timestamp at all**, and the
+///    `expect` below is what proves the field now reaches libavcodec.
+/// 2. `AVSubtitle.pts` is in `AV_TIME_BASE` units — microseconds — and
+///    the converter labelled it with the *stream's* timebase without
+///    rescaling. A cue five seconds in, on this 1/1000 stream, reported
+///    itself as 5,000,000 over 1/1000: five thousand seconds.
+///
+/// The instant assertion is the one that matters to a consumer;
+/// `Timestamp` compares by *when*, so it would hold under either
+/// labelling that was arithmetically honest. The label assertion
+/// beside it pins which of the two honest answers this crate gives.
+#[test]
+fn a_decoded_cue_is_labelled_in_microseconds_and_names_the_right_instant() {
+  let milliseconds = Timebase::new(1, NonZeroI32::new(1_000).expect("non-zero"));
+  let mut decoder = subrip_decoder_in(milliseconds);
+
+  // Five seconds in, counted in the stream's own milliseconds.
+  let packet = cue_packet().with_pts(Some(mediadecode::Timestamp::new(5_000, milliseconds)));
+  assert_eq!(decoder.send_packet(&packet).expect("send"), Sent::Accepted);
+
+  let mut dst = empty_subtitle_frame();
+  assert_eq!(
+    decoder.receive_frame(&mut dst).expect("receive"),
+    Received::Frame,
+  );
+
+  let pts = dst
+    .pts()
+    .expect("libavcodec fills AVSubtitle.pts only once pkt_timebase is set");
+  assert_eq!(
+    pts,
+    mediadecode::Timestamp::new(5, Timebase::SECONDS),
+    "the cue is five seconds in, however it is labelled",
+  );
+  assert_eq!(
+    pts.timebase(),
+    Timebase::MICROS,
+    "AVSubtitle.pts is in AV_TIME_BASE units, and the label says so rather than borrowing the \
+     stream's ruler",
+  );
+  assert_eq!(pts.pts(), 5_000_000);
 }
 
 fn cue_packet() -> mediadecode_ffmpeg::OwnedSubtitlePacket {
   mediadecode::packet::SubtitlePacket::new(
-    mediadecode_ffmpeg::FfmpegBytes::copy_from_slice(b"hello world"),
+    mediadecode_ffmpeg::FfmpegBytes::try_copy_from_slice(b"hello world").expect("a test payload"),
     mediadecode_ffmpeg::extras::SubtitlePacketExtra::default(),
   )
 }

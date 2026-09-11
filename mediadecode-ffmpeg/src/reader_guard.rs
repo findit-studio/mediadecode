@@ -31,7 +31,7 @@ use std::{
   },
 };
 
-use smol_str::SmolStr;
+use smol_bytes::Utf8Bytes;
 
 /// Where a panic raised inside a caller's reader is recorded until the
 /// demuxer can name it.
@@ -42,7 +42,7 @@ use smol_str::SmolStr;
 #[derive(Debug, Default)]
 pub(crate) struct PanicLatch {
   latched: AtomicBool,
-  message: Mutex<Option<SmolStr>>,
+  message: Mutex<Option<Utf8Bytes>>,
 }
 
 impl PanicLatch {
@@ -53,7 +53,7 @@ impl PanicLatch {
     let message = describe(payload);
     // A poisoned lock means a previous holder panicked while
     // describing a panic. The stored value is still a plain
-    // `Option<SmolStr>` and is sound to use, and refusing to record
+    // `Option<Utf8Bytes>` and is sound to use, and refusing to record
     // here would lose the very error this type exists to carry.
     let mut slot = self.message.lock().unwrap_or_else(|e| e.into_inner());
     if slot.is_none() {
@@ -66,7 +66,7 @@ impl PanicLatch {
   /// The latched panic's message, or `None` when no reader has
   /// panicked. Reading it does not clear it: a poisoned `AVIOContext`
   /// stays poisoned, so every later call must report the same cause.
-  pub(crate) fn message(&self) -> Option<SmolStr> {
+  pub(crate) fn message(&self) -> Option<Utf8Bytes> {
     if !self.latched.load(Ordering::Acquire) {
       return None;
     }
@@ -75,19 +75,22 @@ impl PanicLatch {
       .lock()
       .unwrap_or_else(|e| e.into_inner())
       .clone()
-      .or_else(|| Some(SmolStr::new_static(UNNAMED)))
+      .or_else(|| Some(Utf8Bytes::from_static(UNNAMED)))
   }
 }
 
 /// What a panic payload says, for the payload shapes `panic!` produces.
-fn describe(payload: &(dyn Any + Send)) -> SmolStr {
+fn describe(payload: &(dyn Any + Send)) -> Utf8Bytes {
   if let Some(s) = payload.downcast_ref::<&'static str>() {
-    return SmolStr::new(s);
+    // A `panic!("literal")` payload is already `'static`; storing the
+    // borrow beats copying it, and a panic message is the last place
+    // that should need the allocator.
+    return Utf8Bytes::from_static(s);
   }
   if let Some(s) = payload.downcast_ref::<String>() {
-    return SmolStr::new(s);
+    return Utf8Bytes::from(s.as_str());
   }
-  SmolStr::new_static(UNNAMED)
+  Utf8Bytes::from_static(UNNAMED)
 }
 
 /// Stand-in for a payload that is neither `&str` nor `String` — a

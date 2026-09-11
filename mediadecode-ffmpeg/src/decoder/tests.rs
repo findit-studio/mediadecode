@@ -2352,3 +2352,93 @@ fn the_send_roads_route_a_surface_refusal_and_report_a_budget_one() {
     }
   }
 }
+
+/// **The packet timebase reaches the `AVCodecContext`, and only when
+/// one is declared.**
+///
+/// `AVCodecContext.pkt_timebase` is caller-supplied and libavcodec
+/// reads it — its generic subtitle path fills `AVSubtitle.pts` and the
+/// packet-duration fallback only when the field is set. Nothing in
+/// this crate wrote it, on any road, so this asserts the write at the
+/// one choke point every decoder passes through rather than at any one
+/// caller.
+///
+/// The `None` half is the other law: a standalone decoder opened
+/// without a declared ruler leaves the field at libavcodec's own
+/// default, and a zero-numerator timebase is deliberately treated the
+/// same way — unset and `0/1` are the same statement, and writing one
+/// would claim a ruler no container declared.
+#[test]
+fn the_packet_timebase_reaches_the_codec_context() {
+  use std::num::NonZeroI32;
+
+  ffmpeg_next::init().expect("ffmpeg init");
+
+  let parameters = || {
+    let mut parameters = ffmpeg_next::codec::Parameters::new();
+    // SAFETY: `parameters` owns a live, zeroed `AVCodecParameters`;
+    // both fields written are plain scalars.
+    unsafe {
+      let raw = parameters.as_mut_ptr();
+      (*raw).codec_type = ffmpeg_next::ffi::AVMediaType::AVMEDIA_TYPE_VIDEO;
+      (*raw).codec_id = ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_H264;
+    }
+    parameters
+  };
+  let limits = crate::limits::DecoderLimits::default();
+  let read_back = |declared: Option<mediadecode::Timebase>| {
+    let (ctx, _state) =
+      build_codec_context(&parameters(), limits, declared).expect("a context is allocated");
+    // SAFETY: `ctx` owns a live `AVCodecContext` for this borrow, and
+    // `pkt_timebase` is a public `AVRational` field.
+    let raw = unsafe { (*ctx.as_ptr()).pkt_timebase };
+    (raw.num, raw.den)
+  };
+
+  let milliseconds = mediadecode::Timebase::new(1, NonZeroI32::new(1_000).expect("non-zero"));
+  assert_eq!(
+    read_back(Some(milliseconds)),
+    (1, 1_000),
+    "a declared timebase is written verbatim",
+  );
+
+  assert_eq!(
+    read_back(None),
+    (0, 1),
+    "and an undeclared one leaves libavcodec's own default alone",
+  );
+
+  // `0/1` is what a container that declared no timebase hands this
+  // crate. Writing it would be ceremony; the field already says it.
+  let unset = mediadecode::Timebase::new(0, NonZeroI32::new(1).expect("non-zero"));
+  assert_eq!(read_back(Some(unset)), (0, 1));
+}
+
+/// The public standalone decoder can declare a packet timebase.
+///
+/// Before this, only crate-private constructors could — a direct
+/// `VideoDecoder` caller had no way to tell libavcodec what its
+/// packets' ticks meant, however well it knew.
+#[test]
+fn the_public_decoder_has_a_timed_construction_road() {
+  fn _timed_roads_exist() {
+    let _: fn(ffmpeg_next::codec::Parameters, mediadecode::Timebase) -> Result<VideoDecoder> =
+      VideoDecoder::open_timed;
+    let _: fn(
+      ffmpeg_next::codec::Parameters,
+      crate::limits::DecoderLimits,
+      mediadecode::Timebase,
+    ) -> Result<VideoDecoder> = VideoDecoder::open_with_frame_limits_timed;
+    let _: fn(
+      ffmpeg_next::codec::Parameters,
+      Backend,
+      mediadecode::Timebase,
+    ) -> Result<VideoDecoder> = VideoDecoder::open_with_timed;
+    let _: fn(
+      ffmpeg_next::codec::Parameters,
+      Backend,
+      crate::limits::DecoderLimits,
+      mediadecode::Timebase,
+    ) -> Result<VideoDecoder> = VideoDecoder::open_with_limits_timed;
+  }
+}

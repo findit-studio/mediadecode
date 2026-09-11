@@ -692,7 +692,8 @@ fn a_resampled_view_frame_shares_the_resamplers_output_buffer() {
     SAMPLES,
     2,
     mediadecode_ffmpeg::SampleFormat::S16,
-    mediadecode_ffmpeg::channel_layout_description_from_ffmpeg(&ffmpeg_next::ChannelLayout::STEREO),
+    mediadecode_ffmpeg::channel_layout_description_from_ffmpeg(&ffmpeg_next::ChannelLayout::STEREO)
+      .expect("a well-formed layout describes"),
     planes,
     1,
     Default::default(),

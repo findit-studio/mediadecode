@@ -74,3 +74,32 @@ fn demux_limits_carry_all_three_tiers() {
   assert_eq!(mutated.max_attachment_bytes(), 5);
   assert_eq!(mutated.max_total_attachment_bytes(), 6);
 }
+
+/// The chapter seats carry their defaults and take their overrides,
+/// through both mutators the house shape asks for.
+///
+/// The defaults themselves are the load-bearing half: both are
+/// **finite**, which is the whole point of the seat — a chapter table
+/// is file-controlled and libavformat has no ceiling of its own for it.
+#[test]
+fn demux_limits_bound_the_chapter_table() {
+  let d = DemuxLimits::new();
+  assert_eq!(d.max_chapters(), DEFAULT_MAX_CHAPTERS);
+  assert_eq!(
+    d.max_total_chapter_title_bytes(),
+    DEFAULT_MAX_TOTAL_CHAPTER_TITLE_BYTES,
+  );
+
+  let tuned = DemuxLimits::new()
+    .with_max_chapters(7)
+    .with_max_total_chapter_title_bytes(8);
+  assert_eq!(tuned.max_chapters(), 7);
+  assert_eq!(tuned.max_total_chapter_title_bytes(), 8);
+
+  let mut mutated = DemuxLimits::new();
+  mutated
+    .set_max_chapters(9)
+    .set_max_total_chapter_title_bytes(10);
+  assert_eq!(mutated.max_chapters(), 9);
+  assert_eq!(mutated.max_total_chapter_title_bytes(), 10);
+}

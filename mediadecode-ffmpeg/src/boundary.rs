@@ -1145,10 +1145,11 @@ fn build_subtitle_packet<C: crate::FfmpegCarrier + crate::CarrierOps>(
 /// [law]: mediadecode::adapter#the-d-seat-amputation-contract
 pub fn video_packet_from_ffmpeg(
   packet: &Packet,
+  time_base: mediadecode::Timebase,
 ) -> Result<Option<VideoPacket<VideoPacketExtra, FfmpegBytes>>, PacketBufferError> {
   video_packet_from_borrowed::<crate::Owned>(
     packet,
-    mediadecode::Timebase::default(),
+    time_base,
     PacketLimits::default(),
     crate::buffer::PayloadProvenance::CallerSupplied,
   )
@@ -1160,10 +1161,11 @@ pub fn video_packet_from_ffmpeg(
 /// default budgets.
 pub fn audio_packet_from_ffmpeg(
   packet: &Packet,
+  time_base: mediadecode::Timebase,
 ) -> Result<Option<AudioPacket<AudioPacketExtra, FfmpegBytes>>, PacketBufferError> {
   audio_packet_from_borrowed::<crate::Owned>(
     packet,
-    mediadecode::Timebase::default(),
+    time_base,
     PacketLimits::default(),
     crate::buffer::PayloadProvenance::CallerSupplied,
   )
@@ -1175,10 +1177,11 @@ pub fn audio_packet_from_ffmpeg(
 /// [`video_packet_from_ffmpeg`], shared payload included.
 pub fn subtitle_packet_from_ffmpeg(
   packet: &Packet,
+  time_base: mediadecode::Timebase,
 ) -> Result<Option<SubtitlePacket<SubtitlePacketExtra, FfmpegBytes>>, PacketBufferError> {
   subtitle_packet_from_borrowed::<crate::Owned>(
     packet,
-    mediadecode::Timebase::default(),
+    time_base,
     PacketLimits::default(),
     crate::buffer::PayloadProvenance::CallerSupplied,
   )
@@ -1285,26 +1288,20 @@ fn packet_side_data(packet: &Packet) -> Result<Vec<SideDataEntry>, PacketBufferE
           SIDE_DATA_MAX_TOTAL_BYTES,
         )));
       }
-      let mut buf: Vec<u8> = Vec::new();
-      if buf.try_reserve_exact(size).is_err() {
-        return Err(PacketBufferError::SideDataAlloc(BufferSideDataAlloc::new(
-          size,
-        )));
-      }
+      // **One allocation, and a fallible one.** This used to stage
+      // through a `try_reserve_exact`ed `Vec` and then copy again into
+      // the carrier — two payload-sized allocations, the second
+      // infallible — with a comment conceding the doubling was
+      // affordable only because side data is capped. The carrier
+      // allocates fallibly itself now, so the staging bought nothing
+      // and is gone with it.
+      //
       // SAFETY: `data` is valid for `size` bytes per FFmpeg's
       // `AVPacketSideData` contract.
-      buf.extend_from_slice(unsafe { core::slice::from_raw_parts(data_ptr, size) });
-      // Staged through the `Vec` so `try_reserve_exact` keeps *one* of
-      // the two payload-sized allocations a named refusal rather than
-      // an abort. The carrier copy that follows is a second full
-      // allocation of the same size — not a header — and it is
-      // infallible, so what the staging really buys is that the first
-      // and larger risk is reportable and the second is asked for a
-      // size the allocator has just proved it has. The doubling is
-      // affordable only because side data is capped at
-      // [`SIDE_DATA_MAX_TOTAL_BYTES`]; the plane paths, which are not
-      // small, use the one-allocation road instead.
-      FfmpegBytes::copy_from_slice(&buf)
+      FfmpegBytes::try_copy_from_slice(unsafe { core::slice::from_raw_parts(data_ptr, size) })
+        .ok_or(PacketBufferError::SideDataAlloc(BufferSideDataAlloc::new(
+          size,
+        )))?
     };
     out.push(SideDataEntry::new(kind, data));
   }
@@ -1348,15 +1345,17 @@ fn delivered_payload<C: crate::FfmpegCarrier + crate::CarrierOps>(
 //  Timebase-carrying variants.
 //
 //  An `AVPacket`'s timestamps are integers in its *stream's* timebase,
-//  which the packet does not carry — the four functions above therefore
-//  stamp `Timebase::default()` (1/1), leaving the caller to know what
-//  the ticks meant. A demuxer knows: it holds the track table. These
-//  variants take that timebase, so the produced `Timestamp` is a
-//  complete, self-describing value.
+//  which the packet does not carry. The functions above therefore ask
+//  the caller for it — they used to stamp `Timebase::default()` (1/1)
+//  instead, which turned PTS 90,000 from a 1/90,000 stream into a
+//  self-describing timestamp reading 90,000 *seconds*, with nothing in
+//  the value marking 1/1 as a placeholder rather than a reading. A
+//  demuxer knows the real one: it holds the track table. The variants
+//  below add explicit budgets on top of the same requirement.
 // ---------------------------------------------------------------------------
 
-/// [`video_packet_from_ffmpeg`], with the stream's timebase stamped
-/// onto every timestamp instead of the 1/1 placeholder.
+/// [`video_packet_from_ffmpeg`], with explicit carrier and
+/// provenance seats on top of the same timebase requirement.
 pub(crate) fn video_packet_from_ffmpeg_as<C: crate::FfmpegCarrier + crate::CarrierOps>(
   source: Packet,
   time_base: mediadecode::Timebase,
@@ -1404,8 +1403,8 @@ pub(crate) fn video_packet_from_borrowed<C: crate::FfmpegCarrier + crate::Carrie
   Ok(Some(out))
 }
 
-/// [`audio_packet_from_ffmpeg`], with the stream's timebase stamped
-/// onto every timestamp instead of the 1/1 placeholder.
+/// [`audio_packet_from_ffmpeg`], with explicit carrier and
+/// provenance seats on top of the same timebase requirement.
 pub(crate) fn audio_packet_from_ffmpeg_as<C: crate::FfmpegCarrier + crate::CarrierOps>(
   source: Packet,
   time_base: mediadecode::Timebase,
@@ -1453,8 +1452,8 @@ pub(crate) fn audio_packet_from_borrowed<C: crate::FfmpegCarrier + crate::Carrie
   Ok(Some(out))
 }
 
-/// [`subtitle_packet_from_ffmpeg`], with the stream's timebase stamped
-/// onto every timestamp instead of the 1/1 placeholder.
+/// [`subtitle_packet_from_ffmpeg`], with explicit carrier and
+/// provenance seats on top of the same timebase requirement.
 pub(crate) fn subtitle_packet_from_ffmpeg_as<C: crate::FfmpegCarrier + crate::CarrierOps>(
   source: Packet,
   time_base: mediadecode::Timebase,

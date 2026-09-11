@@ -18,7 +18,6 @@ use ffmpeg_next::ffi::{
   AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX, AVCodec, AVCodecContext, AVHWDeviceType, AVPacket,
   AVPacketSideDataType, AVPixelFormat, avcodec_get_hw_config,
 };
-use smol_str::SmolStr;
 
 unsafe extern "C" {
   /// `av_get_pix_fmt_name`, redeclared with a plain `c_int` parameter
@@ -117,7 +116,7 @@ const PIX_FMT_NAME_MAX_BYTES: usize = 64;
 /// name a `static const` table entry that outlives any session, so a
 /// `&'static str` would be sound today — and it would rest the whole
 /// surface on a provenance argument about FFmpeg's internals rather
-/// than on this crate's own memory. [`SmolStr`] keeps a codec name or a
+/// than on this crate's own memory. [`Utf8Bytes`] keeps a codec name or a
 /// format word *inline* (up to 22 bytes, which every one of these is
 /// bar the longest comma list), so the safe answer is also the free
 /// one.
@@ -132,9 +131,27 @@ const PIX_FMT_NAME_MAX_BYTES: usize = 64;
 ///
 /// # Safety
 ///
-/// `ptr` must be null, or point at a NUL-terminated byte string that
-/// stays live and unmodified for the duration of the call.
-pub(crate) unsafe fn table_text(ptr: *const c_char, max_bytes: usize) -> Option<SmolStr> {
+/// `ptr` must be null, or point at a NUL-terminated byte string that is
+/// **valid for the whole process** — not merely for this call.
+///
+/// That is a stronger contract than the one this helper used to carry,
+/// and it is the one every caller already satisfied: libavformat's
+/// `AVInputFormat` entries and libavcodec's `codec_descriptors[]` are
+/// `static const` tables compiled into those libraries, and the two
+/// `name`/`long_name` fields of each are string literals inside them.
+/// Nothing in this crate calls it with a pointer of any other kind.
+///
+/// # Why the return type changed
+///
+/// It used to hand back an owned `Utf8Bytes` built from the borrowed
+/// bytes, which **allocates** past `smol_bytes::INLINE_CAP` — and
+/// FFmpeg's own tables reach past it: the SER demuxer's long name is
+/// sixty-five bytes. So opening an ordinary container could allocate,
+/// infallibly, to copy a string the process already owns for its whole
+/// life. Borrowing is both cheaper and truer; a caller that wants an
+/// owned carrier builds one with `Utf8Bytes::from_static`, which stores
+/// a static slice rather than copying it.
+pub(crate) unsafe fn table_text(ptr: *const c_char, max_bytes: usize) -> Option<&'static str> {
   if ptr.is_null() {
     return None;
   }
@@ -144,35 +161,59 @@ pub(crate) unsafe fn table_text(ptr: *const c_char, max_bytes: usize) -> Option<
     // stops at the terminator.
     if unsafe { *ptr.add(len).cast::<u8>() } == 0 {
       // SAFETY: the `len` bytes below the terminator were just walked,
-      // so the slice is in bounds and initialised.
+      // so the slice is in bounds and initialised — and it lives in a
+      // table valid for the process, which is what makes the `'static`
+      // borrow sound rather than merely convenient.
       let bytes = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len) };
-      return std::str::from_utf8(bytes).ok().map(SmolStr::new);
+      return std::str::from_utf8(bytes).ok();
     }
   }
   None
 }
 
 /// FFmpeg's own name for a raw `AVFrame.format` integer — `"yuv420p"`,
-/// `"vaapi"` — or `None` when libavutil has no descriptor for it.
+/// `"vaapi"` — or `None` when libavutil has no descriptor for it,
+/// **borrowed rather than copied**.
 ///
 /// Diagnostic only. It never feeds a mapping decision: the raw integer
-/// is turned into a [`mediadecode::PixelFormat`] by
-/// [`crate::boundary::from_av_pixel_format`], which compares against
-/// compile-time constants and is the authority. This function exists so
-/// an error can say *which* format was refused when the vocabulary's
-/// answer for it is `None`.
-pub(crate) fn pix_fmt_name(raw: i32) -> Option<SmolStr> {
+/// is turned into a [`mediadecode::PixelFormat`] elsewhere, and this is
+/// what an error message says so a reader can recognise the format
+/// without decoding the integer themselves.
+///
+/// # Why it borrows
+///
+/// libavutil's format names are string literals in its static
+/// `av_pix_fmt_descriptors` table: they live for the process, so there
+/// is nothing to own. A copying version stood here and its only
+/// consumer was the unsupported-format error — which made an
+/// **allocation a precondition of reporting a refusal**, so a
+/// container-selected unsupported format could abort the process
+/// precisely while the converter was trying to name it. An error that
+/// says "this is unsupported" must not depend on the allocator
+/// agreeing, and the string it needs was never the allocator's to give.
+pub(crate) fn pix_fmt_name_static(raw: i32) -> Option<&'static str> {
   // SAFETY: the redeclaration above takes a plain `c_int`, so no
   // `AVPixelFormat` is constructed from `raw` and no invalid enum value
   // is ever formed. libavutil bounds-checks the index itself and
   // returns null for anything outside its table, so every `i32` —
   // negative, `AV_PIX_FMT_NONE`, or past the end — is a defined call.
   let ptr = unsafe { av_get_pix_fmt_name(raw) };
-  // SAFETY: libavutil's format names are string literals in its static
-  // `av_pix_fmt_descriptors` table — NUL-terminated and valid for the
-  // process lifetime — and a null answer is what the reader expects for
-  // an id it has no descriptor for.
-  unsafe { table_text(ptr, PIX_FMT_NAME_MAX_BYTES) }
+  if ptr.is_null() {
+    return None;
+  }
+  for len in 0..PIX_FMT_NAME_MAX_BYTES {
+    // SAFETY: the table's entries are NUL-terminated literals; the walk
+    // reads at most one byte past the last and stops at the terminator.
+    if unsafe { *ptr.add(len).cast::<u8>() } == 0 {
+      // SAFETY: the `len` bytes below the terminator were just walked,
+      // and the table they live in is valid for the process lifetime —
+      // which is what makes the `'static` borrow sound rather than
+      // merely convenient.
+      let bytes = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len) };
+      return std::str::from_utf8(bytes).ok();
+    }
+  }
+  None
 }
 
 /// State pointed to by `AVCodecContext::opaque` so [`get_hw_format`] can pick
@@ -598,18 +639,18 @@ mod tests {
   #[test]
   fn pix_fmt_name_reads_the_linked_librarys_own_table() {
     assert_eq!(
-      pix_fmt_name(AVPixelFormat::AV_PIX_FMT_YUV420P as i32).as_deref(),
+      pix_fmt_name_static(AVPixelFormat::AV_PIX_FMT_YUV420P as i32),
       Some("yuv420p")
     );
     assert_eq!(
-      pix_fmt_name(AVPixelFormat::AV_PIX_FMT_NV12 as i32).as_deref(),
+      pix_fmt_name_static(AVPixelFormat::AV_PIX_FMT_NV12 as i32),
       Some("nv12")
     );
     // A hardware surface: no CPU pixel data, so `from_av_pixel_format`
     // answers `PixelFormat::None` — and this is what puts a name on the
     // integer behind that `None` in the error message.
     assert_eq!(
-      pix_fmt_name(AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX as i32).as_deref(),
+      pix_fmt_name_static(AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX as i32),
       Some("videotoolbox_vld")
     );
   }
@@ -620,11 +661,17 @@ mod tests {
     // the linked library rather than assumed: libavutil bounds-checks
     // the index and answers out-of-range integers with null, so passing
     // a value outside the enum's discriminant set is defined.
-    assert_eq!(pix_fmt_name(AVPixelFormat::AV_PIX_FMT_NONE as i32), None);
-    assert_eq!(pix_fmt_name(-99_999), None);
-    assert_eq!(pix_fmt_name(i32::MIN), None);
-    assert_eq!(pix_fmt_name(i32::MAX), None);
-    assert_eq!(pix_fmt_name(AVPixelFormat::AV_PIX_FMT_NB as i32), None);
+    assert_eq!(
+      pix_fmt_name_static(AVPixelFormat::AV_PIX_FMT_NONE as i32),
+      None
+    );
+    assert_eq!(pix_fmt_name_static(-99_999), None);
+    assert_eq!(pix_fmt_name_static(i32::MIN), None);
+    assert_eq!(pix_fmt_name_static(i32::MAX), None);
+    assert_eq!(
+      pix_fmt_name_static(AVPixelFormat::AV_PIX_FMT_NB as i32),
+      None
+    );
   }
 
   // The callback derefs `(*ctx).opaque`, so we need a real-looking

@@ -7,8 +7,15 @@
 //! The table is built at open and **kept for the life of the session**:
 //! it is what every packet is classified against, so reading it takes
 //! nothing away and may happen at any point. Rows are handed out as
-//! `Arc<TrackInfo<Ffmpeg>>` handles — see
+//! `triomphe::Arc<TrackInfo<Ffmpeg>>` handles — see
 //! [`Demuxer::TrackHandle`](mediadecode::demuxer::Demuxer::TrackHandle).
+//!
+//! A container's **table of contents** is read at that same moment and
+//! kept the same way: `AVFormatContext.chapters`, mirrored into
+//! [`Chapter`] rows and answered by
+//! [`Demuxer::chapters`](mediadecode::demuxer::Demuxer::chapters). See
+//! [`build_chapters`] for what is read, what is bounded before it is
+//! allocated, and what is deliberately left as the container wrote it.
 //!
 //! # What normalization this layer does
 //!
@@ -49,8 +56,8 @@
 //! bookkeeping — an attachment already handed out is never handed out
 //! again, and one not yet handed out is still owed.
 
+use std::collections::{TryReserveError, VecDeque};
 use std::{
-  collections::VecDeque,
   ffi::{CStr, c_int},
   io::{Read, Seek},
   num::NonZeroI32,
@@ -58,6 +65,14 @@ use std::{
   ptr::{addr_of, read_unaligned},
   sync::Arc,
 };
+
+// **The track handle's refcount is triomphe's, not `std`'s**, for the
+// reason [`crate::buffer`] gives at length: `std::sync::Arc::new`
+// aborts when the allocator declines, and the number of these headers
+// is the container's stream count. `triomphe::Arc::try_new` reports
+// it. `std::sync::Arc` stays for the reader-panic latch, whose one
+// allocation is per session rather than per stream.
+use triomphe::Arc as TrackArc;
 
 use derive_more::{IsVariant, TryUnwrap, Unwrap};
 use ffmpeg_next::{
@@ -72,12 +87,12 @@ use mediadecode::{
   Timebase, Timestamp,
   demuxer::{
     AttachmentPacket, AttachmentTrackPacket, AttachmentTrackParams, AudioTrackPacket,
-    AudioTrackParams, DataTrackPacket, DataTrackParams, DemuxedPacket, Demuxer,
+    AudioTrackParams, Chapter, DataTrackPacket, DataTrackParams, DemuxedPacket, Demuxer,
     SubtitleTrackPacket, SubtitleTrackParams, TrackIndex, TrackInfo, TrackKind, TrackParams,
     UnknownTrackParams, VideoTrackPacket, VideoTrackParams,
   },
 };
-use smol_str::SmolStr;
+use smol_bytes::Utf8Bytes;
 
 use crate::{
   Ffmpeg, boundary,
@@ -113,7 +128,18 @@ pub struct CarrierDemuxer<C: crate::FfmpegCarrier> {
   /// [`CodecTicket`](crate::ticket::CodecTicket) made these rows
   /// `Send + Sync` by construction precisely so a track table could
   /// cross tasks.
-  tracks: Vec<Arc<TrackInfo<Ffmpeg>>>,
+  tracks: Vec<TrackArc<TrackInfo<Ffmpeg>>>,
+  /// The container's table of contents, mirrored once at open and held
+  /// for the life of the session — see [`build_chapters`].
+  ///
+  /// Not `Arc`-wrapped, unlike the track rows above, and for the
+  /// reason [`Chapter`] gives: a chapter is four scalars and a title,
+  /// so a consumer that wants one past a borrow of this session clones
+  /// the row itself and there is no carrier choice worth making.
+  ///
+  /// Empty for the overwhelming majority of files — nothing allocates
+  /// where a container declares no chapters.
+  chapters: Vec<Chapter<Ffmpeg>>,
   /// What libavformat decided the bytes are wrapped in, read once at
   /// open — see [`CarrierDemuxer::format`].
   ///
@@ -308,8 +334,8 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
   }
 
   /// Borrows the wrapped `ffmpeg::format::context::Input` — for
-  /// `av_dump_format`, container-level metadata, chapters, and anything
-  /// else the portable track table has no seat for.
+  /// `av_dump_format`, container-level metadata, and anything else the
+  /// portable track and chapter tables have no seat for.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub(crate) const fn input_impl(&self) -> &Input {
     &self.input
@@ -328,10 +354,59 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
   }
 
   fn from_input(input: Input, limits: DemuxLimits) -> Result<Self, DemuxError> {
+    // **Everything the container declares is judged before anything it
+    // declares is paid for**, and that is a property of the *whole*
+    // open rather than of either table.
+    //
+    // The order is: [`admit_chapters`] here, then [`admit_streams`] as
+    // `build_tracks`' first statement, and only then a reservation. Both
+    // passes allocate nothing — they read integers, and price metadata
+    // through a borrow of libavutil's own buffer — so every budgeted
+    // quantity this open can refuse is refused while the process has
+    // spent nothing on the file.
+    //
+    // The class, stated once so it can be checked rather than
+    // rediscovered: probe bytes are metered during the read;
+    // `max_streams` is libavformat's own option, set before the header
+    // is parsed; per-stream and whole-file codec parameters — which
+    // includes extradata, every coded-side-data payload and a custom
+    // channel map, all through
+    // [`measure_parameters`](crate::extras::measure_parameters) — the
+    // per-attachment and whole-file attachment payloads, and the
+    // whole-file stream metadata are charged by `admit_streams`; the
+    // chapter count and the chapter titles by `admit_chapters`; and a
+    // single metadata value is bounded by [`metadata_value`]'s own
+    // walk, which stops at [`METADATA_VALUE_MAX_BYTES`] rather than
+    // reading past it. Three rounds of review found three instances of
+    // one defect here — a correct check placed after the memory it was
+    // meant to protect — which is why the list is written down.
+    admit_chapters(&input, limits)?;
     let (tracks, pending) = build_tracks::<C>(&input, limits)?;
     // One allocation per track, here and never again: the session
     // keeps these handles and hands out clones of them.
-    let tracks = tracks.into_iter().map(Arc::new).collect();
+    //
+    // The table is reserved fallibly and so is each row's handle:
+    // `triomphe::Arc::try_new` reports an allocator refusal where
+    // `std::sync::Arc::new` would abort, and the count is the
+    // container's. See [`crate::buffer`] for why this crate's
+    // refcount is triomphe's.
+    let count = tracks.len();
+    let mut handles: Vec<TrackArc<TrackInfo<Ffmpeg>>> = Vec::new();
+    handles
+      .try_reserve_exact(count)
+      .map_err(|_| DemuxError::TrackTableAlloc(TrackTableAlloc::new(count)))?;
+    for row in tracks {
+      handles.push(
+        TrackArc::try_new(row)
+          .map_err(|_| DemuxError::TrackTableAlloc(TrackTableAlloc::new(count)))?,
+      );
+    }
+    let tracks = handles;
+    // The chapter table is read here for the same reason the track
+    // table is: `avformat_find_stream_info` has run, so the container's
+    // answer is final and a session that holds it can be asked at any
+    // point without touching the file again.
+    let chapters = build_chapters(&input, limits)?;
     // SAFETY: `input` owns a live `AVFormatContext` for the whole of
     // this call, and the read takes copies of the two static-table
     // strings rather than borrowing from it.
@@ -339,6 +414,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
     Ok(Self {
       input,
       tracks,
+      chapters,
       format,
       pending,
       unconverted: None,
@@ -430,8 +506,12 @@ fn reader_panic(latch: &PanicLatch) -> Option<DemuxError> {
 }
 
 impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
-  pub(crate) fn tracks_impl(&self) -> &[Arc<TrackInfo<Ffmpeg>>] {
+  pub(crate) fn tracks_impl(&self) -> &[TrackArc<TrackInfo<Ffmpeg>>] {
     &self.tracks
+  }
+
+  pub(crate) fn chapters_impl(&self) -> &[Chapter<Ffmpeg>] {
+    &self.chapters
   }
 
   pub(crate) fn next_packet_impl(
@@ -760,7 +840,7 @@ macro_rules! demuxer_lane_face {
     impl Demuxer for CarrierDemuxer<$lane> {
       type Adapter = Ffmpeg;
       type Buffer = <$lane as crate::FfmpegCarrier>::Buffer;
-      type TrackHandle = Arc<TrackInfo<Ffmpeg>>;
+      type TrackHandle = TrackArc<TrackInfo<Ffmpeg>>;
       type Error = DemuxError;
 
       /// The track table, held for the life of the session.
@@ -770,8 +850,25 @@ macro_rules! demuxer_lane_face {
       /// [`CodecTicket`](crate::ticket::CodecTicket) mirrors an
       /// `AVCodecParameters` into owned Rust, which is what makes a
       /// row `Send + Sync` and a table shareable across tasks.
-      fn tracks(&self) -> &[Arc<TrackInfo<Ffmpeg>>] {
+      fn tracks(&self) -> &[TrackArc<TrackInfo<Ffmpeg>>] {
         self.tracks_impl()
+      }
+
+      /// The container's chapter table, in the order
+      /// `AVFormatContext.chapters` holds it, mirrored at open and
+      /// held for the life of the session.
+      ///
+      /// Empty where the file declares no chapters — which is the
+      /// provided answer too, so the override changes nothing for a
+      /// container that has none.
+      ///
+      /// **Nothing is repaired.** A chapter whose `end` precedes its
+      /// `start`, and one whose end libavformat left at its
+      /// no-timestamp sentinel because the file declared none, are
+      /// mirrored exactly as written; see [`Chapter`] for why this
+      /// layer reports rather than clamps.
+      fn chapters(&self) -> &[Chapter<Ffmpeg>] {
+        self.chapters_impl()
       }
 
       /// Pulls the next packet.
@@ -1032,6 +1129,444 @@ impl ParametersAlloc {
   }
 }
 
+/// Payload for [`DemuxError::TrackTimebaseInvalid`].
+///
+/// A stream declares an `AVRational` timebase that is not a
+/// [`Timebase`]: a zero or negative denominator, or a negative
+/// numerator.
+///
+/// **Refused rather than repaired.** The value is what every timestamp
+/// on that track would be measured against, and there is no honest
+/// substitute — a ruler invented here is indistinguishable downstream
+/// from one the file declared. `0/1`, libavformat's own "not set yet"
+/// default, is **not** this error: see
+/// [`TrackInfo::timebase`](mediadecode::demuxer::TrackInfo::timebase).
+#[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
+#[error("stream {stream_index} declares the timebase {num}/{den}, which is not a usable one")]
+pub struct TrackTimebaseInvalid {
+  stream_index: usize,
+  num: i32,
+  den: i32,
+}
+
+impl TrackTimebaseInvalid {
+  /// Constructs a `TrackTimebaseInvalid` payload.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(stream_index: usize, num: i32, den: i32) -> Self {
+    Self {
+      stream_index,
+      num,
+      den,
+    }
+  }
+  /// The `AVStream.index` that declared it.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn stream_index(&self) -> usize {
+    self.stream_index
+  }
+  /// The numerator the container wrote.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn num(&self) -> i32 {
+    self.num
+  }
+  /// The denominator the container wrote.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn den(&self) -> i32 {
+    self.den
+  }
+}
+
+/// Payload for [`DemuxError::ChapterTimebaseInvalid`].
+///
+/// A chapter declares an `AVRational` timebase that cannot rule its
+/// span: a zero or negative denominator, a negative numerator, or a
+/// **zero** numerator.
+///
+/// Stricter than [`TrackTimebaseInvalid`] by that last case, and
+/// deliberately: a chapter's ruler is written by whatever wrote the
+/// chapter, so `0/den` there is not an absence but a claim that every
+/// boundary in the table falls on one instant.
+///
+/// **The whole open fails, rather than the row being dropped.** A
+/// chapter table is a table: a reader that quietly returned the other
+/// eleven rows would be handing a consumer something that disagrees
+/// with the file and says nothing about it. This names the row, its
+/// container id and the rational, so a caller learns exactly what the
+/// file wrote — and repairing a container is a job for something that
+/// rewrites containers, not for a reader that would have to invent the
+/// number it repaired with.
+#[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
+#[error(
+  "chapter {index} (container id {id}) declares the timebase {num}/{den}, which cannot rule its span"
+)]
+pub struct ChapterTimebaseInvalid {
+  index: usize,
+  id: i64,
+  num: i32,
+  den: i32,
+}
+
+impl ChapterTimebaseInvalid {
+  /// Constructs a `ChapterTimebaseInvalid` payload.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(index: usize, id: i64, num: i32, den: i32) -> Self {
+    Self {
+      index,
+      id,
+      num,
+      den,
+    }
+  }
+  /// The chapter's position in `AVFormatContext.chapters`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn index(&self) -> usize {
+    self.index
+  }
+  /// The id the container assigned that chapter.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn id(&self) -> i64 {
+    self.id
+  }
+  /// The numerator the container wrote.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn num(&self) -> i32 {
+    self.num
+  }
+  /// The denominator the container wrote.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn den(&self) -> i32 {
+    self.den
+  }
+}
+
+/// Payload for [`DemuxError::TooManyChapters`].
+///
+/// The container declares more chapters than
+/// [`DemuxLimits::max_chapters`] allows. Refused at open, before the
+/// table is reserved.
+#[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
+#[error("the container declares {declared} chapters, over the ceiling of {limit}")]
+pub struct TooManyChapters {
+  declared: usize,
+  limit: u32,
+}
+
+impl TooManyChapters {
+  /// Constructs a `TooManyChapters` payload.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(declared: usize, limit: u32) -> Self {
+    Self { declared, limit }
+  }
+  /// `AVFormatContext.nb_chapters`, as the container declared it.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn declared(&self) -> usize {
+    self.declared
+  }
+  /// The ceiling in force.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn limit(&self) -> u32 {
+    self.limit
+  }
+}
+
+/// Payload for [`DemuxError::ChapterTitleBudgetExhausted`].
+///
+/// The file's chapter titles, together, are over
+/// [`DemuxLimits::max_total_chapter_title_bytes`].
+#[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
+#[error(
+  "the chapter titles reach {bytes} bytes at chapter {index}, over the {limit}-byte whole-file budget"
+)]
+pub struct ChapterTitleBudgetExhausted {
+  index: usize,
+  bytes: usize,
+  limit: usize,
+}
+
+impl ChapterTitleBudgetExhausted {
+  /// Constructs a `ChapterTitleBudgetExhausted` payload.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(index: usize, bytes: usize, limit: usize) -> Self {
+    Self {
+      index,
+      bytes,
+      limit,
+    }
+  }
+  /// The chapter whose title ran the total past the line.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn index(&self) -> usize {
+    self.index
+  }
+  /// The running total at that chapter.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn bytes(&self) -> usize {
+    self.bytes
+  }
+  /// The whole-file budget in force.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn limit(&self) -> usize {
+    self.limit
+  }
+}
+
+/// Payload for [`DemuxError::ChapterTitleTooLong`].
+///
+/// A chapter's `title` has no terminator inside
+/// [`METADATA_VALUE_MAX_BYTES`].
+///
+/// **Distinct from the budget error, and deliberately so.**
+/// [`ChapterTitleBudgetExhausted`] means the file's titles together
+/// exceed what the caller allowed, and a caller answers it by raising
+/// [`DemuxLimits::max_total_chapter_title_bytes`](crate::DemuxLimits::max_total_chapter_title_bytes).
+/// This one means a single value runs past a structural cap this crate
+/// owns and no seat can move — folding the two together would offer a
+/// knob that cannot fix it.
+///
+/// Refused rather than truncated (a truncated title is a different
+/// title), and refused *visibly*: reporting it as an absent title, as
+/// this road used to, made the mirrored table silently disagree with
+/// the container and slipped the value past the budget entirely.
+#[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
+#[error("the title on chapter {index} runs past the {limit}-byte cap on one metadata value")]
+pub struct ChapterTitleTooLong {
+  index: usize,
+  limit: usize,
+}
+
+impl ChapterTitleTooLong {
+  /// Constructs a `ChapterTitleTooLong` payload.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(index: usize, limit: usize) -> Self {
+    Self { index, limit }
+  }
+  /// The chapter's position in `AVFormatContext.chapters`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn index(&self) -> usize {
+    self.index
+  }
+  /// The per-value cap in force.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn limit(&self) -> usize {
+    self.limit
+  }
+}
+
+/// Payload for [`DemuxError::ChapterTitleAlloc`].
+///
+/// A chapter title that passed the budget could not be decoded into
+/// owned text. The size had already been charged, so this is the
+/// allocator refusing rather than the file asking for too much.
+#[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
+#[error("out of memory decoding the {bytes}-byte title on chapter {index}")]
+pub struct ChapterTitleAlloc {
+  index: usize,
+  bytes: usize,
+}
+
+impl ChapterTitleAlloc {
+  /// Constructs a `ChapterTitleAlloc` payload.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(index: usize, bytes: usize) -> Self {
+    Self { index, bytes }
+  }
+  /// The chapter's position in `AVFormatContext.chapters`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn index(&self) -> usize {
+    self.index
+  }
+  /// The decoded size that could not be reserved.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn bytes(&self) -> usize {
+    self.bytes
+  }
+}
+
+/// Payload for [`DemuxError::TrackMetadataTooLong`].
+///
+/// One of a stream's retained metadata values — `filename`,
+/// `mimetype` or `language` — has no terminator inside
+/// [`METADATA_VALUE_MAX_BYTES`]. `key` says which.
+#[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
+#[error("the {key} on stream {stream_index} runs past the {limit}-byte cap on one metadata value")]
+pub struct TrackMetadataTooLong {
+  stream_index: usize,
+  key: &'static str,
+  limit: usize,
+}
+
+impl TrackMetadataTooLong {
+  /// Constructs a `TrackMetadataTooLong` payload.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(stream_index: usize, key: &'static str, limit: usize) -> Self {
+    Self {
+      stream_index,
+      key,
+      limit,
+    }
+  }
+  /// The `AVStream.index` carrying it.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn stream_index(&self) -> usize {
+    self.stream_index
+  }
+  /// The dictionary key that was being read.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn key(&self) -> &'static str {
+    self.key
+  }
+  /// The per-value cap in force.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn limit(&self) -> usize {
+    self.limit
+  }
+}
+
+/// Payload for [`DemuxError::TrackMetadataBudgetExhausted`].
+///
+/// The file's stream metadata, together, is over
+/// [`DemuxLimits::max_total_stream_metadata_bytes`].
+///
+/// The budget is whole-file rather than per-stream because the
+/// exposure is: `max_streams` bounds how many streams a header may
+/// declare and says nothing about what each may carry, and every
+/// admitted stream's three values are mirrored eagerly at open.
+#[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
+#[error(
+  "the stream metadata reaches {bytes} bytes at the {key} on stream {stream_index}, over the {limit}-byte whole-file budget"
+)]
+pub struct TrackMetadataBudgetExhausted {
+  stream_index: usize,
+  key: &'static str,
+  bytes: usize,
+  limit: usize,
+}
+
+impl TrackMetadataBudgetExhausted {
+  /// Constructs a `TrackMetadataBudgetExhausted` payload.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(stream_index: usize, key: &'static str, bytes: usize, limit: usize) -> Self {
+    Self {
+      stream_index,
+      key,
+      bytes,
+      limit,
+    }
+  }
+  /// The `AVStream.index` whose value ran the total past the line.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn stream_index(&self) -> usize {
+    self.stream_index
+  }
+  /// The dictionary key that was being read.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn key(&self) -> &'static str {
+    self.key
+  }
+  /// The running total at that value.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn bytes(&self) -> usize {
+    self.bytes
+  }
+  /// The whole-file budget in force.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn limit(&self) -> usize {
+    self.limit
+  }
+}
+
+/// Payload for [`DemuxError::TrackMetadataAlloc`].
+///
+/// A stream metadata value that passed the budget could not be decoded
+/// into owned text.
+#[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
+#[error("out of memory decoding the {bytes}-byte {key} on stream {stream_index}")]
+pub struct TrackMetadataAlloc {
+  stream_index: usize,
+  key: &'static str,
+  bytes: usize,
+}
+
+impl TrackMetadataAlloc {
+  /// Constructs a `TrackMetadataAlloc` payload.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(stream_index: usize, key: &'static str, bytes: usize) -> Self {
+    Self {
+      stream_index,
+      key,
+      bytes,
+    }
+  }
+  /// The `AVStream.index` carrying it.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn stream_index(&self) -> usize {
+    self.stream_index
+  }
+  /// The dictionary key that was being read.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn key(&self) -> &'static str {
+    self.key
+  }
+  /// The decoded size that could not be reserved.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn bytes(&self) -> usize {
+    self.bytes
+  }
+}
+
+/// Payload for [`DemuxError::TrackTableAlloc`].
+///
+/// The track table, or the attachment queue built beside it, could not
+/// be reserved. The stream count had already passed
+/// [`DemuxLimits::max_streams`](crate::DemuxLimits::max_streams), so
+/// this is the allocator declining rather than the file asking for too
+/// much — reported instead of aborting, which is what an infallible
+/// reservation would have done.
+#[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
+#[error("out of memory reserving the table of {streams} streams")]
+pub struct TrackTableAlloc {
+  streams: usize,
+}
+
+impl TrackTableAlloc {
+  /// Constructs a `TrackTableAlloc` payload.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(streams: usize) -> Self {
+    Self { streams }
+  }
+  /// The stream count the reservation was for.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn streams(&self) -> usize {
+    self.streams
+  }
+}
+
+/// Payload for [`DemuxError::ChapterAlloc`].
+///
+/// The chapter table could not be reserved. The count had already
+/// passed [`DemuxLimits::max_chapters`], so this is the allocator
+/// refusing rather than the file asking for too much — reported
+/// instead of aborting, which is what an infallible reservation would
+/// have done.
+#[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
+#[error("out of memory reserving the table of {declared} chapters")]
+pub struct ChapterAlloc {
+  declared: usize,
+}
+
+impl ChapterAlloc {
+  /// Constructs a `ChapterAlloc` payload.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(declared: usize) -> Self {
+    Self { declared }
+  }
+  /// The chapter count the reservation was for.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn declared(&self) -> usize {
+    self.declared
+  }
+}
+
 /// Payload for [`DemuxError::ParametersCopy`].
 ///
 /// Copying a track's codec parameters failed part way.
@@ -1148,7 +1683,7 @@ impl ParametersOpaque {
 #[derive(thiserror::Error, Debug, Clone)]
 #[error(
   "the custom channel layout for stream {stream_index} declares {channels} channels \
-   but carries no map for them"
+   and carries no usable map for them"
 )]
 pub struct ParametersChannelMap {
   stream_index: usize,
@@ -1173,6 +1708,82 @@ impl ParametersChannelMap {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn channels(&self) -> i32 {
     self.channels
+  }
+}
+
+/// Payload for [`DemuxError::ParametersLayoutShape`].
+///
+/// The non-custom half of what a channel layout can be wrong about, and
+/// the half that went unchecked for eleven rounds of review on the
+/// argument that an order describing its channels through a `uint64_t`
+/// mask cannot be malformed. The mask is not the only field:
+/// `nb_channels` is an `int` a caller writes, and FFmpeg's helpers
+/// compute `nb_channels - popcount(mask)` and take an integer square
+/// root of it without checking either.
+///
+/// See
+/// [`layout_preflight`](crate::channel_layout::layout_preflight) for
+/// the complete rule and why it is one function.
+#[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
+#[error(
+  "the channel layout for stream {stream_index} declares order {order} with {channels} \
+   channels, which is not a shape FFmpeg's own helpers can be given"
+)]
+pub struct ParametersLayoutShape {
+  stream_index: usize,
+  order: i32,
+  channels: i32,
+}
+
+impl ParametersLayoutShape {
+  /// Constructs a `ParametersLayoutShape` payload.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(stream_index: usize, order: i32, channels: i32) -> Self {
+    Self {
+      stream_index,
+      order,
+      channels,
+    }
+  }
+  /// The `AVStream.index` whose layout declared it.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn stream_index(&self) -> usize {
+    self.stream_index
+  }
+  /// `AVChannelLayout.order`, as the raw `c_int` it is on the wire.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn order(&self) -> i32 {
+    self.order
+  }
+  /// `nb_channels`, as the layout declared it.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn channels(&self) -> i32 {
+    self.channels
+  }
+}
+
+/// Names a channel-layout fault for a demux caller — **one mapper, so
+/// the roads that share the preflight also share its report**.
+///
+/// `Alloc` is the only arm that is not a statement about the container:
+/// it is the allocator declining a rendering buffer, and it keeps the
+/// name every other allocator refusal on this road has.
+pub(crate) fn layout_fault_to_demux(
+  stream_index: usize,
+  fault: crate::channel_layout::ChannelLayoutFault,
+) -> DemuxError {
+  use crate::channel_layout::ChannelLayoutFault as Fault;
+  match fault {
+    // The second cannot arrive from a pointer road — it is how the
+    // *safe* conversion refuses a custom layout whose extent it cannot
+    // establish — but both say the same thing about this stream.
+    Fault::MalformedCustomMap { channels } | Fault::UnverifiableCustomMap { channels } => {
+      DemuxError::ParametersChannelMap(ParametersChannelMap::new(stream_index, channels))
+    }
+    Fault::MalformedLayout { order, channels } => {
+      DemuxError::ParametersLayoutShape(ParametersLayoutShape::new(stream_index, order, channels))
+    }
+    Fault::Alloc => DemuxError::ParametersAlloc(ParametersAlloc::new(stream_index)),
   }
 }
 
@@ -1226,13 +1837,13 @@ impl PacketBuffer {
 #[derive(thiserror::Error, Debug, Clone)]
 #[error("the reader panicked: {message}")]
 pub struct ReaderPanic {
-  message: SmolStr,
+  message: Utf8Bytes,
 }
 
 impl ReaderPanic {
   /// Constructs a `ReaderPanic` payload.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn new(message: SmolStr) -> Self {
+  pub const fn new(message: Utf8Bytes) -> Self {
     Self { message }
   }
   /// What the panic payload said.
@@ -1314,6 +1925,66 @@ pub enum DemuxError {
   #[error(transparent)]
   ParametersChannelMap(#[from] ParametersChannelMap),
 
+  /// A stream's channel layout declares a shape FFmpeg's own helpers
+  /// cannot be given — see [`ParametersLayoutShape`].
+  #[error(transparent)]
+  ParametersLayoutShape(#[from] ParametersLayoutShape),
+
+  /// A stream declares a timebase that is not one. Refused at open,
+  /// rather than repaired with a number this crate would have had to
+  /// invent.
+  #[error(transparent)]
+  TrackTimebaseInvalid(#[from] TrackTimebaseInvalid),
+
+  /// A chapter declares a timebase that cannot rule its span. Refused
+  /// at open, for the reason [`ChapterTimebaseInvalid`] gives.
+  #[error(transparent)]
+  ChapterTimebaseInvalid(#[from] ChapterTimebaseInvalid),
+
+  /// The container declares more chapters than the ceiling allows.
+  /// Refused at open, before the table is reserved.
+  #[error(transparent)]
+  TooManyChapters(#[from] TooManyChapters),
+
+  /// The file's chapter titles, together, are over the whole-file
+  /// budget. Refused at the title that crossed it, before it was
+  /// copied.
+  #[error(transparent)]
+  ChapterTitleBudgetExhausted(#[from] ChapterTitleBudgetExhausted),
+
+  /// One chapter title runs past the cap on a single metadata value —
+  /// refused, rather than reported as an absent title.
+  #[error(transparent)]
+  ChapterTitleTooLong(#[from] ChapterTitleTooLong),
+
+  /// A chapter title the budget admitted could not be decoded.
+  #[error(transparent)]
+  ChapterTitleAlloc(#[from] ChapterTitleAlloc),
+
+  /// One of a stream's retained metadata values runs past the cap on a
+  /// single metadata value.
+  #[error(transparent)]
+  TrackMetadataTooLong(#[from] TrackMetadataTooLong),
+
+  /// The file's stream metadata, together, is over the whole-file
+  /// budget. Refused at the value that crossed it, before it was
+  /// copied.
+  #[error(transparent)]
+  TrackMetadataBudgetExhausted(#[from] TrackMetadataBudgetExhausted),
+
+  /// A stream metadata value the budget admitted could not be decoded.
+  #[error(transparent)]
+  TrackMetadataAlloc(#[from] TrackMetadataAlloc),
+
+  /// The chapter table could not be reserved.
+  #[error(transparent)]
+  ChapterAlloc(#[from] ChapterAlloc),
+
+  /// The track table, or the attachment queue beside it, could not be
+  /// reserved.
+  #[error(transparent)]
+  TrackTableAlloc(#[from] TrackTableAlloc),
+
   /// A packet's payload could not be referenced — the bytes are there
   /// and this layer could not carry them.
   #[error(transparent)]
@@ -1349,8 +2020,23 @@ fn build_tracks<C: crate::FfmpegCarrier + crate::CarrierOps>(
   admit_streams(input, limits)?;
 
   let count = input.streams().len();
-  let mut tracks = Vec::with_capacity(count);
+  // **Reserved fallibly, both of them.** The stream count is the
+  // container's; `max_streams` bounds it, and a bound the caller chose
+  // is exactly the number that must come back as an error rather than
+  // an abort when the allocator declines it.
+  let mut tracks = Vec::new();
+  tracks
+    .try_reserve_exact(count)
+    .map_err(|_| DemuxError::TrackTableAlloc(TrackTableAlloc::new(count)))?;
   let mut pending = VecDeque::new();
+  pending
+    .try_reserve(count)
+    .map_err(|_| DemuxError::TrackTableAlloc(TrackTableAlloc::new(count)))?;
+  // The whole file's stream-metadata budget, spent across every
+  // admitted stream rather than per stream: `max_streams` bounds how
+  // many streams a header may declare, and nothing bounded what each
+  // could carry.
+  let mut metadata_spent: usize = 0;
 
   for stream in input.streams() {
     let index = stream.index();
@@ -1385,7 +2071,12 @@ fn build_tracks<C: crate::FfmpegCarrier + crate::CarrierOps>(
     let disposition = unsafe { (*stream.as_ptr()).disposition };
     let attached_pic = is_attachment_disposition(disposition);
 
-    let time_base = rational_to_timebase(stream.time_base());
+    // Already judged by [`admit_streams`], which refuses a malformed
+    // ruler before this loop allocates anything; the same function is
+    // called here because this is where the value is actually needed,
+    // and one function is how the two passes are kept from becoming
+    // two rules.
+    let time_base = stream_timebase(index, stream.time_base())?;
     let raw_duration = stream.duration();
     let duration = (raw_duration != AV_NOPTS_VALUE && raw_duration > 0)
       .then(|| Timestamp::new(raw_duration, time_base));
@@ -1408,11 +2099,31 @@ fn build_tracks<C: crate::FfmpegCarrier + crate::CarrierOps>(
         )),
         boundary::MediaKind::Audio => {
           let ch_layout = unsafe { std::ptr::addr_of!((*par).ch_layout) };
-          // SAFETY: `par` is a live `*const AVCodecParameters` for the
-          // life of `parameters`; the helper validates `order` as an
-          // `i32` before constructing any `AVChannelOrder`.
+          // **This is the trusted road, and here is why it is trusted.**
+          //
+          // The `unsafe` form is the only one that reads a custom
+          // channel map, because its contract asks the caller for the
+          // map's extent — the one thing a pointer cannot be asked.
+          // This call site can supply it: `par` is the
+          // `AVCodecParameters` libavformat itself built for this
+          // stream, and libavformat fills `ch_layout` through
+          // `av_channel_layout_copy`, which allocates the map and sizes
+          // it to `nb_channels` in the same operation. The layout is
+          // never handed in by a caller of this crate, so there is no
+          // road by which `nb_channels` and the map can disagree.
+          //
+          // SAFETY: (1) `par` is a live `*const AVCodecParameters` for
+          // the life of `parameters`, so `ch_layout` is a live, aligned
+          // `*const AVChannelLayout`. (2) For a `CUSTOM` order, `u.map`
+          // is FFmpeg's own allocation of exactly `nb_channels`
+          // `AVChannelCustom` entries, per the paragraph above. The
+          // helper validates `order` as an `i32` before constructing any
+          // `AVChannelOrder`, and refuses a null map or an
+          // unterminated name before FFmpeg is allowed to render the
+          // layout — a precondition, not a courtesy.
           let channel_layout =
-            unsafe { crate::channel_layout::channel_layout_description_from_raw_ptr(ch_layout) };
+            unsafe { crate::channel_layout::channel_layout_description_from_raw_ptr(ch_layout) }
+              .map_err(|fault| layout_fault_to_demux(index, fault))?;
           TrackParams::Audio(AudioTrackParams::new(
             codec,
             unsafe { (*par).sample_rate }.max(0) as u32,
@@ -1474,14 +2185,38 @@ fn build_tracks<C: crate::FfmpegCarrier + crate::CarrierOps>(
       .with_frame_count((frames > 0).then_some(frames));
 
     // SAFETY: `stream` keeps the `AVStream` — and so its metadata
-    // dictionary — live across both reads. The dictionary is read
-    // through `av_dict_get` rather than through
-    // `DictionaryRef::get`: see [`metadata_text`].
+    // dictionary — live across every read below. The dictionary is
+    // read through `av_dict_get` rather than through
+    // `DictionaryRef::get`: see [`metadata_value`].
     let metadata = unsafe { (*stream.as_ptr()).metadata };
+    // **Every retained value is measured, charged and only then
+    // built**, against one whole-file budget. Three values a stream
+    // apiece, mirrored eagerly for every admitted stream, is an
+    // open-time allocation a container controls the size of — and
+    // `max_streams` bounds the count of streams, not the bytes each
+    // one can carry.
+    let mut text = |key: &'static CStr| -> Result<Option<Utf8Bytes>, DemuxError> {
+      // SAFETY: as above — `stream` keeps the dictionary live, and the
+      // borrow does not outlive this call.
+      let raw = unsafe { metadata_value(metadata, key) };
+      retain_metadata(
+        raw,
+        &mut metadata_spent,
+        limits.max_total_stream_metadata_bytes(),
+      )
+      .map_err(|fault| stream_metadata_error(index, key, fault, limits))
+    };
     let info = TrackInfo::new(time_base, params, extra)
       .with_duration(duration)
-      .with_filename(unsafe { metadata_text(metadata, c"filename") })
-      .with_mime_type(unsafe { metadata_text(metadata, c"mimetype") })
+      // The same three keys `RETAINED_STREAM_METADATA` names, in the
+      // same order — `admit_streams` has already charged every one of
+      // them across the whole file, so nothing here can refuse a value
+      // the pre-pass admitted. The charge stays as defence in depth:
+      // it is what makes `metadata_spent` real rather than notional,
+      // and it is the arm that reports an allocator refusal, which no
+      // measurement can foresee.
+      .with_filename(text(c"filename")?)
+      .with_mime_type(text(c"mimetype")?)
       // **`language` is where every container's tag lands.** libavformat
       // normalises the *key*, not the value: Matroska's `Language`
       // element, MP4's `mdhd` language code and an `elng`/ISO 639-2
@@ -1490,7 +2225,7 @@ fn build_tracks<C: crate::FfmpegCarrier + crate::CarrierOps>(
       // wrote is what is read — see
       // [`TrackInfo::language`](mediadecode::demuxer::TrackInfo::language)
       // for why nothing folds it here.
-      .with_language(unsafe { metadata_text(metadata, c"language") });
+      .with_language(text(c"language")?);
 
     // Capture the attachment payload now, so the queue is complete
     // before a single timed packet has been read. Every attachment
@@ -1516,6 +2251,265 @@ fn build_tracks<C: crate::FfmpegCarrier + crate::CarrierOps>(
   }
 
   Ok((tracks, pending))
+}
+
+// ---------------------------------------------------------------------------
+//  Chapter-table construction.
+// ---------------------------------------------------------------------------
+
+/// Mirrors `AVFormatContext.chapters` into owned rows.
+///
+/// libavformat fills the array while it parses the header — the MOV
+/// `chpl`/chapter track, Matroska's `Chapters` element, an Ogg
+/// `CHAPTER` comment — and `avformat_find_stream_info` has returned by
+/// the time this runs, so the answer is final. That is what lets the
+/// session hold the mirror beside the track table and answer
+/// [`Demuxer::chapters`] at any point without touching the file again.
+///
+/// # Read raw, for the reasons the rest of this file is
+///
+/// The fields come off the `AVChapter` directly rather than through
+/// `ffmpeg_next`'s own chapter wrapper. Two reasons, both already
+/// standing here: that wrapper reads the metadata dictionary through
+/// `DictionaryRef`, whose `&str` is built with `from_utf8_unchecked`
+/// over bytes no container validates — see [`metadata_value`], the
+/// measured road every metadata value in this file takes — and its
+/// `as_ptr` dereferences the array entry without checking it, where
+/// this walk answers a null entry by skipping it.
+///
+/// Nothing read here is a bindgen enum: an id, an `AVRational`, two
+/// tick counts and a dictionary pointer.
+///
+/// # Nothing is repaired
+///
+/// A chapter whose `end` precedes its `start`, and one whose end
+/// libavformat left at `AV_NOPTS_VALUE` because the file declared
+/// none, are both mirrored exactly as written. This layer reports what
+/// the container says; see [`Chapter`]'s own doc for why a clamp here
+/// would be worse than the inverted row it replaced.
+///
+/// # Admission before allocation
+///
+/// The judging happens twice, and the first time is
+/// [`admit_chapters`] — which runs before the *track* table is built,
+/// because that table is where an open spends its memory and a file
+/// certain to be refused should not pay for it. What follows here is
+/// the same judgement repeated on the way to a row it has to build
+/// anyway; see that function for why repeating it is how the two
+/// passes stay one rule.
+///
+/// `nb_chapters` is file-controlled and libavformat has no
+/// `max_chapters` knob to bound it with, so this crate judges the count
+/// itself before reserving anything —
+/// [`DemuxLimits::max_chapters`](crate::DemuxLimits::max_chapters), the
+/// same posture [`admit_streams`] takes for the track table. Past the
+/// ceiling the open fails with [`TooManyChapters`]; the reservation
+/// that follows is **fallible** (`try_reserve_exact`), so an allocator
+/// that refuses a count inside the ceiling is a named error rather than
+/// an abort.
+///
+/// Titles are charged as they are read, against
+/// [`DemuxLimits::max_total_chapter_title_bytes`](crate::DemuxLimits::max_total_chapter_title_bytes),
+/// and the charge is made after each single title rather than before —
+/// exactly as [`charge_attachment`] does. What bounds the overshoot is
+/// [`METADATA_VALUE_MAX_BYTES`], which [`metadata_value`] refuses any
+/// one dictionary value past: the worst this can hold before refusing
+/// is the budget plus one 64 KiB title.
+///
+/// Note that libavformat having already built its own chapter array
+/// does **not** bound this one. That array is four scalars and a
+/// pointer per entry; a row here owns a title as well, so the mirror is
+/// the larger of the two and a table that parsed successfully can still
+/// be one this process should not pay for.
+/// Reads the chapter array's shape and **allocates nothing**.
+///
+/// Shared by [`admit_chapters`] and [`build_chapters`] so the two
+/// passes cannot come to disagree about what the container declared.
+/// Returns `None` when there is no table to walk at all.
+///
+/// Safe because the borrow is the whole precondition: `input` owns the
+/// `AVFormatContext` these two fields belong to, and it is live for as
+/// long as the reference is.
+fn chapter_array(input: &Input) -> Option<(usize, *mut *mut ffmpeg_next::ffi::AVChapter)> {
+  // SAFETY: `input` owns a live `AVFormatContext` for the whole of
+  // this call; `nb_chapters` and `chapters` are public fields of it.
+  let (count, array) = unsafe {
+    let context = input.as_ptr();
+    ((*context).nb_chapters as usize, (*context).chapters)
+  };
+  if array.is_null() || count == 0 {
+    None
+  } else {
+    Some((count, array))
+  }
+}
+
+/// Judges the whole chapter table **before anything is materialised**,
+/// allocating not one byte.
+///
+/// # Why this is a pass of its own
+///
+/// The judgement used to live inside [`build_chapters`], which runs
+/// after the track table — and the track table is where this open
+/// spends its memory: attachment carriers up to
+/// [`DemuxLimits::max_total_attachment_bytes`](crate::DemuxLimits::max_total_attachment_bytes),
+/// codec-parameter mirrors, retained stream metadata, and one `Arc` per
+/// row. A file whose chapter count is a hundred times the ceiling was
+/// therefore *certain* to be refused, and paid for hundreds of
+/// megabytes of track material first. Repeating the open repeats the
+/// bill, which is a resource-exhaustion road built out of two correct
+/// checks in the wrong order.
+///
+/// So the cheap, allocation-free judgement runs beside stream
+/// admission, before either table exists. What it judges is exactly
+/// what [`build_chapters`] would have: the declared count against
+/// [`DemuxLimits::max_chapters`](crate::DemuxLimits::max_chapters),
+/// every chapter's timebase, and every title's decoded length against
+/// the aggregate title budget.
+///
+/// # Why the second pass still judges
+///
+/// [`build_chapters`] repeats these checks rather than trusting this
+/// one. It needs the timebase and the title anyway to build a row, and
+/// re-deriving them is how the two passes stay one rule: nothing
+/// between the two can change the container's answer —
+/// `avformat_find_stream_info` has long returned — so a divergence
+/// would be a bug in this file rather than a state to handle. The
+/// repeat costs a pointer walk and a `strlen`; it allocates nothing.
+fn admit_chapters(input: &Input, limits: DemuxLimits) -> Result<(), DemuxError> {
+  let Some((count, array)) = chapter_array(input) else {
+    return Ok(());
+  };
+  if count > limits.max_chapters() as usize {
+    return Err(DemuxError::TooManyChapters(TooManyChapters::new(
+      count,
+      limits.max_chapters(),
+    )));
+  }
+
+  let mut title_spent: usize = 0;
+  for index in 0..count {
+    // SAFETY: `array` is the context's own array of `count` chapter
+    // pointers and `index` is below `count`.
+    let chapter = unsafe { *array.add(index) };
+    if chapter.is_null() {
+      continue;
+    }
+    // SAFETY: a non-null entry is an `AVChapter` the context owns for
+    // its whole life. Every field read is a plain scalar, an
+    // `AVRational` or a dictionary pointer — never a bindgen enum.
+    let (id, time_base, metadata) = unsafe {
+      (
+        (*chapter).id,
+        Rational::from((*chapter).time_base),
+        (*chapter).metadata,
+      )
+    };
+    if positive_rational_to_timebase(time_base).is_none() {
+      return Err(DemuxError::ChapterTimebaseInvalid(
+        ChapterTimebaseInvalid::new(index, id, time_base.numerator(), time_base.denominator()),
+      ));
+    }
+    // The title is **measured, not built**: `metadata_value` returns a
+    // borrow of libavutil's own buffer and `lossy_len` prices the
+    // decoding without producing it, so an over-budget table is
+    // refused having touched no heap at all.
+    //
+    // SAFETY: `metadata` is the chapter's own dictionary, owned by the
+    // context and live for the whole of this call.
+    let raw_title = unsafe { metadata_value(metadata, c"title") };
+    // Measured and charged; the row itself is built by
+    // [`build_chapters`], which is where the bytes are actually spent.
+    let _admitted = charge_metadata(
+      raw_title,
+      &mut title_spent,
+      limits.max_total_chapter_title_bytes(),
+    )
+    .map_err(|fault| chapter_title_error(index, fault, limits))?;
+  }
+  Ok(())
+}
+
+fn build_chapters(input: &Input, limits: DemuxLimits) -> Result<Vec<Chapter<Ffmpeg>>, DemuxError> {
+  let Some((count, array)) = chapter_array(input) else {
+    return Ok(Vec::new());
+  };
+  if count > limits.max_chapters() as usize {
+    return Err(DemuxError::TooManyChapters(TooManyChapters::new(
+      count,
+      limits.max_chapters(),
+    )));
+  }
+
+  let mut out = Vec::new();
+  out
+    .try_reserve_exact(count)
+    .map_err(|_| DemuxError::ChapterAlloc(ChapterAlloc::new(count)))?;
+  let mut title_spent: usize = 0;
+
+  for index in 0..count {
+    // SAFETY: `array` is the context's own array of `count` chapter
+    // pointers and `index` is below `count`.
+    let chapter = unsafe { *array.add(index) };
+    if chapter.is_null() {
+      continue;
+    }
+    // SAFETY: a non-null entry is an `AVChapter` the context owns for
+    // its whole life. Every field below is a plain scalar, an
+    // `AVRational` or a dictionary pointer — never a bindgen enum.
+    let (id, time_base, start, end, metadata) = unsafe {
+      (
+        (*chapter).id,
+        Rational::from((*chapter).time_base),
+        (*chapter).start,
+        (*chapter).end,
+        (*chapter).metadata,
+      )
+    };
+    // **The ruler is judged before the row is built.** A chapter's
+    // timebase is file-controlled and libavformat does not validate it
+    // — the FFMETADATA parser stores `TIMEBASE=-1/1000` as written —
+    // so this is where a container's malformed rational becomes a
+    // refusal instead of a fabricated ruler or a panic.
+    let timebase =
+      positive_rational_to_timebase(time_base).ok_or(DemuxError::ChapterTimebaseInvalid(
+        ChapterTimebaseInvalid::new(index, id, time_base.numerator(), time_base.denominator()),
+      ))?;
+
+    // **`title` is where every container's chapter name lands.**
+    // libavformat normalises the key, not the value: a Matroska
+    // `ChapterDisplay`'s `ChapString`, a MOV chapter track's text
+    // sample and an FFMETADATA `title=` all arrive on this one entry,
+    // and what each wrote is what is read.
+    //
+    // **Measured and charged before a byte of it is copied.** The
+    // reading below borrows libavutil's buffer, so a title the budget
+    // refuses costs no heap at all — see [`retain_metadata`].
+    //
+    // SAFETY: `metadata` is the chapter's own dictionary, owned by the
+    // context and live for the whole of this call.
+    let raw_title = unsafe { metadata_value(metadata, c"title") };
+    let title = retain_metadata(
+      raw_title,
+      &mut title_spent,
+      limits.max_total_chapter_title_bytes(),
+    )
+    .map_err(|fault| chapter_title_error(index, fault, limits))?;
+
+    // Inside the reservation above, which was for `count` rows and is
+    // never pushed past — so no growth, fallible or otherwise, happens
+    // here.
+    out.push(
+      Chapter::new(
+        id,
+        timebase,
+        Timestamp::new(start, timebase),
+        Timestamp::new(end, timebase),
+      )
+      .with_title(title),
+    );
+  }
+  Ok(out)
 }
 
 /// Whether `packet`'s payload is the very allocation the container has
@@ -1647,7 +2641,7 @@ const fn is_attachment_disposition(disposition: c_int) -> bool {
     && disposition & AV_DISPOSITION_TIMED_THUMBNAILS == 0
 }
 
-/// Upper bound on the NUL search in [`metadata_text`].
+/// Upper bound on the NUL search in [`metadata_value`].
 ///
 /// Generous by four orders of magnitude for a filename or a MIME type,
 /// and there only so that a value libavutil did not terminate cannot
@@ -1657,44 +2651,54 @@ const fn is_attachment_disposition(disposition: c_int) -> bool {
 /// filename is a different filename.
 const METADATA_VALUE_MAX_BYTES: usize = 64 * 1024;
 
-/// Reads one entry out of a container's metadata dictionary as text
-/// this crate can own.
+/// What a metadata dictionary holds for one key — **measured, and not
+/// yet copied**.
 ///
-/// **Why not `DictionaryRef::get`.** ffmpeg-next 9.0.0 builds its
-/// `&str` with `from_utf8_unchecked`
-/// (`src/util/dictionary/immutable.rs`), and FFmpeg does not validate
-/// demuxed metadata as UTF-8 — an ID3 frame, a Matroska attachment
-/// name or a MOV atom carries whatever bytes the file carries. A
-/// `filename` holding a stray `0x80` would therefore have produced a
-/// `&str` that is not UTF-8: undefined behaviour the moment it exists,
-/// before `SmolStr` ever copies it.
+/// Three outcomes rather than an `Option`, because the answer that
+/// used to go missing is the third one: a value with no terminator
+/// inside [`METADATA_VALUE_MAX_BYTES`] is not an absent value, and
+/// reporting it as one made a container's declaration vanish silently
+/// *and* escape every budget charged against it.
 ///
-/// Invalid bytes are replaced (`U+FFFD`), not refused. This is
-/// *identity* metadata — the name a font was attached under, the MIME
-/// type declared for a cover — and a file that names its attachment in
-/// some legacy codepage is still a file worth opening. The replacement
-/// characters say plainly that the container's bytes were not text.
+/// `Present` borrows libavutil's own buffer. That is the load-bearing
+/// property of this function and the reason it exists at all: a borrow
+/// allocates nothing, so a caller can learn a value's size and refuse
+/// it **before** any owning conversion exists.
+enum MetadataValue<'a> {
+  /// The dictionary has no such key, or the entry's value is null.
+  Absent,
+  /// The value, borrowed from the dictionary. Not NUL-terminated here:
+  /// the terminator is what bounded the walk.
+  Present(&'a [u8]),
+  /// No terminator below [`METADATA_VALUE_MAX_BYTES`]. Refused rather
+  /// than truncated — a truncated filename is a different filename —
+  /// and now refused *visibly*, unlike an absent one.
+  NotTerminated,
+}
+
+/// Measures one dictionary entry without copying it.
 ///
 /// # Safety
 ///
 /// `dict` must be null or a live `*const AVDictionary` for the
-/// duration of this call.
-unsafe fn metadata_text(dict: *const AVDictionary, key: &CStr) -> Option<SmolStr> {
+/// duration of this call, and the returned borrow is valid only while
+/// that dictionary is neither modified nor freed.
+unsafe fn metadata_value<'a>(dict: *const AVDictionary, key: &CStr) -> MetadataValue<'a> {
   if dict.is_null() {
-    return None;
+    return MetadataValue::Absent;
   }
   // SAFETY: `dict` is live per the contract above and `key` is a
   // NUL-terminated C string by construction; `av_dict_get` reads both
   // and returns a borrowed entry owned by the dictionary.
   let entry = unsafe { av_dict_get(dict, key.as_ptr(), std::ptr::null(), 0) };
   if entry.is_null() {
-    return None;
+    return MetadataValue::Absent;
   }
   // SAFETY: a non-null entry is a live `AVDictionaryEntry` for as long
   // as the dictionary is not modified, which it is not here.
   let value = unsafe { (*entry).value };
   if value.is_null() {
-    return None;
+    return MetadataValue::Absent;
   }
   for len in 0..METADATA_VALUE_MAX_BYTES {
     // SAFETY: `value` is a NUL-terminated string libavutil allocated
@@ -1702,13 +2706,237 @@ unsafe fn metadata_text(dict: *const AVDictionary, key: &CStr) -> Option<SmolStr
     // value byte and stops at the terminator.
     if unsafe { *value.add(len).cast::<u8>() } == 0 {
       // SAFETY: the `len` bytes below the terminator were just walked,
-      // so the slice is in bounds and initialised.
-      let bytes = unsafe { std::slice::from_raw_parts(value.cast::<u8>(), len) };
-      return Some(SmolStr::new(std::string::String::from_utf8_lossy(bytes)));
+      // so the slice is in bounds and initialised. The borrow lives as
+      // long as the dictionary does, which this function's contract
+      // requires of its caller.
+      return MetadataValue::Present(unsafe {
+        std::slice::from_raw_parts(value.cast::<u8>(), len)
+      });
     }
   }
-  None
+  MetadataValue::NotTerminated
 }
+
+/// The length `String::from_utf8_lossy` would produce for `bytes`,
+/// **without producing it**.
+///
+/// The charge has to be the decoded size rather than the raw one:
+/// lossy decoding replaces each invalid sequence with `U+FFFD`, three
+/// bytes, so a value of invalid single bytes triples on the way in. It
+/// also has to be knowable before anything is allocated, which rules
+/// out decoding first and measuring afterwards.
+///
+/// Exactness is not decorative — an approximation would either
+/// under-charge the budget or refuse ordinary text — so agreement with
+/// `from_utf8_lossy` is asserted directly in the unit lanes rather
+/// than argued here.
+pub(crate) fn lossy_len(bytes: &[u8]) -> usize {
+  const REPLACEMENT: usize = char::REPLACEMENT_CHARACTER.len_utf8();
+
+  let mut rest = bytes;
+  let mut total = 0usize;
+  loop {
+    match std::str::from_utf8(rest) {
+      Ok(valid) => return total + valid.len(),
+      Err(fault) => {
+        total += fault.valid_up_to() + REPLACEMENT;
+        match fault.error_len() {
+          // An invalid sequence of `skip` bytes becomes one `U+FFFD`.
+          Some(skip) => rest = &rest[fault.valid_up_to() + skip..],
+          // A truncated trailing sequence: one `U+FFFD`, and the end.
+          None => return total,
+        }
+      }
+    }
+  }
+}
+
+/// Decodes measured bytes into owned text, through a buffer reserved
+/// **fallibly**.
+///
+/// `decoded` is [`lossy_len`]'s answer for the same bytes, so the one
+/// reservation here is exact and the pushes that follow cannot grow
+/// it.
+///
+/// # Nothing is copied, and nothing allocates after the charge
+///
+/// The buffer is reserved once, fallibly, at the exact decoded size,
+/// and then **moved** into the carrier: `Utf8Bytes::from(String)`
+/// keeps a short value inline (`smol_bytes::INLINE_CAP`, no allocation
+/// at all) and hands a longer one to `bytes::Bytes::from(Vec<u8>)`,
+/// which takes the vector's own allocation over. The `Utf8Bytes` this
+/// replaced copied into a fresh `Arc<str>` instead — a second
+/// allocation, infallible, of an attacker-sized value, made while the
+/// first was still live, so failing it aborted the process that the
+/// budget above existed to keep alive.
+///
+/// **The one residue, stated exactly.** `Bytes::from(Vec<u8>)` moves
+/// the buffer outright when the vector's length equals its capacity,
+/// which `try_reserve_exact` followed by exactly `decoded` bytes is
+/// what produces; should an allocator hand back more capacity than was
+/// asked for, `bytes` allocates a fixed-size reference-count header —
+/// thirty-two bytes, the same for a ten-byte title and a sixty-four
+/// kibibyte one. What is gone is the part an attacker could scale.
+pub(crate) fn lossy_text(bytes: &[u8], decoded: usize) -> Result<Utf8Bytes, TryReserveError> {
+  let mut buffer = std::string::String::new();
+  buffer.try_reserve_exact(decoded)?;
+
+  let mut rest = bytes;
+  loop {
+    match std::str::from_utf8(rest) {
+      Ok(valid) => {
+        buffer.push_str(valid);
+        break;
+      }
+      Err(fault) => {
+        let (valid, after) = rest.split_at(fault.valid_up_to());
+        buffer.push_str(
+          std::str::from_utf8(valid).expect("valid_up_to bounds a valid prefix by definition"),
+        );
+        buffer.push(char::REPLACEMENT_CHARACTER);
+        match fault.error_len() {
+          Some(skip) => rest = &after[skip..],
+          None => break,
+        }
+      }
+    }
+  }
+  debug_assert_eq!(
+    buffer.len(),
+    decoded,
+    "lossy_len must price exactly what lossy_text builds",
+  );
+  // The move. Nothing past this point copies the value.
+  Ok(Utf8Bytes::from(buffer))
+}
+
+/// Names the fault a stream's metadata ran into, for the key it was
+/// reading.
+///
+/// One mapper rather than three copies of the same `match`: the three
+/// values a track row retains — `filename`, `mimetype` and `language`
+/// — share one budget and one road, and differ only in which key is
+/// reported.
+/// Names the fault a chapter's title ran into, the way
+/// [`stream_metadata_error`] does for a stream's — one mapper so the
+/// admission pass and the materialisation cannot report the same fault
+/// two different ways.
+fn chapter_title_error(index: usize, fault: MetadataFault, limits: DemuxLimits) -> DemuxError {
+  match fault {
+    MetadataFault::TooLong => {
+      DemuxError::ChapterTitleTooLong(ChapterTitleTooLong::new(index, METADATA_VALUE_MAX_BYTES))
+    }
+    MetadataFault::BudgetExhausted(total) => DemuxError::ChapterTitleBudgetExhausted(
+      ChapterTitleBudgetExhausted::new(index, total, limits.max_total_chapter_title_bytes()),
+    ),
+    MetadataFault::Alloc(bytes) => {
+      DemuxError::ChapterTitleAlloc(ChapterTitleAlloc::new(index, bytes))
+    }
+  }
+}
+
+fn stream_metadata_error(
+  index: usize,
+  key: &'static CStr,
+  fault: MetadataFault,
+  limits: DemuxLimits,
+) -> DemuxError {
+  let key = key.to_str().unwrap_or("<non-utf8 key>");
+  match fault {
+    MetadataFault::TooLong => DemuxError::TrackMetadataTooLong(TrackMetadataTooLong::new(
+      index,
+      key,
+      METADATA_VALUE_MAX_BYTES,
+    )),
+    MetadataFault::BudgetExhausted(total) => {
+      DemuxError::TrackMetadataBudgetExhausted(TrackMetadataBudgetExhausted::new(
+        index,
+        key,
+        total,
+        limits.max_total_stream_metadata_bytes(),
+      ))
+    }
+    MetadataFault::Alloc(bytes) => {
+      DemuxError::TrackMetadataAlloc(TrackMetadataAlloc::new(index, key, bytes))
+    }
+  }
+}
+
+/// Why a metadata value this crate meant to retain was not retained.
+///
+/// Crate-private on purpose: each call site maps it to an error that
+/// names *what* was being read, because "the chapter titles are over
+/// budget" and "this stream's language is over budget" are different
+/// things to a caller even though the mechanism is one.
+#[derive(Debug)]
+enum MetadataFault {
+  /// [`MetadataValue::NotTerminated`].
+  TooLong,
+  /// The running total, which is over the budget.
+  BudgetExhausted(usize),
+  /// The decoded size that could not be reserved.
+  Alloc(usize),
+}
+
+/// **Measure, charge, then materialise — in that order.**
+///
+/// The order is the whole of it. Reading the size is a borrow of
+/// libavutil's buffer and allocates nothing, so a value the budget
+/// refuses costs no heap at all; only a value already admitted is
+/// built, and it is built through [`lossy_text`]'s fallible
+/// reservation.
+///
+/// `spent` advances only for a value actually retained.
+fn retain_metadata(
+  value: MetadataValue<'_>,
+  spent: &mut usize,
+  limit: usize,
+) -> Result<Option<Utf8Bytes>, MetadataFault> {
+  let Some((bytes, decoded)) = charge_metadata(value, spent, limit)? else {
+    return Ok(None);
+  };
+  lossy_text(bytes, decoded)
+    .map(Some)
+    .map_err(|_| MetadataFault::Alloc(decoded))
+}
+
+/// **The judging half of [`retain_metadata`], on its own** — measure
+/// and charge, build nothing.
+///
+/// It is separate because the judging has to happen in a place the
+/// building cannot: an admission pass that runs before any table is
+/// materialised. Sharing one function is what stops the two passes
+/// from drifting into two rules, which for a budget would mean a file
+/// admitted by one and refused by the other after the memory was
+/// already spent.
+///
+/// Returns the admitted bytes with [`lossy_len`]'s price for them, so a
+/// caller that *is* going to build can hand both straight to
+/// [`lossy_text`] without measuring twice. `spent` advances only for a
+/// value that was admitted.
+fn charge_metadata<'a>(
+  value: MetadataValue<'a>,
+  spent: &mut usize,
+  limit: usize,
+) -> Result<Option<(&'a [u8], usize)>, MetadataFault> {
+  let bytes = match value {
+    MetadataValue::Absent => return Ok(None),
+    MetadataValue::NotTerminated => return Err(MetadataFault::TooLong),
+    MetadataValue::Present(bytes) => bytes,
+  };
+  let decoded = lossy_len(bytes);
+  let total = spent.saturating_add(decoded);
+  if total > limit {
+    return Err(MetadataFault::BudgetExhausted(total));
+  }
+  *spent = total;
+  Ok(Some((bytes, decoded)))
+}
+
+/// The three metadata keys a track row retains, in the order
+/// [`build_tracks`] reads them — so the admission pass and the
+/// materialisation refuse on the *same* value and name the same key.
+const RETAINED_STREAM_METADATA: [&CStr; 3] = [c"filename", c"mimetype", c"language"];
 
 /// Wraps `AVStream.attached_pic` — the real packet libavformat parsed
 /// for a cover-art stream — as this track's one attachment packet.
@@ -1895,6 +3123,7 @@ fn extradata_payload<C: crate::FfmpegCarrier + crate::CarrierOps>(
 fn admit_streams(input: &Input, limits: DemuxLimits) -> Result<(), DemuxError> {
   let mut attachment_spent: usize = 0;
   let mut parameter_spent: usize = 0;
+  let mut metadata_spent: usize = 0;
 
   for stream in input.streams() {
     let index = stream.index();
@@ -1906,6 +3135,41 @@ fn admit_streams(input: &Input, limits: DemuxLimits) -> Result<(), DemuxError> {
     if par.is_null() {
       return Err(DemuxError::ParametersMissing(ParametersMissing::new(index)));
     }
+
+    // **The ruler, judged here rather than during materialisation.**
+    //
+    // This is the judge-before-pay invariant for a refusal that is not
+    // a budget, and it was the third place the invariant failed. A
+    // malformed `AVStream.time_base` is a permanent, deterministic fact
+    // about the container — it does not depend on how much memory the
+    // machine has — so it can and must be decided while nothing has
+    // been spent. It used to be decided inside `build_tracks`' loop,
+    // which meant a malformed ruler on the *last* stream was refused
+    // only after every earlier stream's codec ticket, metadata and
+    // attachment carrier had been materialised.
+    //
+    // Structure before budget, deliberately: a stream that is malformed
+    // is a more specific thing to say than a file that is too large,
+    // and the two can be true of one container at once.
+    let _ruler = stream_timebase(index, stream.time_base())?;
+
+    // **And the layout's structure, for the same reason.** A non-null
+    // `ch_layout.opaque`, a custom order with no map or a non-positive
+    // count, and a non-null `opaque` on any map entry are all
+    // permanent facts about the container that the codec ticket would
+    // otherwise discover mid-materialisation — after every earlier
+    // stream had been paid for. Deciding them costs a pointer walk and
+    // no allocation; see
+    // [`validate_channel_layout`](crate::ticket::validate_channel_layout),
+    // which the ticket builder calls again as its own first statement.
+    //
+    // SAFETY: `par` is the live `AVCodecParameters` checked non-null
+    // above, owned by `parameters` for this iteration, and for a custom
+    // order libavformat filled its map with `nb_channels` entries
+    // through `av_channel_layout_copy` — the same argument the demux
+    // road's own channel-layout read makes.
+    unsafe { crate::ticket::validate_channel_layout(par, index) }?;
+
     let footprint =
       unsafe { crate::extras::measure_parameters(par) }.ok_or(DemuxError::ParametersTooLarge(
         ParametersTooLarge::new(index, usize::MAX, limits.max_codec_parameter_bytes()),
@@ -1951,16 +3215,83 @@ fn admit_streams(input: &Input, limits: DemuxLimits) -> Result<(), DemuxError> {
       ));
     }
 
+    // **And the three metadata values this row will retain**, measured
+    // here for the same reason everything else in this pass is: a
+    // budget checked during materialisation is a budget that has
+    // already been paid. The charge used to live in `build_tracks`'s
+    // loop, which meant an over-budget value on the *last* stream was
+    // refused only after every earlier stream's parameter clone and
+    // attachment carrier had been retained and this stream's ticket
+    // copied — so a file certain to be refused could first be made to
+    // cost the whole aggregate, on every open.
+    //
+    // Nothing here allocates: `metadata_value` hands back a borrow of
+    // libavutil's own buffer and `lossy_len` prices the decoding
+    // without producing it. The keys are read in `build_tracks`' own
+    // order so both passes refuse on the same value and name the same
+    // key, and both call `charge_metadata`, so there is one rule
+    // rather than two.
+    //
+    // SAFETY: `stream` keeps the `AVStream` — and so its metadata
+    // dictionary — live across the reads below, and no borrow outlives
+    // this loop iteration.
+    let metadata = unsafe { (*stream.as_ptr()).metadata };
+    for key in RETAINED_STREAM_METADATA {
+      // SAFETY: as above.
+      let raw = unsafe { metadata_value(metadata, key) };
+      let _admitted = charge_metadata(
+        raw,
+        &mut metadata_spent,
+        limits.max_total_stream_metadata_bytes(),
+      )
+      .map_err(|fault| stream_metadata_error(index, key, fault, limits))?;
+    }
+
     // And what the *carrier* will hold, for the two attachment roads.
     let carrier = if cover_art {
       // SAFETY: `attached_pic` is an `AVPacket` embedded in the
-      // `AVStream` by value; `addr_of!` reaches its `size` without
-      // forming a reference to the stream.
-      unsafe {
-        let pkt = std::ptr::addr_of!((*stream.as_ptr()).attached_pic);
-        (*pkt).size
+      // `AVStream` by value; `addr_of!` reaches it without forming a
+      // reference to the stream.
+      let pkt = unsafe { std::ptr::addr_of!((*stream.as_ptr()).attached_pic) };
+
+      // **The parked packet's own structure, judged here.**
+      //
+      // `PacketBuffer` is not one fault: it carries a `TRUSTED` payload
+      // this crate must not copy, a `data`/`size` pair that does not lie
+      // inside the buffer it claims, a buffer somebody else holds a
+      // reference to, flags outside the portable set — **and** the
+      // allocator declining the carrier. Only the last of those is
+      // unforeseeable; the rest are permanent facts about an `AVPacket`
+      // that is already parked and already readable. Deciding them in
+      // the capture meant a bad final attachment was refused after every
+      // earlier stream's ticket, metadata and carrier had been retained.
+      //
+      // The budget passed here is deliberately `usize::MAX`: the size
+      // question belongs to `charge_attachment` below, which answers it
+      // as `AttachmentTooLarge` against the attachment seats rather than
+      // as a packet's own ceiling. This call is asked only for the
+      // structural answers.
+      //
+      // SAFETY: `pkt` points at the live embedded `AVPacket` for the
+      // whole of this call, and no plan outlives it — it is discarded
+      // here, the capture happens later against the same packet.
+      let _plan = unsafe {
+        crate::buffer::preflight_payload(
+          pkt,
+          usize::MAX,
+          crate::buffer::PayloadProvenance::AttachedPicture,
+        )
       }
-      .max(0) as usize
+      .map_err(|source| DemuxError::PacketBuffer(PacketBuffer::new(index, source)))?;
+      // And the flags the packet will be rebuilt with, which is the one
+      // remaining deterministic `PacketBuffer` arm.
+      //
+      // SAFETY: as above.
+      unsafe { boundary::md_flags_from_av_packet(pkt) }
+        .map_err(|source| DemuxError::PacketBuffer(PacketBuffer::new(index, source)))?;
+
+      // SAFETY: a plain `int` field of the live embedded packet.
+      unsafe { (*pkt).size }.max(0) as usize
     } else if synthesized {
       // The **payload**, not the padded clone figure. The carrier is
       // an `FfmpegBytes` over exactly these bytes and the clone omits
@@ -2007,22 +3338,79 @@ fn charge_attachment(
   Ok(())
 }
 
-/// A stream's `AVRational` timebase as a [`Timebase`]. A zero or
-/// negative denominator is clamped to 1 rather than refused: a
-/// malformed timebase makes the track's timestamps meaningless, not the
-/// file unreadable, and every other track still demuxes.
-fn rational_to_timebase(value: Rational) -> Timebase {
-  Timebase::new(
-    value.numerator(),
-    NonZeroI32::new(value.denominator().max(1)).expect("clamped to at least 1"),
-  )
+/// A stream's own ruler, refused rather than repaired — **one
+/// conversion and one error, for the two passes that need it**.
+///
+/// A timebase is file-controlled and there is no honest substitute for
+/// it: it is what every timestamp on the track is measured against, so
+/// a malformed one makes the track's whole timeline a fabrication
+/// rather than a detail. `0/1` — libavformat's own "not set" — is not
+/// malformed and is admitted; see [`rational_to_timebase`].
+///
+/// This exists as a function because the judgement has to happen twice
+/// and must not become two judgements. [`admit_streams`] calls it while
+/// nothing has been allocated, which is what makes a malformed ruler on
+/// the *last* stream refuse the open before the first stream's codec
+/// ticket is copied; [`build_tracks`] calls it again where the value is
+/// actually used. Two call sites, one rule, and no way for the pass
+/// that pays to refuse something the pass that judges admitted.
+fn stream_timebase(index: usize, declared: Rational) -> Result<Timebase, DemuxError> {
+  rational_to_timebase(declared).ok_or(DemuxError::TrackTimebaseInvalid(TrackTimebaseInvalid::new(
+    index,
+    declared.numerator(),
+    declared.denominator(),
+  )))
+}
+
+/// A file-controlled `AVRational` as a [`Timebase`], or `None` where it
+/// is not one.
+///
+/// **Nothing is clamped and nothing is invented.** `None` means exactly
+/// that [`Timebase`] has no such value: a denominator that is zero or
+/// negative, or a negative numerator. A zero numerator *is* admitted,
+/// because it is not malformed — `0/1` is libavformat's own "this
+/// stream has no timebase yet" default, which ordinary containers carry
+/// on untimed streams, and passing it through is reporting rather than
+/// guessing. See [`positive_rational_to_timebase`] for the stricter
+/// rule the seats that cannot mean *absent* take.
+///
+/// # Why this is fallible now
+///
+/// It used to clamp the denominator up to 1 and hand the numerator to
+/// `Timebase::new` unexamined, on the argument that a malformed
+/// timebase makes one track's timestamps meaningless rather than the
+/// file unreadable. The first half of that was a fabrication — a `1/1`
+/// invented here is indistinguishable downstream from a `1/1` the file
+/// really declared — and the second half was a **panic**:
+/// `Timebase::new` asserts a non-negative numerator, and an
+/// `AVRational` out of a container can be negative. libavformat's
+/// FFMETADATA parser stores `TIMEBASE=-1/1000` verbatim, so sixty bytes
+/// of text were enough to abort a safe `open`. Every caller now answers
+/// a `None` with a named error instead.
+fn rational_to_timebase(value: Rational) -> Option<Timebase> {
+  Timebase::try_new(value.numerator(), NonZeroI32::new(value.denominator())?)
+}
+
+/// [`rational_to_timebase`], and the numerator must be positive too.
+///
+/// The rule for a seat where a zero numerator cannot mean "absent".
+///
+/// A chapter's `time_base` is one such seat: `avpriv_new_chapter` takes
+/// it as an argument, so whatever wrote the chapter wrote its ruler
+/// too, and `0/den` there is not an unset default but a declaration
+/// that every boundary in the table is the same instant — which is the
+/// whole content of the row, malformed. A declared frame *rate* is the
+/// other: zero frames per second is not a rate.
+fn positive_rational_to_timebase(value: Rational) -> Option<Timebase> {
+  (value.numerator() > 0)
+    .then(|| rational_to_timebase(value))
+    .flatten()
 }
 
 /// A frame *rate* as a rate-shaped [`Timebase`] (`30000/1001` for
 /// 29.97 fps), or `None` when the container declares none.
 fn rate_to_timebase(value: Rational) -> Option<Timebase> {
-  let (num, den) = (value.numerator(), value.denominator());
-  (num > 0 && den > 0).then(|| Timebase::new(num, NonZeroI32::new(den).expect("checked above")))
+  positive_rational_to_timebase(value)
 }
 
 #[cfg(test)]
@@ -2059,7 +3447,7 @@ mod tests {
     // The bytes a real container can hold: a Latin-1 "café.ttf" whose
     // 0xE9 is not valid UTF-8 on its own. Read through
     // `DictionaryRef::get` this produced a `&str` that violates the
-    // type's invariant — undefined behaviour before `SmolStr` ever
+    // type's invariant — undefined behaviour before anything ever
     // copied it.
     let raw = b"caf\xE9.ttf".to_vec();
     assert!(
@@ -2067,23 +3455,45 @@ mod tests {
       "the source bytes really are not UTF-8",
     );
     let dict = dict_with(c"filename", &raw);
-    let text = unsafe { metadata_text(dict, c"filename") }.expect("the entry exists");
+    let mut spent = 0usize;
+    let text = retain_metadata(
+      unsafe { metadata_value(dict, c"filename") },
+      &mut spent,
+      usize::MAX,
+    )
+    .expect("a readable value")
+    .expect("the entry exists");
     assert_eq!(text.as_str(), "caf\u{FFFD}.ttf");
+    assert_eq!(
+      spent,
+      "caf\u{FFFD}.ttf".len(),
+      "the charge is the decoded size, which the replacement made longer than the raw bytes",
+    );
     // A key the dictionary does not hold, and a null dictionary, are
     // both simply absent.
-    assert_eq!(unsafe { metadata_text(dict, c"mimetype") }, None);
-    assert_eq!(
-      unsafe { metadata_text(std::ptr::null(), c"filename") },
-      None
-    );
+    assert!(matches!(
+      unsafe { metadata_value(dict, c"mimetype") },
+      MetadataValue::Absent,
+    ));
+    assert!(matches!(
+      unsafe { metadata_value(std::ptr::null(), c"filename") },
+      MetadataValue::Absent,
+    ));
     unsafe { av_dict_free(&mut { dict }) };
   }
 
   #[test]
   fn valid_metadata_survives_unchanged() {
     let dict = dict_with(c"mimetype", b"application/x-truetype-font");
+    let mut spent = 0usize;
     assert_eq!(
-      unsafe { metadata_text(dict, c"mimetype") }.as_deref(),
+      retain_metadata(
+        unsafe { metadata_value(dict, c"mimetype") },
+        &mut spent,
+        usize::MAX,
+      )
+      .expect("a readable value")
+      .as_deref(),
       Some("application/x-truetype-font"),
     );
     unsafe { av_dict_free(&mut { dict }) };
@@ -2093,10 +3503,14 @@ mod tests {
   fn an_unterminated_length_is_refused_rather_than_truncated() {
     // Nothing libavutil produces is this long; the cap exists so a
     // value it did not terminate cannot walk off the end. A value that
-    // reaches the cap is absent, never a prefix of itself.
+    // reaches the cap is refused — and, since this shape was fixed,
+    // refused *visibly*: it is no longer the same answer as absent.
     let long = vec![b'a'; METADATA_VALUE_MAX_BYTES + 1];
     let dict = dict_with(c"filename", &long);
-    assert_eq!(unsafe { metadata_text(dict, c"filename") }, None);
+    assert!(matches!(
+      unsafe { metadata_value(dict, c"filename") },
+      MetadataValue::NotTerminated,
+    ));
     unsafe { av_dict_free(&mut { dict }) };
   }
 
@@ -2586,14 +4000,208 @@ mod tests {
     assert_eq!(packet.extra().stream_index(), 7);
   }
 
+  /// **`lossy_len` prices exactly what `from_utf8_lossy` builds.**
+  ///
+  /// The budget charge is made from this number *before* anything is
+  /// decoded, so a disagreement would either under-charge the budget —
+  /// the hostile case, where bytes that are not UTF-8 triple on the way
+  /// through — or refuse ordinary text. Asserted against the real
+  /// decoder rather than argued, over the shapes that differ: valid
+  /// ASCII and multi-byte text, a lone invalid byte, a run of them, an
+  /// invalid sequence between valid text, and a truncated trailing
+  /// sequence (which `error_len() == None` reports and which becomes
+  /// exactly one replacement).
   #[test]
-  fn a_zero_denominator_timebase_is_clamped_not_refused() {
-    // A malformed timebase makes one track's timestamps meaningless.
-    // It must not make the file unreadable — every other track still
-    // demuxes, and the caller can see the 1/1 for what it is.
-    let tb = rational_to_timebase(Rational::new(1, 0));
-    assert_eq!(tb.den().get(), 1);
-    assert_eq!(tb.num(), 1);
+  fn lossy_len_prices_exactly_what_lossy_text_builds() {
+    let cases: [&[u8]; 9] = [
+      b"",
+      b"Opening",
+      "héllo wörld".as_bytes(),
+      b"\xff",
+      b"\xff\xfe\xfd",
+      b"before\xffafter",
+      b"\xe2\x82",           // truncated three-byte sequence
+      b"ok\xe2\x82",         // ... after valid text
+      b"\xf0\x9f\x92\xa9ok", // a real four-byte sequence, untouched
+    ];
+    for raw in cases {
+      let built = std::string::String::from_utf8_lossy(raw);
+      assert_eq!(
+        lossy_len(raw),
+        built.len(),
+        "{raw:?} must be priced at what from_utf8_lossy produces",
+      );
+      let text = lossy_text(raw, lossy_len(raw)).expect("a small reservation");
+      assert_eq!(
+        text.as_str(),
+        built.as_ref(),
+        "{raw:?} must decode identically"
+      );
+    }
+  }
+
+  /// **Measure, charge, materialise — and a value the budget refuses is
+  /// never materialised at all.**
+  ///
+  /// The ordering is a property of the types rather than of the
+  /// control flow, which is what makes it hold: [`metadata_value`]
+  /// hands back a **borrow** of libavutil's buffer, so the size is
+  /// known before any owning conversion exists, and the refusal below
+  /// happens with nothing on the heap. A zero budget therefore costs
+  /// nothing however long the value is.
+  #[test]
+  fn a_refused_metadata_value_is_never_materialised() {
+    let long = vec![b'x'; 4096];
+    let mut spent = 0usize;
+    match retain_metadata(MetadataValue::Present(&long), &mut spent, 0) {
+      Err(MetadataFault::BudgetExhausted(total)) => assert_eq!(total, 4096),
+      _ => panic!("a zero budget must refuse a 4096-byte value"),
+    }
+    assert_eq!(spent, 0, "a refused value does not advance the budget");
+
+    // Under a budget that admits it, the same value is retained and
+    // charged its decoded size — once.
+    let mut spent = 0usize;
+    let text = retain_metadata(MetadataValue::Present(&long), &mut spent, 8192)
+      .expect("admitted")
+      .expect("present");
+    assert_eq!(text.len(), 4096);
+    assert_eq!(spent, 4096);
+
+    // And the three outcomes stay apart.
+    let mut spent = 0usize;
+    assert!(
+      retain_metadata(MetadataValue::Absent, &mut spent, 0)
+        .expect("absent is not a fault")
+        .is_none(),
+    );
+    assert!(matches!(
+      retain_metadata(MetadataValue::NotTerminated, &mut spent, usize::MAX),
+      Err(MetadataFault::TooLong),
+    ));
+    assert_eq!(spent, 0);
+  }
+
+  /// **A value with no terminator is not an absent value.**
+  ///
+  /// The shape that used to erase it: the reader answered `None` for
+  /// both, so a declared title of exactly 65,536 bytes reached a
+  /// consumer as an untitled chapter, uncharged against any budget.
+  #[test]
+  fn the_unterminated_case_is_distinct_from_the_absent_one() {
+    let mut spent = 0usize;
+    assert!(matches!(
+      retain_metadata(MetadataValue::NotTerminated, &mut spent, usize::MAX),
+      Err(MetadataFault::TooLong),
+    ));
+    assert!(matches!(
+      retain_metadata(MetadataValue::Absent, &mut spent, usize::MAX),
+      Ok(None),
+    ));
+  }
+
+  /// **A malformed rational is refused, never clamped and never a
+  /// panic.**
+  ///
+  /// This replaces a lane that asserted the opposite — that `1/0` came
+  /// back as `1/1`. That clamp was a fabrication a consumer could not
+  /// tell from a declaration, and it did not cover the case that
+  /// actually bites: `Timebase::new` asserts a non-negative numerator,
+  /// so a negative one panicked a safe `open`. libavformat stores
+  /// `TIMEBASE=-1/1000` out of an FFMETADATA sidecar verbatim, which
+  /// made sixty bytes of text enough to abort the process.
+  #[test]
+  fn a_malformed_rational_is_refused_rather_than_clamped() {
+    for (num, den) in [(1, 0), (1, -1000), (-1, 1000), (-1, -1000)] {
+      assert_eq!(
+        rational_to_timebase(Rational::new(num, den)),
+        None,
+        "{num}/{den} is not a timebase, and inventing one for it would be indistinguishable \
+         downstream from a file that declared it",
+      );
+    }
+  }
+
+  /// **One rule for a stream's ruler, and both passes hold it.**
+  ///
+  /// The refusal used to live inside `build_tracks`' materialisation
+  /// loop, so a malformed ruler on the *last* stream was decided only
+  /// after every earlier stream's codec ticket, metadata and attachment
+  /// carrier had been paid for. It is decided in `admit_streams` now,
+  /// where nothing has been allocated — and by *this* function, which
+  /// is the only place the conversion and the error are written, so the
+  /// pass that pays cannot refuse something the pass that judges
+  /// admitted.
+  ///
+  /// **On reachability, stated rather than implied.** Unlike
+  /// `AVChapter.time_base` — which libavformat stores exactly as an
+  /// FFMETADATA sidecar wrote it, `TIMEBASE=-1/1000` included, and
+  /// which the lane above pins against a real container — a stream's
+  /// timebase normally arrives through `avpriv_set_pts_info`, which
+  /// refuses a non-positive value itself. No container was found that
+  /// reaches this refusal, so it is a defensive one: demuxers that
+  /// assign `st->time_base` directly are not obliged to go through that
+  /// helper, and a check whose cost is one comparison is not worth
+  /// trading for an assumption about every demuxer in libavformat. What
+  /// this lane can pin is the rule and the report; what the ordering
+  /// rests on is that the pass it now lives in allocates nothing at
+  /// all.
+  #[test]
+  fn a_stream_ruler_is_refused_by_one_rule_that_names_what_was_declared() {
+    for (num, den) in [(1, 0), (1, -1000), (-1, 1000), (-1, -1000)] {
+      match stream_timebase(7, Rational::new(num, den)) {
+        Err(DemuxError::TrackTimebaseInvalid(fault)) => {
+          assert_eq!(fault.stream_index(), 7, "the refusal names the stream");
+          assert_eq!(
+            (fault.num(), fault.den()),
+            (num, den),
+            "{num}/{den} is reported as the container wrote it, not as a repair",
+          );
+        }
+        // Split so nothing here relies on `Timebase` being `Debug`.
+        Err(other) => panic!("{num}/{den} must be a timebase fault, got {other:?}"),
+        Ok(_) => panic!("{num}/{den} must be refused, and it was admitted"),
+      }
+    }
+
+    // And the two shapes a stream may legitimately carry are admitted:
+    // an ordinary ruler, and libavformat's own "never set".
+    assert_eq!(
+      stream_timebase(0, Rational::new(1, 90_000))
+        .map(|tb| (tb.num(), tb.den().get()))
+        .ok(),
+      Some((1, 90_000)),
+    );
+    assert_eq!(
+      stream_timebase(0, Rational::new(0, 1))
+        .map(|tb| (tb.num(), tb.den().get()))
+        .ok(),
+      Some((0, 1)),
+      "`0/1` is not malformed for a track seat — see the lane below",
+    );
+  }
+
+  /// A zero numerator is the one rational the two rules disagree on,
+  /// and the disagreement is the point.
+  ///
+  /// `0/1` is libavformat's own default for a stream whose demuxer
+  /// never set one, so a track seat reads it as the container declaring
+  /// nothing. A chapter's ruler is written by whatever wrote the
+  /// chapter, so the same value there is a claim that every boundary in
+  /// the table falls on one instant — malformed, and refused.
+  #[test]
+  fn a_zero_numerator_is_absent_for_a_track_and_malformed_for_a_chapter() {
+    let zero = Rational::new(0, 1);
+    assert_eq!(
+      rational_to_timebase(zero).map(|tb| (tb.num(), tb.den().get())),
+      Some((0, 1)),
+      "the track rule passes libavformat's own unset default through",
+    );
+    assert_eq!(
+      positive_rational_to_timebase(zero),
+      None,
+      "the strict rule refuses it",
+    );
   }
 
   #[test]

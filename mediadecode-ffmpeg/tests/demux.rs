@@ -21,15 +21,24 @@
 //!   attachment;
 //! - `None` means EOF and stays meaning it;
 //! - timestamps carry their track's timebase, not a placeholder;
-//! - reading the track table costs no packet, whenever it is read.
+//! - reading the track table costs no packet, whenever it is read;
+//! - a container's chapter table reaches the session with the
+//!   container's own ids, its own timebase and its titles — and a file
+//!   that declares none answers an empty table;
+//! - a chapter whose declared timebase is not one is refused **by
+//!   name**, never by panic, and the chapter table is bounded and
+//!   fallibly allocated before a byte of it is reserved.
 
 mod support;
 
 use std::{
   fs::File,
   io::{Read, Seek},
-  sync::Arc,
 };
+
+// The track handle's refcount is triomphe's, so an allocator refusal
+// is reportable rather than an abort — see `mediadecode_ffmpeg::buffer`.
+use triomphe::Arc;
 
 use mediadecode::{
   Received, Timebase, Timestamp,
@@ -39,7 +48,7 @@ use mediadecode::{
 // The owned family under the names this suite was written with — the
 // bare aliases mean the view lane now. Import block only; the
 // assertions below are unchanged.
-use mediadecode_ffmpeg::{DemuxError, FfmpegOwnedDemuxer as FfmpegDemuxer, TrackInfo};
+use mediadecode_ffmpeg::{DemuxError, DemuxLimits, FfmpegOwnedDemuxer as FfmpegDemuxer, TrackInfo};
 use support::Corpus;
 
 /// Drains a session, returning `(track, kind, pts)` for every delivered
@@ -256,6 +265,338 @@ fn an_undetermined_declaration_is_not_a_missing_one() {
   assert_eq!(
     demuxer.tracks()[1].language().map(|tag| tag.as_str()),
     Some("ger"),
+  );
+}
+
+/// **A container's table of contents reaches a door**, carrying the
+/// four things the file wrote: the container's own id, the chapter's
+/// own timebase, the span in it, and the title.
+///
+/// The fixture writes its two chapters in milliseconds and Matroska
+/// stores them in nanoseconds, so the numbers asserted here are the
+/// *container's* after its own rescale — which is the whole reason a
+/// chapter carries a timebase rather than borrowing a track's.
+#[test]
+fn a_session_carries_the_chapter_table_the_container_declares() {
+  let Some(corpus) = Corpus::new() else { return };
+  let demuxer = FfmpegDemuxer::open(&corpus.chaptered_mkv()).expect("open mkv");
+
+  let chapters = demuxer.chapters();
+  assert_eq!(chapters.len(), 2, "the sidecar wrote two chapters");
+
+  let ids: Vec<i64> = chapters.iter().map(|c| c.id()).collect();
+  assert_eq!(
+    ids,
+    vec![1, 2],
+    "the ids are Matroska's UIDs — offset off zero by the muxer because the format forbids \
+     that one — and not the rows' positions, which are 0 and 1",
+  );
+
+  for (index, chapter) in chapters.iter().enumerate() {
+    assert_eq!(
+      chapter.timebase(),
+      Timebase::NANOS,
+      "chapter {index}: Matroska counts chapter time in nanoseconds",
+    );
+  }
+
+  assert_eq!(chapters[0].start().pts(), 0);
+  assert_eq!(chapters[0].end().pts(), 1_000_000_000);
+  assert_eq!(chapters[1].start().pts(), 1_000_000_000);
+  assert_eq!(chapters[1].end().pts(), 2_500_000_000);
+
+  // The same two instants read without the container's ruler, which is
+  // what a consumer that only wants to know *when* asks for.
+  assert_eq!(chapters[0].end(), Timestamp::new(1, Timebase::SECONDS));
+  assert_eq!(chapters[1].start(), Timestamp::new(1_000, Timebase::MILLIS));
+
+  let titles: Vec<Option<&str>> = chapters
+    .iter()
+    .map(|c| c.title().map(|t| t.as_str()))
+    .collect();
+  assert_eq!(titles, vec![Some("Opening"), Some("Closing")]);
+
+  // The table belongs to the session and is held for its whole life:
+  // asking again answers the same rows, and asking cost no packet.
+  assert_eq!(demuxer.chapters().len(), 2);
+}
+
+/// **A container that declares no chapters answers an empty table** —
+/// which is also what the provided default on the face answers.
+///
+/// The same Matroska family as the lane above, so what differs is the
+/// file and not the format: nothing here is an artefact of a container
+/// that could not carry a table in the first place.
+#[test]
+fn a_container_without_chapters_answers_an_empty_table() {
+  let Some(corpus) = Corpus::new() else { return };
+
+  let demuxer = FfmpegDemuxer::open(&corpus.multi_track_mkv()).expect("open mkv");
+  assert!(
+    demuxer.chapters().is_empty(),
+    "a Matroska with four tracks and no Chapters element declares none",
+  );
+  assert_eq!(
+    demuxer.tracks().len(),
+    4,
+    "and an empty chapter table says nothing about the track table",
+  );
+}
+
+/// **A malformed chapter timebase is a named refusal, never a panic.**
+///
+/// `TIMEBASE=-1/1000` in an FFMETADATA sidecar is stored by
+/// libavformat exactly as written — `ffprobe -show_chapters` on this
+/// build reports `time_base=-1/1000` — and the conversion this backend
+/// ran clamped only the *denominator* before `Timebase::new` asserted a
+/// non-negative numerator. Sixty bytes of text therefore aborted a safe
+/// `open`, or killed the process outright under `panic=abort`.
+///
+/// `TIMEBASE=0/1000` is the second shape and is refused too: a chapter
+/// ruler is written by whatever wrote the chapter, so a zero numerator
+/// there is not libavformat's "unset" default but a claim that every
+/// boundary in the table falls on one instant.
+///
+/// **This lane needs no `ffmpeg` CLI.** The sidecar *is* the container
+/// — libavformat has its own ffmetadata demuxer — so a panic
+/// regression is caught everywhere rather than only where the corpus
+/// generator happens to be installed.
+#[test]
+fn a_malformed_chapter_timebase_is_refused_by_name() {
+  support::init_ffmpeg();
+  let dir = tempfile::tempdir().expect("temp dir");
+
+  let sidecar = |name: &str, timebase: &str| {
+    let path = dir.path().join(name);
+    std::fs::write(
+      &path,
+      format!(";FFMETADATA1\n[CHAPTER]\nTIMEBASE={timebase}\nSTART=0\nEND=1000\ntitle=Bad\n\n"),
+    )
+    .expect("writing the sidecar");
+    path
+  };
+
+  for (name, timebase, expected) in [
+    ("negative-num.ffmeta", "-1/1000", (-1, 1000)),
+    ("negative-den.ffmeta", "1/-1000", (1, -1000)),
+    ("zero-num.ffmeta", "0/1000", (0, 1000)),
+  ] {
+    // `map` because the session itself is not `Debug`; the count is
+    // enough to name what came back instead of an error.
+    let opened = FfmpegDemuxer::open(&sidecar(name, timebase)).map(|d| d.chapters().len());
+    match opened {
+      Err(DemuxError::ChapterTimebaseInvalid(fault)) => {
+        assert_eq!(fault.index(), 0);
+        assert_eq!(
+          (fault.num(), fault.den()),
+          expected,
+          "{timebase}: the rational is reported as the container wrote it, not as a repair",
+        );
+      }
+      other => panic!("{timebase} must be refused by name, got {other:?}"),
+    }
+  }
+
+  // **Positive control.** The same shape with a usable ruler opens and
+  // yields its chapter — so the three refusals above are about the
+  // rational, and not about an ffmetadata sidecar being unreadable.
+  let good = FfmpegDemuxer::open(&sidecar("good.ffmeta", "1/1000")).expect("open the sidecar");
+  assert_eq!(good.chapters().len(), 1);
+  assert_eq!(
+    good.chapters()[0].end(),
+    Timestamp::new(1, Timebase::SECONDS)
+  );
+}
+
+/// **The chapter count is judged before the table is reserved.**
+///
+/// `nb_chapters` is file-controlled and libavformat has no
+/// `max_chapters` knob, so a header can declare an enormous table for
+/// a handful of bytes and this crate's mirror — which owns a title per
+/// row — is the larger of the two. The ceiling is this crate's own.
+#[test]
+fn a_chapter_table_over_the_ceiling_is_refused_before_it_is_allocated() {
+  let Some(corpus) = Corpus::new() else { return };
+  let path = corpus.chaptered_mkv();
+
+  let opened = FfmpegDemuxer::open_with(&path, DemuxLimits::new().with_max_chapters(1))
+    .map(|d| d.chapters().len());
+  match opened {
+    Err(DemuxError::TooManyChapters(fault)) => {
+      assert_eq!(fault.declared(), 2);
+      assert_eq!(fault.limit(), 1);
+    }
+    other => panic!("a two-chapter file under a ceiling of one must be refused, got {other:?}"),
+  }
+
+  assert_eq!(
+    FfmpegDemuxer::open(&path).expect("open").chapters().len(),
+    2,
+    "and the default ceiling admits the very same file",
+  );
+}
+
+/// **Chapter titles are charged against a whole-file budget**, and the
+/// error names the title that crossed it.
+#[test]
+fn the_chapter_titles_are_charged_against_a_whole_file_budget() {
+  let Some(corpus) = Corpus::new() else { return };
+
+  let opened = FfmpegDemuxer::open_with(
+    &corpus.chaptered_mkv(),
+    DemuxLimits::new().with_max_total_chapter_title_bytes(1),
+  )
+  .map(|d| d.chapters().len());
+  match opened {
+    Err(DemuxError::ChapterTitleBudgetExhausted(fault)) => {
+      assert_eq!(
+        fault.index(),
+        0,
+        "the first title already crosses a one-byte budget",
+      );
+      assert_eq!(fault.bytes(), "Opening".len());
+      assert_eq!(fault.limit(), 1);
+    }
+    other => panic!("the title budget must be enforced, got {other:?}"),
+  }
+}
+
+/// **A title with no terminator inside the per-value cap is refused by
+/// name — not reported as an absent title.**
+///
+/// The shape that used to erase it: the metadata reader answered
+/// `None` for an over-long value exactly as it did for a missing one,
+/// so a declared title of 65,536 bytes reached a consumer as an
+/// *untitled* chapter — the mirrored table silently disagreeing with
+/// the container — and, because nothing was retained, it was charged
+/// against no budget at all. A zero-byte title budget did not stop it.
+///
+/// 65,535 is the last length the walk can terminate inside the cap and
+/// 65,536 the first it cannot, so the pair brackets the boundary
+/// rather than probing near it.
+#[test]
+fn an_over_long_chapter_title_is_refused_rather_than_erased() {
+  support::init_ffmpeg();
+  let dir = tempfile::tempdir().expect("temp dir");
+
+  let sidecar = |name: &str, title_len: usize| {
+    let path = dir.path().join(name);
+    std::fs::write(
+      &path,
+      format!(
+        ";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=1000\ntitle={}\n\n",
+        "x".repeat(title_len),
+      ),
+    )
+    .expect("writing the sidecar");
+    path
+  };
+
+  // The last length that fits, and it really is retained.
+  let admitted = FfmpegDemuxer::open(&sidecar("at-the-cap.ffmeta", 65_535)).expect("open");
+  assert_eq!(
+    admitted.chapters()[0].title().map(|t| t.len()),
+    Some(65_535),
+    "a title one byte under the cap is carried, not dropped",
+  );
+
+  // The first length that does not.
+  let opened =
+    FfmpegDemuxer::open(&sidecar("over-the-cap.ffmeta", 65_536)).map(|d| d.chapters().len());
+  match opened {
+    Err(DemuxError::ChapterTitleTooLong(fault)) => {
+      assert_eq!(fault.index(), 0);
+      assert_eq!(fault.limit(), 64 * 1024);
+    }
+    other => panic!("an over-long title must be refused by name, got {other:?}"),
+  }
+}
+
+/// **A title the budget refuses is never built.**
+///
+/// The ordering is what this pins: the reader hands back a *borrow* of
+/// libavutil's buffer, so the size is known and the refusal made with
+/// nothing on the heap. Before the fix the title was materialised —
+/// a lossy decode and a `SmolStr`, both infallible — and only then
+/// charged, so a 65,535-byte title did that work under a budget of
+/// zero and an allocator failure aborted a safe `open` instead of
+/// answering.
+///
+/// The error naming the full decoded size is the observable end of
+/// that ordering: the number can only come from the measurement, and
+/// the measurement is the step that happens first.
+#[test]
+fn a_chapter_title_over_the_budget_is_refused_before_it_is_built() {
+  support::init_ffmpeg();
+  let dir = tempfile::tempdir().expect("temp dir");
+  let path = dir.path().join("zero-budget.ffmeta");
+  std::fs::write(
+    &path,
+    format!(
+      ";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=1000\ntitle={}\n\n",
+      "x".repeat(60_000),
+    ),
+  )
+  .expect("writing the sidecar");
+
+  let opened = FfmpegDemuxer::open_with(
+    &path,
+    DemuxLimits::new().with_max_total_chapter_title_bytes(0),
+  )
+  .map(|d| d.chapters().len());
+  match opened {
+    Err(DemuxError::ChapterTitleBudgetExhausted(fault)) => {
+      assert_eq!(fault.index(), 0);
+      assert_eq!(fault.limit(), 0);
+      assert_eq!(
+        fault.bytes(),
+        60_000,
+        "the charge is the measured size, which is what makes the refusal precede the copy",
+      );
+    }
+    other => panic!("a zero title budget must refuse, got {other:?}"),
+  }
+}
+
+/// **Stream metadata is charged against a whole-file budget too.**
+///
+/// Every admitted stream mirrors three values — `filename`, `mimetype`
+/// and `language` — eagerly at open. `max_streams` bounds how many
+/// streams a header may declare and says nothing about what each may
+/// carry: at the 1,000-stream ceiling, three 64 KiB values apiece,
+/// in bytes that are not UTF-8 and so triple through lossy decoding,
+/// is roughly 562 MiB retained before a single packet has been asked
+/// for.
+#[test]
+fn stream_metadata_is_charged_against_a_whole_file_budget() {
+  let Some(corpus) = Corpus::new() else { return };
+  let path = corpus.multi_track_mkv();
+
+  let opened = FfmpegDemuxer::open_with(
+    &path,
+    DemuxLimits::new().with_max_total_stream_metadata_bytes(1),
+  )
+  .map(|d| d.tracks().len());
+  match opened {
+    Err(DemuxError::TrackMetadataBudgetExhausted(fault)) => {
+      assert_eq!(fault.limit(), 1);
+      assert!(
+        fault.bytes() > 1,
+        "the refusal names the running total that crossed the line",
+      );
+      assert!(
+        !fault.key().is_empty(),
+        "and which of the three values it was reading",
+      );
+    }
+    other => panic!("a one-byte metadata budget must refuse, got {other:?}"),
+  }
+
+  // The default budget admits the same file, with its metadata intact.
+  let demuxer = FfmpegDemuxer::open(&path).expect("open");
+  assert_eq!(
+    demuxer.tracks()[3].filename().map(|s| s.as_str()),
+    Some("font.ttf"),
   );
 }
 
