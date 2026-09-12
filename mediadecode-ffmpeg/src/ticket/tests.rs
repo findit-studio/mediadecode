@@ -92,6 +92,201 @@ fn parameters_with_custom_layout(channels: usize) -> Parameters {
   out
 }
 
+/// [`parameters_with_custom_layout`], with the **last** entry's
+/// sixteen-byte name filled edge to edge so it carries no NUL, and an
+/// `extradata` seat of `extradata` bytes beside it.
+///
+/// The last entry rather than the first on purpose: a validation that
+/// walks only far enough to feel thorough passes this, and a
+/// validation placed after the copies pays for `extradata` before
+/// reaching it.
+fn parameters_with_unterminated_last_name(channels: usize, extradata: usize) -> Parameters {
+  let mut out = parameters_with_custom_layout(channels);
+  // SAFETY: `out` owns a live `AVCodecParameters` whose custom map has
+  // `channels` entries; the extradata buffer comes from FFmpeg's
+  // allocator and is handed to it.
+  unsafe {
+    let par = out.as_mut_ptr();
+    let map = (*par).ch_layout.u.map;
+    core::ptr::write_bytes(
+      core::ptr::addr_of_mut!((*map.add(channels - 1)).name).cast::<u8>(),
+      b'x',
+      16,
+    );
+    if extradata > 0 {
+      let buffer = av_mallocz(extradata).cast::<u8>();
+      assert!(!buffer.is_null(), "av_mallocz extradata");
+      core::ptr::write_bytes(buffer, 0xAB, extradata);
+      (*par).extradata = buffer;
+      (*par).extradata_size = extradata as i32;
+    }
+  }
+  out
+}
+
+/// **An unspecified layout's union is never read, mirrored, or
+/// printed.**
+///
+/// `AVChannelLayout`'s own header declares `u` undefined for
+/// `AV_CHANNEL_ORDER_UNSPEC`, and this mirror treated "not custom" as
+/// "mask-backed" — importing whatever bytes happened to sit in that
+/// storage into `ChannelLayoutTicket::mask`, where the public `mask()`
+/// hands them out and the derived `Debug`, `PartialEq` and `Hash`
+/// expose and compare them. Two equivalent unspecified layouts could
+/// therefore mirror to tickets that were not equal.
+///
+/// The junk written below is what a container's uninitialised or
+/// reused storage looks like. The stored zero is a value this crate
+/// *chose*; nothing reads the union to obtain it.
+#[test]
+fn an_unspecified_layout_mirrors_without_reading_its_union() {
+  let unspec = |channels: i32, junk: u64| {
+    let mut out = Parameters::new();
+    // SAFETY: `out` owns a live `AVCodecParameters`. `UNSPEC` is the
+    // zero discriminant the allocator already left; the union is
+    // written with bytes the order does not define, which is the state
+    // under test.
+    unsafe {
+      let par = out.as_mut_ptr();
+      core::ptr::write_unaligned(
+        core::ptr::addr_of_mut!((*par).ch_layout.order).cast::<i32>(),
+        AVChannelOrder::AV_CHANNEL_ORDER_UNSPEC as i32,
+      );
+      (*par).ch_layout.nb_channels = channels;
+      (*par).ch_layout.u.mask = junk;
+    }
+    out
+  };
+
+  let clean = CodecTicket::mirror(&unspec(6, 0), 0, usize::MAX).expect("mirror");
+  let junked =
+    CodecTicket::mirror(&unspec(6, 0xDEAD_BEEF_DEAD_BEEF), 1, usize::MAX).expect("mirror");
+
+  assert_eq!(
+    clean.ch_layout().mask(),
+    0,
+    "nothing was read from the union"
+  );
+  assert_eq!(
+    junked.ch_layout().mask(),
+    0,
+    "and nothing was read here either"
+  );
+  assert_eq!(
+    clean.ch_layout(),
+    junked.ch_layout(),
+    "two unspecified layouts of one width are one layout",
+  );
+
+  let rendered = format!("{:?}", junked.ch_layout());
+  assert!(
+    !rendered.to_ascii_lowercase().contains("dead"),
+    "the junk must not reach a log line: {rendered}",
+  );
+
+  // The rebuild does not invent one either: an order that defines no
+  // arm gets no arm written.
+  let rebuilt = junked.rebuild().expect("rebuild");
+  // SAFETY: `rebuilt` owns a live `AVCodecParameters` for this read.
+  let (order, channels, mask) = unsafe {
+    let par = rebuilt.as_ptr();
+    (
+      core::ptr::read_unaligned(core::ptr::addr_of!((*par).ch_layout.order).cast::<i32>()),
+      (*par).ch_layout.nb_channels,
+      (*par).ch_layout.u.mask,
+    )
+  };
+  assert_eq!(order, AVChannelOrder::AV_CHANNEL_ORDER_UNSPEC as i32);
+  assert_eq!(channels, 6, "the count is carried across");
+  assert_eq!(mask, 0, "and the union is left as the allocator zeroed it");
+
+  // A native layout still round-trips its mask, so the assertions above
+  // are about the order rather than about the mask seat having gone
+  // quiet.
+  let native =
+    CodecTicket::mirror(&parameters_with_native_layout(), 2, usize::MAX).expect("mirror");
+  assert_ne!(native.ch_layout().mask(), 0);
+}
+
+/// Builds an `AVCodecParameters` with an ordinary `NATIVE` stereo
+/// layout — the positive control for the lane above.
+fn parameters_with_native_layout() -> Parameters {
+  let mut out = Parameters::new();
+  // SAFETY: `out` owns a live `AVCodecParameters`; both writes are
+  // scalar stores into the `mask` arm the order names.
+  unsafe {
+    let par = out.as_mut_ptr();
+    core::ptr::write_unaligned(
+      core::ptr::addr_of_mut!((*par).ch_layout.order).cast::<i32>(),
+      AVChannelOrder::AV_CHANNEL_ORDER_NATIVE as i32,
+    );
+    (*par).ch_layout.nb_channels = 2;
+    (*par).ch_layout.u.mask = ffmpeg_next::ffi::AV_CH_LAYOUT_STEREO;
+  }
+  out
+}
+
+/// **A custom name with no terminator is refused, and refused as a
+/// malformed map rather than as anything else.**
+///
+/// `AVChannelCustom::name` is documented as zeroed or NUL-terminated
+/// and nothing enforces it. FFmpeg tests `name[0]` and hands the fixed
+/// array to a `%s` conversion, which reads until a terminator — so a
+/// name filled edge to edge makes that read run off the end of the
+/// entry. The describe road refused it already; this road is the one
+/// that mirrors the layout, and it used to admit it.
+#[test]
+fn a_custom_name_without_a_terminator_is_refused_at_the_mirror() {
+  let parameters = parameters_with_unterminated_last_name(4, 0);
+  match CodecTicket::mirror(&parameters, 5, usize::MAX) {
+    Err(DemuxError::ParametersChannelMap(p)) => {
+      assert_eq!(p.stream_index(), 5);
+      assert_eq!(p.channels(), 4);
+    }
+    Err(other) => panic!("expected ParametersChannelMap, got {other:?}"),
+    Ok(_) => panic!("a name with no terminator must not reach FFmpeg"),
+  }
+
+  // The same map with the terminator `av_mallocz` leaves is fine, so
+  // the refusal is about the terminator and not about custom layouts.
+  CodecTicket::mirror(&parameters_with_custom_layout(4), 5, usize::MAX)
+    .expect("a zeroed name is a terminated one");
+}
+
+/// **Structure is judged before the footprint is even measured**, which
+/// is what puts it before every copy.
+///
+/// The ordering is invisible to a test that only checks *which* error
+/// comes back for a file with one fault — both orderings refuse. So
+/// this file has **two** faults at once: a malformed channel map and an
+/// `extradata` seat far over the budget. Whichever check runs first
+/// names the error, and that makes the assertion a statement about
+/// order rather than about outcome.
+///
+/// Before the fix, `from_raw` measured and judged the footprint, then
+/// copied `extradata` and every coded-side-data payload, and only then
+/// reached the channel layout — so this file answered
+/// `ParametersTooLarge`, and a file inside the budget paid for both
+/// copies before being refused.
+#[test]
+fn a_malformed_layout_is_refused_before_the_footprint_is_measured() {
+  let parameters = parameters_with_unterminated_last_name(4, 64 * 1024);
+  // The footprint really is over the ceiling used below, so the other
+  // ordering had a refusal of its own to reach for.
+  //
+  // SAFETY: `parameters` owns a live `AVCodecParameters`.
+  let declared = unsafe { measure_parameters(parameters.as_ptr()) }
+    .and_then(|f| f.total())
+    .expect("measurable");
+  assert!(declared > 1024, "the extradata must outgrow the ceiling");
+
+  match CodecTicket::mirror(&parameters, 5, 1024) {
+    Err(DemuxError::ParametersChannelMap(p)) => assert_eq!(p.channels(), 4),
+    Err(other) => panic!("structure must be judged before size, got {other:?}"),
+    Ok(_) => panic!("a malformed map must be refused"),
+  }
+}
+
 /// **Every allocation the rebuild makes, made to fail.**
 ///
 /// `rebuild` asks FFmpeg's allocator four separate times — the

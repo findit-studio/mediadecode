@@ -475,15 +475,16 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     let hw_scratch = Frame::empty()?;
     let sw_scratch = alloc_av_video_frame()?;
     let state = match path {
-      DecodePath::Auto => match VideoDecoder::open_with_frame_limits(
+      DecodePath::Auto => match VideoDecoder::open_with_frame_limits_timed(
         try_clone_parameters(&owned_parameters, limits.max_codec_parameter_bytes())?,
         limits,
+        time_base,
       ) {
         Ok(hw) => DecodeState::Hw(Box::new(hw)),
         Err(Error::AllBackendsFailed(_)) => {
           // Open-time HW exhaustion: no rescued packets (open didn't
           // see any). Just open SW directly from our owned copy.
-          let sw = open_sw_decoder(&owned_parameters, limits)?;
+          let sw = open_sw_decoder(&owned_parameters, limits, Some(time_base))?;
           DecodeState::Sw(sw)
         }
         Err(other) => return Err(other),
@@ -492,16 +493,21 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       // tried before it and nothing after it, which is what makes the
       // arm a pin: an open that fails is the answer, where `Auto` would
       // have read the same failure as a reason to look elsewhere.
-      DecodePath::Hardware(backend) => DecodeState::Hw(Box::new(VideoDecoder::open_with_limits(
-        try_clone_parameters(&owned_parameters, limits.max_codec_parameter_bytes())?,
-        backend,
-        limits,
-      )?)),
+      DecodePath::Hardware(backend) => {
+        DecodeState::Hw(Box::new(VideoDecoder::open_with_limits_timed(
+          try_clone_parameters(&owned_parameters, limits.max_codec_parameter_bytes())?,
+          backend,
+          limits,
+          time_base,
+        )?))
+      }
       // The software decoder, opened on purpose rather than reached by
       // degrading. `DecodeState::Sw` is terminal, so this session has
       // nothing to keep it on its path but the shape of the state
       // machine itself.
-      DecodePath::Software => DecodeState::Sw(open_sw_decoder(&owned_parameters, limits)?),
+      DecodePath::Software => {
+        DecodeState::Sw(open_sw_decoder(&owned_parameters, limits, Some(time_base))?)
+      }
     };
     Ok(Self {
       state,
@@ -798,7 +804,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     unconsumed_packets: &[ffmpeg_next::Packet],
     eof_pending: bool,
   ) -> Result<(), Error> {
-    let mut sw = open_sw_decoder(&self.parameters, self.limits)?;
+    let mut sw = open_sw_decoder(&self.parameters, self.limits, Some(self.time_base))?;
     // Bound before the decoder is mutably borrowed, so the error
     // closures below can still consult it.
     let sw_state = sw.state();
@@ -996,7 +1002,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       !(matches!(input, PostCommitInput::Packet(_)) && eof_pending),
       "a current packet and a committed EOF must never be forwarded together",
     );
-    let mut sw = open_sw_decoder(&self.parameters, self.limits)?;
+    let mut sw = open_sw_decoder(&self.parameters, self.limits, Some(self.time_base))?;
     // Captured before the decoder is borrowed for the forward, and
     // before it can be dropped on the error road: this temporary
     // decoder owns the callback state, so a `judge_buffer` refusal
@@ -1947,14 +1953,18 @@ macro_rules! video_lane_face {
 
 video_lane_face!(crate::View, crate::Owned);
 
-fn open_sw_decoder(parameters: &Parameters, limits: DecoderLimits) -> Result<SwDecoder, Error> {
+fn open_sw_decoder(
+  parameters: &Parameters,
+  limits: DecoderLimits,
+  pkt_timebase: Option<Timebase>,
+) -> Result<SwDecoder, Error> {
   // Use the checked codec-context builder — ffmpeg-next's
   // `Context::from_parameters` calls `Context::new()` which doesn't
   // null-check `avcodec_alloc_context3`'s return value before
   // running `avcodec_parameters_to_context` against it. Under
   // memory pressure that's C-level UB; `build_codec_context`
   // surfaces the OOM as an error instead.
-  let (ctx, callback_state) = build_codec_context(parameters, limits)?;
+  let (ctx, callback_state) = build_codec_context(parameters, limits, pkt_timebase)?;
   // Opened without forming a bindgen enum from FFmpeg memory: the codec
   // is resolved off a raw `codec_id`, and the medium is proved off a raw
   // `codec_type`. See `crate::decoder::ensure_codec_type`.

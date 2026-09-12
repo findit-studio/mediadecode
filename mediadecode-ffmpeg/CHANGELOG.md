@@ -11,6 +11,872 @@ The backend-agnostic core it adapts has its own log at
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-09-11
+
+### Added
+
+- **The backend reads `AVFormatContext.chapters`**, filling the
+  `Demuxer::chapters` seat `mediadecode` 0.15.0 opens.
+
+  The table is mirrored once at open — after
+  `avformat_find_stream_info`, beside the track table — and held for
+  the life of the session, so asking for it costs no packet and may
+  happen at any point. A container that declares none allocates
+  nothing.
+
+  **Read raw, for the two reasons already standing in this file.**
+  `ffmpeg_next`'s own chapter wrapper reads the metadata dictionary
+  through `DictionaryRef`, whose `&str` is built with
+  `from_utf8_unchecked` over bytes no container validates — so `title`
+  takes the `metadata_text` road a track's `language` and `filename`
+  already do, replacing invalid bytes rather than forming a `&str` that
+  is not UTF-8 — and that wrapper dereferences an array entry without
+  checking it, where this walk answers a null one by skipping it.
+  Nothing read is a bindgen enum: an id, an `AVRational`, two tick
+  counts and a dictionary pointer.
+
+  **Nothing is repaired.** A chapter whose `end` precedes its `start`,
+  and one whose end libavformat left at `AV_NOPTS_VALUE` because the
+  file declared none, are both mirrored exactly as written — this layer
+  reports what the container says.
+
+  `mediadecode_ffmpeg::Chapter` joins `TrackInfo` and `TrackParams` as
+  the `Ffmpeg`-bound alias of the core row.
+
+  Pinned against real containers: `tests/support` grows a Matroska
+  fixture whose two titled chapters are mixed in from an FFMETADATA
+  sidecar, and the lanes assert the container's own ids (Matroska's
+  UIDs, offset off the zero the format forbids — not the rows'
+  positions), its own nanosecond timebase, both spans and both titles;
+  a chapterless Matroska answers an empty table.
+
+- **Ceilings for the chapter table: `DemuxLimits::max_chapters` and
+  `DemuxLimits::max_total_chapter_title_bytes`**, with
+  `DEFAULT_MAX_CHAPTERS` (4096) and
+  `DEFAULT_MAX_TOTAL_CHAPTER_TITLE_BYTES` (1 MiB), both finite like
+  every other seat there.
+
+  `nb_chapters` is file-controlled and libavformat has **no**
+  `max_chapters` knob, so nothing upstream bounds it: an `AVChapter` is
+  four scalars and a dictionary pointer, cheap enough that a header can
+  declare an enormous table for very few bytes, and the probe budget
+  does not reach a count. This crate's mirror is the larger of the two —
+  a row owns a title as well — so a table that parsed successfully is
+  not thereby a table this process should pay for.
+
+  The count is judged **before** the table is reserved, the reservation
+  is **fallible** (`try_reserve_exact`), and titles are charged as they
+  are read. Four new named faults, all refused at open:
+  `TooManyChapters`, `ChapterTitleBudgetExhausted`, `ChapterAlloc` and
+  `ChapterTimebaseInvalid`. (The per-title half was already bounded one
+  layer down: the metadata reader refuses any single dictionary value
+  past 64 KiB. What the aggregate seat adds is turning *count × that*
+  into a small number.)
+
+
+- **A whole-file budget for stream metadata:
+  `DemuxLimits::max_total_stream_metadata_bytes`, with
+  `DEFAULT_MAX_TOTAL_STREAM_METADATA_BYTES` (4 MiB).**
+
+  A track row mirrors three values off each stream's metadata
+  dictionary — `filename`, `mimetype`, `language` — eagerly, for every
+  admitted stream, before a packet has been asked for. `max_streams`
+  bounds how many streams a header may declare and says nothing about
+  what each may carry: at that ceiling, three values of the 64 KiB a
+  single metadata value may reach, in bytes that are not UTF-8 and so
+  triple through lossy decoding, is roughly **562 MiB** retained during
+  an open — and the path entrypoint has no hard read meter to fall back
+  on. Named faults: `TrackMetadataBudgetExhausted`,
+  `TrackMetadataTooLong`, `TrackMetadataAlloc`, each naming the stream
+  and which of the three values it was reading.
+### Changed
+
+- **A timebase this backend cannot represent is now a named refusal
+  rather than a clamp — and, in one case, rather than a panic.**
+
+  `AVStream.time_base` and `AVChapter.time_base` are both
+  file-controlled. The conversion behind them clamped a non-positive
+  *denominator* up to 1 and handed the numerator to `Timebase::new`
+  unexamined. Two faults in one line: the clamp fabricated a ruler a
+  consumer could not tell from one the file declared, and
+  `Timebase::new` **asserts** a non-negative numerator. libavformat's
+  FFMETADATA parser stores `TIMEBASE=-1/1000` verbatim — measured with
+  `ffprobe`, which reports `time_base=-1/1000` — so sixty bytes of text
+  were enough to panic a safe `open`/`open_reader`, or to kill the
+  process under `panic=abort`.
+
+  The conversion is fallible now and nothing is invented. A stream
+  whose declared timebase is not one fails the open with
+  `TrackTimebaseInvalid`; a chapter's with `ChapterTimebaseInvalid`.
+  Both name the stream or chapter and the rational exactly as the
+  container wrote it.
+
+  **The chapter rule is the stricter of the two, by the zero
+  numerator.** `0/1` is libavformat's own default for a stream whose
+  demuxer never set one, so a track seat reads it as the container
+  declaring nothing and passes it through — as it always has. A
+  chapter's ruler is written by whatever wrote the chapter
+  (`avpriv_new_chapter` takes it as an argument), so the same value
+  there is not an absence but a claim that every boundary in the table
+  falls on one instant.
+
+  **This is a behaviour change** for a file whose stream declares a
+  malformed rational: 0.14.0 opened it with a `1/1` invented here, and
+  0.15.0 refuses it by name. That file's timestamps were never
+  meaningful; what changes is that it now says so instead of looking
+  well-formed.
+
+- **Metadata is measured, charged and only then materialised — in that
+  order.**
+
+  A chapter title was built before the budget was consulted: a lossy
+  decode and a `SmolStr`, both infallible, so a 65,535-byte title did
+  that heap work under a budget of **zero**, and an allocator failure
+  aborted a safe `open` rather than answering. The reader now hands
+  back a *borrow* of libavutil's buffer, so a value's size is known
+  before any owning conversion exists and a refused value costs no heap
+  at all. What is then built is built through a fallible reservation
+  (`String::try_reserve_exact`), with `ChapterTitleAlloc` /
+  `TrackMetadataAlloc` naming an exhaustion.
+
+  The charge is the **decoded** size, not the raw one: lossy decoding
+  replaces each invalid sequence with a three-byte `U+FFFD`, so the raw
+  length would under-charge exactly the hostile input. It is computed
+  without decoding, and its agreement with `String::from_utf8_lossy` is
+  asserted rather than argued.
+
+  `SmolStr::new` itself remains infallible — `smol_str` offers no
+  constructor that is not, and its inline storage covers 23 bytes. What
+  that leaves is one allocation of a size already charged against a
+  budget *and* already served once by the allocator, which is stated
+  here rather than papered over.
+
+- **A metadata value with no terminator inside the 64 KiB per-value cap
+  is refused by name, where it used to read as absent.**
+
+  The reader answered `None` for an over-long value exactly as for a
+  missing one. A declared chapter title of 65,536 bytes therefore
+  reached a consumer as an *untitled* chapter — the mirrored table
+  silently disagreeing with the container — and, retaining nothing,
+  escaped every budget charged against it, including a zero one.
+  Chapters answer `ChapterTitleTooLong`; a stream's three values answer
+  `TrackMetadataTooLong`.
+
+  `ChapterTitleTooLong` is deliberately **not** folded into
+  `ChapterTitleBudgetExhausted`: the budget error is answered by
+  raising `max_total_chapter_title_bytes`, and this one names a
+  structural cap no seat can move — folding them would offer a knob
+  that cannot fix it.
+
+- **(BREAKING) The bare packet converters take the stream's timebase.**
+  `video_packet_from_ffmpeg`, `audio_packet_from_ffmpeg` and
+  `subtitle_packet_from_ffmpeg` stamped `Timebase::default()` — 1/1 —
+  onto raw stream ticks. An `AVPacket` does not carry its stream's
+  timebase, so PTS 90,000 from a 1/90,000 stream became a
+  *self-describing* timestamp reading 90,000 seconds, with nothing in
+  the value marking 1/1 as a placeholder rather than a reading. They
+  now take a `Timebase` and stamp what the caller declares. Callers
+  pass the track row's `timebase()`; the `*_in` variants, which already
+  required one, are unchanged.
+
+- **(BREAKING) The subtitle frame converters no longer take a
+  timebase.** `av_subtitle_to_subtitle_frame`,
+  `av_subtitle_to_owned_subtitle_frame` and `subtitle_frame_from` took
+  a stream `Timebase` that could not affect the answer — see the PTS
+  fix below — and a parameter that cannot affect the answer is how that
+  bug survived review. Drop the argument at the call site.
+
+
+- **(BREAKING) The `Ffmpeg` adapter's text carrier is `Utf8Bytes`, not
+  `SmolStr`** — so `TrackInfo::filename`, `mime_type`, `language` and
+  `Chapter::title` hand back `&Utf8Bytes`. `as_str()` reads the same as
+  before; a caller that named `SmolStr` renames the type.
+
+  Not a preference. A metadata value's length is container-controlled,
+  so the demuxer measures it, charges it against a budget and builds it
+  in a `String` reserved with `try_reserve_exact` — and that chain is
+  worth nothing if the last step allocates again. `SmolStr::new` takes
+  a `&str` and copies it into a fresh `Arc<str>` past 23 bytes: a
+  **second, infallible** allocation of an attacker-sized value, made
+  while the first was still live, so failing it aborted the process the
+  budget existed to keep alive. `Utf8Bytes::from(String)` **moves** the
+  buffer instead — inline under `smol_bytes::INLINE_CAP`, and otherwise
+  through `bytes::Bytes::from(Vec<u8>)`, which takes the vector's own
+  allocation over rather than copying it.
+
+  The one residue, stated rather than glossed: `bytes` moves the buffer
+  outright when length equals capacity, which is what
+  `try_reserve_exact` plus exactly that many bytes produces; if an
+  allocator returns more capacity than was asked for, it allocates a
+  fixed-size 32-byte refcount header — the same for a ten-byte title
+  and a 64 KiB one. What is gone is the part an attacker could scale.
+
+
+- **(BREAKING) The text carrier across this crate is
+  `smol_bytes::Utf8Bytes`; the `smol_str` dependency is gone** — so
+  `TrackInfo::filename`, `mime_type`, `language` and `Chapter::title`
+  hand back `&Utf8Bytes`. `as_str()` reads the same as before; a caller
+  that named `SmolStr` renames the type.
+
+  Not a preference. A metadata value's length is container-controlled,
+  so the demuxer measures it, charges it against a budget and builds it
+  in a `String` reserved with `try_reserve_exact` — and that chain is
+  worth nothing if the last step allocates again. `SmolStr::new` takes
+  a `&str` and copies it into a fresh `Arc<str>` past 23 bytes: a
+  **second, infallible** allocation of an attacker-sized value, made
+  while the first was still live, so failing it aborted the process the
+  budget existed to keep alive. `Utf8Bytes::from(String)` **moves** the
+  buffer instead — inline under `smol_bytes::INLINE_CAP` (62 bytes, no
+  allocation at all) and otherwise through `bytes::Bytes::from(Vec<u8>)`,
+  which takes the vector's own allocation over rather than copying it.
+
+  Measured, not asserted: `tests/metadata_allocation.rs` installs a
+  counting global allocator and watches the conversion itself. A 65,535
+  byte value — the largest single metadata value the reader admits —
+  reaches the carrier with **zero** allocations, as does the first
+  value past the inline window; the `Arc<str>` copy the old carrier
+  made shows up in the same file as one allocation of the full 65,535
+  bytes.
+
+  The swap reaches every text seat **this crate owns**:
+  `ContainerFormat`'s names, `CodecId`'s and the pixel-format namer's,
+  the reader-panic message, and the metadata seats above.
+
+  `smol_str` remains a dependency for exactly one file,
+  `channel_layout.rs`, and the reason is a boundary rather than an
+  oversight: those labels are handed to **`mediaframe`**'s own
+  vocabulary — `ChannelSpec::with_label`, `ChannelLayoutDescription::
+  with_text` — whose seats are `SmolStr`, and that carrier is
+  mediaframe's to choose. Nothing on that road is charged against a
+  budget or sized by a container, so the allocation-failure argument
+  above does not reach it.
+
+- **The standalone `VideoDecoder` can declare a packet timebase.**
+
+  This release's first cut wrote `AVCodecContext.pkt_timebase` only
+  from the crate-private constructors the stream decoder uses; every
+  public `VideoDecoder::open*` routed `None`. A direct caller feeding
+  timestamped packets therefore had no way to tell libavcodec what
+  their ticks meant — and not owning the `AVStream` does not mean not
+  knowing its ruler. `open_timed`, `open_with_frame_limits_timed`,
+  `open_with_timed` and `open_with_limits_timed` declare it, and it
+  reaches every backend state including later hardware probe advances.
+  The four existing constructors remain as **explicitly untimed**
+  conveniences and say so in their docs.
+
+
+- **Every allocation between admission and a successful open is
+  fallible.**
+
+  The budgets decide what a container may spend before a byte is
+  copied — and then the copies themselves were infallible, so a file
+  whose footprint the caller's own ceilings had *admitted* could still
+  abort the process when the allocator declined. A budget that ends in
+  an abort is not a budget.
+
+  `FfmpegBytes` now holds `Arc<Vec<u8>>` rather than `Arc<[u8]>`: the
+  attacker-scaled half goes through `Vec::try_reserve_exact` and the
+  `Arc` is left holding three words, because stable has no fallible
+  `Arc<[u8]>` and `Arc::new_uninit_slice` aborts like every other
+  infallible allocator call. An inline-capable carrier was considered
+  and rejected — inline storage makes `Clone` copy small payloads, and
+  `FfmpegBytes::ptr_eq`, the amputation contract's own instrument, asks
+  whether a clone was a refcount bump.
+
+  On that footing: `FfmpegBytes::try_copy_from_slice` is the road every
+  budgeted copy takes, `from_rows` reserves fallibly (and loses its
+  `MaybeUninit` gather, and the written-every-slot argument with it),
+  the codec-ticket mirror returns `Result` — extradata, each
+  coded-side-data payload, the descriptor table and the custom channel
+  map — and the track table, the attachment queue and the handle
+  vector are all `try_reserve`d. `TrackTableAlloc` joins
+  `ParametersAlloc`, `ChapterAlloc`, `ChapterTitleAlloc` and
+  `TrackMetadataAlloc` as a named open failure.
+
+  **What stays infallible, and why it cannot scale.** One `Arc::new`
+  per track row: a fixed-size header, the row's own variable weight
+  already sitting in carriers allocated fallibly above, and the count
+  bounded by the `max_streams` ceiling. One `Arc` header per carrier,
+  likewise fixed. Stable Rust has no fallible `Arc`, and neither of
+  these grows with anything a file says.
+
+  Watched rather than asserted: `tests/metadata_allocation.rs` opens a
+  real container under a counting allocator and pins that no single
+  allocation approaches the admitted per-stream ceiling — which is what
+  a staged-then-copied payload would look like — and that the total
+  stays in proportion to the file rather than to the budget.
+
+
+- **The refcount is `triomphe::Arc`, so the last aborting allocations
+  on the open path are gone.**
+
+  The previous round moved the attacker-scaled bytes into a
+  `try_reserve_exact`ed `Vec` and handed that to `std::sync::Arc` — and
+  the `Arc` still aborted, once per coded-side-data entry, a count the
+  file controls. `std::sync::Arc` has no fallible constructor on stable
+  at all. `triomphe::Arc` does: `UniqueArc::try_new_uninit_slice` puts
+  the payload in the allocation directly, with no intermediate `Vec`
+  and no second copy, and `Arc::try_new` covers the per-row handle.
+  `FfmpegBytes` also gains an `Empty` variant, so the empty carrier —
+  which a video frame mints three times per decoded picture — costs no
+  allocation at all instead of sharing a `OnceLock` singleton.
+
+  Pointer identity survives, which is what ruled out the inline-capable
+  carrier the text seats use: `ptr_eq` is the amputation contract's
+  instrument for asking whether a clone was a refcount bump, and a
+  carrier that copies small payloads cannot answer it.
+
+  Swept with it: `CarrierOps::commit` returns `Option` (the resampler's
+  owned lane copies there), the side-data road on the packet boundary
+  lost its staged `Vec` and the second full-size copy that followed it,
+  the track handle is `triomphe::Arc::try_new`, and the subtitle
+  converter reserves its rect table and each text increment before
+  writing — mapped to the error `parks_in_decode` already recognises,
+  so a refusal keeps the pending cue for another attempt rather than
+  taking the process.
+
+- **A custom channel layout is validated before FFmpeg is allowed to
+  describe it.**
+
+  `av_channel_layout_describe` renders a `CUSTOM` layout by walking
+  `u.map[i]` for each of `nb_channels`. The description helper formed
+  the layout reference and called it *before* anything looked at the
+  map, so a live layout declaring channels with a null map read from
+  null inside FFmpeg — and the codec ticket's own null-map refusal
+  happens later and could not reach it. The helper's contract asks its
+  caller for a live pointer and nothing more, so such a layout is an
+  input, not a caller error.
+
+  The order is now: fold the raw `order`, read `nb_channels`, and for a
+  custom order check `u.map` — all before the reference exists.
+  `ChannelLayoutFault::MalformedCustomMap` names the refusal, and the
+  demuxer maps it to `ParametersChannelMap`.
+
+- **Channel-layout materialisation is fallible, and its labels no
+  longer allocate.** The channel table and FFmpeg's rendering buffer
+  are `try_reserve`d; each sixteen-byte label is decoded on the stack
+  instead of through a `String`, so the only allocation left on that
+  road is `SmolStr`'s own, bounded at forty-eight bytes by the source
+  array's width.
+
+
+- **The owned resampler allocates before the conversion, so a refusal
+  cannot cost a converted sample.**
+
+  Making `commit` fallible was not enough — it was the wrong place. The
+  owned lane allocated its carrier there, *after* `swr` had consumed
+  the input, so a refusal became `None` while `finish_output` had
+  already advanced `next_pts`, the send arm still answered `Accepted`,
+  and the samples were gone with no error and no retry. That is worse
+  than the abort it replaced.
+
+  `CarrierOps::reserve` takes the allocation now, before `swr` runs,
+  where the existing `OutputBuffer` error already reports it; `commit`
+  returns a carrier rather than an `Option` and cannot fail at all.
+  `FfmpegBytes` grew a length distinct from its allocation so a
+  reservation can be named at its true size without a second copy.
+  This restores an invariant the resampler's own docs already claimed
+  — "nothing below can fail at all".
+
+- **A custom channel map is read on one road only, and that road is
+  `unsafe`** — `channel_layout_from_ffmpeg` and
+  `channel_layout_description_from_ffmpeg` refuse a `CUSTOM` order with
+  `ChannelLayoutFault::UnverifiableCustomMap` rather than dereferencing
+  it. (BREAKING for a caller who passed one; both already return
+  `Result` in this release.)
+
+  Validating harder was the wrong answer and this release tried it
+  first. `ffmpeg_next::ChannelLayout` is a public newtype over a public
+  `AVChannelLayout`, so safe Rust can write `nb_channels = 2` beside a
+  `u.map` that points at one entry, or at a dangling address, or at
+  something misaligned — and **the loop that would check those entries
+  is itself the out-of-bounds read**. Neither provenance nor extent is
+  observable from a pointer; every FFmpeg helper here
+  (`av_channel_layout_describe`, `av_channel_layout_compare`) indexes
+  the same way. No check placed behind a safe signature can establish
+  what that signature failed to demand.
+
+  So the extent is demanded of the caller instead.
+  `channel_layout_description_from_raw_ptr` is the single road that
+  reads a map, and its contract now requires a live, aligned array of
+  exactly `nb_channels` entries. Inside this crate the demux and convert
+  roads satisfy it from FFmpeg's own `AVCodecParameters` and `AVFrame`,
+  where `av_channel_layout_copy` allocated the map and sized it, and
+  each call argues exactly that in its `SAFETY` comment. What the
+  pointer road still *checks* are content faults rather than extent
+  ones — a null map beside a positive count, a non-positive count, and
+  a sixteen-byte name with no NUL inside it (FFmpeg hands that fixed
+  array to a `%s` conversion) — all refused as `MalformedCustomMap`
+  before any helper sees the layout.
+
+- **mediaframe 0.11: the text seats take `Utf8Bytes`, and a channel
+  label or a layout rendering is carried WHOLE.** (Floor
+  `mediaframe = "0.11"`; `smol_str` leaves the dependency graph.)
+
+  The workaround this replaces was honest and lossy. mediaframe's seats
+  took `SmolStr`, whose constructor is infallible and allocates past a
+  twenty-three-byte inline window — on a road that runs once per channel
+  of a file-declared count, that is an abort this crate could not
+  report. So anything longer was reported **absent**: truthful about
+  what the crate did, silent about what the container said.
+
+  **`UnsupportedPixelFormat` is a compact tag now** (BREAKING: the
+  `format()` accessor is gone and `new` takes `(raw, name)`). Two
+  rounds landed on this payload. mediaframe 0.11 widened
+  `PixelFormat`'s text arm, which made it the biggest arm of
+  `ConvertError` at 144 bytes — a cost every `Result` on the convert
+  road pays on its *success* path, and what `clippy::result_large_err`
+  reports. Boxing the format fixed the size and introduced something
+  worse: an **infallible allocation on the refusal path**, so a
+  container-selected unsupported format could abort the process
+  precisely while the converter was trying to report it.
+
+  The payload carries the raw `AVPixelFormat` integer and libavutil's
+  own name for it, **borrowed** from the static descriptor table that
+  outlives the process. Twenty-four bytes, `const fn new`, and no field
+  that can allocate — `ConvertError` is **32 bytes**, smaller than
+  before mediaframe 0.11. The vocabulary's `PixelFormat` is gone from it
+  rather than boxed, and that field's own documentation is why it costs
+  nothing: it already said `raw` and `name` are where the identity
+  survives. The copying `pix_fmt_name` reader went with its last caller.
+
+- **`table_text` borrows FFmpeg's static tables instead of copying
+  them.** It built an owned `Utf8Bytes` from the borrowed bytes, which
+  **allocates** past `smol_bytes::INLINE_CAP` — and FFmpeg's own tables
+  reach past it: the SER demuxer's long name is sixty-five bytes. So
+  opening an ordinary container, or asking a codec for its description,
+  allocated infallibly to duplicate a string the process already owns
+  for its whole life.
+
+  The reader returns `&'static str` now, and its contract says why that
+  is sound rather than merely convenient: every caller reads
+  libavformat's `AVInputFormat` entries or libavcodec's
+  `codec_descriptors[]`, both `static const` tables compiled into those
+  libraries. `ContainerFormat` and `CodecId` store the borrow with
+  `Utf8Bytes::from_static`, which keeps a static slice rather than
+  copying it, at any length. A lane walks a wide span of codec ids under
+  the counting allocator, asserts the scan costs **nothing**, and
+  asserts it really met a name past the inline window — so it cannot
+  pass by never reaching the case it is about.
+
+  Swept with it: a `panic!("literal")` payload is already `'static` and
+  is stored rather than copied. The one borrowed-`&str` conversion left
+  in the crate is the `String` arm of that same panic reader, where the
+  text is a caller's own message rather than anything a container
+  chooses, and where a clone-then-move would cost exactly what the copy
+  costs.
+
+- **A rendering too long to be a layout slug is no longer parsed.**
+  `ChannelLayout::from_str` is total: what it does not recognise it
+  wraps in `Other`, and because the input is *borrowed* that constructor
+  copies — infallibly — for anything past `smol_bytes::INLINE_CAP`, only
+  for the caller to discard it. An unnamed layout whose rendering the
+  container controls therefore paid for an allocation this crate had no
+  use for and could not refuse. Renderings past that window skip the
+  parse; the longest slug the vocabulary recognises is fourteen bytes
+  against a window of sixty-two, and a lane walks FFmpeg's own
+  `av_channel_layout_standard` roster to prove no named layout renders
+  longer than the bypass allows. (A `parse_known` that never constructs
+  `Other` is filed against mediaframe for 0.11.1; this is the surgical
+  fix on this side of the seam.)
+
+  The road is fallible end to end now: measure the lossy decoding
+  without producing it, `try_reserve_exact` that much, build it, and
+  **move** the buffer into the carrier — the same two helpers
+  (`lossy_len`, `lossy_text`) the metadata road already uses, shared
+  rather than restated. Nothing is truncated, nothing is dropped, and an
+  allocator refusal is `ChannelLayoutFault::Alloc` by name. The
+  counting-allocator lanes cover the new road.
+
+- **~~Nothing on a file-scaled path builds a heap `SmolStr`~~** — the
+  gates below were the workaround, and they are gone with the seat that
+  forced them. Kept as a record of what the constraint was:
+
+  A channel label and a layout rendering are decoded into a fixed stack
+  buffer and reported *absent* when the decoding will not fit
+  `SmolStr`'s twenty-three-byte inline window. The rendering's guard
+  compared the **raw** length and then called
+  `String::from_utf8_lossy`, which is two allocations the check did not
+  cover: the decoder allocates whenever its input is not valid UTF-8,
+  and twenty-three raw bytes expand to sixty-nine, so `SmolStr::new`
+  allocated as well. FFmpeg renders a `CUSTOM` layout by concatenating
+  names the file wrote, so "not valid UTF-8" is an input rather than an
+  accident.
+
+  One helper now serves both seats, with a raw-length gate that is
+  sound because lossy decoding never shrinks — a valid byte stays one
+  byte, an invalid one becomes three — so an input already past the
+  window cannot decode to something that fits, and what survives is
+  bounded by a constant rather than by the file. Both mediaframe seats
+  document an empty value as "none", which is a truer answer than an
+  allocation this crate cannot refuse.
+
+- **The frame and image side-data collectors no longer panic on OOM.**
+  Both used `FfmpegBytes::copy_from_slice`, whose body is now an
+  `expect` — a panic instead of an abort is not an improvement. Both
+  use the fallible constructor and return `Result`, propagating as
+  `CarrierAllocFailed` so a timed decoder parks its scratch frame. The
+  infallible constructor is `#[cfg(test)]` now, which makes "no product
+  path reaches it" a compile-time fact rather than a grep: **a fallible
+  staging allocation does not protect a subsequent infallible copy.**
+
+- **A malformed channel layout is permanent, not retryable.** The audio
+  converter mapped both `MalformedCustomMap` and `Alloc` to
+  `CarrierAllocFailed`, which `parks_in_decode` treats as transient — so
+  a decoder held a structurally broken frame and returned the same
+  error forever. `ConvertError::MalformedChannelLayout` is the
+  permanent class; only `Alloc` stays transient.
+
+- **Frame side data is never silently dropped.** `collect_side_data`
+  still reserved a staging `Vec` after the carrier had been made
+  fallible, and `continue`d past the entry when that reservation
+  failed — while the function went on to return `Ok`. A
+  mastering-display, content-light or caption annotation could
+  therefore disappear under momentary memory pressure, and nothing
+  downstream could tell that frame from one whose file never carried
+  any. The dead staging is gone; the carrier's own refusal propagates
+  as `CarrierAllocFailed`, which parks the frame for a retry. Entries
+  are still left out for `SIDE_DATA_MAX_ENTRIES` and
+  `SIDE_DATA_MAX_TOTAL_BYTES`, which are properties of the file rather
+  than of the machine.
+
+- **The decoder error family no longer derives `Clone`.** (BREAKING for
+  a caller that cloned one.) `Error::AllBackendsFailed` and
+  `Error::FallbackFailed` carry `Vec<ffmpeg_next::Packet>`, and
+  ffmpeg-next 9.0.0's `Packet::clone` calls `av_packet_ref` and
+  `av_packet_make_writable` while **discarding both return codes** — so
+  a safe `err.clone()` under memory pressure yields empty or incomplete
+  packets with nothing said. Those packets are the rescued replay
+  history a non-seekable input has no other copy of, which makes a
+  silent partial clone the difference between a recoverable failure and
+  irreversible loss.
+
+  `Clone` is gone from `Error` and from both payloads, and — transitively
+  — from `AudioDecodeError`, `ImageDecodeError` and `ResampleError`,
+  which wrap it. No product code cloned any of them; the census found
+  the only `.clone()` calls in that family were on a pixel format and in
+  tests. Where a duplicate really is needed there is a checked road
+  already: `FfmpegBuffer::try_clone` reports `av_buffer_ref`'s failure
+  rather than swallowing it.
+
+- **One dispatcher decides which arm of a channel layout's union is
+  readable, and every read in the crate goes through it.**
+  `channel_layout::LayoutArm` names what each order defines — `u.mask`
+  for `NATIVE` and `AMBISONIC`, `u.map` for `CUSTOM`, **nothing** for
+  `UNSPEC` and for any order this build has never heard of.
+
+  The rule had to be found twice to be written once. It was applied to
+  the resampler's equality and `Debug`, and the codec-ticket mirror was
+  still reading `u.mask` for an unspecified layout — importing storage
+  FFmpeg declares undefined into `ChannelLayoutTicket::mask`, where the
+  public `mask()` hands it out and the derived `Debug`, `PartialEq` and
+  `Hash` expose and compare it. Two equivalent unspecified layouts could
+  mirror to tickets that were not equal, and a log line could print
+  bytes nobody wrote. The rebuild road had the mirror image of the
+  defect: it wrote a mask back for an order that defines none.
+
+  Two dead helpers went with it — `custom_channels` and
+  `custom_channel_label`, superseded by the raw walk — because both
+  formed `&[AVChannelCustom]` over FFmpeg's map, which is the undefined
+  behaviour that raw walk exists to avoid: each entry carries an
+  open-enum `id`, and a container writing a value outside this build's
+  discriminant set makes the *reference* unsound before any `match` on
+  it can run. Unreachable code that would be unsound if revived is a
+  landmine rather than documentation.
+
+  `ChannelLayoutTicket::is_custom` is gone, and its removal is the point
+  rather than tidying: every caller asked "is this custom?" and treated
+  `false` as "mask-backed", which is exactly how the undefined read got
+  in. The question has three answers, not two. The resampler's staged
+  layout also stopped reading the mask for `NATIVE` *alone*, which had
+  quietly dropped an ambisonic layout's non-diegetic channels.
+
+- **`ResampleSpec`'s `Debug` is hand-written, and its equality is
+  order-aware.** `AVChannelLayout`'s union is **undefined** for
+  `AV_CHANNEL_ORDER_UNSPEC` per FFmpeg's own header, and this crate read
+  `u.mask` for every order that was not `CUSTOM` — so two valid
+  unspecified layouts of the same width compared *unequal* whenever the
+  bytes in storage neither of them owns happened to differ, and merely
+  logging a spec read that storage too (the derived `Debug` delegates to
+  `ffmpeg_next`'s formatter, which prints the mask unconditionally).
+
+  A private `LayoutArm` now names which arm an order actually defines —
+  `mask` for `NATIVE` and `AMBISONIC`, `map` for `CUSTOM`, **nothing**
+  for `UNSPEC` and for any order this build has never heard of — and
+  both traits consult it. An unspecified layout is its order and its
+  width; a future order gets the same treatment until this crate is
+  taught which arm it defines.
+
+- **`ResampleSpec` no longer derives equality**, because the derive was
+  a safe `==` with a raw pointer dereference behind it. (BREAKING only
+  in the sense that two custom layouts now compare by identity; the type
+  is still `PartialEq + Eq`.)
+
+  `ffmpeg_next::ChannelLayout` implements `PartialEq` as
+  `av_channel_layout_compare`, which walks `u.map[i]` for a `CUSTOM`
+  order. A safe caller could therefore forge a layout declaring channels
+  it has no map for, wrap it in two specs, write `a == b`, and reach a
+  dereference inside FFmpeg **without constructing a resampler or
+  running a line of this crate's code**. No preflight can dominate an
+  operator, which is the lesson: the census that found every helper call
+  had not looked at the traits a `derive` writes.
+
+  Equality is hand-written and reads nothing through a pointer: the raw
+  `order`, then the channel count, then the union's `mask` for every
+  order that uses it. A `CUSTOM` order compares by **map identity**,
+  never contents — the extent a safe function cannot establish is the
+  extent it does not read — so two custom layouts describing identical
+  channels through different allocations compare unequal. That is
+  conservative in the only direction that matters: the single product
+  use of layout equality is `check_pair`'s short-circuit, where
+  "unequal" means the rematrix check *runs*.
+
+- **The preflight is `av_channel_layout_check`, line by line.** Two of
+  its rules were missing. A `CUSTOM` map entry whose `id` is
+  `AV_CHAN_NONE` is a **hole in the map**, which `check` walks the map
+  to refuse — admitted, it reached a codec ticket and was published to a
+  consumer as `u32::MAX`. And `check` opens with `if (nb_channels <= 0)
+  return 0;`, so a `NATIVE` layout declaring no channels with an empty
+  mask is invalid even though that order's own rule
+  (`popcount == nb_channels`) is satisfied by it.
+
+  Both are refused now. The one deliberate divergence is narrow and
+  documented: the all-zero `AVChannelLayout` — `UNSPEC` with no channels
+  — is how a container says it declared none, no FFmpeg helper is ever
+  called for it, and refusing it would turn away every stream that
+  simply has no layout.
+
+- **One preflight decides every channel-layout order, and every FFmpeg
+  layout helper in this crate is behind it.** Ten rounds closed the
+  custom-map road and left the rest on the argument that an order
+  describing its channels through a `uint64_t` mask cannot be malformed.
+  The mask is not the only field: `nb_channels` is an `int` a caller
+  writes into a public struct, and `av_channel_layout_describe` computes
+  `nb_channels - popcount(mask)` and takes an integer square root of it
+  without checking either — so a safely constructed `AMBISONIC` layout
+  with an extreme count reached FFmpeg's arithmetic through a **safe**
+  API.
+
+  `channel_layout::layout_preflight` is now the single rule: a count
+  outside the range every downstream calculation assumes, a `NATIVE`
+  mask whose population disagrees with its count, an `AMBISONIC` layout
+  whose mask leaves no channel for the ambisonic part
+  (`popcount(mask) < nb_channels`, which is `av_channel_layout_check`'s
+  own rule verbatim), and the existing custom-map rule.
+
+  **The ambisonic arm is `check`'s rule and only it.** A first cut also
+  demanded that the remainder be a perfect square. That property is
+  real, but it is `av_channel_layout_ambisonic_order`'s question — the
+  function whose own comment calls the failing case "incomplete order -
+  some harmonics are missing" and which answers `AVERROR(EINVAL)` for
+  it. `check` never consults it, FFmpeg describes and converts such a
+  layout, and refusing one here turned a valid file away. Asking a
+  stricter question than the library asks is not caution; it is a
+  different answer to a question nobody posed. The count bound stays —
+  it guards FFmpeg's own `int` arithmetic, which is a separate concern
+  from validity. It allocates nothing, and it dominates every
+  `av_channel_layout_*`, `avcodec_parameters_*` and `swr_*` call that
+  takes a layout: the safe conversions, the demux admission pass, the
+  codec ticket, `bounded_clone_parameters`, `build_codec_context` and
+  the resampler's construction. New named refusals:
+  `DemuxError::ParametersLayoutShape`, `Error::MalformedChannelLayout`
+  and `Error::ChannelMapMissing` — the last two **structural and
+  permanent**, deliberately not the allocation arm.
+
+- **Opening a decoder validates the layout before it measures or
+  copies.** `build_codec_context` checked only a non-null `Parameters`
+  and the heap footprint, and `measure_parameters` prices a custom map
+  from `nb_channels` without looking at `u.map` — so a positive count
+  with a null map passed the budget and reached
+  `avcodec_parameters_to_context`, whose `av_channel_layout_copy`
+  `memcpy`s from that null. Public decoder opens could therefore crash
+  on malformed or version-skewed stream parameters.
+  `bounded_clone_parameters` had the same bypass before its own direct
+  copy. Both run the shared preflight first.
+
+- **The resampler refuses a `CUSTOM` layout at construction, and is
+  `Send`.** `swr_alloc_set_opts2` and `swr_build_matrix2` take an
+  `AVChannelLayout` and assume every invariant
+  `av_channel_layout_check` states; both specs are preflighted before
+  `swr` is handed either. A custom order is refused outright, because
+  its `u.map` extent is not something any signature here can establish —
+  and that refusal is what makes every layout a live resampler holds a
+  plain mask value rather than a struct with a bare pointer in it, which
+  is the invariant behind the new `unsafe impl Send for
+  CarrierResampler<C>`. **`Send` only, never `Sync`**: the `SwrContext`
+  is owned by the value and reached solely through `&mut self`, which is
+  the serialisation; `&self` would not provide it. A static lane asserts
+  `Send` on both carrier lanes.
+
+- **A parked attachment's structure is judged during admission.**
+  `PacketBuffer` is not one fault — a `TRUSTED` payload, a `data`/`size`
+  pair outside the buffer it claims, a buffer somebody else references,
+  flags outside the portable set, **and** the allocator declining the
+  carrier — and only the last is unforeseeable. `payload_of` is split
+  into `preflight_payload`, which decides all the deterministic ones
+  without reading a byte or allocating, and the capture that acts on its
+  plan; `admit_streams` runs the preflight for every parked attachment.
+  A bad final attachment no longer costs the whole table first.
+
+- **One rule decides a custom channel map, and it decides it before any
+  copy.** The structural validator the admission pass relies on checked
+  each entry's `opaque` but not that its sixteen-byte `name` carries a
+  NUL — a rule the *describe* road applied and this one did not, so a
+  malformed final audio stream was admitted and then refused during
+  materialisation, after every earlier stream had been paid for. Two
+  rules for one fact is how that happens, so there is one now:
+  `channel_layout::custom_map_fault` decides null map, non-positive
+  count and unterminated name together, allocates nothing, and is what
+  both the describe road and the codec ticket's validator call.
+
+  One visible consequence, recorded rather than papered over: a custom
+  layout declaring a *negative* channel count used to be refused as
+  `ParametersTooLarge`, because the footprint
+  (`nb_channels * size_of::<AVChannelCustom>()`) could not be computed
+  and that gate was asked first. It is `ParametersChannelMap` now,
+  which is the truer of the two statements about that file — a
+  malformed map, not an oversized one.
+
+  `CodecTicket::from_raw` also had the ordering defect on its own
+  account — it copied `extradata` and every coded-side-data payload and
+  only then reached the layout — so the complete validator is now its
+  first statement, before the footprint is even measured. A lane pins
+  that as an ordering rather than an outcome: a parameter set that is
+  *both* malformed and over budget reports the structure, which only
+  the new order can do.
+
+- **The judge-before-pay rule now covers the refusals that are not
+  budgets.** A malformed `AVStream.time_base`, a non-null
+  `ch_layout.opaque`, and a `CUSTOM` channel order with no map or a
+  non-positive count are all permanent, deterministic facts about the
+  container — none of them depends on how much memory the machine has —
+  yet each was discovered during materialisation, so one on the *last*
+  stream was refused only after every earlier stream had been paid for.
+
+  All three are decided in `admit_streams` now. The stream ruler goes
+  through a new `stream_timebase`, and the layout's structure through a
+  new `validate_channel_layout` split out of the ticket builder; both
+  are called again where the values are actually used, so there is one
+  conversion and one error construction with two call sites rather than
+  two rules. Neither allocates: the layout check is a pointer walk.
+
+  *On reachability, stated rather than implied:* unlike a chapter's
+  timebase — which libavformat stores exactly as an FFMETADATA sidecar
+  wrote it, `TIMEBASE=-1/1000` included — a stream's normally arrives
+  through `avpriv_set_pts_info`, which refuses a non-positive value
+  itself, and no container was found that reaches the refusal. It is
+  kept because demuxers may assign `st->time_base` directly and one
+  comparison is not worth trading for an assumption about every demuxer
+  in libavformat.
+
+- **Stream metadata is charged in the admission pass, not during
+  materialisation.** The third instance of one defect: a value crossing
+  the whole-file metadata budget on the *last* stream was refused only
+  after every earlier stream's parameter clone and attachment carrier
+  had been retained and that stream's own codec ticket copied — so a
+  file certain to be refused could be made to cost the whole aggregate,
+  on every open. `admit_streams` now measures `filename`, `mimetype`
+  and `language` across every stream, allocating nothing, before
+  `build_tracks` reserves a row; the materialisation-time charge stays
+  as defence in depth and is what reports an allocator refusal, which
+  no measurement can foresee. Both passes call one `charge_metadata`,
+  so they cannot become two rules.
+
+  With it — and with the structural refusals above — every refusal an
+  open can raise from the container's declared facts is now raised
+  before the process has spent anything on the file: probe bytes
+  (metered during the read), stream count (libavformat's own option,
+  set before the header is parsed), per-stream and whole-file codec
+  parameters — extradata, every coded-side-data payload and a custom
+  channel map, all through `measure_parameters` — per-attachment and
+  whole-file attachment payloads, whole-file stream metadata, chapter
+  count and chapter titles. `from_input` carries that list in a comment
+  so the class can be checked rather than rediscovered.
+
+- **The chapter table is judged before the track table is built.** Both
+  checks were correct and their order was the defect: `from_input`
+  materialised every track — attachment carriers up to 256 MiB by
+  default, codec-parameter mirrors, retained metadata, one `Arc` per
+  row — and only then ran `build_chapters`'s cheap count check. A file
+  certain to be refused for its chapter count could first be made to
+  cost hundreds of megabytes, and repeating the open repeated the bill.
+
+  A new allocation-free admission pass runs beside stream admission,
+  before either table exists: the declared count against
+  `max_chapters`, every chapter's timebase, and every title's decoded
+  length against the aggregate budget — the title measurement borrows
+  libavutil's own buffer, so an over-budget table is refused having
+  touched no heap at all.
+
+- **`FfmpegBytes` equality and hashing read the span, not the
+  allocation.** The derived implementations compared and hashed the
+  whole backing buffer, and a carrier built from a reservation
+  deliberately keeps capacity past its span — so it compared *unequal*
+  to an exact copy of the very same bytes, and hashed differently.
+  Anything keyed on a payload missed. `PartialEq`, `Eq` and `Hash` are
+  written by hand over `as_slice()` now; `ptr_eq` remains the
+  instrument for the other question, and is deliberately not what `==`
+  answers.
+
+### Fixed
+
+- **Every timed decoder now writes `AVCodecContext.pkt_timebase`.**
+
+  The shared codec-context builder never set it, on any road. FFmpeg
+  documents the field as caller-supplied and libavcodec reads it: its
+  generic subtitle path derives `AVSubtitle.pts` and the
+  packet-duration fallback **only** when it is set, so a subtitle
+  decoder returned timestamped cues carrying neither. The audio and
+  subtitle sessions already held a validated stream `Timebase` and
+  merely kept it Rust-side; the video stream decoder now carries one
+  into every context it opens, hardware probe advances included.
+
+  Audited across every road into the builder: audio and subtitle pass
+  the stream's timebase; the video *stream* decoder passes its own on
+  both the software and hardware paths and holds it for later probe
+  advances; the standalone `VideoDecoder` and the still-image decoder
+  pass none, because neither is opened against a stream and inventing
+  one would be the very defect above.
+
+  A zero-numerator timebase is deliberately **not** written: unset, the
+  field is `0/1`, which is exactly what a container that declared no
+  timebase gives this crate — the two are the same statement, and
+  writing it would claim a ruler the file never did.
+
+- **A decoded subtitle's PTS is labelled in microseconds, as FFmpeg
+  defines it.**
+
+  `AVSubtitle.pts` is in `AV_TIME_BASE` units whatever the stream's own
+  timebase is; the converter attached the *stream* timebase without
+  rescaling, so a cue five seconds into a 1/1000 stream reported itself
+  as 5,000 seconds. It is now labelled `Timebase::MICROS`.
+
+  **Labelled, not rescaled.** A `Timestamp` carries its own timebase
+  and compares by the instant it names, so a microsecond label is
+  already directly comparable with a packet timestamp in any other
+  ruler — and it is exact, where a rescale into a coarser stream
+  timebase would round a cue boundary for nobody's benefit. A consumer
+  that wants the stream's ruler asks by name, with
+  `Timestamp::rescale_to`.
+
+  The two fixes are pinned by one lane, because the first hid the
+  second: with `pkt_timebase` unset libavcodec left `AVSubtitle.pts`
+  absent, so the mislabelling was unreachable through ordinary
+  decoding and only the direct converter could show it.
+
+- **The standalone `VideoDecoder` can declare a packet timebase.**
+
+  This release's first cut wrote `AVCodecContext.pkt_timebase` only
+  from the crate-private constructors the stream decoder uses; every
+  public `VideoDecoder::open*` routed `None`. A direct caller feeding
+  timestamped packets therefore had no way to tell libavcodec what
+  their ticks meant — and not owning the `AVStream` does not mean not
+  knowing its ruler. `open_timed`, `open_with_frame_limits_timed`,
+  `open_with_timed` and `open_with_limits_timed` declare it, and it
+  reaches every backend state including later hardware probe advances.
+  The four existing constructors remain as **explicitly untimed**
+  conveniences and say so in their docs.
+
 ## [0.14.0] - 2026-09-02
 
 ### Added — the seat 0.13 built gets its first occupant

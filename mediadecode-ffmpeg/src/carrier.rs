@@ -255,6 +255,14 @@ pub(crate) mod ops {
     /// `len` must be at most the `cap` the reservation was taken with,
     /// those `len` bytes must now be initialised, and the buffer must
     /// still be alive.
+    /// **Infallible, and that is the whole reason [`Self::reserve`]
+    /// exists.** By the time this runs `swr` has consumed its input and
+    /// written its output; an allocation that failed here would leave a
+    /// caller with samples that are simply gone and nothing to retry
+    /// with. The owned lane therefore takes its allocation in
+    /// `reserve`, before the conversion, and this only copies into it
+    /// and names the length; the view lane only narrows a reference it
+    /// already holds.
     unsafe fn commit(reserved: Self::Reserved, len: usize) -> Self::Buffer;
 
     /// Builds the body of an `AVPacket` on the way **into** a decoder.
@@ -484,7 +492,7 @@ impl ops::CarrierOps for Owned {
   }
 
   fn from_bytes(bytes: &[u8]) -> Option<Self::Buffer> {
-    Some(FfmpegBytes::copy_from_slice(bytes))
+    FfmpegBytes::try_copy_from_slice(bytes)
   }
 
   fn from_rows<'a>(
@@ -498,25 +506,40 @@ impl ops::CarrierOps for Owned {
   /// The plane's start. Nothing is claimed and nothing can fail:
   /// this lane's cost is a copy, and the copy happens at `commit` once
   /// the bytes are real.
-  type Reserved = *const u8;
+  /// The source FFmpeg will write into, and **the destination carrier,
+  /// allocated up front**.
+  ///
+  /// The allocation used to happen in `commit`, after `swr` had already
+  /// consumed the input — so a refusal there lost converted samples
+  /// with no way to retry. It happens here instead, where a refusal
+  /// costs nothing but the attempt.
+  type Reserved = (*const u8, triomphe::UniqueArc<[u8]>);
 
-  unsafe fn reserve(buf: *mut AVBufferRef, offset: usize, _cap: usize) -> Option<Self::Reserved> {
+  unsafe fn reserve(buf: *mut AVBufferRef, offset: usize, cap: usize) -> Option<Self::Reserved> {
     // SAFETY: `buf` is live per the contract and `offset` is inside it.
     let data = unsafe { (*buf).data };
     if data.is_null() {
       return None;
     }
+    // The fallible half, taken before the conversion runs.
+    let destination = FfmpegBytes::reserve(cap)?;
     // SAFETY: `offset` is within the buffer per the contract.
-    Some(unsafe { data.add(offset).cast_const() })
+    Some((unsafe { data.add(offset).cast_const() }, destination))
   }
 
-  unsafe fn commit(reserved: Self::Reserved, len: usize) -> Self::Buffer {
+  unsafe fn commit((source, mut destination): Self::Reserved, len: usize) -> Self::Buffer {
+    let len = len.min(destination.len());
     if len == 0 {
       return FfmpegBytes::empty();
     }
-    // SAFETY: the caller promises `len` initialised bytes from the
-    // reserved pointer, inside a buffer still alive.
-    FfmpegBytes::copy_from_slice(unsafe { core::slice::from_raw_parts(reserved, len) })
+    // SAFETY: the caller promises `len` initialised bytes at `source`
+    // inside a buffer still alive; `destination` was allocated with at
+    // least `len` bytes in `reserve` and is unique, so the two cannot
+    // overlap.
+    unsafe {
+      core::ptr::copy_nonoverlapping(source, destination.as_mut_ptr(), len);
+    }
+    FfmpegBytes::from_reservation(destination, len)
   }
 
   /// Both routes copy. This lane's carrier is Rust-owned memory with no
@@ -542,7 +565,7 @@ impl ops::CarrierOps for Owned {
       }
       core::slice::from_raw_parts(data.add(offset).cast_const(), len)
     };
-    Some(FfmpegBytes::copy_from_slice(bytes))
+    FfmpegBytes::try_copy_from_slice(bytes)
   }
 
   /// Indistinguishable from [`capture`](Self::capture) here: this lane

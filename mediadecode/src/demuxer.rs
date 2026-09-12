@@ -6,6 +6,9 @@
 //! This module names both halves: [`TrackInfo`] describes a track,
 //! [`DemuxedPacket`] delivers one packet with its track coordinate
 //! attached, and [`Demuxer`] is the pull session that hands them out.
+//! A container may also carry a table of contents over the whole
+//! timeline rather than over any one track — [`Chapter`], read off
+//! [`Demuxer::chapters`].
 //!
 //! # The session is pull-style
 //!
@@ -949,6 +952,196 @@ where
 }
 
 // ---------------------------------------------------------------------------
+//  The chapter table.
+// ---------------------------------------------------------------------------
+
+/// One row of the chapter table [`Demuxer::chapters`] returns.
+///
+/// A chapter is a **named stretch of the file's timeline** the
+/// container itself declares: a DVD-style scene marker, a podcast
+/// segment, a Matroska `ChapterAtom`. It names no track — the span
+/// covers the file, and a consumer that wants the packets inside one
+/// [`seek`](Demuxer::seek)s there.
+///
+/// The shape mirrors libavformat's `AVChapter`, which is the shape
+/// every container that carries chapters is read into: an id the
+/// *container* assigned, a timebase, a start and an end expressed in
+/// it, and a title.
+///
+/// # The id is the container's, not the row's position
+///
+/// [`id`](Self::id) is what the file wrote and nothing else — a
+/// Matroska `ChapterUID`, an MP4 chapter track's entry. It is not a
+/// table coordinate, it is not promised to be dense, and two
+/// containers holding the very same chapters routinely number them
+/// differently: an MKV written from an FFMETADATA file numbers from 1,
+/// because Matroska forbids the UID zero, while the MP4 written from
+/// that same file numbers from 0. Where a table coordinate is what is
+/// wanted, the position in [`Demuxer::chapters`] is it — the way
+/// [`TrackIndex`] is the track table's.
+///
+/// # The span is reported, not repaired
+///
+/// [`start`](Self::start) and [`end`](Self::end) are the container's
+/// own two numbers. A file that writes an end before its start, or
+/// leaves the end at whatever its backend spells "no timestamp",
+/// reaches a consumer that way. This tier reads containers: deciding
+/// what an inverted span *means* takes a policy it does not have, and
+/// a clamp applied here would be indistinguishable downstream from a
+/// file that was well-formed all along.
+///
+/// That is also why the two instants are separate seats rather than
+/// one [`TimeRange`](crate::TimeRange): that type's constructor
+/// refuses `end < start`, which is exactly the row this one has to be
+/// able to carry. A consumer that wants a range — and has a policy for
+/// the inverted case — builds one with
+/// [`TimeRange::try_new`](crate::TimeRange::try_new).
+///
+/// # `Clone`, unlike [`TrackInfo`]
+///
+/// The message-carrier law that keeps `Clone` off a track row is about
+/// cost: a row carries backend metadata down to codec parameters. A
+/// chapter is four scalars and the backend's own text carrier, so
+/// copying one costs about what copying a [`Timestamp`] does — there
+/// is no deep copy here for the law to forbid, and no shared-handle
+/// seat is worth minting to avoid one.
+pub struct Chapter<E: DemuxAdapter> {
+  id: i64,
+  timebase: Timebase,
+  start: Timestamp,
+  end: Timestamp,
+  title: Option<E::Text>,
+}
+
+impl<E: DemuxAdapter> Chapter<E> {
+  /// Constructs a `Chapter`. The title defaults to `None`.
+  ///
+  /// `start` and `end` are expected in `timebase` — the chapter's own,
+  /// which is not required to be any track's. Nothing checks that
+  /// `end` follows `start`: see [the span is reported, not
+  /// repaired](Self#the-span-is-reported-not-repaired).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(id: i64, timebase: Timebase, start: Timestamp, end: Timestamp) -> Self {
+    Self {
+      id,
+      timebase,
+      start,
+      end,
+      title: None,
+    }
+  }
+
+  /// Returns the id the **container** assigned this chapter.
+  ///
+  /// Not a table position, and not promised to be dense — see [the id
+  /// is the
+  /// container's](Self#the-id-is-the-containers-not-the-rows-position).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn id(&self) -> i64 {
+    self.id
+  }
+  /// Returns the timebase this chapter's start and end are expressed
+  /// in.
+  ///
+  /// The chapter's own, as the container declares it, and independent
+  /// of every track's: Matroska writes chapters in nanoseconds
+  /// whatever its tracks use.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn timebase(&self) -> Timebase {
+    self.timebase
+  }
+  /// Returns the instant the chapter starts at.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn start(&self) -> Timestamp {
+    self.start
+  }
+  /// Returns the instant the chapter ends at, exactly as the container
+  /// wrote it — which is not promised to follow
+  /// [`start`](Self::start).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn end(&self) -> Timestamp {
+    self.end
+  }
+  /// Returns the chapter's title, when the container carries one.
+  ///
+  /// The container's `title` metadata entry, read exactly as
+  /// [`TrackInfo::language`] is: whatever the file wrote, unfolded and
+  /// untranslated, and `None` where it wrote nothing.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn title(&self) -> Option<&E::Text> {
+    self.title.as_ref()
+  }
+
+  /// Sets the title (consuming builder).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
+  pub fn with_title(mut self, v: Option<E::Text>) -> Self {
+    self.title = v;
+    self
+  }
+
+  /// Sets the title in place.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn set_title(&mut self, v: Option<E::Text>) -> &mut Self {
+    self.title = v;
+    self
+  }
+}
+
+// `Clone`, `Debug` and `PartialEq` are hand-written for the same
+// associated-type reason as `TrackInfo`'s: `#[derive]` would add a
+// flat `E: Clone` / `E: Debug` / `E: PartialEq` bound, while the only
+// field that needs one is `E::Text`. `Debug` needs none at all —
+// `DemuxAdapter::Text` already carries it.
+impl<E: DemuxAdapter> Clone for Chapter<E>
+where
+  E::Text: Clone,
+{
+  fn clone(&self) -> Self {
+    Self {
+      id: self.id,
+      timebase: self.timebase,
+      start: self.start,
+      end: self.end,
+      title: self.title.clone(),
+    }
+  }
+}
+
+impl<E: DemuxAdapter> Debug for Chapter<E> {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("Chapter")
+      .field("id", &self.id)
+      .field("timebase", &self.timebase)
+      .field("start", &self.start)
+      .field("end", &self.end)
+      .field("title", &self.title)
+      .finish()
+  }
+}
+
+// Seat by seat, each under its own rule. The two instants compare as
+// `Timestamp` compares — by *when* they are, so `1_000` over `1/1000`
+// equals `1_000_000` over `1/1000000` — while the row's own
+// `timebase` compares as the rational it is. Two rows covering the
+// same stretch of time under different declared rulers are therefore
+// **not** equal, which is the right answer for a row whose whole job
+// is to report what the container declared: the ruler is part of the
+// declaration.
+impl<E: DemuxAdapter> PartialEq for Chapter<E>
+where
+  E::Text: PartialEq,
+{
+  fn eq(&self, other: &Self) -> bool {
+    self.id == other.id
+      && self.timebase == other.timebase
+      && self.start == other.start
+      && self.end == other.end
+      && self.title == other.title
+  }
+}
+
+// ---------------------------------------------------------------------------
 //  The delivery envelope.
 // ---------------------------------------------------------------------------
 
@@ -1463,6 +1656,22 @@ where
 /// read that costs the session the state it runs on is not a door
 /// worth having.
 ///
+/// # The chapter table
+///
+/// [`chapters`](Self::chapters) is the container's own table of
+/// contents, read the same way and under the same rules: held for the
+/// session's whole life, non-destructive, no ordering rule. It is
+/// **provided**, answering an empty slice — most files declare no
+/// chapters, and a backend for a format that cannot carry them has
+/// nothing to override.
+///
+/// Rows come back by borrow rather than through a handle seat. A
+/// [`Chapter`] is small and `Clone`s where the backend's text carrier
+/// does, so a consumer that needs one past a borrow of the session
+/// copies it; there is nothing here expensive enough to be worth a
+/// carrier choice of its own, which is the whole reason
+/// [`TrackHandle`](Self::TrackHandle) exists on the other table.
+///
 /// # What is not here
 ///
 /// Opening. See the [module docs](self#construction-is-not-on-the-trait).
@@ -1502,6 +1711,21 @@ pub trait Demuxer {
   /// Non-destructive, and callable whenever: see [the track
   /// table](Self#the-track-table) on the trait.
   fn tracks(&self) -> &[Self::TrackHandle];
+
+  /// Returns the container's chapter table, **in table order**.
+  ///
+  /// A container that declares none answers an empty slice — which is
+  /// what the provided body does, so a backend whose format has no
+  /// chapters, and every implementor written before this seat existed,
+  /// answers it correctly without writing a line.
+  ///
+  /// Non-destructive and callable whenever, exactly like
+  /// [`tracks`](Self::tracks): see [the chapter
+  /// table](Self#the-chapter-table) on the trait.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  fn chapters(&self) -> &[Chapter<Self::Adapter>] {
+    &[]
+  }
 
   /// Pulls the next packet in interleaved file order, or `Ok(None)` at
   /// end of file.
@@ -1686,6 +1910,101 @@ mod tests {
 
     info.set_language(None);
     assert_eq!(info.language().copied(), None);
+  }
+
+  /// The chapter row carries the container's four numbers and its
+  /// title, and the title seat has both mutators the row's other
+  /// optional fields have — including the one that can take a title
+  /// back off.
+  #[test]
+  fn a_chapter_row_follows_the_house_shape() {
+    let mut chapter = Chapter::<Loopback>::new(
+      7,
+      ms_tb(),
+      Timestamp::new(1_000, ms_tb()),
+      Timestamp::new(2_500, ms_tb()),
+    );
+    assert_eq!(chapter.id(), 7);
+    assert_eq!(chapter.timebase(), ms_tb());
+    assert_eq!(chapter.start(), Timestamp::new(1_000, ms_tb()));
+    assert_eq!(chapter.end(), Timestamp::new(2_500, ms_tb()));
+    assert_eq!(chapter.title().copied(), None);
+
+    chapter.set_title(Some("Opening"));
+    assert_eq!(chapter.title().copied(), Some("Opening"));
+    chapter.set_title(None);
+    assert_eq!(chapter.title().copied(), None);
+
+    let titled = chapter.with_title(Some("Closing"));
+    assert_eq!(titled.title().copied(), Some("Closing"));
+  }
+
+  /// **The id is the container's, not the table position.** A row
+  /// built for position 0 may carry any id the file wrote, including a
+  /// negative one, and the row keeps it.
+  #[test]
+  fn the_chapter_id_is_whatever_the_container_wrote() {
+    for id in [i64::MIN, -1, 0, 1, i64::MAX] {
+      let chapter = Chapter::<Loopback>::new(
+        id,
+        ms_tb(),
+        Timestamp::new(0, ms_tb()),
+        Timestamp::new(1, ms_tb()),
+      );
+      assert_eq!(chapter.id(), id, "{id} must survive the row unchanged");
+    }
+  }
+
+  /// **An inverted span survives the row.** A container that writes an
+  /// end before its start has written something, and a demux tier that
+  /// clamped it would hand a consumer a well-formed-looking row
+  /// indistinguishable from a file that really was well formed.
+  ///
+  /// This is also the reason the two instants are separate seats:
+  /// [`TimeRange::try_new`](crate::TimeRange::try_new) refuses this
+  /// pair, which is the row that has to be carryable.
+  #[test]
+  fn a_chapter_keeps_an_inverted_span_as_the_container_wrote_it() {
+    let chapter = Chapter::<Loopback>::new(
+      1,
+      ms_tb(),
+      Timestamp::new(5_000, ms_tb()),
+      Timestamp::new(1_000, ms_tb()),
+    );
+    assert_eq!(chapter.start(), Timestamp::new(5_000, ms_tb()));
+    assert_eq!(chapter.end(), Timestamp::new(1_000, ms_tb()));
+    assert!(
+      crate::TimeRange::try_new(
+        chapter.start().pts(),
+        chapter.end().pts(),
+        chapter.timebase()
+      )
+      .is_none(),
+      "the range type refuses exactly the pair this row must be able to carry",
+    );
+  }
+
+  // `format!` needs an allocator; see the `Vec`/`format!` import note
+  // above `VLoop`.
+  #[cfg(any(feature = "std", feature = "alloc"))]
+  #[test]
+  fn chapter_clone_matches_the_original() {
+    let original = Chapter::<Loopback>::new(
+      3,
+      ms_tb(),
+      Timestamp::new(0, ms_tb()),
+      Timestamp::new(1_000, ms_tb()),
+    )
+    .with_title(Some("Prologue"));
+    let cloned = original.clone();
+    assert_eq!(cloned, original);
+    assert!(format!("{cloned:?}").contains("Chapter"));
+
+    assert_ne!(
+      cloned.clone().with_title(Some("Epilogue")),
+      original,
+      "the title is part of the row's identity",
+    );
   }
 
   #[test]
@@ -1893,6 +2212,30 @@ mod tests {
     assert!(d.next_packet().expect("pull").is_some());
   }
 
+  /// **The chapter seat is provided, and neither mock writes a line
+  /// for it.** That is the additivity claim stated as a test: both
+  /// implementations in this file predate the seat, both still
+  /// compile, and both answer the empty table a container without
+  /// chapters has.
+  #[cfg(any(feature = "std", feature = "alloc"))]
+  #[test]
+  fn a_demuxer_that_declares_no_chapters_answers_an_empty_table() {
+    let d = LoopDemuxer {
+      tracks: vec![Rc::new(TrackInfo::new(
+        ms_tb(),
+        TrackParams::Audio(AudioTrackParams::new(1, 48_000, 2, 0, 0)),
+        (),
+      ))],
+      drained: false,
+    };
+    assert!(d.chapters().is_empty());
+    assert_eq!(
+      d.tracks().len(),
+      1,
+      "the chapter table is a different table, and reading it is not reading that one",
+    );
+  }
+
   /// Reading the table is non-destructive, and a handle taken before
   /// the first pull is still the session's own row after EOF.
   ///
@@ -2006,5 +2349,25 @@ mod tests {
     assert_eq!(d.tracks().len(), 1, "the table outlives the pull loop");
     assert_eq!(held.kind(), TrackKind::Subtitle);
     assert!(core::ptr::eq(held, d.tracks()[0]));
+  }
+
+  /// **The provided chapter table costs no allocator.** Deliberately
+  /// outside the `alloc` gate, for the same reason
+  /// [`BorrowedDemuxer`] itself is: the empty slice the default hands
+  /// back is a promoted `&'static []`, not a `Vec`, and if that ever
+  /// stopped being true this lane would be the first to say so.
+  #[test]
+  fn the_provided_chapter_table_needs_no_allocator() {
+    let row = TrackInfo::<Loopback>::new(
+      ms_tb(),
+      TrackParams::Subtitle(SubtitleTrackParams::new(7)),
+      (),
+    );
+    let rows = [&row];
+    let d = BorrowedDemuxer {
+      tracks: &rows,
+      drained: false,
+    };
+    assert!(d.chapters().is_empty());
   }
 }

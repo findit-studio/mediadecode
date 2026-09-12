@@ -19,7 +19,7 @@ use mediadecode::{
   demuxer::DemuxAdapter,
 };
 use mediaframe::audio::ChannelLayoutDescription;
-use smol_str::SmolStr;
+use smol_bytes::Utf8Bytes;
 
 use crate::{
   codec_id::CodecId,
@@ -81,10 +81,32 @@ impl DemuxAdapter for Ffmpeg {
   type TrackExtra = TrackExtra;
   // `AVStream.metadata` hands out borrowed `&str` that dies with the
   // format context, so a track row has to own its identity strings.
-  // `SmolStr` stores a filename or a MIME type inline — both are short
-  // — which is why the rest of this crate's FFI text handling already
-  // uses it.
-  type Text = SmolStr;
+  // **`Utf8Bytes`, and the reason is allocation failure rather than
+  // size.** A metadata value is read out of a container, so its length
+  // is attacker-controlled; the demuxer therefore measures it, charges
+  // it against a budget, and builds it in a `String` reserved with
+  // `try_reserve_exact`, so exhaustion is a named error rather than an
+  // abort.
+  //
+  // That whole chain is only worth anything if the last step — handing
+  // the buffer to this carrier — allocates nothing more. `SmolStr` sat
+  // here before and could not: its constructor takes a `&str` and
+  // copies into a fresh `Arc<str>` for anything past 23 bytes, so a
+  // second, infallible allocation of an attacker-sized value happened
+  // *after* the fallible one, with the first still live. Failing there
+  // aborted the process, which is exactly what the budget existed to
+  // prevent.
+  //
+  // `Utf8Bytes::from(String)` **moves** the buffer instead: short
+  // values go inline (`smol_bytes::INLINE_CAP`, no allocation at all)
+  // and longer ones reach `bytes::Bytes::from(Vec<u8>)`, which takes
+  // the vector's own allocation over rather than copying it. See
+  // `demuxer::lossy_text` for the one residue that remains and why it
+  // is not attacker-scaled.
+  //
+  // It is also the carrier every text seat in this household is
+  // supposed to be on.
+  type Text = Utf8Bytes;
 }
 
 #[cfg(test)]

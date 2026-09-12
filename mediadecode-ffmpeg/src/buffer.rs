@@ -224,10 +224,7 @@
 //!
 //! [law]: mediadecode::adapter#the-d-seat-amputation-contract
 
-use std::{
-  fmt,
-  sync::{Arc, OnceLock},
-};
+use std::fmt;
 
 use derive_more::{IsVariant, TryUnwrap, Unwrap};
 
@@ -267,23 +264,67 @@ use derive_more::{IsVariant, TryUnwrap, Unwrap};
 /// nothing can produce.
 ///
 /// [law]: mediadecode::adapter#the-d-seat-amputation-contract
-#[derive(Clone, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Default)]
 pub struct FfmpegBytes(Inner);
 
 /// The storage behind [`FfmpegBytes`]. **Private, and the point.**
 ///
 /// One arm today; see the type's own docs for the arm that is coming
 /// and why it can arrive without a breaking release.
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone)]
 enum Inner {
-  /// A refcounted slice, allocated by the copy at the boundary.
-  Shared(Arc<[u8]>),
+  /// No bytes, and no allocation either.
+  ///
+  /// The empty carrier is frequent — a video frame allocates four
+  /// plane slots and fills one to three, and a payload-less packet is
+  /// ordinary — and it used to be a process-wide `Arc` singleton
+  /// behind a `OnceLock`. A variant that holds nothing is simpler and
+  /// allocates nothing at all, which is what the fallible road wants
+  /// at its base case.
+  Empty,
+  /// A refcounted buffer, allocated by the copy at the boundary.
+  ///
+  /// **`triomphe::Arc`, and the reason is allocation failure.** The
+  /// bytes here come out of a container and are therefore
+  /// attacker-sized; every road into this carrier is downstream of a
+  /// budget that admitted a number, and a budget is worth nothing if
+  /// the allocation it admitted then aborts the process rather than
+  /// reporting the failure.
+  ///
+  /// `std::sync::Arc` cannot do it: there is no `try_new` for
+  /// `Arc<[u8]>` on stable and `Arc::new_uninit_slice` aborts like
+  /// every other infallible allocator call. Staging through a
+  /// `try_reserve_exact`ed `Vec` only moved the problem — the `Arc`
+  /// that took the `Vec` still allocated infallibly, and one of those
+  /// headers exists per coded-side-data entry, a count the file
+  /// controls. `triomphe::Arc` offers `try_new` and
+  /// `UniqueArc::try_new_uninit_slice`, so the whole allocation is
+  /// fallible and the payload lands in the `Arc` directly, with no
+  /// intermediate `Vec` and no second copy.
+  ///
+  /// An inline-capable carrier — `smol_bytes::Bytes`, which the text
+  /// seats use — was rejected rather than overlooked: inline storage
+  /// makes `Clone` copy small payloads, and [`FfmpegBytes::ptr_eq`],
+  /// the amputation contract's own instrument, asks whether a clone
+  /// was a refcount bump. A carrier that sometimes copies cannot
+  /// answer that question. `triomphe::Arc` keeps pointer identity.
+  Shared {
+    /// The allocation. May be longer than `len`: a producer that sizes
+    /// its output before a conversion runs cannot know the true length
+    /// until afterwards, and re-sizing then would be the very
+    /// allocation-after-the-point-of-no-return this carrier exists to
+    /// avoid.
+    bytes: triomphe::Arc<[u8]>,
+    /// How much of `bytes` is real output. A carrier's span is a span
+    /// a consumer may read, so everything past this is invisible.
+    len: usize,
+  },
 }
 
 impl Default for Inner {
   #[inline]
   fn default() -> Self {
-    Self::Shared(shared_empty())
+    Self::Empty
   }
 }
 
@@ -304,11 +345,101 @@ impl FfmpegBytes {
   /// A zero-length copy lands on the shared empty allocation rather
   /// than minting its own.
   #[inline]
+  ///
+  /// **Test-only.** Its body is `try_copy_from_slice(..).expect(..)`,
+  /// and a `panic` on allocation failure is no better than the abort
+  /// it replaced — so no product path may reach it, and the `cfg`
+  /// below is what makes that a compile-time fact rather than a grep.
+  /// Everything that copies a container-controlled payload uses
+  /// [`Self::try_copy_from_slice`]: a fallible staging allocation does
+  /// not protect a subsequent infallible copy.
+  #[cfg(test)]
   pub fn copy_from_slice(bytes: &[u8]) -> Self {
     if bytes.is_empty() {
       return Self::empty();
     }
-    Self(Inner::Shared(Arc::from(bytes)))
+    Self::try_copy_from_slice(bytes).expect("an infallible copy of an already-admitted payload")
+  }
+
+  /// [`Self::copy_from_slice`], reporting an allocation failure rather
+  /// than aborting on one.
+  ///
+  /// **The road every budgeted copy takes.** The payload is reserved
+  /// with `Vec::try_reserve_exact` before a byte is written, so a
+  /// container whose extradata, side data or attachment the caller's
+  /// ceilings admitted cannot terminate a safe `open` when the
+  /// allocator declines — it answers a named error instead. What is
+  /// left infallible afterwards is the `Arc` header described on
+  /// [`Inner`]: three words, and the same three whatever the payload
+  /// weighs.
+  #[inline]
+  pub fn try_copy_from_slice(bytes: &[u8]) -> Option<Self> {
+    if bytes.is_empty() {
+      return Some(Self::empty());
+    }
+    let mut uninit =
+      triomphe::UniqueArc::<[core::mem::MaybeUninit<u8>]>::try_new_uninit_slice(bytes.len())
+        .ok()?;
+    // SAFETY: the slice was just allocated with exactly `bytes.len()`
+    // slots, `uninit` is unique by type so nothing else can observe
+    // them, and the two regions cannot overlap — one is a fresh
+    // allocation.
+    unsafe {
+      core::ptr::copy_nonoverlapping(
+        bytes.as_ptr(),
+        uninit.as_mut_ptr().cast::<u8>(),
+        bytes.len(),
+      );
+    }
+    // SAFETY: every one of those slots was just written.
+    let filled = unsafe { triomphe::UniqueArc::assume_init_slice(uninit) };
+    let len = filled.len();
+    Some(Self(Inner::Shared {
+      bytes: filled.shareable(),
+      len,
+    }))
+  }
+
+  /// Claims `cap` bytes **now**, to be filled and named later.
+  ///
+  /// The reservation exists so that every fallible step happens on the
+  /// near side of a conversion. `swr` consumes its input as it runs, so
+  /// an allocation that fails afterwards leaves a caller with nothing
+  /// to retry and samples that are simply gone — which is what the
+  /// owned lane did until this seat existed.
+  ///
+  /// The bytes are zeroed rather than left uninitialised: a carrier
+  /// built from a partly-written reservation must still be a `[u8]` a
+  /// consumer may read, and the zeroing happens here, before the point
+  /// of no return, rather than in `commit` where nothing may fail.
+  #[inline]
+  pub(crate) fn reserve(cap: usize) -> Option<triomphe::UniqueArc<[u8]>> {
+    let mut uninit =
+      triomphe::UniqueArc::<[core::mem::MaybeUninit<u8>]>::try_new_uninit_slice(cap).ok()?;
+    // SAFETY: `cap` slots were just allocated and `uninit` is unique by
+    // type, so writing zeros over all of them initialises the whole
+    // slice and nothing else can observe the intermediate state.
+    unsafe {
+      core::ptr::write_bytes(uninit.as_mut_ptr().cast::<u8>(), 0, cap);
+    }
+    // SAFETY: every slot was just written.
+    Some(unsafe { triomphe::UniqueArc::assume_init_slice(uninit) })
+  }
+
+  /// Names how much of a [`Self::reserve`] is real output.
+  ///
+  /// **Infallible, and that is the point**: by the time this runs the
+  /// conversion has happened and there is nothing left to fail.
+  #[inline]
+  pub(crate) fn from_reservation(bytes: triomphe::UniqueArc<[u8]>, len: usize) -> Self {
+    let len = len.min(bytes.len());
+    if len == 0 {
+      return Self::empty();
+    }
+    Self(Inner::Shared {
+      bytes: bytes.shareable(),
+      len,
+    })
   }
 
   /// The zero-length carrier, shared.
@@ -320,7 +451,7 @@ impl FfmpegBytes {
   /// refcount, instead.
   #[inline]
   pub fn empty() -> Self {
-    Self(Inner::Shared(shared_empty()))
+    Self(Inner::Empty)
   }
 
   /// Builds a carrier of `rows * row_bytes` bytes by writing each row
@@ -363,41 +494,49 @@ impl FfmpegBytes {
     if len == 0 {
       return Some(Self::empty());
     }
-    let mut uninit = Arc::<[u8]>::new_uninit_slice(len);
-    {
-      let slots =
-        Arc::get_mut(&mut uninit).expect("the allocation was made here and has not been shared");
-      for index in 0..rows {
-        let source = row(index);
-        if source.len() != row_bytes {
-          // A length that arrives from a caller is an input, not a
-          // promise: refuse rather than copy `row_bytes` out of a
-          // shorter slice. The half-built `Arc` drops with this
-          // return, and every byte of it is still `MaybeUninit`.
-          return None;
-        }
-        let start = index * row_bytes;
-        // `MaybeUninit<u8>` has the same layout as `u8`, so the source
-        // slice can be viewed as one and copied wholesale.
-        let destination = &mut slots[start..start + row_bytes];
-        // SAFETY: `&[u8]` and `&[MaybeUninit<u8>]` have identical
-        // layout, and the cast is read-only on the source side.
-        let source: &[core::mem::MaybeUninit<u8>] = unsafe {
-          core::slice::from_raw_parts(
-            source.as_ptr().cast::<core::mem::MaybeUninit<u8>>(),
-            row_bytes,
-          )
-        };
-        destination.copy_from_slice(source);
+    // One reservation, made **fallibly**, and no staging buffer: the
+    // rows are appended straight into it. `None` therefore covers two
+    // refusals now — a row whose length disagrees with `row_bytes`,
+    // and an allocator that declined the plane — and both are answers
+    // this carrier's callers already had to handle.
+    //
+    // The `MaybeUninit` gather this replaced needed `unsafe` to view
+    // the source as uninitialised memory and a written-every-slot
+    // argument to discharge; appending cannot leave a hole, so the
+    // argument goes with it.
+    let mut uninit =
+      triomphe::UniqueArc::<[core::mem::MaybeUninit<u8>]>::try_new_uninit_slice(len).ok()?;
+    let destination = uninit.as_mut_ptr().cast::<u8>();
+    for index in 0..rows {
+      let source = row(index);
+      if source.len() != row_bytes {
+        // A length that arrives from a caller is an input, not a
+        // promise: refuse rather than copy `row_bytes` out of a
+        // shorter slice. The half-written allocation drops here.
+        return None;
+      }
+      // SAFETY: `rows * row_bytes == len` slots were allocated above,
+      // this row starts at `index * row_bytes` and is exactly
+      // `row_bytes` long, so the write stays inside them; the
+      // allocation is fresh, so it cannot overlap the source.
+      unsafe {
+        core::ptr::copy_nonoverlapping(
+          source.as_ptr(),
+          destination.add(index * row_bytes),
+          row_bytes,
+        );
       }
     }
-    // SAFETY: the loop above wrote every one of the `rows * row_bytes`
-    // slots — `rows` iterations, each filling exactly `row_bytes`
-    // consecutive bytes starting at `index * row_bytes`, with the
-    // length of each source row checked before the copy and the whole
-    // gather abandoned if one disagreed. Nothing in the allocation is
-    // left uninitialised on this road.
-    Some(Self(Inner::Shared(unsafe { uninit.assume_init() })))
+    // SAFETY: the loop wrote every one of the `rows * row_bytes` slots
+    // — `rows` iterations, each filling exactly `row_bytes`
+    // consecutive bytes starting at `index * row_bytes`, with any
+    // disagreeing row abandoning the whole gather before this point.
+    let filled = unsafe { triomphe::UniqueArc::assume_init_slice(uninit) };
+    let filled_len = filled.len();
+    Some(Self(Inner::Shared {
+      bytes: filled.shareable(),
+      len: filled_len,
+    }))
   }
 
   /// The bytes, as a slice.
@@ -407,7 +546,8 @@ impl FfmpegBytes {
   #[inline]
   pub fn as_slice(&self) -> &[u8] {
     match &self.0 {
-      Inner::Shared(bytes) => bytes,
+      Inner::Empty => &[],
+      Inner::Shared { bytes, len } => &bytes[..*len],
     }
   }
 
@@ -433,8 +573,52 @@ impl FfmpegBytes {
   #[inline]
   pub fn ptr_eq(&self, other: &Self) -> bool {
     match (&self.0, &other.0) {
-      (Inner::Shared(a), Inner::Shared(b)) => Arc::ptr_eq(a, b),
+      // Two empties name the same nothing, which is what the
+      // process-wide empty singleton used to answer.
+      (Inner::Empty, Inner::Empty) => true,
+      // The allocation, not the span: two carriers naming different
+      // prefixes of one reservation are still the same allocation, and
+      // this question is about whether a clone copied.
+      (Inner::Shared { bytes: a, .. }, Inner::Shared { bytes: b, .. }) => {
+        triomphe::Arc::ptr_eq(a, b)
+      }
+      _ => false,
     }
+  }
+}
+
+/// **Over the span, not the allocation.**
+///
+/// The derive compared `Inner` structurally, and `Inner` is not a
+/// structural type: a `Shared` arm holds an allocation that may be
+/// longer than the span, because a producer that sizes its output
+/// before a conversion runs cannot know the true length until
+/// afterwards. Two carriers whose [`FfmpegBytes::as_slice`] answers are
+/// byte-for-byte identical therefore compared **unequal** when one came
+/// off a reservation and the other was copied exactly — and `Empty`
+/// compared unequal to a zero-length `Shared`, though both carry
+/// nothing. Capacity a consumer cannot read is not part of the value.
+///
+/// [`FfmpegBytes::ptr_eq`] remains the instrument for the other
+/// question — *is this handle a refcount bump of that one* — and it is
+/// deliberately not what `==` answers.
+impl PartialEq for FfmpegBytes {
+  #[inline]
+  fn eq(&self, other: &Self) -> bool {
+    self.as_slice() == other.as_slice()
+  }
+}
+
+impl Eq for FfmpegBytes {}
+
+/// Hashes exactly what [`PartialEq`] compares, which is the contract's
+/// requirement rather than a preference: the derived hash mixed in the
+/// invisible capacity, so two equal carriers could land in different
+/// buckets and a payload-keyed map would miss.
+impl core::hash::Hash for FfmpegBytes {
+  #[inline]
+  fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+    core::hash::Hash::hash(self.as_slice(), state);
   }
 }
 
@@ -458,13 +642,6 @@ impl fmt::Debug for FfmpegBytes {
       .field("len", &self.len())
       .finish()
   }
-}
-
-/// The process-wide empty `Arc`, so a zero-length carrier costs a
-/// refcount bump rather than an allocation.
-fn shared_empty() -> Arc<[u8]> {
-  static EMPTY: OnceLock<Arc<[u8]>> = OnceLock::new();
-  EMPTY.get_or_init(|| Arc::from(&[][..])).clone()
 }
 
 /// Payload for [`PacketBufferError::PacketTooLarge`].
@@ -922,6 +1099,58 @@ pub(crate) unsafe fn payload_of<C: crate::FfmpegCarrier + crate::CarrierOps>(
   budget: usize,
   provenance: PayloadProvenance,
 ) -> Result<Option<C::Buffer>, PacketBufferError> {
+  // SAFETY: the caller's contract, forwarded unchanged.
+  let Some(plan) = (unsafe { preflight_payload(pkt, budget, provenance) })? else {
+    return Ok(None);
+  };
+  // SAFETY: the plan's extent was proved inside the preflight against
+  // this same live packet, which the caller keeps alive for the call.
+  unsafe { capture_payload::<C>(plan) }.map(Some)
+}
+
+/// What [`preflight_payload`] decided, and everything the capture needs
+/// to act on it — so the judging and the paying share one reading of
+/// the packet rather than each performing their own.
+#[derive(Clone, Copy)]
+pub(crate) struct PayloadPlan {
+  buf: *mut ffmpeg_next::ffi::AVBufferRef,
+  buf_data: *const u8,
+  offset: usize,
+  len: usize,
+  route: CaptureRoute,
+}
+
+/// **Every refusal a packet payload can earn from what the packet
+/// declares — decided without reading a byte of it and without
+/// allocating.**
+///
+/// Split out of [`payload_of`] because the demux admission pass needs
+/// exactly these answers about every parked attachment *before* the
+/// track table has allocated anything. They are all deterministic facts
+/// about the `AVPacket`: a `TRUSTED` payload this crate must not copy,
+/// a declared size over the caller's ceiling, a `data`/`size` pair that
+/// does not lie inside the buffer it claims, and a buffer somebody else
+/// holds a reference to on a road where that is not acceptable. None of
+/// them will be different on a second attempt, so none of them belongs
+/// after the money is spent.
+///
+/// What is deliberately *not* here is [`CaptureFailed`] — the allocator
+/// declining the carrier. That one cannot be foreseen by any amount of
+/// reading, which is what makes it the only `PacketBuffer` arm that is
+/// honestly unpredictable.
+///
+/// `Ok(None)` is the empty answer: a packet with no buffer, no data or
+/// no size is not a fault, it is a packet with nothing in it.
+///
+/// # Safety
+///
+/// `pkt` must be a live `*const AVPacket` for the duration of the call,
+/// and — if a plan comes back — for as long as that plan is used.
+pub(crate) unsafe fn preflight_payload(
+  pkt: *const ffmpeg_next::ffi::AVPacket,
+  budget: usize,
+  provenance: PayloadProvenance,
+) -> Result<Option<PayloadPlan>, PacketBufferError> {
   // SAFETY: `pkt` is live per the contract above; `.buf`, `.data` and
   // `.size` are public fields on `AVPacket`, and `buf` may be null
   // (stack-allocated packets).
@@ -1015,6 +1244,33 @@ pub(crate) unsafe fn payload_of<C: crate::FfmpegCarrier + crate::CarrierOps>(
   //
   // SAFETY: `offset + len` was just proved to lie inside `buf_ptr`'s
   // own `size`, and `buf_ptr` is a live `AVBufferRef` the packet owns.
+  Ok(Some(PayloadPlan {
+    buf: buf_ptr,
+    buf_data: buf_data.cast_const(),
+    offset,
+    len,
+    route,
+  }))
+}
+
+/// Acts on a [`PayloadPlan`] — **the only step that reads the payload,
+/// and the only one that can fail for a reason the plan could not
+/// foresee.**
+///
+/// # Safety
+///
+/// `plan` must come from [`preflight_payload`] over a packet still live
+/// for this call.
+unsafe fn capture_payload<C: crate::FfmpegCarrier + crate::CarrierOps>(
+  plan: PayloadPlan,
+) -> Result<C::Buffer, PacketBufferError> {
+  let PayloadPlan {
+    buf: buf_ptr,
+    buf_data,
+    offset,
+    len,
+    route,
+  } = plan;
   let carried = match route {
     CaptureRoute::Capture => unsafe { C::capture_packet_payload(buf_ptr, offset, len) },
     CaptureRoute::Copy => {
@@ -1027,15 +1283,13 @@ pub(crate) unsafe fn payload_of<C: crate::FfmpegCarrier + crate::CarrierOps>(
       //
       // SAFETY: the extent was proved above and `buf_data` is
       // non-null.
-      let bytes = unsafe { core::slice::from_raw_parts(buf_data.add(offset).cast_const(), len) };
+      let bytes = unsafe { core::slice::from_raw_parts(buf_data.add(offset), len) };
       C::from_bytes(bytes)
     }
     // Answered before the payload was touched.
-    CaptureRoute::Refuse => unreachable!("a refusal returns above"),
+    CaptureRoute::Refuse => unreachable!("a refusal returns from the preflight"),
   };
-  carried
-    .map(Some)
-    .ok_or(PacketBufferError::CaptureFailed(CaptureFailed::new(len)))
+  carried.ok_or(PacketBufferError::CaptureFailed(CaptureFailed::new(len)))
 }
 
 #[cfg(test)]
@@ -1122,15 +1376,75 @@ mod tests {
   }
 
   #[test]
-  fn the_shared_empty_carrier_is_one_allocation() {
+  fn the_empty_carrier_costs_no_allocation() {
     let a = FfmpegBytes::empty();
     let b = FfmpegBytes::empty();
     assert!(a.is_empty());
     assert_eq!(a.len(), 0);
-    assert!(a.ptr_eq(&b), "the empty carrier is shared, not remade");
-    // And a zero-length copy lands on that same allocation rather than
-    // minting its own.
+    assert!(
+      a.ptr_eq(&b),
+      "two empties name the same nothing, which is the answer the shared singleton used to give",
+    );
+    // And a zero-length copy is that same nothing rather than a
+    // minted allocation.
     assert!(FfmpegBytes::copy_from_slice(&[]).ptr_eq(&a));
+    assert!(
+      FfmpegBytes::try_copy_from_slice(&[])
+        .expect("an empty copy cannot fail")
+        .ptr_eq(&a),
+    );
+  }
+
+  /// Equality and hashing read the span, and the two shapes that
+  /// carry the same bytes with different allocations must agree.
+  ///
+  /// The derived implementations did not: a carrier built from a
+  /// reservation keeps capacity past its span (a producer sizes its
+  /// output before the conversion that fills it), so it compared and
+  /// hashed differently from an exact copy of the very same bytes.
+  /// Anything keyed on a payload — a cache, a dedup table — missed.
+  #[test]
+  fn equal_bytes_are_equal_and_hash_alike_whatever_the_allocation() {
+    use core::hash::Hasher;
+
+    fn hash_of(value: &FfmpegBytes) -> u64 {
+      let mut hasher = std::collections::hash_map::DefaultHasher::new();
+      core::hash::Hash::hash(value, &mut hasher);
+      hasher.finish()
+    }
+
+    // Reserved wide, committed short: the allocation is sixteen bytes
+    // and the span is three.
+    let mut reservation = FfmpegBytes::reserve(16).expect("a sixteen-byte reservation");
+    reservation[..3].copy_from_slice(&[7u8, 8, 9]);
+    let reserved = FfmpegBytes::from_reservation(reservation, 3);
+    // Copied exactly: allocation and span are both three bytes.
+    let exact = FfmpegBytes::try_copy_from_slice(&[7u8, 8, 9]).expect("a three-byte copy");
+
+    assert_eq!(reserved.as_slice(), exact.as_slice());
+    assert_eq!(
+      reserved, exact,
+      "capacity a consumer cannot read is not part of the value",
+    );
+    assert_eq!(
+      hash_of(&reserved),
+      hash_of(&exact),
+      "Hash must agree with Eq or a payload-keyed map misses",
+    );
+    assert!(
+      !reserved.ptr_eq(&exact),
+      "and ptr_eq still answers the other question: these are two allocations",
+    );
+
+    // The empty carrier and a zero-length span are the same value too.
+    // `from_reservation` folds a zero length to `Empty`, so this holds
+    // by construction today; it is asserted because the `Eq` above is
+    // what keeps it true if a second storage arm ever lands and stops
+    // folding.
+    let empty_reservation = FfmpegBytes::reserve(8).expect("an eight-byte reservation");
+    let zero_span = FfmpegBytes::from_reservation(empty_reservation, 0);
+    assert_eq!(zero_span, FfmpegBytes::empty());
+    assert_eq!(hash_of(&zero_span), hash_of(&FfmpegBytes::empty()));
   }
 
   #[test]

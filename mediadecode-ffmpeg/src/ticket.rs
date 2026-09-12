@@ -258,11 +258,13 @@ impl ChannelLayoutTicket {
     self.map.as_slice()
   }
 
-  /// Whether this layout's union arm is the custom map.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  fn is_custom(&self) -> bool {
-    self.order == AVChannelOrder::AV_CHANNEL_ORDER_CUSTOM as i32
-  }
+  // `is_custom` used to live here, and its removal is the point rather
+  // than tidying. Every caller asked it "is this custom?" and treated
+  // `false` as "mask-backed" — which is how an unspecified layout's
+  // undefined union came to be read into `mask`. The question has three
+  // answers, not two, and
+  // [`LayoutArm`](crate::channel_layout::LayoutArm) is the only thing
+  // that answers it now.
 }
 
 /// Every seat of one stream's `AVCodecParameters`, owned.
@@ -408,6 +410,24 @@ impl CodecTicket {
       DemuxError::ParametersTooLarge(ParametersTooLarge::new(stream_index, bytes, budget))
     };
 
+    // **Structure first, before the measurement and long before the
+    // copies.** The demux road already ran this during admission, but
+    // this constructor is reachable on its own, and it used to copy
+    // `extradata` and every coded-side-data payload — the two
+    // attacker-sized seats — and only then reach
+    // [`channel_layout_of`], which is where a malformed layout was
+    // discovered. A deterministic refusal derivable from the struct's
+    // own declared fields has no business arriving after two payload
+    // copies, whichever caller asked for the mirror.
+    //
+    // It costs a pointer walk and allocates nothing. See
+    // [`validate_channel_layout`], which is the whole of what can be
+    // refused here from structure alone.
+    //
+    // SAFETY: this function's own contract, forwarded — `par` is a
+    // non-null, live `*const AVCodecParameters`.
+    unsafe { validate_channel_layout(par, stream_index) }?;
+
     // Measured before a byte is copied, exactly as the bounded clone
     // does it: the footprint enumerates the same three heap seats this
     // mirror is about to read, and refusing here is what keeps an
@@ -438,8 +458,8 @@ impl CodecTicket {
         codec_type: read_unaligned(addr_of!((*par).codec_type).cast::<i32>()),
         codec_id: read_unaligned(addr_of!((*par).codec_id).cast::<i32>()),
         codec_tag: (*par).codec_tag,
-        extradata: extradata_of(par, extradata_policy),
-        coded_side_data: side_data_of(par),
+        extradata: extradata_of(par, extradata_policy, stream_index)?,
+        coded_side_data: side_data_of(par, stream_index)?,
         format: (*par).format,
         bit_rate: (*par).bit_rate,
         bits_per_coded_sample: (*par).bits_per_coded_sample,
@@ -872,23 +892,32 @@ impl core::fmt::Debug for CodecTicket {
 /// # Safety
 ///
 /// `par` must be a live `*const AVCodecParameters`.
-unsafe fn extradata_of(par: *const AVCodecParameters, policy: ExtradataPolicy) -> FfmpegBytes {
+unsafe fn extradata_of(
+  par: *const AVCodecParameters,
+  policy: ExtradataPolicy,
+  stream_index: usize,
+) -> Result<FfmpegBytes, DemuxError> {
   if matches!(policy, ExtradataPolicy::Omit) {
-    return FfmpegBytes::empty();
+    return Ok(FfmpegBytes::empty());
   }
   // SAFETY: `par` is live per the contract; both fields are a pointer
   // and an integer.
   let (ptr, size) = unsafe { ((*par).extradata, (*par).extradata_size) };
   let Ok(len) = usize::try_from(size) else {
-    return FfmpegBytes::empty();
+    return Ok(FfmpegBytes::empty());
   };
   if ptr.is_null() || len == 0 {
-    return FfmpegBytes::empty();
+    return Ok(FfmpegBytes::empty());
   }
   // SAFETY: libavformat guarantees `extradata` is readable for
   // `extradata_size` bytes while the parameters live, and the slice is
   // consumed before this function returns.
-  FfmpegBytes::copy_from_slice(unsafe { core::slice::from_raw_parts(ptr, len) })
+  // **Fallibly**, because the size is the container's: the footprint
+  // above admitted it against the caller's ceiling, and an admitted
+  // size that then aborts the process is a budget that did not do its
+  // job.
+  FfmpegBytes::try_copy_from_slice(unsafe { core::slice::from_raw_parts(ptr, len) })
+    .ok_or_else(|| DemuxError::ParametersAlloc(ParametersAlloc::new(stream_index)))
 }
 
 /// Copies every `coded_side_data` entry into owned entries.
@@ -896,16 +925,23 @@ unsafe fn extradata_of(par: *const AVCodecParameters, policy: ExtradataPolicy) -
 /// # Safety
 ///
 /// `par` must be a live `*const AVCodecParameters`.
-unsafe fn side_data_of(par: *const AVCodecParameters) -> Vec<SideDataEntry> {
+unsafe fn side_data_of(
+  par: *const AVCodecParameters,
+  stream_index: usize,
+) -> Result<Vec<SideDataEntry>, DemuxError> {
   // SAFETY: `par` is live per the contract.
   let (array, count) = unsafe { ((*par).coded_side_data, (*par).nb_coded_side_data) };
+  let alloc = || DemuxError::ParametersAlloc(ParametersAlloc::new(stream_index));
   let Ok(count) = usize::try_from(count) else {
-    return Vec::new();
+    return Ok(Vec::new());
   };
   if array.is_null() || count == 0 {
-    return Vec::new();
+    return Ok(Vec::new());
   }
-  let mut entries = Vec::with_capacity(count);
+  // The descriptor table, reserved fallibly: `nb_coded_side_data` is
+  // the container's number too.
+  let mut entries = Vec::new();
+  entries.try_reserve_exact(count).map_err(|_| alloc())?;
   for index in 0..count {
     // **Never `&*entry`.** `AVPacketSideData::type` is an open C enum
     // and an ABI-compatible FFmpeg newer than these bindings emits
@@ -930,22 +966,57 @@ unsafe fn side_data_of(par: *const AVCodecParameters) -> Vec<SideDataEntry> {
     } else {
       // SAFETY: the descriptor declares `size` readable bytes at
       // `data`, and the slice is consumed before the loop advances.
-      FfmpegBytes::copy_from_slice(unsafe { core::slice::from_raw_parts(data, size) })
+      FfmpegBytes::try_copy_from_slice(unsafe { core::slice::from_raw_parts(data, size) })
+        .ok_or_else(alloc)?
     };
     entries.push(SideDataEntry::new(kind, payload));
   }
-  entries
+  Ok(entries)
 }
 
-/// Mirrors the embedded `AVChannelLayout`.
+/// **Every refusal a channel layout can earn from the container's own
+/// declared facts — and not one byte allocated deciding them.**
+///
+/// Split out of [`channel_layout_of`] so the judging can happen where
+/// the paying has not: `admit_streams` calls this for every stream
+/// before the track table reserves a row, so a malformed layout on the
+/// *last* stream refuses the open before the *first* stream's ticket is
+/// copied. `channel_layout_of` calls it again as its own first
+/// statement, which is what lets the build below carry no refusals at
+/// all and makes the two passes one rule rather than two.
+///
+/// Judged here, in this order:
+///
+/// - a non-null `ch_layout.opaque`, which this crate has no way to
+///   mirror and will not silently drop;
+/// - every structural fault of a `CUSTOM` map —a negative or zero
+///   channel count, a null `u.map`, or a sixteen-byte name with no NUL
+///   inside it — through
+///   [`custom_map_fault`](crate::channel_layout::custom_map_fault),
+///   which is the single place that rule is written and which the
+///   describe road applies too. `av_channel_layout_copy` (which
+///   `avcodec_parameters_to_context` moves this field through)
+///   allocates `nb_channels` entries and `memcpy`s from `src->u.map`
+///   with no null check of its own, and `av_channel_layout_describe`
+///   hands each fixed `name` array to a `%s` conversion; carrying
+///   either across would be a faithful round trip of a crash;
+/// - a non-null `opaque` on any entry of that map, which only this road
+///   cares about because only this road mirrors it.
+///
+/// Refusing the incomplete map here is also what lets
+/// [`write_channel_layout`] rely on `map.len() == nb_channels` for a
+/// custom order.
 ///
 /// # Safety
 ///
-/// `par` must be a live `*const AVCodecParameters`.
-unsafe fn channel_layout_of(
+/// `par` must be a live `*const AVCodecParameters`, and for a `CUSTOM`
+/// order with a non-null `u.map` that map must hold `nb_channels` live
+/// `AVChannelCustom` entries — FFmpeg's own contract for a layout it
+/// filled, which is the only kind this crate hands in.
+pub(crate) unsafe fn validate_channel_layout(
   par: *const AVCodecParameters,
   stream_index: usize,
-) -> Result<ChannelLayoutTicket, DemuxError> {
+) -> Result<(), DemuxError> {
   // SAFETY: `ch_layout` is embedded by value; `addr_of!` reaches each
   // field without forming a reference to the layout, and `order` has
   // the layout of a `c_int`.
@@ -962,6 +1033,82 @@ unsafe fn channel_layout_of(
       None,
     )));
   }
+  // **The layout's whole structure, through the one function that
+  // decides it — every order, not only `CUSTOM`.**
+  //
+  // The custom map's rules (null map, non-positive count, a name with
+  // no NUL) and the other orders' (a count outside FFmpeg's arithmetic
+  // range, a `NATIVE` mask that disagrees with its count, an
+  // `AMBISONIC` layout whose channels form no ambisonic order) are one
+  // preflight, and the describe road, the decoder and the resampler
+  // apply exactly this one — so the pass that admits and the road that
+  // materialises cannot come to different answers about a layout.
+  //
+  // An earlier round stopped here for every order but `CUSTOM`, on the
+  // argument that a `uint64_t` mask cannot be malformed. The mask is
+  // not the only field.
+  //
+  // SAFETY: this function's own contract, forwarded: `ch_layout` is
+  // embedded in a live `AVCodecParameters`, `order` was read as the
+  // `c_int` it is, and for a custom order its map holds `nb_channels`
+  // entries.
+  unsafe { crate::channel_layout::layout_preflight(addr_of!((*par).ch_layout)) }
+    .map_err(|fault| crate::demuxer::layout_fault_to_demux(stream_index, fault))?;
+
+  if order != AVChannelOrder::AV_CHANNEL_ORDER_CUSTOM as i32 {
+    return Ok(());
+  }
+  // The map is sound to walk now; what remains is the one thing the
+  // describe road has no opinion about, because it never mirrors it.
+  //
+  // SAFETY: the order names the `map` arm, and the preflight above
+  // proved it non-null with a positive count.
+  let map = unsafe { (*par).ch_layout.u.map };
+  let count = channels.max(0) as usize;
+  for index in 0..count {
+    // Field pointers, never `&AVChannelCustom`: `id` is an open enum
+    // with the same hazard as a side-data type id.
+    //
+    // SAFETY: the contract above makes the map `count` entries long,
+    // `index` is below that count, and the read goes through
+    // `addr_of!`.
+    let opaque = unsafe { read_unaligned(addr_of!((*map.add(index)).opaque)) };
+    if !opaque.is_null() {
+      return Err(DemuxError::ParametersOpaque(ParametersOpaque::new(
+        stream_index,
+        Some(index),
+      )));
+    }
+  }
+  Ok(())
+}
+
+/// Mirrors the embedded `AVChannelLayout`.
+///
+/// Carries no refusals of its own beyond an allocator's: everything
+/// this layout can be refused for is decided by
+/// [`validate_channel_layout`], which runs first here and has already
+/// run during admission.
+///
+/// # Safety
+///
+/// `par` must be a live `*const AVCodecParameters`, with
+/// [`validate_channel_layout`]'s contract for a custom map.
+unsafe fn channel_layout_of(
+  par: *const AVCodecParameters,
+  stream_index: usize,
+) -> Result<ChannelLayoutTicket, DemuxError> {
+  // SAFETY: the caller's contract, forwarded unchanged.
+  unsafe { validate_channel_layout(par, stream_index) }?;
+
+  // SAFETY: as in the validation above — field reads through
+  // `addr_of!`, with `order` read as the `c_int` it is.
+  let (order, channels) = unsafe {
+    (
+      read_unaligned(addr_of!((*par).ch_layout.order).cast::<i32>()),
+      (*par).ch_layout.nb_channels,
+    )
+  };
 
   let mut layout = ChannelLayoutTicket {
     order,
@@ -969,65 +1116,44 @@ unsafe fn channel_layout_of(
     mask: 0,
     map: Vec::new(),
   };
-  if !layout.is_custom() {
-    // Every order but `CUSTOM` describes its channels with the union's
-    // `mask` arm. Reading it for `CUSTOM` would read a pointer.
-    //
-    // SAFETY: the union is eight bytes either way and this arm is the
-    // one the order names.
-    layout.mask = unsafe { (*par).ch_layout.u.mask };
-    return Ok(layout);
+  match crate::channel_layout::LayoutArm::of(order) {
+    // SAFETY: `NATIVE` and `AMBISONIC` are the two orders whose
+    // contract defines `u.mask`, and this arm names exactly them.
+    crate::channel_layout::LayoutArm::Mask => {
+      layout.mask = unsafe { (*par).ch_layout.u.mask };
+      return Ok(layout);
+    }
+    // **`UNSPEC`, and any order this build has never heard of: the
+    // union is not read at all.** FFmpeg's own header declares it
+    // undefined for an unspecified layout, and this mirror used to
+    // treat "not custom" as "mask-backed" — importing whatever bytes
+    // happened to sit there into a field that `mask()` hands out and
+    // that the derived `Debug`, `PartialEq` and `Hash` then expose and
+    // compare. The stored zero is a value this crate chose, not one it
+    // read.
+    crate::channel_layout::LayoutArm::Undefined => return Ok(layout),
+    crate::channel_layout::LayoutArm::Map => {}
   }
 
-  // A custom order without a full map is **refused**, not reproduced.
-  // `av_channel_layout_copy` — the call
-  // `avcodec_parameters_to_context` moves this field through —
-  // allocates `nb_channels` entries and then `memcpy`s from
-  // `src->u.map` with no null check of its own, so a layout that names
-  // channels it has no map for makes libavcodec read from null the
-  // moment a decoder opens. Carrying it across would be a faithful
-  // round trip of a crash. See
-  // [`DemuxError::ParametersChannelMap`](crate::DemuxError).
-  //
-  // Refusing here is also what lets [`write_channel_layout`] rely on
-  // `map.len() == nb_channels` for a custom order.
-  //
-  // SAFETY: the order names the `map` arm.
+  // SAFETY: the order names the `map` arm, and the validation above
+  // proved it non-null with a positive count.
   let map = unsafe { (*par).ch_layout.u.map };
-  let malformed = || {
-    Err(DemuxError::ParametersChannelMap(ParametersChannelMap::new(
-      stream_index,
-      channels,
-    )))
-  };
-  let Ok(count) = usize::try_from(channels) else {
-    return malformed();
-  };
-  if map.is_null() || count == 0 {
-    return malformed();
-  }
-  layout.map.reserve_exact(count);
+  let count = channels.max(0) as usize;
+  layout
+    .map
+    .try_reserve_exact(count)
+    .map_err(|_| DemuxError::ParametersAlloc(ParametersAlloc::new(stream_index)))?;
   for index in 0..count {
-    // Field pointers again, never `&AVChannelCustom`: `id` is an open
-    // enum with the same hazard as a side-data type id.
-    //
-    // SAFETY: FFmpeg's contract makes the map `nb_channels` entries
-    // long, `index` is below that count, and every read goes through
+    // SAFETY: FFmpeg's contract makes the map `count` entries long,
+    // `index` is below that count, and every read goes through
     // `addr_of!`.
-    let (id, name, opaque) = unsafe {
+    let (id, name) = unsafe {
       let entry = map.add(index);
       (
         read_unaligned(addr_of!((*entry).id).cast::<i32>()),
         read_unaligned(addr_of!((*entry).name).cast::<[u8; 16]>()),
-        read_unaligned(addr_of!((*entry).opaque)),
       )
     };
-    if !opaque.is_null() {
-      return Err(DemuxError::ParametersOpaque(ParametersOpaque::new(
-        stream_index,
-        Some(index),
-      )));
-    }
     layout.map.push(CustomChannel::new(id, name));
   }
   Ok(layout)
@@ -1166,13 +1292,28 @@ unsafe fn write_channel_layout(
     (*dst).ch_layout.opaque = core::ptr::null_mut();
   }
 
-  if !layout.is_custom() {
+  match crate::channel_layout::LayoutArm::of(layout.order()) {
     // SAFETY: the order names the `mask` arm.
-    unsafe {
-      (*dst).ch_layout.nb_channels = layout.channels();
-      (*dst).ch_layout.u.mask = layout.mask();
+    crate::channel_layout::LayoutArm::Mask => {
+      unsafe {
+        (*dst).ch_layout.nb_channels = layout.channels();
+        (*dst).ch_layout.u.mask = layout.mask();
+      }
+      return Ok(());
     }
-    return Ok(());
+    // **The union is left as `avcodec_parameters_alloc` zeroed it.**
+    // An order that defines no arm gets no arm written: handing
+    // libavcodec a mask for an unspecified layout would be inventing a
+    // fact about a field FFmpeg says means nothing there, and the
+    // mirror does not read one either.
+    crate::channel_layout::LayoutArm::Undefined => {
+      // SAFETY: `dst` is live and the count is a plain `int` field.
+      unsafe {
+        (*dst).ch_layout.nb_channels = layout.channels();
+      }
+      return Ok(());
+    }
+    crate::channel_layout::LayoutArm::Map => {}
   }
 
   // **`nb_channels` comes from the map, not from the stored field.**

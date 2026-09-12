@@ -312,7 +312,8 @@ fn a_mid_stream_format_change_is_refused_by_name() {
     0,
     2,
     mediadecode_ffmpeg::SampleFormat::S16,
-    mediadecode_ffmpeg::channel_layout_description_from_ffmpeg(&ChannelLayout::STEREO),
+    mediadecode_ffmpeg::channel_layout_description_from_ffmpeg(&ChannelLayout::STEREO)
+      .expect("a well-formed layout describes"),
     std::array::from_fn(|_| {
       mediadecode::frame::Plane::new(mediadecode_ffmpeg::FfmpegBytes::empty(), 0)
     }),
@@ -327,7 +328,8 @@ fn a_mid_stream_format_change_is_refused_by_name() {
     0,
     2,
     mediadecode_ffmpeg::SampleFormat::S16,
-    mediadecode_ffmpeg::channel_layout_description_from_ffmpeg(&ChannelLayout::STEREO),
+    mediadecode_ffmpeg::channel_layout_description_from_ffmpeg(&ChannelLayout::STEREO)
+      .expect("a well-formed layout describes"),
     std::array::from_fn(|_| {
       mediadecode::frame::Plane::new(mediadecode_ffmpeg::FfmpegBytes::empty(), 0)
     }),
@@ -350,7 +352,8 @@ fn a_mid_stream_format_change_is_refused_by_name() {
     0,
     1,
     mediadecode_ffmpeg::SampleFormat::S16,
-    mediadecode_ffmpeg::channel_layout_description_from_ffmpeg(&ChannelLayout::MONO),
+    mediadecode_ffmpeg::channel_layout_description_from_ffmpeg(&ChannelLayout::MONO)
+      .expect("a well-formed layout describes"),
     std::array::from_fn(|_| {
       mediadecode::frame::Plane::new(mediadecode_ffmpeg::FfmpegBytes::empty(), 0)
     }),
@@ -398,7 +401,8 @@ fn the_needs_more_signal_lives_in_the_ok_arm() {
     0,
     2,
     mediadecode_ffmpeg::SampleFormat::S16,
-    mediadecode_ffmpeg::channel_layout_description_from_ffmpeg(&ChannelLayout::STEREO),
+    mediadecode_ffmpeg::channel_layout_description_from_ffmpeg(&ChannelLayout::STEREO)
+      .expect("a well-formed layout describes"),
     std::array::from_fn(|_| {
       mediadecode::frame::Plane::new(mediadecode_ffmpeg::FfmpegBytes::empty(), 0)
     }),
@@ -558,7 +562,7 @@ fn filled_frame(
   bytes: &[u8],
   pts: Option<i64>,
 ) -> mediadecode_ffmpeg::OwnedAudioFrame {
-  let plane = mediadecode_ffmpeg::FfmpegBytes::copy_from_slice(bytes);
+  let plane = mediadecode_ffmpeg::FfmpegBytes::try_copy_from_slice(bytes).expect("a test payload");
   let planes = std::array::from_fn(|index| {
     mediadecode::frame::Plane::new(
       if index == 0 {
@@ -574,7 +578,8 @@ fn filled_frame(
     samples,
     channels,
     mediadecode_ffmpeg::SampleFormat::S16,
-    mediadecode_ffmpeg::channel_layout_description_from_ffmpeg(&layout),
+    mediadecode_ffmpeg::channel_layout_description_from_ffmpeg(&layout)
+      .expect("a well-formed layout describes"),
     planes,
     1,
     Default::default(),
@@ -1132,7 +1137,8 @@ fn a_forged_frame_geometry_is_refused_before_it_can_allocate() {
     128,
     2,
     mediadecode_ffmpeg::SampleFormat::S16,
-    mediadecode_ffmpeg::channel_layout_description_from_ffmpeg(&ChannelLayout::STEREO),
+    mediadecode_ffmpeg::channel_layout_description_from_ffmpeg(&ChannelLayout::STEREO)
+      .expect("a well-formed layout describes"),
     std::array::from_fn(|_| {
       mediadecode::frame::Plane::new(mediadecode_ffmpeg::FfmpegBytes::empty(), 0)
     }),

@@ -90,8 +90,8 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierAudioStreamDecoder<C> {
   ) -> Result<Self, AudioDecodeError> {
     // Use the checked codec-context builder — `Context::from_parameters`
     // is OOM-UB-prone (see `crate::decoder::build_codec_context`).
-    let (ctx, callback_state) =
-      build_codec_context(&parameters, limits).map_err(AudioDecodeError::Decode)?;
+    let (ctx, callback_state) = build_codec_context(&parameters, limits, Some(time_base))
+      .map_err(AudioDecodeError::Decode)?;
     // Opened without forming a bindgen enum from FFmpeg memory: the codec
     // is resolved off a raw `codec_id`, and the medium is proved off a raw
     // `codec_type`. See `crate::decoder::ensure_codec_type`.
@@ -347,7 +347,7 @@ audio_lane_face!(crate::View, crate::Owned);
 /// are exhaustive for the mirror-image reason: their arms are the
 /// substrate's fixed state set, and there the wildcard would be dead
 /// weight hiding a state a consumer forgot.
-#[derive(thiserror::Error, Debug, Clone, IsVariant, Unwrap, TryUnwrap)]
+#[derive(thiserror::Error, Debug, IsVariant, Unwrap, TryUnwrap)]
 #[unwrap(ref, ref_mut)]
 #[try_unwrap(ref, ref_mut)]
 #[non_exhaustive]

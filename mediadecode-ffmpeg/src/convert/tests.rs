@@ -177,7 +177,9 @@ fn an_unsupported_format_is_named_in_the_error() {
   };
   // The *value* is unchanged — this restores the diagnostic, not the
   // struck `Unknown(u32)` variant.
-  assert_eq!(*p.format(), PixelFormat::None);
+  // The payload is a tag now: the raw id and libavutil's borrowed
+  // name are the identity, and no `PixelFormat` is carried.
+  assert!(p.name().is_none() || p.raw() != 0);
   assert_eq!(p.raw(), raw);
   assert_eq!(p.name(), Some("videotoolbox_vld"));
 
@@ -208,7 +210,9 @@ fn an_unnameable_format_still_reports_its_raw_id() {
   let ConvertError::UnsupportedPixelFormat(p) = &err else {
     panic!("expected UnsupportedPixelFormat, got {err:?}");
   };
-  assert_eq!(*p.format(), PixelFormat::None);
+  // The payload is a tag now: the raw id and libavutil's borrowed
+  // name are the identity, and no `PixelFormat` is carried.
+  assert!(p.name().is_none() || p.raw() != 0);
   assert_eq!(p.raw(), raw);
   assert_eq!(p.name(), None);
 

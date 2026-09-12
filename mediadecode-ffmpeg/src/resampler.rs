@@ -24,6 +24,7 @@ use std::{
   ptr::{addr_of, read_unaligned},
 };
 
+use crate::channel_layout::LayoutArm;
 use derive_more::{IsVariant, TryUnwrap, Unwrap};
 use ffmpeg_next::{
   ChannelLayout,
@@ -68,11 +69,110 @@ type Frame<C> = AudioFrame<
 /// source spec in the vocabulary a decoded frame carries, so the
 /// mid-stream check compares like with like without the caller ever
 /// seeing two dialects.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone)]
 pub struct ResampleSpec {
   rate: u32,
   format: Sample,
   layout: ChannelLayout,
+}
+
+/// **`Debug` that never reads undefined storage.**
+///
+/// The derive delegated to `ffmpeg_next::ChannelLayout`'s own
+/// formatter, which prints `u.mask` unconditionally — and for an
+/// `UNSPEC` order that union is undefined per FFmpeg's own header, so
+/// merely *logging* a spec read storage nobody had written. The mask is
+/// printed here only for the orders that define it; see [`LayoutArm`].
+impl core::fmt::Debug for ResampleSpec {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    let order = layout_order(&self.layout);
+    let mut out = f.debug_struct("ResampleSpec");
+    out
+      .field("rate", &self.rate)
+      .field("format", &self.format)
+      .field("order", &order)
+      .field("channels", &self.layout.channels());
+    match LayoutArm::of(order) {
+      // SAFETY: the order defines the `mask` arm.
+      LayoutArm::Mask => out.field("mask", &unsafe { self.layout.0.u.mask }),
+      // The map's *address* is what a reader can use here — its
+      // contents need an extent this type cannot establish.
+      // SAFETY: the order defines the `map` arm; the pointer is
+      // formatted, never dereferenced.
+      LayoutArm::Map => out.field("map", &unsafe { self.layout.0.u.map }),
+      LayoutArm::Undefined => out.field("union", &"undefined for this order"),
+    };
+    out.finish()
+  }
+}
+
+/// **Equality that never asks FFmpeg.**
+///
+/// The derive that stood here was a safe `==` with a raw pointer
+/// dereference behind it, and it is the worst shape this branch found.
+/// `ffmpeg_next::ChannelLayout`'s own `PartialEq` is
+/// `av_channel_layout_compare`, which walks `u.map[i]` for a `CUSTOM`
+/// order — so safe Rust could forge a layout with a positive
+/// `nb_channels` and a null or dangling map, wrap it in two specs,
+/// write `a == b`, and have FFmpeg dereference it. No preflight could
+/// dominate that: `==` is reachable without constructing a resampler at
+/// all, before any of this crate's code runs.
+///
+/// So the comparison is structural and reads nothing through a pointer:
+/// the raw `order` first, then the channel count, then — for every
+/// order that describes its channels through the union's `mask` arm —
+/// the mask itself, a `uint64_t`.
+///
+/// # What a `CUSTOM` order compares as, and why
+///
+/// **Pointer identity, never contents.** A safe function cannot
+/// establish that a map is as long as the count beside it, which is the
+/// same wall
+/// [`channel_layout_from_ffmpeg`](crate::channel_layout::channel_layout_from_ffmpeg)
+/// meets and refuses at; here the answer is the one comparison that
+/// needs no extent — are these the same map? Two custom layouts
+/// describing identical channels through different allocations
+/// therefore compare **unequal**.
+///
+/// That is conservative in the only direction that matters. The single
+/// product use of layout equality is [`check_pair`]'s
+/// `source == target` short-circuit, where "unequal" means the
+/// rematrix check *runs* rather than being skipped; an answer that was
+/// wrong the other way would skip a check. And the relation is still
+/// an equivalence — reflexive, symmetric, transitive — which is what
+/// [`Eq`] requires of it.
+impl PartialEq for ResampleSpec {
+  fn eq(&self, other: &Self) -> bool {
+    self.rate == other.rate
+      && self.format == other.format
+      && layouts_equal(&self.layout, &other.layout)
+  }
+}
+
+impl Eq for ResampleSpec {}
+
+/// Structural equality for two channel layouts, **without an FFmpeg
+/// call and without following a pointer**. See [`ResampleSpec`]'s
+/// [`PartialEq`] for why this exists and what a `CUSTOM` order answers.
+fn layouts_equal(a: &ChannelLayout, b: &ChannelLayout) -> bool {
+  let (order_a, order_b) = (layout_order(a), layout_order(b));
+  if order_a != order_b || a.channels() != b.channels() {
+    return false;
+  }
+  match LayoutArm::of(order_a) {
+    // SAFETY: these two orders name the `mask` arm — a `uint64_t` —
+    // and `AVChannelLayout`'s contract defines it for them.
+    LayoutArm::Mask => unsafe { a.0.u.mask == b.0.u.mask },
+    // SAFETY: this order names the `map` arm. The pointers are
+    // **compared**, never dereferenced — which is the whole point.
+    LayoutArm::Map => unsafe { core::ptr::eq(a.0.u.map, b.0.u.map) },
+    // **Nothing is read.** For `UNSPEC` — and for any order this build
+    // does not name, which folds here — FFmpeg's own header says the
+    // union is undefined and must not be used. Two unspecified layouts
+    // of the same width are the same layout, whatever bytes happen to
+    // sit in storage neither of them owns.
+    LayoutArm::Undefined => true,
+  }
 }
 
 impl ResampleSpec {
@@ -346,6 +446,20 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierResampler<C> {
   ) -> Result<Self, ResampleError> {
     check_spec(&source, SpecEnd::Source)?;
     check_spec(&target, SpecEnd::Target)?;
+    // **Both layouts, preflighted before `swr` is handed either.**
+    //
+    // `swr_alloc_set_opts2` and `swr_build_matrix2` take an
+    // `AVChannelLayout` and assume every invariant
+    // `av_channel_layout_check` states; `ffmpeg_next::ChannelLayout` is
+    // a public newtype over that public struct, so a caller can hand
+    // this constructor a layout breaking any of them — a `NATIVE` count
+    // that disagrees with its mask, an `AMBISONIC` layout whose
+    // channels form no ambisonic order, a count large enough to take
+    // FFmpeg's own `int` arithmetic somewhere it was not meant to go.
+    // One preflight, shared with the demux admission pass, the codec
+    // ticket and the decoder.
+    preflight_layout(&source.layout, SpecEnd::Source)?;
+    preflight_layout(&target.layout, SpecEnd::Target)?;
 
     // The layouts `swr` is really configured with, resolved *before*
     // the pair is judged — because the conversion that will run is
@@ -363,11 +477,26 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierResampler<C> {
     let target_format = SampleFormat::from_ffmpeg(target.format);
     // SAFETY: the layout is a live `ChannelLayout` owned by this scope.
     let target_layout =
-      crate::channel_layout::channel_layout_description_from_ffmpeg(&staged_target_layout);
+      crate::channel_layout::channel_layout_description_from_ffmpeg(&staged_target_layout)
+        .map_err(|_| {
+          ResampleError::UnsupportedLayout(UnsupportedLayout::new(
+            SpecEnd::Target,
+            layout_order(&staged_target_layout),
+            staged_target_layout.channels(),
+          ))
+        })?;
     // SAFETY: the layout is a live `ChannelLayout` owned by `source`
     // for the duration of this call.
-    let source_layout =
-      crate::channel_layout::channel_layout_description_from_ffmpeg(&source.layout);
+    let source_layout = crate::channel_layout::channel_layout_description_from_ffmpeg(
+      &source.layout,
+    )
+    .map_err(|_| {
+      ResampleError::UnsupportedLayout(UnsupportedLayout::new(
+        SpecEnd::Source,
+        layout_order(&source.layout),
+        source.layout.channels(),
+      ))
+    })?;
     let target_timebase = target.timebase();
 
     Ok(Self {
@@ -775,6 +904,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierResampler<C> {
       // before the sharing begins: this resampler allocates a fresh
       // output frame per conversion, so nothing ever writes into a
       // buffer a delivered frame is reading.
+      // Infallible: the owned lane took its allocation in `reserve`,
+      // before `swr` ran, so nothing here can refuse and no converted
+      // sample can be lost to an allocator.
       *slot = Plane::new(unsafe { C::commit(reserved, bytes) }, bytes as u32);
     }
 
@@ -1578,7 +1710,7 @@ impl OutputBuffer {
 /// are exhaustive for the mirror-image reason: their arms are the
 /// substrate's fixed state set, and there the wildcard would be dead
 /// weight hiding a state a consumer forgot.
-#[derive(thiserror::Error, Debug, Clone, IsVariant, Unwrap, TryUnwrap)]
+#[derive(thiserror::Error, Debug, IsVariant, Unwrap, TryUnwrap)]
 #[unwrap(ref, ref_mut)]
 #[try_unwrap(ref, ref_mut)]
 #[non_exhaustive]
@@ -1755,6 +1887,68 @@ fn check_spec(spec: &ResampleSpec, end: SpecEnd) -> Result<(), ResampleError> {
 /// this crate keeps everywhere it touches a bindgen enum: a value
 /// outside this build's discriminant set would be undefined behaviour
 /// the moment it existed as one.
+/// Runs [`crate::channel_layout::layout_preflight`] over a caller's
+/// layout and refuses a `CUSTOM` order outright.
+///
+/// The refusal is not squeamishness about custom layouts; it is what
+/// makes the rest of this type's story true. A `CUSTOM` layout carries
+/// a raw `u.map` pointer whose extent no signature here can establish —
+/// the same wall [`crate::channel_layout::channel_layout_from_ffmpeg`]
+/// meets — and a [`ResampleSpec`] holding one would be a struct with a
+/// bare pointer inside, which is the thing that would have to be
+/// reasoned about for every use of this value on another thread. Every
+/// layout a live resampler holds is mask-only, and therefore a plain
+/// value.
+fn preflight_layout(layout: &ChannelLayout, end: SpecEnd) -> Result<(), ResampleError> {
+  let unsupported = || {
+    ResampleError::UnsupportedLayout(UnsupportedLayout::new(
+      end,
+      layout_order(layout),
+      layout.channels(),
+    ))
+  };
+  if layout_order(layout) == AVChannelOrder::AV_CHANNEL_ORDER_CUSTOM as i32 {
+    return Err(unsupported());
+  }
+  // SAFETY: `layout` is a live `ChannelLayout` for the duration of this
+  // call, and the custom order — the only one whose contract mentions a
+  // map — was just refused.
+  unsafe { crate::channel_layout::layout_preflight(&layout.0 as *const _) }
+    .map_err(|_| unsupported())
+}
+
+/// **`Send`, and deliberately not `Sync`.**
+///
+/// # Safety
+///
+/// The `SwrContext` behind `ctx` is owned by this value: it is
+/// allocated in [`open_context`], never shared, never cloned, and
+/// dropped with the resampler. Every operation that touches it goes
+/// through `&mut self` — `swr_convert_frame`, `swr_get_delay`,
+/// `swr_init` on the rebuild — so no two threads can be inside
+/// libswresample for this context at once, which is the whole of what
+/// that library requires: it keeps no thread-local or process-global
+/// state of its own, and a context is a plain heap allocation whose
+/// address is meaningful on any thread.
+///
+/// The other fields are ordinary owned values. The two
+/// `ffmpeg_next::ChannelLayout`s and the two [`ResampleSpec`]s wrap an
+/// `AVChannelLayout`, which holds a pointer **only for
+/// `AV_CHANNEL_ORDER_CUSTOM`** — and [`preflight_layout`] refuses that
+/// order at the one construction choke point, so every layout a live
+/// resampler holds is the `u.mask` arm: a `uint64_t`, a plain value.
+/// The staged layouts come from [`initialized_layout`], which produces
+/// `av_channel_layout_default`'s mask-only answer. `ready` holds
+/// `Frame<C>` values, whose carriers are `Send` by the carrier
+/// contract.
+///
+/// **Not `Sync`, and that is not an oversight.** `&self` would let two
+/// threads hold the context at once, and nothing in this type
+/// serialises that; the `&mut` receiver is the serialisation. Moving
+/// the whole resampler to another thread is sound; sharing it is not
+/// offered.
+unsafe impl<C: crate::FfmpegCarrier> Send for CarrierResampler<C> {}
+
 fn layout_order(layout: &ChannelLayout) -> i32 {
   // SAFETY: `layout` is a live `ChannelLayout` for the duration of this
   // call; `addr_of!` reaches its `order` field without forming a
@@ -2008,9 +2202,11 @@ unsafe fn layout_from_raw(ptr: *const ffmpeg_next::ffi::AVChannelLayout) -> Opti
   // for `CUSTOM` those eight bytes are a pointer. `layout_from_parts`
   // refuses that order anyway, so a zero is the honest thing to hand
   // it and reading the pointer would be the dishonest one.
-  let mask = if order == AVChannelOrder::AV_CHANNEL_ORDER_NATIVE as i32 {
-    // SAFETY: `u.mask` is the union's variant for NATIVE, and the
-    // order was checked against our own constant before the read.
+  let mask = if matches!(LayoutArm::of(order), LayoutArm::Mask) {
+    // SAFETY: the arm names exactly the orders whose contract defines
+    // `u.mask`. Through the shared dispatcher rather than a local
+    // comparison, which had named `NATIVE` alone and so dropped an
+    // ambisonic layout's non-diegetic channels on the floor.
     unsafe { (*ptr).u.mask }
   } else {
     0
@@ -2070,6 +2266,176 @@ mod tests {
 
   type Frame = super::Frame<crate::Owned>;
 
+  /// **The resampler moves between threads, and does not share.**
+  ///
+  /// Stated as a compile-time fact rather than a comment because the
+  /// `unsafe impl Send` on this type rests on an invariant a later
+  /// change could quietly break: every layout a live resampler holds is
+  /// the mask arm of its union, because [`preflight_layout`] refuses a
+  /// `CUSTOM` order at the one construction choke point. If that
+  /// refusal is ever removed, a `ResampleSpec` starts carrying a raw
+  /// `u.map` pointer and the argument behind the `unsafe impl` is no
+  /// longer true — this lane will still compile, so the refusal's own
+  /// lane below is what guards it, and this one guards the `Send`
+  /// itself against being dropped.
+  ///
+  /// `Sync` is deliberately absent and deliberately not asserted here:
+  /// the `SwrContext` is serialised by `&mut self`, which `&self` would
+  /// not provide.
+  #[test]
+  fn the_resampler_is_send_on_both_lanes() {
+    const fn assert_send<T: Send>() {}
+    assert_send::<CarrierResampler<crate::Owned>>();
+    assert_send::<CarrierResampler<crate::View>>();
+  }
+
+  /// **`==` on a spec never reaches FFmpeg — and this lane's *passing*
+  /// is the proof.**
+  ///
+  /// `ResampleSpec` derived `PartialEq`, and `ffmpeg_next::ChannelLayout`
+  /// implements it as `av_channel_layout_compare`, which walks
+  /// `u.map[i]` for a `CUSTOM` order. So a safe caller could forge a
+  /// layout declaring channels it has no map for, wrap it in two specs,
+  /// and write `a == b` — reaching a dereference of null inside FFmpeg
+  /// without constructing a resampler or touching a single line of this
+  /// crate's own code. No preflight can dominate an operator.
+  ///
+  /// The layouts below are exactly that shape. If the hand-written
+  /// comparison is ever replaced by a derive again, this lane does not
+  /// fail — it **crashes**, because FFmpeg reads from the null map. That
+  /// is the honest signal for this defect, and the same one the
+  /// null-map lanes in `channel_layout` carry.
+  #[test]
+  fn spec_equality_never_follows_a_channel_map() {
+    // SAFETY: a zeroed `AVChannelLayout` is a valid value; the fields
+    // below declare two channels under a custom order and leave `u.map`
+    // null — a shape safe Rust can build and FFmpeg would dereference.
+    let forged = || {
+      let mut inner: ffmpeg_next::ffi::AVChannelLayout = unsafe { std::mem::zeroed() };
+      inner.order = AVChannelOrder::AV_CHANNEL_ORDER_CUSTOM;
+      inner.nb_channels = 2;
+      ChannelLayout(inner)
+    };
+    let format = Sample::I16(ffmpeg_next::format::sample::Type::Packed);
+    let one = ResampleSpec::new(48_000, format, forged());
+    let two = ResampleSpec::new(48_000, format, forged());
+
+    // Two *separate* null maps: equal by every field this comparison
+    // reads, and the answer is the conservative one because the maps
+    // are compared by identity rather than by contents.
+    assert!(one == two, "two null maps are the same map");
+    // Reflexive, which `Eq` requires of it.
+    assert!(one == one);
+
+    // A different map pointer is a different layout, without either
+    // being read. `data` outlives the comparison.
+    let data = [0u8; 64];
+    let mut other_inner: ffmpeg_next::ffi::AVChannelLayout = unsafe { std::mem::zeroed() };
+    other_inner.order = AVChannelOrder::AV_CHANNEL_ORDER_CUSTOM;
+    other_inner.nb_channels = 2;
+    other_inner.u.map = data.as_ptr().cast_mut().cast();
+    let three = ResampleSpec::new(48_000, format, ChannelLayout(other_inner));
+    assert!(one != three, "two different maps are different layouts");
+
+    // And the ordinary road still answers as it always did: mask-only
+    // orders compare by their mask.
+    let stereo = ResampleSpec::new(48_000, format, ChannelLayout::STEREO);
+    assert!(stereo == ResampleSpec::new(48_000, format, ChannelLayout::STEREO));
+    assert!(stereo != ResampleSpec::new(48_000, format, ChannelLayout::MONO));
+    assert!(stereo != ResampleSpec::new(44_100, format, ChannelLayout::STEREO));
+    assert!(stereo != one, "a native layout is not a custom one");
+  }
+
+  /// **An `UNSPEC` layout's union is undefined, so nothing reads it.**
+  ///
+  /// `AVChannelLayout`'s own header says the union must not be used for
+  /// `AV_CHANNEL_ORDER_UNSPEC`, and this crate had been reading
+  /// `u.mask` for every order that was not `CUSTOM`. Two valid
+  /// unspecified layouts of the same width therefore compared
+  /// **unequal** whenever whatever bytes happened to sit in that
+  /// storage differed — a wrong answer derived from memory neither
+  /// layout owns.
+  ///
+  /// The same was true of merely *printing* one: the derived `Debug`
+  /// delegated to `ffmpeg_next`'s formatter, which prints `u.mask`
+  /// unconditionally. Both are order-aware now; see `LayoutArm`.
+  #[test]
+  fn an_unspecified_layout_ignores_its_union() {
+    let unspec = |channels: i32, junk: u64| {
+      // SAFETY: a zeroed `AVChannelLayout` is a valid value. `UNSPEC`
+      // is the zero discriminant, and the union is written with bytes
+      // the order does not define — which is exactly the state under
+      // test.
+      let mut inner: ffmpeg_next::ffi::AVChannelLayout = unsafe { std::mem::zeroed() };
+      inner.order = AVChannelOrder::AV_CHANNEL_ORDER_UNSPEC;
+      inner.nb_channels = channels;
+      inner.u.mask = junk;
+      ChannelLayout(inner)
+    };
+    let format = Sample::I16(ffmpeg_next::format::sample::Type::Packed);
+
+    let plain = ResampleSpec::new(48_000, format, unspec(6, 0));
+    let junked = ResampleSpec::new(48_000, format, unspec(6, 0xDEAD_BEEF_DEAD_BEEF));
+    assert!(
+      plain == junked,
+      "two unspecified layouts of one width are one layout, whatever sits in storage the \
+       order does not define",
+    );
+    // The width is still the value, so a different one is a different
+    // layout.
+    assert!(plain != ResampleSpec::new(48_000, format, unspec(2, 0)));
+
+    // And `Debug` says the union is undefined rather than printing it.
+    let rendered = format!("{plain:?}");
+    assert!(
+      rendered.contains("undefined for this order"),
+      "an unspecified layout must not have its union printed: {rendered}",
+    );
+    assert!(
+      !rendered.contains("dead") && !rendered.contains("DEAD"),
+      "the junk must not reach a log line: {rendered}",
+    );
+    // A native layout does print its mask, which is what makes the
+    // line above a statement about the order rather than about `Debug`.
+    let native = ResampleSpec::new(48_000, format, ChannelLayout::STEREO);
+    assert!(format!("{native:?}").contains("mask"));
+  }
+
+  /// A `CUSTOM` layout is refused at construction — the invariant the
+  /// `unsafe impl Send` above rests on, and the reason a live
+  /// resampler's layouts are plain values.
+  #[test]
+  fn a_custom_layout_is_refused_at_construction() {
+    // SAFETY: a zeroed `AVChannelLayout` is a valid value; the fields
+    // below are set to a custom order declaring channels, and the
+    // pointer arm stays null — a shape a safe caller can build.
+    let mut inner: ffmpeg_next::ffi::AVChannelLayout = unsafe { std::mem::zeroed() };
+    inner.order = AVChannelOrder::AV_CHANNEL_ORDER_CUSTOM;
+    inner.nb_channels = 2;
+    let custom = ChannelLayout(inner);
+
+    let spec = ResampleSpec::new(
+      48_000,
+      Sample::I16(ffmpeg_next::format::sample::Type::Packed),
+      custom,
+    );
+    let target = ResampleSpec::new(
+      48_000,
+      Sample::I16(ffmpeg_next::format::sample::Type::Packed),
+      ChannelLayout::STEREO,
+    );
+    // Matched rather than formatted: the resampler is deliberately not
+    // `Debug`, so only the error side can be printed.
+    match FfmpegResampler::new(spec, target, FrameLimits::default()) {
+      Err(ResampleError::UnsupportedLayout(fault)) => {
+        assert_eq!(fault.end(), SpecEnd::Source);
+        assert_eq!(fault.channels(), 2);
+      }
+      Err(other) => panic!("a custom layout must be an unsupported layout, got {other:?}"),
+      Ok(_) => panic!("a custom layout must be refused at construction"),
+    }
+  }
+
   /// A 48 kHz packed-s16 stereo frame of silence, with the plane its
   /// header claims.
   fn stereo_frame(samples: u32) -> Frame {
@@ -2089,7 +2455,8 @@ mod tests {
       samples,
       2,
       SampleFormat::S16,
-      crate::channel_layout::channel_layout_description_from_ffmpeg(&ChannelLayout::STEREO),
+      crate::channel_layout::channel_layout_description_from_ffmpeg(&ChannelLayout::STEREO)
+        .expect("a stereo layout describes"),
       planes,
       1,
       AudioFrameExtra::default(),

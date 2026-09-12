@@ -1723,6 +1723,24 @@ pub(crate) fn bounded_clone_parameters_with(
     )));
   }
 
+  // **Structure before size, and long before the copy.**
+  //
+  // `measure_parameters` prices a custom map from `nb_channels` alone;
+  // it does not look at `u.map`. So a layout with a positive count and
+  // a null map passed the budget and reached the
+  // `av_channel_layout_copy` below, whose `memcpy` reads from that
+  // null — and a `NATIVE` count that disagrees with its mask, or an
+  // `AMBISONIC` layout whose channels form no ambisonic order, reached
+  // the same helper with the same absence of checking. One preflight,
+  // shared with the demux admission pass and the decoder, decides all
+  // of it and allocates nothing.
+  //
+  // SAFETY: `src` is a live `AVCodecParameters` owned by `source` for
+  // the duration of this call, and for a custom order its map is
+  // FFmpeg's own allocation of `nb_channels` entries.
+  unsafe { crate::channel_layout::layout_preflight(core::ptr::addr_of!((*src).ch_layout)) }
+    .map_err(|fault| crate::demuxer::layout_fault_to_demux(stream_index, fault))?;
+
   // SAFETY: `src` is a live `AVCodecParameters` owned by `source` for
   // the duration of this call.
   let footprint = unsafe { measure_parameters(src) }.ok_or_else(|| {

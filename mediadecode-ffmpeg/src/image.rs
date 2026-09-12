@@ -129,7 +129,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierImageDecoder<C> {
     // Use the checked codec-context builder — `Context::from_parameters`
     // is OOM-UB-prone (see `crate::decoder::build_codec_context`).
     let (ctx, callback_state) =
-      build_codec_context(&parameters, limits).map_err(ImageDecodeError::Decode)?;
+      build_codec_context(&parameters, limits, None).map_err(ImageDecodeError::Decode)?;
     // **Opened without ever forming a bindgen enum from FFmpeg memory.**
     // `Context::decoder().video()` looks cheap and is not: it resolves
     // the codec by reading `AVCodecParameters.codec_id` as the bindgen
@@ -432,7 +432,7 @@ impl InputTooLarge {
 /// are exhaustive for the mirror-image reason: their arms are the
 /// substrate's fixed state set, and there the wildcard would be dead
 /// weight hiding a state a consumer forgot.
-#[derive(thiserror::Error, Debug, Clone, IsVariant, Unwrap, TryUnwrap)]
+#[derive(thiserror::Error, Debug, IsVariant, Unwrap, TryUnwrap)]
 #[unwrap(ref, ref_mut)]
 #[try_unwrap(ref, ref_mut)]
 #[non_exhaustive]

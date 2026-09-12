@@ -413,7 +413,7 @@ fn drive(dec: &mut FfmpegVideoStreamDecoder, clip: &SyntheticClip) -> Vec<i64> {
   };
 
   for av_pkt in &clip.packets {
-    let vpkt = boundary::video_packet_from_ffmpeg(av_pkt)
+    let vpkt = boundary::video_packet_from_ffmpeg(av_pkt, mediadecode::Timebase::SECONDS)
       .expect("a wrappable payload")
       .expect("packet has a buffer");
     crate::accepted(dec.send_packet(&vpkt), "send_packet");
@@ -506,7 +506,7 @@ fn post_commit_failure_degrades_and_resyncs_at_next_keyframe() {
   // resync keyframe. Even if mpeg4 conceals frames from those lone P-frames, the
   // KEYFRAME-GATED guard must stay pending and no keyframe must be recorded.
   for av_pkt in clip.packets.iter().take(third_key) {
-    let vpkt = boundary::video_packet_from_ffmpeg(av_pkt)
+    let vpkt = boundary::video_packet_from_ffmpeg(av_pkt, mediadecode::Timebase::SECONDS)
       .expect("a wrappable payload")
       .expect("packet has a buffer");
     crate::accepted(dec.send_packet(&vpkt), "send_packet");
@@ -532,7 +532,7 @@ fn post_commit_failure_degrades_and_resyncs_at_next_keyframe() {
   // Phase 2: feed the resync keyframe and the remainder; the frame SW delivers
   // after the keyframe clears the guard.
   for av_pkt in clip.packets.iter().skip(third_key) {
-    let vpkt = boundary::video_packet_from_ffmpeg(av_pkt)
+    let vpkt = boundary::video_packet_from_ffmpeg(av_pkt, mediadecode::Timebase::SECONDS)
       .expect("a wrappable payload")
       .expect("packet has a buffer");
     crate::accepted(dec.send_packet(&vpkt), "send_packet");
@@ -725,7 +725,7 @@ fn post_commit_sw_open_failure_stays_on_hw_transactionally() {
   // touching it).
   let mut raw = Packet::new(16);
   raw.set_pts(Some(0));
-  let vpkt = boundary::video_packet_from_ffmpeg(&raw)
+  let vpkt = boundary::video_packet_from_ffmpeg(&raw, mediadecode::Timebase::SECONDS)
     .expect("a wrappable payload")
     .expect("packet has a buffer");
 
@@ -799,7 +799,7 @@ fn sw_replay_drain_surfaces_non_transient_decode_error() {
   let mut dst = crate::empty_owned_video_frame();
   let mut err = None;
   for av_pkt in &clip.packets {
-    let vpkt = boundary::video_packet_from_ffmpeg(av_pkt)
+    let vpkt = boundary::video_packet_from_ffmpeg(av_pkt, mediadecode::Timebase::SECONDS)
       .expect("a wrappable payload")
       .expect("packet has a buffer");
     if let Err(e) = dec.send_packet(&vpkt) {
@@ -899,7 +899,7 @@ fn sw_replay_deferred_error_surfaces_fallback_failed_at_commit() {
   let mut surfaced = None;
   let mut dst = crate::empty_owned_video_frame();
   for av_pkt in clip.packets.iter().take(fail_at + 1) {
-    let vpkt = boundary::video_packet_from_ffmpeg(av_pkt)
+    let vpkt = boundary::video_packet_from_ffmpeg(av_pkt, mediadecode::Timebase::SECONDS)
       .expect("a wrappable payload")
       .expect("packet has a buffer");
     match dec.send_packet(&vpkt) {
@@ -1072,7 +1072,7 @@ fn post_commit_fallback_never_resyncing_escalates_at_eof() {
 
   // HW decodes the whole stream 1:1 (no fallback yet).
   for av_pkt in &clip.packets {
-    let vpkt = boundary::video_packet_from_ffmpeg(av_pkt)
+    let vpkt = boundary::video_packet_from_ffmpeg(av_pkt, mediadecode::Timebase::SECONDS)
       .expect("a wrappable payload")
       .expect("packet has a buffer");
     crate::accepted(dec.send_packet(&vpkt), "send_packet");
@@ -1177,7 +1177,7 @@ fn post_commit_gap_counter_tallies_then_clears_on_resync() {
   // observable before any resync frame clears it.
   let mut dst = crate::empty_owned_video_frame();
   for av_pkt in clip.packets.iter().take(fail_at + 1) {
-    let vpkt = boundary::video_packet_from_ffmpeg(av_pkt)
+    let vpkt = boundary::video_packet_from_ffmpeg(av_pkt, mediadecode::Timebase::SECONDS)
       .expect("a wrappable payload")
       .expect("packet has a buffer");
     crate::accepted(dec.send_packet(&vpkt), "send_packet");
@@ -1230,7 +1230,7 @@ fn post_commit_gap_counter_tallies_then_clears_on_resync() {
   // P-frames, so concealed frames may land but the guard must stay pending.
   // Drain fully each time so the keyframe send below never hits SW backpressure.
   for av_pkt in clip.packets[(fail_at + 1)..third_key].iter() {
-    let vpkt = boundary::video_packet_from_ffmpeg(av_pkt)
+    let vpkt = boundary::video_packet_from_ffmpeg(av_pkt, mediadecode::Timebase::SECONDS)
       .expect("a wrappable payload")
       .expect("packet has a buffer");
     crate::accepted(dec.send_packet(&vpkt), "send_packet");
@@ -1247,9 +1247,10 @@ fn post_commit_gap_counter_tallies_then_clears_on_resync() {
   // frame's delivery clears the whole degraded state. The guard is still pending
   // here: the anchor is set, but no post-keyframe frame has been delivered yet.
   assert!(third_key < clip.packets.len(), "clip has a third keyframe");
-  let key_vpkt = boundary::video_packet_from_ffmpeg(&clip.packets[third_key])
-    .expect("a wrappable payload")
-    .expect("packet has a buffer");
+  let key_vpkt =
+    boundary::video_packet_from_ffmpeg(&clip.packets[third_key], mediadecode::Timebase::SECONDS)
+      .expect("a wrappable payload")
+      .expect("packet has a buffer");
   crate::accepted(dec.send_packet(&key_vpkt), "send_packet");
   assert!(
     dec.degraded_keyframe_seen_for_test(),
@@ -1266,7 +1267,7 @@ fn post_commit_gap_counter_tallies_then_clears_on_resync() {
     if resynced {
       break;
     }
-    let vpkt = boundary::video_packet_from_ffmpeg(av_pkt)
+    let vpkt = boundary::video_packet_from_ffmpeg(av_pkt, mediadecode::Timebase::SECONDS)
       .expect("a wrappable payload")
       .expect("packet has a buffer");
     crate::accepted(dec.send_packet(&vpkt), "send_packet");
@@ -1358,7 +1359,7 @@ fn post_commit_concealed_p_frame_does_not_clear_resync_escalates_at_eof() {
   // `fail_at`, and the GOP-2 P-frames — but NEVER the GOP-3 keyframe. Each drain
   // may deliver a concealed frame; none may clear the keyframe-gated guard.
   for av_pkt in clip.packets.iter().take(third_key) {
-    let vpkt = boundary::video_packet_from_ffmpeg(av_pkt)
+    let vpkt = boundary::video_packet_from_ffmpeg(av_pkt, mediadecode::Timebase::SECONDS)
       .expect("a wrappable payload")
       .expect("packet has a buffer");
     crate::accepted(dec.send_packet(&vpkt), "send_packet");
@@ -1462,7 +1463,7 @@ fn post_commit_retains_no_replay_frames() {
   // post-commit fallback. If the post-commit path drained frames into the replay
   // queue (the removed terminal-drain behaviour), they would sit there now.
   for av_pkt in clip.packets.iter().take(fail_at + 1) {
-    let vpkt = boundary::video_packet_from_ffmpeg(av_pkt)
+    let vpkt = boundary::video_packet_from_ffmpeg(av_pkt, mediadecode::Timebase::SECONDS)
       .expect("a wrappable payload")
       .expect("packet has a buffer");
     crate::accepted(dec.send_packet(&vpkt), "send_packet");
@@ -1485,7 +1486,7 @@ fn post_commit_retains_no_replay_frames() {
   // — the SW decoder delivers directly from itself, never from a replay buffer.
   let mut dst = crate::empty_owned_video_frame();
   for av_pkt in clip.packets.iter().skip(fail_at + 1) {
-    let vpkt = boundary::video_packet_from_ffmpeg(av_pkt)
+    let vpkt = boundary::video_packet_from_ffmpeg(av_pkt, mediadecode::Timebase::SECONDS)
       .expect("a wrappable payload")
       .expect("packet has a buffer");
     crate::accepted(dec.send_packet(&vpkt), "send_packet");
@@ -1615,7 +1616,8 @@ fn fx3_high_422_10bit_falls_back_to_software_and_decodes_whole_stream() {
     }
     let is_key = packet.is_key();
     let pkt_pts = packet.pts();
-    let Some(vpkt) = boundary::video_packet_from_ffmpeg(&packet).expect("a wrappable payload")
+    let Some(vpkt) = boundary::video_packet_from_ffmpeg(&packet, mediadecode::Timebase::SECONDS)
+      .expect("a wrappable payload")
     else {
       continue; // empty packet (no payload) — skip
     };
@@ -1903,7 +1905,7 @@ fn the_cold_fallback_forwards_keep_the_allocator_refusal() {
 
   // **The packet arm**, exactly as `degrade_to_sw_inner` drives it:
   // capture the state, forward, route the error.
-  let mut sw = super::open_sw_decoder(&clip.parameters, limits).expect("open sw");
+  let mut sw = super::open_sw_decoder(&clip.parameters, limits, None).expect("open sw");
   let state = sw.state();
   let refusal = sw
     .send_packet(&clip.packets[0])
@@ -1916,7 +1918,7 @@ fn the_cold_fallback_forwards_keep_the_allocator_refusal() {
 
   // **The EOF arm**, driven on a decoder that has something to flush so
   // the call can actually refuse — see the reachability note above.
-  let mut sw = super::open_sw_decoder(&clip.parameters, limits).expect("open sw");
+  let mut sw = super::open_sw_decoder(&clip.parameters, limits, None).expect("open sw");
   let state = sw.state();
   // Feed without collecting, so whatever the decoder buffers is still
   // pending when EOF arrives.
@@ -1933,7 +1935,7 @@ fn the_cold_fallback_forwards_keep_the_allocator_refusal() {
   // refuses cost, not fallbacks.
   let generous = DecoderLimits::new()
     .with_frame(FrameLimits::new().with_max_frame_bytes(crate::DEFAULT_MAX_FRAME_BYTES));
-  let mut sw = super::open_sw_decoder(&clip.parameters, generous).expect("open sw");
+  let mut sw = super::open_sw_decoder(&clip.parameters, generous, None).expect("open sw");
   let state = sw.state();
   sw.send_packet(&clip.packets[0])
     .map_err(|e| crate::decoder::software_exit(state, e))
@@ -2897,7 +2899,7 @@ fn the_software_path_opens_without_probing_anything() {
   let mut dst = crate::empty_owned_video_frame();
   let mut delivered = 0usize;
   for av_pkt in &clip.packets {
-    let vpkt = boundary::video_packet_from_ffmpeg(av_pkt)
+    let vpkt = boundary::video_packet_from_ffmpeg(av_pkt, mediadecode::Timebase::SECONDS)
       .expect("a wrappable payload")
       .expect("packet has a buffer");
     crate::accepted(dec.send_packet(&vpkt), "send_packet");
@@ -3007,7 +3009,7 @@ fn a_hardware_pin_reports_a_mid_stream_exhaustion_instead_of_degrading() {
     let mut dst = crate::empty_owned_video_frame();
     let mut refusal = None;
     for av_pkt in &clip.packets {
-      let vpkt = boundary::video_packet_from_ffmpeg(av_pkt)
+      let vpkt = boundary::video_packet_from_ffmpeg(av_pkt, mediadecode::Timebase::SECONDS)
         .expect("a wrappable payload")
         .expect("packet has a buffer");
       match dec.send_packet(&vpkt) {
@@ -3051,7 +3053,7 @@ fn a_hardware_pin_reports_a_frame_time_exhaustion_too() {
   )
   .expect("build a pinned test decoder");
 
-  let vpkt = boundary::video_packet_from_ffmpeg(&clip.packets[0])
+  let vpkt = boundary::video_packet_from_ffmpeg(&clip.packets[0], mediadecode::Timebase::SECONDS)
     .expect("a wrappable payload")
     .expect("packet has a buffer");
   crate::accepted(dec.send_packet(&vpkt), "send_packet");
@@ -3089,7 +3091,7 @@ fn a_hardware_pin_reports_an_exhaustion_raised_at_eof() {
   )
   .expect("build a pinned test decoder");
 
-  let vpkt = boundary::video_packet_from_ffmpeg(&clip.packets[0])
+  let vpkt = boundary::video_packet_from_ffmpeg(&clip.packets[0], mediadecode::Timebase::SECONDS)
     .expect("a wrappable payload")
     .expect("packet has a buffer");
   crate::accepted(dec.send_packet(&vpkt), "send_packet");
@@ -3135,7 +3137,7 @@ fn the_auto_path_still_degrades_where_a_pin_would_not() {
 
   let mut dst = crate::empty_owned_video_frame();
   for av_pkt in clip.packets.iter().take(2) {
-    let vpkt = boundary::video_packet_from_ffmpeg(av_pkt)
+    let vpkt = boundary::video_packet_from_ffmpeg(av_pkt, mediadecode::Timebase::SECONDS)
       .expect("a wrappable payload")
       .expect("packet has a buffer");
     crate::accepted(dec.send_packet(&vpkt), "send_packet");

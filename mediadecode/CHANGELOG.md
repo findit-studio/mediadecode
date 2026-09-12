@@ -11,40 +11,52 @@ The sibling FFmpeg adapter has its own log at
 
 ## [Unreleased]
 
-### Removed (BREAKING)
+## [0.15.0] - 2026-09-11
 
-- **The optional `ingraph` feature is gone, whole** — the feature
-  itself, its `dep:ingraph` row, the `mediadecode::ingraph` module it
-  gated, and that module's tests. Deleted, not deprecated: this is the
-  0.x line, and no alias survives.
+### Added
 
-  The feature self-granted [`packet::PacketFlags`] citizenship in the
-  indexing framework ([#49]), which put the dependency edge backwards —
-  a vocabulary crate depending on the framework that reads it, rather
-  than the framework depending on the vocabulary crate the way it
-  already does for `mediaframe` and `mediatime`. The direction is
-  reversed now: `PacketFlags`' citizenship lives behind **`ingraph`'s
-  own `mediadecode` feature** instead ([ingraph#524]), carrying six of
-  this module's seven rows — `FlagsValue`, `FlagsFilterMarker`,
-  `DefaultMarker`, `DefaultVecMarker`, `ColumnKind`, `ColumnEq`. A
-  consumer reading, defaulting or comparing a `PacketFlags` column
-  turns this crate's `ingraph` feature off and `ingraph`'s own
-  `mediadecode` feature on instead — nothing about `PacketFlags` itself
-  changed shape.
+- **The container's table of contents crosses the demux seam:
+  `demuxer::Chapter`, and a *provided* `Demuxer::chapters`.**
 
-  **`CursorValue` does not cross, and that is not an oversight.**
-  `ingraph`'s bare-seat citizenship deliberately withholds the
-  keyset-cursor row: a flags column's cursor domain is the declared bit
-  mask, which is a storage-tier precondition the read-side citizenship
-  this feature (and its replacement) grants does not carry — the
-  module's own note argues this at length, and a dedicated test on that
-  side asserts the absence rather than leaving it implicit. A consumer
-  that paged a `PacketFlags` column by keyset cursor loses that
-  capability here; it returns only if and when `ingraph` grows the
-  storage half for this citizen.
+  A chapter is a named stretch of the **file's** timeline the container
+  itself declares — a DVD-style scene marker, a podcast segment, a
+  Matroska `ChapterAtom`. It belongs to no track, so it has no seat on
+  `TrackInfo`, and until now the only road to one was whatever escape
+  hatch a backend happened to expose.
 
-  [#49]: https://github.com/findit-studio/mediadecode/issues/49
-  [ingraph#524]: https://github.com/findit-studio/ingraph/pull/524
+  `Chapter<E: DemuxAdapter>` carries exactly what a container writes:
+  `id` — the **container's** id, not the row's position — a `timebase`
+  of the chapter's own, `start` and `end` expressed in it, and an
+  optional `title` on the adapter's `Text` carrier. House shape
+  throughout: private fields, `new`, `const` getters, `with_title` /
+  `set_title`. `Debug` unconditionally; `Clone` where `E::Text: Clone`,
+  `PartialEq` where `E::Text: PartialEq` — each hand-written, so the
+  bound lands on `E::Text` rather than on a flat `E` that no field
+  needs.
+
+  Two shape decisions, both argued in the type's own docs:
+
+  - **`Clone`, unlike `TrackInfo`.** The message-carrier law that keeps
+    `Clone` off a track row is about cost — a row carries backend
+    metadata down to codec parameters. A chapter is four scalars and a
+    title, so there is no deep copy here for the law to forbid, and no
+    `TrackHandle`-style carrier seat worth minting to avoid one.
+  - **Two instants, not one `TimeRange`.** `TimeRange`'s constructor
+    refuses `end < start`, which is precisely the row a container can
+    write and this tier has to be able to report. The span is
+    reported, never repaired: deciding what an inverted span *means*
+    takes a policy a demux tier does not have, and a clamp applied
+    here would be indistinguishable downstream from a file that was
+    well formed all along.
+
+  **`Demuxer::chapters(&self) -> &[Chapter<Self::Adapter>]` is
+  provided**, answering an empty slice — so every implementor written
+  before the seat existed compiles unchanged *and* answers correctly:
+  most files declare no chapters, and a format that cannot carry them
+  has nothing to override. Rows come back by borrow rather than through
+  a handle seat, for the same reason `Chapter` is `Clone`. The table is
+  read under the track table's rules: held for the session's whole
+  life, non-destructive, no ordering rule at all.
 
 ## [0.14.0] - 2026-09-02
 
@@ -81,6 +93,41 @@ The sibling FFmpeg adapter has its own log at
   `cargo hack clippy / build / test -p mediadecode --feature-powerset
   --exclude-no-default-features` and `cargo fmt --check`, stable
   toolchain, all clean with zero source change.
+
+### Removed (BREAKING)
+
+- **The optional `ingraph` feature is gone, whole** — the feature
+  itself, its `dep:ingraph` row, the `mediadecode::ingraph` module it
+  gated, and that module's tests. Deleted, not deprecated: this is the
+  0.x line, and no alias survives.
+
+  The feature self-granted [`packet::PacketFlags`] citizenship in the
+  indexing framework ([#49]), which put the dependency edge backwards —
+  a vocabulary crate depending on the framework that reads it, rather
+  than the framework depending on the vocabulary crate the way it
+  already does for `mediaframe` and `mediatime`. The direction is
+  reversed now: `PacketFlags`' citizenship lives behind **`ingraph`'s
+  own `mediadecode` feature** instead ([ingraph#524]), carrying six of
+  this module's seven rows — `FlagsValue`, `FlagsFilterMarker`,
+  `DefaultMarker`, `DefaultVecMarker`, `ColumnKind`, `ColumnEq`. A
+  consumer reading, defaulting or comparing a `PacketFlags` column
+  turns this crate's `ingraph` feature off and `ingraph`'s own
+  `mediadecode` feature on instead — nothing about `PacketFlags` itself
+  changed shape.
+
+  **`CursorValue` does not cross, and that is not an oversight.**
+  `ingraph`'s bare-seat citizenship deliberately withholds the
+  keyset-cursor row: a flags column's cursor domain is the declared bit
+  mask, which is a storage-tier precondition the read-side citizenship
+  this feature (and its replacement) grants does not carry — the
+  module's own note argues this at length, and a dedicated test on that
+  side asserts the absence rather than leaving it implicit. A consumer
+  that paged a `PacketFlags` column by keyset cursor loses that
+  capability here; it returns only if and when `ingraph` grows the
+  storage half for this citizen.
+
+  [#49]: https://github.com/findit-studio/mediadecode/issues/49
+  [ingraph#524]: https://github.com/findit-studio/ingraph/pull/524
 
 ## [0.13.0] - 2026-09-01
 
