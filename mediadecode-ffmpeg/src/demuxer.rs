@@ -737,12 +737,14 @@ fn path_cstring(path: &Path) -> Result<CString, ffmpeg_next::Error> {
 /// finished, with libavformat's own account of how it came by it.
 ///
 /// `AVFormatContext.duration` counts `AV_TIME_BASE` ticks —
-/// microseconds — and is `AV_NOPTS_VALUE` where nothing is known, so
-/// the figure is carried in that timebase rather than rescaled: exact,
-/// and comparable with any track's timestamps, because a [`Timestamp`]
-/// compares by the instant it names. A value that is not positive
-/// reports no length and answers `None`, the rule a track's duration
-/// follows.
+/// microseconds — and is `AV_NOPTS_VALUE` where nothing is known. The
+/// raw microsecond **length** is preserved without rescaling, so
+/// nothing is rounded. Being a length, it cannot be compared with a
+/// track's coordinates — its timestamps and its measured end, which are
+/// positions on that track's timeline — until the track's start time
+/// and any presentation edits have been applied. A value that is not
+/// positive reports no length and answers `None`, the rule a track's
+/// duration follows.
 ///
 /// The account is `AVFormatContext.duration_estimation_method`,
 /// libavformat's record of how it estimated the figure, read as the raw
@@ -1281,8 +1283,10 @@ macro_rules! demuxer_lane_face {
       /// appears only after probing is libavformat's fill, which hands a
       /// stream that supplied no timing the container's length, so it is
       /// not carried; neither is one for a stream libavformat creates
-      /// during probing. For a track's length measured from its packets,
-      /// see [`measured_end`](Demuxer::measured_end).
+      /// during probing. The last packet end this backend observed on
+      /// the track's timeline is [`measured_end`](Demuxer::measured_end);
+      /// a length needs the track's start and its presentation edits
+      /// applied, which is the composer's job.
       ///
       /// Reading the table takes nothing away — clone the handles worth
       /// keeping. `Arc` is the carrier because
@@ -4070,7 +4074,8 @@ mod tests {
   /// stands in for one read, part-way through — libavformat words
   /// damage differently in every container, and the policy for it is
   /// one — and the walk still carries on and still delivers every
-  /// packet, but its figure is no longer the file's measured end.
+  /// packet, but its figure is no longer one a complete walk stands
+  /// behind.
   #[test]
   fn a_corrupt_read_the_session_skips_keeps_the_walk_from_being_complete() {
     let mut clean = open_silence(5);
@@ -4100,7 +4105,7 @@ mod tests {
     let figure = skipped.measured_end(TrackIndex::new(0)).expect("a figure");
     assert!(
       !figure.walk_complete(),
-      "a read was skipped as corrupt, so the figure is not the file's measured end",
+      "a read was skipped as corrupt, so the walk is not complete",
     );
     assert_eq!(
       figure.end(),
@@ -4130,7 +4135,7 @@ mod tests {
       .expect("the first packet's figure");
     assert!(
       !figure.walk_complete(),
-      "packets were passed by, so the figure is not the file's measured end",
+      "packets were passed by, so the walk is not complete",
     );
   }
 
@@ -4159,7 +4164,7 @@ mod tests {
       .expect("the first packet's figure");
     assert!(
       !figure.walk_complete(),
-      "packets were passed by, so the figure is not the file's measured end",
+      "packets were passed by, so the walk is not complete",
     );
   }
 

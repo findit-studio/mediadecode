@@ -791,7 +791,8 @@ fn a_walk_to_end_of_file_agrees_with_the_container_within_one_frame() {
     assert!(
       within(measured.end(), reported, one_frame()),
       "track {index} ({:?}): the measured end {} is within one frame of the container's \
-       figure {reported}",
+       figure {reported} (the fixture's tracks start at zero, so an endpoint and a length \
+       name the same instant)",
       track.kind(),
       measured.end(),
     );

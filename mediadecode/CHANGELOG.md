@@ -17,13 +17,15 @@ The sibling FFmpeg adapter has its own log at
   library's account of it: a *provided* `Demuxer::duration` answering
   `Option<ContainerDuration>`.**
 
-  A file's length is read in layers, and each layer is answered by its
-  own method. This one is the figure the library reports for the file as
-  a whole, `ContainerDuration::value`, while `TrackInfo::duration` stays
-  the library's figure for one track. A track the library reported none
-  for stays `None`: Matroska reports a length for the file and none for
-  any track, and the container's figure is never copied onto a row by
-  this tier.
+  The figures that bear on a file's duration come in layers, and each
+  layer is answered by its own method. Two are lengths — the
+  container-level figure and a track's — and one is an endpoint, the
+  walk's measured end. This method is the first: the figure the library
+  reports for the file as a whole, `ContainerDuration::value`, while
+  `TrackInfo::duration` stays the library's figure for one track. A
+  track the library reported none for stays `None`: Matroska reports a
+  length for the file and none for any track, and the container's
+  figure is never copied onto a row by this tier.
 
   The figure carries how the library says it came by it,
   `ContainerDuration::source`, in libavformat's own three words and no

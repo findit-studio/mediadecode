@@ -112,11 +112,11 @@ impl Measured {
   /// with no payload is a real endpoint, and a later one is the end.
   ///
   /// **An end that does not fit in an `i64` is no end.** Saturating
-  /// would record `i64::MAX` as though the file had ended there, and
+  /// would record `i64::MAX` as though the track had ended there, and
   /// end of file would then return it as an exact figure over a
   /// complete walk. The track answers none from then on, and the walk
-  /// stops being complete too: the other tracks' figures cannot be
-  /// called the file's measured end while one track's is missing.
+  /// stops being complete too: the other tracks' figures are not marked
+  /// complete while one track's end is missing.
   ///
   /// A completed walk is frozen and ignores the packet.
   pub(crate) fn observe(&mut self, track: usize, pts: Option<i64>, duration: i64) {

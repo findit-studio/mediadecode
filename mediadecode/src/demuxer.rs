@@ -1918,8 +1918,10 @@ where
 ///
 /// # Durations
 ///
-/// A file's duration is read in layers, and each layer is answered by
-/// its own method so that none is mistaken for another:
+/// The figures that bear on a file's duration come in layers, and each
+/// layer is answered by its own method so that none is mistaken for
+/// another. Two are lengths — the container-level figure and a track's
+/// — and one is an endpoint, the walk's measured end:
 ///
 /// - [`duration`](Self::duration) is the **container-level** figure the
 ///   library reports for the file as a whole — a *length* — with the
@@ -2344,7 +2346,8 @@ mod tests {
       reported,
       ContainerDuration::new(figure, DurationSource::FromBitrate),
     );
-    // ...while the figure itself compares as the instant it names.
+    // ...while the figure itself compares by the quantity it names, in
+    // whichever ruler it is written.
     assert_eq!(
       reported,
       ContainerDuration::new(
