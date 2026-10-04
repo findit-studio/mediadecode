@@ -32,12 +32,12 @@ The sibling FFmpeg adapter has its own log at
   duration") and `FromBitrate` ("Duration estimated from bitrate (less
   accurate)"), plus `Unknown` for an account the build cannot name,
   which is never folded into an estimate. None of them says that a
-  header declares the figure, and the type does not rank them; a
-  measured end that is complete and exact is a stronger figure than any
-  arm, and one that is not is a lower bound to compose with it.
-  `TrackInfo::duration`'s doc now says it is the library's figure from
-  before probing and no claim about the file, and points at
-  `measured_end` as the per-track figure measured from packets.
+  header declares the figure, and the type does not rank them. The
+  figure is a *length*, and the walk's measured end is an endpoint on a
+  track's timeline — different quantities that this tier neither ranks
+  nor converts. `TrackInfo::duration`'s doc now says it is the
+  library's figure from before probing and no claim about the file, and
+  points at `measured_end` for what the packets themselves show.
 
   Provided, answering `None`, so every implementor written before the
   method existed compiles unchanged and answers correctly. Like the two
@@ -48,14 +48,21 @@ The sibling FFmpeg adapter has its own log at
 
   `measured_end(track)` answers where a track's packets ended — the
   greatest `pts + duration` over the timed packets the session read on
-  it, an instant on the track's own timeline — with two independent
+  it, an endpoint on the track's own timeline — with two independent
   qualifications. `MeasuredEnd::exact` is `false`, for good, from the
-  first packet on the track whose duration is not positive (libavformat
-  writes zero for one it does not know) or that was delivered with no
-  timestamp: the end then advances to that packet's `pts` only, and is
-  a lower bound. Complete and exact, a measured end is the strongest
-  figure the tier reports; an inexact one is a lower bound for the
-  reader to compose with the container's figure.
+  first timed packet read with a duration that is not positive
+  (libavformat writes zero for one it does not know) or the first packet
+  read with no usable timestamp: the end then advances to that packet's
+  `pts` only, or not at all, and is a lower bound. The mark is made when
+  the packet is read, so it does not depend on whether the packet is
+  then delivered, refused or parked. A measured end promises only that
+  it is exact when `exact`, covering what `walk_complete` says.
+
+  It is an endpoint, not a length. The container's duration is a
+  length, and a track that starts at ten seconds and runs for two ends
+  at twelve against a container duration of two. Turning an end into a
+  length means subtracting the track's start and honouring presentation
+  edits, which is the composer's job and not this crate's.
 
   `MeasuredEnd::walk_complete` is `false` for a figure *so far* and
   turns `true` only once every packet the library delivered to the

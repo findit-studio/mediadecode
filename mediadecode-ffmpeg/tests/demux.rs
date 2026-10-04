@@ -756,7 +756,7 @@ fn a_walk_to_end_of_file_measures_each_track_exactly() {
 }
 
 /// **Each track's measured end agrees with the container's figure to
-/// within one frame.**
+/// within one frame — on a fixture whose tracks start at zero.**
 ///
 /// The two are independent: the muxer wrote the container's figure from
 /// its own packets, and the walk measured these ones. Every track of
@@ -765,6 +765,12 @@ fn a_walk_to_end_of_file_measures_each_track_exactly() {
 /// last packet's duration misses on the video track (one frame short of
 /// its own end, a frame and a half short of the container's) and by a
 /// whole second on the subtitles.
+///
+/// The agreement is the fixture's, not a law about the two quantities.
+/// An end is an endpoint on a track's timeline and the container's
+/// duration is a length; they name the same instant here only because
+/// every track starts at zero. A track that started at ten seconds
+/// would end at twelve against a length of two.
 #[test]
 fn a_walk_to_end_of_file_agrees_with_the_container_within_one_frame() {
   let Some(corpus) = Corpus::new() else { return };
@@ -796,7 +802,10 @@ fn a_walk_to_end_of_file_agrees_with_the_container_within_one_frame() {
 ///
 /// The container's figure, the longest track's own and the greatest
 /// measured end all name the clip's length, within one frame of one
-/// another — and each track's measured end equals the raw walk's.
+/// another — and each track's measured end equals the raw walk's. As
+/// in the Matroska lane, the agreement is the fixture's: its tracks
+/// start at zero, which is what lets an endpoint and a length name the
+/// same instant.
 #[test]
 fn an_mp4_walk_measures_the_length_its_container_and_tracks_report() {
   let Some(corpus) = Corpus::new() else { return };

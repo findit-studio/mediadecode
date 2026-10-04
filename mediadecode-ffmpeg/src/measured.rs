@@ -9,6 +9,11 @@
 //! nothing of its own, so there is no seek-to-end probe and no second
 //! pass over the file.
 //!
+//! The figure is an **endpoint on the track's own timeline**, not a
+//! length: turning it into one means subtracting the track's start and
+//! honouring presentation edits, which is the composer's job and not
+//! this module's.
+//!
 //! # Lifecycle
 //!
 //! The walk is *unbroken* from the session's first read until something
@@ -96,11 +101,14 @@ impl Measured {
   /// a lower bound. A duration libavformat derived from the stream's
   /// frame rate or frame size for a packet whose demuxer wrote none
   /// counts as a duration here, and is only as exact as that derivation.
-  /// A packet without a `pts` has no end to place and is passed over; a
-  /// *delivered* one makes the end inexact through
-  /// [`untimed_delivery`](Self::untimed_delivery).
   ///
-  /// The caller observes **before any payload filter**: a timed packet
+  /// A packet **read** without a usable `pts` has no end to place: it
+  /// moves no figure, and it makes the track's end inexact too. That
+  /// holds whether or not the packet carries a payload and whatever
+  /// becomes of it afterwards — delivered, refused or parked.
+  ///
+  /// The caller observes **before the payload conversion**, which is
+  /// what makes both marks independent of its outcome: a timed packet
   /// with no payload is a real endpoint, and a later one is the end.
   ///
   /// **An end that does not fit in an `i64` is no end.** Saturating
@@ -115,8 +123,11 @@ impl Measured {
     if self.walk_complete {
       return;
     }
-    let Some(pts) = pts else { return };
     let Some(slot) = self.ends.get_mut(track) else {
+      return;
+    };
+    let Some(pts) = pts else {
+      slot.exact = false;
       return;
     };
     let end = if duration > 0 {
@@ -137,19 +148,6 @@ impl Measured {
       Figure::End(seen) => Figure::End(seen.max(end)),
       Figure::Unrepresentable => Figure::Unrepresentable,
     };
-  }
-
-  /// A packet was **delivered** on `track` with no usable `pts`. Its end
-  /// cannot be placed, so the track's end is a lower bound. An untimed
-  /// packet with nothing in it is never delivered and never reaches
-  /// here. A completed walk is frozen and ignores it.
-  pub(crate) fn untimed_delivery(&mut self, track: usize) {
-    if self.walk_complete {
-      return;
-    }
-    if let Some(slot) = self.ends.get_mut(track) {
-      slot.exact = false;
-    }
   }
 
   /// The session answered end of file. The walk is complete only if it

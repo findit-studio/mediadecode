@@ -86,13 +86,28 @@ fn a_track_whose_packets_all_carry_a_duration_is_exact() {
   assert!(figure.exact());
 }
 
-/// A packet that was delivered with no timestamp has no end to place,
-/// so the end is a lower bound — and the figure itself does not move.
+/// A packet that was read with no timestamp has no end to place, so the
+/// end is a lower bound — and the figure itself does not move. The mark
+/// is made when the packet is read, whatever becomes of it after.
 #[test]
-fn a_delivered_packet_without_a_timestamp_makes_the_end_a_lower_bound() {
+fn a_packet_read_without_a_timestamp_makes_the_end_a_lower_bound() {
   let mut m = Measured::new(1).expect("reserve");
   m.observe(0, Some(0), 40);
-  m.untimed_delivery(0);
+  m.observe(0, None, 0);
+  let figure = m.get(0, ms()).expect("measured");
+  assert_eq!(figure.end(), at(40));
+  assert!(!figure.exact());
+}
+
+/// The mark does not need a figure to land on: a track whose first
+/// packet has no timestamp is already inexact when its first end
+/// arrives.
+#[test]
+fn a_timestamp_less_first_packet_leaves_the_track_inexact_for_good() {
+  let mut m = Measured::new(1).expect("reserve");
+  m.observe(0, None, 40);
+  assert_eq!(m.get(0, ms()), None, "no end yet");
+  m.observe(0, Some(0), 40);
   let figure = m.get(0, ms()).expect("measured");
   assert_eq!(figure.end(), at(40));
   assert!(!figure.exact());
@@ -142,7 +157,7 @@ fn each_track_keeps_its_own_figure_and_a_stray_index_is_ignored() {
   m.observe(0, Some(1_960), 40);
   m.observe(1, Some(3), 1);
   m.observe(7, Some(99), 1);
-  m.untimed_delivery(7);
+  m.observe(7, None, 0);
   assert_eq!(end_of(&m, 0), Some(at(2_000)));
   assert_eq!(
     m.get(1, Timebase::SECONDS).map(|e| e.end()),
@@ -231,8 +246,12 @@ fn a_completed_walk_is_frozen() {
   );
   m.observe(0, Some(2_000), 0);
   assert_eq!(m.get(0, ms()), Some(frozen), "nor does an unknown duration");
-  m.untimed_delivery(0);
-  assert_eq!(m.get(0, ms()), Some(frozen), "nor an untimed delivery");
+  m.observe(0, None, 0);
+  assert_eq!(
+    m.get(0, ms()),
+    Some(frozen),
+    "nor a packet with no timestamp"
+  );
   m.observe(0, Some(i64::MAX - 1), 40);
   assert_eq!(m.get(0, ms()), Some(frozen), "nor an unrepresentable end");
 }

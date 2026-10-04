@@ -49,11 +49,19 @@ The backend-agnostic core it adapts has its own log at
 
   `MeasuredEnd::exact` turns `false`, for good, the first time a timed
   packet on the track is read with a duration that is not positive
-  (libavformat writes zero for one it does not know) or is delivered
-  with no usable `pts`: the end advances to that packet's `pts` only and
-  the figure is a lower bound. A duration libavformat derived from the
-  stream's frame rate or frame size counts as a duration, and is only
-  as exact as that derivation.
+  (libavformat writes zero for one it does not know) or a packet on it
+  is read with no usable `pts`: the end advances to that packet's `pts`
+  only, or not at all, and the figure is a lower bound. The mark is made
+  when the packet is read, before the payload conversion, so it does not
+  depend on whether the packet is then delivered, refused or parked, nor
+  on whether it carries a payload. A duration libavformat derived from
+  the stream's frame rate or frame size counts as a duration, and is
+  only as exact as that derivation.
+
+  The figure is an endpoint on the track's own timeline, not a length:
+  the container's duration is a length, and turning an end into one
+  means subtracting the track's start and honouring presentation edits,
+  which is the composer's job and not this crate's.
 
   `MeasuredEnd::walk_complete` holds once a walk that skipped nothing
   has answered `Ok(None)`, and a complete walk is frozen: a later read
@@ -78,15 +86,18 @@ The backend-agnostic core it adapts has its own log at
 
   Pinned against real containers and against a hand-built WAV: every
   timed track of a subtitled Matroska and of an MP4 measures exactly
-  what a bare `av_read_frame` loop sees and agrees with the container's
-  own figure to within a frame; a walk stopped early answers a figure
-  marked as not complete; and a seek, a dropped packet, a skipped
-  corrupt read, a stream the table never described (an MPEG transport
-  stream that adds audio mid-file), a track of unknown kind and an
-  unrepresentable end each keep a walk from being called complete,
-  while a timed empty packet at the end moves the measured end, a last
-  packet with no duration leaves the end a lower bound, and a complete
-  walk stays frozen through a later seek.
+  what a bare `av_read_frame` loop sees; on those fixtures, whose tracks
+  start at zero, an endpoint and the container's length name the same
+  instant, and the two agree to within a frame; a walk stopped early
+  answers a figure marked as not complete; and a seek, a dropped
+  packet, a skipped corrupt read, a stream the table never described
+  (an MPEG transport stream that adds audio mid-file), a track of
+  unknown kind and an unrepresentable end each keep a walk from being
+  called complete, while a timed empty packet at the end moves the
+  measured end, a last packet with no duration leaves the end a lower
+  bound, a packet read with no `pts` leaves it a lower bound even when
+  its conversion is refused, and a complete walk stays frozen through a
+  later seek.
 
 ### Fixed
 

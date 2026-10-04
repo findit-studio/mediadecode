@@ -816,8 +816,9 @@ impl<E: DemuxAdapter> TrackInfo<E> {
   /// container's own figure ([`Demuxer::duration`]) is never copied
   /// onto it.
   ///
-  /// The per-track figure measured from packets is
-  /// [`Demuxer::measured_end`], exact when it says so.
+  /// What the packets themselves show is [`Demuxer::measured_end`]: an
+  /// endpoint on the track's timeline rather than a length, exact when
+  /// it says so.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn duration(&self) -> Option<Timestamp> {
     self.duration
@@ -1169,9 +1170,11 @@ where
 /// Each names what libavformat *did* to produce the figure; none says
 /// that a header declares it, and none should be read as if it did.
 /// Which to trust, and how far, is the consumer's call — this type
-/// reports and does not rank. A [`MeasuredEnd`] that is complete and
-/// exact is a stronger figure than any arm here; one that is not is a
-/// lower bound for the reader to compose with the container's figure.
+/// reports and does not rank.
+///
+/// The figure these arms account for is a **length**, and a
+/// [`MeasuredEnd`] is an endpoint on a track's timeline: different
+/// quantities, which this type does not set against each other.
 ///
 /// Carried by [`ContainerDuration`], so the account travels with the
 /// figure.
@@ -1183,11 +1186,9 @@ pub enum DurationSource {
   /// libavformat estimated the duration from packet timestamps — for an
   /// MPEG program or transport stream, the ones at the tail of the
   /// file. An estimate made from timestamps, and one libavformat itself
-  /// calls accurate; a measured end that is complete and exact is
-  /// stronger. This
-  /// arm's value is zero, which is also what the field holds until
-  /// libavformat sets it, so the label alone does not prove that
-  /// packets were read.
+  /// calls accurate. This arm's value is zero, which is also what the
+  /// field holds until libavformat sets it, so the label alone does not
+  /// prove that packets were read.
   FromPts,
   /// `AVFMT_DURATION_FROM_STREAM`. libavformat's words: "Duration
   /// estimated from a stream with a known duration".
@@ -1205,8 +1206,7 @@ pub enum DurationSource {
   ///
   /// libavformat divided the file's size by a bitrate, and says itself
   /// that this is the less accurate way: it is exact only for a
-  /// constant bitrate over a file that is all media. A measured end
-  /// that is complete and exact is stronger.
+  /// constant bitrate over a file that is all media.
   FromBitrate,
   /// An account this build cannot name: libavformat recorded a method
   /// it has no word for here, or the backend has a figure and no
@@ -1222,6 +1222,10 @@ pub enum DurationSource {
 /// one, and [`source`](Self::source) is how the library says it came by
 /// it. Read the two together — the same number means one thing read off
 /// timestamps and another divided out of a bitrate.
+///
+/// The figure is a **length**: how long the library says the file runs.
+/// It is not an endpoint on any track's timeline, and it is not
+/// interchangeable with a [`MeasuredEnd`].
 ///
 /// It is the *container's* figure and no track's: a track's own comes
 /// through [`TrackInfo::duration`], or is absent.
@@ -1265,34 +1269,42 @@ impl ContainerDuration {
 ///
 /// What [`Demuxer::measured_end`] answers. [`end`](Self::end) is the
 /// greatest packet end — a packet's timestamp plus its duration — over
-/// the timed packets the session read on the track. It is qualified by
+/// the timed packets the session read on the track: an **endpoint on
+/// that track's own timeline**, in its own timebase. It is qualified by
 /// [`walk_complete`](Self::walk_complete), whether the walk that
 /// measured it covered the file, and by [`exact`](Self::exact), whether
 /// every packet's end was actually known.
 ///
-/// A measured end is **exact only when `exact` holds**; otherwise it is
-/// a lower bound. Complete *and* exact, it is the strongest figure this
-/// tier reports for the track. An inexact one is a lower bound a reader
-/// composes with the container's figure ([`Demuxer::duration`]), and
-/// which to trust is the consumer's call.
+/// That is the figure's whole promise: **exact when `exact` holds,
+/// otherwise a lower bound, and covering what `walk_complete` says.**
 ///
-/// # An instant, not a length
+/// # An endpoint, not a length
 ///
-/// It is *when* the last packet ends, on the track's own timeline and
-/// in its own timebase: a track that starts at one second and runs for
-/// two ends at three. A timed packet with no payload counts: it is a
-/// real endpoint, and a later one is the end.
+/// The container's duration ([`Demuxer::duration`]) is a *length*. The
+/// two are different quantities and are not interchangeable: a track
+/// that starts at ten seconds and runs for two ends at twelve, against
+/// a container duration of two, and a presentation edit can shift
+/// either again. Turning an end into a length means subtracting the
+/// track's start and honouring any presentation edits. That is the
+/// composer's job; this crate does not do it, and the figure here
+/// neither performs it nor implies it.
+///
+/// A timed packet with no payload counts toward the end: it is a real
+/// endpoint, and a later one is the end.
 ///
 /// # Exact, or a lower bound
 ///
 /// `exact` turns `false`, for good, the first time a packet on the
-/// track lacks what an end needs: a duration or a timestamp. A packet
-/// whose duration is not positive — libavformat writes zero for one it
-/// does not know — ends, as far as the walk can tell, where it starts,
-/// and a packet delivered with no timestamp has no end to place; either
-/// leaves `end` a lower bound. A duration the library derived itself
-/// from the stream's frame rate or frame size counts as a duration, and
-/// is only as exact as that derivation.
+/// track lacks what an end needs: a duration or a timestamp. A timed
+/// packet read with a duration that is not positive — libavformat
+/// writes zero for one it does not know — ends, as far as the walk can
+/// tell, where it starts; a packet read with no usable timestamp has no
+/// end to place. Either leaves `end` a lower bound. The mark is made
+/// when the packet is *read*, so it does not depend on what becomes of
+/// the packet afterwards (delivered, refused, parked) or on whether it
+/// carries a payload. A duration the library derived itself from the
+/// stream's frame rate or frame size counts as a duration, and is only
+/// as exact as that derivation.
 ///
 /// # Complete, or so far
 ///
@@ -1335,7 +1347,8 @@ impl MeasuredEnd {
     }
   }
 
-  /// Returns the greatest packet end the session has read on the track.
+  /// Returns the greatest packet end the session has read on the track:
+  /// an endpoint on the track's own timeline, not a length.
   ///
   /// Exact only when [`exact`](Self::exact) holds, a lower bound
   /// otherwise, and final only when [`walk_complete`](Self::walk_complete)
@@ -1362,9 +1375,9 @@ impl MeasuredEnd {
   /// Returns `true` when every packet's end on the track was known, so
   /// [`end`](Self::end) is the greatest of known ends.
   ///
-  /// `false` means [`end`](Self::end) is a lower bound: a packet had no
-  /// positive duration or no timestamp, from which point on the walk
-  /// cannot say where the track really ends. See [the type's
+  /// `false` means [`end`](Self::end) is a lower bound: a packet was
+  /// read with no positive duration or no timestamp, from which point
+  /// on the walk cannot say where the track really ends. See [the type's
   /// docs](MeasuredEnd#exact-or-a-lower-bound).
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn exact(&self) -> bool {
@@ -1905,26 +1918,31 @@ where
 ///
 /// # Durations
 ///
-/// A file's length is read in layers, and each layer is answered by its
-/// own method so that none is mistaken for another:
+/// A file's duration is read in layers, and each layer is answered by
+/// its own method so that none is mistaken for another:
 ///
 /// - [`duration`](Self::duration) is the **container-level** figure the
-///   library reports for the file as a whole, with the library's own
-///   account of how it came by it ([`DurationSource`]). That account
-///   names what the library did — read timestamps, took a stream's
-///   duration, divided a size by a bitrate — and not what the file
-///   declares.
+///   library reports for the file as a whole — a *length* — with the
+///   library's own account of how it came by it ([`DurationSource`]).
+///   That account names what the library did — read timestamps, took a
+///   stream's duration, divided a size by a bitrate — and not what the
+///   file declares.
 /// - [`TrackInfo::duration`] is the library's figure for **one track**
 ///   as it stood when the container was opened, before probing. It is
 ///   no claim about the file either, and a track the library reported
 ///   none for stays `None`: the container's figure is never copied onto
 ///   it.
 /// - [`measured_end`](Self::measured_end) is what the **walk**
-///   measured: where a track's packets ended. It rides the pulls the
-///   caller already makes and carries two qualifications of its own —
-///   whether the walk covered the file, and whether every packet's end
-///   was known. Complete and exact, it is the strongest per-track
-///   figure; otherwise it is a lower bound.
+///   measured: where a track's packets ended — an *endpoint* on that
+///   track's own timeline. It rides the pulls the caller already makes
+///   and carries two qualifications of its own: whether the walk
+///   covered the file, and whether every packet's end was known.
+///
+/// The first and third are different quantities, a length and an
+/// endpoint. This tier does not rank one against the other and does not
+/// turn either into the other: making a length out of an end means
+/// subtracting the track's start and honouring presentation edits, and
+/// that is the composer's job.
 ///
 /// # What is not here
 ///
@@ -1987,9 +2005,12 @@ pub trait Demuxer {
   ///
   /// [`ContainerDuration::source`] is that account in the library's own
   /// words ([`DurationSource`]). It says what the library did, not what
-  /// the file declares, and no arm is stronger than a measured end that
-  /// is complete and exact. See [durations](Self#durations) on the
+  /// the file declares. It is a *length*: [`measured_end`] answers a
+  /// different quantity, an endpoint on a track's timeline, and the two
+  /// are not interchangeable. See [durations](Self#durations) on the
   /// trait.
+  ///
+  /// [`measured_end`]: Self::measured_end
   ///
   /// It is not any track's duration: a track the library reported none
   /// for stays `None`, and this figure is never copied onto it.
@@ -2011,6 +2032,10 @@ pub trait Demuxer {
   /// carries a payload. It rides [`next_packet`](Self::next_packet) —
   /// each timed packet read moves it — so nothing is read for it,
   /// nothing is sought, and there is no second pass.
+  ///
+  /// The figure is an **endpoint on the track's own timeline, not a
+  /// length**; making a length of it is the composer's job (see
+  /// [`MeasuredEnd`]).
   ///
   /// At any moment the answer is the figure *so far*, qualified twice:
   /// [`MeasuredEnd::walk_complete`] says when the walk covered the file
