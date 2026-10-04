@@ -11,6 +11,12 @@ The backend-agnostic core it adapts has its own log at
 
 ## [Unreleased]
 
+## [0.15.1] - 2026-10-05
+
+### Changed
+
+- Version alignment with the workspace release 0.15.1 (`mediadecode` 0.15.1); no change of its own.
+
 ## [0.15.0] - 2026-09-11
 
 **No changes; released in lockstep.** Tracks `mediadecode` 0.15.0 and
