@@ -33,6 +33,7 @@ mod footprint;
 mod frame;
 mod image;
 pub mod limits;
+mod measured;
 mod pixdesc;
 mod reader_guard;
 #[cfg(feature = "resample")]

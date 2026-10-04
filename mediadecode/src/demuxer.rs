@@ -1147,6 +1147,70 @@ where
 }
 
 // ---------------------------------------------------------------------------
+//  The measured end.
+// ---------------------------------------------------------------------------
+
+/// Where one track's packets ended, as the walk the caller performed
+/// measured it, and whether that walk is over.
+///
+/// What [`Demuxer::measured_end`] answers. [`end`](Self::end) is the
+/// greatest packet end — a packet's timestamp plus its duration — over
+/// the packets the session has delivered on the track, and
+/// [`reached_end`](Self::reached_end) says whether those are all the
+/// track's packets or only the ones so far.
+///
+/// # An instant, not a length
+///
+/// It is *when* the last packet ends, on the track's own timeline and
+/// in its own timebase: a track that starts at one second and runs for
+/// two ends at three. A packet that carries no duration ends where it
+/// starts, so a track none of whose packets carries one measures where
+/// its last packet begins.
+///
+/// # Final, or so far
+///
+/// While `reached_end` is `false` the figure is a lower bound that
+/// still rises as the walk goes on — a value so far, and not a
+/// statement about the file. It turns `true` when the session has
+/// delivered every packet of one unbroken pass to end of file: no
+/// [`seek`](Demuxer::seek) on the way, and no packet refused and
+/// dropped. From then on the figure is the track's measured end and no
+/// longer moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeasuredEnd {
+  end: Timestamp,
+  reached_end: bool,
+}
+
+impl MeasuredEnd {
+  /// Constructs a `MeasuredEnd` from the greatest packet end seen and
+  /// whether the walk that saw it has reached end of file.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(end: Timestamp, reached_end: bool) -> Self {
+    Self { end, reached_end }
+  }
+
+  /// Returns the greatest packet end the walk has delivered on the
+  /// track: the track's measured end once
+  /// [`reached_end`](Self::reached_end) holds, a lower bound before.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn end(&self) -> Timestamp {
+    self.end
+  }
+
+  /// Returns `true` when the walk reached end of file in one unbroken
+  /// pass, which makes [`end`](Self::end) final.
+  ///
+  /// `false` means the figure is *so far*: the walk has not finished,
+  /// or a seek or a dropped packet means it never covered every packet
+  /// in one pass.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn reached_end(&self) -> bool {
+    self.reached_end
+  }
+}
+
+// ---------------------------------------------------------------------------
 //  The delivery envelope.
 // ---------------------------------------------------------------------------
 
@@ -1687,6 +1751,10 @@ where
 /// - [`TrackInfo::duration`] is what the container states **for one
 ///   track**. A track stays `None` where its container states none for
 ///   it, and the container's figure is never copied onto it.
+/// - [`measured_end`](Self::measured_end) is what the **walk**
+///   measured: where a track's packets ended. It rides the pulls the
+///   caller already makes, is final once the walk reaches end of file,
+///   and says so while it is not.
 ///
 /// # What is not here
 ///
@@ -1759,6 +1827,29 @@ pub trait Demuxer {
   /// tables. Provided: a backend with no such figure answers `None`.
   #[cfg_attr(not(tarpaulin), inline(always))]
   fn duration(&self) -> Option<Timestamp> {
+    None
+  }
+
+  /// Returns where `track`'s packets ended, as the walk this session
+  /// has performed measured it, or `None` where the session has
+  /// delivered no packet on `track` that carries a timestamp.
+  ///
+  /// A packet's end is its timestamp plus its duration, and its
+  /// timestamp alone where it carries no duration; the figure is the
+  /// greatest end over the packets delivered. It rides
+  /// [`next_packet`](Self::next_packet) — each timed packet delivered
+  /// moves it — so nothing is read for it, nothing is sought, and there
+  /// is no second pass.
+  ///
+  /// At any moment the answer is the figure *so far*;
+  /// [`MeasuredEnd::reached_end`] says when it is final. See
+  /// [durations](Self#durations) on the trait.
+  ///
+  /// A track that is off the timeline — an attachment — and a track
+  /// outside the table both answer `None`. Provided: a backend that
+  /// does not measure answers `None` for every track.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  fn measured_end(&self, _track: TrackIndex) -> Option<MeasuredEnd> {
     None
   }
 
@@ -2043,6 +2134,29 @@ mod tests {
   }
 
   #[test]
+  fn a_measured_end_carries_the_figure_and_whether_it_is_final() {
+    let so_far = MeasuredEnd::new(Timestamp::new(1_960, ms_tb()), false);
+    assert_eq!(so_far.end(), Timestamp::new(1_960, ms_tb()));
+    assert!(!so_far.reached_end());
+
+    let landed = MeasuredEnd::new(Timestamp::new(2_000, ms_tb()), true);
+    assert!(landed.reached_end());
+    // The figure compares as the instant it names, so the same moment
+    // on another ruler is the same figure...
+    assert_eq!(
+      landed,
+      MeasuredEnd::new(Timestamp::new(2, Timebase::SECONDS), true),
+    );
+    // ...while "so far" and "final" are different statements about it.
+    assert_ne!(
+      landed,
+      MeasuredEnd::new(Timestamp::new(2_000, ms_tb()), false),
+    );
+    let copy = landed;
+    assert_eq!(copy, landed);
+  }
+
+  #[test]
   fn data_packet_follows_the_house_shape() {
     let pts = Timestamp::new(1500, ms_tb());
     let p: DataPacket<(), &[u8]> = DataPacket::new(&b"klv"[..], ())
@@ -2294,6 +2408,34 @@ mod tests {
     );
   }
 
+  /// **The measured end is provided too.** A backend that does not
+  /// measure answers `None` for every track — the one the mock has and
+  /// the one it does not — and still delivers the packet it owes.
+  #[cfg(any(feature = "std", feature = "alloc"))]
+  #[test]
+  fn a_demuxer_that_measures_nothing_answers_none_for_every_track() {
+    let mut d = LoopDemuxer {
+      tracks: vec![Rc::new(TrackInfo::new(
+        ms_tb(),
+        TrackParams::Audio(AudioTrackParams::new(1, 48_000, 2, 0, 0)),
+        (),
+      ))],
+      drained: false,
+    };
+    assert_eq!(d.measured_end(TrackIndex::new(0)), None);
+    assert_eq!(
+      d.measured_end(TrackIndex::new(9)),
+      None,
+      "outside the table"
+    );
+    assert!(d.next_packet().expect("pull").is_some());
+    assert_eq!(
+      d.measured_end(TrackIndex::new(0)),
+      None,
+      "a backend that never overrode the method measures nothing, whatever it delivered",
+    );
+  }
+
   /// Reading the table is non-destructive, and a handle taken before
   /// the first pull is still the session's own row after EOF.
   ///
@@ -2445,5 +2587,22 @@ mod tests {
       drained: false,
     };
     assert_eq!(d.duration(), None);
+  }
+
+  /// The provided measured end needs no allocator: a `Copy` value in an
+  /// `Option`, outside the `alloc` gate like its siblings.
+  #[test]
+  fn the_provided_measured_end_needs_no_allocator() {
+    let row = TrackInfo::<Loopback>::new(
+      ms_tb(),
+      TrackParams::Subtitle(SubtitleTrackParams::new(7)),
+      (),
+    );
+    let rows = [&row];
+    let d = BorrowedDemuxer {
+      tracks: &rows,
+      drained: false,
+    };
+    assert_eq!(d.measured_end(TrackIndex::new(0)), None);
   }
 }

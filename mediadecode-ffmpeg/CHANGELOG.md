@@ -28,6 +28,28 @@ The backend-agnostic core it adapts has its own log at
   for the file while none of its tracks does, and an MP4's container and
   tracks state the same length to within a frame.
 
+- **The backend measures each track's end as the walk delivers
+  packets**, answering `Demuxer::measured_end`.
+
+  One running figure per track: the greatest `pts + duration` over the
+  timed packets delivered, `pts` alone where a packet carries no
+  duration (libavformat derives one for most packets whose demuxer wrote
+  none), and a packet with no `pts` passed over. It is folded in on the
+  packet being delivered — no read, no seek — and held beside the track
+  table, reserved fallibly with it (`TrackTableAlloc` names a refusal).
+  An attachment track, which is off the timeline, answers `None`.
+
+  `MeasuredEnd::reached_end` holds once an unbroken pass has answered
+  `Ok(None)`. A `seek`, or a packet refused and dropped on the way,
+  breaks the pass for good: the figure is still reported, and never as
+  final unless it already was.
+
+  Pinned against real containers: every timed track of a subtitled
+  Matroska and of an MP4 measures exactly what a bare `av_read_frame`
+  loop sees and agrees with the container's own statement to within a
+  frame; a walk stopped early answers a figure marked as not final; a
+  seek and a dropped packet each keep a figure from being called final.
+
 ### Fixed
 
 - **An attachment's row no longer carries the container's length as its

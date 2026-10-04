@@ -713,6 +713,34 @@ pub fn raw_packet_order(path: &Path) -> Vec<(usize, Option<i64>)> {
   out
 }
 
+/// Per stream, the greatest `pts + duration` a bare `av_read_frame` loop
+/// sees — `pts` alone where a packet carries no duration — which is the
+/// walk's own measure taken without this crate. The demux lane compares
+/// against it rather than against a hand-written expectation.
+pub fn raw_stream_ends(path: &Path) -> Vec<Option<i64>> {
+  let mut input = ffmpeg_next::format::input(path).expect("open input");
+  let mut ends: Vec<Option<i64>> = vec![None; input.streams().count()];
+  loop {
+    let mut packet = ffmpeg_next::Packet::empty();
+    match packet.read(&mut input) {
+      Ok(()) => {
+        let Some(pts) = packet.pts() else { continue };
+        let end = if packet.duration() > 0 {
+          pts + packet.duration()
+        } else {
+          pts
+        };
+        let slot = &mut ends[packet.stream()];
+        *slot = Some(slot.map_or(end, |seen| seen.max(end)));
+      }
+      Err(ffmpeg_next::Error::Eof) => break,
+      Err(ffmpeg_next::Error::InvalidData) => continue,
+      Err(e) => panic!("read: {e}"),
+    }
+  }
+  ends
+}
+
 /// Asserts a submission was taken, and answers nothing.
 ///
 /// The `#[must_use]` on [`mediadecode::Sent`] is deliberate teeth: a

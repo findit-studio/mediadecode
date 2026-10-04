@@ -28,6 +28,22 @@ The sibling FFmpeg adapter has its own log at
   method existed compiles unchanged and answers correctly. Like the two
   tables it is fixed for the session's life and callable at any point.
 
+- **A walk's measured end crosses the demux seam: `demuxer::MeasuredEnd`,
+  and a *provided* `Demuxer::measured_end`.**
+
+  `measured_end(track)` answers where a track's packets ended — the
+  greatest `pts + duration` over the packets the session has delivered
+  on it, an instant on the track's own timeline — together with whether
+  the walk is over. `MeasuredEnd::reached_end` is `false` for a figure
+  *so far*, a lower bound that still rises, and turns `true` only once
+  the session has delivered every packet of one unbroken pass to end of
+  file: no seek and no refused, dropped packet on the way.
+
+  The figure rides the pulls the caller already makes, so nothing is
+  read for it, nothing is sought, and there is no second pass. Provided,
+  answering `None` for every track, so every implementor written before
+  the method existed compiles unchanged.
+
 ## [0.15.0] - 2026-09-11
 
 ### Added

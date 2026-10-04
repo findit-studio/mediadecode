@@ -29,7 +29,10 @@
 //!   name**, never by panic, and the chapter table is bounded and
 //!   fallibly allocated before a byte of it is reserved;
 //! - a container states its own length, and a track it states none for
-//!   stays `None` — the container's figure is never copied onto a row.
+//!   stays `None` — the container's figure is never copied onto a row;
+//! - a walk to end of file measures each track's end exactly, a walk
+//!   that stopped early says its figure is only the one so far, and a
+//!   seek or a dropped packet means the figure is never called final.
 
 mod support;
 
@@ -44,13 +47,15 @@ use triomphe::Arc;
 
 use mediadecode::{
   Received, Timebase, Timestamp,
-  demuxer::{DemuxedPacket, Demuxer, TrackKind},
+  demuxer::{DemuxedPacket, Demuxer, MeasuredEnd, TrackIndex, TrackKind},
   packet::PacketFlags,
 };
 // The owned family under the names this suite was written with — the
 // bare aliases mean the view lane now. Import block only; the
 // assertions below are unchanged.
-use mediadecode_ffmpeg::{DemuxError, DemuxLimits, FfmpegOwnedDemuxer as FfmpegDemuxer, TrackInfo};
+use mediadecode_ffmpeg::{
+  DemuxError, DemuxLimits, FfmpegOwnedDemuxer as FfmpegDemuxer, PacketLimits, TrackInfo,
+};
 use support::Corpus;
 
 /// Drains a session, returning `(track, kind, pts)` for every delivered
@@ -470,6 +475,331 @@ fn a_cover_picture_states_no_duration_though_its_container_does() {
     None,
     "an attachment is off the timeline and has no extent to state",
   );
+}
+
+/// The position of the first track of `kind`.
+fn track_of(demuxer: &FfmpegDemuxer, kind: TrackKind) -> usize {
+  demuxer
+    .tracks()
+    .iter()
+    .position(|track| track.kind() == kind)
+    .unwrap_or_else(|| panic!("the fixture has a {kind:?} track"))
+}
+
+/// Every track's figure, in table order.
+fn measured_ends(demuxer: &FfmpegDemuxer) -> Vec<Option<MeasuredEnd>> {
+  (0..demuxer.tracks().len())
+    .map(|index| demuxer.measured_end(TrackIndex::new(index)))
+    .collect()
+}
+
+/// **A walk to end of file measures each track's end exactly.**
+///
+/// Nothing is measured before a pull. After the walk every timed track
+/// answers a final figure that equals what a bare `av_read_frame` loop
+/// sees (`support::raw_stream_ends`), and the attachment answers
+/// `None`. The subtitle track is the anchor that needs no oracle: its
+/// last cue starts at one second and lasts one, and the fixture's
+/// SubRip text says it ends at two, so a figure that dropped the
+/// duration reads one.
+#[test]
+fn a_walk_to_end_of_file_measures_each_track_exactly() {
+  let Some(corpus) = Corpus::new() else { return };
+  let path = corpus.multi_track_mkv();
+  let mut demuxer = FfmpegDemuxer::open(&path).expect("open mkv");
+
+  assert!(
+    measured_ends(&demuxer).iter().all(Option::is_none),
+    "nothing has been delivered, so nothing is measured",
+  );
+
+  assert!(!drain(&mut demuxer).is_empty());
+  let oracle = support::raw_stream_ends(&path);
+
+  for (index, track) in demuxer.tracks().iter().enumerate() {
+    let measured = demuxer.measured_end(TrackIndex::new(index));
+    if track.kind() == TrackKind::Attachment {
+      assert_eq!(
+        measured, None,
+        "track {index}: an attachment is off the timeline"
+      );
+      continue;
+    }
+    let measured = measured.unwrap_or_else(|| {
+      panic!(
+        "track {index} ({:?}) delivered packets and measured none",
+        track.kind()
+      )
+    });
+    assert!(
+      measured.reached_end(),
+      "track {index}: the walk reached end of file in one pass",
+    );
+    let raw = oracle[index].expect("the raw walk saw this track too");
+    assert_eq!(
+      measured.end(),
+      Timestamp::new(raw, track.timebase()),
+      "track {index} ({:?}): the figure is the greatest pts + duration the raw walk sees",
+      track.kind(),
+    );
+  }
+
+  let subtitles = track_of(&demuxer, TrackKind::Subtitle);
+  assert_eq!(
+    demuxer
+      .measured_end(TrackIndex::new(subtitles))
+      .map(|measured| measured.end()),
+    Some(Timestamp::new(2, Timebase::SECONDS)),
+    "the last cue runs from one second to two",
+  );
+}
+
+/// **Each track's measured end agrees with the container's statement
+/// to within one frame.**
+///
+/// The two are independent: the muxer wrote the container's figure from
+/// its own packets, and the walk measured these ones. Every track of
+/// the fixture was cut to the same two seconds, so each one's end sits
+/// within a frame of that figure — which a measure that dropped the
+/// last packet's duration misses on the video track (one frame short of
+/// its own end, a frame and a half short of the container's) and by a
+/// whole second on the subtitles.
+#[test]
+fn a_walk_to_end_of_file_agrees_with_the_container_within_one_frame() {
+  let Some(corpus) = Corpus::new() else { return };
+  let mut demuxer = FfmpegDemuxer::open(&corpus.multi_track_mkv()).expect("open mkv");
+  assert!(!drain(&mut demuxer).is_empty());
+  let stated = demuxer.duration().expect("the container states its length");
+
+  for (index, track) in demuxer.tracks().iter().enumerate() {
+    if track.kind() == TrackKind::Attachment {
+      continue;
+    }
+    let measured = demuxer
+      .measured_end(TrackIndex::new(index))
+      .unwrap_or_else(|| panic!("track {index} ({:?}) measured none", track.kind()));
+    assert!(
+      within(measured.end(), stated, one_frame()),
+      "track {index} ({:?}): the measured end {} is within one frame of the container's \
+       statement {stated}",
+      track.kind(),
+      measured.end(),
+    );
+  }
+}
+
+/// **In an MP4 the container, its tracks and the walk tell one story.**
+///
+/// The container's statement, the longest track's own and the greatest
+/// measured end all name the clip's length, within one frame of one
+/// another — and each track's measured end equals the raw walk's.
+#[test]
+fn an_mp4_walk_measures_the_length_its_container_and_tracks_state() {
+  let Some(corpus) = Corpus::new() else { return };
+  let path = corpus.language_tagged_mp4();
+  let mut demuxer = FfmpegDemuxer::open(&path).expect("open mp4");
+  assert!(!drain(&mut demuxer).is_empty());
+  let oracle = support::raw_stream_ends(&path);
+
+  let mut greatest = None;
+  for (index, track) in demuxer.tracks().iter().enumerate() {
+    let measured = demuxer
+      .measured_end(TrackIndex::new(index))
+      .unwrap_or_else(|| panic!("track {index} delivered packets and measured none"));
+    assert!(
+      measured.reached_end(),
+      "track {index}: end of file was reached"
+    );
+    assert_eq!(
+      measured.end(),
+      Timestamp::new(
+        oracle[index].expect("the raw walk saw this track"),
+        track.timebase()
+      ),
+      "track {index}: the greatest pts + duration the raw walk sees",
+    );
+    greatest = greatest.max(Some(measured.end()));
+  }
+  let measured = greatest.expect("the clip has tracks");
+
+  let stated = demuxer
+    .duration()
+    .expect("the movie header states a duration");
+  let longest = demuxer
+    .tracks()
+    .iter()
+    .filter_map(|track| track.duration())
+    .max()
+    .expect("an MP4 states a duration per track");
+  assert!(
+    within(measured, stated, one_frame()),
+    "measured {measured} against the container's {stated}",
+  );
+  assert!(
+    within(measured, longest, one_frame()),
+    "measured {measured} against the longest stated track {longest}",
+  );
+  assert!(
+    within(stated, longest, one_frame()),
+    "the container's {stated} against the longest stated track {longest}",
+  );
+}
+
+/// **A walk that stops early answers the figure so far, and says so.**
+///
+/// Three timed packets in, a track that has delivered answers a figure
+/// flagged as not final; a track that has delivered nothing answers
+/// `None`. Walking on raises each figure and flips the flag, and a
+/// pull after end of file moves nothing.
+#[test]
+fn a_walk_that_stops_early_answers_the_figure_so_far_and_says_so() {
+  let Some(corpus) = Corpus::new() else { return };
+  let mut demuxer = FfmpegDemuxer::open(&corpus.multi_track_mkv()).expect("open mkv");
+
+  let mut timed = 0;
+  while timed < 3 {
+    let packet = demuxer.next_packet().expect("pull").expect("a packet");
+    if !matches!(packet, DemuxedPacket::Attachment(_)) {
+      timed += 1;
+    }
+  }
+  let so_far = measured_ends(&demuxer);
+  assert!(
+    so_far.iter().any(Option::is_some),
+    "three timed packets were delivered, so some track has a figure",
+  );
+  for (index, measured) in so_far.iter().enumerate() {
+    if let Some(measured) = measured {
+      assert!(
+        !measured.reached_end(),
+        "track {index}: the walk is not over, so the figure is not final",
+      );
+    }
+  }
+
+  drain(&mut demuxer);
+  let landed = measured_ends(&demuxer);
+  for (index, (before, after)) in so_far.iter().zip(&landed).enumerate() {
+    if demuxer.tracks()[index].kind() == TrackKind::Attachment {
+      assert_eq!(after, &None);
+      continue;
+    }
+    let after = after.expect("every timed track delivered by end of file");
+    assert!(
+      after.reached_end(),
+      "track {index}: end of file was reached"
+    );
+    if let Some(before) = before {
+      assert!(
+        after.end() > before.end(),
+        "track {index}: the figure rose from {} to {} as the walk went on",
+        before.end(),
+        after.end(),
+      );
+    }
+  }
+
+  assert!(demuxer.next_packet().expect("pull").is_none());
+  assert_eq!(
+    measured_ends(&demuxer),
+    landed,
+    "a pull after end of file moves nothing",
+  );
+}
+
+/// **A seek ends the claim to be one pass, and a final figure survives
+/// one.**
+///
+/// A walk that seeks still measures every packet it delivers, and its
+/// figures are exact — but it never covered the file in one pass, so it
+/// never calls them final. A figure that was final already stays so
+/// through a later seek and a second walk, and does not move.
+#[test]
+fn a_seek_ends_the_claim_to_be_one_pass_and_a_final_figure_survives_one() {
+  let Some(corpus) = Corpus::new() else { return };
+  let path = corpus.multi_track_mkv();
+  let oracle = support::raw_stream_ends(&path);
+  let start = Timestamp::new(0, Timebase::SECONDS);
+
+  let mut sought = FfmpegDemuxer::open(&path).expect("open mkv");
+  for _ in 0..2 {
+    sought.next_packet().expect("pull").expect("a packet");
+  }
+  sought.seek(start).expect("seek");
+  drain(&mut sought);
+  for (index, track) in sought.tracks().iter().enumerate() {
+    if track.kind() == TrackKind::Attachment {
+      continue;
+    }
+    let measured = sought
+      .measured_end(TrackIndex::new(index))
+      .expect("a timed track measured");
+    assert!(
+      !measured.reached_end(),
+      "track {index}: a seek broke the pass, so the figure is not final",
+    );
+    assert_eq!(
+      measured.end(),
+      Timestamp::new(
+        oracle[index].expect("the raw walk saw this track"),
+        track.timebase()
+      ),
+      "track {index}: the figure still reflects every packet delivered",
+    );
+  }
+
+  let mut whole = FfmpegDemuxer::open(&path).expect("open mkv");
+  drain(&mut whole);
+  let landed = measured_ends(&whole);
+  assert!(
+    landed
+      .iter()
+      .flatten()
+      .all(|measured| measured.reached_end())
+  );
+  whole.seek(start).expect("seek");
+  drain(&mut whole);
+  assert_eq!(
+    measured_ends(&whole),
+    landed,
+    "a seek and a second walk neither un-finalise nor move a final figure",
+  );
+}
+
+/// **A packet the session refuses and drops breaks the pass.**
+///
+/// A 64-byte ceiling refuses every video and audio packet of the
+/// fixture, by name, while the one-word subtitle cues pass. A caller
+/// can carry on pulling after that error, and a walk that did reaches
+/// end of file without having delivered every packet. The figure for
+/// the track that did deliver is real and exact, and is not called
+/// final.
+#[test]
+fn a_dropped_packet_means_the_walk_never_calls_its_figures_final() {
+  let Some(corpus) = Corpus::new() else { return };
+  let limits = DemuxLimits::new().with_packet(PacketLimits::new().with_max_packet_bytes(64));
+  let mut demuxer = FfmpegDemuxer::open_with(&corpus.multi_track_mkv(), limits).expect("open mkv");
+
+  let mut refused = 0;
+  loop {
+    match demuxer.next_packet() {
+      Ok(Some(_)) => {}
+      Ok(None) => break,
+      Err(DemuxError::PacketBuffer(_)) => refused += 1,
+      Err(other) => panic!("only the ceiling is expected to refuse here: {other:?}"),
+    }
+  }
+  assert!(refused > 0, "the ceiling refused packets");
+
+  let subtitles = track_of(&demuxer, TrackKind::Subtitle);
+  let measured = demuxer
+    .measured_end(TrackIndex::new(subtitles))
+    .expect("the cues were delivered");
+  assert!(
+    !measured.reached_end(),
+    "packets were dropped, so one pass did not deliver the file",
+  );
+  assert_eq!(measured.end(), Timestamp::new(2, Timebase::SECONDS));
 }
 
 /// **A malformed chapter timebase is a named refusal, never a panic.**

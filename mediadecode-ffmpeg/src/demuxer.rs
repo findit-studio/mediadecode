@@ -22,6 +22,13 @@
 //! [`Demuxer::duration`](mediadecode::demuxer::Demuxer::duration) — and
 //! it is the container's, never a track's: see [`container_duration`].
 //!
+//! What the **walk** measures is kept beside the tables, and costs no
+//! read of its own: each timed packet [`Demuxer::next_packet`] delivers
+//! folds its end into its track's running figure, and
+//! [`Demuxer::measured_end`](mediadecode::demuxer::Demuxer::measured_end)
+//! answers it — flagged as final only once an unbroken pass has reached
+//! end of file. See [`Measured`].
+//!
 //! # What normalization this layer does
 //!
 //! libavformat's track table is not quite the one the demux tier
@@ -93,8 +100,8 @@ use mediadecode::{
   demuxer::{
     AttachmentPacket, AttachmentTrackPacket, AttachmentTrackParams, AudioTrackPacket,
     AudioTrackParams, Chapter, DataTrackPacket, DataTrackParams, DemuxedPacket, Demuxer,
-    SubtitleTrackPacket, SubtitleTrackParams, TrackIndex, TrackInfo, TrackKind, TrackParams,
-    UnknownTrackParams, VideoTrackPacket, VideoTrackParams,
+    MeasuredEnd, SubtitleTrackPacket, SubtitleTrackParams, TrackIndex, TrackInfo, TrackKind,
+    TrackParams, UnknownTrackParams, VideoTrackPacket, VideoTrackParams,
   },
 };
 use smol_bytes::Utf8Bytes;
@@ -105,6 +112,7 @@ use crate::{
   codec_id::CodecId,
   extras::{AttachmentPacketExtra, TrackExtra},
   limits::DemuxLimits,
+  measured::Measured,
   reader_guard::{GuardedReader, PanicLatch},
   sample_format::SampleFormat,
 };
@@ -158,6 +166,10 @@ pub struct CarrierDemuxer<C: crate::FfmpegCarrier> {
   /// The container's own stated duration, read once at open — see
   /// [`container_duration`].
   duration: Option<Timestamp>,
+  /// What the walk has measured so far, one figure per track — see
+  /// [`Measured`]. Fed by [`Self::next_packet_impl`] as packets are
+  /// delivered; it reads nothing itself.
+  measured: Measured,
   pending: VecDeque<(
     TrackIndex,
     AttachmentPacket<AttachmentPacketExtra, C::Buffer>,
@@ -426,12 +438,18 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
     // strings rather than borrowing from it.
     let format = unsafe { crate::ContainerFormat::from_context(input.as_ptr()) };
     let duration = container_duration(&input);
+    // One figure per track, reserved fallibly like the table it rides
+    // beside: the count is the container's, already past
+    // `max_streams`.
+    let measured =
+      Measured::new(count).map_err(|_| DemuxError::TrackTableAlloc(TrackTableAlloc::new(count)))?;
     Ok(Self {
       input,
       tracks,
       chapters,
       format,
       duration,
+      measured,
       pending,
       unconverted: None,
       eof: false,
@@ -550,6 +568,13 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
     &self.chapters
   }
 
+  /// Where `track`'s packets ended, as this session's walk measured
+  /// it — see [`Measured`].
+  pub(crate) fn measured_end_impl(&self, track: TrackIndex) -> Option<MeasuredEnd> {
+    let index = track.get();
+    self.measured.get(index, self.tracks.get(index)?.timebase())
+  }
+
   pub(crate) fn next_packet_impl(
     &mut self,
   ) -> Result<Option<DemuxedPacket<Ffmpeg, C::Buffer>>, DemuxError> {
@@ -592,6 +617,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
             Ok(()) => {}
             Err(ffmpeg_next::Error::Eof) => {
               self.eof = true;
+              self.measured.end_of_file();
               return Ok(None);
             }
             // A demuxer can resync past a corrupt packet, and
@@ -744,6 +770,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
           // session make progress.
           if source.parks_in_demux() {
             self.unconverted = Some((packet, provenance));
+          } else {
+            // Dropped: this pass will not have delivered every packet,
+            // so it can no longer call its figures final.
+            self.measured.break_pass();
           }
           return Err(DemuxError::PacketBuffer(PacketBuffer::new(index, source)));
         }
@@ -753,12 +783,21 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
       // packet, which some demuxers emit as a marker. Nothing to
       // deliver; read the next one.
       if let Some(out) = built {
+        // The walk measures itself on the packet it is delivering — no
+        // read, no seek. Only the four timed kinds reach here: an
+        // attachment is off the timeline and was passed by above.
+        self
+          .measured
+          .observe(index, packet.pts(), packet.duration());
         return Ok(Some(out));
       }
     }
   }
 
   pub(crate) fn seek_impl(&mut self, target: Timestamp) -> Result<(), DemuxError> {
+    // Any seek ends the claim to be one unbroken pass — a failed one
+    // too, since where the container sits afterwards is unspecified.
+    self.measured.break_pass();
     let ts = target.rescale_to(av_time_base_q()).pts();
     // Only our own EOF latch is cleared, and only before the seek —
     // the seek machinery gates on `eof_reached`, so clearing it
@@ -924,6 +963,26 @@ macro_rules! demuxer_lane_face {
       /// bitrate and file size, which this backend does not tell apart.
       fn duration(&self) -> Option<Timestamp> {
         self.duration_impl()
+      }
+
+      /// Where `track`'s packets ended, as this session's walk measured
+      /// it: the greatest `pts + duration` over the timed packets
+      /// delivered on it, in the track's own timebase.
+      ///
+      /// A packet that carries no duration contributes its `pts`
+      /// alone; libavformat derives a duration from the stream's frame
+      /// rate or frame size for most packets whose demuxer wrote none,
+      /// so that is the rare case. A packet with no `pts` is passed
+      /// over. Nothing is read for this and nothing is sought: the
+      /// figure rides the pulls the caller makes.
+      ///
+      /// [`MeasuredEnd::reached_end`] holds once an unbroken pass has
+      /// answered `Ok(None)`. A [`seek`](Demuxer::seek), or a packet
+      /// that was refused and dropped, breaks the pass for good; the
+      /// figure is then still reported, and never as final unless it
+      /// already was. An attachment track answers `None`.
+      fn measured_end(&self, track: TrackIndex) -> Option<MeasuredEnd> {
+        self.measured_end_impl(track)
       }
 
       /// Pulls the next packet.
@@ -1571,8 +1630,9 @@ impl TrackMetadataAlloc {
 
 /// Payload for [`DemuxError::TrackTableAlloc`].
 ///
-/// The track table, or the attachment queue built beside it, could not
-/// be reserved. The stream count had already passed
+/// The track table, or the attachment queue or the per-track
+/// measurement built beside it, could not be reserved. The stream count
+/// had already passed
 /// [`DemuxLimits::max_streams`](crate::DemuxLimits::max_streams), so
 /// this is the allocator declining rather than the file asking for too
 /// much — reported instead of aborting, which is what an infallible
