@@ -47,16 +47,25 @@ The backend-agnostic core it adapts has its own log at
   (`TrackTableAlloc` names a refusal). An attachment track, which is off
   the timeline, answers `None`.
 
+  `MeasuredEnd::exact` turns `false`, for good, the first time a timed
+  packet on the track is read with a duration that is not positive
+  (libavformat writes zero for one it does not know) or is delivered
+  with no usable `pts`: the end advances to that packet's `pts` only and
+  the figure is a lower bound. A duration libavformat derived from the
+  stream's frame rate or frame size counts as a duration, and is only
+  as exact as that derivation.
+
   `MeasuredEnd::walk_complete` holds once a walk that skipped nothing
-  has answered `Ok(None)`. The walk breaks for good at a `seek` and at
-  every packet `av_read_frame` produced that the session did not
-  observe: refused and dropped, skipped as corrupt
-  (`AVERROR_INVALIDDATA`), on a stream the track table never described
-  (a container that adds streams after open, as MPEG-TS and RTP do), or
-  on a track of unknown kind. The figure is still reported, and never as
-  complete unless it already was. Accounting for streams that appear
-  after open is not built; a session that read a packet on one never
-  answers complete.
+  has answered `Ok(None)`, and a complete walk is frozen: a later read
+  or seek neither moves its figures nor takes the flag back. Before it
+  completes, the walk breaks for good at a `seek` and at every packet
+  `av_read_frame` produced that the session did not observe: refused and
+  dropped, skipped as corrupt (`AVERROR_INVALIDDATA`), on a stream the
+  track table never described (a container that adds streams after
+  open, as MPEG-TS and RTP do), or on a track of unknown kind. The
+  figure then keeps rising as a "so far" maximum and stays a lower
+  bound. Accounting for streams that appear after open is not built; a
+  session that read a packet on one never answers complete.
 
   An end that does not fit in an `i64` is no end: the track answers
   `None` and the walk stops being complete, where saturating would have
@@ -75,7 +84,9 @@ The backend-agnostic core it adapts has its own log at
   corrupt read, a stream the table never described (an MPEG transport
   stream that adds audio mid-file), a track of unknown kind and an
   unrepresentable end each keep a walk from being called complete,
-  while a timed empty packet at the end moves the measured end.
+  while a timed empty packet at the end moves the measured end, a last
+  packet with no duration leaves the end a lower bound, and a complete
+  walk stays frozen through a later seek.
 
 ### Fixed
 
@@ -90,7 +101,8 @@ The backend-agnostic core it adapts has its own log at
   a figure that appears only afterwards is dropped. It is no claim about
   the file: a format's reader may compute the figure itself (WAV derives
   it from the data chunk's size) and a stream libavformat creates while
-  probing has none. The exact per-track figure is `measured_end`.
+  probing has none. The per-track figure measured from packets is
+  `measured_end`.
 
 - **A path that is not valid UTF-8, or that holds a NUL byte, fails the
   open with an error** (`EINVAL`) where `ffmpeg-next`'s `input_*`

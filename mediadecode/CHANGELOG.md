@@ -33,9 +33,11 @@ The sibling FFmpeg adapter has its own log at
   accurate)"), plus `Unknown` for an account the build cannot name,
   which is never folded into an estimate. None of them says that a
   header declares the figure, and the type does not rank them; a
-  measured end outranks every arm. `TrackInfo::duration`'s doc now says
-  it is the library's figure from before probing and no claim about the
-  file, and points at `measured_end` as the exact per-track figure.
+  measured end that is complete and exact is a stronger figure than any
+  arm, and one that is not is a lower bound to compose with it.
+  `TrackInfo::duration`'s doc now says it is the library's figure from
+  before probing and no claim about the file, and points at
+  `measured_end` as the per-track figure measured from packets.
 
   Provided, answering `None`, so every implementor written before the
   method existed compiles unchanged and answers correctly. Like the two
@@ -46,17 +48,27 @@ The sibling FFmpeg adapter has its own log at
 
   `measured_end(track)` answers where a track's packets ended — the
   greatest `pts + duration` over the timed packets the session read on
-  it, an instant on the track's own timeline — together with whether
-  the walk covered the file. `MeasuredEnd::walk_complete` is `false` for
-  a figure *so far*, a lower bound that still rises, and turns `true`
-  only once every packet the library delivered to the session was
-  observed, from the first to end of file, with no skip. A seek breaks
-  the walk, and so does any packet that was read and not observed —
-  refused, skipped as corrupt, or on a stream the session never
-  described, which is what a container that adds streams mid-read
-  produces — and so does an end too large to represent, whose track
-  answers `None`. A timed packet with no payload is observed: it is a
-  real endpoint.
+  it, an instant on the track's own timeline — with two independent
+  qualifications. `MeasuredEnd::exact` is `false`, for good, from the
+  first packet on the track whose duration is not positive (libavformat
+  writes zero for one it does not know) or that was delivered with no
+  timestamp: the end then advances to that packet's `pts` only, and is
+  a lower bound. Complete and exact, a measured end is the strongest
+  figure the tier reports; an inexact one is a lower bound for the
+  reader to compose with the container's figure.
+
+  `MeasuredEnd::walk_complete` is `false` for a figure *so far* and
+  turns `true` only once every packet the library delivered to the
+  session was observed, from the first to end of file, with no skip. A
+  complete walk is frozen: its figures are final, and a later read or
+  seek neither moves them nor takes the flag back. A walk broken before
+  it completes — by a seek, by any packet that was read and not
+  observed (refused, skipped as corrupt, or on a stream the session
+  never described, which is what a container that adds streams
+  mid-read produces), or by an end too large to represent, whose track
+  answers `None` — can never complete in the session, and its figure
+  keeps rising as a "so far" maximum. A timed packet with no payload is
+  observed: it is a real endpoint.
 
   What a complete walk does not cover is the library's own probing,
   before the session's first read. libavformat buffers and replays the

@@ -732,6 +732,10 @@ fn a_walk_to_end_of_file_measures_each_track_exactly() {
       measured.walk_complete(),
       "track {index}: the walk reached end of file and skipped nothing",
     );
+    assert!(
+      measured.exact(),
+      "track {index}: every packet carried a pts and a positive duration, so the end is exact",
+    );
     let raw = oracle[index].expect("the raw walk saw this track too");
     assert_eq!(
       measured.end(),
@@ -809,6 +813,10 @@ fn an_mp4_walk_measures_the_length_its_container_and_tracks_report() {
     assert!(
       measured.walk_complete(),
       "track {index}: end of file was reached"
+    );
+    assert!(
+      measured.exact(),
+      "track {index}: every packet carried a pts and a positive duration"
     );
     assert_eq!(
       measured.end(),
@@ -937,7 +945,7 @@ fn a_seek_ends_the_claim_to_a_complete_walk_and_a_complete_walk_survives_one() {
       .expect("a timed track measured");
     assert!(
       !measured.walk_complete(),
-      "track {index}: a seek broke the walk, so the figure is not complete",
+      "track {index}: a seek broke the walk, so it can never be complete",
     );
     assert_eq!(
       measured.end(),
@@ -945,7 +953,8 @@ fn a_seek_ends_the_claim_to_a_complete_walk_and_a_complete_walk_survives_one() {
         oracle[index].expect("the raw walk saw this track"),
         track.timebase()
       ),
-      "track {index}: the figure still reflects every packet read",
+      "track {index}: after the break the figure kept rising as a so-far maximum, and reflects \
+       every packet read",
     );
   }
 

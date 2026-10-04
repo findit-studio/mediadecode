@@ -34,7 +34,8 @@
 //! folds its end into its track's running figure, and
 //! [`Demuxer::measured_end`](mediadecode::demuxer::Demuxer::measured_end)
 //! answers it — marked complete only once a walk that skipped nothing
-//! has reached end of file. See [`Measured`].
+//! has reached end of file, and exact only while every packet's end was
+//! known. See [`Measured`].
 //!
 //! # What normalization this layer does
 //!
@@ -138,13 +139,14 @@ enum InjectedRead {
   /// that matters: damage is worded differently in every container, and
   /// the policy for it is one.
   Fault(ffmpeg_next::Error),
-  /// libavformat hands over a packet with no payload, on `stream`,
-  /// carrying this timing. Some demuxers write timed packets with
-  /// nothing in them, and the end of a track can be one.
-  EmptyPacket {
+  /// libavformat hands over a packet on `stream` carrying this timing
+  /// and payload. An empty payload is a packet with nothing in it: some
+  /// demuxers write timed ones, and the end of a track can be one.
+  Packet {
     stream: usize,
     pts: Option<i64>,
     duration: i64,
+    payload: Vec<u8>,
   },
 }
 
@@ -576,8 +578,8 @@ struct PreProbeDuration {
 /// **Its limit.** Only streams that exist before probing are recorded.
 /// A format that creates a stream while it is being probed has no figure
 /// here, whatever its demuxer set on that stream, because afterwards the
-/// figure cannot be told from the fill. The exact per-track figure is
-/// the measured end.
+/// figure cannot be told from the fill. The per-track figure measured
+/// from packets is `measured_end`.
 ///
 /// The time base is kept with each figure, so a figure keeps the ruler
 /// it was in even if probing later refines the stream's own.
@@ -869,11 +871,15 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
     if let Some(injected) = self.injected_reads.pop_front() {
       return match injected {
         InjectedRead::Fault(fault) => Err(fault),
-        InjectedRead::EmptyPacket {
+        InjectedRead::Packet {
           stream,
           pts,
           duration,
+          payload,
         } => {
+          if !payload.is_empty() {
+            *packet = Packet::copy(&payload);
+          }
           packet.set_stream(stream);
           packet.set_pts(pts);
           packet.set_duration(duration);
@@ -1134,6 +1140,12 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
       // deliver; its timing, if it had any, was observed above. Read the
       // next one.
       if let Some(out) = built {
+        // A packet delivered with no usable `pts` has no end to place,
+        // so the track's measured end is a lower bound from here on. Only
+        // the four timed kinds reach this arm.
+        if packet.pts().is_none() {
+          self.measured.untimed_delivery(index);
+        }
         return Ok(Some(out));
       }
     }
@@ -1272,8 +1284,8 @@ macro_rules! demuxer_lane_face {
       /// appears only after probing is libavformat's fill, which hands a
       /// stream that supplied no timing the container's length, so it is
       /// not carried; neither is one for a stream libavformat creates
-      /// during probing. For a track's length regardless,
-      /// [`measured_end`](Demuxer::measured_end) is the exact figure.
+      /// during probing. For a track's length measured from its packets,
+      /// see [`measured_end`](Demuxer::measured_end).
       ///
       /// Reading the table takes nothing away — clone the handles worth
       /// keeping. `Arc` is the carrier because
@@ -1334,19 +1346,32 @@ macro_rules! demuxer_lane_face {
       /// and a later one is the end. Nothing is read for this and
       /// nothing is sought: the figure rides the pulls the caller makes.
       ///
-      /// [`MeasuredEnd::walk_complete`] holds once a walk that skipped
-      /// nothing has answered `Ok(None)`. The walk stops being complete
-      /// for good at a [`seek`](Demuxer::seek) and at every packet
-      /// `av_read_frame` produced that this session did not observe:
-      /// refused and dropped, skipped as corrupt
-      /// (`AVERROR_INVALIDDATA`), or on a stream the table never
-      /// described — which is what a container that adds streams after
-      /// open (MPEG-TS, RTP) produces, so a session that read a packet
-      /// on a grown stream never answers complete. Accounting for such
-      /// streams as they appear is not done here. A cover picture's
-      /// duplicate packet, whose one delivery happened at open, and an
-      /// untimed empty packet carry nothing to observe and do not break
-      /// the walk.
+      /// **Exactness.** [`MeasuredEnd::exact`] turns `false`, for good,
+      /// the first time a timed packet on the track is read with a
+      /// duration that is not positive (libavformat writes zero for one
+      /// it does not know) or is delivered with no usable `pts`: the
+      /// end then advances to that packet's `pts` only, and the figure is
+      /// a lower bound. A duration libavformat derived from the stream's
+      /// frame rate or frame size counts as a duration, and is only as
+      /// exact as that derivation.
+      ///
+      /// **Completeness.** [`MeasuredEnd::walk_complete`] holds once a
+      /// walk that skipped nothing has answered `Ok(None)`, and a
+      /// complete walk is frozen: a later read or seek neither moves
+      /// its figures nor takes the flag back. The walk stops being
+      /// complete for good, before it completes, at a
+      /// [`seek`](Demuxer::seek) and at every packet `av_read_frame`
+      /// produced that this session did not observe: refused and
+      /// dropped, skipped as corrupt (`AVERROR_INVALIDDATA`), or on a
+      /// stream the table never described — which is what a container
+      /// that adds streams after open (MPEG-TS, RTP) produces, so a
+      /// session that read a packet on a grown stream never answers
+      /// complete. Accounting for such streams as they appear is not
+      /// done here. A cover picture's duplicate packet, whose one
+      /// delivery happened at open, and an untimed empty packet carry
+      /// nothing to observe and do not break the walk. After a break the
+      /// figure keeps rising as a "so far" maximum and stays a lower
+      /// bound.
       ///
       /// **What it does not cover.** libavformat probes while the
       /// container opens, before this session's first read. It buffers
@@ -1355,10 +1380,8 @@ macro_rules! demuxer_lane_face {
       /// skipped there is invisible and a complete walk does not vouch
       /// for it.
       ///
-      /// The figure is then still reported, and never as complete unless
-      /// it already was. An attachment track answers `None`, and so does
-      /// a track whose end does not fit in an `i64`, which breaks the
-      /// walk as well.
+      /// An attachment track answers `None`, and so does a track whose
+      /// end does not fit in an `i64`, which breaks the walk as well.
       fn measured_end(&self, track: TrackIndex) -> Option<MeasuredEnd> {
         self.measured_end_impl(track)
       }
@@ -2582,8 +2605,8 @@ fn build_tracks<C: crate::FfmpegCarrier + crate::CarrierOps>(
     // timed stream whose first packet lies past the probe, such as a
     // sparse subtitle track. A figure that appears only after probing
     // is libavformat's fill and is dropped here, and so is one for a
-    // stream libavformat created while probing; the exact per-track
-    // figure is the measured end.
+    // stream libavformat created while probing; the per-track figure
+    // measured from packets is `measured_end`.
     let duration = pre_probe.get(index);
     let raw_start = stream.start_time();
     let frames = stream.frames();
@@ -4122,24 +4145,29 @@ mod tests {
   /// nothing in it but a timestamp and a duration arrives, a second past
   /// where the real ones stopped. It carries no payload, so it is never
   /// delivered — but it is timed, so the track's measured end moves to
-  /// it, and the walk that read it is still complete. A measurement that
-  /// filtered on payload first would have stopped at the last real
-  /// packet.
+  /// it, and the walk that read it is still complete and the end still
+  /// exact. A measurement that filtered on payload first would have
+  /// stopped at the last real packet.
   #[test]
   fn a_timed_empty_packet_at_the_end_moves_the_measured_end() {
     let mut clean = open_silence(5);
     let packets = walk(&mut clean);
     let control = clean.measured_end(TrackIndex::new(0)).expect("a figure");
+    assert!(
+      control.exact(),
+      "every real packet carries a pts and a positive duration"
+    );
     let tail = control.end().rescale_to(Timebase::HZ_8K).pts();
 
     let mut demuxer = open_silence(5);
     for _ in 0..packets {
       assert!(demuxer.next_packet().expect("pull").is_some());
     }
-    demuxer.injected_reads.push_back(InjectedRead::EmptyPacket {
+    demuxer.injected_reads.push_back(InjectedRead::Packet {
       stream: 0,
       pts: Some(tail),
       duration: 8_000,
+      payload: Vec::new(),
     });
     assert!(
       demuxer.next_packet().expect("pull").is_none(),
@@ -4156,11 +4184,86 @@ mod tests {
       figure.walk_complete(),
       "an empty packet is observed, not skipped, so the walk is still complete",
     );
+    assert!(figure.exact(), "its duration is known");
+  }
+
+  /// **A last packet whose duration is unknown ends at its `pts`, and
+  /// the end is a lower bound.**
+  ///
+  /// The same timed empty packet, with the duration libavformat writes
+  /// when it does not know one — zero. The end advances to the packet's
+  /// `pts`, half a second past where the real packets stopped, and no
+  /// further: the walk cannot say where that packet really ends, so the
+  /// figure is complete but not exact. A variable-frame-rate track whose
+  /// last packet has no derivable duration is this case.
+  #[test]
+  fn a_last_packet_with_no_duration_ends_at_its_pts_and_the_end_is_a_lower_bound() {
+    let mut clean = open_silence(5);
+    let packets = walk(&mut clean);
+    let control = clean.measured_end(TrackIndex::new(0)).expect("a figure");
+    let tail = control.end().rescale_to(Timebase::HZ_8K).pts();
+
+    let mut demuxer = open_silence(5);
+    for _ in 0..packets {
+      assert!(demuxer.next_packet().expect("pull").is_some());
+    }
+    demuxer.injected_reads.push_back(InjectedRead::Packet {
+      stream: 0,
+      pts: Some(tail + 4_000),
+      duration: 0,
+      payload: Vec::new(),
+    });
+    assert!(demuxer.next_packet().expect("pull").is_none());
+    let figure = demuxer.measured_end(TrackIndex::new(0)).expect("a figure");
+    assert_eq!(
+      figure.end(),
+      Timestamp::new(tail + 4_000, Timebase::HZ_8K),
+      "an unknown duration advances the end to the pts and no further",
+    );
+    assert!(
+      figure.walk_complete(),
+      "the walk covered the file, whatever the end is"
+    );
+    assert!(
+      !figure.exact(),
+      "a packet whose end is unknown leaves the figure a lower bound"
+    );
+  }
+
+  /// **A packet delivered with no `pts` has no end to place, and the end
+  /// is a lower bound.** The packet is real — it has a payload and is
+  /// delivered — so it is the walk's loss of exactness and not an
+  /// untimed marker passed by.
+  #[test]
+  fn a_delivered_packet_with_no_pts_makes_the_end_a_lower_bound() {
+    let mut clean = open_silence(5);
+    let packets = walk(&mut clean);
+    let control = clean.measured_end(TrackIndex::new(0)).expect("a figure");
+
+    let mut demuxer = open_silence(5);
+    for _ in 0..2 {
+      assert!(demuxer.next_packet().expect("pull").is_some());
+    }
+    demuxer.injected_reads.push_back(InjectedRead::Packet {
+      stream: 0,
+      pts: None,
+      duration: 0,
+      payload: vec![0; 64],
+    });
+    assert_eq!(
+      walk(&mut demuxer),
+      packets - 2 + 1,
+      "the untimed packet is delivered as well as every real one",
+    );
+    let figure = demuxer.measured_end(TrackIndex::new(0)).expect("a figure");
+    assert_eq!(figure.end(), control.end(), "it moved no end");
+    assert!(figure.walk_complete());
+    assert!(!figure.exact());
   }
 
   /// **An empty packet with no timestamp has nothing to observe and is
-  /// passed by without consequence.** The figure is untouched and the
-  /// walk stays complete.
+  /// passed by without consequence.** The figure is untouched, still
+  /// exact, and the walk stays complete.
   #[test]
   fn an_untimed_empty_packet_is_passed_by_without_consequence() {
     let mut clean = open_silence(5);
@@ -4171,10 +4274,11 @@ mod tests {
     for _ in 0..2 {
       assert!(demuxer.next_packet().expect("pull").is_some());
     }
-    demuxer.injected_reads.push_back(InjectedRead::EmptyPacket {
+    demuxer.injected_reads.push_back(InjectedRead::Packet {
       stream: 0,
       pts: None,
       duration: 0,
+      payload: Vec::new(),
     });
     assert_eq!(walk(&mut demuxer), packets - 2);
     assert_eq!(

@@ -816,7 +816,8 @@ impl<E: DemuxAdapter> TrackInfo<E> {
   /// container's own figure ([`Demuxer::duration`]) is never copied
   /// onto it.
   ///
-  /// The exact per-track figure is [`Demuxer::measured_end`].
+  /// The per-track figure measured from packets is
+  /// [`Demuxer::measured_end`], exact when it says so.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn duration(&self) -> Option<Timestamp> {
     self.duration
@@ -1168,8 +1169,9 @@ where
 /// Each names what libavformat *did* to produce the figure; none says
 /// that a header declares it, and none should be read as if it did.
 /// Which to trust, and how far, is the consumer's call — this type
-/// reports and does not rank. A [`MeasuredEnd`] from the caller's own
-/// walk is the exact figure and outranks every arm here.
+/// reports and does not rank. A [`MeasuredEnd`] that is complete and
+/// exact is a stronger figure than any arm here; one that is not is a
+/// lower bound for the reader to compose with the container's figure.
 ///
 /// Carried by [`ContainerDuration`], so the account travels with the
 /// figure.
@@ -1181,7 +1183,8 @@ pub enum DurationSource {
   /// libavformat estimated the duration from packet timestamps — for an
   /// MPEG program or transport stream, the ones at the tail of the
   /// file. An estimate made from timestamps, and one libavformat itself
-  /// calls accurate; a measured end replaces it when a walk lands. This
+  /// calls accurate; a measured end that is complete and exact is
+  /// stronger. This
   /// arm's value is zero, which is also what the field holds until
   /// libavformat sets it, so the label alone does not prove that
   /// packets were read.
@@ -1202,8 +1205,8 @@ pub enum DurationSource {
   ///
   /// libavformat divided the file's size by a bitrate, and says itself
   /// that this is the less accurate way: it is exact only for a
-  /// constant bitrate over a file that is all media. It never outranks
-  /// a measured end.
+  /// constant bitrate over a file that is all media. A measured end
+  /// that is complete and exact is stronger.
   FromBitrate,
   /// An account this build cannot name: libavformat recorded a method
   /// it has no word for here, or the backend has a figure and no
@@ -1257,36 +1260,55 @@ impl ContainerDuration {
 // ---------------------------------------------------------------------------
 
 /// Where one track's packets ended, as the walk the caller performed
-/// measured it, and whether that walk covered the file.
+/// measured it — with two qualifications that are independent of each
+/// other.
 ///
 /// What [`Demuxer::measured_end`] answers. [`end`](Self::end) is the
 /// greatest packet end — a packet's timestamp plus its duration — over
-/// the timed packets the session read on the track, and
-/// [`walk_complete`](Self::walk_complete) says whether the walk that
-/// measured it covered the file or only part of it.
+/// the timed packets the session read on the track. It is qualified by
+/// [`walk_complete`](Self::walk_complete), whether the walk that
+/// measured it covered the file, and by [`exact`](Self::exact), whether
+/// every packet's end was actually known.
+///
+/// A measured end is **exact only when `exact` holds**; otherwise it is
+/// a lower bound. Complete *and* exact, it is the strongest figure this
+/// tier reports for the track. An inexact one is a lower bound a reader
+/// composes with the container's figure ([`Demuxer::duration`]), and
+/// which to trust is the consumer's call.
 ///
 /// # An instant, not a length
 ///
 /// It is *when* the last packet ends, on the track's own timeline and
 /// in its own timebase: a track that starts at one second and runs for
-/// two ends at three. A packet that carries no duration ends where it
-/// starts, so a track none of whose packets carries one measures where
-/// its last packet begins. A timed packet with no payload counts: it is
-/// a real endpoint, and a later one is the end.
+/// two ends at three. A timed packet with no payload counts: it is a
+/// real endpoint, and a later one is the end.
+///
+/// # Exact, or a lower bound
+///
+/// `exact` turns `false`, for good, the first time a packet on the
+/// track lacks what an end needs: a duration or a timestamp. A packet
+/// whose duration is not positive — libavformat writes zero for one it
+/// does not know — ends, as far as the walk can tell, where it starts,
+/// and a packet delivered with no timestamp has no end to place; either
+/// leaves `end` a lower bound. A duration the library derived itself
+/// from the stream's frame rate or frame size counts as a duration, and
+/// is only as exact as that derivation.
 ///
 /// # Complete, or so far
 ///
-/// While `walk_complete` is `false` the figure is a lower bound that
-/// still rises as the walk goes on — a value so far, and not a
-/// statement about the file. It turns `true` when every packet the
-/// library delivered to this session was observed, from the first one
-/// to end of file, with no skip. The walk stops being complete, for
-/// good, at any [`seek`](Demuxer::seek), at any packet that was read
-/// and not observed — refused, skipped as corrupt, or on a stream the
-/// session never described, which is what a container that adds
-/// streams mid-read produces — and at an end too large to represent.
-/// From then on the figure is the track's measured end and no longer
-/// moves.
+/// `walk_complete` is `true` only when every packet the library
+/// delivered to this session was observed, from the first one to end of
+/// file, with no skip. A walk that is complete is **frozen**: its
+/// figures are final, and neither a later read nor a later
+/// [`seek`](Demuxer::seek) moves them or takes the flag back.
+///
+/// A walk that skips something before it completes — a seek, a packet
+/// read and not observed (refused, skipped as corrupt, or on a stream
+/// the session never described, which is what a container that adds
+/// streams mid-read produces), or an end too large to represent — can
+/// never complete in this session. Measurement carries on as a "so far"
+/// maximum: `end` keeps rising as packets are read, and stays a lower
+/// bound however far the walk goes.
 ///
 /// **What it does not cover.** A library probes while it opens the
 /// container, before this session's first read. libavformat buffers the
@@ -1297,20 +1319,27 @@ impl ContainerDuration {
 pub struct MeasuredEnd {
   end: Timestamp,
   walk_complete: bool,
+  exact: bool,
 }
 
 impl MeasuredEnd {
-  /// Constructs a `MeasuredEnd` from the greatest packet end seen and
-  /// whether the walk that saw it was complete.
+  /// Constructs a `MeasuredEnd` from the greatest packet end seen,
+  /// whether the walk that saw it was complete, and whether every
+  /// packet's end was known.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn new(end: Timestamp, walk_complete: bool) -> Self {
-    Self { end, walk_complete }
+  pub const fn new(end: Timestamp, walk_complete: bool, exact: bool) -> Self {
+    Self {
+      end,
+      walk_complete,
+      exact,
+    }
   }
 
-  /// Returns the greatest packet end the session has read on the
-  /// track: the track's measured end once
-  /// [`walk_complete`](Self::walk_complete) holds, a lower bound
-  /// before.
+  /// Returns the greatest packet end the session has read on the track.
+  ///
+  /// Exact only when [`exact`](Self::exact) holds, a lower bound
+  /// otherwise, and final only when [`walk_complete`](Self::walk_complete)
+  /// holds, a figure so far before.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn end(&self) -> Timestamp {
     self.end
@@ -1321,12 +1350,25 @@ impl MeasuredEnd {
   ///
   /// `false` means the figure is *so far*: the walk has not finished,
   /// or a seek, a packet read and not observed, or an unrepresentable
-  /// end means it did not cover the file. `true` does not reach back
-  /// into the library's own probing, which is not observable — see
-  /// [the type's docs](MeasuredEnd#complete-or-so-far).
+  /// end means it did not cover the file, and it never will in this
+  /// session. `true` freezes the figure and does not reach back into
+  /// the library's own probing, which is not observable — see [the
+  /// type's docs](MeasuredEnd#complete-or-so-far).
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn walk_complete(&self) -> bool {
     self.walk_complete
+  }
+
+  /// Returns `true` when every packet's end on the track was known, so
+  /// [`end`](Self::end) is the greatest of known ends.
+  ///
+  /// `false` means [`end`](Self::end) is a lower bound: a packet had no
+  /// positive duration or no timestamp, from which point on the walk
+  /// cannot say where the track really ends. See [the type's
+  /// docs](MeasuredEnd#exact-or-a-lower-bound).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn exact(&self) -> bool {
+    self.exact
   }
 }
 
@@ -1879,9 +1921,10 @@ where
 ///   it.
 /// - [`measured_end`](Self::measured_end) is what the **walk**
 ///   measured: where a track's packets ended. It rides the pulls the
-///   caller already makes, is complete once the walk reaches end of
-///   file, and says so while it is not. It is the exact per-track
-///   figure.
+///   caller already makes and carries two qualifications of its own —
+///   whether the walk covered the file, and whether every packet's end
+///   was known. Complete and exact, it is the strongest per-track
+///   figure; otherwise it is a lower bound.
 ///
 /// # What is not here
 ///
@@ -1944,8 +1987,9 @@ pub trait Demuxer {
   ///
   /// [`ContainerDuration::source`] is that account in the library's own
   /// words ([`DurationSource`]). It says what the library did, not what
-  /// the file declares, and no arm outranks a measured end. See
-  /// [durations](Self#durations) on the trait.
+  /// the file declares, and no arm is stronger than a measured end that
+  /// is complete and exact. See [durations](Self#durations) on the
+  /// trait.
   ///
   /// It is not any track's duration: a track the library reported none
   /// for stays `None`, and this figure is never copied onto it.
@@ -1968,10 +2012,11 @@ pub trait Demuxer {
   /// each timed packet read moves it — so nothing is read for it,
   /// nothing is sought, and there is no second pass.
   ///
-  /// At any moment the answer is the figure *so far*;
+  /// At any moment the answer is the figure *so far*, qualified twice:
   /// [`MeasuredEnd::walk_complete`] says when the walk covered the file
-  /// and what that does not vouch for. See [durations](Self#durations)
-  /// on the trait.
+  /// and what that does not vouch for, and [`MeasuredEnd::exact`] says
+  /// whether every packet's end was known or the figure is a lower
+  /// bound. See [durations](Self#durations) on the trait.
   ///
   /// A track that is off the timeline — an attachment — a track outside
   /// the table, and a track whose end is too large to represent all
@@ -2306,24 +2351,30 @@ mod tests {
   }
 
   #[test]
-  fn a_measured_end_carries_the_figure_and_whether_the_walk_was_complete() {
-    let so_far = MeasuredEnd::new(Timestamp::new(1_960, ms_tb()), false);
+  fn a_measured_end_carries_the_figure_and_its_two_qualifications() {
+    let so_far = MeasuredEnd::new(Timestamp::new(1_960, ms_tb()), false, true);
     assert_eq!(so_far.end(), Timestamp::new(1_960, ms_tb()));
     assert!(!so_far.walk_complete());
+    assert!(so_far.exact());
 
-    let covered = MeasuredEnd::new(Timestamp::new(2_000, ms_tb()), true);
+    let covered = MeasuredEnd::new(Timestamp::new(2_000, ms_tb()), true, true);
     assert!(covered.walk_complete());
     // The figure compares as the instant it names, so the same moment
     // on another ruler is the same figure...
     assert_eq!(
       covered,
-      MeasuredEnd::new(Timestamp::new(2, Timebase::SECONDS), true),
+      MeasuredEnd::new(Timestamp::new(2, Timebase::SECONDS), true, true),
     );
-    // ...while "so far" and "complete" are different statements about it.
+    // ...while "so far" against "complete", and a lower bound against
+    // an exact end, are different statements about it.
     assert_ne!(
       covered,
-      MeasuredEnd::new(Timestamp::new(2_000, ms_tb()), false),
+      MeasuredEnd::new(Timestamp::new(2_000, ms_tb()), false, true),
     );
+    let lower_bound = MeasuredEnd::new(Timestamp::new(2_000, ms_tb()), true, false);
+    assert_ne!(covered, lower_bound);
+    assert!(!lower_bound.exact(), "the two flags are independent");
+    assert!(lower_bound.walk_complete());
     let copy = covered;
     assert_eq!(copy, covered);
   }
