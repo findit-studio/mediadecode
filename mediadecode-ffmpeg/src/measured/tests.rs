@@ -83,12 +83,12 @@ fn each_track_keeps_its_own_figure_and_a_stray_index_is_ignored() {
 }
 
 /// An end that does not fit in an `i64` is no end at all. Saturating
-/// would name `i64::MAX` as an exact end and let end of file call it
-/// final; instead the track answers none, a later smaller packet does
-/// not resurrect it, and no other track's figure is called final while
-/// this one is missing.
+/// would name `i64::MAX` as an exact end and let end of file call the
+/// walk complete over it; instead the track answers none, a later
+/// smaller packet does not resurrect it, and no other track's figure is
+/// called complete while this one is missing.
 #[test]
-fn an_end_that_does_not_fit_is_no_end_and_no_figure_is_final() {
+fn an_end_that_does_not_fit_is_no_end_and_no_walk_is_complete() {
   let mut m = Measured::new(2).expect("reserve");
   m.observe(0, Some(0), 40);
   m.observe(1, Some(i64::MAX - 1), 40);
@@ -105,7 +105,7 @@ fn an_end_that_does_not_fit_is_no_end_and_no_figure_is_final() {
   assert_eq!(
     m.get(0, ms()),
     Some(MeasuredEnd::new(at(40), false)),
-    "one track's end is missing, so the pass is not final for the others",
+    "one track's end is missing, so the walk is not complete for the others",
   );
 }
 
@@ -117,7 +117,7 @@ fn the_largest_end_that_fits_is_still_a_figure() {
   m.observe(0, Some(i64::MAX - 40), 40);
   assert_eq!(m.get(0, ms()).map(|e| e.end()), Some(at(i64::MAX)));
   m.end_of_file();
-  assert!(m.get(0, ms()).expect("measured").reached_end());
+  assert!(m.get(0, ms()).expect("measured").walk_complete());
 }
 
 /// A track that starts before zero still ends where its last packet
@@ -129,37 +129,38 @@ fn an_end_before_zero_is_still_an_end() {
   assert_eq!(m.get(0, ms()).map(|e| e.end()), Some(at(-10)));
 }
 
-/// The walk is final only when end of file answers an unbroken pass.
+/// The walk is complete only when end of file answers a walk that
+/// skipped nothing.
 #[test]
-fn end_of_file_makes_the_figures_final_on_an_unbroken_pass() {
+fn end_of_file_completes_a_walk_that_skipped_nothing() {
   let mut m = Measured::new(1).expect("reserve");
   m.observe(0, Some(0), 40);
-  assert!(!m.get(0, ms()).expect("measured").reached_end());
+  assert!(!m.get(0, ms()).expect("measured").walk_complete());
   m.end_of_file();
-  assert!(m.get(0, ms()).expect("measured").reached_end());
+  assert!(m.get(0, ms()).expect("measured").walk_complete());
 }
 
-/// A pass a seek or a dropped packet broke never claims to be final,
+/// A walk a seek or a skipped packet broke never claims to be complete,
 /// though the figure it measured is still reported.
 #[test]
-fn a_broken_pass_never_claims_to_be_final() {
+fn a_broken_walk_never_claims_to_be_complete() {
   let mut m = Measured::new(1).expect("reserve");
   m.observe(0, Some(0), 40);
-  m.break_pass();
+  m.break_walk();
   m.end_of_file();
   let measured = m.get(0, ms()).expect("measured");
-  assert!(!measured.reached_end());
+  assert!(!measured.walk_complete());
   assert_eq!(measured.end(), at(40));
 }
 
-/// A figure that is already final stays final when a later seek breaks
-/// the pass: the packets delivered again are the ones already counted.
+/// A walk that is already complete stays so when a later seek breaks
+/// it: the packets read again are the ones already counted.
 #[test]
-fn a_final_figure_stays_final_when_a_later_seek_breaks_the_pass() {
+fn a_complete_walk_stays_complete_when_a_later_seek_breaks_it() {
   let mut m = Measured::new(1).expect("reserve");
   m.observe(0, Some(0), 40);
   m.end_of_file();
-  m.break_pass();
+  m.break_walk();
   m.observe(0, Some(0), 40);
   m.end_of_file();
   assert_eq!(m.get(0, ms()), Some(MeasuredEnd::new(at(40), true)),);

@@ -137,10 +137,11 @@ impl Corpus {
     out
   }
 
-  /// An MP3 with **no Xing/Info frame and no ID3 tag**: nothing in the
-  /// file states a length, so libavformat divides the file's size by the
-  /// first frame's bitrate — `AVFMT_DURATION_FROM_BITRATE`, the weakest
-  /// provenance a container duration can have.
+  /// An MP3 with **no Xing/Info frame and no ID3 tag**: libavformat has
+  /// no duration field to read and no timestamps to read one from, so it
+  /// divides the file's size by the first frame's bitrate and records
+  /// `AVFMT_DURATION_FROM_BITRATE` — "Duration estimated from bitrate
+  /// (less accurate)".
   #[rustfmt::skip]
   pub fn headerless_mp3(&self) -> PathBuf {
     let out = self.path("headerless.mp3");
@@ -156,9 +157,8 @@ impl Corpus {
   }
 
   /// An MPEG **transport stream** — video and audio, a second long.
-  /// The format carries no header to read a length from, so libavformat
-  /// reads packet timestamps at the tail of the file itself:
-  /// `AVFMT_DURATION_FROM_PTS`.
+  /// libavformat records `AVFMT_DURATION_FROM_PTS` for it — "Duration
+  /// accurately estimated from PTSes".
   #[rustfmt::skip]
   pub fn transport_stream(&self) -> PathBuf {
     let out = self.path("transport.ts");
@@ -859,14 +859,15 @@ pub fn raw_stream_ends(path: &Path) -> Vec<Option<i64>> {
   ends
 }
 
-/// What each stream's **header** states for its duration — `(ticks, time
-/// base numerator, time base denominator)` per stream, `None` where it
-/// states none — read the way a bare libavformat user reads it before
-/// probing: `avformat_open_input` and **no** `avformat_find_stream_info`.
+/// libavformat's figure for each stream's duration **before it probes**
+/// — `(ticks, time base numerator, time base denominator)` per stream,
+/// `None` where it holds none — read the way a bare libavformat user
+/// reads it: `avformat_open_input` and **no**
+/// `avformat_find_stream_info`.
 ///
-/// This is the oracle for the rule that a track's stated duration is the
-/// header's and not a figure libavformat filled in while probing, taken
-/// without the code under test.
+/// This is the oracle for the rule that a track carries the figure
+/// libavformat held before probing and not one it filled in while
+/// probing, taken without the code under test.
 pub fn raw_header_durations(path: &Path) -> Vec<Option<(i64, i32, i32)>> {
   use ffmpeg_next::ffi::{
     AV_NOPTS_VALUE, AVFormatContext, avformat_close_input, avformat_open_input,

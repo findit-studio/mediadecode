@@ -739,10 +739,10 @@ impl<E: DemuxAdapter> Debug for TrackParams<E> {
 ///
 /// Carries what a consumer needs to decide whether it wants the track
 /// and how to open a decoder for it: the kind, the timebase every
-/// timestamp on that track is expressed in, the duration the container
-/// states for it, the per-kind codec parameters, the language the
-/// container declares for the track, and — for attachments — the
-/// identity the file was attached under.
+/// timestamp on that track is expressed in, the duration the library
+/// reported for it before probing, the per-kind codec parameters, the
+/// language the container declares for the track, and — for
+/// attachments — the identity the file was attached under.
 ///
 /// Everything a particular backend knows and this row has no seat for
 /// rides [`DemuxAdapter::TrackExtra`].
@@ -799,19 +799,24 @@ impl<E: DemuxAdapter> TrackInfo<E> {
   pub const fn timebase(&self) -> Timebase {
     self.timebase
   }
-  /// Returns the duration the container **states for this track**, or
-  /// `None` where it states none.
+  /// Returns the duration the demuxing library reported for this track
+  /// when it opened the container, before it probed any packet, or
+  /// `None` where it reported none.
   ///
-  /// "States" is the header's word, read before the demuxing library
-  /// has probed the stream. A track stays `None` where its container
-  /// states no duration for it — Matroska states a length for the file
-  /// and none for any track — and neither the container's own figure
-  /// ([`Demuxer::duration`]) nor anything a library fills in later is
-  /// ever copied onto it: libavformat, for one, gives a stream that
-  /// supplied no timing of its own the container's length once probing
-  /// ends, and that fill is not the file's statement. Where a track's
-  /// length is wanted regardless, [`Demuxer::measured_end`] is the
-  /// honest per-track figure.
+  /// That is the library's figure and no claim about the file: a
+  /// format's reader may compute it itself — libavformat's WAV reader
+  /// derives it from the data chunk's size — and this tier cannot tell
+  /// that from a duration the file declares. What it does keep out is
+  /// the fill probing adds. libavformat gives a stream that supplied no
+  /// timing the container's own length once probing ends, so a figure
+  /// that appears only afterwards is not carried, and a stream the
+  /// library creates during probing has none here. A track stays `None`
+  /// where the library reported nothing before probing — Matroska
+  /// reports a length for the file and none for any track — and the
+  /// container's own figure ([`Demuxer::duration`]) is never copied
+  /// onto it.
+  ///
+  /// The exact per-track figure is [`Demuxer::measured_end`].
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn duration(&self) -> Option<Timestamp> {
     self.duration
@@ -1156,59 +1161,67 @@ where
 //  The container's duration.
 // ---------------------------------------------------------------------------
 
-/// How a container-level duration came to be known: what the demuxing
-/// library did to produce it, and so what a reader should trust it as.
+/// How the demuxing library came by a container-level duration, in the
+/// library's own three words and no others.
 ///
-/// Carried by [`ContainerDuration`], so the provenance travels with the
-/// figure and a bitrate guess cannot be read as the file's own
-/// statement. The three arms are three different acts rather than three
-/// grades of one: a header was read, packets were read, or a size was
-/// divided. A [`MeasuredEnd`] from the caller's own walk is exact and
-/// replaces any of them when it lands.
+/// The arms are libavformat's `AVDurationEstimationMethod`, verbatim.
+/// Each names what libavformat *did* to produce the figure; none says
+/// that a header declares it, and none should be read as if it did.
+/// Which to trust, and how far, is the consumer's call — this type
+/// reports and does not rank. A [`MeasuredEnd`] from the caller's own
+/// walk is the exact figure and outranks every arm here.
 ///
-/// The names are crate-neutral. The FFmpeg backend maps libavformat's
-/// `AVDurationEstimationMethod` onto them, and its docs say how.
+/// Carried by [`ContainerDuration`], so the account travels with the
+/// figure.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, IsVariant)]
 pub enum DurationSource {
-  /// Read from headers: the container's own duration field — a
-  /// Matroska segment's, an MP4's movie header — or the durations its
-  /// streams' headers state. libavformat's `AVFMT_DURATION_FROM_STREAM`.
+  /// `AVFMT_DURATION_FROM_PTS`. libavformat's words: "Duration
+  /// accurately estimated from PTSes".
   ///
-  /// What the file says about itself; nothing was measured. Trust it as
-  /// a statement: a file can state a length its packets do not bear
-  /// out — cut short, muxed live, edited without the header being
-  /// rewritten — which is why a measured end replaces it.
-  Stated,
-  /// Measured by the library from packet timestamps during probing —
-  /// for an MPEG program or transport stream, which has no header to
-  /// read a length from, the timestamps at the tail of the file.
-  /// libavformat's `AVFMT_DURATION_FROM_PTS`.
+  /// libavformat estimated the duration from packet timestamps — for an
+  /// MPEG program or transport stream, the ones at the tail of the
+  /// file. An estimate made from timestamps, and one libavformat itself
+  /// calls accurate; a measured end replaces it when a walk lands. This
+  /// arm's value is zero, which is also what the field holds until
+  /// libavformat sets it, so the label alone does not prove that
+  /// packets were read.
+  FromPts,
+  /// `AVFMT_DURATION_FROM_STREAM`. libavformat's words: "Duration
+  /// estimated from a stream with a known duration".
   ///
-  /// A measurement, not a statement: observed rather than declared. It
-  /// was observed over a window of the file and not a full pass, so a
-  /// measured end from the caller's own walk replaces it when it lands.
-  Probed,
-  /// Estimated from the file's size and a bitrate: the file carries no
-  /// duration and no timestamps the library could read one from — an
-  /// MP3 with no Xing header. libavformat's `AVFMT_DURATION_FROM_BITRATE`.
+  /// libavformat took the figure from a stream's duration or from the
+  /// container's own duration field, and the label does not say which:
+  /// it is reported for Matroska too, where the figure is the
+  /// container's own field and no stream has one. It is not a
+  /// declaration by the file — a format's reader may compute a stream's
+  /// duration from other fields rather than read it, and this label
+  /// covers that as well.
+  FromStream,
+  /// `AVFMT_DURATION_FROM_BITRATE`. libavformat's words: "Duration
+  /// estimated from bitrate (less accurate)".
   ///
-  /// The weakest figure here. It is exact only for a constant bitrate
-  /// over a file that is all media, and it is off by whatever the
-  /// bitrate varies or the file carries besides media. It never
-  /// outranks a measured end.
-  Estimated,
+  /// libavformat divided the file's size by a bitrate, and says itself
+  /// that this is the less accurate way: it is exact only for a
+  /// constant bitrate over a file that is all media. It never outranks
+  /// a measured end.
+  FromBitrate,
+  /// An account this build cannot name: libavformat recorded a method
+  /// it has no word for here, or the backend has a figure and no
+  /// account of how it was reached. Nothing is claimed about the
+  /// figure, and it is not folded into an estimate.
+  Unknown,
 }
 
-/// A container-level duration with its provenance.
+/// A container-level duration with the library's account of it.
 ///
 /// What [`Demuxer::duration`] answers: [`value`](Self::value) is the
 /// figure, as a [`Timestamp`] the way [`TrackInfo::duration`] carries
-/// one, and [`source`](Self::source) says how it came to be known. Read
-/// the two together — the same number means one thing as a header's
-/// statement and another as a guess from a bitrate.
+/// one, and [`source`](Self::source) is how the library says it came by
+/// it. Read the two together — the same number means one thing read off
+/// timestamps and another divided out of a bitrate.
 ///
-/// It is the *container's* figure and no track's: a track states its
-/// own through [`TrackInfo::duration`], or states none.
+/// It is the *container's* figure and no track's: a track's own comes
+/// through [`TrackInfo::duration`], or is absent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContainerDuration {
   value: Timestamp,
@@ -1216,8 +1229,8 @@ pub struct ContainerDuration {
 }
 
 impl ContainerDuration {
-  /// Constructs a `ContainerDuration` from a figure and how it came to
-  /// be known.
+  /// Constructs a `ContainerDuration` from a figure and the library's
+  /// account of it.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new(value: Timestamp, source: DurationSource) -> Self {
     Self { value, source }
@@ -1225,14 +1238,14 @@ impl ContainerDuration {
 
   /// Returns the figure.
   ///
-  /// Whether it is the container's statement, a measurement the library
-  /// made, or a guess is [`source`](Self::source)'s to say.
+  /// How far to trust it is [`source`](Self::source)'s to say, in the
+  /// library's own words.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn value(&self) -> Timestamp {
     self.value
   }
 
-  /// Returns how the figure came to be known.
+  /// Returns the library's account of how it came by the figure.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn source(&self) -> DurationSource {
     self.source
@@ -1244,13 +1257,13 @@ impl ContainerDuration {
 // ---------------------------------------------------------------------------
 
 /// Where one track's packets ended, as the walk the caller performed
-/// measured it, and whether that walk is over.
+/// measured it, and whether that walk covered the file.
 ///
 /// What [`Demuxer::measured_end`] answers. [`end`](Self::end) is the
 /// greatest packet end — a packet's timestamp plus its duration — over
-/// the packets the session has delivered on the track, and
-/// [`reached_end`](Self::reached_end) says whether those are all the
-/// track's packets or only the ones so far.
+/// the timed packets the session read on the track, and
+/// [`walk_complete`](Self::walk_complete) says whether the walk that
+/// measured it covered the file or only part of it.
 ///
 /// # An instant, not a length
 ///
@@ -1258,52 +1271,62 @@ impl ContainerDuration {
 /// in its own timebase: a track that starts at one second and runs for
 /// two ends at three. A packet that carries no duration ends where it
 /// starts, so a track none of whose packets carries one measures where
-/// its last packet begins.
+/// its last packet begins. A timed packet with no payload counts: it is
+/// a real endpoint, and a later one is the end.
 ///
-/// # Final, or so far
+/// # Complete, or so far
 ///
-/// While `reached_end` is `false` the figure is a lower bound that
+/// While `walk_complete` is `false` the figure is a lower bound that
 /// still rises as the walk goes on — a value so far, and not a
-/// statement about the file. It turns `true` when the session has
-/// delivered every packet of one unbroken pass to end of file. The
-/// pass breaks, for good, at any [`seek`](Demuxer::seek) and at any
-/// packet that was read and not delivered: refused, skipped as
-/// corrupt, or on a stream the session never described — which is what
-/// a container that adds streams mid-read produces, so a session that
-/// read a packet on such a stream never answers final. An end too large
-/// to represent breaks it as well. From then on the figure is the
-/// track's measured end and no longer moves.
+/// statement about the file. It turns `true` when every packet the
+/// library delivered to this session was observed, from the first one
+/// to end of file, with no skip. The walk stops being complete, for
+/// good, at any [`seek`](Demuxer::seek), at any packet that was read
+/// and not observed — refused, skipped as corrupt, or on a stream the
+/// session never described, which is what a container that adds
+/// streams mid-read produces — and at an end too large to represent.
+/// From then on the figure is the track's measured end and no longer
+/// moves.
+///
+/// **What it does not cover.** A library probes while it opens the
+/// container, before this session's first read. libavformat buffers the
+/// packets it reads then and replays them, but a read error it swallows
+/// during probing is not exposed anywhere, so data skipped there is
+/// invisible to the session, and a complete walk does not vouch for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MeasuredEnd {
   end: Timestamp,
-  reached_end: bool,
+  walk_complete: bool,
 }
 
 impl MeasuredEnd {
   /// Constructs a `MeasuredEnd` from the greatest packet end seen and
-  /// whether the walk that saw it has reached end of file.
+  /// whether the walk that saw it was complete.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn new(end: Timestamp, reached_end: bool) -> Self {
-    Self { end, reached_end }
+  pub const fn new(end: Timestamp, walk_complete: bool) -> Self {
+    Self { end, walk_complete }
   }
 
-  /// Returns the greatest packet end the walk has delivered on the
+  /// Returns the greatest packet end the session has read on the
   /// track: the track's measured end once
-  /// [`reached_end`](Self::reached_end) holds, a lower bound before.
+  /// [`walk_complete`](Self::walk_complete) holds, a lower bound
+  /// before.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn end(&self) -> Timestamp {
     self.end
   }
 
-  /// Returns `true` when the walk reached end of file in one unbroken
-  /// pass, which makes [`end`](Self::end) final.
+  /// Returns `true` when every packet the library delivered to this
+  /// session was observed, from the first to end of file, with no skip.
   ///
   /// `false` means the figure is *so far*: the walk has not finished,
-  /// or a seek, a packet read and not delivered, or an unrepresentable
-  /// end means it never covered every packet in one pass.
+  /// or a seek, a packet read and not observed, or an unrepresentable
+  /// end means it did not cover the file. `true` does not reach back
+  /// into the library's own probing, which is not observable — see
+  /// [the type's docs](MeasuredEnd#complete-or-so-far).
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn reached_end(&self) -> bool {
-    self.reached_end
+  pub const fn walk_complete(&self) -> bool {
+    self.walk_complete
   }
 }
 
@@ -1843,22 +1866,22 @@ where
 /// A file's length is read in layers, and each layer is answered by its
 /// own method so that none is mistaken for another:
 ///
-/// - [`duration`](Self::duration) is the **container's** figure for the
-///   file as a whole, with its provenance: [`Stated`] where headers say
-///   so, [`Probed`] where the library read packet timestamps, and
-///   [`Estimated`] where it divided a size by a bitrate. Only the first
-///   is the container's own statement.
-/// - [`TrackInfo::duration`] is what the container states **for one
-///   track**. A track stays `None` where its container states none for
-///   it, and the container's figure is never copied onto it.
+/// - [`duration`](Self::duration) is the **container-level** figure the
+///   library reports for the file as a whole, with the library's own
+///   account of how it came by it ([`DurationSource`]). That account
+///   names what the library did — read timestamps, took a stream's
+///   duration, divided a size by a bitrate — and not what the file
+///   declares.
+/// - [`TrackInfo::duration`] is the library's figure for **one track**
+///   as it stood when the container was opened, before probing. It is
+///   no claim about the file either, and a track the library reported
+///   none for stays `None`: the container's figure is never copied onto
+///   it.
 /// - [`measured_end`](Self::measured_end) is what the **walk**
 ///   measured: where a track's packets ended. It rides the pulls the
-///   caller already makes, is final once the walk reaches end of file,
-///   and says so while it is not.
-///
-/// [`Stated`]: DurationSource::Stated
-/// [`Probed`]: DurationSource::Probed
-/// [`Estimated`]: DurationSource::Estimated
+///   caller already makes, is complete once the walk reaches end of
+///   file, and says so while it is not. It is the exact per-track
+///   figure.
 ///
 /// # What is not here
 ///
@@ -1915,21 +1938,17 @@ pub trait Demuxer {
     &[]
   }
 
-  /// Returns the container's duration for the file as a whole, with
-  /// its provenance, or `None` where the container offers no figure.
+  /// Returns the container-level duration the library reports for the
+  /// file as a whole, with the library's account of how it came by it,
+  /// or `None` where it reports none.
   ///
-  /// [`ContainerDuration::source`] says how the figure came to be
-  /// known, and only [`Stated`](DurationSource::Stated) is the
-  /// container's own statement — read as written, so a header that
-  /// disagrees with the packets behind it is reported as it is. A
-  /// [`Probed`](DurationSource::Probed) figure is a measurement the
-  /// library made while probing, and an
-  /// [`Estimated`](DurationSource::Estimated) one is a guess; neither
-  /// outranks a measured end. See [durations](Self#durations) on the
-  /// trait.
+  /// [`ContainerDuration::source`] is that account in the library's own
+  /// words ([`DurationSource`]). It says what the library did, not what
+  /// the file declares, and no arm outranks a measured end. See
+  /// [durations](Self#durations) on the trait.
   ///
-  /// It is not any track's duration. A track whose container states
-  /// none for it stays `None`; this figure is never copied onto it.
+  /// It is not any track's duration: a track the library reported none
+  /// for stays `None`, and this figure is never copied onto it.
   ///
   /// Fixed for the life of the session and callable whenever, like the
   /// tables. Provided: a backend with no such figure answers `None`.
@@ -1939,19 +1958,20 @@ pub trait Demuxer {
   }
 
   /// Returns where `track`'s packets ended, as the walk this session
-  /// has performed measured it, or `None` where the session has
-  /// delivered no packet on `track` that carries a timestamp.
+  /// has performed measured it, or `None` where the session has read no
+  /// packet on `track` that carries a timestamp.
   ///
   /// A packet's end is its timestamp plus its duration, and its
   /// timestamp alone where it carries no duration; the figure is the
-  /// greatest end over the packets delivered. It rides
-  /// [`next_packet`](Self::next_packet) — each timed packet delivered
-  /// moves it — so nothing is read for it, nothing is sought, and there
-  /// is no second pass.
+  /// greatest end over the timed packets read, whether or not a packet
+  /// carries a payload. It rides [`next_packet`](Self::next_packet) —
+  /// each timed packet read moves it — so nothing is read for it,
+  /// nothing is sought, and there is no second pass.
   ///
   /// At any moment the answer is the figure *so far*;
-  /// [`MeasuredEnd::reached_end`] says when it is final. See
-  /// [durations](Self#durations) on the trait.
+  /// [`MeasuredEnd::walk_complete`] says when the walk covered the file
+  /// and what that does not vouch for. See [durations](Self#durations)
+  /// on the trait.
   ///
   /// A track that is off the timeline — an attachment — a track outside
   /// the table, and a track whose end is too large to represent all
@@ -2243,39 +2263,42 @@ mod tests {
   }
 
   #[test]
-  fn a_container_duration_carries_the_figure_and_how_it_came_to_be_known() {
+  fn a_container_duration_carries_the_figure_and_the_librarys_account_of_it() {
     let figure = Timestamp::new(2_021, ms_tb());
-    let stated = ContainerDuration::new(figure, DurationSource::Stated);
-    assert_eq!(stated.value(), figure);
-    assert_eq!(stated.source(), DurationSource::Stated);
+    let reported = ContainerDuration::new(figure, DurationSource::FromStream);
+    assert_eq!(reported.value(), figure);
+    assert_eq!(reported.source(), DurationSource::FromStream);
 
-    // The same figure from a different act is a different answer...
+    // The same figure under a different account is a different answer...
     assert_ne!(
-      stated,
-      ContainerDuration::new(figure, DurationSource::Estimated),
+      reported,
+      ContainerDuration::new(figure, DurationSource::FromBitrate),
     );
     // ...while the figure itself compares as the instant it names.
     assert_eq!(
-      stated,
+      reported,
       ContainerDuration::new(
         Timestamp::new(2_021_000, Timebase::MICROS),
-        DurationSource::Stated
+        DurationSource::FromStream
       ),
     );
-    let copy = stated;
-    assert_eq!(copy, stated);
+    let copy = reported;
+    assert_eq!(copy, reported);
 
-    // Three acts, three predicates, no overlap.
+    // libavformat's three words and the one this tier adds for an
+    // account it cannot name: four arms, four predicates, no overlap.
     for (source, flags) in [
-      (DurationSource::Stated, (true, false, false)),
-      (DurationSource::Probed, (false, true, false)),
-      (DurationSource::Estimated, (false, false, true)),
+      (DurationSource::FromPts, (true, false, false, false)),
+      (DurationSource::FromStream, (false, true, false, false)),
+      (DurationSource::FromBitrate, (false, false, true, false)),
+      (DurationSource::Unknown, (false, false, false, true)),
     ] {
       assert_eq!(
         (
-          source.is_stated(),
-          source.is_probed(),
-          source.is_estimated()
+          source.is_from_pts(),
+          source.is_from_stream(),
+          source.is_from_bitrate(),
+          source.is_unknown()
         ),
         flags,
       );
@@ -2283,26 +2306,26 @@ mod tests {
   }
 
   #[test]
-  fn a_measured_end_carries_the_figure_and_whether_it_is_final() {
+  fn a_measured_end_carries_the_figure_and_whether_the_walk_was_complete() {
     let so_far = MeasuredEnd::new(Timestamp::new(1_960, ms_tb()), false);
     assert_eq!(so_far.end(), Timestamp::new(1_960, ms_tb()));
-    assert!(!so_far.reached_end());
+    assert!(!so_far.walk_complete());
 
-    let landed = MeasuredEnd::new(Timestamp::new(2_000, ms_tb()), true);
-    assert!(landed.reached_end());
+    let covered = MeasuredEnd::new(Timestamp::new(2_000, ms_tb()), true);
+    assert!(covered.walk_complete());
     // The figure compares as the instant it names, so the same moment
     // on another ruler is the same figure...
     assert_eq!(
-      landed,
+      covered,
       MeasuredEnd::new(Timestamp::new(2, Timebase::SECONDS), true),
     );
-    // ...while "so far" and "final" are different statements about it.
+    // ...while "so far" and "complete" are different statements about it.
     assert_ne!(
-      landed,
+      covered,
       MeasuredEnd::new(Timestamp::new(2_000, ms_tb()), false),
     );
-    let copy = landed;
-    assert_eq!(copy, landed);
+    let copy = covered;
+    assert_eq!(copy, covered);
   }
 
   #[test]
