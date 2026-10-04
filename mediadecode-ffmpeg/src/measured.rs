@@ -12,14 +12,26 @@ use std::collections::TryReserveError;
 
 use mediadecode::{Timebase, Timestamp, demuxer::MeasuredEnd};
 
+/// One track's running figure.
+#[derive(Clone, Copy)]
+enum Figure {
+  /// No packet carrying a timestamp has arrived.
+  Unseen,
+  /// The greatest packet end delivered so far, in the track's own ticks.
+  End(i64),
+  /// A packet's end did not fit in an `i64`, so the track has no figure
+  /// that can be named. Never left again: a later, smaller packet does
+  /// not make the greatest end representable.
+  Unrepresentable,
+}
+
 /// What a walk has measured so far.
 pub(crate) struct Measured {
-  /// Per track, the greatest packet end delivered so far, in that
-  /// track's own ticks; `None` until a packet carrying a timestamp
-  /// arrives.
-  ends: Vec<Option<i64>>,
+  /// One figure per track.
+  ends: Vec<Figure>,
   /// `true` while the walk is one unbroken pass from the first packet:
-  /// no seek and no dropped packet since the session opened.
+  /// no seek, no packet read and not delivered, and no end that could
+  /// not be represented, since the session opened.
   unbroken: bool,
   /// `true` once an unbroken pass has answered end of file. Never
   /// cleared: the figures are final from then on, and a later seek can
@@ -34,7 +46,7 @@ impl Measured {
     let mut ends = Vec::new();
     ends.try_reserve_exact(tracks)?;
     // Inside the capacity just reserved, so this cannot allocate.
-    ends.resize(tracks, None);
+    ends.resize(tracks, Figure::Unseen);
     Ok(Self {
       ends,
       unbroken: true,
@@ -52,19 +64,34 @@ impl Measured {
   /// last packet begins. A packet without a `pts` says nothing about
   /// when it ends and is passed over.
   ///
-  /// The sum saturates: a hostile timestamp near `i64::MAX` must stay a
-  /// very large figure, not wrap into a small one.
+  /// **An end that does not fit in an `i64` is no end.** Saturating
+  /// would record `i64::MAX` as though the file had ended there, and
+  /// end of file would then return it as an exact, final figure. The
+  /// track answers none from then on, and the pass stops being final
+  /// too: the other tracks' figures cannot be called the file's measured
+  /// end while one track's is missing.
   pub(crate) fn observe(&mut self, track: usize, pts: Option<i64>, duration: i64) {
     let Some(pts) = pts else { return };
     let Some(slot) = self.ends.get_mut(track) else {
       return;
     };
     let end = if duration > 0 {
-      pts.saturating_add(duration)
+      match pts.checked_add(duration) {
+        Some(end) => end,
+        None => {
+          *slot = Figure::Unrepresentable;
+          self.unbroken = false;
+          return;
+        }
+      }
     } else {
       pts
     };
-    *slot = Some(slot.map_or(end, |seen| seen.max(end)));
+    *slot = match *slot {
+      Figure::Unseen => Figure::End(end),
+      Figure::End(seen) => Figure::End(seen.max(end)),
+      Figure::Unrepresentable => Figure::Unrepresentable,
+    };
   }
 
   /// The session answered end of file. The figures are final only if
@@ -76,20 +103,23 @@ impl Measured {
   }
 
   /// The walk is no longer one unbroken pass from the first packet: a
-  /// seek moved it, or a packet was refused and dropped. A figure that
-  /// was already final stays final.
+  /// seek moved it, or a packet was read and not delivered. A figure
+  /// that was already final stays final.
   pub(crate) fn break_pass(&mut self) {
     self.unbroken = false;
   }
 
   /// The figure for `track`, expressed in that track's own `timebase`,
-  /// or `None` where nothing has been measured on it.
+  /// or `None` where nothing has been measured on it or its end cannot
+  /// be represented.
   pub(crate) fn get(&self, track: usize, timebase: Timebase) -> Option<MeasuredEnd> {
-    let ticks = self.ends.get(track).copied().flatten()?;
-    Some(MeasuredEnd::new(
-      Timestamp::new(ticks, timebase),
-      self.reached_end,
-    ))
+    match self.ends.get(track)? {
+      Figure::End(ticks) => Some(MeasuredEnd::new(
+        Timestamp::new(*ticks, timebase),
+        self.reached_end,
+      )),
+      Figure::Unseen | Figure::Unrepresentable => None,
+    }
   }
 }
 

@@ -33,15 +33,20 @@
 //! - the container's duration says how libavformat came by it: stated
 //!   by headers, probed from packet timestamps, or estimated from a
 //!   bitrate;
+//! - a track states exactly what its header stated, read before
+//!   probing, so a figure libavformat fills in afterwards — a sparse
+//!   subtitle track gets the container's length — never reaches a row;
 //! - a walk to end of file measures each track's end exactly, a walk
 //!   that stopped early says its figure is only the one so far, and a
-//!   seek or a dropped packet means the figure is never called final.
+//!   seek or a dropped packet means the figure is never called final,
+//!   and so does a stream the table never described.
 
 mod support;
 
 use std::{
   fs::File,
   io::{Read, Seek},
+  num::NonZeroI32,
 };
 
 // The track handle's refcount is triomphe's, so an allocator refusal
@@ -518,10 +523,9 @@ fn an_mp4_duration_is_stated() {
 /// by the first frame's bitrate and reports it as such. The guess is
 /// close for a constant-bitrate clip — this is not a wild figure — but
 /// it is a guess, and the source is what keeps it from being read as a
-/// header's word. (The audio track's own row carries the same figure
-/// libavformat copied into the stream; that is the per-track fill
-/// `TrackInfo::duration` documents, and `measured_end` is the honest
-/// per-track answer.)
+/// header's word. The audio track's own row is `None`: the header
+/// states no length for it, and the same guess libavformat copies into
+/// the stream while probing is not the file's statement.
 #[test]
 fn a_headerless_mp3_duration_is_estimated() {
   let Some(corpus) = Corpus::new() else { return };
@@ -542,6 +546,11 @@ fn a_headerless_mp3_duration_is_estimated() {
     ),
     "a constant-bitrate guess is near the clip's two seconds, got {}",
     duration.value(),
+  );
+  assert_eq!(
+    demuxer.tracks()[0].duration(),
+    None,
+    "the guess is the container's, and no header states a length for the track",
   );
 }
 
@@ -569,6 +578,95 @@ fn a_transport_stream_duration_is_probed() {
     ),
     "about the clip's one second, got {}",
     duration.value(),
+  );
+}
+
+/// **A sparse subtitle track states no duration, though libavformat
+/// fills one in while probing.**
+///
+/// The subtitle track's one cue starts at 1.5 s of a two-second clip, so
+/// libavformat has seen no packet on it when probing ends and hands it
+/// the container's start and length (`ffprobe` on this build: the
+/// subtitle track reads `duration=2.021000`, video and audio `N/A`).
+/// Matroska states no duration for any track, so every row is `None` —
+/// the figure reads as the file's statement for the track only if it
+/// is taken after the fill.
+#[test]
+fn a_sparse_subtitle_track_states_no_duration_after_probing() {
+  let Some(corpus) = Corpus::new() else { return };
+  let demuxer = FfmpegDemuxer::open(&corpus.sparse_subtitle_mkv()).expect("open mkv");
+
+  assert!(
+    demuxer.duration().is_some(),
+    "the segment states a length for the file",
+  );
+  let subtitles = track_of(&demuxer, TrackKind::Subtitle);
+  assert_eq!(
+    demuxer.tracks()[subtitles].duration(),
+    None,
+    "the length on this track is libavformat's fill, not a statement the file made for it",
+  );
+  for (index, track) in demuxer.tracks().iter().enumerate() {
+    assert_eq!(track.duration(), None, "track {index} ({:?})", track.kind());
+  }
+}
+
+/// **A track states exactly what its header stated.**
+///
+/// The oracle opens each file the way a bare libavformat user does
+/// before probing — `avformat_open_input` and no
+/// `avformat_find_stream_info` — and every row's `duration` must equal
+/// what the header said there: `None` for Matroska and for a headerless
+/// MP3 (whose container figure is a guess), the header's own figure for
+/// an MP4. Anything that appears only after probing is libavformat's
+/// fill and must not reach a row.
+#[test]
+fn a_track_states_exactly_what_its_header_stated() {
+  let Some(corpus) = Corpus::new() else { return };
+  let fixtures = [
+    ("subtitled mkv", corpus.multi_track_mkv()),
+    ("sparse-subtitle mkv", corpus.sparse_subtitle_mkv()),
+    ("mp4", corpus.language_tagged_mp4()),
+    ("cover-art mp3", corpus.cover_art_mp3()),
+    ("headerless mp3", corpus.headerless_mp3()),
+    ("transport stream", corpus.transport_stream()),
+  ];
+  for (name, path) in fixtures {
+    let demuxer = FfmpegDemuxer::open(&path).expect("open");
+    let header = support::raw_header_durations(&path);
+    for (index, track) in demuxer.tracks().iter().enumerate() {
+      // A stream probing added has no header to have stated anything.
+      let expected = header
+        .get(index)
+        .copied()
+        .flatten()
+        .and_then(|(ticks, num, den)| {
+          Some(Timestamp::new(
+            ticks,
+            Timebase::try_new(num, NonZeroI32::new(den)?)?,
+          ))
+        });
+      assert_eq!(
+        track.duration(),
+        expected,
+        "{name}, track {index} ({:?}): a row carries the header's figure and nothing libavformat \
+         filled in",
+        track.kind(),
+      );
+    }
+  }
+}
+
+/// **A path that cannot be a C string is an error, not a panic.**
+/// `ffmpeg-next`'s own `input_*` functions panic on a NUL byte; the open
+/// sequence this crate makes itself answers `EINVAL`.
+#[test]
+fn a_path_that_cannot_be_a_c_string_is_an_error_not_a_panic() {
+  support::init_ffmpeg();
+  let opened = FfmpegDemuxer::open("a\0b.mkv");
+  assert!(
+    matches!(opened, Err(DemuxError::Ffmpeg(_))),
+    "a NUL byte cannot cross into C, and the answer is an error",
   );
 }
 
@@ -899,6 +997,53 @@ fn a_dropped_packet_means_the_walk_never_calls_its_figures_final() {
     "packets were dropped, so one pass did not deliver the file",
   );
   assert_eq!(measured.end(), Timestamp::new(2, Timebase::SECONDS));
+}
+
+/// **A stream that appears after open keeps the pass from ever being
+/// final.**
+///
+/// A second of video alone, a second with audio, then video alone
+/// again, joined: the first and last program maps list one stream and
+/// the middle one lists two. libavformat sees the head of the file when
+/// it opens and a window at the tail, so the audio announced in the
+/// middle is a stream the table never described, and its packets are
+/// passed by. The video track's figure is real, and the pass is not
+/// final — whatever the audio's last packet was, nothing here measured
+/// it.
+///
+/// Where a build describes every stream at open, there is no late
+/// stream to pass by and the lane reports itself NOT RUN, by name.
+#[test]
+fn a_stream_that_appears_after_open_keeps_the_pass_from_ever_being_final() {
+  let Some(corpus) = Corpus::new() else { return };
+  let limits = DemuxLimits::new().with_max_probe_bytes(20_000);
+  let mut demuxer =
+    FfmpegDemuxer::open_with(&corpus.late_audio_ts(), limits).expect("open the joined stream");
+  let described = demuxer.tracks().len();
+  drain(&mut demuxer);
+  let grown = demuxer.input().streams().count();
+  if grown <= described {
+    eprintln!(
+      "NOT RUN: a_stream_that_appears_after_open_keeps_the_pass_from_ever_being_final — \
+       libavformat described all {grown} streams at open on this build, so there is no late \
+       stream to pass by",
+    );
+    return;
+  }
+
+  let figures = measured_ends(&demuxer);
+  assert!(
+    figures.iter().any(Option::is_some),
+    "the stream the table did describe delivered packets",
+  );
+  for (index, figure) in figures.iter().enumerate() {
+    if let Some(figure) = figure {
+      assert!(
+        !figure.reached_end(),
+        "track {index}: the container grew a stream, so the pass is not final",
+      );
+    }
+  }
 }
 
 /// **A malformed chapter timebase is a named refusal, never a panic.**

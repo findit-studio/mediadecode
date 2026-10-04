@@ -30,9 +30,9 @@ The sibling FFmpeg adapter has its own log at
   measurement) or `Estimated` (the file's size over a bitrate — the
   weakest, and never ahead of a measured end). The provenance travels
   with the figure so that a guess cannot be read as the container's own
-  statement. `TrackInfo::duration`'s doc now says a backend's per-track
-  figure can be its library's fill rather than the file's statement, and
-  points at `measured_end` as the honest per-track figure.
+  statement. `TrackInfo::duration`'s doc now says a track states only
+  what its header states, read before any library fill-in, and points at
+  `measured_end` as the honest per-track figure.
 
   Provided, answering `None`, so every implementor written before the
   method existed compiles unchanged and answers correctly. Like the two
@@ -47,7 +47,11 @@ The sibling FFmpeg adapter has its own log at
   the walk is over. `MeasuredEnd::reached_end` is `false` for a figure
   *so far*, a lower bound that still rises, and turns `true` only once
   the session has delivered every packet of one unbroken pass to end of
-  file: no seek and no refused, dropped packet on the way.
+  file. A seek breaks the pass, and so does any packet that was read and
+  not delivered — refused, skipped as corrupt, or on a stream the session
+  never described, which is what a container that adds streams mid-read
+  produces — and so does an end too large to represent, whose track
+  answers `None`.
 
   The figure rides the pulls the caller already makes, so nothing is
   read for it, nothing is sought, and there is no second pass. Provided,

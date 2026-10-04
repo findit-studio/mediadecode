@@ -82,15 +82,42 @@ fn each_track_keeps_its_own_figure_and_a_stray_index_is_ignored() {
   assert_eq!(m.get(7, ms()), None);
 }
 
-/// A timestamp near the top of the range saturates instead of wrapping
-/// into a small figure, and a later smaller one cannot lower it.
+/// An end that does not fit in an `i64` is no end at all. Saturating
+/// would name `i64::MAX` as an exact end and let end of file call it
+/// final; instead the track answers none, a later smaller packet does
+/// not resurrect it, and no other track's figure is called final while
+/// this one is missing.
 #[test]
-fn a_hostile_timestamp_saturates_instead_of_wrapping() {
+fn an_end_that_does_not_fit_is_no_end_and_no_figure_is_final() {
+  let mut m = Measured::new(2).expect("reserve");
+  m.observe(0, Some(0), 40);
+  m.observe(1, Some(i64::MAX - 1), 40);
+  assert_eq!(m.get(1, ms()), None, "the end is unrepresentable");
+
+  m.observe(1, Some(5), 40);
+  assert_eq!(
+    m.get(1, ms()),
+    None,
+    "a later, smaller packet does not make it representable"
+  );
+
+  m.end_of_file();
+  assert_eq!(
+    m.get(0, ms()),
+    Some(MeasuredEnd::new(at(40), false)),
+    "one track's end is missing, so the pass is not final for the others",
+  );
+}
+
+/// The largest end that does fit is an ordinary figure: the check is
+/// for overflow, not for large.
+#[test]
+fn the_largest_end_that_fits_is_still_a_figure() {
   let mut m = Measured::new(1).expect("reserve");
-  m.observe(0, Some(i64::MAX - 1), 40);
+  m.observe(0, Some(i64::MAX - 40), 40);
   assert_eq!(m.get(0, ms()).map(|e| e.end()), Some(at(i64::MAX)));
-  m.observe(0, Some(5), 40);
-  assert_eq!(m.get(0, ms()).map(|e| e.end()), Some(at(i64::MAX)));
+  m.end_of_file();
+  assert!(m.get(0, ms()).expect("measured").reached_end());
 }
 
 /// A track that starts before zero still ends where its last packet

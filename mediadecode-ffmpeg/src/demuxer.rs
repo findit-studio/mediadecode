@@ -17,7 +17,13 @@
 //! [`build_chapters`] for what is read, what is bounded before it is
 //! allocated, and what is deliberately left as the container wrote it.
 //!
-//! The container's **duration** is read then too —
+//! Opening is two calls, `avformat_open_input` and
+//! `avformat_find_stream_info`, with one read between them: each
+//! stream's **header-stated** duration is taken before probing can
+//! overwrite it — see [`HeaderDurations`] — because afterwards a figure
+//! libavformat filled in cannot be told from one the file stated.
+//!
+//! The container's **duration** is read at open too —
 //! `AVFormatContext.duration`, with libavformat's account of how it
 //! came by it, answered by
 //! [`Demuxer::duration`](mediadecode::demuxer::Demuxer::duration) — and
@@ -71,11 +77,11 @@
 
 use std::collections::{TryReserveError, VecDeque};
 use std::{
-  ffi::{CStr, c_int},
+  ffi::{CStr, CString, c_int},
   io::{Read, Seek},
   num::NonZeroI32,
   path::Path,
-  ptr::{addr_of, read_unaligned},
+  ptr::{self, addr_of, read_unaligned},
   sync::Arc,
 };
 
@@ -89,12 +95,13 @@ use triomphe::Arc as TrackArc;
 
 use derive_more::{IsVariant, TryUnwrap, Unwrap};
 use ffmpeg_next::{
-  Packet, Rational,
+  Dictionary, Packet, Rational,
   ffi::{
     AV_DISPOSITION_ATTACHED_PIC, AV_DISPOSITION_TIMED_THUMBNAILS, AV_NOPTS_VALUE, AVDictionary,
-    AVDurationEstimationMethod, AVStream, av_dict_get,
+    AVDurationEstimationMethod, AVFMT_FLAG_CUSTOM_IO, AVFormatContext, AVStream, av_dict_get,
+    avformat_alloc_context, avformat_find_stream_info, avformat_open_input,
   },
-  format::{self, context::Input},
+  format::context::{Input, StreamIo},
 };
 use mediadecode::{
   Timebase, Timestamp,
@@ -171,6 +178,10 @@ pub struct CarrierDemuxer<C: crate::FfmpegCarrier> {
   /// [`Measured`]. Fed by [`Self::next_packet_impl`] as packets are
   /// delivered; it reads nothing itself.
   measured: Measured,
+  /// Faults that answer the next reads in place of libavformat. Test
+  /// only: see [`Self::read_into`].
+  #[cfg(test)]
+  injected_reads: VecDeque<ffmpeg_next::Error>,
   pending: VecDeque<(
     TrackIndex,
     AttachmentPacket<AttachmentPacketExtra, C::Buffer>,
@@ -271,10 +282,8 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
     // `max_streams` only: the hard byte meter needs an `AVIOContext`
     // this crate owns, and a path is opened by libavformat's own
     // protocol layer. The reader entrypoint gets both.
-    Self::from_input(
-      format::input_with_dictionary(path, probe_options(limits))?,
-      limits,
-    )
+    let (input, stated) = open_path(path.as_ref(), limits)?;
+    Self::from_input(input, stated, limits)
   }
 
   /// Opens a container from any `Read + Seek` byte source, through a
@@ -314,26 +323,28 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
     limits: DemuxLimits,
   ) -> Result<Self, DemuxError> {
     let (guarded, latch, meter) = GuardedReader::new(reader, limits.max_probe_bytes());
-    let io = format::context::StreamIo::from_read_seek(guarded)?;
-    let input =
-      format::input_from_stream(io, filename, Some(probe_options(limits))).map_err(|e| {
-        // Three ways this can fail, and they must not be confused: a
-        // panicked reader, a probe budget reached, or libavformat's own
-        // verdict. The meter is consulted before the errno because
-        // libavformat folds the reader's I/O error into whatever it was
-        // doing at the time — usually "invalid data" — which would
-        // report a refusal this crate made as a malformed file.
-        reader_panic(&latch)
-          .or_else(|| {
-            meter.tripped().then(|| {
-              DemuxError::ProbeBudgetExhausted(ProbeBudgetExhausted::new(
-                meter.read(),
-                meter.budget(),
-              ))
-            })
+    let io = StreamIo::from_read_seek(guarded)?;
+    let (input, stated) = open_stream(io, filename, probe_options(limits)).map_err(|fault| {
+      let OpenFault::Ffmpeg(e) = fault else {
+        return DemuxError::from(fault);
+      };
+      // Three ways this can fail, and they must not be confused: a
+      // panicked reader, a probe budget reached, or libavformat's own
+      // verdict. The meter is consulted before the errno because
+      // libavformat folds the reader's I/O error into whatever it was
+      // doing at the time — usually "invalid data" — which would
+      // report a refusal this crate made as a malformed file.
+      reader_panic(&latch)
+        .or_else(|| {
+          meter.tripped().then(|| {
+            DemuxError::ProbeBudgetExhausted(ProbeBudgetExhausted::new(
+              meter.read(),
+              meter.budget(),
+            ))
           })
-          .unwrap_or(DemuxError::Ffmpeg(e))
-      })?;
+        })
+        .unwrap_or(DemuxError::Ffmpeg(e))
+    })?;
     if meter.tripped() {
       return Err(DemuxError::ProbeBudgetExhausted(ProbeBudgetExhausted::new(
         meter.read(),
@@ -349,7 +360,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
     if let Some(panicked) = reader_panic(&latch) {
       return Err(panicked);
     }
-    let mut demuxer = Self::from_input(input, limits)?;
+    let mut demuxer = Self::from_input(input, stated, limits)?;
     demuxer.reader_panic = Some(latch);
     Ok(demuxer)
   }
@@ -381,7 +392,11 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
     self.duration
   }
 
-  fn from_input(input: Input, limits: DemuxLimits) -> Result<Self, DemuxError> {
+  fn from_input(
+    input: Input,
+    stated: HeaderDurations,
+    limits: DemuxLimits,
+  ) -> Result<Self, DemuxError> {
     // **Everything the container declares is judged before anything it
     // declares is paid for**, and that is a property of the *whole*
     // open rather than of either table.
@@ -409,7 +424,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
     // one defect here — a correct check placed after the memory it was
     // meant to protect — which is why the list is written down.
     admit_chapters(&input, limits)?;
-    let (tracks, pending) = build_tracks::<C>(&input, limits)?;
+    let (tracks, pending) = build_tracks::<C>(&input, &stated, limits)?;
     // One allocation per track, here and never again: the session
     // keeps these handles and hands out clones of them.
     //
@@ -452,6 +467,8 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
       format,
       duration,
       measured,
+      #[cfg(test)]
+      injected_reads: VecDeque::new(),
       pending,
       unconverted: None,
       eof: false,
@@ -487,6 +504,203 @@ fn probe_options(limits: DemuxLimits) -> ffmpeg_next::Dictionary<'static> {
   options.set("formatprobesize", &probe);
   options.set("max_streams", &limits.max_streams().to_string());
   options
+}
+
+/// Why [`open_path`] or [`open_stream`] could not produce an input.
+enum OpenFault {
+  /// libavformat's own verdict, from either call it was asked to make.
+  Ffmpeg(ffmpeg_next::Error),
+  /// The record of header-stated durations could not be reserved.
+  Alloc(TrackTableAlloc),
+}
+
+impl From<OpenFault> for DemuxError {
+  fn from(fault: OpenFault) -> Self {
+    match fault {
+      OpenFault::Ffmpeg(e) => DemuxError::Ffmpeg(e),
+      OpenFault::Alloc(alloc) => DemuxError::TrackTableAlloc(alloc),
+    }
+  }
+}
+
+/// One stream's duration as its **header** stated it, with the ruler it
+/// was stated in.
+#[derive(Clone, Copy)]
+struct StatedDuration {
+  /// `AVStream.duration` as the header left it; `AV_NOPTS_VALUE` where
+  /// the header stated none.
+  ticks: i64,
+  /// `AVStream.time_base` at the same moment.
+  num: i32,
+  den: i32,
+}
+
+/// What each stream's **header** stated for its own duration, read in
+/// the one moment that tells a statement from a fill: after
+/// `avformat_open_input` has parsed the headers and before
+/// `avformat_find_stream_info` has probed anything.
+///
+/// Probing rewrites `AVStream.duration`. A stream that supplied no
+/// timing while libavformat read packets — an attachment, or a timed
+/// stream whose first packet lies past the probe, such as a sparse
+/// subtitle track — is handed the *container's* start and length in its
+/// place, and from then on the field cannot be told from a figure the
+/// file stated for the track: an MP4 track whose own header says the
+/// same length looks identical. Looking before the fill is the only
+/// road that separates them, so that is when this reads. A value that
+/// appears only after probing is libavformat's and not the file's, and
+/// is not carried; the honest per-track figure is the measured end.
+///
+/// The time base is kept with each figure, so a figure keeps the ruler
+/// it was stated in even if probing later refines the stream's own.
+struct HeaderDurations(Vec<StatedDuration>);
+
+impl HeaderDurations {
+  /// Reads every stream the headers declared. The count is the
+  /// container's, already capped by `max_streams`, and the record is
+  /// reserved fallibly.
+  fn read(input: &Input) -> Result<Self, OpenFault> {
+    // SAFETY: `input` owns a live, opened `AVFormatContext`;
+    // `nb_streams` and `streams` are public fields of it, and `streams`
+    // holds `nb_streams` entries.
+    let (count, streams) = unsafe {
+      let context = input.as_ptr();
+      ((*context).nb_streams as usize, (*context).streams)
+    };
+    let mut stated = Vec::new();
+    stated
+      .try_reserve_exact(count)
+      .map_err(|_| OpenFault::Alloc(TrackTableAlloc::new(count)))?;
+    for index in 0..count {
+      // SAFETY: entries `0..nb_streams` of `streams` are the context's
+      // own `AVStream` pointers, live as long as `input` is.
+      let stream = unsafe { *streams.add(index) };
+      stated.push(if stream.is_null() {
+        StatedDuration {
+          ticks: AV_NOPTS_VALUE,
+          num: 0,
+          den: 1,
+        }
+      } else {
+        // SAFETY: a non-null entry points at a live `AVStream`.
+        unsafe {
+          StatedDuration {
+            ticks: (*stream).duration,
+            num: (*stream).time_base.num,
+            den: (*stream).time_base.den,
+          }
+        }
+      });
+    }
+    Ok(Self(stated))
+  }
+
+  /// The duration the header stated for stream `index`, or `None` where
+  /// it stated none: `AV_NOPTS_VALUE`, not positive, or in a ruler that
+  /// is not one.
+  fn get(&self, index: usize) -> Option<Timestamp> {
+    let stated = self.0.get(index)?;
+    if stated.ticks == AV_NOPTS_VALUE || stated.ticks <= 0 {
+      return None;
+    }
+    let ruler = rational_to_timebase(Rational::new(stated.num, stated.den))?;
+    Some(Timestamp::new(stated.ticks, ruler))
+  }
+}
+
+/// Opens a container from a path, in the two steps
+/// `ffmpeg_next::format::input_with_dictionary` makes —
+/// `avformat_open_input`, then `avformat_find_stream_info` — with
+/// [`HeaderDurations`] read between them, which that function gives no
+/// chance to do.
+fn open_path(path: &Path, limits: DemuxLimits) -> Result<(Input, HeaderDurations), OpenFault> {
+  let path = path_cstring(path).map_err(OpenFault::Ffmpeg)?;
+  // SAFETY: `context` starts null, which `avformat_open_input` allocates
+  // into; the options dictionary is handed over for the call and what
+  // libavformat leaves of it is taken back and freed; on success the
+  // context is owned by the `Input` wrapped around it.
+  unsafe {
+    let mut context: *mut AVFormatContext = ptr::null_mut();
+    let mut options = probe_options(limits).disown();
+    let status = avformat_open_input(&mut context, path.as_ptr(), ptr::null_mut(), &mut options);
+    drop(Dictionary::own(options));
+    if status != 0 {
+      return Err(OpenFault::Ffmpeg(ffmpeg_next::Error::from(status)));
+    }
+    probe(Input::wrap(context))
+  }
+}
+
+/// Opens a container over a custom `AVIOContext`, in the same two steps
+/// as [`open_path`] and with `ffmpeg_next::format::input_from_stream`'s
+/// own setup of the context.
+fn open_stream(
+  mut io: StreamIo,
+  filename: Option<&str>,
+  options: Dictionary<'static>,
+) -> Result<(Input, HeaderDurations), OpenFault> {
+  debug_assert!(
+    !io.is_writable(),
+    "a demux session is only ever opened over a read source",
+  );
+  let filename = filename
+    .map(CString::new)
+    .transpose()
+    .map_err(|_| OpenFault::Ffmpeg(invalid_argument()))?;
+  let filename_ptr = filename.as_ref().map_or(ptr::null(), |name| name.as_ptr());
+  // SAFETY: the context is allocated here and given the caller's
+  // `AVIOContext` with `AVFMT_FLAG_CUSTOM_IO`, so libavformat neither
+  // opens nor closes an I/O context of its own; `avformat_open_input`
+  // frees the context itself on failure, in which case `io` drops here;
+  // on success the `Input` owns both and closes the context before the
+  // I/O context goes.
+  unsafe {
+    let mut context = avformat_alloc_context();
+    if context.is_null() {
+      return Err(OpenFault::Ffmpeg(ffmpeg_next::Error::Other {
+        errno: libc::ENOMEM,
+      }));
+    }
+    (*context).pb = io.as_mut_ptr();
+    (*context).flags |= AVFMT_FLAG_CUSTOM_IO;
+    let mut options = options.disown();
+    let status = avformat_open_input(&mut context, filename_ptr, ptr::null_mut(), &mut options);
+    drop(Dictionary::own(options));
+    if status != 0 {
+      return Err(OpenFault::Ffmpeg(ffmpeg_next::Error::from(status)));
+    }
+    probe(Input::wrap_with_custom_io(context, io))
+  }
+}
+
+/// Reads the header-stated durations of an opened, unprobed `input`, then
+/// probes it. A failure drops `input`, which closes the context.
+fn probe(mut input: Input) -> Result<(Input, HeaderDurations), OpenFault> {
+  let stated = HeaderDurations::read(&input)?;
+  // SAFETY: `input` owns a live context that `avformat_open_input` has
+  // opened and nothing has probed.
+  let status = unsafe { avformat_find_stream_info(input.as_mut_ptr(), ptr::null_mut()) };
+  if status < 0 {
+    return Err(OpenFault::Ffmpeg(ffmpeg_next::Error::from(status)));
+  }
+  Ok((input, stated))
+}
+
+/// `EINVAL`, the answer for an argument libavformat could never take.
+fn invalid_argument() -> ffmpeg_next::Error {
+  ffmpeg_next::Error::Other {
+    errno: libc::EINVAL,
+  }
+}
+
+/// A path as the C string `avformat_open_input` takes. A path that is
+/// not valid UTF-8, or that holds a NUL byte, is refused with `EINVAL`
+/// where `ffmpeg-next`'s own `input_*` functions panic.
+fn path_cstring(path: &Path) -> Result<CString, ffmpeg_next::Error> {
+  path
+    .to_str()
+    .and_then(|text| CString::new(text).ok())
+    .ok_or_else(invalid_argument)
 }
 
 /// The container's duration, as libavformat holds it once the open has
@@ -621,6 +835,20 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
 
   /// Where `track`'s packets ended, as this session's walk measured
   /// it — see [`Measured`].
+  /// One `av_read_frame` into `packet`.
+  ///
+  /// Under test a queued fault answers in its place, which is how a
+  /// corrupt read is stood in for: libavformat answers
+  /// `AVERROR_INVALIDDATA` for damage that is different in every
+  /// container, and the policy for it is the same.
+  fn read_into(&mut self, packet: &mut Packet) -> Result<(), ffmpeg_next::Error> {
+    #[cfg(test)]
+    if let Some(fault) = self.injected_reads.pop_front() {
+      return Err(fault);
+    }
+    packet.read(&mut self.input)
+  }
+
   pub(crate) fn measured_end_impl(&self, track: TrackIndex) -> Option<MeasuredEnd> {
     let index = track.get();
     self.measured.get(index, self.tracks.get(index)?.timebase())
@@ -655,7 +883,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
         Some((packet, provenance)) => (packet, Some(provenance)),
         None => {
           let mut packet = Packet::empty();
-          let read = packet.read(&mut self.input);
+          let read = self.read_into(&mut packet);
           // A panicking reader reported an ordinary I/O error to C, and
           // libavformat may answer that with the error, with EOF (a
           // stream it cannot read looks finished), or with a packet it
@@ -675,7 +903,14 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
             // `AVERROR_INVALIDDATA` is not latched into the
             // `AVIOContext`, so reading again makes progress. Every
             // other error is sticky and is surfaced.
-            Err(ffmpeg_next::Error::InvalidData) => continue,
+            //
+            // **The read advanced past data that was never delivered**,
+            // so this pass has not covered the file and can no longer
+            // call its measured ends final.
+            Err(ffmpeg_next::Error::InvalidData) => {
+              self.measured.break_pass();
+              continue;
+            }
             Err(e) => return Err(DemuxError::Ffmpeg(e)),
           }
           (packet, None)
@@ -685,7 +920,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
       let index = packet.stream();
       // A packet for a stream the table does not describe cannot be
       // placed, so it is passed by — the same answer the `Unknown` arm
-      // below gives a track nothing can name.
+      // below gives a track nothing can name. Passed by is not
+      // delivered, so it breaks the pass: a session that read a packet
+      // on a stream it never described never answers final.
       //
       // **Neither an assertion nor an error.** The arm is reachable on
       // healthy input: a format flagged `AVFMTCTX_NOHEADER` — MPEG-TS,
@@ -709,6 +946,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
       // log a line per packet for as long as it runs. See
       // [`Self::unplaceable_reported`].
       let Some(info) = self.tracks.get(index) else {
+        self.measured.break_pass();
         if !self.unplaceable_reported {
           self.unplaceable_reported = true;
           tracing::debug!(
@@ -802,11 +1040,16 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
         // so anything arriving on one now is the duplicate some
         // demuxers emit for cover art. Drop it — the contract is
         // exactly one, and the one has already left. Nothing is
-        // converted here, so there is nothing to park.
+        // converted here, so there is nothing to park, and nothing is
+        // lost, so the pass stays unbroken.
         TrackKind::Attachment => continue,
         // The roster of arms is five; a track nothing can name has no
-        // arm and its packets are not delivered.
-        TrackKind::Unknown => continue,
+        // arm and its packets are not delivered — which is data read
+        // and passed by, so the pass breaks.
+        TrackKind::Unknown => {
+          self.measured.break_pass();
+          continue;
+        }
       };
 
       let built = match converted {
@@ -971,12 +1214,14 @@ macro_rules! demuxer_lane_face {
 
       /// The track table, held for the life of the session.
       ///
-      /// A row's `duration` is `AVStream.duration` as libavformat holds
-      /// it, which for a stream with no timing of its own is the
-      /// container's length copied in — and by value that cannot be told
-      /// from a track whose header states the same one. Attachment rows
-      /// are guarded against it; for any other track
-      /// [`measured_end`](Demuxer::measured_end) is the honest figure.
+      /// A row's `duration` is what the stream's **header** stated for
+      /// it, read between `avformat_open_input` and
+      /// `avformat_find_stream_info`. A value that appears only after
+      /// probing is libavformat's fill — it hands a stream that supplied
+      /// no timing the container's length — and is not the file's
+      /// statement, so it is not carried. For a track's length
+      /// regardless, [`measured_end`](Demuxer::measured_end) is the
+      /// honest figure.
       ///
       /// Reading the table takes nothing away — clone the handles worth
       /// keeping. `Arc` is the carrier because
@@ -1037,10 +1282,22 @@ macro_rules! demuxer_lane_face {
       /// figure rides the pulls the caller makes.
       ///
       /// [`MeasuredEnd::reached_end`] holds once an unbroken pass has
-      /// answered `Ok(None)`. A [`seek`](Demuxer::seek), or a packet
-      /// that was refused and dropped, breaks the pass for good; the
-      /// figure is then still reported, and never as final unless it
-      /// already was. An attachment track answers `None`.
+      /// answered `Ok(None)`. The pass breaks for good at a
+      /// [`seek`](Demuxer::seek) and at every packet `av_read_frame`
+      /// produced that this session did not deliver: refused and
+      /// dropped, skipped as corrupt (`AVERROR_INVALIDDATA`), or on a
+      /// stream the table never described — which is what a container
+      /// that adds streams after open (MPEG-TS, RTP) produces, so a
+      /// session that read a packet on a grown stream never answers
+      /// final. Accounting for such streams as they appear is not done
+      /// here. A cover picture's duplicate packet, whose one delivery
+      /// happened at open, and an empty marker packet carry nothing to
+      /// deliver and do not break the pass.
+      ///
+      /// The figure is then still reported, and never as final unless it
+      /// already was. An attachment track answers `None`, and so does a
+      /// track whose end does not fit in an `i64`, which breaks the
+      /// pass as well.
       fn measured_end(&self, track: TrackIndex) -> Option<MeasuredEnd> {
         self.measured_end_impl(track)
       }
@@ -2186,6 +2443,7 @@ type BuiltTracks<C> = (
 
 fn build_tracks<C: crate::FfmpegCarrier + crate::CarrierOps>(
   input: &Input,
+  stated: &HeaderDurations,
   limits: DemuxLimits,
 ) -> Result<BuiltTracks<C>, DemuxError> {
   // **Admission before allocation.** Every attachment in the file is
@@ -2252,27 +2510,17 @@ fn build_tracks<C: crate::FfmpegCarrier + crate::CarrierOps>(
     // and one function is how the two passes are kept from becoming
     // two rules.
     let time_base = stream_timebase(index, stream.time_base())?;
-    // **The duration the container states for this stream — or none.**
+    // **The duration the header states for this stream — or none.**
     //
-    // libavformat answers this field for streams whose container
-    // states nothing: a stream that has no start time once probing
-    // ends is given the *container's* start and length in its place.
-    // An attachment never delivers a timed packet, so that is what
-    // every font and every cover picture receives — and read as it
-    // stands, the file's length would sit on the attachment's row as
-    // though the file had stated it for that track. An attachment is
-    // off the timeline and has no extent to state, so its row says so.
-    //
-    // The same fill-in can reach a timed stream that delivered no
-    // packet while probing — a sparse subtitle track. That one is not
-    // guarded: by value it is the figure a header could just as well
-    // have stated (an MP4 track whose own length equals the movie's
-    // looks identical), so the honest per-track figure is the measured
-    // end, not a guess made here.
-    let attachment = attached_pic || medium.is_attachment();
-    let raw_duration = stream.duration();
-    let duration = (!attachment && raw_duration != AV_NOPTS_VALUE && raw_duration > 0)
-      .then(|| Timestamp::new(raw_duration, time_base));
+    // Read from [`HeaderDurations`], captured before libavformat
+    // probed. `AVStream.duration` as it stands now is no statement:
+    // probing hands a stream that supplied no timing the *container's*
+    // length, which is what every font and cover picture receives, and
+    // any timed stream whose first packet lies past the probe — a
+    // sparse subtitle track. A figure that appears only after probing
+    // is libavformat's fill and is dropped here; the honest per-track
+    // figure is the measured end.
+    let duration = stated.get(index);
     let raw_start = stream.start_time();
     let frames = stream.frames();
 
@@ -3662,6 +3910,158 @@ mod tests {
         "method {unnamed} is not one this build names, so it is not promoted to a statement",
       );
     }
+  }
+
+  /// A PCM WAV built by hand — 8 kHz mono 16-bit silence, `packets`
+  /// demux packets long. Hermetic: no `ffmpeg` CLI and no file, so the
+  /// lanes below that stand a fault in for libavformat's run anywhere.
+  fn silence_wav(packets: usize) -> Vec<u8> {
+    let data_len = packets * 4096;
+    let mut wav = Vec::with_capacity(44 + data_len);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&((36 + data_len) as u32).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+    wav.extend_from_slice(&8_000u32.to_le_bytes()); // sample rate
+    wav.extend_from_slice(&16_000u32.to_le_bytes()); // byte rate
+    wav.extend_from_slice(&2u16.to_le_bytes()); // block align
+    wav.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&(data_len as u32).to_le_bytes());
+    wav.resize(44 + data_len, 0);
+    wav
+  }
+
+  fn open_silence(packets: usize) -> CarrierDemuxer<crate::Owned> {
+    CarrierDemuxer::<crate::Owned>::open_reader(
+      std::io::Cursor::new(silence_wav(packets)),
+      Some("silence.wav"),
+    )
+    .expect("a hand-built WAV opens")
+  }
+
+  /// Pulls to end of file and counts the packets delivered.
+  fn walk(demuxer: &mut CarrierDemuxer<crate::Owned>) -> usize {
+    let mut delivered = 0;
+    while demuxer.next_packet().expect("pull").is_some() {
+      delivered += 1;
+    }
+    delivered
+  }
+
+  /// **A read libavformat answers `InvalidData` to is data the session
+  /// passed by, so no figure of the pass is final.**
+  ///
+  /// The undisturbed walk is the control: it ends final. Then a fault
+  /// stands in for one read, part-way through — libavformat words
+  /// damage differently in every container, and the policy for it is
+  /// one — and the walk still carries on and still delivers every
+  /// packet, but its figure is no longer the file's measured end.
+  #[test]
+  fn a_corrupt_read_the_session_skips_leaves_no_figure_final() {
+    let mut clean = open_silence(5);
+    let packets = walk(&mut clean);
+    assert!(
+      packets >= 2,
+      "the WAV yields several packets, got {packets}"
+    );
+    let control = clean.measured_end(TrackIndex::new(0)).expect("a figure");
+    assert!(
+      control.reached_end(),
+      "control: an undisturbed walk ends final"
+    );
+
+    let mut skipped = open_silence(5);
+    for _ in 0..2 {
+      assert!(skipped.next_packet().expect("pull").is_some());
+    }
+    skipped
+      .injected_reads
+      .push_back(ffmpeg_next::Error::InvalidData);
+    assert_eq!(
+      walk(&mut skipped),
+      packets - 2,
+      "the walk carried on past the skip and delivered every packet",
+    );
+    let figure = skipped.measured_end(TrackIndex::new(0)).expect("a figure");
+    assert!(
+      !figure.reached_end(),
+      "a read was skipped as corrupt, so the figure is not the file's measured end",
+    );
+    assert_eq!(
+      figure.end(),
+      control.end(),
+      "the figure itself is untouched"
+    );
+  }
+
+  /// **A packet on a stream the table never described is data the
+  /// session passed by, so no figure of the pass is final.**
+  ///
+  /// The table is fixed at open, so a stream a container adds
+  /// afterwards — MPEG-TS and RTP do — has no row. Here that is stood in
+  /// for by dropping the only row after one packet has been delivered:
+  /// every packet that follows is on an undescribed stream. The first
+  /// packet's figure is still on the books and is read past the emptied
+  /// table.
+  #[test]
+  fn a_packet_on_a_stream_the_table_does_not_describe_keeps_the_pass_from_being_final() {
+    let mut demuxer = open_silence(5);
+    assert!(demuxer.next_packet().expect("pull").is_some());
+    demuxer.tracks.clear();
+    assert_eq!(walk(&mut demuxer), 0, "every later packet is passed by");
+    let figure = demuxer
+      .measured
+      .get(0, Timebase::MILLIS)
+      .expect("the first packet's figure");
+    assert!(
+      !figure.reached_end(),
+      "packets were passed by, so the figure is not the file's measured end",
+    );
+  }
+
+  /// **A track nothing can name has packets the session passes by, so no
+  /// figure of the pass is final.** The row is replaced with one of the
+  /// `Unknown` kind after a packet has given the track a figure.
+  #[test]
+  fn a_track_of_unknown_kind_keeps_the_pass_from_being_final() {
+    let mut demuxer = open_silence(5);
+    assert!(demuxer.next_packet().expect("pull").is_some());
+    let row = &demuxer.tracks[0];
+    let unknown = TrackInfo::new(
+      row.timebase(),
+      TrackParams::Unknown(UnknownTrackParams::new(CodecId::from_raw(0))),
+      row.extra().clone(),
+    );
+    demuxer.tracks[0] = TrackArc::new(unknown);
+    assert_eq!(
+      walk(&mut demuxer),
+      0,
+      "no packet of an unnameable track is delivered"
+    );
+    let figure = demuxer
+      .measured
+      .get(0, Timebase::MILLIS)
+      .expect("the first packet's figure");
+    assert!(
+      !figure.reached_end(),
+      "packets were passed by, so the figure is not the file's measured end",
+    );
+  }
+
+  /// **The header's duration survives probing, and only the header's.**
+  /// A WAV states its length in the header (the data chunk's size), so
+  /// the row carries it exactly: five 4096-byte chunks of 16-bit 8 kHz
+  /// samples is 1.28 s.
+  #[test]
+  fn a_wav_row_carries_the_length_its_header_states() {
+    let demuxer = open_silence(5);
+    let stated = demuxer.tracks()[0]
+      .duration()
+      .expect("a WAV header states its length");
+    assert_eq!(stated, Timestamp::new(1_280, Timebase::MILLIS));
   }
 
   #[test]

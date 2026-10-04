@@ -802,16 +802,15 @@ impl<E: DemuxAdapter> TrackInfo<E> {
   /// Returns the duration the container **states for this track**, or
   /// `None` where it states none.
   ///
-  /// A track stays `None` where its container states no duration for
-  /// it — Matroska states a length for the file and none for any track —
-  /// and the container's own figure ([`Demuxer::duration`]) is never
-  /// copied onto it by this tier.
-  ///
-  /// This is the demuxing library's per-track figure, and a library may
-  /// fill it from the container's own: libavformat gives a stream that
-  /// has no timing of its own the container's length, and that cannot
-  /// be told by value from a track whose header states the same one.
-  /// Where a track's length matters, [`Demuxer::measured_end`] is the
+  /// "States" is the header's word, read before the demuxing library
+  /// has probed the stream. A track stays `None` where its container
+  /// states no duration for it — Matroska states a length for the file
+  /// and none for any track — and neither the container's own figure
+  /// ([`Demuxer::duration`]) nor anything a library fills in later is
+  /// ever copied onto it: libavformat, for one, gives a stream that
+  /// supplied no timing of its own the container's length once probing
+  /// ends, and that fill is not the file's statement. Where a track's
+  /// length is wanted regardless, [`Demuxer::measured_end`] is the
   /// honest per-track figure.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn duration(&self) -> Option<Timestamp> {
@@ -1266,10 +1265,14 @@ impl ContainerDuration {
 /// While `reached_end` is `false` the figure is a lower bound that
 /// still rises as the walk goes on — a value so far, and not a
 /// statement about the file. It turns `true` when the session has
-/// delivered every packet of one unbroken pass to end of file: no
-/// [`seek`](Demuxer::seek) on the way, and no packet refused and
-/// dropped. From then on the figure is the track's measured end and no
-/// longer moves.
+/// delivered every packet of one unbroken pass to end of file. The
+/// pass breaks, for good, at any [`seek`](Demuxer::seek) and at any
+/// packet that was read and not delivered: refused, skipped as
+/// corrupt, or on a stream the session never described — which is what
+/// a container that adds streams mid-read produces, so a session that
+/// read a packet on such a stream never answers final. An end too large
+/// to represent breaks it as well. From then on the figure is the
+/// track's measured end and no longer moves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MeasuredEnd {
   end: Timestamp,
@@ -1296,8 +1299,8 @@ impl MeasuredEnd {
   /// pass, which makes [`end`](Self::end) final.
   ///
   /// `false` means the figure is *so far*: the walk has not finished,
-  /// or a seek or a dropped packet means it never covered every packet
-  /// in one pass.
+  /// or a seek, a packet read and not delivered, or an unrepresentable
+  /// end means it never covered every packet in one pass.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn reached_end(&self) -> bool {
     self.reached_end
@@ -1950,9 +1953,10 @@ pub trait Demuxer {
   /// [`MeasuredEnd::reached_end`] says when it is final. See
   /// [durations](Self#durations) on the trait.
   ///
-  /// A track that is off the timeline — an attachment — and a track
-  /// outside the table both answer `None`. Provided: a backend that
-  /// does not measure answers `None` for every track.
+  /// A track that is off the timeline — an attachment — a track outside
+  /// the table, and a track whose end is too large to represent all
+  /// answer `None`. Provided: a backend that does not measure answers
+  /// `None` for every track.
   #[cfg_attr(not(tarpaulin), inline(always))]
   fn measured_end(&self, _track: TrackIndex) -> Option<MeasuredEnd> {
     None
