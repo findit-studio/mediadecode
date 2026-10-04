@@ -11,6 +11,8 @@ The sibling FFmpeg adapter has its own log at
 
 ## [Unreleased]
 
+## [0.15.1] - 2026-10-05
+
 ### Added
 
 - **The container-level duration crosses the demux seam, with the

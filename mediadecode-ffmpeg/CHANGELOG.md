@@ -11,6 +11,8 @@ The backend-agnostic core it adapts has its own log at
 
 ## [Unreleased]
 
+## [0.15.1] - 2026-10-05
+
 ### Added
 
 - **The backend reads `AVFormatContext.duration` and its
