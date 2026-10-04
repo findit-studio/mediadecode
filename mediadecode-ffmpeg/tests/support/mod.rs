@@ -137,6 +137,46 @@ impl Corpus {
     out
   }
 
+  /// An MP3 with **no Xing/Info frame and no ID3 tag**: nothing in the
+  /// file states a length, so libavformat divides the file's size by the
+  /// first frame's bitrate — `AVFMT_DURATION_FROM_BITRATE`, the weakest
+  /// provenance a container duration can have.
+  #[rustfmt::skip]
+  pub fn headerless_mp3(&self) -> PathBuf {
+    let out = self.path("headerless.mp3");
+    if out.exists() {
+      return out;
+    }
+    run_ffmpeg(&[
+      "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100:duration=2",
+      "-c:a", "libmp3lame", "-write_xing", "0", "-id3v2_version", "0",
+      out.to_str().expect("utf-8 path"),
+    ]);
+    out
+  }
+
+  /// An MPEG **transport stream** — video and audio, a second long.
+  /// The format carries no header to read a length from, so libavformat
+  /// reads packet timestamps at the tail of the file itself:
+  /// `AVFMT_DURATION_FROM_PTS`.
+  #[rustfmt::skip]
+  pub fn transport_stream(&self) -> PathBuf {
+    let out = self.path("transport.ts");
+    if out.exists() {
+      return out;
+    }
+    run_ffmpeg(&[
+      "-f", "lavfi", "-i", "testsrc2=size=64x48:rate=25:duration=1",
+      "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=1",
+      "-map", "0:v", "-map", "1:a",
+      "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+      "-c:a", "aac",
+      "-f", "mpegts",
+      out.to_str().expect("utf-8 path"),
+    ]);
+    out
+  }
+
   /// A Matroska file whose audio and subtitle tracks carry **language
   /// tags** and whose video track carries none.
   ///

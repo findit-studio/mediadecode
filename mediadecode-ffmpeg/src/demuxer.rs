@@ -17,8 +17,9 @@
 //! [`build_chapters`] for what is read, what is bounded before it is
 //! allocated, and what is deliberately left as the container wrote it.
 //!
-//! The container's **stated duration** is read then too —
-//! `AVFormatContext.duration`, answered by
+//! The container's **duration** is read then too —
+//! `AVFormatContext.duration`, with libavformat's account of how it
+//! came by it, answered by
 //! [`Demuxer::duration`](mediadecode::demuxer::Demuxer::duration) — and
 //! it is the container's, never a track's: see [`container_duration`].
 //!
@@ -91,7 +92,7 @@ use ffmpeg_next::{
   Packet, Rational,
   ffi::{
     AV_DISPOSITION_ATTACHED_PIC, AV_DISPOSITION_TIMED_THUMBNAILS, AV_NOPTS_VALUE, AVDictionary,
-    AVStream, av_dict_get,
+    AVDurationEstimationMethod, AVStream, av_dict_get,
   },
   format::{self, context::Input},
 };
@@ -99,9 +100,9 @@ use mediadecode::{
   Timebase, Timestamp,
   demuxer::{
     AttachmentPacket, AttachmentTrackPacket, AttachmentTrackParams, AudioTrackPacket,
-    AudioTrackParams, Chapter, DataTrackPacket, DataTrackParams, DemuxedPacket, Demuxer,
-    MeasuredEnd, SubtitleTrackPacket, SubtitleTrackParams, TrackIndex, TrackInfo, TrackKind,
-    TrackParams, UnknownTrackParams, VideoTrackPacket, VideoTrackParams,
+    AudioTrackParams, Chapter, ContainerDuration, DataTrackPacket, DataTrackParams, DemuxedPacket,
+    Demuxer, DurationSource, MeasuredEnd, SubtitleTrackPacket, SubtitleTrackParams, TrackIndex,
+    TrackInfo, TrackKind, TrackParams, UnknownTrackParams, VideoTrackPacket, VideoTrackParams,
   },
 };
 use smol_bytes::Utf8Bytes;
@@ -163,9 +164,9 @@ pub struct CarrierDemuxer<C: crate::FfmpegCarrier> {
   /// name is not readable text — neither of which a successful open
   /// produces.
   format: Option<crate::ContainerFormat>,
-  /// The container's own stated duration, read once at open — see
-  /// [`container_duration`].
-  duration: Option<Timestamp>,
+  /// The container's duration and its provenance, read once at open —
+  /// see [`container_duration`].
+  duration: Option<ContainerDuration>,
   /// What the walk has measured so far, one figure per track — see
   /// [`Measured`]. Fed by [`Self::next_packet_impl`] as packets are
   /// delivered; it reads nothing itself.
@@ -373,9 +374,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
     self.format.as_ref()
   }
 
-  /// The container's stated duration — see [`container_duration`].
+  /// The container's duration and its provenance — see
+  /// [`container_duration`].
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub(crate) const fn duration_impl(&self) -> Option<Timestamp> {
+  pub(crate) const fn duration_impl(&self) -> Option<ContainerDuration> {
     self.duration
   }
 
@@ -487,8 +489,8 @@ fn probe_options(limits: DemuxLimits) -> ffmpeg_next::Dictionary<'static> {
   options
 }
 
-/// The container's stated duration, as libavformat holds it once the
-/// open has finished.
+/// The container's duration, as libavformat holds it once the open has
+/// finished, with how libavformat came by it.
 ///
 /// `AVFormatContext.duration` counts `AV_TIME_BASE` ticks —
 /// microseconds — and is `AV_NOPTS_VALUE` where nothing is known, so
@@ -498,13 +500,62 @@ fn probe_options(limits: DemuxLimits) -> ffmpeg_next::Dictionary<'static> {
 /// states no length and answers `None`, the rule a track's duration
 /// follows.
 ///
+/// The provenance is `AVFormatContext.duration_estimation_method`,
+/// which libavformat settles in the same pass that fills the figure; see
+/// [`duration_source`] for the map.
+///
 /// This is the **container's** figure and nothing else's. It is never
 /// the answer for a track: a Matroska file states a length for itself
 /// and none for any track, and a row that borrowed this one would say
 /// the file had stated it for them.
-fn container_duration(input: &Input) -> Option<Timestamp> {
+fn container_duration(input: &Input) -> Option<ContainerDuration> {
   let raw = input.duration();
-  (raw != AV_NOPTS_VALUE && raw > 0).then(|| Timestamp::new(raw, av_time_base_q()))
+  if raw == AV_NOPTS_VALUE || raw <= 0 {
+    return None;
+  }
+  // SAFETY: `input` owns a live `AVFormatContext` for the whole of this
+  // call. The field is read as the 4-byte integer the C enum is, never
+  // as the bindgen enum — see [`duration_source`].
+  let method =
+    unsafe { read_unaligned(addr_of!((*input.as_ptr()).duration_estimation_method).cast::<i32>()) };
+  Some(ContainerDuration::new(
+    Timestamp::new(raw, av_time_base_q()),
+    duration_source(method),
+  ))
+}
+
+/// Maps libavformat's `AVDurationEstimationMethod` onto the
+/// crate-neutral [`DurationSource`].
+///
+/// - `AVFMT_DURATION_FROM_STREAM` is [`Stated`](DurationSource::Stated):
+///   the figure is the container's own duration, or the durations its
+///   streams' headers state.
+/// - `AVFMT_DURATION_FROM_PTS` is [`Probed`](DurationSource::Probed):
+///   libavformat read packet timestamps itself — for MPEG program and
+///   transport streams, from the tail of the file — so the figure is a
+///   measurement it made while probing.
+/// - `AVFMT_DURATION_FROM_BITRATE` is
+///   [`Estimated`](DurationSource::Estimated): the file's size over a
+///   bitrate.
+///
+/// A method this build does not name is carried as the weakest arm,
+/// `Estimated`: a figure whose provenance cannot be read must not be
+/// promoted to a statement.
+///
+/// The method arrives as the integer it is on the wire. Forming the
+/// bindgen enum from it would be undefined behaviour for any value
+/// outside this build's discriminant set, so only the constants are
+/// ever cast, and only to integers.
+fn duration_source(method: i32) -> DurationSource {
+  const FROM_PTS: i32 = AVDurationEstimationMethod::AVFMT_DURATION_FROM_PTS as i32;
+  const FROM_STREAM: i32 = AVDurationEstimationMethod::AVFMT_DURATION_FROM_STREAM as i32;
+  match method {
+    FROM_STREAM => DurationSource::Stated,
+    FROM_PTS => DurationSource::Probed,
+    // `AVFMT_DURATION_FROM_BITRATE`, and anything this build does not
+    // name.
+    _ => DurationSource::Estimated,
+  }
 }
 
 /// Payload for [`DemuxError::ProbeBudgetExhausted`].
@@ -920,7 +971,14 @@ macro_rules! demuxer_lane_face {
 
       /// The track table, held for the life of the session.
       ///
-      /// Reading it takes nothing away — clone the handles worth
+      /// A row's `duration` is `AVStream.duration` as libavformat holds
+      /// it, which for a stream with no timing of its own is the
+      /// container's length copied in — and by value that cannot be told
+      /// from a track whose header states the same one. Attachment rows
+      /// are guarded against it; for any other track
+      /// [`measured_end`](Demuxer::measured_end) is the honest figure.
+      ///
+      /// Reading the table takes nothing away — clone the handles worth
       /// keeping. `Arc` is the carrier because
       /// [`CodecTicket`](crate::ticket::CodecTicket) mirrors an
       /// `AVCodecParameters` into owned Rust, which is what makes a
@@ -946,22 +1004,24 @@ macro_rules! demuxer_lane_face {
         self.chapters_impl()
       }
 
-      /// The container's stated duration, from
-      /// `AVFormatContext.duration`, read once at open and held for
-      /// the life of the session.
+      /// The container's duration with its provenance, from
+      /// `AVFormatContext.duration` and
+      /// `AVFormatContext.duration_estimation_method`, read once at
+      /// open and held for the life of the session.
       ///
-      /// The container's own statement, never a track's: Matroska
-      /// states a length here and none on any track, and the tracks'
-      /// rows keep saying so. `None` where libavformat holds no
-      /// positive figure.
+      /// The container's figure, never a track's: Matroska states a
+      /// length here and none on any track, and the tracks' rows keep
+      /// saying so. `None` where libavformat holds no positive figure.
       ///
       /// The figure is counted in `AV_TIME_BASE` ticks — microseconds —
-      /// and carried in that timebase, not rescaled. It is
-      /// libavformat's figure: the container's where the format writes
-      /// one, and where a format writes none libavformat fills the
-      /// field itself from its streams' durations or, last, from
-      /// bitrate and file size, which this backend does not tell apart.
-      fn duration(&self) -> Option<Timestamp> {
+      /// and carried in that timebase, not rescaled. libavformat's
+      /// estimation method becomes the [`DurationSource`]:
+      /// `FROM_STREAM` is `Stated` (the container's or its streams'
+      /// headers), `FROM_PTS` is `Probed` (libavformat read packet
+      /// timestamps while probing), and `FROM_BITRATE` is `Estimated`
+      /// (the file's size over a bitrate). A method this build does not
+      /// name is `Estimated`, the weakest arm.
+      fn duration(&self) -> Option<ContainerDuration> {
         self.duration_impl()
       }
 
@@ -2202,6 +2262,13 @@ fn build_tracks<C: crate::FfmpegCarrier + crate::CarrierOps>(
     // stands, the file's length would sit on the attachment's row as
     // though the file had stated it for that track. An attachment is
     // off the timeline and has no extent to state, so its row says so.
+    //
+    // The same fill-in can reach a timed stream that delivered no
+    // packet while probing — a sparse subtitle track. That one is not
+    // guarded: by value it is the figure a header could just as well
+    // have stated (an MP4 track whose own length equals the movie's
+    // looks identical), so the honest per-track figure is the measured
+    // end, not a guess made here.
     let attachment = attached_pic || medium.is_attachment();
     let raw_duration = stream.duration();
     let duration = (!attachment && raw_duration != AV_NOPTS_VALUE && raw_duration > 0)
@@ -3566,6 +3633,35 @@ mod tests {
     };
     assert!(rc >= 0, "av_dict_set failed: {rc}");
     dict
+  }
+
+  /// **The provenance is a map over libavformat's three methods, and
+  /// anything else is the weakest arm.** The method arrives as the
+  /// integer it is on the wire, so a value a newer libavformat adds —
+  /// or a corrupt one — has to land somewhere without ever forming the
+  /// bindgen enum.
+  #[test]
+  fn libavformats_estimation_method_becomes_the_crate_neutral_source() {
+    use ffmpeg_next::ffi::AVDurationEstimationMethod as Method;
+    assert_eq!(
+      duration_source(Method::AVFMT_DURATION_FROM_STREAM as i32),
+      DurationSource::Stated,
+    );
+    assert_eq!(
+      duration_source(Method::AVFMT_DURATION_FROM_PTS as i32),
+      DurationSource::Probed,
+    );
+    assert_eq!(
+      duration_source(Method::AVFMT_DURATION_FROM_BITRATE as i32),
+      DurationSource::Estimated,
+    );
+    for unnamed in [3, 7, -1, i32::MAX, i32::MIN] {
+      assert_eq!(
+        duration_source(unnamed),
+        DurationSource::Estimated,
+        "method {unnamed} is not one this build names, so it is not promoted to a statement",
+      );
+    }
   }
 
   #[test]

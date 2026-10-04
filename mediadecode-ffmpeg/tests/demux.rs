@@ -30,6 +30,9 @@
 //!   fallibly allocated before a byte of it is reserved;
 //! - a container states its own length, and a track it states none for
 //!   stays `None` — the container's figure is never copied onto a row;
+//! - the container's duration says how libavformat came by it: stated
+//!   by headers, probed from packet timestamps, or estimated from a
+//!   bitrate;
 //! - a walk to end of file measures each track's end exactly, a walk
 //!   that stopped early says its figure is only the one so far, and a
 //!   seek or a dropped packet means the figure is never called final.
@@ -47,7 +50,7 @@ use triomphe::Arc;
 
 use mediadecode::{
   Received, Timebase, Timestamp,
-  demuxer::{DemuxedPacket, Demuxer, MeasuredEnd, TrackIndex, TrackKind},
+  demuxer::{DemuxedPacket, Demuxer, DurationSource, MeasuredEnd, TrackIndex, TrackKind},
   packet::PacketFlags,
 };
 // The owned family under the names this suite was written with — the
@@ -385,7 +388,8 @@ fn a_matroska_container_states_its_length_while_no_track_does() {
   // that; it is never short of it and never off by orders of magnitude.
   let stated = demuxer
     .duration()
-    .expect("a Matroska segment states its duration");
+    .expect("a Matroska segment states its duration")
+    .value();
   assert!(
     within(
       stated,
@@ -420,7 +424,8 @@ fn an_mp4_container_and_its_tracks_state_the_same_length() {
 
   let stated = demuxer
     .duration()
-    .expect("an MP4's movie header states its duration");
+    .expect("an MP4's movie header states its duration")
+    .value();
   assert!(
     within(
       stated,
@@ -474,6 +479,96 @@ fn a_cover_picture_states_no_duration_though_its_container_does() {
     pictures[0].duration(),
     None,
     "an attachment is off the timeline and has no extent to state",
+  );
+}
+
+/// **A Matroska duration is the container's own statement.** The
+/// segment's duration is a header, so libavformat reports it as read
+/// from headers and nothing was measured.
+#[test]
+fn a_matroska_duration_is_stated() {
+  let Some(corpus) = Corpus::new() else { return };
+  let demuxer = FfmpegDemuxer::open(&corpus.multi_track_mkv()).expect("open mkv");
+  let duration = demuxer
+    .duration()
+    .expect("a Matroska segment states its duration");
+  assert_eq!(
+    duration.source(),
+    DurationSource::Stated,
+    "the figure is a header's, not a measurement or a guess",
+  );
+}
+
+/// **An MP4 duration is the container's own statement too**: the movie
+/// header, which libavformat reports as read from headers.
+#[test]
+fn an_mp4_duration_is_stated() {
+  let Some(corpus) = Corpus::new() else { return };
+  let demuxer = FfmpegDemuxer::open(&corpus.language_tagged_mp4()).expect("open mp4");
+  let duration = demuxer
+    .duration()
+    .expect("an MP4's movie header states its duration");
+  assert_eq!(duration.source(), DurationSource::Stated);
+}
+
+/// **A duration libavformat had to guess says so.**
+///
+/// An MP3 with no Xing frame and no tag states nothing, and carries no
+/// timestamps to read one from, so libavformat divides the file's size
+/// by the first frame's bitrate and reports it as such. The guess is
+/// close for a constant-bitrate clip — this is not a wild figure — but
+/// it is a guess, and the source is what keeps it from being read as a
+/// header's word. (The audio track's own row carries the same figure
+/// libavformat copied into the stream; that is the per-track fill
+/// `TrackInfo::duration` documents, and `measured_end` is the honest
+/// per-track answer.)
+#[test]
+fn a_headerless_mp3_duration_is_estimated() {
+  let Some(corpus) = Corpus::new() else { return };
+  let demuxer = FfmpegDemuxer::open(&corpus.headerless_mp3()).expect("open mp3");
+  let duration = demuxer
+    .duration()
+    .expect("libavformat still produces a figure, from the bitrate");
+  assert_eq!(
+    duration.source(),
+    DurationSource::Estimated,
+    "nothing in the file states or timestamps a length, so the figure is a guess",
+  );
+  assert!(
+    within(
+      duration.value(),
+      Timestamp::new(2, Timebase::SECONDS),
+      Timestamp::new(250, Timebase::MILLIS),
+    ),
+    "a constant-bitrate guess is near the clip's two seconds, got {}",
+    duration.value(),
+  );
+}
+
+/// **A transport stream's duration is a measurement libavformat made.**
+/// The format has no header to state a length, so libavformat reads
+/// packet timestamps itself while probing and reports the figure as
+/// read from them.
+#[test]
+fn a_transport_stream_duration_is_probed() {
+  let Some(corpus) = Corpus::new() else { return };
+  let demuxer = FfmpegDemuxer::open(&corpus.transport_stream()).expect("open ts");
+  let duration = demuxer
+    .duration()
+    .expect("libavformat reads the timestamps at the tail of the file");
+  assert_eq!(
+    duration.source(),
+    DurationSource::Probed,
+    "the figure was observed from packet timestamps, not declared",
+  );
+  assert!(
+    within(
+      duration.value(),
+      Timestamp::new(1, Timebase::SECONDS),
+      Timestamp::new(250, Timebase::MILLIS),
+    ),
+    "about the clip's one second, got {}",
+    duration.value(),
   );
 }
 
@@ -569,7 +664,10 @@ fn a_walk_to_end_of_file_agrees_with_the_container_within_one_frame() {
   let Some(corpus) = Corpus::new() else { return };
   let mut demuxer = FfmpegDemuxer::open(&corpus.multi_track_mkv()).expect("open mkv");
   assert!(!drain(&mut demuxer).is_empty());
-  let stated = demuxer.duration().expect("the container states its length");
+  let stated = demuxer
+    .duration()
+    .expect("the container states its length")
+    .value();
 
   for (index, track) in demuxer.tracks().iter().enumerate() {
     if track.kind() == TrackKind::Attachment {
@@ -624,7 +722,8 @@ fn an_mp4_walk_measures_the_length_its_container_and_tracks_state() {
 
   let stated = demuxer
     .duration()
-    .expect("the movie header states a duration");
+    .expect("the movie header states a duration")
+    .value();
   let longest = demuxer
     .tracks()
     .iter()

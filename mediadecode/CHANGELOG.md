@@ -13,16 +13,26 @@ The sibling FFmpeg adapter has its own log at
 
 ### Added
 
-- **The container's own stated duration crosses the demux seam: a
-  *provided* `Demuxer::duration`.**
+- **The container's duration crosses the demux seam, with its
+  provenance: a *provided* `Demuxer::duration` answering
+  `Option<ContainerDuration>`.**
 
   A file's length is read in layers, and each layer is answered by its
-  own method. This one is what the **container** states for the file —
-  its own statement, not a measurement — while `TrackInfo::duration`
-  stays what the container states **for one track**. A track whose
-  container states none for it stays `None`: Matroska states a length
-  for the file and none for any track, and the container's figure is
-  never copied onto a row.
+  own method. This one is the **container's** figure for the file,
+  while `TrackInfo::duration` stays what the container states **for one
+  track**. A track whose container states none for it stays `None`:
+  Matroska states a length for the file and none for any track, and the
+  container's figure is never copied onto a row by this tier.
+
+  The figure carries how it came to be known, as a crate-neutral
+  `DurationSource` on `ContainerDuration::source`: `Stated` (headers say
+  so), `Probed` (the library read packet timestamps while probing — a
+  measurement) or `Estimated` (the file's size over a bitrate — the
+  weakest, and never ahead of a measured end). The provenance travels
+  with the figure so that a guess cannot be read as the container's own
+  statement. `TrackInfo::duration`'s doc now says a backend's per-track
+  figure can be its library's fill rather than the file's statement, and
+  points at `measured_end` as the honest per-track figure.
 
   Provided, answering `None`, so every implementor written before the
   method existed compiles unchanged and answers correctly. Like the two

@@ -805,7 +805,14 @@ impl<E: DemuxAdapter> TrackInfo<E> {
   /// A track stays `None` where its container states no duration for
   /// it — Matroska states a length for the file and none for any track —
   /// and the container's own figure ([`Demuxer::duration`]) is never
-  /// copied onto it.
+  /// copied onto it by this tier.
+  ///
+  /// This is the demuxing library's per-track figure, and a library may
+  /// fill it from the container's own: libavformat gives a stream that
+  /// has no timing of its own the container's length, and that cannot
+  /// be told by value from a track whose header states the same one.
+  /// Where a track's length matters, [`Demuxer::measured_end`] is the
+  /// honest per-track figure.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn duration(&self) -> Option<Timestamp> {
     self.duration
@@ -1143,6 +1150,93 @@ where
       && self.start == other.start
       && self.end == other.end
       && self.title == other.title
+  }
+}
+
+// ---------------------------------------------------------------------------
+//  The container's duration.
+// ---------------------------------------------------------------------------
+
+/// How a container-level duration came to be known: what the demuxing
+/// library did to produce it, and so what a reader should trust it as.
+///
+/// Carried by [`ContainerDuration`], so the provenance travels with the
+/// figure and a bitrate guess cannot be read as the file's own
+/// statement. The three arms are three different acts rather than three
+/// grades of one: a header was read, packets were read, or a size was
+/// divided. A [`MeasuredEnd`] from the caller's own walk is exact and
+/// replaces any of them when it lands.
+///
+/// The names are crate-neutral. The FFmpeg backend maps libavformat's
+/// `AVDurationEstimationMethod` onto them, and its docs say how.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, IsVariant)]
+pub enum DurationSource {
+  /// Read from headers: the container's own duration field — a
+  /// Matroska segment's, an MP4's movie header — or the durations its
+  /// streams' headers state. libavformat's `AVFMT_DURATION_FROM_STREAM`.
+  ///
+  /// What the file says about itself; nothing was measured. Trust it as
+  /// a statement: a file can state a length its packets do not bear
+  /// out — cut short, muxed live, edited without the header being
+  /// rewritten — which is why a measured end replaces it.
+  Stated,
+  /// Measured by the library from packet timestamps during probing —
+  /// for an MPEG program or transport stream, which has no header to
+  /// read a length from, the timestamps at the tail of the file.
+  /// libavformat's `AVFMT_DURATION_FROM_PTS`.
+  ///
+  /// A measurement, not a statement: observed rather than declared. It
+  /// was observed over a window of the file and not a full pass, so a
+  /// measured end from the caller's own walk replaces it when it lands.
+  Probed,
+  /// Estimated from the file's size and a bitrate: the file carries no
+  /// duration and no timestamps the library could read one from — an
+  /// MP3 with no Xing header. libavformat's `AVFMT_DURATION_FROM_BITRATE`.
+  ///
+  /// The weakest figure here. It is exact only for a constant bitrate
+  /// over a file that is all media, and it is off by whatever the
+  /// bitrate varies or the file carries besides media. It never
+  /// outranks a measured end.
+  Estimated,
+}
+
+/// A container-level duration with its provenance.
+///
+/// What [`Demuxer::duration`] answers: [`value`](Self::value) is the
+/// figure, as a [`Timestamp`] the way [`TrackInfo::duration`] carries
+/// one, and [`source`](Self::source) says how it came to be known. Read
+/// the two together — the same number means one thing as a header's
+/// statement and another as a guess from a bitrate.
+///
+/// It is the *container's* figure and no track's: a track states its
+/// own through [`TrackInfo::duration`], or states none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContainerDuration {
+  value: Timestamp,
+  source: DurationSource,
+}
+
+impl ContainerDuration {
+  /// Constructs a `ContainerDuration` from a figure and how it came to
+  /// be known.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(value: Timestamp, source: DurationSource) -> Self {
+    Self { value, source }
+  }
+
+  /// Returns the figure.
+  ///
+  /// Whether it is the container's statement, a measurement the library
+  /// made, or a guess is [`source`](Self::source)'s to say.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn value(&self) -> Timestamp {
+    self.value
+  }
+
+  /// Returns how the figure came to be known.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn source(&self) -> DurationSource {
+    self.source
   }
 }
 
@@ -1746,8 +1840,11 @@ where
 /// A file's length is read in layers, and each layer is answered by its
 /// own method so that none is mistaken for another:
 ///
-/// - [`duration`](Self::duration) is what the **container** states for
-///   the file as a whole — its own statement, not a measurement.
+/// - [`duration`](Self::duration) is the **container's** figure for the
+///   file as a whole, with its provenance: [`Stated`] where headers say
+///   so, [`Probed`] where the library read packet timestamps, and
+///   [`Estimated`] where it divided a size by a bitrate. Only the first
+///   is the container's own statement.
 /// - [`TrackInfo::duration`] is what the container states **for one
 ///   track**. A track stays `None` where its container states none for
 ///   it, and the container's figure is never copied onto it.
@@ -1755,6 +1852,10 @@ where
 ///   measured: where a track's packets ended. It rides the pulls the
 ///   caller already makes, is final once the walk reaches end of file,
 ///   and says so while it is not.
+///
+/// [`Stated`]: DurationSource::Stated
+/// [`Probed`]: DurationSource::Probed
+/// [`Estimated`]: DurationSource::Estimated
 ///
 /// # What is not here
 ///
@@ -1811,14 +1912,18 @@ pub trait Demuxer {
     &[]
   }
 
-  /// Returns the container's own **stated** duration, or `None` where
-  /// it states none.
+  /// Returns the container's duration for the file as a whole, with
+  /// its provenance, or `None` where the container offers no figure.
   ///
-  /// The container's statement about its own length, read as written —
-  /// a Matroska segment's duration, an MP4's movie header — and not a
-  /// measurement: a header can disagree with the packets behind it, and
-  /// which of the two to trust is the consumer's call. See
-  /// [durations](Self#durations) on the trait.
+  /// [`ContainerDuration::source`] says how the figure came to be
+  /// known, and only [`Stated`](DurationSource::Stated) is the
+  /// container's own statement — read as written, so a header that
+  /// disagrees with the packets behind it is reported as it is. A
+  /// [`Probed`](DurationSource::Probed) figure is a measurement the
+  /// library made while probing, and an
+  /// [`Estimated`](DurationSource::Estimated) one is a guess; neither
+  /// outranks a measured end. See [durations](Self#durations) on the
+  /// trait.
   ///
   /// It is not any track's duration. A track whose container states
   /// none for it stays `None`; this figure is never copied onto it.
@@ -1826,7 +1931,7 @@ pub trait Demuxer {
   /// Fixed for the life of the session and callable whenever, like the
   /// tables. Provided: a backend with no such figure answers `None`.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  fn duration(&self) -> Option<Timestamp> {
+  fn duration(&self) -> Option<ContainerDuration> {
     None
   }
 
@@ -2134,6 +2239,46 @@ mod tests {
   }
 
   #[test]
+  fn a_container_duration_carries_the_figure_and_how_it_came_to_be_known() {
+    let figure = Timestamp::new(2_021, ms_tb());
+    let stated = ContainerDuration::new(figure, DurationSource::Stated);
+    assert_eq!(stated.value(), figure);
+    assert_eq!(stated.source(), DurationSource::Stated);
+
+    // The same figure from a different act is a different answer...
+    assert_ne!(
+      stated,
+      ContainerDuration::new(figure, DurationSource::Estimated),
+    );
+    // ...while the figure itself compares as the instant it names.
+    assert_eq!(
+      stated,
+      ContainerDuration::new(
+        Timestamp::new(2_021_000, Timebase::MICROS),
+        DurationSource::Stated
+      ),
+    );
+    let copy = stated;
+    assert_eq!(copy, stated);
+
+    // Three acts, three predicates, no overlap.
+    for (source, flags) in [
+      (DurationSource::Stated, (true, false, false)),
+      (DurationSource::Probed, (false, true, false)),
+      (DurationSource::Estimated, (false, false, true)),
+    ] {
+      assert_eq!(
+        (
+          source.is_stated(),
+          source.is_probed(),
+          source.is_estimated()
+        ),
+        flags,
+      );
+    }
+  }
+
+  #[test]
   fn a_measured_end_carries_the_figure_and_whether_it_is_final() {
     let so_far = MeasuredEnd::new(Timestamp::new(1_960, ms_tb()), false);
     assert_eq!(so_far.end(), Timestamp::new(1_960, ms_tb()));
@@ -2385,13 +2530,13 @@ mod tests {
     );
   }
 
-  /// **The stated duration is provided, and neither mock writes a line
-  /// for it.** A backend with no figure of its own answers `None`, and
-  /// asking costs the session nothing: the packet it owes is still
+  /// **The container duration is provided, and neither mock writes a
+  /// line for it.** A backend with no figure of its own answers `None`,
+  /// and asking costs the session nothing: the packet it owes is still
   /// owed afterwards.
   #[cfg(any(feature = "std", feature = "alloc"))]
   #[test]
-  fn a_demuxer_that_states_no_duration_answers_none() {
+  fn a_demuxer_with_no_container_duration_answers_none() {
     let mut d = LoopDemuxer {
       tracks: vec![Rc::new(TrackInfo::new(
         ms_tb(),
@@ -2571,11 +2716,11 @@ mod tests {
     assert!(d.chapters().is_empty());
   }
 
-  /// The provided stated duration needs no allocator either: it is an
-  /// `Option` of a `Copy` instant, and this lane sits outside the
+  /// The provided container duration needs no allocator either: it is
+  /// an `Option` of a `Copy` value, and this lane sits outside the
   /// `alloc` gate so that stays true.
   #[test]
-  fn the_provided_stated_duration_needs_no_allocator() {
+  fn the_provided_container_duration_needs_no_allocator() {
     let row = TrackInfo::<Loopback>::new(
       ms_tb(),
       TrackParams::Subtitle(SubtitleTrackParams::new(7)),

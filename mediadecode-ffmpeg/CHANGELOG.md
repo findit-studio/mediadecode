@@ -13,20 +13,33 @@ The backend-agnostic core it adapts has its own log at
 
 ### Added
 
-- **The backend reads `AVFormatContext.duration`**, answering the
-  `Demuxer::duration` that `mediadecode` adds.
+- **The backend reads `AVFormatContext.duration` and its
+  `duration_estimation_method`**, answering the `Demuxer::duration` that
+  `mediadecode` adds, with the provenance libavformat records.
 
-  Read once at open, after probing, and carried in `AV_TIME_BASE`
-  microseconds rather than rescaled; `None` where libavformat holds no
-  positive figure. It is libavformat's figure: the container's own where
-  the format writes one (Matroska, MP4), and where a format writes none
-  libavformat fills the field itself from its streams' durations or,
-  last, from bitrate and file size — which the backend does not tell
-  apart.
+  The figure is read once at open, after probing, and carried in
+  `AV_TIME_BASE` microseconds rather than rescaled; `None` where
+  libavformat holds no positive figure. The method becomes the
+  `DurationSource`: `FROM_STREAM` is `Stated` (the container's or its
+  streams' headers — Matroska, MP4), `FROM_PTS` is `Probed` (libavformat
+  read packet timestamps itself while probing — an MPEG transport
+  stream) and `FROM_BITRATE` is `Estimated` (the file's size over a
+  bitrate — an MP3 with no Xing header). The method is read as the raw
+  integer it is on the wire, never as the bindgen enum, and one this
+  build does not name is carried as `Estimated`, the weakest arm.
 
-  Pinned against real containers: a subtitled Matroska states a length
-  for the file while none of its tracks does, and an MP4's container and
-  tracks state the same length to within a frame.
+  A track's own `duration` stays `AVStream.duration` as libavformat
+  holds it. libavformat copies the container's length into a stream with
+  no timing of its own, and by value that cannot be told from a track
+  whose header states the same one, so the docs now say so and point at
+  `measured_end` as the honest per-track figure. Attachment rows are the
+  guarded case; see Fixed.
+
+  Pinned against real containers: a subtitled Matroska and an MP4 answer
+  `Stated`, an MP3 with no Xing header answers `Estimated`, an MPEG
+  transport stream answers `Probed`; a subtitled Matroska states a
+  length for the file while none of its tracks does; and an MP4's
+  container and tracks state the same length to within a frame.
 
 - **The backend measures each track's end as the walk delivers
   packets**, answering `Demuxer::measured_end`.
