@@ -11,6 +11,84 @@ The sibling FFmpeg adapter has its own log at
 
 ## [Unreleased]
 
+### Added
+
+- **The container-level duration crosses the demux seam, with the
+  library's account of it: a *provided* `Demuxer::duration` answering
+  `Option<ContainerDuration>`.**
+
+  The figures that bear on a file's duration come in layers, and each
+  layer is answered by its own method. Two are lengths — the
+  container-level figure and a track's — and one is an endpoint, the
+  walk's measured end. This method is the first: the figure the library
+  reports for the file as a whole, `ContainerDuration::value`, while
+  `TrackInfo::duration` stays the library's figure for one track. A
+  track the library reported none for stays `None`: Matroska reports a
+  length for the file and none for any track, and the container's
+  figure is never copied onto a row by this tier.
+
+  The figure carries how the library says it came by it,
+  `ContainerDuration::source`, in libavformat's own three words and no
+  others: `DurationSource::FromPts` ("Duration accurately estimated from
+  PTSes"), `FromStream` ("Duration estimated from a stream with a known
+  duration") and `FromBitrate` ("Duration estimated from bitrate (less
+  accurate)"), plus `Unknown` for an account the build cannot name,
+  which is never folded into an estimate. None of them says that a
+  header declares the figure, and the type does not rank them. The
+  figure is a *length*, and the walk's measured end is an endpoint on a
+  track's timeline — different quantities that this tier neither ranks
+  nor converts. `TrackInfo::duration`'s doc now says it is the
+  library's figure from before probing and no claim about the file, and
+  points at `measured_end` for what the packets themselves show.
+
+  Provided, answering `None`, so every implementor written before the
+  method existed compiles unchanged and answers correctly. Like the two
+  tables it is fixed for the session's life and callable at any point.
+
+- **A walk's measured end crosses the demux seam: `demuxer::MeasuredEnd`,
+  and a *provided* `Demuxer::measured_end`.**
+
+  `measured_end(track)` answers where a track's packets ended — the
+  greatest `pts + duration` over the timed packets the session read on
+  it, an endpoint on the track's own timeline — with two independent
+  qualifications. `MeasuredEnd::exact` is `false`, for good, from the
+  first timed packet read with a duration that is not positive
+  (libavformat writes zero for one it does not know) or the first packet
+  read with no usable timestamp: the end then advances to that packet's
+  `pts` only, or not at all, and is a lower bound. The mark is made when
+  the packet is read, so it does not depend on whether the packet is
+  then delivered, refused or parked. A measured end promises only that
+  it is exact when `exact`, covering what `walk_complete` says.
+
+  It is an endpoint, not a length. The container's duration is a
+  length, and a track that starts at ten seconds and runs for two ends
+  at twelve against a container duration of two. Turning an end into a
+  length means subtracting the track's start and honouring presentation
+  edits, which is the composer's job and not this crate's.
+
+  `MeasuredEnd::walk_complete` is `false` for a figure *so far* and
+  turns `true` only once every packet the library delivered to the
+  session was observed, from the first to end of file, with no skip. A
+  complete walk is frozen: its figures are final, and a later read or
+  seek neither moves them nor takes the flag back. A walk broken before
+  it completes — by a seek, by any packet that was read and not
+  observed (refused, skipped as corrupt, or on a stream the session
+  never described, which is what a container that adds streams
+  mid-read produces), or by an end too large to represent, whose track
+  answers `None` — can never complete in the session, and its figure
+  keeps rising as a "so far" maximum. A timed packet with no payload is
+  observed: it is a real endpoint.
+
+  What a complete walk does not cover is the library's own probing,
+  before the session's first read. libavformat buffers and replays the
+  packets it reads then, but a read error it swallows is not exposed
+  anywhere, so data skipped there is invisible.
+
+  The figure rides the pulls the caller already makes, so nothing is
+  read for it, nothing is sought, and there is no second pass. Provided,
+  answering `None` for every track, so every implementor written before
+  the method existed compiles unchanged.
+
 ## [0.15.0] - 2026-09-11
 
 ### Added

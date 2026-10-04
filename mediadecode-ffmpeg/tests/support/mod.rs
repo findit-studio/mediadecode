@@ -137,6 +137,124 @@ impl Corpus {
     out
   }
 
+  /// An MP3 with **no Xing/Info frame and no ID3 tag**: libavformat has
+  /// no duration field to read and no timestamps to read one from, so it
+  /// divides the file's size by the first frame's bitrate and records
+  /// `AVFMT_DURATION_FROM_BITRATE` — "Duration estimated from bitrate
+  /// (less accurate)".
+  #[rustfmt::skip]
+  pub fn headerless_mp3(&self) -> PathBuf {
+    let out = self.path("headerless.mp3");
+    if out.exists() {
+      return out;
+    }
+    run_ffmpeg(&[
+      "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100:duration=2",
+      "-c:a", "libmp3lame", "-write_xing", "0", "-id3v2_version", "0",
+      out.to_str().expect("utf-8 path"),
+    ]);
+    out
+  }
+
+  /// An MPEG **transport stream** — video and audio, a second long.
+  /// libavformat records `AVFMT_DURATION_FROM_PTS` for it — "Duration
+  /// accurately estimated from PTSes".
+  #[rustfmt::skip]
+  pub fn transport_stream(&self) -> PathBuf {
+    let out = self.path("transport.ts");
+    if out.exists() {
+      return out;
+    }
+    run_ffmpeg(&[
+      "-f", "lavfi", "-i", "testsrc2=size=64x48:rate=25:duration=1",
+      "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=1",
+      "-map", "0:v", "-map", "1:a",
+      "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+      "-c:a", "aac",
+      "-f", "mpegts",
+      out.to_str().expect("utf-8 path"),
+    ]);
+    out
+  }
+
+  /// A Matroska file whose subtitle track is **sparse**: its one cue
+  /// starts at 1.5 s of a two-second clip, so no subtitle packet is
+  /// anywhere near the start of the file where libavformat probes.
+  ///
+  /// That is the shape in which libavformat gives a timed stream the
+  /// container's own length once probing ends: a stream that supplied no
+  /// timing while it read packets has no start time, and is handed the
+  /// container's start and length in its place. `ffprobe` on this build
+  /// reports `duration=2.021000` for the subtitle track and `N/A` for
+  /// the video and audio, which delivered packets at the start.
+  #[rustfmt::skip]
+  pub fn sparse_subtitle_mkv(&self) -> PathBuf {
+    let out = self.path("sparse.mkv");
+    if out.exists() {
+      return out;
+    }
+    let subs = self.path("late.srt");
+    std::fs::write(&subs, "1\n00:00:01,500 --> 00:00:02,000\nlate cue\n\n")
+      .expect("writing the late subtitle");
+    run_ffmpeg(&[
+      "-f", "lavfi", "-i", "testsrc2=size=64x48:rate=25:duration=2",
+      "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=2",
+      "-i", subs.to_str().expect("utf-8 path"),
+      "-map", "0:v", "-map", "1:a", "-map", "2:s",
+      "-c:v", "libx264", "-preset", "ultrafast", "-g", "25", "-pix_fmt", "yuv420p",
+      "-c:a", "aac", "-c:s", "srt",
+      out.to_str().expect("utf-8 path"),
+    ]);
+    out
+  }
+
+  /// An MPEG transport stream whose **middle adds a stream**: a second
+  /// of video alone, a second of video with audio, then a second of
+  /// video alone again, joined end to end at 6 Mbit/s so each part is
+  /// about 700 KB.
+  ///
+  /// The size is the point. libavformat reads the head of the file when
+  /// it opens a transport stream and, for a seekable one, a window at
+  /// the tail to estimate the duration — so a stream announced anywhere
+  /// but the very ends is one the open never sees. The first and last
+  /// program maps list one stream and the middle one lists two, which
+  /// leaves the audio a stream the session's table never described: the
+  /// way MPEG-TS and RTP add streams mid-read.
+  #[rustfmt::skip]
+  pub fn late_audio_ts(&self) -> PathBuf {
+    let out = self.path("late-audio.ts");
+    if out.exists() {
+      return out;
+    }
+    let part = |name: &str, with_audio: bool| {
+      let path = self.path(name);
+      let video = [
+        "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+        "-b:v", "6M", "-minrate", "6M", "-maxrate", "6M", "-bufsize", "6M",
+        "-x264-params", "nal-hrd=cbr",
+      ];
+      let target = path.to_str().expect("utf-8 path");
+      let mut args = vec!["-f", "lavfi", "-i", "testsrc2=size=320x240:rate=25:duration=1"];
+      if with_audio {
+        args.extend(["-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=1"]);
+        args.extend(["-map", "0:v", "-map", "1:a"]);
+      }
+      args.extend(video);
+      if with_audio {
+        args.extend(["-c:a", "aac"]);
+      }
+      args.extend(["-f", "mpegts", target]);
+      run_ffmpeg(&args);
+      path
+    };
+    let mut joined = Vec::new();
+    for (name, with_audio) in [("late-a.ts", false), ("late-b.ts", true), ("late-c.ts", false)] {
+      joined.extend(std::fs::read(part(name, with_audio)).expect("reading a part"));
+    }
+    std::fs::write(&out, joined).expect("writing the joined stream");
+    out
+  }
+
   /// A Matroska file whose audio and subtitle tracks carry **language
   /// tags** and whose video track carries none.
   ///
@@ -711,6 +829,74 @@ pub fn raw_packet_order(path: &Path) -> Vec<(usize, Option<i64>)> {
     }
   }
   out
+}
+
+/// Per stream, the greatest `pts + duration` a bare `av_read_frame` loop
+/// sees — `pts` alone where a packet carries no duration — which is the
+/// walk's own measure taken without this crate. The demux lane compares
+/// against it rather than against a hand-written expectation.
+pub fn raw_stream_ends(path: &Path) -> Vec<Option<i64>> {
+  let mut input = ffmpeg_next::format::input(path).expect("open input");
+  let mut ends: Vec<Option<i64>> = vec![None; input.streams().count()];
+  loop {
+    let mut packet = ffmpeg_next::Packet::empty();
+    match packet.read(&mut input) {
+      Ok(()) => {
+        let Some(pts) = packet.pts() else { continue };
+        let end = if packet.duration() > 0 {
+          pts + packet.duration()
+        } else {
+          pts
+        };
+        let slot = &mut ends[packet.stream()];
+        *slot = Some(slot.map_or(end, |seen| seen.max(end)));
+      }
+      Err(ffmpeg_next::Error::Eof) => break,
+      Err(ffmpeg_next::Error::InvalidData) => continue,
+      Err(e) => panic!("read: {e}"),
+    }
+  }
+  ends
+}
+
+/// libavformat's figure for each stream's duration **before it probes**
+/// — `(ticks, time base numerator, time base denominator)` per stream,
+/// `None` where it holds none — read the way a bare libavformat user
+/// reads it: `avformat_open_input` and **no**
+/// `avformat_find_stream_info`.
+///
+/// This is the oracle for the rule that a track carries the figure
+/// libavformat held before probing and not one it filled in while
+/// probing, taken without the code under test.
+pub fn raw_header_durations(path: &Path) -> Vec<Option<(i64, i32, i32)>> {
+  use ffmpeg_next::ffi::{
+    AV_NOPTS_VALUE, AVFormatContext, avformat_close_input, avformat_open_input,
+  };
+
+  let c_path = std::ffi::CString::new(path.to_str().expect("utf-8 path")).expect("no NUL");
+  // SAFETY: `context` starts null for `avformat_open_input` to allocate
+  // into; on success it is read while open and closed before returning,
+  // and `streams` holds `nb_streams` pointers into it.
+  unsafe {
+    let mut context: *mut AVFormatContext = std::ptr::null_mut();
+    let status = avformat_open_input(
+      &mut context,
+      c_path.as_ptr(),
+      std::ptr::null_mut(),
+      std::ptr::null_mut(),
+    );
+    assert_eq!(status, 0, "avformat_open_input failed: {status}");
+    let out = (0..(*context).nb_streams as usize)
+      .map(|index| {
+        let stream = *(*context).streams.add(index);
+        let ticks = (*stream).duration;
+        (ticks != AV_NOPTS_VALUE && ticks > 0)
+          .then(|| (ticks, (*stream).time_base.num, (*stream).time_base.den))
+      })
+      .collect();
+    avformat_close_input(&mut context);
+    out
+  }
 }
 
 /// Asserts a submission was taken, and answers nothing.

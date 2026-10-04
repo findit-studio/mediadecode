@@ -11,6 +11,117 @@ The backend-agnostic core it adapts has its own log at
 
 ## [Unreleased]
 
+### Added
+
+- **The backend reads `AVFormatContext.duration` and its
+  `duration_estimation_method`**, answering the `Demuxer::duration` that
+  `mediadecode` adds, with libavformat's own account of the figure.
+
+  The figure is read once at open, after probing, and carried in
+  `AV_TIME_BASE` microseconds rather than rescaled; `None` where
+  libavformat holds no positive figure. The method is carried word for
+  word — `FROM_PTS`, `FROM_STREAM` and `FROM_BITRATE` become `FromPts`,
+  `FromStream` and `FromBitrate` — and a method this build does not name
+  becomes `Unknown`, not an estimate. It is read as the raw integer it is
+  on the wire, never as the bindgen enum. None of the three says that
+  the file declares the figure: `FROM_STREAM` is what libavformat
+  records for a duration taken from a stream or from the container's own
+  field (Matroska's), and the label does not say which.
+
+  Pinned against real containers: Matroska and MP4 answer `FromStream`,
+  an MP3 with no Xing header answers `FromBitrate`, an MPEG transport
+  stream answers `FromPts`; a subtitled Matroska reports a length for
+  the file while no track has a figure before probing; and an MP4's
+  container and tracks report the same length to within a frame.
+
+- **The backend measures each track's end as the walk reads packets**,
+  answering `Demuxer::measured_end`.
+
+  One running figure per track: the greatest `pts + duration` over the
+  timed packets read, `pts` alone where a packet carries no duration
+  (libavformat derives one for most packets whose demuxer wrote none),
+  and a packet with no `pts` passed over. It is folded in before any
+  payload filter, so a timed packet with no payload counts as the real
+  endpoint it is. It rides the packet loop — no read, no seek — and is
+  held beside the track table, reserved fallibly with it
+  (`TrackTableAlloc` names a refusal). An attachment track, which is off
+  the timeline, answers `None`.
+
+  `MeasuredEnd::exact` turns `false`, for good, the first time a timed
+  packet on the track is read with a duration that is not positive
+  (libavformat writes zero for one it does not know) or a packet on it
+  is read with no usable `pts`: the end advances to that packet's `pts`
+  only, or not at all, and the figure is a lower bound. The mark is made
+  when the packet is read, before the payload conversion, so it does not
+  depend on whether the packet is then delivered, refused or parked, nor
+  on whether it carries a payload. A duration libavformat derived from
+  the stream's frame rate or frame size counts as a duration, and is
+  only as exact as that derivation.
+
+  The figure is an endpoint on the track's own timeline, not a length:
+  the container's duration is a length, and turning an end into one
+  means subtracting the track's start and honouring presentation edits,
+  which is the composer's job and not this crate's.
+
+  `MeasuredEnd::walk_complete` holds once a walk that skipped nothing
+  has answered `Ok(None)`, and a complete walk is frozen: a later read
+  or seek neither moves its figures nor takes the flag back. Before it
+  completes, the walk breaks for good at a `seek` and at every packet
+  `av_read_frame` produced that the session did not observe: refused and
+  dropped, skipped as corrupt (`AVERROR_INVALIDDATA`), on a stream the
+  track table never described (a container that adds streams after
+  open, as MPEG-TS and RTP do), or on a track of unknown kind. The
+  figure then keeps rising as a "so far" maximum and stays a lower
+  bound. Accounting for streams that appear after open is not built; a
+  session that read a packet on one never answers complete.
+
+  An end that does not fit in an `i64` is no end: the track answers
+  `None` and the walk stops being complete, where saturating would have
+  recorded `i64::MAX` as an exact end over a complete walk.
+
+  What it does not cover: libavformat probes while the container opens,
+  before the session's first read, and a read error it swallows then is
+  not exposed anywhere, so data skipped there is invisible to a walk
+  that otherwise reads as complete.
+
+  Pinned against real containers and against a hand-built WAV: every
+  timed track of a subtitled Matroska and of an MP4 measures exactly
+  what a bare `av_read_frame` loop sees; on those fixtures, whose tracks
+  start at zero, an endpoint and the container's length name the same
+  instant, and the two agree to within a frame; a walk stopped early
+  answers a figure marked as not complete; and a seek, a dropped
+  packet, a skipped corrupt read, a stream the table never described
+  (an MPEG transport stream that adds audio mid-file), a track of
+  unknown kind and an unrepresentable end each keep a walk from being
+  called complete, while a timed empty packet at the end moves the
+  measured end, a last packet with no duration leaves the end a lower
+  bound, a packet read with no `pts` leaves it a lower bound even when
+  its conversion is refused, and a complete walk stays frozen through a
+  later seek.
+
+### Fixed
+
+- **A track's row no longer carries a duration libavformat filled in
+  while probing.** Once probing ends, libavformat gives a stream that
+  supplied no timing the container's own start and length. Every font
+  and cover picture received it, and so did any timed stream whose first
+  packet lies past the probe — a sparse subtitle track — so those rows
+  presented the file's length as the track's own. `TrackInfo::duration`
+  is now libavformat's figure for the stream from before probing, read
+  between `avformat_open_input` and `avformat_find_stream_info`, and
+  a figure that appears only afterwards is dropped. It is no claim about
+  the file: a format's reader may compute the figure itself (WAV derives
+  it from the data chunk's size) and a stream libavformat creates while
+  probing has none. The per-track figure measured from packets is
+  `measured_end`.
+
+- **A path that is not valid UTF-8, or that holds a NUL byte, fails the
+  open with an error** (`EINVAL`) where `ffmpeg-next`'s `input_*`
+  functions panicked. The open is now this crate's own sequence of the
+  two calls those functions make, `avformat_open_input` and
+  `avformat_find_stream_info`, with the pre-probe read between them;
+  both entrypoints (path and `Read + Seek`) take it.
+
 ## [0.15.0] - 2026-09-11
 
 ### Added

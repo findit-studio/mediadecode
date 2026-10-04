@@ -27,13 +27,27 @@
 //!   that declares none answers an empty table;
 //! - a chapter whose declared timebase is not one is refused **by
 //!   name**, never by panic, and the chapter table is bounded and
-//!   fallibly allocated before a byte of it is reserved.
+//!   fallibly allocated before a byte of it is reserved;
+//! - a container reports a length of its own, and a track libavformat
+//!   held no figure for before probing stays `None` — the container's
+//!   figure is never copied onto a row;
+//! - the container's duration carries libavformat's own account of how
+//!   it came by it, in libavformat's words: from PTS, from a stream, or
+//!   from a bitrate;
+//! - a track carries exactly the figure libavformat held before
+//!   probing, so a figure it fills in afterwards — a sparse subtitle
+//!   track gets the container's length — never reaches a row;
+//! - a walk to end of file measures each track's end exactly, a walk
+//!   that stopped early says its figure is only the one so far, and a
+//!   seek, a dropped packet or a stream the table never described means
+//!   the walk is never called complete.
 
 mod support;
 
 use std::{
   fs::File,
   io::{Read, Seek},
+  num::NonZeroI32,
 };
 
 // The track handle's refcount is triomphe's, so an allocator refusal
@@ -42,13 +56,15 @@ use triomphe::Arc;
 
 use mediadecode::{
   Received, Timebase, Timestamp,
-  demuxer::{DemuxedPacket, Demuxer, TrackKind},
+  demuxer::{DemuxedPacket, Demuxer, DurationSource, MeasuredEnd, TrackIndex, TrackKind},
   packet::PacketFlags,
 };
 // The owned family under the names this suite was written with — the
 // bare aliases mean the view lane now. Import block only; the
 // assertions below are unchanged.
-use mediadecode_ffmpeg::{DemuxError, DemuxLimits, FfmpegOwnedDemuxer as FfmpegDemuxer, TrackInfo};
+use mediadecode_ffmpeg::{
+  DemuxError, DemuxLimits, FfmpegOwnedDemuxer as FfmpegDemuxer, PacketLimits, TrackInfo,
+};
 use support::Corpus;
 
 /// Drains a session, returning `(track, kind, pts)` for every delivered
@@ -66,6 +82,19 @@ fn drain(demuxer: &mut FfmpegDemuxer) -> Vec<(usize, TrackKind, Option<Timestamp
     out.push((packet.track().get(), packet.kind(), pts));
   }
   out
+}
+
+/// `|a - b| <= tolerance`, each read as the instant it names: the
+/// container's figure, a track's and a packet's are three different
+/// rulers.
+fn within(a: Timestamp, b: Timestamp, tolerance: Timestamp) -> bool {
+  let micros = |t: Timestamp| t.rescale_to(Timebase::MICROS).pts();
+  (micros(a) - micros(b)).abs() <= micros(tolerance)
+}
+
+/// One video frame of the 25 fps clips this suite generates.
+fn one_frame() -> Timestamp {
+  Timestamp::new(1, Timebase::PAL_25)
 }
 
 #[test]
@@ -341,6 +370,703 @@ fn a_container_without_chapters_answers_an_empty_table() {
     4,
     "and an empty chapter table says nothing about the track table",
   );
+}
+
+/// **A Matroska container reports a length while no track has a figure
+/// before probing.**
+///
+/// Matroska is the shape this is about: the segment carries a duration
+/// for the file and the format has no place for one on a track, so a
+/// row that took the container's figure as the track's would present
+/// the file's length as the track's own.
+///
+/// The font is in the check on purpose. libavformat gives a stream that
+/// supplied no timing the container's own length once probing ends —
+/// `ffprobe` on this build reports `duration=2.021000` for it and `N/A`
+/// for the three timed tracks — and that fill must not reach the row.
+#[test]
+fn a_matroska_container_reports_a_length_while_no_track_has_one_before_probing() {
+  let Some(corpus) = Corpus::new() else { return };
+  let demuxer = FfmpegDemuxer::open(&corpus.multi_track_mkv()).expect("open mkv");
+
+  // Two seconds of media. The muxer's own figure may run a packet past
+  // that; it is never short of it and never off by orders of magnitude.
+  let reported = demuxer
+    .duration()
+    .expect("a Matroska segment carries a duration")
+    .value();
+  assert!(
+    within(
+      reported,
+      Timestamp::new(2, Timebase::SECONDS),
+      Timestamp::new(250, Timebase::MILLIS),
+    ),
+    "the container's figure is about the clip's two seconds, got {reported}",
+  );
+
+  assert_eq!(demuxer.tracks().len(), 4);
+  for (index, track) in demuxer.tracks().iter().enumerate() {
+    assert_eq!(
+      track.duration(),
+      None,
+      "track {index} ({:?}): libavformat held no figure for this track before probing, and \
+       neither the container's own figure nor the fill probing adds is borrowed to fill the gap",
+      track.kind(),
+    );
+  }
+}
+
+/// **Where libavformat holds a figure for every track, the layers
+/// agree.**
+///
+/// An ISOBMFF reader gives each track a duration of its own, unlike
+/// Matroska's, so the container's figure and each track's are all
+/// present here and must tell one story.
+#[test]
+fn an_mp4_container_and_its_tracks_report_the_same_length() {
+  let Some(corpus) = Corpus::new() else { return };
+  let demuxer = FfmpegDemuxer::open(&corpus.language_tagged_mp4()).expect("open mp4");
+
+  let reported = demuxer
+    .duration()
+    .expect("an MP4 carries a movie duration")
+    .value();
+  assert!(
+    within(
+      reported,
+      Timestamp::new(1, Timebase::SECONDS),
+      Timestamp::new(250, Timebase::MILLIS),
+    ),
+    "the container's figure is about the clip's one second, got {reported}",
+  );
+
+  let longest = demuxer
+    .tracks()
+    .iter()
+    .enumerate()
+    .map(|(index, track)| {
+      track
+        .duration()
+        .unwrap_or_else(|| panic!("track {index}: libavformat held a figure for each MP4 track"))
+    })
+    .max()
+    .expect("the clip has tracks");
+  assert!(
+    within(reported, longest, one_frame()),
+    "the container's figure ({reported}) and the longest track's ({longest}) agree within one \
+     frame",
+  );
+}
+
+/// **A cover picture is an attachment, and has no figure before probing
+/// though its container reports one.**
+///
+/// The second shape of the font's case: the picture's stream is parked
+/// outside the timeline, so libavformat gives it the container's own
+/// start and length while probing — `ffprobe` on this build reports
+/// `duration=2.000000` for it — and the row must not carry that fill.
+#[test]
+fn a_cover_picture_has_no_pre_probe_duration_though_its_container_reports_one() {
+  let Some(corpus) = Corpus::new() else { return };
+  let demuxer = FfmpegDemuxer::open(&corpus.cover_art_mp3()).expect("open mp3");
+
+  assert!(
+    demuxer.duration().is_some(),
+    "libavformat reports a length for the MP3",
+  );
+  let pictures: Vec<_> = demuxer
+    .tracks()
+    .iter()
+    .filter(|track| track.kind() == TrackKind::Attachment)
+    .collect();
+  assert_eq!(pictures.len(), 1, "the cover picture is the one attachment");
+  assert_eq!(
+    pictures[0].duration(),
+    None,
+    "libavformat held no figure for the picture before probing",
+  );
+}
+
+/// **A Matroska duration is labelled `FROM_STREAM`.** That is
+/// libavformat's own word for it — "Duration estimated from a stream
+/// with a known duration" — and it records it here although no stream
+/// carries a duration: the segment's figure is the container's own
+/// field. The label does not say whether a file declares a figure, and
+/// this lane does not read it as if it did.
+#[test]
+fn a_matroska_duration_is_from_stream() {
+  let Some(corpus) = Corpus::new() else { return };
+  let demuxer = FfmpegDemuxer::open(&corpus.multi_track_mkv()).expect("open mkv");
+  let duration = demuxer
+    .duration()
+    .expect("a Matroska segment carries a duration");
+  assert_eq!(
+    duration.source(),
+    DurationSource::FromStream,
+    "libavformat's own label for a duration taken from the container's field or a stream's",
+  );
+}
+
+/// **An MP4 duration is labelled `FROM_STREAM` too**, for the same
+/// reason: libavformat's word covers a figure taken from the container
+/// or from a stream, and does not say which.
+#[test]
+fn an_mp4_duration_is_from_stream() {
+  let Some(corpus) = Corpus::new() else { return };
+  let demuxer = FfmpegDemuxer::open(&corpus.language_tagged_mp4()).expect("open mp4");
+  let duration = demuxer.duration().expect("an MP4 carries a movie duration");
+  assert_eq!(duration.source(), DurationSource::FromStream);
+}
+
+/// **A duration libavformat divided out of a bitrate says so.**
+///
+/// An MP3 with no Xing frame and no tag gives libavformat no duration
+/// field and no timestamps to read one from, so it divides the file's
+/// size by the first frame's bitrate and records
+/// `AVFMT_DURATION_FROM_BITRATE` — "Duration estimated from bitrate
+/// (less accurate)". The figure is close for a constant-bitrate clip,
+/// but it is an estimate, and the label is what keeps it from being
+/// read as anything else. The audio track's own row is `None`: libavformat held no figure
+/// for it before probing, and the same estimate it copies into the
+/// stream while probing is not carried.
+#[test]
+fn a_headerless_mp3_duration_is_from_bitrate() {
+  let Some(corpus) = Corpus::new() else { return };
+  let demuxer = FfmpegDemuxer::open(&corpus.headerless_mp3()).expect("open mp3");
+  let duration = demuxer
+    .duration()
+    .expect("libavformat still produces a figure, from the bitrate");
+  assert_eq!(
+    duration.source(),
+    DurationSource::FromBitrate,
+    "nothing in the file gives libavformat a duration or timestamps to read, so it divides by a bitrate",
+  );
+  assert!(
+    within(
+      duration.value(),
+      Timestamp::new(2, Timebase::SECONDS),
+      Timestamp::new(250, Timebase::MILLIS),
+    ),
+    "a constant-bitrate estimate is near the clip's two seconds, got {}",
+    duration.value(),
+  );
+  assert_eq!(
+    demuxer.tracks()[0].duration(),
+    None,
+    "the estimate is the container's, and libavformat held no figure for the track before probing",
+  );
+}
+
+/// **A transport stream's duration is labelled `FROM_PTS`.** The
+/// format has no duration field, so libavformat reads packet timestamps
+/// itself while probing and records `AVFMT_DURATION_FROM_PTS` —
+/// "Duration accurately estimated from PTSes".
+#[test]
+fn a_transport_stream_duration_is_from_pts() {
+  let Some(corpus) = Corpus::new() else { return };
+  let demuxer = FfmpegDemuxer::open(&corpus.transport_stream()).expect("open ts");
+  let duration = demuxer
+    .duration()
+    .expect("libavformat reads the timestamps at the tail of the file");
+  assert_eq!(
+    duration.source(),
+    DurationSource::FromPts,
+    "libavformat's own label for a duration estimated from packet timestamps",
+  );
+  assert!(
+    within(
+      duration.value(),
+      Timestamp::new(1, Timebase::SECONDS),
+      Timestamp::new(250, Timebase::MILLIS),
+    ),
+    "about the clip's one second, got {}",
+    duration.value(),
+  );
+}
+
+/// **A sparse subtitle track has no figure before probing, though
+/// libavformat fills one in while probing.**
+///
+/// The subtitle track's one cue starts at 1.5 s of a two-second clip, so
+/// libavformat has seen no packet on it when probing ends and hands it
+/// the container's start and length (`ffprobe` on this build: the
+/// subtitle track reads `duration=2.021000`, video and audio `N/A`).
+/// Matroska gives libavformat no duration for any track, so every row is
+/// `None` — the figure reaches the row only if it is taken after the
+/// fill.
+#[test]
+fn a_sparse_subtitle_track_has_no_pre_probe_duration() {
+  let Some(corpus) = Corpus::new() else { return };
+  let demuxer = FfmpegDemuxer::open(&corpus.sparse_subtitle_mkv()).expect("open mkv");
+
+  assert!(
+    demuxer.duration().is_some(),
+    "libavformat reports a length for the file",
+  );
+  let subtitles = track_of(&demuxer, TrackKind::Subtitle);
+  assert_eq!(
+    demuxer.tracks()[subtitles].duration(),
+    None,
+    "the length on this track is libavformat's fill, not a figure it held before probing",
+  );
+  for (index, track) in demuxer.tracks().iter().enumerate() {
+    assert_eq!(track.duration(), None, "track {index} ({:?})", track.kind());
+  }
+}
+
+/// **A track carries exactly the figure libavformat held before
+/// probing.**
+///
+/// The oracle opens each file the way a bare libavformat user does
+/// before probing — `avformat_open_input` and no
+/// `avformat_find_stream_info` — and every row's `duration` must equal
+/// what libavformat held there: `None` for Matroska and for a headerless
+/// MP3 (whose container figure is a bitrate estimate), the MP4 reader's
+/// own figure for an MP4. Anything that appears only after probing is
+/// libavformat's fill and must not reach a row.
+#[test]
+fn a_track_carries_exactly_the_figure_libavformat_held_before_probing() {
+  let Some(corpus) = Corpus::new() else { return };
+  let fixtures = [
+    ("subtitled mkv", corpus.multi_track_mkv()),
+    ("sparse-subtitle mkv", corpus.sparse_subtitle_mkv()),
+    ("mp4", corpus.language_tagged_mp4()),
+    ("cover-art mp3", corpus.cover_art_mp3()),
+    ("headerless mp3", corpus.headerless_mp3()),
+    ("transport stream", corpus.transport_stream()),
+  ];
+  for (name, path) in fixtures {
+    let demuxer = FfmpegDemuxer::open(&path).expect("open");
+    let held = support::raw_header_durations(&path);
+    for (index, track) in demuxer.tracks().iter().enumerate() {
+      // A stream probing added did not exist to hold a figure.
+      let expected = held
+        .get(index)
+        .copied()
+        .flatten()
+        .and_then(|(ticks, num, den)| {
+          Some(Timestamp::new(
+            ticks,
+            Timebase::try_new(num, NonZeroI32::new(den)?)?,
+          ))
+        });
+      assert_eq!(
+        track.duration(),
+        expected,
+        "{name}, track {index} ({:?}): a row carries the figure libavformat held before probing \
+         and nothing it filled in afterwards",
+        track.kind(),
+      );
+    }
+  }
+}
+
+/// **A path that cannot be a C string is an error, not a panic.**
+/// `ffmpeg-next`'s own `input_*` functions panic on a NUL byte; the open
+/// sequence this crate makes itself answers `EINVAL`.
+#[test]
+fn a_path_that_cannot_be_a_c_string_is_an_error_not_a_panic() {
+  support::init_ffmpeg();
+  let opened = FfmpegDemuxer::open("a\0b.mkv");
+  assert!(
+    matches!(opened, Err(DemuxError::Ffmpeg(_))),
+    "a NUL byte cannot cross into C, and the answer is an error",
+  );
+}
+
+/// The position of the first track of `kind`.
+fn track_of(demuxer: &FfmpegDemuxer, kind: TrackKind) -> usize {
+  demuxer
+    .tracks()
+    .iter()
+    .position(|track| track.kind() == kind)
+    .unwrap_or_else(|| panic!("the fixture has a {kind:?} track"))
+}
+
+/// Every track's figure, in table order.
+fn measured_ends(demuxer: &FfmpegDemuxer) -> Vec<Option<MeasuredEnd>> {
+  (0..demuxer.tracks().len())
+    .map(|index| demuxer.measured_end(TrackIndex::new(index)))
+    .collect()
+}
+
+/// **A walk to end of file measures each track's end exactly.**
+///
+/// Nothing is measured before a pull. After the walk every timed track
+/// answers a figure over a complete walk that equals what a bare
+/// `av_read_frame` loop sees (`support::raw_stream_ends`), and the
+/// attachment answers `None`. The subtitle track is the anchor that
+/// needs no oracle: its last cue starts at one second and lasts one,
+/// and the fixture's SubRip text says it ends at two, so a figure that
+/// dropped the duration reads one.
+#[test]
+fn a_walk_to_end_of_file_measures_each_track_exactly() {
+  let Some(corpus) = Corpus::new() else { return };
+  let path = corpus.multi_track_mkv();
+  let mut demuxer = FfmpegDemuxer::open(&path).expect("open mkv");
+
+  assert!(
+    measured_ends(&demuxer).iter().all(Option::is_none),
+    "nothing has been read, so nothing is measured",
+  );
+
+  assert!(!drain(&mut demuxer).is_empty());
+  let oracle = support::raw_stream_ends(&path);
+
+  for (index, track) in demuxer.tracks().iter().enumerate() {
+    let measured = demuxer.measured_end(TrackIndex::new(index));
+    if track.kind() == TrackKind::Attachment {
+      assert_eq!(
+        measured, None,
+        "track {index}: an attachment is off the timeline"
+      );
+      continue;
+    }
+    let measured = measured.unwrap_or_else(|| {
+      panic!(
+        "track {index} ({:?}) delivered packets and measured none",
+        track.kind()
+      )
+    });
+    assert!(
+      measured.walk_complete(),
+      "track {index}: the walk reached end of file and skipped nothing",
+    );
+    assert!(
+      measured.exact(),
+      "track {index}: every packet carried a pts and a positive duration, so the end is exact",
+    );
+    let raw = oracle[index].expect("the raw walk saw this track too");
+    assert_eq!(
+      measured.end(),
+      Timestamp::new(raw, track.timebase()),
+      "track {index} ({:?}): the figure is the greatest pts + duration the raw walk sees",
+      track.kind(),
+    );
+  }
+
+  let subtitles = track_of(&demuxer, TrackKind::Subtitle);
+  assert_eq!(
+    demuxer
+      .measured_end(TrackIndex::new(subtitles))
+      .map(|measured| measured.end()),
+    Some(Timestamp::new(2, Timebase::SECONDS)),
+    "the last cue runs from one second to two",
+  );
+}
+
+/// **Each track's measured end agrees with the container's figure to
+/// within one frame — on a fixture whose tracks start at zero.**
+///
+/// The two are independent: the muxer wrote the container's figure from
+/// its own packets, and the walk measured these ones. Every track of
+/// the fixture was cut to the same two seconds, so each one's end sits
+/// within a frame of that figure — which a measure that dropped the
+/// last packet's duration misses on the video track (one frame short of
+/// its own end, a frame and a half short of the container's) and by a
+/// whole second on the subtitles.
+///
+/// The agreement is the fixture's, not a law about the two quantities.
+/// An end is an endpoint on a track's timeline and the container's
+/// duration is a length; they name the same instant here only because
+/// every track starts at zero. A track that started at ten seconds
+/// would end at twelve against a length of two.
+#[test]
+fn a_walk_to_end_of_file_agrees_with_the_container_within_one_frame() {
+  let Some(corpus) = Corpus::new() else { return };
+  let mut demuxer = FfmpegDemuxer::open(&corpus.multi_track_mkv()).expect("open mkv");
+  assert!(!drain(&mut demuxer).is_empty());
+  let reported = demuxer
+    .duration()
+    .expect("libavformat reports a length for the file")
+    .value();
+
+  for (index, track) in demuxer.tracks().iter().enumerate() {
+    if track.kind() == TrackKind::Attachment {
+      continue;
+    }
+    let measured = demuxer
+      .measured_end(TrackIndex::new(index))
+      .unwrap_or_else(|| panic!("track {index} ({:?}) measured none", track.kind()));
+    assert!(
+      within(measured.end(), reported, one_frame()),
+      "track {index} ({:?}): the measured end {} is within one frame of the container's \
+       figure {reported} (the fixture's tracks start at zero, so an endpoint and a length \
+       name the same instant)",
+      track.kind(),
+      measured.end(),
+    );
+  }
+}
+
+/// **In an MP4 the container, its tracks and the walk tell one story.**
+///
+/// The container's figure, the longest track's own and the greatest
+/// measured end all name the clip's length, within one frame of one
+/// another — and each track's measured end equals the raw walk's. As
+/// in the Matroska lane, the agreement is the fixture's: its tracks
+/// start at zero, which is what lets an endpoint and a length name the
+/// same instant.
+#[test]
+fn an_mp4_walk_measures_the_length_its_container_and_tracks_report() {
+  let Some(corpus) = Corpus::new() else { return };
+  let path = corpus.language_tagged_mp4();
+  let mut demuxer = FfmpegDemuxer::open(&path).expect("open mp4");
+  assert!(!drain(&mut demuxer).is_empty());
+  let oracle = support::raw_stream_ends(&path);
+
+  let mut greatest = None;
+  for (index, track) in demuxer.tracks().iter().enumerate() {
+    let measured = demuxer
+      .measured_end(TrackIndex::new(index))
+      .unwrap_or_else(|| panic!("track {index} delivered packets and measured none"));
+    assert!(
+      measured.walk_complete(),
+      "track {index}: end of file was reached"
+    );
+    assert!(
+      measured.exact(),
+      "track {index}: every packet carried a pts and a positive duration"
+    );
+    assert_eq!(
+      measured.end(),
+      Timestamp::new(
+        oracle[index].expect("the raw walk saw this track"),
+        track.timebase()
+      ),
+      "track {index}: the greatest pts + duration the raw walk sees",
+    );
+    greatest = greatest.max(Some(measured.end()));
+  }
+  let measured = greatest.expect("the clip has tracks");
+
+  let reported = demuxer
+    .duration()
+    .expect("libavformat reports a movie duration")
+    .value();
+  let longest = demuxer
+    .tracks()
+    .iter()
+    .filter_map(|track| track.duration())
+    .max()
+    .expect("libavformat held a figure for each MP4 track");
+  assert!(
+    within(measured, reported, one_frame()),
+    "measured {measured} against the container's {reported}",
+  );
+  assert!(
+    within(measured, longest, one_frame()),
+    "measured {measured} against the longest track's figure {longest}",
+  );
+  assert!(
+    within(reported, longest, one_frame()),
+    "the container's {reported} against the longest track's figure {longest}",
+  );
+}
+
+/// **A walk that stops early answers the figure so far, and says so.**
+///
+/// Three timed packets in, a track that has been read answers a figure
+/// flagged as not complete; a track that has been read not at all
+/// answers `None`. Walking on raises each figure and flips the flag,
+/// and a pull after end of file moves nothing.
+#[test]
+fn a_walk_that_stops_early_answers_the_figure_so_far_and_says_so() {
+  let Some(corpus) = Corpus::new() else { return };
+  let mut demuxer = FfmpegDemuxer::open(&corpus.multi_track_mkv()).expect("open mkv");
+
+  let mut timed = 0;
+  while timed < 3 {
+    let packet = demuxer.next_packet().expect("pull").expect("a packet");
+    if !matches!(packet, DemuxedPacket::Attachment(_)) {
+      timed += 1;
+    }
+  }
+  let so_far = measured_ends(&demuxer);
+  assert!(
+    so_far.iter().any(Option::is_some),
+    "three timed packets were read, so some track has a figure",
+  );
+  for (index, measured) in so_far.iter().enumerate() {
+    if let Some(measured) = measured {
+      assert!(
+        !measured.walk_complete(),
+        "track {index}: the walk is not over, so the figure is not complete",
+      );
+    }
+  }
+
+  drain(&mut demuxer);
+  let landed = measured_ends(&demuxer);
+  for (index, (before, after)) in so_far.iter().zip(&landed).enumerate() {
+    if demuxer.tracks()[index].kind() == TrackKind::Attachment {
+      assert_eq!(after, &None);
+      continue;
+    }
+    let after = after.expect("every timed track was read by end of file");
+    assert!(
+      after.walk_complete(),
+      "track {index}: end of file was reached"
+    );
+    if let Some(before) = before {
+      assert!(
+        after.end() > before.end(),
+        "track {index}: the figure rose from {} to {} as the walk went on",
+        before.end(),
+        after.end(),
+      );
+    }
+  }
+
+  assert!(demuxer.next_packet().expect("pull").is_none());
+  assert_eq!(
+    measured_ends(&demuxer),
+    landed,
+    "a pull after end of file moves nothing",
+  );
+}
+
+/// **A seek ends the claim to a complete walk, and a complete walk
+/// survives one.**
+///
+/// A walk that seeks still measures every packet it reads, and its
+/// figures are exact — but it never covered the file in one walk, so it
+/// never calls them complete. A walk that was complete already stays so
+/// through a later seek and a second walk, and its figures do not move.
+#[test]
+fn a_seek_ends_the_claim_to_a_complete_walk_and_a_complete_walk_survives_one() {
+  let Some(corpus) = Corpus::new() else { return };
+  let path = corpus.multi_track_mkv();
+  let oracle = support::raw_stream_ends(&path);
+  let start = Timestamp::new(0, Timebase::SECONDS);
+
+  let mut sought = FfmpegDemuxer::open(&path).expect("open mkv");
+  for _ in 0..2 {
+    sought.next_packet().expect("pull").expect("a packet");
+  }
+  sought.seek(start).expect("seek");
+  drain(&mut sought);
+  for (index, track) in sought.tracks().iter().enumerate() {
+    if track.kind() == TrackKind::Attachment {
+      continue;
+    }
+    let measured = sought
+      .measured_end(TrackIndex::new(index))
+      .expect("a timed track measured");
+    assert!(
+      !measured.walk_complete(),
+      "track {index}: a seek broke the walk, so it can never be complete",
+    );
+    assert_eq!(
+      measured.end(),
+      Timestamp::new(
+        oracle[index].expect("the raw walk saw this track"),
+        track.timebase()
+      ),
+      "track {index}: after the break the figure kept rising as a so-far maximum, and reflects \
+       every packet read",
+    );
+  }
+
+  let mut whole = FfmpegDemuxer::open(&path).expect("open mkv");
+  drain(&mut whole);
+  let landed = measured_ends(&whole);
+  assert!(
+    landed
+      .iter()
+      .flatten()
+      .all(|measured| measured.walk_complete())
+  );
+  whole.seek(start).expect("seek");
+  drain(&mut whole);
+  assert_eq!(
+    measured_ends(&whole),
+    landed,
+    "a seek and a second walk neither un-complete nor move a complete walk's figures",
+  );
+}
+
+/// **A packet the session refuses and drops breaks the walk.**
+///
+/// A 64-byte ceiling refuses every video and audio packet of the
+/// fixture, by name, while the one-word subtitle cues pass. A caller
+/// can carry on pulling after that error, and a walk that did reaches
+/// end of file without having observed every packet. The figure for
+/// the track that was read is real and exact, and is not called
+/// complete.
+#[test]
+fn a_dropped_packet_means_the_walk_is_never_complete() {
+  let Some(corpus) = Corpus::new() else { return };
+  let limits = DemuxLimits::new().with_packet(PacketLimits::new().with_max_packet_bytes(64));
+  let mut demuxer = FfmpegDemuxer::open_with(&corpus.multi_track_mkv(), limits).expect("open mkv");
+
+  let mut refused = 0;
+  loop {
+    match demuxer.next_packet() {
+      Ok(Some(_)) => {}
+      Ok(None) => break,
+      Err(DemuxError::PacketBuffer(_)) => refused += 1,
+      Err(other) => panic!("only the ceiling is expected to refuse here: {other:?}"),
+    }
+  }
+  assert!(refused > 0, "the ceiling refused packets");
+
+  let subtitles = track_of(&demuxer, TrackKind::Subtitle);
+  let measured = demuxer
+    .measured_end(TrackIndex::new(subtitles))
+    .expect("the cues were read");
+  assert!(
+    !measured.walk_complete(),
+    "packets were dropped, so the walk did not cover the file",
+  );
+  assert_eq!(measured.end(), Timestamp::new(2, Timebase::SECONDS));
+}
+
+/// **A stream that appears after open keeps the walk from ever being
+/// complete.**
+///
+/// A second of video alone, a second with audio, then video alone
+/// again, joined: the first and last program maps list one stream and
+/// the middle one lists two. libavformat sees the head of the file when
+/// it opens and a window at the tail, so the audio announced in the
+/// middle is a stream the table never described, and its packets are
+/// passed by. The video track's figure is real, and the walk is not
+/// complete — whatever the audio's last packet was, nothing here
+/// measured it.
+///
+/// Where a build describes every stream at open, there is no late
+/// stream to pass by and the lane reports itself NOT RUN, by name.
+#[test]
+fn a_stream_that_appears_after_open_keeps_the_walk_from_ever_being_complete() {
+  let Some(corpus) = Corpus::new() else { return };
+  let limits = DemuxLimits::new().with_max_probe_bytes(20_000);
+  let mut demuxer =
+    FfmpegDemuxer::open_with(&corpus.late_audio_ts(), limits).expect("open the joined stream");
+  let described = demuxer.tracks().len();
+  drain(&mut demuxer);
+  let grown = demuxer.input().streams().count();
+  if grown <= described {
+    eprintln!(
+      "NOT RUN: a_stream_that_appears_after_open_keeps_the_walk_from_ever_being_complete — \
+       libavformat described all {grown} streams at open on this build, so there is no late \
+       stream to pass by",
+    );
+    return;
+  }
+
+  let figures = measured_ends(&demuxer);
+  assert!(
+    figures.iter().any(Option::is_some),
+    "the stream the table did describe was read",
+  );
+  for (index, figure) in figures.iter().enumerate() {
+    if let Some(figure) = figure {
+      assert!(
+        !figure.walk_complete(),
+        "track {index}: the container grew a stream, so the walk is not complete",
+      );
+    }
+  }
 }
 
 /// **A malformed chapter timebase is a named refusal, never a panic.**
