@@ -27,7 +27,9 @@
 //!   that declares none answers an empty table;
 //! - a chapter whose declared timebase is not one is refused **by
 //!   name**, never by panic, and the chapter table is bounded and
-//!   fallibly allocated before a byte of it is reserved.
+//!   fallibly allocated before a byte of it is reserved;
+//! - a container states its own length, and a track it states none for
+//!   stays `None` — the container's figure is never copied onto a row.
 
 mod support;
 
@@ -66,6 +68,19 @@ fn drain(demuxer: &mut FfmpegDemuxer) -> Vec<(usize, TrackKind, Option<Timestamp
     out.push((packet.track().get(), packet.kind(), pts));
   }
   out
+}
+
+/// `|a - b| <= tolerance`, each read as the instant it names: the
+/// container's figure, a track's and a packet's are three different
+/// rulers.
+fn within(a: Timestamp, b: Timestamp, tolerance: Timestamp) -> bool {
+  let micros = |t: Timestamp| t.rescale_to(Timebase::MICROS).pts();
+  (micros(a) - micros(b)).abs() <= micros(tolerance)
+}
+
+/// One video frame of the 25 fps clips this suite generates.
+fn one_frame() -> Timestamp {
+  Timestamp::new(1, Timebase::PAL_25)
 }
 
 #[test]
@@ -340,6 +355,120 @@ fn a_container_without_chapters_answers_an_empty_table() {
     demuxer.tracks().len(),
     4,
     "and an empty chapter table says nothing about the track table",
+  );
+}
+
+/// **A container states its own length, and a track it states none for
+/// stays `None`.**
+///
+/// Matroska is the shape this is about: the segment carries a duration
+/// for the file and the format has no place to put one for a track, so
+/// a row that read the container's figure back as the track's would say
+/// the file had stated it for each of them.
+///
+/// The font is in the check on purpose. libavformat gives a stream that
+/// delivered no packet the container's own length once probing ends —
+/// `ffprobe` on this build reports `duration=2.021000` for it and `N/A`
+/// for the three timed tracks — and that figure must not reach the
+/// attachment's row either.
+#[test]
+fn a_matroska_container_states_its_length_while_no_track_does() {
+  let Some(corpus) = Corpus::new() else { return };
+  let demuxer = FfmpegDemuxer::open(&corpus.multi_track_mkv()).expect("open mkv");
+
+  // Two seconds of media. The muxer's own figure may run a packet past
+  // that; it is never short of it and never off by orders of magnitude.
+  let stated = demuxer
+    .duration()
+    .expect("a Matroska segment states its duration");
+  assert!(
+    within(
+      stated,
+      Timestamp::new(2, Timebase::SECONDS),
+      Timestamp::new(250, Timebase::MILLIS),
+    ),
+    "the container's statement is about the clip's two seconds, got {stated}",
+  );
+
+  assert_eq!(demuxer.tracks().len(), 4);
+  for (index, track) in demuxer.tracks().iter().enumerate() {
+    assert_eq!(
+      track.duration(),
+      None,
+      "track {index} ({:?}): Matroska states no duration for a track, and the container's own \
+       figure is not borrowed to fill the gap",
+      track.kind(),
+    );
+  }
+}
+
+/// **Where a container states a length for every track, the layers
+/// agree.**
+///
+/// An ISOBMFF track carries its own duration (`mdhd`), unlike
+/// Matroska's, so the three figures a file can state — the container's,
+/// and each track's — are all present here and must tell one story.
+#[test]
+fn an_mp4_container_and_its_tracks_state_the_same_length() {
+  let Some(corpus) = Corpus::new() else { return };
+  let demuxer = FfmpegDemuxer::open(&corpus.language_tagged_mp4()).expect("open mp4");
+
+  let stated = demuxer
+    .duration()
+    .expect("an MP4's movie header states its duration");
+  assert!(
+    within(
+      stated,
+      Timestamp::new(1, Timebase::SECONDS),
+      Timestamp::new(250, Timebase::MILLIS),
+    ),
+    "the container's statement is about the clip's one second, got {stated}",
+  );
+
+  let longest = demuxer
+    .tracks()
+    .iter()
+    .enumerate()
+    .map(|(index, track)| {
+      track
+        .duration()
+        .unwrap_or_else(|| panic!("track {index}: an MP4 states a duration for each track"))
+    })
+    .max()
+    .expect("the clip has tracks");
+  assert!(
+    within(stated, longest, one_frame()),
+    "the container's statement ({stated}) and the longest stated track ({longest}) agree \
+     within one frame",
+  );
+}
+
+/// **A cover picture is an attachment, and states no duration though
+/// its container does.**
+///
+/// The second shape of the font's case: the picture's stream is parked
+/// outside the timeline, so libavformat gives it the container's own
+/// start and length — `ffprobe` on this build reports `duration=2.000000`
+/// for it — and the row must not repeat that as the picture's own.
+#[test]
+fn a_cover_picture_states_no_duration_though_its_container_does() {
+  let Some(corpus) = Corpus::new() else { return };
+  let demuxer = FfmpegDemuxer::open(&corpus.cover_art_mp3()).expect("open mp3");
+
+  assert!(
+    demuxer.duration().is_some(),
+    "the MP3 states a length for the file",
+  );
+  let pictures: Vec<_> = demuxer
+    .tracks()
+    .iter()
+    .filter(|track| track.kind() == TrackKind::Attachment)
+    .collect();
+  assert_eq!(pictures.len(), 1, "the cover picture is the one attachment");
+  assert_eq!(
+    pictures[0].duration(),
+    None,
+    "an attachment is off the timeline and has no extent to state",
   );
 }
 

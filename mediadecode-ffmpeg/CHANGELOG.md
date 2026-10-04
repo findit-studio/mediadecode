@@ -11,6 +11,33 @@ The backend-agnostic core it adapts has its own log at
 
 ## [Unreleased]
 
+### Added
+
+- **The backend reads `AVFormatContext.duration`**, answering the
+  `Demuxer::duration` that `mediadecode` adds.
+
+  Read once at open, after probing, and carried in `AV_TIME_BASE`
+  microseconds rather than rescaled; `None` where libavformat holds no
+  positive figure. It is libavformat's figure: the container's own where
+  the format writes one (Matroska, MP4), and where a format writes none
+  libavformat fills the field itself from its streams' durations or,
+  last, from bitrate and file size — which the backend does not tell
+  apart.
+
+  Pinned against real containers: a subtitled Matroska states a length
+  for the file while none of its tracks does, and an MP4's container and
+  tracks state the same length to within a frame.
+
+### Fixed
+
+- **An attachment's row no longer carries the container's length as its
+  own duration.** libavformat gives a stream that delivered no packet
+  the container's own start and length once probing ends, and a font or
+  a cover picture never delivers a timed packet, so every attachment row
+  read the file's length as though the file had stated it for that
+  track. An attachment is off the timeline and has no extent to state;
+  its `TrackInfo::duration` is `None`.
+
 ## [0.15.0] - 2026-09-11
 
 ### Added

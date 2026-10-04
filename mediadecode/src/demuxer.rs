@@ -739,8 +739,8 @@ impl<E: DemuxAdapter> Debug for TrackParams<E> {
 ///
 /// Carries what a consumer needs to decide whether it wants the track
 /// and how to open a decoder for it: the kind, the timebase every
-/// timestamp on that track is expressed in, the duration when the
-/// container knows it, the per-kind codec parameters, the language the
+/// timestamp on that track is expressed in, the duration the container
+/// states for it, the per-kind codec parameters, the language the
 /// container declares for the track, and — for attachments — the
 /// identity the file was attached under.
 ///
@@ -799,8 +799,13 @@ impl<E: DemuxAdapter> TrackInfo<E> {
   pub const fn timebase(&self) -> Timebase {
     self.timebase
   }
-  /// Returns the track duration, or `None` when the container does not
-  /// carry one.
+  /// Returns the duration the container **states for this track**, or
+  /// `None` where it states none.
+  ///
+  /// A track stays `None` where its container states no duration for
+  /// it — Matroska states a length for the file and none for any track —
+  /// and the container's own figure ([`Demuxer::duration`]) is never
+  /// copied onto it.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn duration(&self) -> Option<Timestamp> {
     self.duration
@@ -1672,6 +1677,17 @@ where
 /// carrier choice of its own, which is the whole reason
 /// [`TrackHandle`](Self::TrackHandle) exists on the other table.
 ///
+/// # Durations
+///
+/// A file's length is read in layers, and each layer is answered by its
+/// own method so that none is mistaken for another:
+///
+/// - [`duration`](Self::duration) is what the **container** states for
+///   the file as a whole — its own statement, not a measurement.
+/// - [`TrackInfo::duration`] is what the container states **for one
+///   track**. A track stays `None` where its container states none for
+///   it, and the container's figure is never copied onto it.
+///
 /// # What is not here
 ///
 /// Opening. See the [module docs](self#construction-is-not-on-the-trait).
@@ -1725,6 +1741,25 @@ pub trait Demuxer {
   #[cfg_attr(not(tarpaulin), inline(always))]
   fn chapters(&self) -> &[Chapter<Self::Adapter>] {
     &[]
+  }
+
+  /// Returns the container's own **stated** duration, or `None` where
+  /// it states none.
+  ///
+  /// The container's statement about its own length, read as written —
+  /// a Matroska segment's duration, an MP4's movie header — and not a
+  /// measurement: a header can disagree with the packets behind it, and
+  /// which of the two to trust is the consumer's call. See
+  /// [durations](Self#durations) on the trait.
+  ///
+  /// It is not any track's duration. A track whose container states
+  /// none for it stays `None`; this figure is never copied onto it.
+  ///
+  /// Fixed for the life of the session and callable whenever, like the
+  /// tables. Provided: a backend with no such figure answers `None`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  fn duration(&self) -> Option<Timestamp> {
+    None
   }
 
   /// Pulls the next packet in interleaved file order, or `Ok(None)` at
@@ -2236,6 +2271,29 @@ mod tests {
     );
   }
 
+  /// **The stated duration is provided, and neither mock writes a line
+  /// for it.** A backend with no figure of its own answers `None`, and
+  /// asking costs the session nothing: the packet it owes is still
+  /// owed afterwards.
+  #[cfg(any(feature = "std", feature = "alloc"))]
+  #[test]
+  fn a_demuxer_that_states_no_duration_answers_none() {
+    let mut d = LoopDemuxer {
+      tracks: vec![Rc::new(TrackInfo::new(
+        ms_tb(),
+        TrackParams::Audio(AudioTrackParams::new(1, 48_000, 2, 0, 0)),
+        (),
+      ))],
+      drained: false,
+    };
+    assert_eq!(d.duration(), None);
+    assert_eq!(d.tracks()[0].duration(), None, "a different question");
+    assert!(
+      d.next_packet().expect("pull").is_some(),
+      "reading the duration is not a pull",
+    );
+  }
+
   /// Reading the table is non-destructive, and a handle taken before
   /// the first pull is still the session's own row after EOF.
   ///
@@ -2369,5 +2427,23 @@ mod tests {
       drained: false,
     };
     assert!(d.chapters().is_empty());
+  }
+
+  /// The provided stated duration needs no allocator either: it is an
+  /// `Option` of a `Copy` instant, and this lane sits outside the
+  /// `alloc` gate so that stays true.
+  #[test]
+  fn the_provided_stated_duration_needs_no_allocator() {
+    let row = TrackInfo::<Loopback>::new(
+      ms_tb(),
+      TrackParams::Subtitle(SubtitleTrackParams::new(7)),
+      (),
+    );
+    let rows = [&row];
+    let d = BorrowedDemuxer {
+      tracks: &rows,
+      drained: false,
+    };
+    assert_eq!(d.duration(), None);
   }
 }

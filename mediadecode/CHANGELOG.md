@@ -11,6 +11,23 @@ The sibling FFmpeg adapter has its own log at
 
 ## [Unreleased]
 
+### Added
+
+- **The container's own stated duration crosses the demux seam: a
+  *provided* `Demuxer::duration`.**
+
+  A file's length is read in layers, and each layer is answered by its
+  own method. This one is what the **container** states for the file —
+  its own statement, not a measurement — while `TrackInfo::duration`
+  stays what the container states **for one track**. A track whose
+  container states none for it stays `None`: Matroska states a length
+  for the file and none for any track, and the container's figure is
+  never copied onto a row.
+
+  Provided, answering `None`, so every implementor written before the
+  method existed compiles unchanged and answers correctly. Like the two
+  tables it is fixed for the session's life and callable at any point.
+
 ## [0.15.0] - 2026-09-11
 
 ### Added

@@ -17,6 +17,11 @@
 //! [`build_chapters`] for what is read, what is bounded before it is
 //! allocated, and what is deliberately left as the container wrote it.
 //!
+//! The container's **stated duration** is read then too —
+//! `AVFormatContext.duration`, answered by
+//! [`Demuxer::duration`](mediadecode::demuxer::Demuxer::duration) — and
+//! it is the container's, never a track's: see [`container_duration`].
+//!
 //! # What normalization this layer does
 //!
 //! libavformat's track table is not quite the one the demux tier
@@ -150,6 +155,9 @@ pub struct CarrierDemuxer<C: crate::FfmpegCarrier> {
   /// name is not readable text — neither of which a successful open
   /// produces.
   format: Option<crate::ContainerFormat>,
+  /// The container's own stated duration, read once at open — see
+  /// [`container_duration`].
+  duration: Option<Timestamp>,
   pending: VecDeque<(
     TrackIndex,
     AttachmentPacket<AttachmentPacketExtra, C::Buffer>,
@@ -353,6 +361,12 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
     self.format.as_ref()
   }
 
+  /// The container's stated duration — see [`container_duration`].
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub(crate) const fn duration_impl(&self) -> Option<Timestamp> {
+    self.duration
+  }
+
   fn from_input(input: Input, limits: DemuxLimits) -> Result<Self, DemuxError> {
     // **Everything the container declares is judged before anything it
     // declares is paid for**, and that is a property of the *whole*
@@ -411,11 +425,13 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
     // this call, and the read takes copies of the two static-table
     // strings rather than borrowing from it.
     let format = unsafe { crate::ContainerFormat::from_context(input.as_ptr()) };
+    let duration = container_duration(&input);
     Ok(Self {
       input,
       tracks,
       chapters,
       format,
+      duration,
       pending,
       unconverted: None,
       eof: false,
@@ -451,6 +467,26 @@ fn probe_options(limits: DemuxLimits) -> ffmpeg_next::Dictionary<'static> {
   options.set("formatprobesize", &probe);
   options.set("max_streams", &limits.max_streams().to_string());
   options
+}
+
+/// The container's stated duration, as libavformat holds it once the
+/// open has finished.
+///
+/// `AVFormatContext.duration` counts `AV_TIME_BASE` ticks —
+/// microseconds — and is `AV_NOPTS_VALUE` where nothing is known, so
+/// the figure is carried in that timebase rather than rescaled: exact,
+/// and comparable with any track's timestamps, because a [`Timestamp`]
+/// compares by the instant it names. A value that is not positive
+/// states no length and answers `None`, the rule a track's duration
+/// follows.
+///
+/// This is the **container's** figure and nothing else's. It is never
+/// the answer for a track: a Matroska file states a length for itself
+/// and none for any track, and a row that borrowed this one would say
+/// the file had stated it for them.
+fn container_duration(input: &Input) -> Option<Timestamp> {
+  let raw = input.duration();
+  (raw != AV_NOPTS_VALUE && raw > 0).then(|| Timestamp::new(raw, av_time_base_q()))
 }
 
 /// Payload for [`DemuxError::ProbeBudgetExhausted`].
@@ -869,6 +905,25 @@ macro_rules! demuxer_lane_face {
       /// layer reports rather than clamps.
       fn chapters(&self) -> &[Chapter<Ffmpeg>] {
         self.chapters_impl()
+      }
+
+      /// The container's stated duration, from
+      /// `AVFormatContext.duration`, read once at open and held for
+      /// the life of the session.
+      ///
+      /// The container's own statement, never a track's: Matroska
+      /// states a length here and none on any track, and the tracks'
+      /// rows keep saying so. `None` where libavformat holds no
+      /// positive figure.
+      ///
+      /// The figure is counted in `AV_TIME_BASE` ticks — microseconds —
+      /// and carried in that timebase, not rescaled. It is
+      /// libavformat's figure: the container's where the format writes
+      /// one, and where a format writes none libavformat fills the
+      /// field itself from its streams' durations or, last, from
+      /// bitrate and file size, which this backend does not tell apart.
+      fn duration(&self) -> Option<Timestamp> {
+        self.duration_impl()
       }
 
       /// Pulls the next packet.
@@ -2077,8 +2132,19 @@ fn build_tracks<C: crate::FfmpegCarrier + crate::CarrierOps>(
     // and one function is how the two passes are kept from becoming
     // two rules.
     let time_base = stream_timebase(index, stream.time_base())?;
+    // **The duration the container states for this stream — or none.**
+    //
+    // libavformat answers this field for streams whose container
+    // states nothing: a stream that has no start time once probing
+    // ends is given the *container's* start and length in its place.
+    // An attachment never delivers a timed packet, so that is what
+    // every font and every cover picture receives — and read as it
+    // stands, the file's length would sit on the attachment's row as
+    // though the file had stated it for that track. An attachment is
+    // off the timeline and has no extent to state, so its row says so.
+    let attachment = attached_pic || medium.is_attachment();
     let raw_duration = stream.duration();
-    let duration = (raw_duration != AV_NOPTS_VALUE && raw_duration > 0)
+    let duration = (!attachment && raw_duration != AV_NOPTS_VALUE && raw_duration > 0)
       .then(|| Timestamp::new(raw_duration, time_base));
     let raw_start = stream.start_time();
     let frames = stream.frames();
