@@ -684,23 +684,28 @@ impl DecoderLimits {
 /// software decoder must decode, or the session stays where it was and
 /// the packets go back to the caller — and a frame-threaded decoder
 /// reports a packet's failure only once it has a packet per thread in
-/// flight. The session returns to these threads at the next keyframe —
-/// after a post-commit degrade, the one after the keyframe it resyncs at:
-/// the one-thread decoder is drained, every picture it holds delivered in
+/// flight. The session returns to these threads at the next **clean**
+/// random access point — a keyframe nothing after it references past: an
+/// H.264 IDR, an HEVC IDR or BLA, a VP8, VP9 or AV1 keyframe, any keyframe
+/// of a stream that reorders nothing — or at the first keyframe after a
+/// seek; after a post-commit degrade, not before its resync. There the
+/// one-thread decoder is drained, every picture it holds delivered in
 /// order, and closed, and a decoder on these threads is opened and fed
-/// from the keyframe on. One software decoder is open at any instant and
-/// no packet is decoded twice. Until that keyframe the session decodes on
-/// one thread — on a file whose first packet the hardware refuses, the
-/// first GOP at most — and
+/// from the keyframe on. One software decoder is open at any instant, no
+/// packet is decoded twice, and no picture is lost. Until that keyframe the
+/// session decodes on one thread — on an H.264 file of IDR GOPs whose first
+/// packet the hardware refuses, the first GOP at most — and
 /// [`active_threads`](crate::CarrierVideoStreamDecoder::active_threads)
-/// says so. A fallback at the end of the stream keeps its one thread
-/// until a seek, and the first keyframe after it.
+/// says so. A fallback at the end of the stream keeps its one thread until
+/// a seek, and the first keyframe after it.
 ///
-/// A keyframe that opens an open GOP — an HEVC CRA, an H.264 recovery
-/// point that is not an IDR — is followed by leading pictures that may
-/// reference the GOP before it, which the closed decoder held: at such a
-/// switch they come out as a seek to that keyframe would make them, and
-/// one warning says so. A closed GOP loses nothing.
+/// An open-GOP keyframe — an HEVC CRA, an H.264 recovery point that is not
+/// an IDR — is never a switch point: its leading pictures reference the
+/// GOP before it, which a decoder opened there never saw, and would be
+/// dropped or concealed. So a stream whose keyframes are all open (x265's
+/// default CRA cadence) stays on the one thread after a fallback until
+/// the caller seeks, and the session warns once when a fallback has run a
+/// minute of stream that way, naming the codec and the reason.
 ///
 /// # The roads it does not reach
 ///

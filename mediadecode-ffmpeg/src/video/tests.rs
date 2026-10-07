@@ -31,34 +31,82 @@ struct SyntheticClip {
 /// inter-frame prediction so P-frames actually appear. `max_b_frames == 0`
 /// keeps decode order == display order (simple monotonic PTS).
 fn encode_synthetic_clip(width: u32, height: u32, frames: usize, gop: u32) -> SyntheticClip {
-  encode_clip(width, height, frames, gop, 0)
-}
-
-/// [`encode_synthetic_clip`] with up to `b_frames` B-frames between
-/// references, in **closed** GOPs (`AV_CODEC_FLAG_CLOSED_GOP`): decode
-/// order differs from display order inside a GOP, and no picture
-/// references across a keyframe.
-fn encode_clip(width: u32, height: u32, frames: usize, gop: u32, b_frames: usize) -> SyntheticClip {
   use ffmpeg_next as ff;
   ff::init().expect("ffmpeg init");
-
   let codec = ff::codec::encoder::find(ff::codec::Id::MPEG4).expect("mpeg4 encoder present");
+  encode_clip(codec, width, height, frames, ff::Dictionary::new(), |enc| {
+    enc.set_gop(gop);
+    enc.set_max_b_frames(0);
+    enc.set_bit_rate(500_000);
+  })
+}
+
+/// An H.264 clip from `libx264` in **closed** GOPs: an IDR every 8
+/// frames, two B-frames between references (so decode order is not
+/// display order), no scene cuts — nothing after an IDR references past
+/// it.
+fn encode_h264_closed_gops(width: u32, height: u32, frames: usize) -> SyntheticClip {
+  encode_x26x(
+    "libx264",
+    "x264-params",
+    "keyint=8:min-keyint=8:scenecut=0:bframes=2:b-adapt=0:open-gop=0",
+    width,
+    height,
+    frames,
+  )
+}
+
+/// An HEVC clip from `libx265` in **open** GOPs: a keyframe every 8
+/// frames, each after the first a CRA whose two RASL leading pictures
+/// reference the GOP before it.
+fn encode_hevc_open_gops(width: u32, height: u32, frames: usize) -> SyntheticClip {
+  encode_x26x(
+    "libx265",
+    "x265-params",
+    "keyint=8:min-keyint=8:scenecut=0:bframes=2:b-adapt=0:open-gop=1:log-level=error",
+    width,
+    height,
+    frames,
+  )
+}
+
+/// A clip from the named external encoder, under its own parameter string.
+fn encode_x26x(
+  encoder: &str,
+  params_key: &str,
+  params: &str,
+  width: u32,
+  height: u32,
+  frames: usize,
+) -> SyntheticClip {
+  use ffmpeg_next as ff;
+  ff::init().expect("ffmpeg init");
+  let codec = ff::codec::encoder::find_by_name(encoder)
+    .unwrap_or_else(|| panic!("{encoder} is linked into this FFmpeg"));
+  let mut options = ff::Dictionary::new();
+  options.set(params_key, params);
+  encode_clip(codec, width, height, frames, options, |_| {})
+}
+
+/// Paints the moving pattern into `frames` YUV 4:2:0 pictures and
+/// encodes them with `codec`, configured by `configure` and opened with
+/// `options`.
+fn encode_clip(
+  codec: ffmpeg_next::Codec,
+  width: u32,
+  height: u32,
+  frames: usize,
+  options: ffmpeg_next::Dictionary<'_>,
+  configure: impl FnOnce(&mut ffmpeg_next::codec::encoder::video::Video),
+) -> SyntheticClip {
+  use ffmpeg_next as ff;
   let ctx = ff::codec::context::Context::new_with_codec(codec);
   let mut enc = ctx.encoder().video().expect("video encoder context");
   enc.set_width(width);
   enc.set_height(height);
   enc.set_format(ff::format::Pixel::YUV420P);
   enc.set_time_base(ff::Rational::new(1, 25));
-  enc.set_gop(gop);
-  enc.set_max_b_frames(b_frames);
-  let mut options = ff::Dictionary::new();
-  if b_frames > 0 {
-    enc.set_flags(ff::codec::Flags::CLOSED_GOP);
-    // The MPEG-4 encoder refuses closed GOPs beside scene-change
-    // detection, which would also move the keyframes `gop` places.
-    options.set("sc_threshold", "1000000000");
-  }
-  enc.set_bit_rate(500_000);
+  configure(&mut enc);
   let mut opened = enc.open_as_with(codec, options).expect("open encoder");
   let parameters = ff::codec::Parameters::from(&opened);
 
@@ -3526,16 +3574,63 @@ fn one_software_decoder_is_open_at_any_instant_and_no_packet_is_decoded_twice() 
   }
 }
 
-/// LAW (Codex R2): **the pictures come out in presentation order across
-/// the switch**, with B-frames reordering inside every GOP. A probe-era
-/// fallback on a closed-GOP clip whose decode order is not its display
-/// order delivers, on three threads, exactly what it delivers on one: the
-/// one-thread decoder's tail is drained before the keyframe goes to the
-/// new decoder, and no picture is lost, repeated or reordered at the seam.
+/// The index of the first keyframe after packet `after`.
+fn keyframe_after(clip: &SyntheticClip, after: usize) -> usize {
+  clip
+    .packets
+    .iter()
+    .enumerate()
+    .skip(after + 1)
+    .find(|(_, packet)| packet.is_key())
+    .map(|(index, _)| index)
+    .expect("the clip has a keyframe after the fallback")
+}
+
+/// Drives `clip` through a probe-era fallback at packet `fail_at` on
+/// `threads`, answering the pictures it delivered and the threads after
+/// each send.
+fn threads_through_a_fallback(
+  clip: &SyntheticClip,
+  fail_at: usize,
+  threads: crate::Threads,
+) -> (
+  Vec<Option<mediadecode::Timestamp>>,
+  Vec<Option<core::num::NonZeroU32>>,
+) {
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test(
+    Box::new(FakeHw::failing(16, 16, 0, fail_at, FailShape::ProbeEra)),
+    clip.parameters.clone(),
+    tb,
+  )
+  .expect("build test decoder")
+  .with_threads_for_test(threads);
+  let mut dst = crate::empty_owned_video_frame();
+  let mut shown = Vec::new();
+  let mut threads_after = Vec::new();
+  for av_pkt in &clip.packets {
+    crate::accepted(dec.send_packet(&pushed(av_pkt)), "send_packet");
+    threads_after.push(dec.active_threads());
+    while let Received::Frame = dec.receive_frame(&mut dst).expect("receive_frame") {
+      shown.push(dst.pts());
+    }
+  }
+  crate::accepted(dec.send_eof(), "send_eof");
+  while let Received::Frame = dec.receive_frame(&mut dst).expect("receive_frame") {
+    shown.push(dst.pts());
+  }
+  (shown, threads_after)
+}
+
+/// LAW (Codex R2, the authority's lossless rule): **a closed-GOP H.264
+/// stream returns to the session's threads at its next IDR, and loses no
+/// picture.** `libx264`'s IDR GOPs with B-frames: a probe-era fallback at
+/// packet 3 decodes on one thread until the next IDR and on three from
+/// it; every picture comes out, in presentation order, exactly as the same
+/// fallback delivers them on one thread.
 #[test]
-fn pictures_come_out_in_presentation_order_across_the_switch() {
-  let (w, h) = (96u32, 64u32);
-  let clip = encode_clip(w, h, 40, 8, 2);
+fn a_closed_gop_h264_stream_switches_at_its_next_idr_and_loses_no_picture() {
+  let clip = encode_h264_closed_gops(128, 96, 40);
   assert!(
     clip
       .packets
@@ -3543,22 +3638,102 @@ fn pictures_come_out_in_presentation_order_across_the_switch() {
       .any(|pair| pair[1].pts() < pair[0].pts()),
     "the clip reorders: some packet displays before the one decoded ahead of it"
   );
-  let seam = || FakeHw::failing(w, h, 0, 3, FailShape::ProbeEra);
-
-  let (single, _) = decode_through_a_fallback(&clip, seam(), crate::Threads::Single);
-  assert_eq!(single.len(), clip.packets.len(), "one picture per packet");
-  let shown: Vec<_> = single.iter().map(|(pts, _)| *pts).collect();
-  let mut ordered = shown.clone();
-  ordered.sort();
-  ordered.dedup();
-  assert_eq!(shown, ordered, "one thread delivers in presentation order");
-
+  let idr = keyframe_after(&clip, 3);
   let three = core::num::NonZeroU32::new(3).expect("nonzero");
-  let (threaded, threads) = decode_through_a_fallback(&clip, seam(), crate::Threads::Count(three));
-  assert_eq!(threads, Some(three), "the switch happened");
+
+  let (single, _) = threads_through_a_fallback(&clip, 3, crate::Threads::Single);
+  assert_eq!(single.len(), clip.packets.len(), "one picture per packet");
+  let mut ordered = single.clone();
+  ordered.sort();
+  assert_eq!(single, ordered, "one thread delivers in presentation order");
+
+  let (threaded, threads) = threads_through_a_fallback(&clip, 3, crate::Threads::Count(three));
+  for (index, threads) in threads.iter().enumerate().skip(3) {
+    let expected = if index < idr {
+      core::num::NonZeroU32::MIN
+    } else {
+      three
+    };
+    assert_eq!(
+      *threads,
+      Some(expected),
+      "after send {index} (next IDR {idr})"
+    );
+  }
   assert_eq!(
     threaded, single,
-    "the same pictures, in the same order, across the switch"
+    "no picture lost, none moved, across the switch"
+  );
+}
+
+/// LAW (Codex R2, the authority's lossless rule): **an open-GOP HEVC
+/// stream never switches mid-stream, and loses no picture; a seek is
+/// where it switches.** `libx265`'s CRA keyframes lead with RASL pictures
+/// that reference the GOP before them, so none is a clean point: after a
+/// probe-era fallback the session stays on one thread to the end and
+/// delivers every picture the one-thread fallback delivers. After a seek
+/// the first keyframe is a switch point — the seek discarded what led it —
+/// and the stream decodes whole again on three threads.
+#[test]
+fn an_open_gop_hevc_stream_stays_on_one_thread_until_a_seek_and_loses_no_picture() {
+  let clip = encode_hevc_open_gops(128, 96, 40);
+  assert!(
+    keyframe_after(&clip, 3) < clip.packets.len(),
+    "the clip has keyframes after the fallback"
+  );
+  let three = core::num::NonZeroU32::new(3).expect("nonzero");
+
+  let (single, _) = threads_through_a_fallback(&clip, 3, crate::Threads::Single);
+  assert_eq!(single.len(), clip.packets.len(), "one picture per packet");
+  let (threaded, threads) = threads_through_a_fallback(&clip, 3, crate::Threads::Count(three));
+  assert_eq!(threaded.len(), single.len(), "no picture lost to a switch");
+  assert_eq!(threaded, single, "none moved either");
+  assert!(
+    threads
+      .iter()
+      .skip(3)
+      .all(|threads| *threads == Some(core::num::NonZeroU32::MIN)),
+    "no CRA is a switch point: {threads:?}"
+  );
+
+  // The seek: the first keyframe after it switches, and the stream
+  // decodes whole on three threads.
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test(
+    Box::new(FakeHw::failing(16, 16, 0, 3, FailShape::ProbeEra)),
+    clip.parameters.clone(),
+    tb,
+  )
+  .expect("build test decoder")
+  .with_threads_for_test(crate::Threads::Count(three));
+  let mut dst = crate::empty_owned_video_frame();
+  for av_pkt in &clip.packets {
+    crate::accepted(dec.send_packet(&pushed(av_pkt)), "send_packet");
+    while let Received::Frame = dec.receive_frame(&mut dst).expect("receive_frame") {}
+  }
+  dec.flush().expect("a seek");
+  let mut decoded = 0usize;
+  for (index, av_pkt) in clip.packets.iter().enumerate() {
+    crate::accepted(dec.send_packet(&pushed(av_pkt)), "send_packet");
+    if index == 0 {
+      assert_eq!(
+        dec.active_threads(),
+        Some(three),
+        "the first keyframe after the seek switched"
+      );
+    }
+    while let Received::Frame = dec.receive_frame(&mut dst).expect("receive_frame") {
+      decoded += 1;
+    }
+  }
+  crate::accepted(dec.send_eof(), "send_eof");
+  while let Received::Frame = dec.receive_frame(&mut dst).expect("receive_frame") {
+    decoded += 1;
+  }
+  assert_eq!(
+    decoded,
+    clip.packets.len(),
+    "the whole stream after the seek"
   );
 }
 

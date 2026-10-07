@@ -56,19 +56,22 @@ The backend-agnostic core it adapts has its own log at
   packet's failure only once it has a packet per thread in flight. So
   the probe-era replay and the post-commit cold forward run on a
   one-thread decoder, and that decoder is the one committed. At the next
-  keyframe the session sends — after a post-commit degrade, the one after
-  the keyframe it resyncs at — it is drained, every picture it still
-  holds delivered first and in order, and closed, and a decoder on the
-  session's threads is opened and fed from the keyframe on. One software
-  decoder is open at any instant and no packet is decoded twice, so no
-  budget has to span two decoded histories. Between a fallback and that
-  keyframe the session decodes on one thread: on a file whose first
-  packet the hardware refuses, the first GOP at most. A fallback at the
-  end of the stream keeps its one-thread decoder until a seek, and the
-  first keyframe after it. A switch at an open-GOP keyframe (an HEVC
-  CRA, an H.264 recovery point that is not an IDR) leaves that
-  keyframe's leading pictures to what a seek to it would make of them,
-  and says so in one warning.
+  clean random access point the session sends — an H.264 IDR, an HEVC IDR
+  or BLA, a VP8, VP9 or AV1 keyframe, any keyframe of a stream that
+  reorders nothing — or at the first keyframe after a seek, and after a
+  post-commit degrade not before its resync, it is drained, every picture
+  it still holds delivered first and in order, and closed, and a decoder
+  on the session's threads is opened and fed from the keyframe on. One
+  software decoder is open at any instant, no packet is decoded twice and
+  no picture is lost, so no budget has to span two decoded histories.
+  Between a fallback and that keyframe the session decodes on one thread:
+  on an H.264 file of IDR GOPs whose first packet the hardware refuses,
+  the first GOP at most. An open-GOP keyframe (an HEVC CRA, an H.264
+  recovery point that is not an IDR) is never a switch point, so a stream
+  whose keyframes are all open stays on one thread after a fallback until
+  a seek, with one warning, naming the codec and the reason, once a
+  minute of stream has gone by that way. A fallback at the end of the
+  stream keeps its one-thread decoder until a seek.
 
 ## [0.15.1] - 2026-10-05
 

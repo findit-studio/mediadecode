@@ -70,12 +70,18 @@
 //! fallback is a transaction and only a one-thread decoder decides one
 //! before it commits — a frame-threaded decoder reports a packet's failure
 //! a packet per thread later. The session returns to its threads at the
-//! next keyframe: the one-thread decoder is drained, every picture it holds
-//! delivered in order, and closed; then a decoder on the session's threads
-//! is opened and fed from the keyframe on — after a post-commit degrade, the
-//! keyframe after the one it resyncs at. One software decoder is open at any
-//! instant and no packet is decoded twice, so there is never a second
-//! decoded history for a budget to span.
+//! next CLEAN random access point — a keyframe nothing after it references
+//! past, such as an H.264 IDR; never an HEVC CRA or an H.264 recovery
+//! point, whose leading pictures reference the GOP before them — or at the
+//! first keyframe after a seek, which discards leading pictures by its own
+//! nature. There the one-thread decoder is drained, every picture it holds
+//! delivered in order, and closed, and a decoder on the session's threads is
+//! opened and fed from the keyframe on; after a post-commit degrade, not
+//! before its resync. One software decoder is open at any instant, no
+//! packet is decoded twice and no picture is lost, so there is never a
+//! second decoded history for a budget to span. A stream whose keyframes
+//! are all open stays on the one thread until a seek, and says so once a
+//! minute of it has gone by.
 //!
 //! Frames produced by either path are converted via
 //! [`crate::convert::av_frame_to_video_frame`] so the consumer sees
@@ -83,6 +89,9 @@
 //! FfmpegBytes>` shape regardless of which backend produced it.
 
 use std::collections::VecDeque;
+
+/// Which keyframes a decoder can start at without losing a picture.
+mod access;
 
 /// Maximum number of frames the SW fallback replay path will buffer
 /// while draining the new SW decoder during packet/EOF replay — and the
@@ -206,18 +215,21 @@ pub struct CarrierVideoStreamDecoder<C: crate::FfmpegCarrier> {
   /// `true` while the software decoder serving runs on one thread and
   /// [`limits`](Self::limits) asks for more: from a fallback, which
   /// commits the one-thread decoder that proved what it was fed, until
-  /// the next keyframe, where
+  /// the next clean keyframe (or the first after a seek), where
   /// [`restore_session_threads`](Self::restore_session_threads) drains
   /// that decoder, closes it and opens one on the session's threads.
   sw_threads_pending: bool,
-  /// The timestamp of the keyframe the session last returned to its
-  /// threads at, while the packets after it may still be its leading
-  /// pictures — an open GOP's, which display before it and may reference
-  /// the GOP the closed decoder held. See [`Self::note_leading`].
-  switched_at: Option<i64>,
-  /// Packets after [`switched_at`](Self::switched_at) that display before
-  /// it, counted for the one warning [`Self::note_leading`] gives.
-  leading_after_switch: u64,
+  /// `true` from a [`flush`](Self::flush_impl) until the next keyframe:
+  /// the first keyframe after a seek is a switch point whatever kind it
+  /// is, because the seek has already discarded what led it.
+  seeked: bool,
+  /// The timestamp of the first packet the one-thread decoder took after
+  /// a fallback (or after a seek), while
+  /// [`sw_threads_pending`](Self::sw_threads_pending) holds — the start of
+  /// the minute [`Self::note_one_thread`] counts.
+  one_thread_since: Option<i64>,
+  /// `true` once the minute's warning has been given; it is given once.
+  one_thread_warned: bool,
   /// `true` once `send_eof` has been called on the active decoder.
   /// Used to propagate EOF to the SW decoder when fallback fires
   /// during the drain phase — without this, codecs that hold tail
@@ -652,8 +664,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       time_base,
       limits,
       sw_threads_pending: false,
-      switched_at: None,
-      leading_after_switch: 0,
+      seeked: false,
+      one_thread_since: None,
+      one_thread_warned: false,
       scratch_pending: false,
       _carrier: core::marker::PhantomData,
     })
@@ -982,21 +995,23 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     Ok(())
   }
 
-  /// **The session's threads, back at a keyframe.** The one-thread
+  /// **The session's threads, back at a clean keyframe.** The one-thread
   /// decoder a fallback committed is drained — the end of the stream sent,
   /// every picture it still holds queued behind the ones already waiting,
   /// so they come out first and in order — and closed; then a decoder on
   /// the session's [`Threads`](crate::Threads) is opened, which the
   /// keyframe that called this is sent to next.
   ///
-  /// # Why at a keyframe, and why nothing has to be proved
+  /// # Why at a clean keyframe, and why nothing has to be proved
   ///
-  /// A keyframe references nothing before it, so the new decoder starts
-  /// clean there: it is fed every packet from the keyframe on, none of
-  /// them twice, and a packet it cannot decode is an ordinary decode error
-  /// with that packet still the caller's — there is no transaction to
-  /// keep, because there is no history to hand over. An open GOP's leading
-  /// pictures are the one exception, and [`Self::note_leading`] names it.
+  /// [`Self::send_on_software`] calls this only at a clean random access
+  /// point ([`access`]) — a keyframe nothing after it references past — or
+  /// at the first keyframe after a seek, which has discarded what led it.
+  /// So the new decoder starts clean there: it is fed every packet from the
+  /// keyframe on, none of them twice, it decodes every picture the
+  /// one-thread decoder would have, and a packet it cannot decode is an
+  /// ordinary decode error with that packet still the caller's — there is
+  /// no transaction to keep, because there is no history to hand over.
   ///
   /// # One decoder at a time
   ///
@@ -1051,25 +1066,36 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// waiting for (or when no decoder is open), then the packet handed to
   /// the decoder serving now.
   ///
+  /// **Only at a clean random access point** ([`access`]), or at the
+  /// first keyframe after a seek: a decoder opened at an open-GOP keyframe
+  /// would drop or conceal the leading pictures the closed decoder could
+  /// decode, and the session never trades a picture for threads.
+  ///
   /// **Not across an open post-commit gap.** A cold decoder degraded to
   /// mid-stream proves its resync on the keyframe it resyncs at
   /// ([`Self::resync_on_frame`]); switching there would split that proof
   /// across two decoders, the old one's tail of concealed pictures
   /// delivered after the anchor it does not belong to. So the session
-  /// resyncs on one thread and returns to its threads at the keyframe
+  /// resyncs on one thread and returns to its threads at a clean keyframe
   /// after that.
   fn send_on_software(
     &mut self,
     pkt: &Packet,
     phase: crate::decoder::SessionPhase,
   ) -> Result<Sent, VideoDecodeError> {
+    let key = pkt.is_key();
     let switching = self.sw_threads_pending
       && (matches!(self.state, DecodeState::SwClosed)
-        || (pkt.is_key() && !self.degraded_resync_pending));
+        || (key && !self.degraded_resync_pending && (self.seeked || self.clean_keyframe(pkt))));
+    if key {
+      self.seeked = false;
+    }
     if switching {
       self
         .restore_session_threads()
         .map_err(VideoDecodeError::Decode)?;
+    } else if self.sw_threads_pending {
+      self.note_one_thread(pkt);
     }
     let DecodeState::Sw(sw) = &mut self.state else {
       // `restore_session_threads` leaves a decoder open or returns, and
@@ -1094,49 +1120,80 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     // Count packets crossing an unresolved post-commit resync gap so the
     // escalation at EOF can report how much tail was lost.
     self.count_degraded_packet();
-    if switching {
-      self.switched_at = pkt.pts();
-      self.leading_after_switch = 0;
-    } else {
-      self.note_leading(pkt);
-    }
     Ok(Sent::Accepted)
   }
 
-  /// **An open GOP at the switch, named rather than hidden.** A keyframe
-  /// that opens an open GOP — an HEVC CRA, an H.264 recovery point that is
-  /// not an IDR — is followed in decode order by leading pictures that
-  /// display before it and may reference the GOP before it. That GOP was
-  /// in the decoder [`Self::restore_session_threads`] closed, so the new
-  /// one makes of those pictures what a seek to the keyframe would: it
-  /// drops or conceals the ones that need it. A closed GOP has none, and
-  /// a switch there loses nothing.
-  ///
-  /// So the packets after the switch keyframe that display before it are
-  /// counted, and the first one that does not ends the count with one
-  /// warning when there were any.
-  fn note_leading(&mut self, pkt: &Packet) {
-    let Some(key) = self.switched_at else {
+  /// The keyframe rule for this session's stream, read off its codec
+  /// parameters: the codec, and how its extradata packs NAL units.
+  fn keyframe_rule(&self) -> access::KeyframeRule {
+    // SAFETY: the owned, deep-copied parameters' pointer, only read.
+    let raw = unsafe { self.parameters.as_ptr() };
+    if raw.is_null() {
+      return access::KeyframeRule::Reordering;
+    }
+    // SAFETY: `raw` is that live pointer (checked non-null above).
+    // `codec_id` is read as the 32-bit integer the field holds, never
+    // formed into a bindgen enum; `extradata` is read for `extradata_size`
+    // bytes, which FFmpeg allocated together.
+    unsafe {
+      let codec_id = core::ptr::read(core::ptr::addr_of!((*raw).codec_id) as *const i32);
+      let data = (*raw).extradata;
+      let size = usize::try_from((*raw).extradata_size).unwrap_or(0);
+      let extradata = if data.is_null() || size == 0 {
+        &[][..]
+      } else {
+        core::slice::from_raw_parts(data, size)
+      };
+      access::KeyframeRule::of(codec_id, extradata)
+    }
+  }
+
+  /// Whether `pkt`, a keyframe, is a clean random access point for this
+  /// stream — see [`access::KeyframeRule::is_clean`]. Whether the decoder
+  /// reorders is read off the one serving now.
+  fn clean_keyframe(&self, pkt: &Packet) -> bool {
+    let reorders = match &self.state {
+      // SAFETY: `sw` is the live opened software decoder; one plain
+      // integer field is read and the pointer is not kept.
+      DecodeState::Sw(sw) => (unsafe { (*sw.as_ptr()).has_b_frames }) != 0,
+      _ => true,
+    };
+    pkt
+      .data()
+      .is_some_and(|data| self.keyframe_rule().is_clean(data, reorders))
+  }
+
+  /// **A fallback that outlives a minute on one thread says so, once.** A
+  /// stream whose keyframes are all open — x265's default CRA cadence —
+  /// never offers a clean point to switch at, so after a fallback it stays
+  /// on the one-thread decoder until the caller seeks. Losing no picture is
+  /// the rule; this warning is how a deployment learns what it costs: the
+  /// first time a minute of stream time has gone by on one thread, it
+  /// names the codec and why its keyframes are not clean.
+  fn note_one_thread(&mut self, pkt: &Packet) {
+    if self.one_thread_warned {
+      return;
+    }
+    let Some(at) = pkt.pts().or_else(|| pkt.dts()) else {
       return;
     };
-    match pkt.pts() {
-      Some(pts) if pts < key => {
-        self.leading_after_switch = self.leading_after_switch.saturating_add(1);
-      }
-      _ => {
-        if self.leading_after_switch > 0 {
-          tracing::warn!(
-            leading = self.leading_after_switch,
-            keyframe_pts = key,
-            "mediadecode-ffmpeg: the keyframe the software decoder returned to the \
-             session's threads at opens an open GOP; pictures after it that display before \
-             it and reference the GOP before it are what a seek to it would make of them",
-          );
-        }
-        self.switched_at = None;
-        self.leading_after_switch = 0;
-      }
+    let since = *self.one_thread_since.get_or_insert(at);
+    let seconds = at.saturating_sub(since) as f64 * f64::from(self.time_base.num())
+      / f64::from(self.time_base.den().get());
+    if seconds < 60.0 {
+      return;
     }
+    self.one_thread_warned = true;
+    let codec = crate::decoder::find_decoder(&self.parameters)
+      .map(|codec| codec.name().to_owned())
+      .unwrap_or_default();
+    tracing::warn!(
+      codec,
+      reason = self.keyframe_rule().reason(),
+      "mediadecode-ffmpeg: a software fallback has decoded a minute of stream on one thread \
+       with no clean random access point to return to the session's threads at; it stays on \
+       one thread until the caller seeks",
+    );
   }
 
   /// **Post-commit** degrade-and-continue transition: open the SW decoder
@@ -1516,8 +1573,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       time_base,
       limits,
       sw_threads_pending: false,
-      switched_at: None,
-      leading_after_switch: 0,
+      seeked: false,
+      one_thread_since: None,
+      one_thread_warned: false,
       scratch_pending: false,
       _carrier: core::marker::PhantomData,
     })
@@ -2025,9 +2083,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     // resync tracking from before the flush is moot. Clear it so the next EOF
     // doesn't escalate over a now-irrelevant pre-flush gap.
     self.clear_degraded_resync();
-    // And so is an open-GOP count from before it.
-    self.switched_at = None;
-    self.leading_after_switch = 0;
+    // The first keyframe after a seek is a switch point whatever its kind:
+    // the seek has discarded what led it. And the minute starts over.
+    self.seeked = true;
+    self.one_thread_since = None;
     match &mut self.state {
       // The HW seam's `flush` returns `Result` for a uniform trait; the
       // real `VideoDecoder::flush` is infallible (always `Ok`).
