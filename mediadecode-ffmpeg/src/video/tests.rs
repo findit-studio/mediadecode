@@ -3429,3 +3429,116 @@ fn a_post_commit_degrade_continues_on_the_session_threads() {
   );
   assert_eq!(threaded, single, "the same pictures, in the same order");
 }
+
+/// LAW (Codex R1, [high]): a probe-era fallback that promotes to the
+/// session's threads holds ONE software decoder — and so one decoded
+/// history — at a time. The proving decoder frees each picture as it
+/// drains and is gone, reference frames and all, before the decoder on
+/// the session's threads opens; the replay queue the session commits is
+/// that decoder's alone.
+#[test]
+fn a_threaded_promotion_holds_one_decoder_at_a_time() {
+  let (w, h) = (96u32, 64u32);
+  let clip = encode_synthetic_clip(w, h, 40, 6);
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let three = core::num::NonZeroU32::new(3).expect("nonzero");
+  let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test(
+    Box::new(FakeHw::failing(w, h, 0, 20, FailShape::ProbeEra)),
+    clip.parameters.clone(),
+    tb,
+  )
+  .expect("build test decoder")
+  .with_threads_for_test(crate::Threads::Count(three));
+
+  super::live_sw::reset_peak();
+  let mut dst = crate::empty_owned_video_frame();
+  for av_pkt in clip.packets.iter().take(21) {
+    let vpkt = boundary::video_packet_from_ffmpeg(av_pkt, mediadecode::Timebase::SECONDS)
+      .expect("a wrappable payload")
+      .expect("packet has a buffer");
+    crate::accepted(dec.send_packet(&vpkt), "send_packet");
+    while let Received::Frame = dec.receive_frame(&mut dst).expect("receive_frame") {}
+  }
+  assert!(dec.is_software(), "the seam exhausted at send 20");
+  assert_eq!(
+    dec.active_threads(),
+    Some(three),
+    "and the session promoted"
+  );
+  assert_eq!(
+    super::live_sw::peak(),
+    1,
+    "the proving decoder was still alive when the threaded one opened"
+  );
+}
+
+/// LAW (Codex R1, [medium]): a fallback committed at the end of the
+/// stream keeps its one-thread decoder — nothing is left to thread — and
+/// the next flush (a seek) reopens it on the session's threads, on both
+/// fallback roads; the reopened decoder decodes the stream again.
+#[test]
+fn a_fallback_at_the_end_reopens_on_the_session_threads_at_the_next_flush() {
+  let (w, h) = (96u32, 64u32);
+  let clip = encode_synthetic_clip(w, h, 12, 6);
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let three = core::num::NonZeroU32::new(3).expect("nonzero");
+  let packet = |av_pkt: &Packet| {
+    boundary::video_packet_from_ffmpeg(av_pkt, mediadecode::Timebase::SECONDS)
+      .expect("a wrappable payload")
+      .expect("packet has a buffer")
+  };
+
+  // The probe-era road: every packet buffered, the end accepted, and
+  // the exhaustion raised at the first receive — `eof_pending` holds.
+  let probe_era: Box<dyn HwInner> = Box::new(FakeHw::failing_at_receive(w, h));
+  // The post-commit road: the hardware decodes every packet and fails at
+  // the end of the stream.
+  let post_commit: Box<dyn HwInner> = Box::new(FakeHwEofFails::new(w, h));
+  for (road, seam, drain_as_fed) in [
+    ("probe-era", probe_era, false),
+    ("post-commit", post_commit, true),
+  ] {
+    let mut dec =
+      FfmpegVideoStreamDecoder::from_hw_inner_for_test(seam, clip.parameters.clone(), tb)
+        .expect("build test decoder")
+        .with_threads_for_test(crate::Threads::Count(three));
+    let mut dst = crate::empty_owned_video_frame();
+    for av_pkt in &clip.packets {
+      crate::accepted(dec.send_packet(&packet(av_pkt)), "send_packet");
+      if drain_as_fed {
+        while let Ok(Received::Frame) = dec.receive_frame(&mut dst) {}
+      }
+    }
+    let _ = dec.send_eof();
+    while let Ok(Received::Frame) = dec.receive_frame(&mut dst) {}
+    assert!(dec.is_software(), "{road}: the session fell back");
+    assert_eq!(
+      dec.active_threads(),
+      Some(core::num::NonZeroU32::MIN),
+      "{road}: committed at the end, on one thread"
+    );
+
+    dec.flush().expect("a flush");
+    assert_eq!(
+      dec.active_threads(),
+      Some(three),
+      "{road}: the flush reopened the decoder on the session's threads"
+    );
+    let mut decoded = 0usize;
+    for av_pkt in &clip.packets {
+      crate::accepted(dec.send_packet(&packet(av_pkt)), "send_packet");
+      while let Received::Frame = dec.receive_frame(&mut dst).expect("receive_frame") {
+        decoded += 1;
+      }
+    }
+    crate::accepted(dec.send_eof(), "send_eof");
+    while let Received::Frame = dec.receive_frame(&mut dst).expect("receive_frame") {
+      decoded += 1;
+    }
+    assert_eq!(
+      decoded,
+      clip.packets.len(),
+      "{road}: the reopened decoder decodes"
+    );
+  }
+}

@@ -54,12 +54,16 @@ The backend-agnostic core it adapts has its own log at
   stays where it was and the packets go back to the caller — and a
   frame-threaded decoder reports a packet's failure only once it has a
   packet per thread in flight. So the probe-era replay and the
-  post-commit cold forward run on a one-thread decoder first, exactly as
-  before, and once that has taken them, and the stream goes on, the same
-  packets are handed to a decoder on the session's threads, which is
-  the one committed. A session whose end is already committed keeps the
-  one-thread decoder, and so does one whose threaded decoder cannot be
-  opened.
+  post-commit cold forward run on a one-thread decoder first, and once
+  that has taken them, and the stream goes on, the same packets are
+  handed to a decoder on the session's threads, which is the one
+  committed. The probe-era proving decoder keeps no pictures — each is
+  freed as it drains — and is dropped before the threaded decoder
+  opens, so one decoded history is resident at a time, within the
+  replay queue's existing cap. A session that commits a one-thread
+  decoder while its limits ask for more — its end already committed, or
+  a threaded decoder that would not open — reopens on its threads at its
+  next `flush`.
 
 ## [0.15.1] - 2026-10-05
 
