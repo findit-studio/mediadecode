@@ -61,6 +61,36 @@ fn an_h264_idr_is_clean_and_a_recovery_point_is_not() {
   }
 }
 
+/// LAW (Codex R4, [high]): **H.264: the first picture decides.** A packet
+/// whose first slice is a non-IDR picture (type 1) is not clean though an
+/// IDR slice (type 5) follows it: a decoder started there would begin cold
+/// on a picture that references what it never saw. With the IDR first it
+/// is clean. In both packings.
+#[test]
+fn an_h264_packet_with_a_picture_before_its_idr_is_not_clean() {
+  let picture_first: [&[u8]; 4] = [&[0x67, 1], &[0x68, 1], &[0x41, 0x9a], &[0x65, 0x88]];
+  let idr_first: [&[u8]; 4] = [&[0x67, 1], &[0x68, 1], &[0x65, 0x88], &[0x41, 0x9a]];
+  for (rule, pack) in [
+    (
+      KeyframeRule::of(CodecId::H264.raw(), &[]),
+      annex_b as fn(&[&[u8]]) -> Vec<u8>,
+    ),
+    (
+      KeyframeRule::of(CodecId::H264.raw(), &AVCC),
+      length_prefixed,
+    ),
+  ] {
+    assert!(
+      !rule.is_clean(&pack(&picture_first), true),
+      "{rule:?}: a picture before the IDR"
+    );
+    assert!(
+      rule.is_clean(&pack(&idr_first), true),
+      "{rule:?}: the IDR first"
+    );
+  }
+}
+
 /// **HEVC: an IDR or a BLA is clean, a CRA never is**, whatever precedes
 /// the first picture's NAL unit (a VPS, an SEI).
 #[test]

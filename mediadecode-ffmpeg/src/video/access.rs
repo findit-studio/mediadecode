@@ -19,9 +19,11 @@ mod tests;
 /// How a stream's keyframes are read for cleanliness.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum KeyframeRule {
-  /// H.264: a keyframe is clean when it carries an IDR slice. Its NAL
-  /// units are length-prefixed by `nal_length` bytes (`avcC`), or
-  /// start-coded (Annex B) when `None`.
+  /// H.264: a keyframe is clean when its first picture's NAL unit (types
+  /// 1–5) is an IDR slice (5). A packet with any picture before the IDR is
+  /// not: a decoder started there would begin on a picture that references
+  /// what it never saw. Its NAL units are length-prefixed by `nal_length`
+  /// bytes (`avcC`), or start-coded (Annex B) when `None`.
   H264 {
     /// The NAL length field's width, from the `avcC` record.
     nal_length: Option<usize>,
@@ -78,7 +80,8 @@ impl KeyframeRule {
   pub(crate) fn is_clean(self, data: &[u8], reorders: bool) -> bool {
     match self {
       Self::H264 { nal_length } => nal_units(data, nal_length).is_some_and(|units| {
-        let mut idr = false;
+        // The first picture's unit decides, as HEVC's does.
+        let mut first_picture = None;
         for unit in units {
           // `forbidden_zero_bit` (1) · `nal_ref_idc` (2) · `nal_unit_type` (5).
           let Some(&header) = unit.first() else {
@@ -87,15 +90,16 @@ impl KeyframeRule {
           if header & 0x80 != 0 {
             return false;
           }
-          if header & 0x1f == 5 {
-            // An IDR slice: its header byte and a slice header after it.
-            if unit.len() < 2 {
-              return false;
-            }
-            idr = true;
+          let kind = header & 0x1f;
+          // An IDR slice: its header byte and a slice header after it.
+          if kind == 5 && unit.len() < 2 {
+            return false;
+          }
+          if (1..=5).contains(&kind) {
+            first_picture.get_or_insert(kind);
           }
         }
-        idr
+        first_picture == Some(5)
       }),
       Self::Hevc { nal_length } => nal_units(data, nal_length).is_some_and(|units| {
         for unit in units {

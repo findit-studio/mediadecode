@@ -77,10 +77,13 @@ The backend-agnostic core it adapts has its own log at
   whose keyframes are all open stays on one thread after a fallback until
   a seek, with one warning, naming the codec and the reason, once a
   minute of stream has gone by that way. A fallback at the end of the
-  stream keeps its one-thread decoder until a seek. A keyframe is clean
-  only when its NAL units parse whole — every header byte present and
-  valid (H.264's and HEVC's forbidden bit, HEVC's second header byte and a
-  non-zero temporal id), a picture's unit carrying a slice past its header.
+  stream keeps its one-thread decoder until a seek. An H.264 or HEVC
+  keyframe is clean only when the first picture's NAL unit in its packet is
+  the IDR (or, for HEVC, the BLA) — a packet with any picture before it is
+  not — and only when its NAL units parse whole — every header byte present
+  and valid (H.264's and HEVC's forbidden bit, HEVC's second header byte and
+  a non-zero temporal id), a picture's unit carrying a slice past its
+  header.
   The session's threads are attempted once: a decoder on them that will
   not open leaves the session on one thread for good. A switch drains the
   old decoder into the session's queue of pictures waiting for delivery,
