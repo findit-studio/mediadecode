@@ -45,9 +45,11 @@
 //!   does not lead it, in every codec — fed once the decoder's output is
 //!   settled (drained to "needs input" since the last packet). Then the
 //!   only pictures from before the anchor that can still come out are the
-//!   ones its reorder buffer holds, at most `has_b_frames` of them (read
-//!   live, the larger of its value at the anchor and now; none for VP8,
-//!   VP9 and AV1, which do not reorder): the `has_b_frames + 1`-th picture
+//!   ones its reorder buffer holds, at most `has_b_frames` of them (the
+//!   largest value read from just before the anchoring packet was
+//!   submitted on — a keyframe can activate parameters that lower it while
+//!   the pictures from before it still wait; none for VP8, VP9 and AV1,
+//!   which do not reorder): the `has_b_frames + 1`-th picture
 //!   output after the anchor is at or after it in decode order, and its
 //!   delivery closes the gap. Nothing is drained or reset for it — the
 //!   decoder that kept decoding keeps every picture. A concealed picture a
@@ -261,6 +263,15 @@ pub struct CarrierVideoStreamDecoder<C: crate::FfmpegCarrier> {
   /// Test-only: how many opens on the session's threads were attempted.
   #[cfg(test)]
   threaded_opens: usize,
+  /// Test-only: the `has_b_frames` the decoder serving reports, in place of
+  /// its own.
+  #[cfg(test)]
+  reorder_override: Option<usize>,
+  /// Test-only: the `has_b_frames` the decoder serving reports once it has
+  /// taken its next packet — the parameters a keyframe activates lowering
+  /// it.
+  #[cfg(test)]
+  reorder_on_submit: Option<usize>,
   /// `true` once `send_eof` has been called on the active decoder.
   /// Used to propagate EOF to the SW decoder when fallback fires
   /// during the drain phase — without this, codecs that hold tail
@@ -287,9 +298,13 @@ pub struct CarrierVideoStreamDecoder<C: crate::FfmpegCarrier> {
   /// packet: the anchor only starts the count the reorder bound reads
   /// ([`Self::outputs_since_anchor`]).
   degraded_anchored: bool,
-  /// The decoder's `has_b_frames` when the resync was anchored — how many
-  /// pictures from before the anchor its reorder buffer may still hold.
-  /// The bound reads the larger of this and the live value.
+  /// The largest `has_b_frames` the decoder serving has shown since just
+  /// before the anchoring packet was submitted — how many pictures from
+  /// before the anchor its reorder buffer may still hold. Read before the
+  /// submission, because a keyframe can activate parameters that lower it
+  /// (an HEVC SPS with fewer `num_reorder_pics`) while those pictures still
+  /// wait; then after it, after every packet since and at every picture
+  /// out, the largest kept. The bound reads it.
   anchor_reorder: usize,
   /// Whether the stream's keyframes reset every reference with no
   /// reordering (VP8, VP9, AV1): the bound is the first picture.
@@ -805,6 +820,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       fail_threaded_opens: false,
       #[cfg(test)]
       threaded_opens: 0,
+      #[cfg(test)]
+      reorder_override: None,
+      #[cfg(test)]
+      reorder_on_submit: None,
       scratch_pending: false,
       _carrier: core::marker::PhantomData,
     })
@@ -1341,7 +1360,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// ([`Self::sw_output_settled`]); until then the send answers `MustDrain`,
   /// so the pictures from before the anchor that can still come out are
   /// the ones the reorder buffer holds, which the bound counts
-  /// ([`Self::resync_on_output`]).
+  /// ([`Self::resync_on_output`]). The buffer's depth is read before the
+  /// packet is submitted — its parameters can lower it while those pictures
+  /// still wait — and the bound keeps the largest it reads from there on
+  /// ([`Self::anchor_reorder`]).
   ///
   /// A decode error met while feeding what was pending is kept for the
   /// drain ([`Self::deferred_error`]), and this send answers `MustDrain`
@@ -1399,6 +1421,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     if anchoring && !self.sw_output_settled {
       return Ok(Sent::MustDrain);
     }
+    // The reorder depth before the anchor is submitted: the parameters it
+    // activates can lower it while the pictures from before it still wait.
+    let reorder_before = if anchoring { self.live_reorder() } else { 0 };
     if pkt.is_key() {
       self.seeked = false;
     }
@@ -1429,10 +1454,16 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
         }
       };
     }
+    #[cfg(test)]
+    if let Some(depth) = self.reorder_on_submit.take() {
+      self.reorder_override = Some(depth);
+    }
     self.sw_output_settled = false;
     if anchoring {
-      self.anchor_resync();
+      self.anchor_resync(reorder_before);
     } else {
+      // The depth after every packet taken since the anchor, kept if larger.
+      self.observe_reorder();
       // Count packets crossing an unresolved post-commit resync gap so the
       // escalation at EOF can report how much was lost.
       self.count_degraded_packet();
@@ -1631,6 +1662,8 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       // the only thing they can hand the cold decoder.
       PostCommitInput::FrameTime | PostCommitInput::Eof => None,
     };
+    // The cold decoder's reorder depth before the forward, for an anchor.
+    let reorder_before = reorder_depth(&sw);
     if let Some(pkt) = forwarded {
       sw.submit(pkt)
         .map_err(|e| crate::decoder::software_exit(state, e))?;
@@ -1666,7 +1699,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       if pkt.is_key() {
         // The refused current packet is itself the resync anchor.
         self.seeked = false;
-        self.anchor_resync();
+        self.anchor_resync(reorder_before);
       } else {
         self.count_degraded_packet();
       }
@@ -1694,11 +1727,13 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
 
   /// **The resync anchored** at the key-flagged packet the decoder serving
   /// just took across the open gap: the count of pictures out since starts,
-  /// against the reorder buffer's depth now (`has_b_frames`) — or none for
-  /// a stream whose keyframes reset every reference (VP8, VP9, AV1).
-  fn anchor_resync(&mut self) {
+  /// against the reorder buffer's depth — `reorder_before`, read before the
+  /// packet was submitted, or the largest read since
+  /// ([`Self::anchor_reorder`]) — or none for a stream whose keyframes reset
+  /// every reference (VP8, VP9, AV1).
+  fn anchor_resync(&mut self, reorder_before: usize) {
     self.degraded_anchored = true;
-    self.anchor_reorder = self.live_reorder();
+    self.anchor_reorder = reorder_before;
     self.anchor_resets = self.keyframe_rule() == access::KeyframeRule::Resets;
     self.outputs_since_anchor = 0;
     self.check_reorder_bound();
@@ -1713,27 +1748,38 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     }
   }
 
-  /// The decoder serving's `has_b_frames`, read live: how many pictures its
-  /// reorder buffer holds back. FFmpeg raises it as it discovers reordering.
+  /// The decoder serving's `has_b_frames`, read live ([`reorder_depth`]).
   fn live_reorder(&self) -> usize {
+    #[cfg(test)]
+    if let Some(depth) = self.reorder_override {
+      return depth;
+    }
     match &self.state {
-      // SAFETY: `sw` is the live opened software decoder; one plain integer
-      // field is read and the pointer is not kept.
-      DecodeState::Sw(sw) => usize::try_from(unsafe { (*sw.as_ptr()).has_b_frames }).unwrap_or(0),
+      DecodeState::Sw(sw) => reorder_depth(sw),
       _ => 0,
     }
   }
 
+  /// The reorder buffer's depth, observed while the resync is anchored: the
+  /// bound keeps the largest it has seen ([`Self::anchor_reorder`]).
+  fn observe_reorder(&mut self) {
+    if self.degraded_resync_pending && self.degraded_anchored {
+      self.anchor_reorder = self.anchor_reorder.max(self.live_reorder());
+    }
+  }
+
   /// **The reorder bound**: once more pictures have come out since the
-  /// anchor than the reorder buffer could hold from before it — the larger
-  /// of its depth at the anchor and now, or none for a stream whose
+  /// anchor than the reorder buffer could hold from before it — the largest
+  /// depth it has shown from just before the anchor on, this reading
+  /// included ([`Self::anchor_reorder`]), or none for a stream whose
   /// keyframes reset every reference — the last of them is at or after the
   /// anchor in decode order, and the gap is closed.
   fn check_reorder_bound(&mut self) {
+    self.observe_reorder();
     let reorder = if self.anchor_resets {
       0
     } else {
-      self.anchor_reorder.max(self.live_reorder())
+      self.anchor_reorder
     };
     if self.outputs_since_anchor > reorder {
       self.clear_degraded_resync();
@@ -1972,6 +2018,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       fail_threaded_opens: false,
       #[cfg(test)]
       threaded_opens: 0,
+      #[cfg(test)]
+      reorder_override: None,
+      #[cfg(test)]
+      reorder_on_submit: None,
       scratch_pending: false,
       _carrier: core::marker::PhantomData,
     })
@@ -2009,6 +2059,19 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// The decoder serving's `has_b_frames`, read live.
   pub(crate) fn reorder_for_test(&self) -> usize {
     self.live_reorder()
+  }
+
+  /// The decoder serving reports `depth` as its `has_b_frames` from here on,
+  /// in place of its own.
+  pub(crate) fn set_reorder_for_test(&mut self, depth: usize) {
+    self.reorder_override = Some(depth);
+  }
+
+  /// The decoder serving reports `depth` as its `has_b_frames` once it has
+  /// taken its next packet — the parameters a keyframe activates lowering
+  /// it.
+  pub(crate) fn reorder_on_next_packet_for_test(&mut self, depth: usize) {
+    self.reorder_on_submit = Some(depth);
   }
 
   /// Every open on the session's threads fails from here on.
@@ -2961,6 +3024,15 @@ fn footprint(frame: &frame::Video) -> usize {
     }
     total
   }
+}
+
+/// A software decoder's `has_b_frames`: how many pictures its reorder buffer
+/// holds back. FFmpeg raises it as it discovers reordering, and the
+/// parameters a keyframe activates can lower it.
+fn reorder_depth(sw: &SwDecoder) -> usize {
+  // SAFETY: `sw` is a live opened software decoder; one plain integer field
+  // is read and the pointer is not kept.
+  usize::try_from(unsafe { (*sw.as_ptr()).has_b_frames }).unwrap_or(0)
 }
 
 fn open_sw_decoder(

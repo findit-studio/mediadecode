@@ -4534,3 +4534,62 @@ fn a_keyframe_that_decodes_to_nothing_leaves_the_loss_reported() {
     "the fallback window, packets 8 to 11, and nothing else"
   );
 }
+
+/// LAW (Codex R5 row 1, [high]): **the reorder bound keeps the largest
+/// depth from just before the anchor on.** A keyframe can activate
+/// parameters that lower `has_b_frames` — an HEVC SPS with fewer
+/// `num_reorder_pics` — while pictures from before it still wait in the
+/// decoder, so the depth is read before the anchoring packet is submitted,
+/// and the bound keeps the largest of that, the depth after it and every
+/// depth since. Here the decoder serving reports a depth of 2 until it takes
+/// keyframe 12 and 0 after it: the bound stays 2, and pictures 12 and 13
+/// leave the gap open. Raised to 4 before packet 14 and lowered to 0 again
+/// before 15, the bound stays 4: 14 and 15 leave the gap open too, and 16,
+/// the fifth picture out after the anchor, closes it.
+#[test]
+fn the_reorder_bound_keeps_the_largest_depth_from_before_the_anchor_on() {
+  let clip = encode_synthetic_clip(128, 96, 24, 6);
+  assert_eq!(nth_keyframe(&clip, 3), 12);
+  let mut dec = before_the_anchor(&clip);
+  let mut dst = crate::empty_owned_video_frame();
+  let mut delivered: Vec<(i64, bool)> = Vec::new();
+  let mut drain = |dec: &mut FfmpegVideoStreamDecoder, delivered: &mut Vec<(i64, bool)>| {
+    while let Received::Frame = dec.receive_frame(&mut dst).expect("receive_frame") {
+      let pts = dst.pts().map_or(i64::MIN, |t| t.pts());
+      delivered.push((pts, dec.degraded_resync_pending_for_test()));
+    }
+  };
+  drain(&mut dec, &mut delivered);
+  assert_eq!(
+    delivered,
+    [(11, true)],
+    "packet 11's picture, the gap still open"
+  );
+  delivered.clear();
+
+  dec.set_reorder_for_test(2);
+  dec.reorder_on_next_packet_for_test(0);
+  crate::accepted(dec.send_packet(&pushed(&clip.packets[12])), "the anchor");
+  assert!(
+    dec.degraded_anchored_for_test(),
+    "keyframe 12 anchors the resync"
+  );
+  assert_eq!(dec.reorder_for_test(), 0, "the anchor lowered the depth");
+  drain(&mut dec, &mut delivered);
+  crate::accepted(dec.send_packet(&pushed(&clip.packets[13])), "packet 13");
+  drain(&mut dec, &mut delivered);
+  dec.set_reorder_for_test(4);
+  crate::accepted(dec.send_packet(&pushed(&clip.packets[14])), "packet 14");
+  drain(&mut dec, &mut delivered);
+  dec.set_reorder_for_test(0);
+  for av_pkt in &clip.packets[15..17] {
+    crate::accepted(dec.send_packet(&pushed(av_pkt)), "send_packet");
+    drain(&mut dec, &mut delivered);
+  }
+  assert_eq!(
+    delivered,
+    [(12, true), (13, true), (14, true), (15, true), (16, false)],
+    "the gap stays open while the pictures out since the anchor are within the largest depth, \
+     4, and closes at the fifth"
+  );
+}
