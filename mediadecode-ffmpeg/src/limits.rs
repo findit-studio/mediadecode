@@ -697,7 +697,9 @@ impl DecoderLimits {
 /// packet the hardware refuses, the first GOP at most — and
 /// [`active_threads`](crate::CarrierVideoStreamDecoder::active_threads)
 /// says so. A fallback at the end of the stream keeps its one thread until
-/// a seek, and the first keyframe after it.
+/// a seek, and the first keyframe after it. The session's threads are
+/// attempted once: if a decoder on them will not open, the session stays on
+/// one thread for good.
 ///
 /// An open-GOP keyframe — an HEVC CRA, an H.264 recovery point that is not
 /// an IDR — is never a switch point: its leading pictures reference the

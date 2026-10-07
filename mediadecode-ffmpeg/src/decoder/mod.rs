@@ -1059,7 +1059,9 @@ impl VideoDecoder {
       | Error::BackendUnsupportedByCodec(_)
       | Error::HwDeviceInitFailed(_)
       | Error::AllBackendsFailed(_)
-      | Error::FallbackFailed(_) => VerdictRouting::Direct,
+      | Error::FallbackFailed(_)
+      // The software road's own queue; no hardware funnel mints it.
+      | Error::ReplayQueueFull(_) => VerdictRouting::Direct,
     }
   }
 

@@ -588,7 +588,7 @@ fn post_commit_failure_degrades_and_resyncs_at_next_keyframe() {
      (a concealed P-frame must not clear it)"
   );
   assert!(
-    !dec.degraded_keyframe_seen_for_test(),
+    dec.degraded_anchor_for_test().is_none(),
     "no keyframe has crossed the gap, so the keyframe-seen anchor must be unset"
   );
 
@@ -1285,7 +1285,7 @@ fn post_commit_gap_counter_tallies_then_clears_on_resync() {
      keyframe has crossed the gap yet"
   );
   assert!(
-    !dec.degraded_keyframe_seen_for_test(),
+    dec.degraded_anchor_for_test().is_none(),
     "no keyframe fed yet, so the keyframe-seen anchor must be unset"
   );
 
@@ -1299,7 +1299,7 @@ fn post_commit_gap_counter_tallies_then_clears_on_resync() {
     crate::accepted(dec.send_packet(&vpkt), "send_packet");
     while try_poll(&mut dec) {}
     assert!(
-      dec.degraded_resync_pending_for_test() && !dec.degraded_keyframe_seen_for_test(),
+      dec.degraded_resync_pending_for_test() && dec.degraded_anchor_for_test().is_none(),
       "concealed P-frame frames before the keyframe must not clear the guard or \
        set the keyframe anchor"
     );
@@ -1316,7 +1316,7 @@ fn post_commit_gap_counter_tallies_then_clears_on_resync() {
       .expect("packet has a buffer");
   crate::accepted(dec.send_packet(&key_vpkt), "send_packet");
   assert!(
-    dec.degraded_keyframe_seen_for_test(),
+    dec.degraded_anchor_for_test().is_some(),
     "feeding the keyframe across the gap must record it as the resync anchor"
   );
 
@@ -1436,7 +1436,7 @@ fn post_commit_concealed_p_frame_does_not_clear_resync_escalates_at_eof() {
         "a concealed P-frame must not clear the keyframe-gated resync guard"
       );
       assert!(
-        !dec.degraded_keyframe_seen_for_test(),
+        dec.degraded_anchor_for_test().is_none(),
         "no keyframe was fed, so the keyframe-seen anchor must stay unset"
       );
     }
@@ -2868,7 +2868,7 @@ fn a_parked_recovery_frame_still_clears_the_resync_guard() {
       }
       crate::accepted(dec.send_packet(&packet(third_key)), "send the keyframe");
       assert!(
-        dec.degraded_keyframe_seen_for_test(),
+        dec.degraded_anchor_for_test().is_some(),
         "the keyframe crossed the gap and is the resync anchor",
       );
       assert!(
@@ -3848,4 +3848,186 @@ fn a_fallback_at_the_end_returns_to_the_session_threads_at_the_first_keyframe_af
       "{road}: the decoder on the session's threads decodes"
     );
   }
+}
+
+/// Drains every frame the session has ready, answering how many came out.
+fn drain_ready(dec: &mut FfmpegVideoStreamDecoder) -> usize {
+  let mut dst = crate::empty_owned_video_frame();
+  let mut frames = 0;
+  while let Received::Frame = dec.receive_frame(&mut dst).expect("receive_frame") {
+    frames += 1;
+  }
+  frames
+}
+
+/// LAW (Codex R3, [high]): **a keyframe-only stream whose threaded decoder
+/// will not open keeps its queue bounded.** Every packet is a clean
+/// keyframe and every open on the session's threads fails. The threaded
+/// open is attempted once, the session stays on one thread for good, and
+/// a caller that sends without draining is answered `MustDrain` rather
+/// than having switch after switch pile drained pictures into the queue —
+/// which never holds more than the fallback's own replay. Nothing is lost.
+#[test]
+fn a_keyframe_only_stream_whose_threads_will_not_open_keeps_its_queue_bounded() {
+  let (w, h) = (96u32, 64u32);
+  let clip = encode_synthetic_clip(w, h, 40, 1);
+  assert!(
+    clip.packets.iter().all(Packet::is_key),
+    "every packet a keyframe"
+  );
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let three = core::num::NonZeroU32::new(3).expect("nonzero");
+  let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test(
+    Box::new(FakeHw::failing(w, h, 0, 3, FailShape::ProbeEra)),
+    clip.parameters.clone(),
+    tb,
+  )
+  .expect("build test decoder")
+  .with_threads_for_test(crate::Threads::Count(three))
+  .failing_threaded_opens_for_test();
+
+  let mut delivered = 0usize;
+  let mut most_queued = 0usize;
+  for av_pkt in &clip.packets {
+    // A caller that sends without draining until it is told to.
+    loop {
+      match dec.send_packet(&pushed(av_pkt)).expect("send_packet") {
+        Sent::Accepted => break,
+        Sent::MustDrain => delivered += drain_ready(&mut dec),
+      }
+    }
+    most_queued = most_queued.max(dec.sw_replay_len_for_test());
+  }
+  crate::accepted(dec.send_eof(), "send_eof");
+  delivered += drain_ready(&mut dec);
+
+  assert!(
+    most_queued <= 3,
+    "the queue held {most_queued} pictures; the replay's three are its most"
+  );
+  assert_eq!(
+    dec.threaded_opens_for_test(),
+    1,
+    "the session's threads are attempted once"
+  );
+  assert_eq!(
+    dec.active_threads(),
+    Some(core::num::NonZeroU32::MIN),
+    "and the session stays on one thread for good"
+  );
+  assert_eq!(delivered, clip.packets.len(), "no picture lost");
+}
+
+/// The post-commit road the resync laws stand on: a clip with keyframes at
+/// 0, 6, 12 and 18; the hardware decodes up to packet 8 and fails there
+/// post-commit (a P-frame the cold decoder takes, as
+/// `post_commit_concealed_p_frame_does_not_clear_resync_escalates_at_eof`
+/// found); packets 8 to 10 go to the cold software decoder drained, 11 is
+/// sent and left undrained, and then the keyframe at 12 — so the cold
+/// decoder's concealed picture from before the anchor comes out after the
+/// anchor was fed.
+fn up_to_the_anchor(clip: &SyntheticClip) -> FfmpegVideoStreamDecoder {
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test(
+    Box::new(FakeHw::failing(128, 96, 8, 8, FailShape::PostCommit)),
+    clip.parameters.clone(),
+    tb,
+  )
+  .expect("build test decoder");
+  for av_pkt in &clip.packets[..11] {
+    crate::accepted(dec.send_packet(&pushed(av_pkt)), "send_packet");
+    drain_ready(&mut dec);
+  }
+  assert!(dec.degraded_resync_pending_for_test(), "the gap is open");
+  crate::accepted(dec.send_packet(&pushed(&clip.packets[11])), "the last P");
+  crate::accepted(dec.send_packet(&pushed(&clip.packets[12])), "the anchor");
+  assert!(
+    dec.degraded_anchor_for_test().is_some(),
+    "the keyframe anchored"
+  );
+  dec
+}
+
+/// LAW (Codex R3, [high]): **a frame from before the anchor does not prove
+/// the resync.** The concealed picture the cold decoder made of the P-frame
+/// before the keyframe comes out after the keyframe was fed; it is not
+/// decoded from the anchor or anything after it, so the guard stands. The
+/// keyframe's own picture is what clears it.
+#[test]
+fn a_frame_from_before_the_anchor_does_not_prove_the_resync() {
+  let clip = encode_synthetic_clip(128, 96, 24, 6);
+  assert_eq!(nth_keyframe(&clip, 3), 12);
+  let mut dec = up_to_the_anchor(&clip);
+  let anchor = dec.degraded_anchor_for_test().expect("anchored");
+  let mut dst = crate::empty_owned_video_frame();
+
+  assert!(
+    matches!(dec.receive_frame(&mut dst), Ok(Received::Frame)),
+    "the concealed picture from before the anchor"
+  );
+  let first = dec
+    .last_delivered_serial_for_test()
+    .expect("a stamped packet's");
+  assert!(
+    first < anchor,
+    "it came from before the anchor: {first} < {anchor}"
+  );
+  assert!(
+    dec.degraded_resync_pending_for_test(),
+    "a picture from before the anchor proves nothing"
+  );
+
+  assert!(matches!(dec.receive_frame(&mut dst), Ok(Received::Frame)));
+  assert_eq!(dec.last_delivered_serial_for_test(), Some(anchor));
+  assert!(
+    !dec.degraded_resync_pending_for_test(),
+    "the keyframe's own picture clears the guard"
+  );
+}
+
+/// LAW (Codex R3, [high]): **a keyframe that decodes to nothing leaves the
+/// loss reported.** The anchor's payload is damaged, so it is taken and
+/// produces no picture; the concealed picture from before it is delivered
+/// after it and proves nothing. At the end of the stream the gap is still
+/// open, and the loss escalates as `PostCommitNeverResynced` rather than
+/// ending clean.
+#[test]
+fn a_keyframe_that_decodes_to_nothing_leaves_the_loss_reported() {
+  let mut clip = encode_synthetic_clip(128, 96, 24, 6);
+  assert_eq!(nth_keyframe(&clip, 3), 12);
+  corrupt_packet_payload(&mut clip.packets[12]);
+  let mut dec = up_to_the_anchor(&clip);
+  let anchor = dec.degraded_anchor_for_test().expect("anchored");
+
+  let mut dst = crate::empty_owned_video_frame();
+  let mut escalated = false;
+  let mut ended = false;
+  let mut eof_sent = false;
+  for _ in 0..16 {
+    match dec.receive_frame(&mut dst) {
+      Ok(Received::Frame) => {
+        let serial = dec.last_delivered_serial_for_test().expect("stamped");
+        assert!(serial < anchor, "no picture comes from the damaged anchor");
+      }
+      Ok(Received::NeedsInput) if !eof_sent => {
+        crate::accepted(dec.send_eof(), "send_eof");
+        eof_sent = true;
+      }
+      Ok(Received::NeedsInput | Received::Ended) => {
+        ended = true;
+        break;
+      }
+      Err(VideoDecodeError::PostCommitNeverResynced(_)) => {
+        escalated = true;
+        break;
+      }
+      // The damaged anchor's own decode error, reported where it met.
+      Err(VideoDecodeError::Decode(_)) => {}
+      Err(other) => panic!("unexpected: {other:?}"),
+    }
+  }
+  assert!(
+    escalated && !ended,
+    "the gap never closed, so the end escalates (escalated {escalated}, ended {ended})"
+  );
 }

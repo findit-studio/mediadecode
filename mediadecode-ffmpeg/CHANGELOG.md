@@ -23,6 +23,12 @@ The backend-agnostic core it adapts has its own log at
   libavcodec takes frame threading where the codec has it, slice
   threading where it has only that, and one thread otherwise.
 
+- **`Error::ReplayQueueFull`** (`ReplayQueueFull { cap }`, exported): the
+  software video road's queue of decoded pictures waiting for delivery —
+  a fallback replay's, or the tail a one-thread decoder is drained of at a
+  thread switch — refuses past its one cap (64 pictures) by this name,
+  where a replay overflow used to surface as a bare `ENOMEM`.
+
 - **`active_threads()` on the video stream decoder**: the count
   libavcodec settled on, read back from the opened context of the
   decoder serving now — the resolved count on the software road, one on
@@ -71,7 +77,29 @@ The backend-agnostic core it adapts has its own log at
   whose keyframes are all open stays on one thread after a fallback until
   a seek, with one warning, naming the codec and the reason, once a
   minute of stream has gone by that way. A fallback at the end of the
-  stream keeps its one-thread decoder until a seek.
+  stream keeps its one-thread decoder until a seek. A keyframe is clean
+  only when its NAL units parse whole — every header byte present and
+  valid (H.264's and HEVC's forbidden bit, HEVC's second header byte and a
+  non-zero temporal id), a picture's unit carrying a slice past its header.
+  The session's threads are attempted once: a decoder on them that will
+  not open leaves the session on one thread for good. A switch drains the
+  old decoder into the session's queue of pictures waiting for delivery,
+  so it is attempted only while that queue is empty — the send answers
+  `MustDrain` until it is — and the queue has one cap across everything
+  in it.
+
+### Fixed
+
+- **A post-commit resync is proved by a picture decoded at or after its
+  anchor keyframe.** Any keyframe the cold software decoder took used to
+  arm the proof, and the next picture delivered — even a concealed one
+  from before the keyframe, delivered late — cleared the guard; a
+  keyframe that decoded to nothing then let the end of the stream pass as
+  clean instead of escalating `PostCommitNeverResynced`. Every packet now
+  carries the session's sequence number in `opaque`, which software
+  contexts copy onto the frames they decode from it
+  (`AV_CODEC_FLAG_COPY_OPAQUE`), and the guard clears only on a picture
+  from the anchor or a later packet.
 
 ## [0.15.1] - 2026-10-05
 

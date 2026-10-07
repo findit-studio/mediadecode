@@ -146,6 +146,41 @@ pub enum Error {
   /// gives a free `impl From<FallbackFailed> for Error`.
   #[error(transparent)]
   FallbackFailed(#[from] FallbackFailed),
+
+  /// The software video road's queue of decoded pictures waiting for
+  /// delivery would pass its cap — the pictures a fallback replay decoded,
+  /// or the tail a one-thread decoder is drained of when a session returns
+  /// to its threads at a keyframe. Refused rather than grown; see
+  /// [`ReplayQueueFull`].
+  #[error(transparent)]
+  ReplayQueueFull(#[from] ReplayQueueFull),
+}
+
+/// Payload for [`Error::ReplayQueueFull`].
+///
+/// One budget spans the whole queue — what a replay left waiting and any
+/// tail drained behind it — so no sequence of fallbacks and switches can
+/// grow it past the cap; the pictures past it are refused, by this name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+  "the software video decoder's queue of decoded pictures waiting for delivery is full at {cap}; \
+   drain it before sending more"
+)]
+pub struct ReplayQueueFull {
+  cap: usize,
+}
+
+impl ReplayQueueFull {
+  /// Constructs a [`ReplayQueueFull`] payload.
+  #[inline]
+  pub const fn new(cap: usize) -> Self {
+    Self { cap }
+  }
+  /// The most pictures the queue holds.
+  #[inline]
+  pub const fn cap(&self) -> usize {
+    self.cap
+  }
 }
 
 /// Payload for [`Error::HwDeviceInitFailed`].

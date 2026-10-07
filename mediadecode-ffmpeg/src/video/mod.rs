@@ -230,6 +230,16 @@ pub struct CarrierVideoStreamDecoder<C: crate::FfmpegCarrier> {
   one_thread_since: Option<i64>,
   /// `true` once the minute's warning has been given; it is given once.
   one_thread_warned: bool,
+  /// Test-only: every open on the session's threads fails.
+  #[cfg(test)]
+  fail_threaded_opens: bool,
+  /// Test-only: how many opens on the session's threads were attempted.
+  #[cfg(test)]
+  threaded_opens: usize,
+  /// Test-only: the sequence number of the packet the last delivered
+  /// frame was decoded from.
+  #[cfg(test)]
+  last_serial: Option<u64>,
   /// `true` once `send_eof` has been called on the active decoder.
   /// Used to propagate EOF to the SW decoder when fallback fires
   /// during the drain phase — without this, codecs that hold tail
@@ -243,20 +253,27 @@ pub struct CarrierVideoStreamDecoder<C: crate::FfmpegCarrier> {
   /// *bounded* — SW resyncs at that keyframe. This flag makes the promise
   /// enforced rather than assumed: while it is set we have no proof SW ever
   /// recovered from a real keyframe. It is cleared only when SW delivers a frame
-  /// *and* [`Self::degraded_keyframe_seen`] is set (a lone concealed P-frame a
-  /// lenient codec emits from the gap does **not** clear it); if EOF is reached
+  /// decoded from the anchor or a packet after it ([`Self::degraded_anchor`];
+  /// a lone concealed P-frame a lenient codec emits from the gap, delivered
+  /// before or after the anchor was fed, does **not** clear it); if EOF is reached
   /// while it is still set the loss is escalated (a distinct loud error) rather
   /// than silently swallowing the whole tail. Probe-era fallbacks never set it —
   /// they replay losslessly and produce frames immediately.
   degraded_resync_pending: bool,
-  /// `true` once a **keyframe** packet has been successfully fed to the SW
-  /// decoder while [`Self::degraded_resync_pending`] is set — i.e. a real resync
-  /// anchor crossed the gap. The pending flag clears only on a delivered SW
-  /// frame *after* this is set, so a concealed non-keyframe frame (a lenient
-  /// codec decoding a lone P-frame from the dropped span) cannot masquerade as a
-  /// resync and prematurely clear the guard. Set alongside `enter`/cleared with
-  /// the pending flag.
-  degraded_keyframe_seen: bool,
+  /// The sequence number of the first **keyframe** packet fed to the SW
+  /// decoder while [`Self::degraded_resync_pending`] is set — the resync
+  /// anchor that crossed the gap. The pending flag clears only on a delivered
+  /// SW frame decoded from this packet or a later one: every packet carries its
+  /// number through `opaque` into the frame it produces
+  /// (`AV_CODEC_FLAG_COPY_OPAQUE`, see [`Self::next_serial`]), so a concealed
+  /// frame from the dropped span — delivered before the anchor's own, or
+  /// after it, delayed — cannot masquerade as a resync, and a keyframe that
+  /// produces nothing leaves the guard armed. Never a session-wide boolean.
+  degraded_anchor: Option<u64>,
+  /// The sequence number the next packet sent is stamped with, in its
+  /// `opaque` — counted from 1, so a frame whose `opaque` is null came from
+  /// no stamped packet.
+  next_serial: u64,
   /// Packets fed to the SW decoder since the post-commit fallback fired while
   /// [`Self::degraded_resync_pending`] is set — i.e. across the unresolved
   /// resync gap. Reported in the escalation message so the lost span is
@@ -659,7 +676,8 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       sw_replay_frames: VecDeque::new(),
       eof_sent: false,
       degraded_resync_pending: false,
-      degraded_keyframe_seen: false,
+      degraded_anchor: None,
+      next_serial: 1,
       degraded_packets_since_fallback: 0,
       time_base,
       limits,
@@ -667,6 +685,12 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       seeked: false,
       one_thread_since: None,
       one_thread_warned: false,
+      #[cfg(test)]
+      fail_threaded_opens: false,
+      #[cfg(test)]
+      threaded_opens: 0,
+      #[cfg(test)]
+      last_serial: None,
       scratch_pending: false,
       _carrier: core::marker::PhantomData,
     })
@@ -1019,46 +1043,67 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// instant is more than one software decoder open — the decoded history
   /// is the open decoder's alone, which is why no budget spans two.
   ///
+  /// # One queue, one budget
+  ///
+  /// The tail drains into the session's own queue of pictures waiting for
+  /// delivery, under the one cap that queue has
+  /// ([`SW_REPLAY_FRAME_CAP`], refused past it as
+  /// [`Error::ReplayQueueFull`]); [`Self::send_on_software`] attempts a
+  /// switch only while that queue is empty, answering
+  /// [`Sent::MustDrain`] until the caller has drained it. So nothing a
+  /// switch drains piles up behind anything else.
+  ///
   /// # When an open fails
   ///
-  /// A decoder on one thread is opened instead, and the session tries
-  /// its threads again at the next keyframe. Should that fail too, the
-  /// session is left with no decoder open
+  /// The session's threads are attempted **once**: a decoder on the
+  /// session's threads that will not open is not retried, and a decoder on
+  /// one thread is opened instead, for the rest of the session —
+  /// [`active_threads`](Self::active_threads_impl) answers one. Should that
+  /// fail too, the session is left with no decoder open
   /// ([`DecodeState::SwClosed`]), the error is returned — the packet was
   /// not taken — and the next send opens one again. A drain that fails
   /// closes the old decoder all the same, after queueing the pictures it
   /// did deliver: it was already told the stream ended.
   fn restore_session_threads(&mut self) -> Result<(), Error> {
     if let DecodeState::Sw(sw) = &mut self.state {
-      // The tail is bounded by the codec's own reorder delay, and capped
-      // on its own like a replay; it queues behind whatever a fallback
-      // replay left waiting, so the pictures come out in order.
-      let mut tail = VecDeque::new();
-      let drained = replay_history(sw, &[], true, &mut tail);
-      self.sw_replay_frames.append(&mut tail);
+      let drained = replay_history(sw, &[], true, &mut self.sw_replay_frames);
       self.state = DecodeState::SwClosed;
       drained?;
     }
-    let sw = match open_sw_decoder(&self.parameters, self.limits, Some(self.time_base)) {
-      Ok(sw) => {
-        self.sw_threads_pending = false;
-        sw
+    let one_thread = self.limits.with_threads(crate::Threads::Single);
+    let sw = if self.sw_threads_pending {
+      self.sw_threads_pending = false;
+      match self.open_on_session_threads() {
+        Ok(sw) => sw,
+        Err(error) => {
+          tracing::warn!(
+            %error,
+            "mediadecode-ffmpeg: the software decoder could not be opened on the session's \
+             threads at a keyframe; the session stays on one thread for good",
+          );
+          open_sw_decoder(&self.parameters, one_thread, Some(self.time_base))?
+        }
       }
-      Err(error) => {
-        tracing::warn!(
-          %error,
-          "mediadecode-ffmpeg: the software decoder could not be opened on the session's \
-           threads at a keyframe; it continues on one thread and tries again at the next",
-        );
-        open_sw_decoder(
-          &self.parameters,
-          self.limits.with_threads(crate::Threads::Single),
-          Some(self.time_base),
-        )?
-      }
+    } else {
+      open_sw_decoder(&self.parameters, one_thread, Some(self.time_base))?
     };
     self.state = DecodeState::Sw(sw);
     Ok(())
+  }
+
+  /// The one open a switch attempts on the session's own threads. In tests
+  /// it can be made to fail, and is counted.
+  fn open_on_session_threads(&mut self) -> Result<SwDecoder, Error> {
+    #[cfg(test)]
+    {
+      self.threaded_opens += 1;
+      if self.fail_threaded_opens {
+        return Err(Error::Ffmpeg(ffmpeg_next::Error::Other {
+          errno: libc::ENOMEM,
+        }));
+      }
+    }
+    open_sw_decoder(&self.parameters, self.limits, Some(self.time_base))
   }
 
   /// The software road's send: the session's threads restored first when
@@ -1084,9 +1129,17 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     phase: crate::decoder::SessionPhase,
   ) -> Result<Sent, VideoDecodeError> {
     let key = pkt.is_key();
-    let switching = self.sw_threads_pending
-      && (matches!(self.state, DecodeState::SwClosed)
-        || (key && !self.degraded_resync_pending && (self.seeked || self.clean_keyframe(pkt))));
+    let switching = matches!(self.state, DecodeState::SwClosed)
+      || (self.sw_threads_pending
+        && key
+        && !self.degraded_resync_pending
+        && (self.seeked || self.clean_keyframe(pkt)));
+    // One queue, one budget: the switch drains the old decoder into the
+    // queue, so it waits until the caller has emptied it. The packet is
+    // still the caller's, to re-offer.
+    if switching && !self.sw_replay_frames.is_empty() {
+      return Ok(Sent::MustDrain);
+    }
     if key {
       self.seeked = false;
     }
@@ -1116,7 +1169,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     }
     // A keyframe fed across an unresolved post-commit gap is the resync
     // anchor; record it so the next delivered frame can clear the guard.
-    self.note_degraded_keyframe(pkt.is_key());
+    self.note_degraded_keyframe(pkt);
     // Count packets crossing an unresolved post-commit resync gap so the
     // escalation at EOF can report how much tail was lost.
     self.count_degraded_packet();
@@ -1338,9 +1391,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     self.state = DecodeState::Sw(sw);
     self.sw_threads_pending = self.limits.threads().thread_count() != 1;
     self.enter_degraded_resync();
-    if forwarded.is_some_and(|pkt| pkt.is_key()) {
-      // The refused current packet was itself the resync anchor.
-      self.note_degraded_keyframe(true);
+    if let Some(pkt) = forwarded {
+      // The refused current packet may itself be the resync anchor.
+      self.note_degraded_keyframe(pkt);
     }
     if forwarded.is_some() {
       self.count_degraded_packet();
@@ -1354,24 +1407,24 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// (a delivered frame after a keyframe was fed — see
   /// [`Self::note_degraded_keyframe`] / [`Self::resync_on_frame`]) and the EOF
   /// escalation in [`VideoStreamDecoder::receive_frame`]. Called only on the
-  /// post-commit path, only after a clean commit. Resets the keyframe-seen anchor
-  /// and the gap counter.
+  /// post-commit path, only after a clean commit. Resets the anchor and the gap
+  /// counter.
   #[inline]
   fn enter_degraded_resync(&mut self) {
     self.degraded_resync_pending = true;
-    self.degraded_keyframe_seen = false;
+    self.degraded_anchor = None;
     self.degraded_packets_since_fallback = 0;
   }
 
-  /// Record that a packet fed to the SW decoder across an unresolved post-commit
-  /// gap was a **keyframe** — the resync anchor. Only a frame delivered *after*
-  /// this clears the pending flag, so a lenient codec's concealed P-frame can't
-  /// masquerade as a resync. A no-op outside degraded mode, or for a
-  /// non-keyframe.
+  /// Record that `pkt`, fed to the SW decoder across an unresolved post-commit
+  /// gap, was a **keyframe** — the resync anchor, by its sequence number. The
+  /// first such keyframe anchors; only a frame decoded from it or a later
+  /// packet clears the pending flag. A no-op outside degraded mode, for a
+  /// non-keyframe, or once an anchor is set.
   #[inline]
-  fn note_degraded_keyframe(&mut self, is_key: bool) {
-    if self.degraded_resync_pending && is_key {
-      self.degraded_keyframe_seen = true;
+  fn note_degraded_keyframe(&mut self, pkt: &Packet) {
+    if self.degraded_resync_pending && self.degraded_anchor.is_none() && pkt.is_key() {
+      self.degraded_anchor = packet_serial(pkt);
     }
   }
 
@@ -1385,16 +1438,22 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     }
   }
 
-  /// A SW frame was delivered. Clear post-commit degraded mode **only if** a
-  /// keyframe was fed across the gap ([`Self::degraded_keyframe_seen`]) — that is
-  /// a real keyframe-anchored resync, so the dropped span is now the promised
-  /// *bounded* gap. A frame delivered with no keyframe yet (a concealed P-frame
-  /// from the dropped span) leaves the guard set, so the one-GOP bound stays
-  /// enforced and the EOF escalation still fires if no keyframe ever arrives.
-  /// Idempotent; a no-op outside degraded mode (steady state, probe-era replay).
+  /// A SW frame decoded from the packet numbered `serial` was delivered. Clear
+  /// post-commit degraded mode **only if** that packet is the anchor or came
+  /// after it ([`Self::degraded_anchor`]) — a frame demonstrably at or after a
+  /// real keyframe, so the dropped span is now the promised *bounded* gap. A
+  /// frame from before the anchor (a concealed P-frame from the dropped span,
+  /// however late it comes out) or from no stamped packet leaves the guard set,
+  /// so the one-GOP bound stays enforced and the EOF escalation still fires if
+  /// no frame at or after a keyframe ever arrives. Idempotent; a no-op outside
+  /// degraded mode (steady state, probe-era replay).
   #[inline]
-  fn resync_on_frame(&mut self) {
-    if self.degraded_resync_pending && self.degraded_keyframe_seen {
+  fn resync_on_frame(&mut self, serial: Option<u64>) {
+    if self.degraded_resync_pending
+      && self
+        .degraded_anchor
+        .is_some_and(|anchor| serial.is_some_and(|serial| serial >= anchor))
+    {
       self.clear_degraded_resync();
     }
   }
@@ -1408,7 +1467,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   #[inline]
   fn clear_degraded_resync(&mut self) {
     self.degraded_resync_pending = false;
-    self.degraded_keyframe_seen = false;
+    self.degraded_anchor = None;
     self.degraded_packets_since_fallback = 0;
   }
 
@@ -1426,14 +1485,19 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   fn commit_delivery(
     &mut self,
     frame: VideoFrame<mediadecode::PixelFormat, VideoFrameExtra, C::Buffer>,
+    serial: Option<u64>,
     dst: &mut VideoFrame<mediadecode::PixelFormat, VideoFrameExtra, C::Buffer>,
   ) {
     // The seat is free once a carrier exists for what it held.
     self.scratch_pending = false;
-    // A delivered frame is what clears a keyframe-anchored resync. A
-    // no-op on every road that never entered degraded mode, which is
-    // why it can be unconditional here.
-    self.resync_on_frame();
+    // A delivered frame at or after the anchor is what clears a
+    // keyframe-anchored resync. A no-op on every road that never entered
+    // degraded mode, which is why it can be unconditional here.
+    self.resync_on_frame(serial);
+    #[cfg(test)]
+    {
+      self.last_serial = serial;
+    }
     *dst = frame;
   }
 
@@ -1507,6 +1571,8 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       // is — and the software scratch is the one its road would use.
       DecodeState::Sw(_) | DecodeState::SwClosed => unsafe { self.sw_scratch.as_ptr() },
     };
+    // Read before the conversion takes what it needs out of the frame.
+    let serial = frame_serial(av_frame);
     // SAFETY: the scratch frame is live — either just filled by the
     // inner decoder's `receive_frame`, or left holding a frame whose
     // conversion did not commit. Convert takes what it needs out of it,
@@ -1516,7 +1582,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     };
     match converted {
       Ok(new_frame) => {
-        self.commit_delivery(new_frame, dst);
+        self.commit_delivery(new_frame, serial, dst);
         Ok(Received::Frame)
       }
       Err(e) => {
@@ -1568,7 +1634,8 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       sw_replay_frames: VecDeque::new(),
       eof_sent: false,
       degraded_resync_pending: false,
-      degraded_keyframe_seen: false,
+      degraded_anchor: None,
+      next_serial: 1,
       degraded_packets_since_fallback: 0,
       time_base,
       limits,
@@ -1576,6 +1643,12 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       seeked: false,
       one_thread_since: None,
       one_thread_warned: false,
+      #[cfg(test)]
+      fail_threaded_opens: false,
+      #[cfg(test)]
+      threaded_opens: 0,
+      #[cfg(test)]
+      last_serial: None,
       scratch_pending: false,
       _carrier: core::marker::PhantomData,
     })
@@ -1602,11 +1675,33 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     self.degraded_resync_pending
   }
 
-  /// Whether a keyframe has been fed to the SW decoder across the unresolved
-  /// post-commit gap (the resync anchor). Lets the keyframe-gating test confirm
-  /// a concealed P-frame does not set it (so the resync clear stays blocked).
-  pub(crate) const fn degraded_keyframe_seen_for_test(&self) -> bool {
-    self.degraded_keyframe_seen
+  /// The sequence number of the keyframe fed to the SW decoder across the
+  /// unresolved post-commit gap (the resync anchor), if one was. Lets the
+  /// keyframe-gating tests confirm a concealed P-frame does not set it, and
+  /// that only a frame at or after it clears the guard.
+  pub(crate) const fn degraded_anchor_for_test(&self) -> Option<u64> {
+    self.degraded_anchor
+  }
+
+  /// Every open on the session's threads fails from here on.
+  pub(crate) const fn failing_threaded_opens_for_test(mut self) -> Self {
+    self.fail_threaded_opens = true;
+    self
+  }
+
+  /// How many opens on the session's threads were attempted.
+  pub(crate) const fn threaded_opens_for_test(&self) -> usize {
+    self.threaded_opens
+  }
+
+  /// How many pictures wait in the replay queue.
+  pub(crate) fn sw_replay_len_for_test(&self) -> usize {
+    self.sw_replay_frames.len()
+  }
+
+  /// The sequence number of the packet the last delivered frame came from.
+  pub(crate) const fn last_delivered_serial_for_test(&self) -> Option<u64> {
+    self.last_serial
   }
 
   /// Whether the post-commit path retained any replay frames — must always be
@@ -1696,6 +1791,11 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       _ => crate::carrier::BodyRoute::Submission,
     };
     boundary::with_ffmpeg_video_packet::<C, _>(packet, limits, route, |av_pkt| {
+      // Every packet carries its sequence number into the frame it makes —
+      // see [`Self::next_serial`] and [`Self::resync_on_frame`].
+      stamp_serial(av_pkt, self.next_serial);
+      self.next_serial = self.next_serial.wrapping_add(1).max(1);
+      let av_pkt: &Packet = av_pkt;
       match &mut self.state {
         DecodeState::Hw(hw) => match hw.send_packet(av_pkt) {
           // The seam already classified libavcodec's back pressure, so
@@ -1784,6 +1884,8 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     // any allocation failure, which is the one thing this queue exists
     // to prevent. It leaves the queue when a carrier exists for it.
     if let Some(replayed) = self.sw_replay_frames.front() {
+      // SAFETY: a live frame owned by the queue; read for one field.
+      let serial = frame_serial(unsafe { replayed.as_ptr() });
       // SAFETY: `replayed` is a live AVFrame owned by this queue;
       // convert takes what it needs out of it.
       let converted = unsafe {
@@ -1804,7 +1906,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
         }
       };
       self.sw_replay_frames.pop_front();
-      self.commit_delivery(new_frame, dst);
+      self.commit_delivery(new_frame, serial, dst);
       return Ok(Received::Frame);
     }
     // A frame whose conversion did not commit is converted again before
@@ -1877,6 +1979,8 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
             // conversion that cannot commit must leave the head where
             // it is rather than advance past it.
             if let Some(replayed) = self.sw_replay_frames.front() {
+              // SAFETY: a live frame owned by the queue; read for one field.
+              let serial = frame_serial(unsafe { replayed.as_ptr() });
               // SAFETY: `replayed` is a live AVFrame owned by this
               // queue; convert takes what it needs out of it.
               let converted = unsafe {
@@ -1897,7 +2001,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
                 }
               };
               self.sw_replay_frames.pop_front();
-              self.commit_delivery(new_frame, dst);
+              self.commit_delivery(new_frame, serial, dst);
               return Ok(Received::Frame);
             }
             // Fall through to the loop; next iteration takes the Sw arm.
@@ -1914,6 +2018,8 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
               // The frame is out of the decoder's queue from here; the
               // seat is what keeps it if the conversion cannot commit.
               self.scratch_pending = true;
+              // SAFETY: the scratch just filled; read for one field.
+              let serial = frame_serial(unsafe { self.sw_scratch.as_ptr() });
               // SAFETY: the scratch frame is live (just filled by
               // `receive_frame`); convert takes what it needs out of
               // it, so the scratch can be reused once this commits.
@@ -1932,11 +2038,11 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
                 }
               };
               // SW produced a frame. The commit point clears degraded mode only
-              // if a keyframe was fed across the gap — a real keyframe-anchored
-              // resync, so the dropped span is the promised bounded gap. A
-              // concealed P-frame (no keyframe yet) does not clear it (see
-              // `resync_on_frame`).
-              self.commit_delivery(new_frame, dst);
+              // if the frame came from the anchor keyframe or a later packet — a
+              // real keyframe-anchored resync, so the dropped span is the
+              // promised bounded gap. A concealed P-frame from before the anchor
+              // does not clear it (see `resync_on_frame`).
+              self.commit_delivery(new_frame, serial, dst);
               return Ok(Received::Frame);
             }
             // Funnel first — so a recorded budget refusal is named
@@ -2311,14 +2417,13 @@ fn replay_history(
           if local_replay.len() >= SW_REPLAY_FRAME_CAP {
             tracing::error!(
               cap = SW_REPLAY_FRAME_CAP,
-              "mediadecode-ffmpeg: SW fallback replay produced more frames than the \
-               replay cap allows; aborting fallback (no frames dropped — they're \
-               still in the SW decoder's internal queue and will be released when \
-               it drops)",
+              "mediadecode-ffmpeg: the software decoder's queue of pictures waiting for \
+               delivery is full; refusing rather than growing it (the pictures past the \
+               cap stay in the decoder and are released when it drops)",
             );
-            return Err(Error::Ffmpeg(ffmpeg_next::Error::Other {
-              errno: libc::ENOMEM,
-            }));
+            return Err(Error::ReplayQueueFull(crate::ReplayQueueFull::new(
+              SW_REPLAY_FRAME_CAP,
+            )));
           }
           local_replay.push_back(tmp);
         }
@@ -2394,6 +2499,36 @@ fn replay_history(
   drain_into(sw, sw_state, local_replay)
 }
 
+/// Writes the session's sequence number `serial` into `packet`'s `opaque`,
+/// which a software context opened with `AV_CODEC_FLAG_COPY_OPAQUE` copies
+/// onto the frame the packet makes — see [`frame_serial`].
+fn stamp_serial(packet: &mut Packet, serial: u64) {
+  use ffmpeg_next::packet::Mut;
+  // SAFETY: `packet` owns its `AVPacket` exclusively here; `opaque` is a
+  // plain pointer field FFmpeg never dereferences, only copies.
+  unsafe { (*packet.as_mut_ptr()).opaque = serial as usize as *mut libc::c_void };
+}
+
+/// The sequence number [`stamp_serial`] wrote into `packet`, if any.
+fn packet_serial(packet: &Packet) -> Option<u64> {
+  use ffmpeg_next::packet::Ref;
+  // SAFETY: `packet` is a live `AVPacket`; one pointer field is read.
+  let opaque = unsafe { (*packet.as_ptr()).opaque };
+  (!opaque.is_null()).then_some(opaque as usize as u64)
+}
+
+/// The sequence number of the packet `frame` was decoded from, carried in
+/// its `opaque` (see [`stamp_serial`]), if any.
+fn frame_serial(frame: *const ffmpeg_next::ffi::AVFrame) -> Option<u64> {
+  if frame.is_null() {
+    return None;
+  }
+  // SAFETY: `frame` is a live `AVFrame` (checked non-null); one pointer
+  // field is read.
+  let opaque = unsafe { (*frame).opaque };
+  (!opaque.is_null()).then_some(opaque as usize as u64)
+}
+
 fn open_sw_decoder(
   parameters: &Parameters,
   limits: DecoderLimits,
@@ -2415,6 +2550,16 @@ fn open_sw_decoder(
   // `request_threads` for why the allocator judge is safe on
   // libavcodec's worker threads.
   crate::decoder::request_threads(&mut ctx, limits.threads());
+  // **Each frame names the packet it came from.** libavcodec copies a
+  // packet's `opaque` onto the frames it decodes from it when this flag is
+  // set — on every thread, in output order — which is what ties a
+  // post-commit resync to a frame decoded at or after its anchor keyframe
+  // (see `resync_on_frame`).
+  // SAFETY: `ctx` is the context just built and not yet opened; `flags` is
+  // a plain integer field libavcodec reads at open.
+  unsafe {
+    (*ctx.as_mut_ptr()).flags |= ffmpeg_next::ffi::AV_CODEC_FLAG_COPY_OPAQUE as libc::c_int;
+  }
   // Opened without forming a bindgen enum from FFmpeg memory: the codec
   // is resolved off a raw `codec_id`, and the medium is proved off a raw
   // `codec_type`. See `crate::decoder::ensure_codec_type`.
