@@ -116,6 +116,20 @@ The backend-agnostic core it adapts has its own log at
   `MustDrain` until it is — and the queue has one budget across everything
   in it.
 
+- **(BREAKING) `PostCommitNeverResynced` reports the gap in two counts.**
+  `new(packets_before_anchor, packets_unproven, anchor_seen)` and the
+  accessors `packets_before_anchor()`, `packets_unproven()` and
+  `anchor_seen()` replace `new(packets_lost)` and `packets_lost()`. The one
+  count stopped at the first keyframe, so a keyframe that decoded to nothing
+  read as nothing after it at all, and the packets taken between an anchor
+  and an un-anchor vanished. The first count is the fallback window; the
+  second, every packet the decoder took after the first keyframe, through
+  an un-anchor, with the resync never proved — decoded, delivered, unproven;
+  the keyframe itself is in neither, and `anchor_seen` says whether there
+  was one. The message reads "N packets before a keyframe, M after it with
+  the resync never proved" ("N packets before a keyframe, and no keyframe
+  after them" when none came).
+
 ### Fixed
 
 - **A post-commit resync is proved by the decoder's reorder bound.** Any
@@ -142,9 +156,9 @@ The backend-agnostic core it adapts has its own log at
   key-flagged packet anchors again. `PostCommitNeverResynced` is raised when
   no key-flagged packet was fed across the gap or the pictures out after one
   never passed the bound, still once, as the `Err` of the `receive_frame`
-  that reaches the end, after every picture was delivered; its `packets_lost`
-  counts the packets fed across the gap before an anchor, and never one
-  decoded since.
+  that reaches the end, after every picture was delivered, and counts the gap
+  in two parts: the packets fed before a keyframe anchored the resync, and
+  those fed after it with the resync never proved.
 
 ## [0.15.1] - 2026-10-05
 

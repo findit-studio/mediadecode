@@ -1157,10 +1157,10 @@ fn failed_eof_fallback_restores_eof_sent_and_stays_on_hw() {
 /// all**: we fail post-commit at `send_eof`, so the SW decoder opens cold,
 /// receives only the re-forwarded EOF, and can categorically produce no frame.
 /// `receive_frame` then returns EOF while the resync is still pending →
-/// escalation. (`packets_lost` is 0 here: zero packets crossed to SW — the lost
-/// tail was the HW-side frames the EOF-time failure stranded. The counter is
-/// incremented for packets fed to SW across a gap entered from the
-/// `send_packet` arm; this EOF-entry path forwards none.)
+/// escalation. (Both counts are 0 here and no keyframe was seen: zero packets
+/// crossed to SW — the lost tail was the HW-side frames the EOF-time failure
+/// stranded. The counts grow with packets fed to SW across a gap entered
+/// from the `send_packet` arm; this EOF-entry path forwards none.)
 #[test]
 fn post_commit_fallback_never_resyncing_escalates_at_eof() {
   let (w, h) = (128u32, 96u32);
@@ -1239,9 +1239,13 @@ fn post_commit_fallback_never_resyncing_escalates_at_eof() {
   let VideoDecodeError::PostCommitNeverResynced(p) = esc else {
     panic!("expected PostCommitNeverResynced, got {esc:?}");
   };
-  let packets_lost = p.packets_lost();
   assert_eq!(
-    packets_lost, 0,
+    (
+      p.packets_before_anchor(),
+      p.packets_unproven(),
+      p.anchor_seen()
+    ),
+    (0, 0, false),
     "no packets crossed to SW on the EOF-entry path; the lost tail was HW-side"
   );
   assert!(
@@ -1318,7 +1322,7 @@ fn post_commit_gap_counter_tallies_then_clears_on_resync() {
   // Exactly the forwarded current packet crossed the gap from the send_packet
   // arm so far — the tally proves gap packets are counted.
   assert_eq!(
-    dec.degraded_packets_since_fallback_for_test(),
+    dec.packets_before_anchor_for_test(),
     1,
     "the forwarded current packet must be tallied as crossing the gap"
   );
@@ -1410,7 +1414,7 @@ fn post_commit_gap_counter_tallies_then_clears_on_resync() {
     "the keyframe-anchored resync must clear the pending flag"
   );
   assert_eq!(
-    dec.degraded_packets_since_fallback_for_test(),
+    dec.packets_before_anchor_for_test(),
     0,
     "resync must reset the gap counter"
   );
@@ -1531,11 +1535,10 @@ fn post_commit_concealed_p_frame_does_not_clear_resync_escalates_at_eof() {
   let VideoDecodeError::PostCommitNeverResynced(p) = esc else {
     panic!("expected PostCommitNeverResynced, got {esc:?}");
   };
-  let packets_lost = p.packets_lost();
   assert!(
-    packets_lost >= 1,
+    p.packets_before_anchor() >= 1 && p.packets_unproven() == 0 && !p.anchor_seen(),
     "every forwarded gap packet (current P-frame + the GOP-2 tail) must be \
-     tallied as lost; got {packets_lost}"
+     tallied before a keyframe that never came; got {p}"
   );
   assert!(
     !dec.degraded_resync_pending_for_test(),
@@ -1802,7 +1805,7 @@ fn fx3_high_422_10bit_falls_back_to_software_and_decodes_whole_stream() {
         obs.abort = Some("send_eof asked for a drain after the feed loop drained".into());
       }
       Err(VideoDecodeError::PostCommitNeverResynced(p)) => {
-        obs.escalated_never_resynced = Some(p.packets_lost());
+        obs.escalated_never_resynced = Some(p.to_string());
       }
       Err(e) => obs.abort = Some(format!("send_eof errored: {e:?}")),
     }
@@ -1870,9 +1873,9 @@ fn fx3_high_422_10bit_falls_back_to_software_and_decodes_whole_stream() {
   //     boundary is acceptable; never reaching a keyframe is the failure.
   assert!(
     obs.escalated_never_resynced.is_none(),
-    "the cold SW decoder never resynced at a keyframe before EOF (PostCommitNeverResynced, {:?} \
-     packets lost) — the whole tail was dropped; Codex R7's finding 2 (HW swallowed the keyframe / \
-     cold SW never saw it) reproduces on real H.264",
+    "the cold SW decoder never resynced at a keyframe before EOF ({:?}) — the whole tail was \
+     dropped; Codex R7's finding 2 (HW swallowed the keyframe / cold SW never saw it) reproduces \
+     on real H.264",
     obs.escalated_never_resynced
   );
   assert!(
@@ -1917,8 +1920,8 @@ struct Fx3Observation {
   pts_out: Vec<i64>,
   /// `Debug` of the terminal error if the drive aborted before EOF.
   abort: Option<String>,
-  /// `packets_lost` if the fallback escalated `PostCommitNeverResynced`.
-  escalated_never_resynced: Option<u64>,
+  /// The loss, stated, if the fallback escalated `PostCommitNeverResynced`.
+  escalated_never_resynced: Option<String>,
 }
 
 impl Fx3Observation {
@@ -1976,12 +1979,8 @@ impl Fx3Observation {
         }
         Ok(Received::Ended) => break,
         Err(VideoDecodeError::PostCommitNeverResynced(p)) => {
-          let packets_lost = p.packets_lost();
-          self.escalated_never_resynced = Some(packets_lost);
-          eprintln!(
-            "  -> PostCommitNeverResynced at EOF: {packets_lost} packets fed to SW produced no \
-             frame (no keyframe crossed the gap)"
-          );
+          eprintln!("  -> PostCommitNeverResynced at EOF: {p}");
+          self.escalated_never_resynced = Some(p.to_string());
           break;
         }
         Err(e) => return Err(format!("{e:?}")),
@@ -4499,7 +4498,8 @@ fn the_gap_closes_at_the_picture_past_the_reorder_bound() {
 /// is fed keyframe 12, which fails and anchors nothing. At the end of the
 /// stream the gap is still open, and it escalates as
 /// `PostCommitNeverResynced` — counting the four packets fed across the gap
-/// before it, 8 to 11, and nothing else.
+/// before it, 8 to 11, and no anchor: the damaged keyframe was refused, and
+/// its own error reported it.
 #[test]
 fn a_keyframe_that_decodes_to_nothing_leaves_the_loss_reported() {
   let mut clip = encode_synthetic_clip(128, 96, 24, 6);
@@ -4536,7 +4536,11 @@ fn a_keyframe_that_decodes_to_nothing_leaves_the_loss_reported() {
         break;
       }
       Err(VideoDecodeError::PostCommitNeverResynced(loss)) => {
-        lost = Some(loss.packets_lost());
+        lost = Some((
+          loss.packets_before_anchor(),
+          loss.packets_unproven(),
+          loss.anchor_seen(),
+        ));
         break;
       }
       // The damaged anchor's own decode error, reported where it met.
@@ -4550,8 +4554,8 @@ fn a_keyframe_that_decodes_to_nothing_leaves_the_loss_reported() {
   );
   assert_eq!(
     lost,
-    Some(4),
-    "the fallback window, packets 8 to 11, and nothing else"
+    Some((4, 0, false)),
+    "the fallback window, packets 8 to 11, and no anchor: the damaged keyframe was refused"
   );
 }
 
@@ -4671,6 +4675,22 @@ fn across_a_b_frame_gap(clip: &SyntheticClip) -> (FfmpegVideoStreamDecoder, usiz
   (dec, anchor, pre, taken)
 }
 
+/// A B-frame from before packet `before`, flagged as a keyframe — a
+/// key-flagged packet a decoder past it takes and, its time out of order,
+/// decodes to nothing. A copy of its own: the push face takes no payload
+/// the clip still shares.
+fn a_stale_b_frame_flagged_key(clip: &SyntheticClip, before: usize) -> Packet {
+  // Decode order puts a B-frame after a later picture.
+  let stale = (1..before)
+    .find(|&index| clip.packets[index].pts() < clip.packets[index - 1].pts())
+    .expect("a B-frame");
+  let mut flagged = Packet::copy(clip.packets[stale].data().expect("a payload"));
+  flagged.set_pts(clip.packets[stale].pts());
+  flagged.set_dts(clip.packets[stale].dts());
+  flagged.set_flags(ffmpeg_next::packet::Flags::KEY);
+  flagged
+}
+
 /// LAW (Codex R5 row 2, [high]): **at the end of the stream the reorder
 /// bound is the proof too.** On the MPEG-4 B-frame road (`has_b_frames` 1)
 /// the cold decoder holds one picture from before the keyframe. In the
@@ -4689,15 +4709,7 @@ fn an_anchor_that_decodes_to_nothing_is_not_proved_by_the_end_of_the_stream() {
     1,
     "the decoder holds one picture back"
   );
-  // A B-frame from the first GOP: decode order puts it after a later picture.
-  let stale = (1..anchor)
-    .find(|&index| clip.packets[index].pts() < clip.packets[index - 1].pts())
-    .expect("a B-frame");
-  // A copy of its own: the push face takes no payload the clip still shares.
-  let mut flagged = Packet::copy(clip.packets[stale].data().expect("a payload"));
-  flagged.set_pts(clip.packets[stale].pts());
-  flagged.set_dts(clip.packets[stale].dts());
-  flagged.set_flags(ffmpeg_next::packet::Flags::KEY);
+  let flagged = a_stale_b_frame_flagged_key(&clip, anchor);
   crate::accepted(
     dec.send_packet(&pushed(&flagged)),
     "the stale B-frame, flagged a keyframe",
@@ -4917,5 +4929,98 @@ fn the_end_a_replay_owed_is_committed_when_the_decoder_takes_it() {
     super::live_sw::eofs(),
     1,
     "the decoder was told the stream ended once"
+  );
+}
+
+/// Sends EOF and drains to the end, answering the escalation if there was
+/// one — every picture before it delivered, a decode error tolerated.
+fn the_end(dec: &mut FfmpegVideoStreamDecoder) -> Option<PostCommitNeverResynced> {
+  crate::accepted(dec.send_eof(), "send_eof");
+  let mut dst = crate::empty_owned_video_frame();
+  loop {
+    match dec.receive_frame(&mut dst) {
+      Ok(Received::Frame) | Err(VideoDecodeError::Decode(_)) => {}
+      Ok(Received::Ended) => break None,
+      Err(VideoDecodeError::PostCommitNeverResynced(loss)) => break Some(loss),
+      other => panic!("draining to the end: {other:?}"),
+    }
+  }
+}
+
+/// LAW (Codex R5 row 7, [medium]): **an anchor that decodes to nothing is
+/// seen, with nothing after it.** On the MPEG-4 B-frame road the cold
+/// decoder takes the gap's packets, then a key-flagged packet that decodes
+/// to nothing — a stale B-frame — and the stream ends. The escalation counts
+/// the gap's packets before the keyframe, none after it, and says a
+/// keyframe was seen: "N packets before a keyframe, 0 after it with the
+/// resync never proved".
+#[test]
+fn an_empty_anchor_is_seen_with_the_packets_before_it_counted() {
+  let clip = encode_mpeg4_with_b_frames(128, 96, 30);
+  let (mut dec, anchor, _, taken) = across_a_b_frame_gap(&clip);
+  assert!(taken >= 1, "the cold decoder took the gap's packets");
+  crate::accepted(
+    dec.send_packet(&pushed(&a_stale_b_frame_flagged_key(&clip, anchor))),
+    "the stale B-frame, flagged a keyframe",
+  );
+  assert!(dec.degraded_anchored_for_test(), "it anchors the resync");
+  let loss = the_end(&mut dec).expect("the gap never closed");
+  assert_eq!(
+    (
+      loss.packets_before_anchor(),
+      loss.packets_unproven(),
+      loss.anchor_seen()
+    ),
+    (taken, 0, true),
+    "the gap's packets before the keyframe, none after it, the keyframe seen"
+  );
+  assert_eq!(
+    loss.to_string(),
+    format!(
+      "post-commit HW->SW fallback never resynced before EOF: {taken} packets before a \
+       keyframe, 0 after it with the resync never proved"
+    )
+  );
+}
+
+/// LAW (Codex R5 row 7, [medium]): **the packets after the anchor are
+/// counted, through an un-anchor.** The cold decoder takes packets 8 to 11
+/// across the gap, and keyframe 12 anchors the resync while the decoder
+/// serving reports a reorder depth of 3, so pictures 12 to 14 leave the gap
+/// open. Packet 15 is reported failed, un-anchoring it; 16 and 17 are taken
+/// and the stream ends before keyframe 18. The escalation counts the four
+/// packets before the keyframe and the four taken after it — 13, 14, 16 and
+/// 17 — where the single count it replaces lost 13 and 14 and put 16 and 17
+/// in the window.
+#[test]
+fn the_packets_after_the_anchor_are_counted_through_an_unanchor() {
+  let clip = encode_synthetic_clip(128, 96, 24, 6);
+  assert_eq!(nth_keyframe(&clip, 3), 12);
+  let mut dec = before_the_anchor(&clip);
+  drain_ready(&mut dec);
+  dec.set_reorder_for_test(3);
+  for (index, av_pkt) in clip.packets.iter().enumerate().take(18).skip(12) {
+    if index == 15 {
+      dec.fail_next_packet_for_test();
+      match dec.send_packet(&pushed(av_pkt)) {
+        Err(VideoDecodeError::Decode(_)) => {}
+        other => panic!("packet 15 is reported failed: {other:?}"),
+      }
+      assert!(!dec.degraded_anchored_for_test(), "the failure un-anchors");
+    } else {
+      crate::accepted(dec.send_packet(&pushed(av_pkt)), "send_packet");
+    }
+    drain_ready(&mut dec);
+    assert!(dec.degraded_resync_pending_for_test(), "the gap stays open");
+  }
+  let loss = the_end(&mut dec).expect("the gap never closed");
+  assert_eq!(
+    (
+      loss.packets_before_anchor(),
+      loss.packets_unproven(),
+      loss.anchor_seen()
+    ),
+    (4, 4, true),
+    "packets 8 to 11 before the keyframe; 13, 14, 16 and 17 after it: {loss}"
   );
 }

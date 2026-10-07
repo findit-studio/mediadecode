@@ -60,7 +60,8 @@
 //!   key-flagged packet was fed across the gap, or the pictures out after
 //!   one never passed the bound — `receive_frame`
 //!   escalates with a distinct [`VideoDecodeError::PostCommitNeverResynced`]
-//!   (and a `tracing::error!`), counting the packets fed before an anchor,
+//!   (and a `tracing::error!`), counting the packets fed before a keyframe
+//!   anchored the resync and those fed after it with the resync unproved,
 //!   rather than surfacing a clean end-of-stream that would swallow the tail
 //!   silently. So the gap is either bounded-and-logged (a resync happened)
 //!   or reported-at-EOF (it never did) — never silent-and-unbounded.
@@ -327,12 +328,19 @@ pub struct CarrierVideoStreamDecoder<C: crate::FfmpegCarrier> {
   /// ready. A key-flagged packet anchors only then, so the pictures from
   /// before it are the reorder buffer's alone.
   sw_output_settled: bool,
-  /// Packets fed to the SW decoder since the post-commit fallback fired while
-  /// [`Self::degraded_resync_pending`] is set — i.e. across the unresolved
-  /// resync gap. Reported in the escalation message so the lost span is
-  /// quantified ("N packets, no keyframe found"). Reset whenever the flag
-  /// clears or on `flush`.
-  degraded_packets_since_fallback: u64,
+  /// Packets the software decoder took across the open gap before a
+  /// key-flagged packet anchored the resync — the fallback window. Reported
+  /// by the escalation ([`PostCommitNeverResynced::packets_before_anchor`]);
+  /// reset whenever the gap closes, and on `flush`.
+  packets_before_anchor: u64,
+  /// Packets the software decoder took after the first anchor while the gap
+  /// stayed open — through an un-anchor and any anchor after it: decoded,
+  /// their pictures delivered, never proved to come from after the gap.
+  /// Reported by the escalation ([`PostCommitNeverResynced::packets_unproven`]).
+  packets_unproven: u64,
+  /// Whether a key-flagged packet has anchored the resync since the gap
+  /// opened, un-anchored since or not.
+  anchor_seen: bool,
   /// Source-stream time base, used to label produced frames.
   time_base: Timebase,
   /// The lane this decoder captures into. A marker: the carrier
@@ -874,7 +882,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       anchor_resets: false,
       outputs_since_anchor: 0,
       sw_output_settled: true,
-      degraded_packets_since_fallback: 0,
+      packets_before_anchor: 0,
+      packets_unproven: 0,
+      anchor_seen: false,
       time_base,
       limits,
       sw_threads_pending: false,
@@ -1819,7 +1829,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     self.anchor_reorder = 0;
     self.anchor_resets = false;
     self.outputs_since_anchor = 0;
-    self.degraded_packets_since_fallback = 0;
+    self.packets_before_anchor = 0;
+    self.packets_unproven = 0;
+    self.anchor_seen = false;
   }
 
   /// **The resync anchored** at the key-flagged packet the decoder serving
@@ -1829,6 +1841,12 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// ([`Self::anchor_reorder`]) — or none for a stream whose keyframes reset
   /// every reference (VP8, VP9, AV1).
   fn anchor_resync(&mut self, reorder_before: usize) {
+    // An anchor after the first — the first un-anchored — is one more packet
+    // fed after it.
+    if self.anchor_seen {
+      self.count_degraded_packet();
+    }
+    self.anchor_seen = true;
     self.degraded_anchored = true;
     self.anchor_reorder = reorder_before;
     self.anchor_resets = self.keyframe_rule() == access::KeyframeRule::Resets;
@@ -1883,14 +1901,21 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     }
   }
 
-  /// Count one packet fed to the SW decoder across the gap before an anchor —
-  /// the fallback window — so the EOF escalation can quantify what was lost.
-  /// A no-op once a key-flagged packet anchors the resync, and once SW has
-  /// resynced: the packets decoded since are not lost.
+  /// Count one packet the software decoder took across the open gap, for
+  /// the EOF escalation: before the first anchor, the fallback window
+  /// ([`Self::packets_before_anchor`]); after it, a packet decoded with the
+  /// resync never proved ([`Self::packets_unproven`]). The first anchor
+  /// itself is neither — it is what [`Self::anchor_seen`] records. A no-op
+  /// once the gap has closed.
   #[inline]
   fn count_degraded_packet(&mut self) {
-    if self.degraded_resync_pending && !self.degraded_anchored {
-      self.degraded_packets_since_fallback = self.degraded_packets_since_fallback.saturating_add(1);
+    if !self.degraded_resync_pending {
+      return;
+    }
+    if self.anchor_seen {
+      self.packets_unproven = self.packets_unproven.saturating_add(1);
+    } else {
+      self.packets_before_anchor = self.packets_before_anchor.saturating_add(1);
     }
   }
 
@@ -1923,7 +1948,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     self.anchor_reorder = 0;
     self.anchor_resets = false;
     self.outputs_since_anchor = 0;
-    self.degraded_packets_since_fallback = 0;
+    self.packets_before_anchor = 0;
+    self.packets_unproven = 0;
+    self.anchor_seen = false;
   }
 
   /// The one place a delivered frame is committed.
@@ -2007,18 +2034,19 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     if !self.degraded_resync_pending {
       return Ok(Received::Ended);
     }
-    let packets_lost = self.degraded_packets_since_fallback;
+    let loss = PostCommitNeverResynced::new(
+      self.packets_before_anchor,
+      self.packets_unproven,
+      self.anchor_seen,
+    );
     tracing::error!(
-      packets_lost,
-      "mediadecode-ffmpeg: post-commit HW->SW fallback never resynced before EOF — \
-       {packets_lost} packets fed to the software decoder produced no frame (no \
-       keyframe found across the gap); the stream tail from the fallback point was \
-       lost",
+      packets_before_anchor = loss.packets_before_anchor(),
+      packets_unproven = loss.packets_unproven(),
+      anchor_seen = loss.anchor_seen(),
+      "mediadecode-ffmpeg: {loss}",
     );
     self.clear_degraded_resync();
-    Err(VideoDecodeError::PostCommitNeverResynced(
-      PostCommitNeverResynced::new(packets_lost),
-    ))
+    Err(VideoDecodeError::PostCommitNeverResynced(loss))
   }
 
   /// Internal: convert the active scratch frame into a
@@ -2103,7 +2131,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       anchor_resets: false,
       outputs_since_anchor: 0,
       sw_output_settled: true,
-      degraded_packets_since_fallback: 0,
+      packets_before_anchor: 0,
+      packets_unproven: 0,
+      anchor_seen: false,
       time_base,
       limits,
       sw_threads_pending: false,
@@ -2213,11 +2243,11 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     self.sw_replay_frames.is_empty()
   }
 
-  /// Packets fed to SW across an unresolved post-commit resync gap. Lets the
-  /// counter test confirm packets crossing the gap from the `send_packet` arm
-  /// are tallied (and cleared on resync).
-  pub(crate) const fn degraded_packets_since_fallback_for_test(&self) -> u64 {
-    self.degraded_packets_since_fallback
+  /// Packets the software decoder took across the open gap before an
+  /// anchor. Lets the counter test confirm packets crossing the gap are
+  /// tallied (and cleared on resync).
+  pub(crate) const fn packets_before_anchor_for_test(&self) -> u64 {
+    self.packets_before_anchor
   }
 }
 
@@ -3207,32 +3237,77 @@ fn open_sw_decoder(
 ///
 /// It is returned once, as the `Err` of the `receive_frame` that reaches the
 /// end, after every picture the decoder produced was delivered; the next
-/// `receive_frame` answers `Ended`. [`Self::packets_lost`] counts the
-/// packets fed across the gap before an anchor — the fallback window — and
-/// never one decoded since.
-#[derive(thiserror::Error, Debug)]
-#[error(
-  "post-commit HW->SW fallback never resynced before EOF: {packets_lost} packets fed to the \
-   software decoder produced no frame (no keyframe found across the gap) — the stream tail \
-   from the fallback point was lost"
-)]
+/// `receive_frame` answers `Ended`.
+///
+/// The packets the software decoder took across the gap are counted in two
+/// parts, either side of the first key-flagged packet that anchored the
+/// resync: [`Self::packets_before_anchor`], the fallback window, and
+/// [`Self::packets_unproven`], decoded and their pictures delivered but never
+/// proved to come from after the gap — through an un-anchor, and any anchor
+/// after the first. The first anchor itself is in neither count;
+/// [`Self::anchor_seen`] says whether there was one. A packet the decoder
+/// refused with an error was reported by that error, and is counted in
+/// neither.
+#[derive(Debug)]
 pub struct PostCommitNeverResynced {
-  packets_lost: u64,
+  packets_before_anchor: u64,
+  packets_unproven: u64,
+  anchor_seen: bool,
 }
 
 impl PostCommitNeverResynced {
   /// Constructs a `PostCommitNeverResynced` payload.
   #[inline]
-  pub const fn new(packets_lost: u64) -> Self {
-    Self { packets_lost }
+  pub const fn new(packets_before_anchor: u64, packets_unproven: u64, anchor_seen: bool) -> Self {
+    Self {
+      packets_before_anchor,
+      packets_unproven,
+      anchor_seen,
+    }
   }
-  /// Packets fed to the software decoder across the gap before a
-  /// key-flagged packet anchored the resync: the fallback window.
+
+  /// Packets the software decoder took across the gap before a key-flagged
+  /// packet anchored the resync: the fallback window.
   #[inline]
-  pub const fn packets_lost(&self) -> u64 {
-    self.packets_lost
+  pub const fn packets_before_anchor(&self) -> u64 {
+    self.packets_before_anchor
+  }
+
+  /// Packets the software decoder took after the first anchor with the
+  /// resync never proved: decoded, their pictures delivered, never shown to
+  /// come from after the gap.
+  #[inline]
+  pub const fn packets_unproven(&self) -> u64 {
+    self.packets_unproven
+  }
+
+  /// Whether a key-flagged packet anchored the resync at all.
+  #[inline]
+  pub const fn anchor_seen(&self) -> bool {
+    self.anchor_seen
   }
 }
+
+impl core::fmt::Display for PostCommitNeverResynced {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    write!(
+      f,
+      "post-commit HW->SW fallback never resynced before EOF: {} packets before a keyframe",
+      self.packets_before_anchor
+    )?;
+    if self.anchor_seen {
+      write!(
+        f,
+        ", {} after it with the resync never proved",
+        self.packets_unproven
+      )
+    } else {
+      f.write_str(", and no keyframe after them")
+    }
+  }
+}
+
+impl std::error::Error for PostCommitNeverResynced {}
 
 /// Error type for [`FfmpegVideoStreamDecoder`] — **faults and the
 /// send-side refusal**.
