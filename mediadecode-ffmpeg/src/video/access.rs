@@ -72,18 +72,47 @@ impl KeyframeRule {
 
   /// Whether the keyframe `data` is a clean random access point, for a
   /// decoder that `reorders` pictures. Bytes that do not parse are not
-  /// clean: nothing is proved about them.
+  /// clean: nothing is proved about them. A NAL unit is read whole —
+  /// every header byte present and valid, a picture's unit carrying
+  /// payload past its header — or the access unit is not clean.
   pub(crate) fn is_clean(self, data: &[u8], reorders: bool) -> bool {
     match self {
-      Self::H264 { nal_length } => {
-        nal_headers(data, nal_length).is_some_and(|headers| headers.iter().any(|&h| h & 0x1f == 5))
-      }
-      Self::Hevc { nal_length } => nal_headers(data, nal_length).is_some_and(|headers| {
-        headers
-          .iter()
-          .map(|&h| (h >> 1) & 0x3f)
-          .find(|&kind| kind < 32)
-          .is_some_and(|kind| (16..=20).contains(&kind))
+      Self::H264 { nal_length } => nal_units(data, nal_length).is_some_and(|units| {
+        let mut idr = false;
+        for unit in units {
+          // `forbidden_zero_bit` (1) · `nal_ref_idc` (2) · `nal_unit_type` (5).
+          let Some(&header) = unit.first() else {
+            return false;
+          };
+          if header & 0x80 != 0 {
+            return false;
+          }
+          if header & 0x1f == 5 {
+            // An IDR slice: its header byte and a slice header after it.
+            if unit.len() < 2 {
+              return false;
+            }
+            idr = true;
+          }
+        }
+        idr
+      }),
+      Self::Hevc { nal_length } => nal_units(data, nal_length).is_some_and(|units| {
+        for unit in units {
+          let [first, second, ..] = unit else {
+            return false;
+          };
+          if first & 0x80 != 0 || second & 0x07 == 0 {
+            return false;
+          }
+          let kind = (first >> 1) & 0x3f;
+          if kind < 32 {
+            // The first picture's unit decides: it must carry a slice
+            // header past its two header bytes.
+            return unit.len() > 2 && (16..=20).contains(&kind);
+          }
+        }
+        false
       }),
       Self::Resets => true,
       Self::Reordering => !reorders,
@@ -108,11 +137,11 @@ impl KeyframeRule {
   }
 }
 
-/// The first byte of every NAL unit in `data`: length-prefixed by
-/// `nal_length` bytes, or start-coded when `None`. `None` when a
-/// length-prefixed unit runs past the end.
-fn nal_headers(data: &[u8], nal_length: Option<usize>) -> Option<Vec<u8>> {
-  let mut headers = Vec::new();
+/// Every NAL unit in `data`, whole: length-prefixed by `nal_length`
+/// bytes, or start-coded when `None`. `None` when a length-prefixed unit
+/// runs past the end or is empty, or a start code ends the data.
+fn nal_units(data: &[u8], nal_length: Option<usize>) -> Option<Vec<&[u8]>> {
+  let mut units = Vec::new();
   match nal_length {
     Some(width) => {
       let mut at = 0usize;
@@ -123,25 +152,34 @@ fn nal_headers(data: &[u8], nal_length: Option<usize>) -> Option<Vec<u8>> {
           .fold(0usize, |length, &byte| (length << 8) | usize::from(byte));
         at += width;
         let unit = data.get(at..at.checked_add(length)?)?;
-        if let Some(&header) = unit.first() {
-          headers.push(header);
+        if unit.is_empty() {
+          return None;
         }
+        units.push(unit);
         at += length;
       }
     }
     None => {
+      // Every start code's position, then each unit runs to the next one.
+      let mut starts = Vec::new();
       let mut at = 0usize;
       while at + 3 <= data.len() {
         if data[at..at + 3] == [0, 0, 1] {
-          if let Some(&header) = data.get(at + 3) {
-            headers.push(header);
-          }
+          starts.push(at + 3);
           at += 3;
         } else {
           at += 1;
         }
       }
+      for (index, &start) in starts.iter().enumerate() {
+        let end = starts.get(index + 1).map_or(data.len(), |&next| next - 3);
+        let unit = data.get(start..end)?;
+        if unit.is_empty() {
+          return None;
+        }
+        units.push(unit);
+      }
     }
   }
-  Some(headers)
+  Some(units)
 }
