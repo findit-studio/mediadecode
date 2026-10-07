@@ -675,20 +675,32 @@ impl DecoderLimits {
 /// not reference one another, so each is decoded on a thread of its
 /// own.
 ///
-/// # Every software road, the fallbacks included
+/// # Every software road; a fallback's from the next keyframe
 ///
-/// A session pinned to software, one that finds no hardware backend at
-/// open, and one that falls back from hardware mid-stream all decode on
-/// these threads. The two fallbacks are transactions — the packets
-/// they hand the software decoder must decode, or the session stays
-/// where it was and the packets go back to the caller — and a
-/// frame-threaded decoder reports a packet's failure only once it has
-/// a packet per thread in flight. So each fallback first proves what it
-/// forwards on a one-thread decoder, exactly as it always has, and then
-/// hands the same packets to a decoder on these threads and continues
-/// on that one. The packets a fallback forwards are decoded twice —
-/// once to prove them, once to go on — and the pictures are the same
-/// pictures.
+/// A session pinned to software and one that finds no hardware backend
+/// at open decode on these threads from the first packet. A session that
+/// falls back from hardware mid-stream commits a decoder on **one**
+/// thread: the fallback is a transaction — the packets it hands the
+/// software decoder must decode, or the session stays where it was and
+/// the packets go back to the caller — and a frame-threaded decoder
+/// reports a packet's failure only once it has a packet per thread in
+/// flight. The session returns to these threads at the next keyframe —
+/// after a post-commit degrade, the one after the keyframe it resyncs at:
+/// the one-thread decoder is drained, every picture it holds delivered in
+/// order, and closed, and a decoder on these threads is opened and fed
+/// from the keyframe on. One software decoder is open at any instant and
+/// no packet is decoded twice. Until that keyframe the session decodes on
+/// one thread — on a file whose first packet the hardware refuses, the
+/// first GOP at most — and
+/// [`active_threads`](crate::CarrierVideoStreamDecoder::active_threads)
+/// says so. A fallback at the end of the stream keeps its one thread
+/// until a seek, and the first keyframe after it.
+///
+/// A keyframe that opens an open GOP — an HEVC CRA, an H.264 recovery
+/// point that is not an IDR — is followed by leading pictures that may
+/// reference the GOP before it, which the closed decoder held: at such a
+/// switch they come out as a seek to that keyframe would make them, and
+/// one warning says so. A closed GOP loses nothing.
 ///
 /// # The roads it does not reach
 ///

@@ -31,6 +31,14 @@ struct SyntheticClip {
 /// inter-frame prediction so P-frames actually appear. `max_b_frames == 0`
 /// keeps decode order == display order (simple monotonic PTS).
 fn encode_synthetic_clip(width: u32, height: u32, frames: usize, gop: u32) -> SyntheticClip {
+  encode_clip(width, height, frames, gop, 0)
+}
+
+/// [`encode_synthetic_clip`] with up to `b_frames` B-frames between
+/// references, in **closed** GOPs (`AV_CODEC_FLAG_CLOSED_GOP`): decode
+/// order differs from display order inside a GOP, and no picture
+/// references across a keyframe.
+fn encode_clip(width: u32, height: u32, frames: usize, gop: u32, b_frames: usize) -> SyntheticClip {
   use ffmpeg_next as ff;
   ff::init().expect("ffmpeg init");
 
@@ -42,9 +50,16 @@ fn encode_synthetic_clip(width: u32, height: u32, frames: usize, gop: u32) -> Sy
   enc.set_format(ff::format::Pixel::YUV420P);
   enc.set_time_base(ff::Rational::new(1, 25));
   enc.set_gop(gop);
-  enc.set_max_b_frames(0);
+  enc.set_max_b_frames(b_frames);
+  let mut options = ff::Dictionary::new();
+  if b_frames > 0 {
+    enc.set_flags(ff::codec::Flags::CLOSED_GOP);
+    // The MPEG-4 encoder refuses closed GOPs beside scene-change
+    // detection, which would also move the keyframes `gop` places.
+    options.set("sc_threshold", "1000000000");
+  }
   enc.set_bit_rate(500_000);
-  let mut opened = enc.open_as(codec).expect("open encoder");
+  let mut opened = enc.open_as_with(codec, options).expect("open encoder");
   let parameters = ff::codec::Parameters::from(&opened);
 
   let mut packets: Vec<Packet> = Vec::new();
@@ -3379,14 +3394,14 @@ fn decode_through_a_fallback(
   (delivered, dec.active_threads())
 }
 
-/// **The probe-era fallback decodes on the session's threads and loses
-/// nothing.** A seam that buffers five packets and then exhausts hands
-/// them back as history; the fallback proves them on one thread, replays
-/// them into a decoder on the session's threads, and continues there —
-/// and the session delivers the same pictures, every one of them, as
-/// the same fallback on one thread.
+/// **The probe-era fallback returns to the session's threads at the next
+/// keyframe and loses nothing.** A seam that buffers five packets and
+/// then exhausts hands them back as history; the fallback replays them
+/// into a one-thread decoder and commits it, and at the next keyframe the
+/// session drains it and goes on on its own threads — delivering the same
+/// pictures, every one of them, as the same fallback on one thread.
 #[test]
-fn a_probe_era_fallback_continues_on_the_session_threads() {
+fn a_probe_era_fallback_returns_to_the_session_threads_at_the_next_keyframe() {
   let (w, h) = (96u32, 64u32);
   let clip = encode_synthetic_clip(w, h, 40, 6);
   let seam = || FakeHw::failing(w, h, 0, 5, FailShape::ProbeEra);
@@ -3401,18 +3416,19 @@ fn a_probe_era_fallback_continues_on_the_session_threads() {
   assert_eq!(
     threaded_threads,
     Some(three),
-    "the committed decoder runs on the session's threads, not the proving one's"
+    "the session is back on its own threads"
   );
   assert_eq!(threaded, single, "the same pictures, in the same order");
 }
 
-/// **The post-commit degrade continues on the session's threads.** A
-/// seam that delivers two GOPs and then fails mid-GOP leaves the session
-/// on a cold software decoder; the forward is proved on one thread and
-/// the session continues on its own, delivering what the same degrade
+/// **The post-commit degrade returns to the session's threads at the
+/// keyframe after its resync.** A seam that delivers two GOPs and then
+/// fails mid-GOP leaves the session on a cold one-thread decoder; that
+/// decoder resyncs at the next keyframe, and at the one after it the
+/// session goes on on its own threads, delivering what the same degrade
 /// on one thread delivers.
 #[test]
-fn a_post_commit_degrade_continues_on_the_session_threads() {
+fn a_post_commit_degrade_returns_to_the_session_threads_at_the_keyframe_after_its_resync() {
   let (w, h) = (96u32, 64u32);
   let clip = encode_synthetic_clip(w, h, 30, 6);
   let fail_at = nth_keyframe(&clip, 2) + 2;
@@ -3430,63 +3446,172 @@ fn a_post_commit_degrade_continues_on_the_session_threads() {
   assert_eq!(threaded, single, "the same pictures, in the same order");
 }
 
-/// LAW (Codex R1, [high]): a probe-era fallback that promotes to the
-/// session's threads holds ONE software decoder — and so one decoded
-/// history — at a time. The proving decoder frees each picture as it
-/// drains and is gone, reference frames and all, before the decoder on
-/// the session's threads opens; the replay queue the session commits is
-/// that decoder's alone.
+/// The video packet the push face takes for `av_pkt`.
+fn pushed(av_pkt: &Packet) -> mediadecode::packet::VideoPacket<VideoPacketExtra, FfmpegBytes> {
+  boundary::video_packet_from_ffmpeg(av_pkt, mediadecode::Timebase::SECONDS)
+    .expect("a wrappable payload")
+    .expect("packet has a buffer")
+}
+
+/// LAW (Codex R2, [high] ×2): over a whole session — a fallback, the
+/// switch to the session's threads at the next keyframe, a seek, the
+/// switch again — **at most one software decoder is open at any
+/// instant**, and **no packet is decoded twice**: software decoders take
+/// exactly the packets the session hands the software road, each once. On
+/// both fallback roads.
 #[test]
-fn a_threaded_promotion_holds_one_decoder_at_a_time() {
+fn one_software_decoder_is_open_at_any_instant_and_no_packet_is_decoded_twice() {
   let (w, h) = (96u32, 64u32);
-  let clip = encode_synthetic_clip(w, h, 40, 6);
+  let clip = encode_synthetic_clip(w, h, 30, 6);
   let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
   let three = core::num::NonZeroU32::new(3).expect("nonzero");
+  let post_commit_at = nth_keyframe(&clip, 2) + 2;
+
+  for (road, seam, software_packets) in [
+    // History 0..5, the refused current packet 5, then the rest.
+    (
+      "probe-era",
+      FakeHw::failing(w, h, 0, 5, FailShape::ProbeEra),
+      clip.packets.len(),
+    ),
+    // The hardware decodes up to the failure; software takes the rest.
+    (
+      "post-commit",
+      FakeHw::failing(w, h, post_commit_at, post_commit_at, FailShape::PostCommit),
+      clip.packets.len() - post_commit_at,
+    ),
+  ] {
+    let mut dec =
+      FfmpegVideoStreamDecoder::from_hw_inner_for_test(Box::new(seam), clip.parameters.clone(), tb)
+        .expect("build test decoder")
+        .with_threads_for_test(crate::Threads::Count(three));
+    super::live_sw::reset_peak();
+    super::live_sw::reset_sent();
+    let mut dst = crate::empty_owned_video_frame();
+    let mut drain = |dec: &mut FfmpegVideoStreamDecoder| {
+      while let Received::Frame = dec.receive_frame(&mut dst).expect("receive_frame") {}
+    };
+    for av_pkt in &clip.packets {
+      crate::accepted(dec.send_packet(&pushed(av_pkt)), "send_packet");
+      drain(&mut dec);
+    }
+    crate::accepted(dec.send_eof(), "send_eof");
+    drain(&mut dec);
+    assert_eq!(dec.active_threads(), Some(three), "{road}: switched");
+    assert_eq!(
+      super::live_sw::sent(),
+      software_packets,
+      "{road}: every packet the software road was handed, decoded once"
+    );
+
+    // A seek, and the whole stream again from its first keyframe.
+    dec.flush().expect("a flush");
+    super::live_sw::reset_sent();
+    for av_pkt in &clip.packets {
+      crate::accepted(dec.send_packet(&pushed(av_pkt)), "send_packet");
+      drain(&mut dec);
+    }
+    crate::accepted(dec.send_eof(), "send_eof");
+    drain(&mut dec);
+    assert_eq!(
+      super::live_sw::sent(),
+      clip.packets.len(),
+      "{road}: after the seek"
+    );
+    assert_eq!(
+      super::live_sw::peak(),
+      1,
+      "{road}: a second software decoder was open beside the first"
+    );
+  }
+}
+
+/// LAW (Codex R2): **the pictures come out in presentation order across
+/// the switch**, with B-frames reordering inside every GOP. A probe-era
+/// fallback on a closed-GOP clip whose decode order is not its display
+/// order delivers, on three threads, exactly what it delivers on one: the
+/// one-thread decoder's tail is drained before the keyframe goes to the
+/// new decoder, and no picture is lost, repeated or reordered at the seam.
+#[test]
+fn pictures_come_out_in_presentation_order_across_the_switch() {
+  let (w, h) = (96u32, 64u32);
+  let clip = encode_clip(w, h, 40, 8, 2);
+  assert!(
+    clip
+      .packets
+      .windows(2)
+      .any(|pair| pair[1].pts() < pair[0].pts()),
+    "the clip reorders: some packet displays before the one decoded ahead of it"
+  );
+  let seam = || FakeHw::failing(w, h, 0, 3, FailShape::ProbeEra);
+
+  let (single, _) = decode_through_a_fallback(&clip, seam(), crate::Threads::Single);
+  assert_eq!(single.len(), clip.packets.len(), "one picture per packet");
+  let shown: Vec<_> = single.iter().map(|(pts, _)| *pts).collect();
+  let mut ordered = shown.clone();
+  ordered.sort();
+  ordered.dedup();
+  assert_eq!(shown, ordered, "one thread delivers in presentation order");
+
+  let three = core::num::NonZeroU32::new(3).expect("nonzero");
+  let (threaded, threads) = decode_through_a_fallback(&clip, seam(), crate::Threads::Count(three));
+  assert_eq!(threads, Some(three), "the switch happened");
+  assert_eq!(
+    threaded, single,
+    "the same pictures, in the same order, across the switch"
+  );
+}
+
+/// LAW (Codex R2): **one thread from the fallback to the next keyframe,
+/// the session's own from that keyframe on.** `active_threads` answers
+/// the decoder serving at every send: the fallback's one-thread decoder
+/// for the packets before the keyframe, and the session's threads from
+/// the keyframe's own send.
+#[test]
+fn the_session_threads_return_at_the_first_keyframe_after_a_fallback() {
+  let (w, h) = (96u32, 64u32);
+  let clip = encode_synthetic_clip(w, h, 20, 6);
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let three = core::num::NonZeroU32::new(3).expect("nonzero");
+  let next_keyframe = nth_keyframe(&clip, 2);
+  assert!(next_keyframe > 4, "the seam fails inside the first GOP");
   let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test(
-    Box::new(FakeHw::failing(w, h, 0, 20, FailShape::ProbeEra)),
+    Box::new(FakeHw::failing(w, h, 0, 3, FailShape::ProbeEra)),
     clip.parameters.clone(),
     tb,
   )
   .expect("build test decoder")
   .with_threads_for_test(crate::Threads::Count(three));
-
-  super::live_sw::reset_peak();
   let mut dst = crate::empty_owned_video_frame();
-  for av_pkt in clip.packets.iter().take(21) {
-    let vpkt = boundary::video_packet_from_ffmpeg(av_pkt, mediadecode::Timebase::SECONDS)
-      .expect("a wrappable payload")
-      .expect("packet has a buffer");
-    crate::accepted(dec.send_packet(&vpkt), "send_packet");
+  for (index, av_pkt) in clip.packets.iter().enumerate() {
+    crate::accepted(dec.send_packet(&pushed(av_pkt)), "send_packet");
     while let Received::Frame = dec.receive_frame(&mut dst).expect("receive_frame") {}
+    let expected = match index {
+      0..3 => None,
+      _ if index < next_keyframe => Some(core::num::NonZeroU32::MIN),
+      _ => Some(three),
+    };
+    if let Some(expected) = expected {
+      assert_eq!(
+        dec.active_threads(),
+        Some(expected),
+        "after send {index} (next keyframe {next_keyframe})"
+      );
+    }
   }
-  assert!(dec.is_software(), "the seam exhausted at send 20");
-  assert_eq!(
-    dec.active_threads(),
-    Some(three),
-    "and the session promoted"
-  );
-  assert_eq!(
-    super::live_sw::peak(),
-    1,
-    "the proving decoder was still alive when the threaded one opened"
-  );
 }
 
-/// LAW (Codex R1, [medium]): a fallback committed at the end of the
-/// stream keeps its one-thread decoder — nothing is left to thread — and
-/// the next flush (a seek) reopens it on the session's threads, on both
-/// fallback roads; the reopened decoder decodes the stream again.
+/// LAW (Codex R1 [medium], under R2's rule): a fallback committed at the
+/// end of the stream keeps its one-thread decoder — nothing is left to
+/// thread — and so does the flush after it; the first keyframe after the
+/// seek returns the session to its threads, on both fallback roads, and
+/// the decoder there decodes the stream again.
 #[test]
-fn a_fallback_at_the_end_reopens_on_the_session_threads_at_the_next_flush() {
+fn a_fallback_at_the_end_returns_to_the_session_threads_at_the_first_keyframe_after_a_seek() {
   let (w, h) = (96u32, 64u32);
   let clip = encode_synthetic_clip(w, h, 12, 6);
   let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
   let three = core::num::NonZeroU32::new(3).expect("nonzero");
-  let packet = |av_pkt: &Packet| {
-    boundary::video_packet_from_ffmpeg(av_pkt, mediadecode::Timebase::SECONDS)
-      .expect("a wrappable payload")
-      .expect("packet has a buffer")
-  };
 
   // The probe-era road: every packet buffered, the end accepted, and
   // the exhaustion raised at the first receive — `eof_pending` holds.
@@ -3504,7 +3629,7 @@ fn a_fallback_at_the_end_reopens_on_the_session_threads_at_the_next_flush() {
         .with_threads_for_test(crate::Threads::Count(three));
     let mut dst = crate::empty_owned_video_frame();
     for av_pkt in &clip.packets {
-      crate::accepted(dec.send_packet(&packet(av_pkt)), "send_packet");
+      crate::accepted(dec.send_packet(&pushed(av_pkt)), "send_packet");
       if drain_as_fed {
         while let Ok(Received::Frame) = dec.receive_frame(&mut dst) {}
       }
@@ -3521,12 +3646,19 @@ fn a_fallback_at_the_end_reopens_on_the_session_threads_at_the_next_flush() {
     dec.flush().expect("a flush");
     assert_eq!(
       dec.active_threads(),
-      Some(three),
-      "{road}: the flush reopened the decoder on the session's threads"
+      Some(core::num::NonZeroU32::MIN),
+      "{road}: the flush keeps the decoder; the keyframe after it switches"
     );
     let mut decoded = 0usize;
-    for av_pkt in &clip.packets {
-      crate::accepted(dec.send_packet(&packet(av_pkt)), "send_packet");
+    for (index, av_pkt) in clip.packets.iter().enumerate() {
+      crate::accepted(dec.send_packet(&pushed(av_pkt)), "send_packet");
+      if index == 0 {
+        assert_eq!(
+          dec.active_threads(),
+          Some(three),
+          "{road}: the first keyframe after the seek returned the session to its threads"
+        );
+      }
       while let Received::Frame = dec.receive_frame(&mut dst).expect("receive_frame") {
         decoded += 1;
       }
@@ -3538,7 +3670,7 @@ fn a_fallback_at_the_end_reopens_on_the_session_threads_at_the_next_flush() {
     assert_eq!(
       decoded,
       clip.packets.len(),
-      "{road}: the reopened decoder decodes"
+      "{road}: the decoder on the session's threads decodes"
     );
   }
 }

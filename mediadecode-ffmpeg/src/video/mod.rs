@@ -64,6 +64,19 @@
 //! life — there's no probe-back-to-HW logic; once we've decided the
 //! stream isn't HW-decodable, that decision is sticky.
 //!
+//! **Threads, after a fallback.** Every software decoder a session opens
+//! decodes on the [`Threads`](crate::Threads) its limits ask for, except
+//! the one a fallback commits: that one runs on one thread, because the
+//! fallback is a transaction and only a one-thread decoder decides one
+//! before it commits — a frame-threaded decoder reports a packet's failure
+//! a packet per thread later. The session returns to its threads at the
+//! next keyframe: the one-thread decoder is drained, every picture it holds
+//! delivered in order, and closed; then a decoder on the session's threads
+//! is opened and fed from the keyframe on — after a post-commit degrade, the
+//! keyframe after the one it resyncs at. One software decoder is open at any
+//! instant and no packet is decoded twice, so there is never a second
+//! decoded history for a budget to span.
+//!
 //! Frames produced by either path are converted via
 //! [`crate::convert::av_frame_to_video_frame`] so the consumer sees
 //! the same `mediadecode::VideoFrame<PixelFormat, VideoFrameExtra,
@@ -72,7 +85,9 @@
 use std::collections::VecDeque;
 
 /// Maximum number of frames the SW fallback replay path will buffer
-/// while draining the new SW decoder during packet/EOF replay.
+/// while draining the new SW decoder during packet/EOF replay — and the
+/// tail a one-thread decoder is drained of when the session returns to its
+/// threads at a keyframe (see `restore_session_threads`).
 /// Replaying many compressed packets through SW can produce hundreds
 /// of decoded frames before the fallback commits; with no cap the
 /// resident memory grows unbounded (e.g. 4K frames at ~12 MB each ×
@@ -188,12 +203,21 @@ pub struct CarrierVideoStreamDecoder<C: crate::FfmpegCarrier> {
   /// `AVCodecContext`s it opens — HW candidates, the SW fallback, and
   /// any decoder a later probe advance builds all get the same number.
   limits: DecoderLimits,
-  /// `true` while the committed software decoder runs on one thread and
-  /// [`limits`](Self::limits) asks for more: a fallback that committed
-  /// its proving decoder — at an end of stream already committed, or
-  /// because a decoder on the session's threads would not open. The next
-  /// [`flush`](Self::flush_impl) reopens it on the session's threads.
+  /// `true` while the software decoder serving runs on one thread and
+  /// [`limits`](Self::limits) asks for more: from a fallback, which
+  /// commits the one-thread decoder that proved what it was fed, until
+  /// the next keyframe, where
+  /// [`restore_session_threads`](Self::restore_session_threads) drains
+  /// that decoder, closes it and opens one on the session's threads.
   sw_threads_pending: bool,
+  /// The timestamp of the keyframe the session last returned to its
+  /// threads at, while the packets after it may still be its leading
+  /// pictures — an open GOP's, which display before it and may reference
+  /// the GOP the closed decoder held. See [`Self::note_leading`].
+  switched_at: Option<i64>,
+  /// Packets after [`switched_at`](Self::switched_at) that display before
+  /// it, counted for the one warning [`Self::note_leading`] gives.
+  leading_after_switch: u64,
   /// `true` once `send_eof` has been called on the active decoder.
   /// Used to propagate EOF to the SW decoder when fallback fires
   /// during the drain phase — without this, codecs that hold tail
@@ -368,8 +392,15 @@ enum DecodeState {
   /// `AllBackendsFailed`. Boxed behind [`HwInner`] so tests can inject a
   /// fake HW decoder.
   Hw(Box<dyn HwInner>),
-  /// Software decoder. Terminal state.
+  /// Software decoder. Terminal state, together with [`Self::SwClosed`].
   Sw(SwDecoder),
+  /// The software road with no decoder open: the one-thread decoder a
+  /// fallback committed was drained and closed at a keyframe, and the
+  /// decoder on the session's threads that replaces it could not be
+  /// opened, nor one on a single thread. Nothing is resident; the next
+  /// send opens a decoder again. See
+  /// `CarrierVideoStreamDecoder::restore_session_threads`.
+  SwClosed,
 }
 
 /// A software decoder and the callback state its codec context points
@@ -394,15 +425,33 @@ pub(crate) struct SwDecoder {
 }
 
 /// A test-only census of the software decoders alive on this thread,
-/// and the most alive at once since [`reset_peak`](live_sw::reset_peak)
-/// — what "one decoded history at a time" is measured by, since a
-/// decoder holds its own reference frames and in-flight pictures.
+/// the most alive at once since [`reset_peak`](live_sw::reset_peak) —
+/// what "one decoded history at a time" is measured by, since a decoder
+/// holds its own reference frames and in-flight pictures — and the
+/// packets software decoders have taken since [`reset_sent`](live_sw::reset_sent),
+/// which is what "no packet decoded twice" is measured by.
 #[cfg(test)]
 pub(crate) mod live_sw {
   use core::cell::Cell;
 
   std::thread_local! {
     static LIVE: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+    static SENT: Cell<usize> = const { Cell::new(0) };
+  }
+
+  /// One packet a software decoder took.
+  pub(crate) fn note_sent() {
+    SENT.with(|sent| sent.set(sent.get() + 1));
+  }
+
+  /// Starts the packet count over.
+  pub(crate) fn reset_sent() {
+    SENT.with(|sent| sent.set(0));
+  }
+
+  /// The packets software decoders have taken since the last reset.
+  pub(crate) fn sent() -> usize {
+    SENT.with(Cell::get)
   }
 
   /// One live software decoder.
@@ -457,6 +506,18 @@ impl SwDecoder {
   /// and cold-fallback helpers, which drop the state when they finish.
   pub(crate) fn state(&self) -> *const crate::ffi::CallbackState {
     &*self._callback_state
+  }
+
+  /// Hands `packet` to this decoder. Every packet this module gives a
+  /// software decoder goes through here, so the test census counts each
+  /// one the decoder took.
+  pub(crate) fn submit(&mut self, packet: &Packet) -> Result<(), ffmpeg_next::Error> {
+    let taken = self.decoder.send_packet(packet);
+    #[cfg(test)]
+    if taken.is_ok() {
+      live_sw::note_sent();
+    }
+    taken
   }
 }
 
@@ -591,6 +652,8 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       time_base,
       limits,
       sw_threads_pending: false,
+      switched_at: None,
+      leading_after_switch: 0,
       scratch_pending: false,
       _carrier: core::marker::PhantomData,
     })
@@ -600,7 +663,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// path. `false` while still on the HW probe (the initial state).
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub(crate) const fn is_software_impl(&self) -> bool {
-    matches!(self.state, DecodeState::Sw(_))
+    matches!(self.state, DecodeState::Sw(_) | DecodeState::SwClosed)
   }
 
   /// Returns `true` while the HW probe is still active.
@@ -611,13 +674,16 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
 
   /// The thread count libavcodec settled on for the decoder serving
   /// now — read off its opened context, so it follows a mid-stream
-  /// fallback the way [`Self::is_software_impl`] does.
+  /// fallback the way [`Self::is_software_impl`] does: one between a
+  /// fallback and the next keyframe, the session's own after it, and
+  /// none while no software decoder is open.
   pub(crate) fn active_threads_impl(&self) -> Option<core::num::NonZeroU32> {
     match &self.state {
       DecodeState::Hw(hw) => hw.active_threads(),
       // SAFETY: `sw` is the live opened software decoder; the pointer is
       // read for one field and not kept.
       DecodeState::Sw(sw) => crate::decoder::opened_threads(unsafe { sw.as_ptr() }),
+      DecodeState::SwClosed => None,
     }
   }
 
@@ -671,7 +737,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   pub(crate) fn scaled_output_capability_impl(&self) -> ScaledOutputCapability {
     match &self.state {
       DecodeState::Hw(hw) => hw.scaled_output_capability(),
-      DecodeState::Sw(_) => ScaledOutputCapability::Unsupported,
+      DecodeState::Sw(_) | DecodeState::SwClosed => ScaledOutputCapability::Unsupported,
     }
   }
 
@@ -778,7 +844,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     }
     match &mut self.state {
       DecodeState::Hw(hw) => hw.request_scaled_output(size),
-      DecodeState::Sw(_) => ScaledOutputCapability::Unsupported,
+      DecodeState::Sw(_) | DecodeState::SwClosed => ScaledOutputCapability::Unsupported,
     }
   }
 
@@ -789,7 +855,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   pub(crate) fn hardware_inner_impl(&self) -> Option<&VideoDecoder> {
     match &self.state {
       DecodeState::Hw(hw) => hw.as_video_decoder(),
-      DecodeState::Sw(_) => None,
+      DecodeState::Sw(_) | DecodeState::SwClosed => None,
     }
   }
 
@@ -881,7 +947,8 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// untouched on the borrowed slice; the wrapper takes ownership of
   /// them and surfaces them in `FallbackFailed` if this returns Err.
   ///
-  /// # The history is proved on one thread, then decoded on the session's
+  /// # The history is decoded once, on one thread, and that decoder is
+  /// committed
   ///
   /// The transaction below rests on one property: every error a replayed
   /// packet can cause surfaces before the commit. A one-thread decoder
@@ -891,99 +958,185 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// so a corrupt packet in a short history would surface only after the
   /// commit, as a plain decode error with the rescued packets gone.
   ///
-  /// So when the session asks for more than one thread, the history is
-  /// first decoded on a one-thread decoder that KEEPS NOTHING: each
-  /// picture is freed as it is drained, and the decoder is dropped,
-  /// reference frames and all, once it has decided the transaction. Only
-  /// then are the same packets replayed into a decoder on the session's
-  /// own [`Threads`](crate::Threads), and that one is committed with the
-  /// pictures it produced; the rest come out of it as the stream
-  /// continues, the same pictures in the same order. One decoded history
-  /// is resident at a time — never the proving one beside the committed
-  /// one — so the replay queue's cap ([`SW_REPLAY_FRAME_CAP`]) and the
-  /// committed decoder's frames in flight are the whole of it.
-  ///
-  /// Handing the proved pictures forward and starting the threaded
-  /// decoder at the next keyframe instead would decode nothing twice, but
-  /// it splits one stream across two decoders at a packet the container
-  /// calls a keyframe — and an open-GOP keyframe's leading pictures
-  /// reference the GOP before it, which the new decoder never saw.
-  ///
-  /// Should the threaded decoder fail to open or to take the history,
-  /// the history is decoded once more on one thread, kept, and committed:
-  /// the transaction is already decided, and the threads are a speed-up.
-  /// A session that commits a one-thread decoder while its limits ask for
-  /// more — that road, or an end of stream already committed, where
-  /// nothing is left to thread — reopens on its threads at its next
-  /// [`flush`](Self::flush_impl).
+  /// So the history is replayed into a decoder on one thread whatever
+  /// the session's [`Threads`](crate::Threads), and the decoder that
+  /// proved it is the one committed, with the pictures it produced. When
+  /// the session asks for more threads it gets them back at the next
+  /// keyframe — see [`Self::restore_session_threads`] — and until then it
+  /// decodes on this one. Nothing is decoded twice and no second decoder
+  /// is opened beside this one.
   fn fall_back_to_sw_inner(
     &mut self,
     unconsumed_packets: &[ffmpeg_next::Packet],
     eof_pending: bool,
   ) -> Result<(), Error> {
     let one_thread = self.limits.with_threads(crate::Threads::Single);
-    let threaded = self.limits.threads().thread_count() != 1;
-    if threaded && !eof_pending {
-      {
-        let mut proving = open_sw_decoder(&self.parameters, one_thread, Some(self.time_base))?;
-        replay_history(&mut proving, unconsumed_packets, false, None)?;
-      }
-      match self.replay_on_session_threads(unconsumed_packets) {
-        Ok((sw, mut replay)) => {
-          self.sw_replay_frames.append(&mut replay);
-          self.state = DecodeState::Sw(sw);
-          self.sw_threads_pending = false;
-          return Ok(());
-        }
-        Err(error) => tracing::warn!(
-          %error,
-          "mediadecode-ffmpeg: the threaded software decoder did not take the proved \
-           history; the session continues on one thread and reopens on its threads at \
-           its next flush",
-        ),
-      }
-    }
     let mut sw = open_sw_decoder(&self.parameters, one_thread, Some(self.time_base))?;
     let mut local_replay: VecDeque<frame::Video> = VecDeque::new();
-    replay_history(
-      &mut sw,
-      unconsumed_packets,
-      eof_pending,
-      Some(&mut local_replay),
-    )?;
+    replay_history(&mut sw, unconsumed_packets, eof_pending, &mut local_replay)?;
     // Commit: only after replay, any EOF forwarding, AND the final drain
     // succeeded do we move the new SW decoder and queue into `self`.
     self.sw_replay_frames.append(&mut local_replay);
     self.state = DecodeState::Sw(sw);
-    self.sw_threads_pending = threaded;
+    self.sw_threads_pending = self.limits.threads().thread_count() != 1;
     Ok(())
   }
 
-  /// A software decoder on the session's own threads, fed a history a
-  /// one-thread decoder has already proved, with whatever pictures it
-  /// produced while taking it. See [`Self::fall_back_to_sw_inner`].
-  fn replay_on_session_threads(
-    &self,
-    unconsumed_packets: &[ffmpeg_next::Packet],
-  ) -> Result<(SwDecoder, VecDeque<frame::Video>), Error> {
-    let mut threaded = open_sw_decoder(&self.parameters, self.limits, Some(self.time_base))?;
-    let mut replay = VecDeque::new();
-    replay_history(&mut threaded, unconsumed_packets, false, Some(&mut replay))?;
-    Ok((threaded, replay))
+  /// **The session's threads, back at a keyframe.** The one-thread
+  /// decoder a fallback committed is drained — the end of the stream sent,
+  /// every picture it still holds queued behind the ones already waiting,
+  /// so they come out first and in order — and closed; then a decoder on
+  /// the session's [`Threads`](crate::Threads) is opened, which the
+  /// keyframe that called this is sent to next.
+  ///
+  /// # Why at a keyframe, and why nothing has to be proved
+  ///
+  /// A keyframe references nothing before it, so the new decoder starts
+  /// clean there: it is fed every packet from the keyframe on, none of
+  /// them twice, and a packet it cannot decode is an ordinary decode error
+  /// with that packet still the caller's — there is no transaction to
+  /// keep, because there is no history to hand over. An open GOP's leading
+  /// pictures are the one exception, and [`Self::note_leading`] names it.
+  ///
+  /// # One decoder at a time
+  ///
+  /// The old decoder is dropped before the new one is opened, so at no
+  /// instant is more than one software decoder open — the decoded history
+  /// is the open decoder's alone, which is why no budget spans two.
+  ///
+  /// # When an open fails
+  ///
+  /// A decoder on one thread is opened instead, and the session tries
+  /// its threads again at the next keyframe. Should that fail too, the
+  /// session is left with no decoder open
+  /// ([`DecodeState::SwClosed`]), the error is returned — the packet was
+  /// not taken — and the next send opens one again. A drain that fails
+  /// closes the old decoder all the same, after queueing the pictures it
+  /// did deliver: it was already told the stream ended.
+  fn restore_session_threads(&mut self) -> Result<(), Error> {
+    if let DecodeState::Sw(sw) = &mut self.state {
+      // The tail is bounded by the codec's own reorder delay, and capped
+      // on its own like a replay; it queues behind whatever a fallback
+      // replay left waiting, so the pictures come out in order.
+      let mut tail = VecDeque::new();
+      let drained = replay_history(sw, &[], true, &mut tail);
+      self.sw_replay_frames.append(&mut tail);
+      self.state = DecodeState::SwClosed;
+      drained?;
+    }
+    let sw = match open_sw_decoder(&self.parameters, self.limits, Some(self.time_base)) {
+      Ok(sw) => {
+        self.sw_threads_pending = false;
+        sw
+      }
+      Err(error) => {
+        tracing::warn!(
+          %error,
+          "mediadecode-ffmpeg: the software decoder could not be opened on the session's \
+           threads at a keyframe; it continues on one thread and tries again at the next",
+        );
+        open_sw_decoder(
+          &self.parameters,
+          self.limits.with_threads(crate::Threads::Single),
+          Some(self.time_base),
+        )?
+      }
+    };
+    self.state = DecodeState::Sw(sw);
+    Ok(())
   }
 
-  /// A cold software decoder on the session's own threads, handed the
-  /// packet a one-thread decoder has already proved. See
-  /// [`Self::degrade_to_sw_inner`].
-  fn forward_on_session_threads(&self, forwarded: Option<&Packet>) -> Result<SwDecoder, Error> {
-    let mut threaded = open_sw_decoder(&self.parameters, self.limits, Some(self.time_base))?;
-    if let Some(pkt) = forwarded {
-      let state = threaded.state();
-      threaded
-        .send_packet(pkt)
-        .map_err(|e| crate::decoder::software_exit(state, e))?;
+  /// The software road's send: the session's threads restored first when
+  /// this packet is the keyframe a fallback's one-thread decoder was
+  /// waiting for (or when no decoder is open), then the packet handed to
+  /// the decoder serving now.
+  ///
+  /// **Not across an open post-commit gap.** A cold decoder degraded to
+  /// mid-stream proves its resync on the keyframe it resyncs at
+  /// ([`Self::resync_on_frame`]); switching there would split that proof
+  /// across two decoders, the old one's tail of concealed pictures
+  /// delivered after the anchor it does not belong to. So the session
+  /// resyncs on one thread and returns to its threads at the keyframe
+  /// after that.
+  fn send_on_software(
+    &mut self,
+    pkt: &Packet,
+    phase: crate::decoder::SessionPhase,
+  ) -> Result<Sent, VideoDecodeError> {
+    let switching = self.sw_threads_pending
+      && (matches!(self.state, DecodeState::SwClosed)
+        || (pkt.is_key() && !self.degraded_resync_pending));
+    if switching {
+      self
+        .restore_session_threads()
+        .map_err(VideoDecodeError::Decode)?;
     }
-    Ok(threaded)
+    let DecodeState::Sw(sw) = &mut self.state else {
+      // `restore_session_threads` leaves a decoder open or returns, and
+      // no other road reaches here without one.
+      return Err(VideoDecodeError::Decode(Error::Ffmpeg(
+        ffmpeg_next::Error::Bug,
+      )));
+    };
+    let st = sw.state();
+    if let Err(e) = sw.submit(pkt) {
+      // Funnel, then gate. **Nothing below runs on back pressure**,
+      // which is the point of returning here rather than falling
+      // through: a packet libavcodec did not take must not be
+      // counted across the resync gap or recorded as a keyframe
+      // anchor, or a caller's honest re-offer would double-count
+      // it.
+      return crate::decoder::software_send(st, e, phase).map_err(VideoDecodeError::Decode);
+    }
+    // A keyframe fed across an unresolved post-commit gap is the resync
+    // anchor; record it so the next delivered frame can clear the guard.
+    self.note_degraded_keyframe(pkt.is_key());
+    // Count packets crossing an unresolved post-commit resync gap so the
+    // escalation at EOF can report how much tail was lost.
+    self.count_degraded_packet();
+    if switching {
+      self.switched_at = pkt.pts();
+      self.leading_after_switch = 0;
+    } else {
+      self.note_leading(pkt);
+    }
+    Ok(Sent::Accepted)
+  }
+
+  /// **An open GOP at the switch, named rather than hidden.** A keyframe
+  /// that opens an open GOP — an HEVC CRA, an H.264 recovery point that is
+  /// not an IDR — is followed in decode order by leading pictures that
+  /// display before it and may reference the GOP before it. That GOP was
+  /// in the decoder [`Self::restore_session_threads`] closed, so the new
+  /// one makes of those pictures what a seek to the keyframe would: it
+  /// drops or conceals the ones that need it. A closed GOP has none, and
+  /// a switch there loses nothing.
+  ///
+  /// So the packets after the switch keyframe that display before it are
+  /// counted, and the first one that does not ends the count with one
+  /// warning when there were any.
+  fn note_leading(&mut self, pkt: &Packet) {
+    let Some(key) = self.switched_at else {
+      return;
+    };
+    match pkt.pts() {
+      Some(pts) if pts < key => {
+        self.leading_after_switch = self.leading_after_switch.saturating_add(1);
+      }
+      _ => {
+        if self.leading_after_switch > 0 {
+          tracing::warn!(
+            leading = self.leading_after_switch,
+            keyframe_pts = key,
+            "mediadecode-ffmpeg: the keyframe the software decoder returned to the \
+             session's threads at opens an open GOP; pictures after it that display before \
+             it and reference the GOP before it are what a seek to it would make of them",
+          );
+        }
+        self.switched_at = None;
+        self.leading_after_switch = 0;
+      }
+    }
   }
 
   /// **Post-commit** degrade-and-continue transition: open the SW decoder
@@ -1062,11 +1215,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// The forward is decided on one thread, for the reason
   /// [`Self::fall_back_to_sw_inner`] gives: a frame-threaded decoder takes a
   /// packet without decoding it, so a forward that fails would be committed
-  /// and fail afterwards instead of rolling back. Once the one-thread decoder
-  /// has taken the input — and only when the stream goes on — a decoder on
-  /// the session's [`Threads`](crate::Threads) is opened cold and handed the
-  /// same packet, and that one is committed; if it cannot be, the one-thread
-  /// decoder is.
+  /// and fail afterwards instead of rolling back. The one-thread decoder that
+  /// took the input is the one committed; the session returns to its
+  /// [`Threads`](crate::Threads) at the next keyframe, which is also where
+  /// this cold decoder resyncs — see [`Self::restore_session_threads`].
   fn degrade_to_sw_inner(
     &mut self,
     input: PostCommitInput<'_>,
@@ -1100,7 +1252,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       PostCommitInput::FrameTime | PostCommitInput::Eof => None,
     };
     if let Some(pkt) = forwarded {
-      sw.send_packet(pkt)
+      sw.submit(pkt)
         .map_err(|e| crate::decoder::software_exit(state, e))?;
     }
     // **The end of the stream is re-forwarded here, on every arm that
@@ -1124,27 +1276,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       sw.send_eof()
         .map_err(|e| crate::decoder::software_exit(state, e))?;
     }
-    // The session's own threads, once the forward is proved. A session
-    // whose end is committed only drains from here, so it keeps the
-    // one-thread decoder until its next flush (see `flush_impl`).
-    let mut threads_pending = self.limits.threads().thread_count() != 1;
-    if threads_pending && !eof_pending {
-      match self.forward_on_session_threads(forwarded) {
-        Ok(threaded) => {
-          sw = threaded;
-          threads_pending = false;
-        }
-        Err(error) => tracing::warn!(
-          %error,
-          "mediadecode-ffmpeg: the threaded software decoder did not take the proved \
-           forward; the session continues on one thread and reopens on its threads at its \
-           next flush",
-        ),
-      }
-    }
-    // Commit: only after a clean open + forward.
+    // Commit: only after a clean open + forward. The session's own
+    // threads come back at the next keyframe.
     self.state = DecodeState::Sw(sw);
-    self.sw_threads_pending = threads_pending;
+    self.sw_threads_pending = self.limits.threads().thread_count() != 1;
     self.enter_degraded_resync();
     if forwarded.is_some_and(|pkt| pkt.is_key()) {
       // The refused current packet was itself the resync anchor.
@@ -1311,7 +1446,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   ) -> Result<Received, VideoDecodeError> {
     let av_frame = match &mut self.state {
       DecodeState::Hw(_) => unsafe { self.hw_scratch.as_inner_mut().as_ptr() },
-      DecodeState::Sw(_) => unsafe { self.sw_scratch.as_ptr() },
+      // `SwClosed` holds no parked frame — a switch is refused while one
+      // is — and the software scratch is the one its road would use.
+      DecodeState::Sw(_) | DecodeState::SwClosed => unsafe { self.sw_scratch.as_ptr() },
     };
     // SAFETY: the scratch frame is live — either just filled by the
     // inner decoder's `receive_frame`, or left holding a frame whose
@@ -1379,6 +1516,8 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       time_base,
       limits,
       sw_threads_pending: false,
+      switched_at: None,
+      leading_after_switch: 0,
       scratch_pending: false,
       _carrier: core::marker::PhantomData,
     })
@@ -1556,41 +1695,17 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
               .fall_back_to_sw(rescued, eof_pending)
               .map_err(VideoDecodeError::Decode)?;
             // Forward the new (still-unconsumed) current packet to the
-            // freshly-opened SW decoder — the HW decoder REFUSED it, so it was not
-            // in the replay set. A failure here surfaces (it is not silently
-            // dropped), and back pressure from the fresh decoder is reported as
-            // such rather than mistaken for one: the fallback committed either
-            // way, and the caller re-offers the packet.
-            if let DecodeState::Sw(sw) = &mut self.state {
-              let st = sw.state();
-              if let Err(e) = sw.send_packet(av_pkt) {
-                return crate::decoder::software_send(st, e, phase)
-                  .map_err(VideoDecodeError::Decode);
-              }
-            }
-            Ok(Sent::Accepted)
+            // software road — the HW decoder REFUSED it, so it was not in the
+            // replay set. It is the road's next packet like any other: a
+            // keyframe here is where the session's threads come back. A
+            // failure surfaces (it is not silently dropped), and back pressure
+            // is reported as such rather than mistaken for one: the fallback
+            // committed either way, and the caller re-offers the packet.
+            self.send_on_software(av_pkt, phase)
           }
           Err(other) => Err(VideoDecodeError::Decode(other)),
         },
-        DecodeState::Sw(sw) => {
-          let st = sw.state();
-          if let Err(e) = sw.send_packet(av_pkt) {
-            // Funnel, then gate. **Nothing below runs on back pressure**,
-            // which is the point of returning here rather than falling
-            // through: a packet libavcodec did not take must not be
-            // counted across the resync gap or recorded as a keyframe
-            // anchor, or a caller's honest re-offer would double-count
-            // it.
-            return crate::decoder::software_send(st, e, phase).map_err(VideoDecodeError::Decode);
-          }
-          // A keyframe fed across an unresolved post-commit gap is the resync
-          // anchor; record it so the next delivered frame can clear the guard.
-          self.note_degraded_keyframe(av_pkt.is_key());
-          // Count packets crossing an unresolved post-commit resync gap so the
-          // escalation at EOF can report how much tail was lost.
-          self.count_degraded_packet();
-          Ok(Sent::Accepted)
-        }
+        DecodeState::Sw(_) | DecodeState::SwClosed => self.send_on_software(av_pkt, phase),
       }
     })
     .map_err(|e| VideoDecodeError::Decode(Error::PacketBuild(e)))?
@@ -1784,6 +1899,16 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
             }
           }
         }
+        // No decoder open (see [`DecodeState::SwClosed`]): nothing is
+        // waiting in one, so the drain asks for the packet that opens the
+        // next — or, past the session's end, the stream has ended.
+        DecodeState::SwClosed => {
+          return if self.eof_sent {
+            self.ended()
+          } else {
+            Ok(Received::NeedsInput)
+          };
+        }
       }
     }
   }
@@ -1865,6 +1990,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
           Err(e) => crate::decoder::software_send(st, e, phase).map_err(VideoDecodeError::Decode),
         }
       }
+      // No decoder is open, so none holds anything to flush out: the end
+      // is taken, and the drain answers it once the queue is empty.
+      DecodeState::SwClosed => Ok(Sent::Accepted),
     };
     // Commit EOF state only when the EOF was actually **taken** — a failed
     // fallback left `self.eof_sent` untouched (restored-by-construction: we
@@ -1897,32 +2025,20 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     // resync tracking from before the flush is moot. Clear it so the next EOF
     // doesn't escalate over a now-irrelevant pre-flush gap.
     self.clear_degraded_resync();
+    // And so is an open-GOP count from before it.
+    self.switched_at = None;
+    self.leading_after_switch = 0;
     match &mut self.state {
       // The HW seam's `flush` returns `Result` for a uniform trait; the
       // real `VideoDecoder::flush` is infallible (always `Ok`).
       DecodeState::Hw(hw) => hw.flush().map_err(VideoDecodeError::Decode)?,
-      // **A one-thread decoder a fallback committed reopens on the
-      // session's threads here.** A flush discards everything a decoder
-      // holds, so a fresh context opened from the same parameters is the
-      // flushed decoder on other threads; when it cannot be opened, the
-      // old one is flushed and kept, and the next flush tries again.
-      DecodeState::Sw(sw) if self.sw_threads_pending => {
-        match open_sw_decoder(&self.parameters, self.limits, Some(self.time_base)) {
-          Ok(threaded) => {
-            *sw = threaded;
-            self.sw_threads_pending = false;
-          }
-          Err(error) => {
-            tracing::warn!(
-              %error,
-              "mediadecode-ffmpeg: the flushed software decoder could not be reopened on \
-               the session's threads; it stays on one thread",
-            );
-            sw.flush();
-          }
-        }
-      }
+      // **A one-thread decoder a fallback committed is flushed and kept.**
+      // The session's threads come back at the first keyframe after the
+      // flush — where a seek lands — by the same rule as anywhere else
+      // (see [`Self::restore_session_threads`]); the flushed decoder has
+      // nothing left to drain there.
       DecodeState::Sw(sw) => sw.flush(),
+      DecodeState::SwClosed => {}
     }
     Ok(())
   }
@@ -2098,20 +2214,18 @@ macro_rules! video_lane_face {
 
 video_lane_face!(crate::View, crate::Owned);
 
-/// Replays a probe-era history into a freshly opened software decoder:
-/// every packet, the end of the stream when `eof_pending`, and a final
-/// drain — the body of the fallback transaction, shared by the decoder
-/// that proves the history and the threaded decoder that is then fed
-/// the same packets. See `fall_back_to_sw_inner`.
-///
-/// `local_replay` is where drained pictures go; [`None`] frees each one
-/// as it is drained, which is how the proving decoder decides the
-/// transaction without holding a decoded history of its own.
+/// Feeds a software decoder `unconsumed_packets`, the end of the stream
+/// when `eof_pending`, and a final drain — the body of the probe-era
+/// fallback transaction (see `fall_back_to_sw_inner`), and, with no
+/// packets and the end, the drain that empties a one-thread decoder
+/// before the session returns to its threads at a keyframe (see
+/// `restore_session_threads`). Either way the drained pictures go to
+/// `local_replay`, at most [`SW_REPLAY_FRAME_CAP`] of them.
 fn replay_history(
   sw: &mut SwDecoder,
   unconsumed_packets: &[ffmpeg_next::Packet],
   eof_pending: bool,
-  mut local_replay: Option<&mut VecDeque<frame::Video>>,
+  local_replay: &mut VecDeque<frame::Video>,
 ) -> Result<(), Error> {
   // Bound before the decoder is mutably borrowed, so the error
   // closures below can still consult it.
@@ -2127,24 +2241,10 @@ fn replay_history(
   // replay packets) instead of being silently swallowed and the fallback
   // committed over corruption.
   fn drain_into(
-    sw: &mut ffmpeg_next::decoder::Video,
+    sw: &mut SwDecoder,
     state: *const crate::ffi::CallbackState,
-    local_replay: Option<&mut VecDeque<frame::Video>>,
+    local_replay: &mut VecDeque<frame::Video>,
   ) -> std::result::Result<(), Error> {
-    let Some(local_replay) = local_replay else {
-      // Proving only: each picture is freed here as it is drained.
-      let mut tmp = alloc_av_video_frame()?;
-      loop {
-        match sw.receive_frame(&mut tmp) {
-          Ok(()) => {}
-          Err(ffmpeg_next::Error::Other { errno }) if errno == ffmpeg_next::error::EAGAIN => {
-            return Ok(());
-          }
-          Err(ffmpeg_next::Error::Eof) => return Ok(()),
-          Err(other) => return Err(crate::decoder::software_exit(state, other)),
-        }
-      }
-    };
     loop {
       let mut tmp = alloc_av_video_frame()?;
       match sw.receive_frame(&mut tmp) {
@@ -2179,10 +2279,10 @@ fn replay_history(
   for pkt in unconsumed_packets {
     let mut attempts: u32 = 0;
     loop {
-      match sw.send_packet(pkt) {
+      match sw.submit(pkt) {
         Ok(()) => break,
         Err(ffmpeg_next::Error::Other { errno }) if errno == ffmpeg_next::error::EAGAIN => {
-          drain_into(sw, sw_state, local_replay.as_deref_mut())?;
+          drain_into(sw, sw_state, local_replay)?;
           attempts += 1;
           if attempts > 16 {
             return Err(Error::Ffmpeg(ffmpeg_next::Error::Other {
@@ -2203,7 +2303,7 @@ fn replay_history(
       match sw.send_eof() {
         Ok(()) => break,
         Err(ffmpeg_next::Error::Other { errno }) if errno == ffmpeg_next::error::EAGAIN => {
-          drain_into(sw, sw_state, local_replay.as_deref_mut())?;
+          drain_into(sw, sw_state, local_replay)?;
           attempts += 1;
           if attempts > 16 {
             return Err(Error::Ffmpeg(ffmpeg_next::Error::Other {
@@ -2249,11 +2349,12 @@ fn open_sw_decoder(
   let (mut ctx, callback_state) = build_codec_context(parameters, limits, pkt_timebase)?;
   // **The threads, before the open that reads them.** Every software
   // session decodes on the threads its limits ask for — opened on
-  // purpose, at open-time exhaustion, or by a mid-stream fallback, whose
-  // two transactions first prove what they forward on a one-thread
-  // decoder opened here too (see `fall_back_to_sw_inner`). See
-  // [`crate::Threads`] for the cost and `request_threads` for why the
-  // allocator judge is safe on libavcodec's worker threads.
+  // purpose, at open-time exhaustion, or at the first keyframe after a
+  // mid-stream fallback, whose two transactions commit a one-thread
+  // decoder opened here too (see `fall_back_to_sw_inner` and
+  // `restore_session_threads`). See [`crate::Threads`] for the cost and
+  // `request_threads` for why the allocator judge is safe on
+  // libavcodec's worker threads.
   crate::decoder::request_threads(&mut ctx, limits.threads());
   // Opened without forming a bindgen enum from FFmpeg memory: the codec
   // is resolved off a raw `codec_id`, and the medium is proved off a raw

@@ -48,22 +48,27 @@ The backend-agnostic core it adapts has its own log at
   many are in flight says `Count`. The hardware road, and the audio,
   subtitle and image decoders, keep one thread.
 
-- **The two software fallbacks prove what they forward on one thread,
-  then continue on the session's threads.** Both are transactions — the
-  packets they hand the software decoder must decode, or the session
-  stays where it was and the packets go back to the caller — and a
-  frame-threaded decoder reports a packet's failure only once it has a
-  packet per thread in flight. So the probe-era replay and the
-  post-commit cold forward run on a one-thread decoder first, and once
-  that has taken them, and the stream goes on, the same packets are
-  handed to a decoder on the session's threads, which is the one
-  committed. The probe-era proving decoder keeps no pictures — each is
-  freed as it drains — and is dropped before the threaded decoder
-  opens, so one decoded history is resident at a time, within the
-  replay queue's existing cap. A session that commits a one-thread
-  decoder while its limits ask for more — its end already committed, or
-  a threaded decoder that would not open — reopens on its threads at its
-  next `flush`.
+- **A software fallback commits the one-thread decoder that proved it,
+  and the session returns to its threads at the next keyframe.** Both
+  fallbacks are transactions — the packets they hand the software
+  decoder must decode, or the session stays where it was and the
+  packets go back to the caller — and a frame-threaded decoder reports a
+  packet's failure only once it has a packet per thread in flight. So
+  the probe-era replay and the post-commit cold forward run on a
+  one-thread decoder, and that decoder is the one committed. At the next
+  keyframe the session sends — after a post-commit degrade, the one after
+  the keyframe it resyncs at — it is drained, every picture it still
+  holds delivered first and in order, and closed, and a decoder on the
+  session's threads is opened and fed from the keyframe on. One software
+  decoder is open at any instant and no packet is decoded twice, so no
+  budget has to span two decoded histories. Between a fallback and that
+  keyframe the session decodes on one thread: on a file whose first
+  packet the hardware refuses, the first GOP at most. A fallback at the
+  end of the stream keeps its one-thread decoder until a seek, and the
+  first keyframe after it. A switch at an open-GOP keyframe (an HEVC
+  CRA, an H.264 recovery point that is not an IDR) leaves that
+  keyframe's leading pictures to what a seek to it would make of them,
+  and says so in one warning.
 
 ## [0.15.1] - 2026-10-05
 
