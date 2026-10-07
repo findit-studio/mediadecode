@@ -4768,3 +4768,49 @@ fn a_packet_reported_failed_leaves_the_output_unsettled_until_a_drain() {
     "keyframe 12's own picture closes the gap"
   );
 }
+
+/// LAW (Codex R5 row 5, [high]): **past the end, a replay's error waits
+/// behind the pictures it queued before it.** A probe-era fallback raised
+/// at the first drain after the end replays twelve packets through a queue
+/// whose budget holds two and a half pictures, so the drains feed it in
+/// rounds. Packet 5 is damaged: the round that feeds it queues pictures 3
+/// and 4 first, then meets its error. The drain delivers 3 and 4, then the
+/// error, then the rest — the error never jumps a picture decoded before it.
+#[test]
+fn past_the_end_a_replay_error_waits_behind_the_pictures_queued_before_it() {
+  let (w, h) = (96u32, 64u32);
+  let mut clip = encode_synthetic_clip(w, h, 12, 100);
+  let budget = picture_bytes(&clip) * 5 / 2;
+  corrupt_packet_payload(&mut clip.packets[5]);
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test(
+    Box::new(FakeHw::failing_at_receive(w, h)),
+    clip.parameters.clone(),
+    tb,
+  )
+  .expect("build test decoder")
+  .with_threads_for_test(crate::Threads::Single)
+  .with_max_replay_bytes_for_test(budget);
+  for av_pkt in &clip.packets {
+    crate::accepted(dec.send_packet(&pushed(av_pkt)), "send_packet");
+  }
+  crate::accepted(dec.send_eof(), "send_eof");
+
+  let mut dst = crate::empty_owned_video_frame();
+  let mut seen: Vec<Option<i64>> = Vec::new();
+  loop {
+    match dec.receive_frame(&mut dst) {
+      Ok(Received::Frame) => seen.push(Some(dst.pts().map_or(i64::MIN, |t| t.pts()))),
+      Ok(Received::Ended) => break,
+      Err(VideoDecodeError::Decode(_)) => seen.push(None),
+      other => panic!("draining past the end: {other:?} after {seen:?}"),
+    }
+    assert!(seen.len() < 64, "the drain ends: {seen:?}");
+  }
+  assert!(dec.is_software(), "the probe-era fallback committed");
+  assert_eq!(
+    seen[..6],
+    [Some(0), Some(1), Some(2), Some(3), Some(4), None],
+    "pictures 3 and 4, queued before the damaged packet, come out before its error: {seen:?}"
+  );
+}

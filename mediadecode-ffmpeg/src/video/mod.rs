@@ -231,8 +231,9 @@ pub struct CarrierVideoStreamDecoder<C: crate::FfmpegCarrier> {
   pending_eof: bool,
   /// A decode error met while feeding what was pending — a replay's packet
   /// or a restart's drain — on a send, which answered `MustDrain` with the
-  /// caller's packet untaken. Reported on the drain, after the pictures
-  /// queued before it.
+  /// caller's packet untaken, or on a drain past the end, which feeds the
+  /// replay itself. Reported on the drain, after the pictures queued before
+  /// it.
   deferred_error: Option<Error>,
   /// Resource ceilings for the frames this decoder exports, and for the
   /// `AVCodecContext`s it opens — HW candidates, the SW fallback, and
@@ -2348,13 +2349,20 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       return Ok(Received::NeedsInput);
     }
     // A replay a fallback left: the next send carries it on, or — past the
-    // session's end, where nothing more can be sent — this drain does.
+    // session's end, where nothing more can be sent — this drain does. An
+    // error it meets waits behind the pictures it queued before it, which
+    // are delivered first, from the top.
     if self.has_pending_replay() {
       if !self.eof_sent {
         return Ok(Received::NeedsInput);
       }
-      self.replay_pending().map_err(VideoDecodeError::Decode)?;
-      if !self.sw_replay_frames.is_empty() || self.has_pending_replay() {
+      if let Err(error) = self.replay_pending() {
+        self.deferred_error = Some(error);
+      }
+      if !self.sw_replay_frames.is_empty()
+        || self.deferred_error.is_some()
+        || self.has_pending_replay()
+      {
         return self.receive_frame_impl(dst);
       }
     }

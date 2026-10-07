@@ -37,7 +37,9 @@ The backend-agnostic core it adapts has its own log at
   caller's, and resumes once the caller has taken pictures: a replay
   committed at the budget feeds its remaining packets before anything sent
   next, and a restart's decoder stays open, draining, until it has given its
-  last. Nothing is dropped.
+  last. Nothing is dropped. An error the resumed replay meets is reported
+  after the pictures it queued before it, on a send's drain and past the end
+  alike.
 
 - **`Error::ReplayQueueFull`** (`ReplayQueueFull { frame_bytes, budget }`,
   exported): a decoded picture that alone exceeds that budget, which no
