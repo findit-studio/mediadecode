@@ -250,6 +250,9 @@ struct FakeHw {
   /// Refcounted clones of every packet accepted so far — the probe-era
   /// `unconsumed_packets` history surfaced on a [`FailShape::ProbeEra`] failure.
   history: Vec<Packet>,
+  /// When set, raise a **probe-era** exhaustion from `send_eof`, carrying
+  /// every packet accepted — the end-of-stream fallback road.
+  fail_at_eof: bool,
   /// When set, raise a **probe-era** exhaustion from `receive_frame`
   /// rather than from `send_packet`.
   ///
@@ -272,6 +275,7 @@ impl FakeHw {
       sends: 0,
       queued: VecDeque::new(),
       history: Vec::new(),
+      fail_at_eof: false,
       fail_at_receive: false,
     }
   }
@@ -292,8 +296,17 @@ impl FakeHw {
       sends: 0,
       queued: VecDeque::new(),
       history: Vec::new(),
+      fail_at_eof: false,
       fail_at_receive: false,
     }
+  }
+
+  /// Accepts every packet, then raises probe-era exhaustion at the end of
+  /// the stream — the fallback `send_eof` drives.
+  fn failing_at_eof(width: u32, height: u32) -> Self {
+    let mut hw = Self::failing(width, height, 0, usize::MAX, FailShape::ProbeEra);
+    hw.fail_at_eof = true;
+    hw
   }
 
   /// Accepts every packet, then raises probe-era exhaustion the first
@@ -366,6 +379,13 @@ impl HwInner for FakeHw {
   }
 
   fn send_eof(&mut self) -> Result<Sent, Error> {
+    if self.fail_at_eof {
+      // Once: the decoder falls back and never asks this seam again.
+      self.fail_at_eof = false;
+      return Err(Error::AllBackendsFailed(
+        crate::error::AllBackendsFailed::new(Vec::new(), std::mem::take(&mut self.history)),
+      ));
+    }
     Ok(Sent::Accepted)
   }
 
@@ -4812,5 +4832,90 @@ fn past_the_end_a_replay_error_waits_behind_the_pictures_queued_before_it() {
     seen[..6],
     [Some(0), Some(1), Some(2), Some(3), Some(4), None],
     "pictures 3 and 4, queued before the damaged packet, come out before its error: {seen:?}"
+  );
+}
+
+/// LAW (Codex R5 row 6, [high]): **the end a replay owed is the session's
+/// the moment the decoder takes it, and it is never sent again.** A
+/// probe-era fallback raised by `send_eof` replays eleven packets through a
+/// queue whose budget holds two and a half pictures, so each `send_eof`
+/// feeds a round and answers `MustDrain`, until the last, which feeds
+/// pictures 9 and 10 and the end — and the drain after the end fails. That
+/// `send_eof` is accepted: the end was committed when the decoder took it.
+/// The drain then delivers 9 and 10 and then the error, and the decoder is
+/// told the stream ended exactly once — a caller that obeys every
+/// `MustDrain` never sends a second end into a decoder that has one.
+#[test]
+fn the_end_a_replay_owed_is_committed_when_the_decoder_takes_it() {
+  let (w, h) = (96u32, 64u32);
+  let clip = encode_synthetic_clip(w, h, 11, 100);
+  assert_eq!(clip.packets.len(), 11, "one packet a picture");
+  let budget = picture_bytes(&clip) * 5 / 2;
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test(
+    Box::new(FakeHw::failing_at_eof(w, h)),
+    clip.parameters.clone(),
+    tb,
+  )
+  .expect("build test decoder")
+  .with_threads_for_test(crate::Threads::Single)
+  .with_max_replay_bytes_for_test(budget);
+  for av_pkt in &clip.packets {
+    crate::accepted(dec.send_packet(&pushed(av_pkt)), "send_packet");
+  }
+  super::replay_fault::arm();
+  super::live_sw::reset_eofs();
+
+  let mut dst = crate::empty_owned_video_frame();
+  let mut seen: Vec<Option<i64>> = Vec::new();
+  let mut drain = |dec: &mut FfmpegVideoStreamDecoder, seen: &mut Vec<Option<i64>>| loop {
+    match dec.receive_frame(&mut dst) {
+      Ok(Received::Frame) => seen.push(Some(dst.pts().map_or(i64::MIN, |t| t.pts()))),
+      Err(VideoDecodeError::Decode(_)) => seen.push(None),
+      Ok(Received::NeedsInput | Received::Ended) => break,
+      Err(other) => panic!("draining: {other:?} after {seen:?}"),
+    }
+  };
+  let mut fault = None;
+  let mut rounds = 0usize;
+  loop {
+    match dec.send_eof() {
+      Ok(Sent::Accepted) => break,
+      Ok(Sent::MustDrain) => {
+        rounds += 1;
+        assert!(rounds < 16, "the replay advances: {seen:?}");
+        drain(&mut dec, &mut seen);
+      }
+      Err(error) => {
+        fault = Some(error);
+        break;
+      }
+    }
+  }
+  assert!(
+    fault.is_none(),
+    "the end, once the decoder took it, is never sent again: {fault:?}"
+  );
+  assert!(dec.is_software(), "the probe-era fallback committed");
+  assert!(dec.eof_sent_for_test(), "the session's end is committed");
+  assert_eq!(
+    seen,
+    (0..9).map(Some).collect::<Vec<_>>(),
+    "the rounds before the last delivered pictures 0 to 8"
+  );
+  drain(&mut dec, &mut seen);
+  assert_eq!(
+    seen[9..],
+    [Some(9), Some(10), None],
+    "the last round's pictures, then the error held behind them: {seen:?}"
+  );
+  assert!(
+    matches!(dec.receive_frame(&mut dst), Ok(Received::Ended)),
+    "and the end"
+  );
+  assert_eq!(
+    super::live_sw::eofs(),
+    1,
+    "the decoder was told the stream ended once"
   );
 }

@@ -227,7 +227,10 @@ pub struct CarrierVideoStreamDecoder<C: crate::FfmpegCarrier> {
   /// the queue reached its budget first. They are fed, under the budget,
   /// before anything the caller sends next ([`Self::replay_pending`]).
   pending_history: VecDeque<Packet>,
-  /// Whether that replay still owes the decoder the end of the stream.
+  /// Whether that replay still owes the decoder the end of the stream. Once
+  /// the decoder takes it, that end is the session's: [`Self::eof_sent`] is
+  /// committed at once, whatever the drain after it meets
+  /// ([`Self::replay_pending`]).
   pending_eof: bool,
   /// A decode error met while feeding what was pending — a replay's packet
   /// or a restart's drain — on a send, which answered `MustDrain` with the
@@ -597,6 +600,25 @@ pub(crate) mod live_sw {
   std::thread_local! {
     static LIVE: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
     static SENT: Cell<usize> = const { Cell::new(0) };
+    static EOFS: Cell<usize> = const { Cell::new(0) };
+  }
+
+  /// One end of the stream a software decoder was sent and answered —
+  /// taken, or refused as a second one; back pressure, which takes
+  /// nothing, aside.
+  pub(crate) fn note_eof() {
+    EOFS.with(|eofs| eofs.set(eofs.get() + 1));
+  }
+
+  /// Starts the count of ends over.
+  pub(crate) fn reset_eofs() {
+    EOFS.with(|eofs| eofs.set(0));
+  }
+
+  /// The ends software decoders were sent and answered since the last
+  /// reset.
+  pub(crate) fn eofs() -> usize {
+    EOFS.with(Cell::get)
   }
 
   /// One packet a software decoder took.
@@ -650,6 +672,29 @@ pub(crate) mod live_sw {
   }
 }
 
+/// Test-only: a fault a replay meets on the drain after the decoder takes
+/// the end of the stream — where FFmpeg reports an error for a packet it
+/// decodes only once told the stream ended.
+#[cfg(test)]
+pub(crate) mod replay_fault {
+  use core::cell::Cell;
+
+  std::thread_local! {
+    static AFTER_EOF: Cell<bool> = const { Cell::new(false) };
+  }
+
+  /// The next replay that feeds the end of the stream fails on the drain
+  /// after it.
+  pub(crate) fn arm() {
+    AFTER_EOF.with(|armed| armed.set(true));
+  }
+
+  /// Whether the armed fault fires now; it fires once.
+  pub(crate) fn fire() -> bool {
+    AFTER_EOF.with(|armed| armed.replace(false))
+  }
+}
+
 impl SwDecoder {
   /// The callback state this decoder's codec context points at.
   ///
@@ -678,6 +723,19 @@ impl SwDecoder {
       live_sw::note_sent();
     }
     taken
+  }
+
+  /// Tells this decoder the stream ended. Every end this module gives a
+  /// software decoder goes through here, so the test census counts each
+  /// one the decoder answered.
+  pub(crate) fn send_eof(&mut self) -> Result<(), ffmpeg_next::Error> {
+    let told = self.decoder.send_eof();
+    #[cfg(test)]
+    if !matches!(told, Err(ffmpeg_next::Error::Other { errno }) if errno == ffmpeg_next::error::EAGAIN)
+    {
+      live_sw::note_eof();
+    }
+    told
   }
 }
 
@@ -1201,6 +1259,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// with every picture it makes queued — stopping again where the queue
   /// reaches its budget. Answers whether nothing is left. A packet that
   /// fails is consumed with its error, so a retry never offers it twice.
+  ///
+  /// The end of the stream, once the decoder takes it, is the session's at
+  /// once ([`Self::eof_sent`]) — before the drain after it, whose error the
+  /// caller defers — so it is never sent to the decoder again.
   fn replay_pending(&mut self) -> Result<bool, Error> {
     if !self.has_pending_replay() {
       return Ok(true);
@@ -1220,6 +1282,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     self.pending_history.drain(..progress.fed);
     if progress.eof_sent {
       self.pending_eof = false;
+      self.eof_sent = true;
     }
     replayed?;
     Ok(!self.has_pending_replay())
@@ -1389,7 +1452,17 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       return Ok(Sent::MustDrain);
     }
     // A fallback's replay left packets to feed: they come before this one.
-    match self.replay_pending() {
+    let replayed = self.replay_pending();
+    // It fed the end of the stream a `send_eof` left owed: the session has
+    // ended, and this packet comes after it. An error the replay met waits
+    // for the drain.
+    if self.eof_sent {
+      if let Err(error) = replayed {
+        self.deferred_error = Some(error);
+      }
+      return Err(Self::after_eof());
+    }
+    match replayed {
       Ok(true) => {}
       Ok(false) => return Ok(Sent::MustDrain),
       Err(error) => {
@@ -2535,17 +2608,25 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
         return Ok(Sent::MustDrain);
       }
       let forwarding = self.pending_eof;
-      match self.replay_pending() {
+      let replayed = self.replay_pending();
+      // The end the replay owed is this one. Once the decoder took it, it is
+      // the session's — `replay_pending` committed it — and this send is
+      // accepted whatever the drain after it met: that error waits for the
+      // caller's drain, behind the pictures queued before it, and the end is
+      // never sent again.
+      if forwarding && self.eof_sent {
+        if let Err(error) = replayed {
+          self.deferred_error = Some(error);
+        }
+        return Ok(Sent::Accepted);
+      }
+      match replayed {
         Ok(true) => {}
         Ok(false) => return Ok(Sent::MustDrain),
         Err(error) => {
           self.deferred_error = Some(error);
           return Ok(Sent::MustDrain);
         }
-      }
-      if forwarding {
-        self.eof_sent = true;
-        return Ok(Sent::Accepted);
       }
       if self.restart.is_some() {
         match self.drain_for_restart() {
@@ -2939,6 +3020,10 @@ fn replay_history(
       match sw.send_eof() {
         Ok(()) => {
           progress.eof_sent = true;
+          #[cfg(test)]
+          if replay_fault::fire() {
+            return Err(Error::Ffmpeg(ffmpeg_next::Error::InvalidData));
+          }
           break;
         }
         Err(ffmpeg_next::Error::Other { errno }) if errno == ffmpeg_next::error::EAGAIN => {

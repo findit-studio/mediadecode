@@ -39,7 +39,10 @@ The backend-agnostic core it adapts has its own log at
   next, and a restart's decoder stays open, draining, until it has given its
   last. Nothing is dropped. An error the resumed replay meets is reported
   after the pictures it queued before it, on a send's drain and past the end
-  alike.
+  alike; and the end of the stream the replay owes is the session's the
+  moment the decoder takes it — the `send_eof` that fed it is accepted even
+  when the drain after it fails, that error waits for the drain, and the
+  end is never sent to the decoder twice.
 
 - **`Error::ReplayQueueFull`** (`ReplayQueueFull { frame_bytes, budget }`,
   exported): a decoded picture that alone exceeds that budget, which no
