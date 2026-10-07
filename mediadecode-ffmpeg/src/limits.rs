@@ -468,6 +468,18 @@ impl PacketLimits {
   }
 }
 
+/// Default for [`DecoderLimits::max_replay_bytes`]: the most bytes the
+/// software video road's queue of decoded pictures waiting for delivery
+/// holds at once.
+///
+/// 512 MiB — about forty 1080p 4:2:0 8-bit pictures, or fifteen 4K 4:2:2
+/// 10-bit ones. The queue takes a fallback replay's pictures and the tail a
+/// one-thread decoder is drained of where the session restarts it at a
+/// clean keyframe; reaching the budget stops the drain, resumable, until
+/// the caller has taken pictures — nothing is dropped. Sixty-four pictures
+/// bound it besides.
+pub const DEFAULT_MAX_REPLAY_BYTES: usize = 512 * 1024 * 1024;
+
 /// What opening and running one **decoder** may spend.
 ///
 /// Composes [`FrameLimits`] — what the frames it produces may cost —
@@ -481,8 +493,11 @@ impl PacketLimits {
 /// `AVCodecContext` whose ceilings cannot move after `avcodec_open2`.
 ///
 /// The same reason carries [`Threads`], the one seat here that is not a
-/// byte ceiling: how many threads a software video decoder may decode
-/// on is also a context field libavcodec reads once, at open.
+/// byte ceiling: how many threads a software video decoder may decode on
+/// is also a context field libavcodec reads once, at open. Beside it sits
+/// the byte budget of the software video road's queue of pictures waiting
+/// for delivery ([`Self::max_replay_bytes`]), which this crate keeps, not
+/// libavcodec.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DecoderLimits {
   frame: FrameLimits,
@@ -490,6 +505,7 @@ pub struct DecoderLimits {
   max_packet_bytes: usize,
   max_image_input_bytes: usize,
   threads: Threads,
+  max_replay_bytes: usize,
 }
 
 impl Default for DecoderLimits {
@@ -502,7 +518,8 @@ impl Default for DecoderLimits {
 impl DecoderLimits {
   /// The defaults: [`FrameLimits::new`],
   /// [`DEFAULT_MAX_CODEC_PARAMETER_BYTES`], [`DEFAULT_MAX_PACKET_BYTES`],
-  /// [`DEFAULT_MAX_IMAGE_INPUT_BYTES`] and [`Threads::Auto`].
+  /// [`DEFAULT_MAX_IMAGE_INPUT_BYTES`], [`Threads::Auto`] and
+  /// [`DEFAULT_MAX_REPLAY_BYTES`].
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new() -> Self {
     Self {
@@ -511,6 +528,7 @@ impl DecoderLimits {
       max_packet_bytes: DEFAULT_MAX_PACKET_BYTES,
       max_image_input_bytes: DEFAULT_MAX_IMAGE_INPUT_BYTES,
       threads: Threads::Auto,
+      max_replay_bytes: DEFAULT_MAX_REPLAY_BYTES,
     }
   }
 
@@ -556,6 +574,20 @@ impl DecoderLimits {
   pub const fn threads(&self) -> Threads {
     self.threads
   }
+  /// Most bytes the **software video** road's queue of decoded pictures
+  /// waiting for delivery may hold — a fallback replay's pictures, and the
+  /// tail a one-thread decoder is drained of where the session restarts it
+  /// at a clean keyframe ([`DEFAULT_MAX_REPLAY_BYTES`] by default; 64
+  /// pictures bound it besides). A picture's bytes are the buffers it
+  /// references. A drain that reaches it stops and answers
+  /// [`Sent::MustDrain`](mediadecode::Sent::MustDrain), resuming once the
+  /// caller has taken pictures, so nothing is dropped; a picture that alone
+  /// exceeds it is refused by name, as
+  /// [`Error::ReplayQueueFull`](crate::Error::ReplayQueueFull).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn max_replay_bytes(&self) -> usize {
+    self.max_replay_bytes
+  }
 
   /// Sets the frame ceilings (consuming builder).
   #[cfg_attr(not(tarpaulin), inline(always))]
@@ -592,6 +624,14 @@ impl DecoderLimits {
     self.threads = value;
     self
   }
+  /// Sets the software video road's replay-queue budget (consuming
+  /// builder).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
+  pub const fn with_max_replay_bytes(mut self, value: usize) -> Self {
+    self.max_replay_bytes = value;
+    self
+  }
 
   /// Sets the frame ceilings in place.
   #[cfg_attr(not(tarpaulin), inline(always))]
@@ -621,6 +661,12 @@ impl DecoderLimits {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn set_threads(&mut self, value: Threads) -> &mut Self {
     self.threads = value;
+    self
+  }
+  /// Sets the software video road's replay-queue budget in place.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn set_max_replay_bytes(&mut self, value: usize) -> &mut Self {
+    self.max_replay_bytes = value;
     self
   }
 }

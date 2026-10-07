@@ -103,16 +103,12 @@ use std::collections::VecDeque;
 /// Which keyframes a decoder can start at without losing a picture.
 mod access;
 
-/// Maximum number of frames the SW fallback replay path will buffer
-/// while draining the new SW decoder during packet/EOF replay — and the
-/// tail a one-thread decoder is drained of when the session returns to its
-/// threads at a keyframe (see `restore_session_threads`).
-/// Replaying many compressed packets through SW can produce hundreds
-/// of decoded frames before the fallback commits; with no cap the
-/// resident memory grows unbounded (e.g. 4K frames at ~12 MB each ×
-/// 100s of frames). 64 frames is enough room to absorb every
-/// realistic codec's reorder/lookahead window without becoming a
-/// resource sink.
+/// The most pictures the software road's queue of pictures waiting for
+/// delivery holds at once — a cheap second bound beside its byte budget
+/// ([`DecoderLimits::max_replay_bytes`]). The queue takes a fallback
+/// replay's pictures and the tail a one-thread decoder is drained of where
+/// the session restarts it at a clean keyframe; a drain that reaches either
+/// bound stops, resumable, rather than drop a picture (see `drain_into`).
 const SW_REPLAY_FRAME_CAP: usize = 64;
 
 use derive_more::{IsVariant, TryUnwrap, Unwrap};
@@ -214,10 +210,26 @@ pub struct CarrierVideoStreamDecoder<C: crate::FfmpegCarrier> {
   /// SW-side scratch frame (filled by `ffmpeg::decoder::Video::receive_frame`).
   sw_scratch: frame::Video,
   /// Frames produced while draining the SW decoder during fallback
-  /// replay (see [`Self::fall_back_to_sw`]). The trait's
-  /// `receive_frame` delivers from this queue before pulling new
-  /// frames from the SW decoder. Empty in steady-state operation.
-  sw_replay_frames: VecDeque<frame::Video>,
+  /// replay (see [`Self::fall_back_to_sw`]), and the tail a restart at a
+  /// clean keyframe drains. The trait's `receive_frame` delivers from this
+  /// queue before pulling new frames from the SW decoder. Empty in
+  /// steady-state operation.
+  sw_replay_frames: ReplayQueue,
+  /// A restart of the software decoder in progress — its drain stopped at
+  /// the queue's budget — finished when the caller sends the keyframe
+  /// again ([`Self::send_on_software`]).
+  restart: Option<Restart>,
+  /// The rescued packets a probe-era fallback's replay has not fed yet:
+  /// the queue reached its budget first. They are fed, under the budget,
+  /// before anything the caller sends next ([`Self::replay_pending`]).
+  pending_history: VecDeque<Packet>,
+  /// Whether that replay still owes the decoder the end of the stream.
+  pending_eof: bool,
+  /// A decode error met while feeding what was pending — a replay's packet
+  /// or a restart's drain — on a send, which answered `MustDrain` with the
+  /// caller's packet untaken. Reported on the drain, after the pictures
+  /// queued before it.
+  deferred_error: Option<Error>,
   /// Resource ceilings for the frames this decoder exports, and for the
   /// `AVCodecContext`s it opens — HW candidates, the SW fallback, and
   /// any decoder a later probe advance builds all get the same number.
@@ -226,8 +238,9 @@ pub struct CarrierVideoStreamDecoder<C: crate::FfmpegCarrier> {
   /// [`limits`](Self::limits) asks for more: from a fallback, which
   /// commits the one-thread decoder that proved what it was fed, until
   /// the next clean keyframe (or the first after a seek), where
-  /// [`restore_session_threads`](Self::restore_session_threads) drains
-  /// that decoder, closes it and opens one on the session's threads.
+  /// [`send_on_software`](Self::send_on_software) drains that decoder,
+  /// closes it and opens one on the session's threads
+  /// ([`open_after_drain`](Self::open_after_drain)).
   sw_threads_pending: bool,
   /// `true` from a [`flush`](Self::flush_impl) until the next keyframe:
   /// the first keyframe after a seek is a switch point whatever kind it
@@ -269,7 +282,7 @@ pub struct CarrierVideoStreamDecoder<C: crate::FfmpegCarrier> {
   degraded_resync_pending: bool,
   /// `true` once the resync is anchored across the open gap: the software
   /// decoder was drained, reset and fed a clean random access point (see
-  /// [`Self::anchor_resync`]), or opened cold on one. From then on every
+  /// [`Self::send_on_software`]), or opened cold on one. From then on every
   /// picture it outputs is decoded from that keyframe or a packet after it,
   /// by construction, so the first one delivered clears
   /// [`Self::degraded_resync_pending`]. No picture is matched to a packet.
@@ -428,8 +441,98 @@ enum DecodeState {
   /// decoder on the session's threads that replaces it could not be
   /// opened, nor one on a single thread. Nothing is resident; the next
   /// send opens a decoder again. See
-  /// `CarrierVideoStreamDecoder::restore_session_threads`.
+  /// `CarrierVideoStreamDecoder::open_after_drain`.
   SwClosed,
+}
+
+/// The software road's queue of decoded pictures waiting for delivery, and
+/// the bytes they hold ([`footprint`]).
+///
+/// It takes a fallback replay's pictures and the tail a one-thread decoder
+/// is drained of where the session restarts it at a clean keyframe, and it
+/// is delivered before anything the decoder serving outputs. Bounded by the
+/// session's [`DecoderLimits::max_replay_bytes`] and by
+/// [`SW_REPLAY_FRAME_CAP`] pictures: a drain stops once either is reached
+/// (see [`ReplayQueue::full`]) and resumes after the caller has taken
+/// pictures, so nothing is dropped to keep within them.
+#[derive(Default)]
+struct ReplayQueue {
+  frames: VecDeque<(frame::Video, usize)>,
+  bytes: usize,
+}
+
+impl ReplayQueue {
+  /// How many pictures wait.
+  #[cfg(test)]
+  fn len(&self) -> usize {
+    self.frames.len()
+  }
+
+  fn is_empty(&self) -> bool {
+    self.frames.is_empty()
+  }
+
+  /// The bytes the queued pictures hold.
+  #[cfg(test)]
+  fn bytes(&self) -> usize {
+    self.bytes
+  }
+
+  fn front(&self) -> Option<&frame::Video> {
+    self.frames.front().map(|(frame, _)| frame)
+  }
+
+  fn pop_front(&mut self) -> Option<frame::Video> {
+    let (frame, bytes) = self.frames.pop_front()?;
+    self.bytes = self.bytes.saturating_sub(bytes);
+    Some(frame)
+  }
+
+  fn push_back(&mut self, frame: frame::Video, bytes: usize) {
+    self.bytes = self.bytes.saturating_add(bytes);
+    self.frames.push_back((frame, bytes));
+  }
+
+  fn append(&mut self, other: &mut Self) {
+    self.bytes = self.bytes.saturating_add(other.bytes);
+    other.bytes = 0;
+    self.frames.append(&mut other.frames);
+  }
+
+  fn clear(&mut self) {
+    self.frames.clear();
+    self.bytes = 0;
+  }
+
+  /// Whether a drain must stop here: past `budget` bytes, or holding the
+  /// [`SW_REPLAY_FRAME_CAP`] pictures. A drain checks before it receives a
+  /// picture, so the queue holds at most one picture past its budget.
+  fn full(&self, budget: usize) -> bool {
+    self.bytes > budget || self.frames.len() >= SW_REPLAY_FRAME_CAP
+  }
+}
+
+/// A restart of the software decoder in progress, at a clean keyframe the
+/// caller is sending: the decoder serving is being drained into the queue —
+/// told the stream ended, every picture it holds queued — and the keyframe
+/// waits, re-offered after each `MustDrain`, until it has given its last.
+#[derive(Clone, Copy, Debug)]
+struct Restart {
+  kind: RestartKind,
+  /// Whether the decoder serving has taken the end of the stream yet: it
+  /// answers back pressure while pictures it made wait to be read.
+  eof_sent: bool,
+}
+
+/// What a drained decoder becomes at the keyframe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RestartKind {
+  /// Reset (`avcodec_flush_buffers`), anchoring a post-commit resync there
+  /// — see `CarrierVideoStreamDecoder::send_on_software`.
+  Anchor,
+  /// Closed, and a decoder on the session's threads opened in its place —
+  /// see `CarrierVideoStreamDecoder::open_after_drain`.
+  Switch,
 }
 
 /// A software decoder and the callback state its codec context points
@@ -673,7 +776,11 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       parameters: owned_parameters,
       hw_scratch,
       sw_scratch,
-      sw_replay_frames: VecDeque::new(),
+      sw_replay_frames: ReplayQueue::default(),
+      restart: None,
+      pending_history: VecDeque::new(),
+      pending_eof: false,
+      deferred_error: None,
       eof_sent: false,
       degraded_resync_pending: false,
       degraded_anchored: false,
@@ -940,6 +1047,17 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// queue, and (where reachable) any consumed packets are dropped —
   /// `self` is left in its prior state.
   ///
+  /// **Within the queue's budget.** The pictures the replay makes wait in
+  /// the session's queue, under its byte budget
+  /// ([`DecoderLimits::max_replay_bytes`]) and its
+  /// [`SW_REPLAY_FRAME_CAP`]. A history whose pictures reach either before
+  /// it is all fed is committed there: the packets it has not fed are kept
+  /// ([`Self::pending_history`]) and fed under the budget, as the caller
+  /// drains, before anything it sends next — so nothing is dropped. The
+  /// transaction covers what was fed before the commit; a packet fed after
+  /// it that fails is an ordinary decode error, reported on the drain, its
+  /// packet consumed.
+  ///
   /// **EOF-aware**: when EOF was already accepted on the HW path
   /// (`self.eof_sent`), the new SW decoder also receives `send_eof()`
   /// after replay. Without this, codecs that delay tail frames hang
@@ -969,7 +1087,13 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     // lose every compressed byte the HW path had consumed when a
     // fallback transition fails partway.
     match self.fall_back_to_sw_inner(&unconsumed_packets, eof_pending) {
-      Ok(()) => Ok(()),
+      Ok(fed) => {
+        // What the budget left unfed is replayed as the caller drains.
+        self
+          .pending_history
+          .extend(unconsumed_packets.into_iter().skip(fed));
+        Ok(())
+      }
       Err(source) => Err(Error::FallbackFailed(FallbackFailed::new(
         Box::new(source),
         unconsumed_packets,
@@ -979,7 +1103,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
 
   /// Worker for [`Self::fall_back_to_sw`]. Returns the rescued packets
   /// untouched on the borrowed slice; the wrapper takes ownership of
-  /// them and surfaces them in `FallbackFailed` if this returns Err.
+  /// them and surfaces them in `FallbackFailed` if this returns Err. On
+  /// success it answers how many of them the decoder took before the
+  /// queue reached its budget; the wrapper keeps the rest.
   ///
   /// # The history is decoded once, on one thread, and that decoder is
   /// committed
@@ -996,36 +1122,81 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// the session's [`Threads`](crate::Threads), and the decoder that
   /// proved it is the one committed, with the pictures it produced. When
   /// the session asks for more threads it gets them back at the next
-  /// keyframe — see [`Self::restore_session_threads`] — and until then it
+  /// keyframe — see [`Self::open_after_drain`] — and until then it
   /// decodes on this one. Nothing is decoded twice and no second decoder
   /// is opened beside this one.
   fn fall_back_to_sw_inner(
     &mut self,
     unconsumed_packets: &[ffmpeg_next::Packet],
     eof_pending: bool,
-  ) -> Result<(), Error> {
+  ) -> Result<usize, Error> {
     let one_thread = self.limits.with_threads(crate::Threads::Single);
     let mut sw = open_sw_decoder(&self.parameters, one_thread, Some(self.time_base))?;
-    let mut local_replay: VecDeque<frame::Video> = VecDeque::new();
-    replay_history(&mut sw, unconsumed_packets, eof_pending, &mut local_replay)?;
+    let mut local_replay = ReplayQueue::default();
+    let mut progress = Replay::default();
+    replay_history(
+      &mut sw,
+      unconsumed_packets,
+      eof_pending,
+      &mut local_replay,
+      self.limits.max_replay_bytes(),
+      &mut progress,
+    )?;
     // Commit: only after replay, any EOF forwarding, AND the final drain
-    // succeeded do we move the new SW decoder and queue into `self`.
+    // succeeded — or the queue reached its budget first — do we move the
+    // new SW decoder and queue into `self`.
     self.sw_replay_frames.append(&mut local_replay);
     self.state = DecodeState::Sw(sw);
     self.sw_threads_pending = self.limits.threads().thread_count() != 1;
-    Ok(())
+    self.pending_eof = eof_pending && !progress.eof_sent;
+    Ok(progress.fed)
   }
 
-  /// **The session's threads, back at a clean keyframe.** The one-thread
-  /// decoder a fallback committed is drained — the end of the stream sent,
-  /// every picture it still holds queued behind the ones already waiting,
-  /// so they come out first and in order — and closed; then a decoder on
-  /// the session's [`Threads`](crate::Threads) is opened, which the
-  /// keyframe that called this is sent to next.
+  /// Whether a probe-era fallback's replay left packets, or the end of the
+  /// stream, for the caller's drains to feed.
+  fn has_pending_replay(&self) -> bool {
+    !self.pending_history.is_empty() || self.pending_eof
+  }
+
+  /// **The replay a fallback left, resumed**: the packets it has not fed,
+  /// then the end of the stream if it owes it, fed to the decoder serving
+  /// with every picture it makes queued — stopping again where the queue
+  /// reaches its budget. Answers whether nothing is left. A packet that
+  /// fails is consumed with its error, so a retry never offers it twice.
+  fn replay_pending(&mut self) -> Result<bool, Error> {
+    if !self.has_pending_replay() {
+      return Ok(true);
+    }
+    let DecodeState::Sw(sw) = &mut self.state else {
+      return Ok(true);
+    };
+    let mut progress = Replay::default();
+    let replayed = replay_history(
+      sw,
+      self.pending_history.make_contiguous(),
+      self.pending_eof,
+      &mut self.sw_replay_frames,
+      self.limits.max_replay_bytes(),
+      &mut progress,
+    );
+    self.pending_history.drain(..progress.fed);
+    if progress.eof_sent {
+      self.pending_eof = false;
+    }
+    replayed?;
+    Ok(!self.has_pending_replay())
+  }
+
+  /// **The session's threads, back at a clean keyframe**, once the
+  /// one-thread decoder a fallback committed has given its last picture to
+  /// the queue ([`Self::drain_for_restart`]): that decoder is closed, then a
+  /// decoder on the session's [`Threads`](crate::Threads) is opened, which
+  /// the keyframe the caller is sending is sent to next. Also where a
+  /// session with no decoder open ([`DecodeState::SwClosed`]) opens one.
   ///
   /// # Why at a clean keyframe, and why nothing has to be proved
   ///
-  /// [`Self::send_on_software`] calls this only at a clean random access
+  /// [`Self::send_on_software`] restarts only at a clean random access
   /// point ([`access`]) — a keyframe nothing after it references past — or
   /// at the first keyframe after a seek, which has discarded what led it.
   /// So the new decoder starts clean there: it is fed every packet from the
@@ -1040,16 +1211,6 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// instant is more than one software decoder open — the decoded history
   /// is the open decoder's alone, which is why no budget spans two.
   ///
-  /// # One queue, one budget
-  ///
-  /// The tail drains into the session's own queue of pictures waiting for
-  /// delivery, under the one cap that queue has
-  /// ([`SW_REPLAY_FRAME_CAP`], refused past it as
-  /// [`Error::ReplayQueueFull`]); [`Self::send_on_software`] attempts a
-  /// switch only while that queue is empty, answering
-  /// [`Sent::MustDrain`] until the caller has drained it. So nothing a
-  /// switch drains piles up behind anything else.
-  ///
   /// # When an open fails
   ///
   /// The session's threads are attempted **once**: a decoder on the
@@ -1058,15 +1219,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// [`active_threads`](Self::active_threads_impl) answers one. Should that
   /// fail too, the session is left with no decoder open
   /// ([`DecodeState::SwClosed`]), the error is returned — the packet was
-  /// not taken — and the next send opens one again. A drain that fails
-  /// closes the old decoder all the same, after queueing the pictures it
-  /// did deliver: it was already told the stream ended.
-  fn restore_session_threads(&mut self) -> Result<(), Error> {
-    if let DecodeState::Sw(sw) = &mut self.state {
-      let drained = replay_history(sw, &[], true, &mut self.sw_replay_frames);
-      self.state = DecodeState::SwClosed;
-      drained?;
-    }
+  /// not taken — and the next send opens one again.
+  fn open_after_drain(&mut self) -> Result<(), Error> {
+    self.state = DecodeState::SwClosed;
     let one_thread = self.limits.with_threads(crate::Threads::Single);
     let sw = if self.sw_threads_pending {
       self.sw_threads_pending = false;
@@ -1088,6 +1243,64 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     Ok(())
   }
 
+  /// **A restart's drain, advanced**: the decoder serving is told the
+  /// stream ended — once it has room for that — and every picture it holds
+  /// is queued, until it has given its last or the queue reaches its budget
+  /// (see `drain_into`). Answers whether it has given its last; if not, the
+  /// caller drains and sends the keyframe again, and this resumes where it
+  /// stopped. Nothing is dropped.
+  fn drain_for_restart(&mut self) -> Result<bool, Error> {
+    let Some(restart) = self.restart.as_mut() else {
+      return Ok(true);
+    };
+    let DecodeState::Sw(sw) = &mut self.state else {
+      return Ok(true);
+    };
+    let state = sw.state();
+    let budget = self.limits.max_replay_bytes();
+    let mut attempts: u32 = 0;
+    while !restart.eof_sent {
+      match sw.send_eof() {
+        Ok(()) => restart.eof_sent = true,
+        Err(ffmpeg_next::Error::Other { errno }) if errno == ffmpeg_next::error::EAGAIN => {
+          if drain_into(sw, state, &mut self.sw_replay_frames, budget)? == Drained::Full {
+            return Ok(false);
+          }
+          attempts += 1;
+          if attempts > 16 {
+            // A decoder that takes neither the end nor gives a picture:
+            // treated as told, so the drain below ends it.
+            restart.eof_sent = true;
+          }
+        }
+        Err(other) => {
+          restart.eof_sent = true;
+          return Err(crate::decoder::software_exit(state, other));
+        }
+      }
+    }
+    Ok(drain_into(sw, state, &mut self.sw_replay_frames, budget)? == Drained::Empty)
+  }
+
+  /// **A drained restart, completed**: the drained decoder is reset to
+  /// anchor a post-commit resync at the keyframe the caller is sending, or
+  /// closed and one on the session's threads opened
+  /// ([`Self::open_after_drain`]).
+  fn finish_restart(&mut self) -> Result<(), Error> {
+    let Some(restart) = self.restart.take() else {
+      return Ok(());
+    };
+    match restart.kind {
+      RestartKind::Anchor => {
+        if let DecodeState::Sw(sw) = &mut self.state {
+          sw.flush();
+        }
+        Ok(())
+      }
+      RestartKind::Switch => self.open_after_drain(),
+    }
+  }
+
   /// The one open a switch attempts on the session's own threads. In tests
   /// it can be made to fail, and is counted.
   fn open_on_session_threads(&mut self) -> Result<SwDecoder, Error> {
@@ -1103,66 +1316,107 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     open_sw_decoder(&self.parameters, self.limits, Some(self.time_base))
   }
 
-  /// The software road's send: the decoder serving restarted first when
-  /// this packet is a clean random access point it was waiting for (or a
-  /// decoder opened when none is), then the packet handed to the decoder
-  /// serving now.
+  /// The software road's send: what a fallback's replay left fed first,
+  /// the decoder serving restarted when this packet is a clean random
+  /// access point it was waiting for (or a decoder opened when none is),
+  /// then the packet handed to the decoder serving now.
   ///
   /// **Two restarts, one definition of clean.** Both happen only at a clean
   /// random access point ([`access`]) or at the first keyframe after a seek,
-  /// and both begin by draining the one-thread decoder a fallback committed:
-  /// the end of the stream sent, every picture it still holds queued, so
-  /// they come out first and in order.
+  /// and both begin by draining the one-thread decoder a fallback committed
+  /// ([`Self::drain_for_restart`]): the end of the stream sent, every
+  /// picture it still holds queued, so they come out first and in order.
+  /// The drain stops where the queue reaches its budget and answers
+  /// `MustDrain`; the caller drains and sends the keyframe again, and the
+  /// drain resumes — nothing is dropped.
   ///
-  /// - **Across an open post-commit gap** the resync is anchored there
-  ///   ([`Self::anchor_resync`]): the drained decoder is reset and fed the
+  /// - **Across an open post-commit gap** the resync is anchored there: the
+  ///   drained decoder is reset (`avcodec_flush_buffers`) and fed the
   ///   keyframe, so every picture it outputs from then on is decoded from
-  ///   the keyframe or a packet after it. The session stays on its one
-  ///   thread until a clean keyframe after the resync, so the resync is
-  ///   never split across two decoders.
+  ///   the keyframe or a packet after it ([`Self::resync_on_output`]). The
+  ///   session stays on its one thread until a clean keyframe after the
+  ///   resync, so the resync is never split across two decoders.
   /// - **Otherwise**, while the session's threads are pending, it returns to
-  ///   them ([`Self::restore_session_threads`]): the drained decoder is
-  ///   closed and one on the session's threads opened.
+  ///   them: the drained decoder is closed and one on the session's threads
+  ///   opened ([`Self::open_after_drain`]).
   ///
   /// A decoder opened at an open-GOP keyframe would drop or conceal the
   /// leading pictures the closed decoder could decode, and the session never
   /// trades a picture for threads; a resync anchored at one would count
   /// pictures made from what the gap dropped as recovered.
+  ///
+  /// A decode error met while feeding what was pending is kept for the
+  /// drain ([`Self::deferred_error`]), and this send answers `MustDrain`
+  /// with the packet still the caller's.
   fn send_on_software(
     &mut self,
     pkt: &Packet,
     phase: crate::decoder::SessionPhase,
   ) -> Result<Sent, VideoDecodeError> {
-    let key = pkt.is_key();
-    let clean = self.switch_point(pkt);
-    let anchoring = clean
-      && self.degraded_resync_pending
-      && !self.degraded_anchored
-      && matches!(self.state, DecodeState::Sw(_));
-    let switching = matches!(self.state, DecodeState::SwClosed)
-      || (clean && self.sw_threads_pending && !self.degraded_resync_pending);
-    // One queue, one budget: a restart drains the decoder serving into the
-    // queue, so it waits until the caller has emptied it. The packet is
-    // still the caller's, to re-offer.
-    if (anchoring || switching) && !self.sw_replay_frames.is_empty() {
+    // An error the drain has not reported yet comes before anything more.
+    if self.deferred_error.is_some() {
       return Ok(Sent::MustDrain);
     }
-    if key {
+    // A fallback's replay left packets to feed: they come before this one.
+    match self.replay_pending() {
+      Ok(true) => {}
+      Ok(false) => return Ok(Sent::MustDrain),
+      Err(error) => {
+        self.deferred_error = Some(error);
+        return Ok(Sent::MustDrain);
+      }
+    }
+    if self.restart.is_none() && matches!(self.state, DecodeState::Sw(_)) {
+      let clean = self.switch_point(pkt);
+      let kind = if clean && self.degraded_resync_pending && !self.degraded_anchored {
+        Some(RestartKind::Anchor)
+      } else if clean && self.sw_threads_pending && !self.degraded_resync_pending {
+        Some(RestartKind::Switch)
+      } else {
+        None
+      };
+      if let Some(kind) = kind {
+        // One queue, one budget: a restart drains into the queue, so it
+        // begins once the caller has emptied it. The packet is still the
+        // caller's, to re-offer.
+        if !self.sw_replay_frames.is_empty() {
+          return Ok(Sent::MustDrain);
+        }
+        self.restart = Some(Restart {
+          kind,
+          eof_sent: false,
+        });
+      }
+    }
+    if let Some(restart) = self.restart {
+      match self.drain_for_restart() {
+        Ok(true) => {}
+        Ok(false) => return Ok(Sent::MustDrain),
+        Err(error) => {
+          self.deferred_error = Some(error);
+          return Ok(Sent::MustDrain);
+        }
+      }
+      self.finish_restart().map_err(VideoDecodeError::Decode)?;
+      if restart.kind == RestartKind::Anchor {
+        // The decoder was reset at this packet: when it is a clean random
+        // access point, every picture from here is decoded from it on.
+        self.degraded_anchored = self.switch_point(pkt);
+      }
+    }
+    if matches!(self.state, DecodeState::SwClosed) {
+      // No decoder open: one is opened, on one thread for good.
+      self.open_after_drain().map_err(VideoDecodeError::Decode)?;
+    }
+    if pkt.is_key() {
       self.seeked = false;
     }
-    if anchoring {
-      self.anchor_resync().map_err(VideoDecodeError::Decode)?;
-    }
-    if switching {
-      self
-        .restore_session_threads()
-        .map_err(VideoDecodeError::Decode)?;
-    } else if self.sw_threads_pending {
+    if self.sw_threads_pending {
       self.note_one_thread(pkt);
     }
     let DecodeState::Sw(sw) = &mut self.state else {
-      // `restore_session_threads` leaves a decoder open or returns, and
-      // no other road reaches here without one.
+      // `open_after_drain` leaves a decoder open or returns, and no other
+      // road reaches here without one.
       return Err(VideoDecodeError::Decode(Error::Ffmpeg(
         ffmpeg_next::Error::Bug,
       )));
@@ -1172,39 +1426,14 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       // Funnel, then gate. **Nothing below runs on back pressure**,
       // which is the point of returning here rather than falling
       // through: a packet libavcodec did not take must not be
-      // counted across the resync gap or recorded as a keyframe
-      // anchor, or a caller's honest re-offer would double-count
-      // it.
+      // counted across the resync gap, or a caller's honest re-offer
+      // would double-count it.
       return crate::decoder::software_send(st, e, phase).map_err(VideoDecodeError::Decode);
     }
     // Count packets crossing an unresolved post-commit resync gap so the
     // escalation at EOF can report how much tail was lost.
     self.count_degraded_packet();
     Ok(Sent::Accepted)
-  }
-
-  /// **The resync, anchored by construction**, at a clean random access
-  /// point across an open post-commit gap. The one-thread decoder serving is
-  /// drained — the end of the stream sent, every picture it still holds
-  /// queued behind the ones already waiting, so they come out first and in
-  /// order — and reset with `avcodec_flush_buffers`, so it holds nothing
-  /// from before the keyframe the caller is sending. From here every
-  /// picture it outputs is decoded from that keyframe or a packet after it,
-  /// and the first one delivered closes the gap
-  /// ([`Self::resync_on_output`]); one the keyframe cannot produce leaves it
-  /// open to the end of the stream.
-  ///
-  /// A drain that fails resets the decoder all the same: it was already
-  /// told the stream ended. The pictures it did deliver stay queued, and the
-  /// error is returned with the keyframe still the caller's.
-  fn anchor_resync(&mut self) -> Result<(), Error> {
-    let DecodeState::Sw(sw) = &mut self.state else {
-      return Ok(());
-    };
-    let drained = replay_history(sw, &[], true, &mut self.sw_replay_frames);
-    sw.flush();
-    self.degraded_anchored = true;
-    drained
   }
 
   /// Whether `pkt` is a point to restart the software decoder at: a
@@ -1367,7 +1596,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// and fail afterwards instead of rolling back. The one-thread decoder that
   /// took the input is the one committed; the session returns to its
   /// [`Threads`](crate::Threads) at the next keyframe, which is also where
-  /// this cold decoder resyncs — see [`Self::restore_session_threads`].
+  /// this cold decoder resyncs — see [`Self::send_on_software`].
   fn degrade_to_sw_inner(
     &mut self,
     input: PostCommitInput<'_>,
@@ -1445,7 +1674,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// Enter post-commit degraded mode after a post-commit fallback commits: the
   /// SW decoder opened cold and the span up to the next keyframe is being
   /// dropped. We hold this mode until the resync is anchored at a clean
-  /// random access point ([`Self::anchor_resync`]) and a picture comes out
+  /// random access point ([`Self::send_on_software`]) and a picture comes out
   /// after it ([`Self::resync_on_output`]), and the EOF escalation in
   /// [`VideoStreamDecoder::receive_frame`] reports it otherwise. Called only on
   /// the post-commit path, only after a clean commit. Resets the anchor and
@@ -1659,7 +1888,11 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       parameters: owned_parameters,
       hw_scratch: Frame::empty()?,
       sw_scratch: alloc_av_video_frame()?,
-      sw_replay_frames: VecDeque::new(),
+      sw_replay_frames: ReplayQueue::default(),
+      restart: None,
+      pending_history: VecDeque::new(),
+      pending_eof: false,
+      deferred_error: None,
       eof_sent: false,
       degraded_resync_pending: false,
       degraded_anchored: false,
@@ -1722,6 +1955,17 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// How many pictures wait in the replay queue.
   pub(crate) fn sw_replay_len_for_test(&self) -> usize {
     self.sw_replay_frames.len()
+  }
+
+  /// The bytes the pictures waiting in the replay queue hold.
+  pub(crate) fn sw_replay_bytes_for_test(&self) -> usize {
+    self.sw_replay_frames.bytes()
+  }
+
+  /// The session with its replay queue's byte budget at `bytes`.
+  pub(crate) const fn with_max_replay_bytes_for_test(mut self, bytes: usize) -> Self {
+    self.limits = self.limits.with_max_replay_bytes(bytes);
+    self
   }
 
   /// Whether the post-commit path retained any replay frames — must always be
@@ -1929,6 +2173,27 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       self.commit_delivery(new_frame, false, dst);
       return Ok(Received::Frame);
     }
+    // A decode error a send met while feeding what was pending, reported
+    // after the pictures queued before it.
+    if let Some(error) = self.deferred_error.take() {
+      return Err(VideoDecodeError::Decode(error));
+    }
+    // A restart's drain waits for the caller to send its keyframe again,
+    // which carries it on: the drained decoder is not read from here.
+    if self.restart.is_some() {
+      return Ok(Received::NeedsInput);
+    }
+    // A replay a fallback left: the next send carries it on, or — past the
+    // session's end, where nothing more can be sent — this drain does.
+    if self.has_pending_replay() {
+      if !self.eof_sent {
+        return Ok(Received::NeedsInput);
+      }
+      self.replay_pending().map_err(VideoDecodeError::Decode)?;
+      if !self.sw_replay_frames.is_empty() || self.has_pending_replay() {
+        return self.receive_frame_impl(dst);
+      }
+    }
     // A frame whose conversion did not commit is converted again before
     // the decoder is asked for another — see [`Self::scratch_pending`].
     // The scratch still holds it, and `deliver_frame` reads whichever
@@ -1989,40 +2254,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
             self
               .fall_back_to_sw(rescued, eof_pending)
               .map_err(VideoDecodeError::Decode)?;
-            // If the replay produced any drained frames, return one
-            // immediately — preserves stream order vs. whatever the
-            // SW decoder will produce next.
-            // **Peeked, not popped** — the second delivery path onto
-            // this queue, and it owes the same discipline as the first
-            // (see the head of `receive_frame_impl`). The replay queue
-            // is the rescue history's only copy of these frames, so a
-            // conversion that cannot commit must leave the head where
-            // it is rather than advance past it.
-            if let Some(replayed) = self.sw_replay_frames.front() {
-              // SAFETY: `replayed` is a live AVFrame owned by this
-              // queue; convert takes what it needs out of it.
-              let converted = unsafe {
-                convert::av_frame_to_video_frame_as::<C>(
-                  replayed.as_ptr(),
-                  self.time_base,
-                  self.limits.frame(),
-                )
-              };
-              let new_frame = match converted {
-                Ok(new_frame) => new_frame,
-                Err(e) if e.parks_in_decode() => return Err(VideoDecodeError::Convert(e)),
-                // A frame nothing can carry is dropped rather than
-                // re-offered forever.
-                Err(e) => {
-                  self.sw_replay_frames.pop_front();
-                  return Err(VideoDecodeError::Convert(e));
-                }
-              };
-              self.sw_replay_frames.pop_front();
-              self.commit_delivery(new_frame, false, dst);
-              return Ok(Received::Frame);
-            }
-            // Fall through to the loop; next iteration takes the Sw arm.
+            // Delivered from the top, where the replay's queue comes first
+            // and what it left pending is carried on — preserving stream
+            // order against whatever the SW decoder produces next.
+            return self.receive_frame_impl(dst);
           }
           Err(other) => return Err(VideoDecodeError::Decode(other)),
         },
@@ -2108,6 +2343,43 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     if self.scratch_pending {
       return Ok(Sent::MustDrain);
     }
+    // On the software road what is pending comes first: an error the drain
+    // has not reported, the packets and the end a fallback's replay left —
+    // whose end, once fed, is this one — and a restart's drain, whose
+    // decoder was told the stream ended already and, drained, has nothing
+    // left to restart for.
+    if matches!(self.state, DecodeState::Sw(_)) {
+      if self.deferred_error.is_some() {
+        return Ok(Sent::MustDrain);
+      }
+      let forwarding = self.pending_eof;
+      match self.replay_pending() {
+        Ok(true) => {}
+        Ok(false) => return Ok(Sent::MustDrain),
+        Err(error) => {
+          self.deferred_error = Some(error);
+          return Ok(Sent::MustDrain);
+        }
+      }
+      if forwarding {
+        self.eof_sent = true;
+        return Ok(Sent::Accepted);
+      }
+      if self.restart.is_some() {
+        match self.drain_for_restart() {
+          Ok(true) => {
+            self.restart = None;
+            self.eof_sent = true;
+            return Ok(Sent::Accepted);
+          }
+          Ok(false) => return Ok(Sent::MustDrain),
+          Err(error) => {
+            self.deferred_error = Some(error);
+            return Ok(Sent::MustDrain);
+          }
+        }
+      }
+    }
     let phase = self.phase();
     let outcome = match &mut self.state {
       DecodeState::Hw(hw) => match hw.send_eof() {
@@ -2153,12 +2425,15 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
               .map_err(VideoDecodeError::Decode)
           } else {
             // Probe-era: replay the buffered history (lossless), re-forwarding
-            // EOF inside the transaction.
+            // EOF inside the transaction. A replay the queue's budget stopped
+            // has not fed the end yet: the caller drains and sends it again,
+            // and the software road feeds what is left, the end last.
             let rescued = p.into_unconsumed_packets();
-            self
-              .fall_back_to_sw(rescued, true)
-              .map(|()| Sent::Accepted)
-              .map_err(VideoDecodeError::Decode)
+            match self.fall_back_to_sw(rescued, true) {
+              Ok(()) if self.has_pending_replay() => Ok(Sent::MustDrain),
+              Ok(()) => Ok(Sent::Accepted),
+              Err(error) => Err(VideoDecodeError::Decode(error)),
+            }
           }
         }
         Err(other) => Err(VideoDecodeError::Decode(other)),
@@ -2196,6 +2471,12 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     // flushing the inner decoder — otherwise a seek/reset would
     // surface stale pre-flush frames on the next `receive_frame`.
     self.sw_replay_frames.clear();
+    // So does what was pending: a replay's unfed packets, a restart's drain
+    // (the flush below resets its decoder), an error not yet reported.
+    self.pending_history.clear();
+    self.pending_eof = false;
+    self.restart = None;
+    self.deferred_error = None;
     // And a parked frame belongs to the position being abandoned.
     self.scratch_pending = false;
     // Flush ends the drain phase; the decoder accepts new packets
@@ -2216,8 +2497,8 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       // **A one-thread decoder a fallback committed is flushed and kept.**
       // The session's threads come back at the first keyframe after the
       // flush — where a seek lands — by the same rule as anywhere else
-      // (see [`Self::restore_session_threads`]); the flushed decoder has
-      // nothing left to drain there.
+      // (see [`Self::send_on_software`]); the flushed decoder has nothing
+      // left to drain there.
       DecodeState::Sw(sw) => sw.flush(),
       DecodeState::SwClosed => {}
     }
@@ -2395,103 +2676,104 @@ macro_rules! video_lane_face {
 
 video_lane_face!(crate::View, crate::Owned);
 
-/// Feeds a software decoder `unconsumed_packets`, the end of the stream
-/// when `eof_pending`, and a final drain — the body of the probe-era
-/// fallback transaction (see `fall_back_to_sw_inner`), and, with no
-/// packets and the end, the drain that empties a one-thread decoder
-/// before the session returns to its threads at a keyframe (see
-/// `restore_session_threads`). Either way the drained pictures go to
-/// `local_replay`, at most [`SW_REPLAY_FRAME_CAP`] of them.
+/// How far a replay got: the packets the decoder took — a packet it
+/// failed counted with them, consumed — and whether it took the end of the
+/// stream.
+#[derive(Default)]
+struct Replay {
+  fed: usize,
+  eof_sent: bool,
+}
+
+/// How a drain into the queue stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Drained {
+  /// The decoder has no picture ready, for now or for good.
+  Empty,
+  /// The queue reached its budget first; the decoder may hold more.
+  Full,
+}
+
+/// Feeds a software decoder `packets`, then the end of the stream when
+/// `eof`, pulling every picture it makes into `queue` — the body of the
+/// probe-era fallback's transaction (see `fall_back_to_sw_inner`) and of
+/// the replay it leaves for the caller's drains (see `replay_pending`).
+///
+/// Stops, resumable, between packets once `queue` reaches `budget`
+/// ([`ReplayQueue::full`]): `progress` says how far it got, and the rest is
+/// fed by a later call. Nothing is dropped.
 fn replay_history(
   sw: &mut SwDecoder,
-  unconsumed_packets: &[ffmpeg_next::Packet],
-  eof_pending: bool,
-  local_replay: &mut VecDeque<frame::Video>,
+  packets: &[ffmpeg_next::Packet],
+  eof: bool,
+  queue: &mut ReplayQueue,
+  budget: usize,
+  progress: &mut Replay,
 ) -> Result<(), Error> {
   // Bound before the decoder is mutably borrowed, so the error
   // closures below can still consult it.
   let sw_state = sw.state();
-  // Helper: drain SW into the local replay queue, capped at
-  // `SW_REPLAY_FRAME_CAP`.
-  //
-  // Error discipline: stop the drain **only** on the transient
-  // backpressure signals EAGAIN / EOF (the decoder has no more output for
-  // now). Every other `ffmpeg_next::Error` — e.g. `InvalidData` from a
-  // corrupt replayed packet — is a real decode failure and is propagated,
-  // so a non-recoverable error surfaces as `FallbackFailed` (carrying the
-  // replay packets) instead of being silently swallowed and the fallback
-  // committed over corruption.
-  fn drain_into(
-    sw: &mut SwDecoder,
-    state: *const crate::ffi::CallbackState,
-    local_replay: &mut VecDeque<frame::Video>,
-  ) -> std::result::Result<(), Error> {
-    loop {
-      let mut tmp = alloc_av_video_frame()?;
-      match sw.receive_frame(&mut tmp) {
-        Ok(()) => {
-          if local_replay.len() >= SW_REPLAY_FRAME_CAP {
-            tracing::error!(
-              cap = SW_REPLAY_FRAME_CAP,
-              "mediadecode-ffmpeg: the software decoder's queue of pictures waiting for \
-               delivery is full; refusing rather than growing it (the pictures past the \
-               cap stay in the decoder and are released when it drops)",
-            );
-            return Err(Error::ReplayQueueFull(crate::ReplayQueueFull::new(
-              SW_REPLAY_FRAME_CAP,
-            )));
-          }
-          local_replay.push_back(tmp);
-        }
-        // EAGAIN / EOF: no more output for now — stop draining, success.
-        Err(ffmpeg_next::Error::Other { errno }) if errno == ffmpeg_next::error::EAGAIN => {
-          break;
-        }
-        Err(ffmpeg_next::Error::Eof) => break,
-        // Any other error is a genuine decode failure on a replayed
-        // packet — surface it so it is not masked as a clean fallback.
-        Err(other) => return Err(crate::decoder::software_exit(state, other)),
-      }
+  for pkt in packets {
+    if queue.full(budget) {
+      return Ok(());
     }
-    Ok(())
-  }
-
-  for pkt in unconsumed_packets {
     let mut attempts: u32 = 0;
     loop {
       match sw.submit(pkt) {
         Ok(()) => break,
         Err(ffmpeg_next::Error::Other { errno }) if errno == ffmpeg_next::error::EAGAIN => {
-          drain_into(sw, sw_state, local_replay)?;
+          if drain_into(sw, sw_state, queue, budget)? == Drained::Full {
+            return Ok(());
+          }
           attempts += 1;
           if attempts > 16 {
+            // A decoder that takes neither the packet nor gives a picture:
+            // the packet is consumed with the error, so a retry moves on.
+            progress.fed += 1;
             return Err(Error::Ffmpeg(ffmpeg_next::Error::Other {
               errno: ffmpeg_next::error::EAGAIN,
             }));
           }
         }
-        Err(other) => return Err(crate::decoder::software_exit(sw_state, other)),
+        Err(other) => {
+          progress.fed += 1;
+          return Err(crate::decoder::software_exit(sw_state, other));
+        }
       }
+    }
+    progress.fed += 1;
+    // What it made, pulled now, so an error it carries surfaces with it.
+    if drain_into(sw, sw_state, queue, budget)? == Drained::Full {
+      return Ok(());
     }
   }
   // Re-forward EOF if the HW path already saw it. SW EOF can also
   // return EAGAIN until prior output is drained — mirror the
   // packet-replay loop.
-  if eof_pending {
+  if eof && !progress.eof_sent {
     let mut attempts: u32 = 0;
     loop {
       match sw.send_eof() {
-        Ok(()) => break,
+        Ok(()) => {
+          progress.eof_sent = true;
+          break;
+        }
         Err(ffmpeg_next::Error::Other { errno }) if errno == ffmpeg_next::error::EAGAIN => {
-          drain_into(sw, sw_state, local_replay)?;
+          if drain_into(sw, sw_state, queue, budget)? == Drained::Full {
+            return Ok(());
+          }
           attempts += 1;
           if attempts > 16 {
+            progress.eof_sent = true;
             return Err(Error::Ffmpeg(ffmpeg_next::Error::Other {
               errno: ffmpeg_next::error::EAGAIN,
             }));
           }
         }
-        Err(other) => return Err(crate::decoder::software_exit(sw_state, other)),
+        Err(other) => {
+          progress.eof_sent = true;
+          return Err(crate::decoder::software_exit(sw_state, other));
+        }
       }
     }
   }
@@ -2508,11 +2790,97 @@ fn replay_history(
   // wrapped as `FallbackFailed` (retaining the rescued packets) and the
   // decoder stays on HW — nothing is committed. (Only the probe-era path
   // reaches this; the post-commit path degrades via `degrade_to_sw` and never
-  // replays, so it has no drained frames to commit or convert.) On a
-  // frame-threaded decoder the drain reaches only what its threads have
-  // finished, which is why the transaction is decided on one thread — see
-  // `fall_back_to_sw_inner`.
-  drain_into(sw, sw_state, local_replay)
+  // replays.) On a frame-threaded decoder the drain reaches only what its
+  // threads have finished, which is why the transaction is decided on one
+  // thread — see `fall_back_to_sw_inner`. A queue at its budget stops it:
+  // the pictures still in the decoder come out on the drain, after the queue.
+  drain_into(sw, sw_state, queue, budget)?;
+  Ok(())
+}
+
+/// Pulls the decoder's pictures into `queue` until it has none ready or
+/// the queue reaches `budget` — checked before each picture is received, so
+/// the queue holds at most one picture past it, and nothing received is
+/// dropped. A picture whose footprint alone exceeds `budget` can never be
+/// queued under it — no progress is possible — and is refused by name,
+/// [`Error::ReplayQueueFull`].
+///
+/// Error discipline: stop the drain **only** on the transient signals
+/// EAGAIN / EOF (the decoder has no more output for now). Every other
+/// `ffmpeg_next::Error` — e.g. `InvalidData` from a corrupt packet — is a
+/// real decode failure and is propagated, so a non-recoverable error
+/// surfaces instead of being silently swallowed.
+fn drain_into(
+  sw: &mut SwDecoder,
+  state: *const crate::ffi::CallbackState,
+  queue: &mut ReplayQueue,
+  budget: usize,
+) -> std::result::Result<Drained, Error> {
+  loop {
+    if queue.full(budget) {
+      return Ok(Drained::Full);
+    }
+    let mut tmp = alloc_av_video_frame()?;
+    match sw.receive_frame(&mut tmp) {
+      Ok(()) => {
+        let bytes = footprint(&tmp);
+        if bytes > budget {
+          tracing::error!(
+            bytes,
+            budget,
+            "mediadecode-ffmpeg: a decoded picture alone exceeds the software decoder's \
+             replay budget; refusing it rather than queue past the budget",
+          );
+          return Err(Error::ReplayQueueFull(crate::ReplayQueueFull::new(
+            bytes, budget,
+          )));
+        }
+        queue.push_back(tmp, bytes);
+      }
+      // EAGAIN / EOF: no more output for now — stop draining, success.
+      Err(ffmpeg_next::Error::Other { errno }) if errno == ffmpeg_next::error::EAGAIN => {
+        return Ok(Drained::Empty);
+      }
+      Err(ffmpeg_next::Error::Eof) => return Ok(Drained::Empty),
+      // Any other error is a genuine decode failure — surface it so it is
+      // not masked.
+      Err(other) => return Err(crate::decoder::software_exit(state, other)),
+    }
+  }
+}
+
+/// The bytes a decoded picture holds: the sizes of the buffers it
+/// references — `buf[]` and `extended_buf` — or, for one that references
+/// none, an upper bound on what its format and dimensions allocate
+/// (`crate::footprint::video_frame_bytes`).
+fn footprint(frame: &frame::Video) -> usize {
+  // SAFETY: `frame` is a live `AVFrame`; its buffer pointers, their
+  // `size`, the extended buffer count and three plain integers are read,
+  // and no reference into FFmpeg memory is kept.
+  unsafe {
+    let raw = frame.as_ptr();
+    let mut total: usize = 0;
+    for &buf in &(*raw).buf {
+      if !buf.is_null() {
+        total = total.saturating_add((*buf).size);
+      }
+    }
+    let extended = (*raw).extended_buf;
+    let count = usize::try_from((*raw).nb_extended_buf).unwrap_or(0);
+    if !extended.is_null() {
+      for index in 0..count {
+        let buf = *extended.add(index);
+        if !buf.is_null() {
+          total = total.saturating_add((*buf).size);
+        }
+      }
+    }
+    if total == 0 {
+      total = crate::footprint::video_frame_bytes((*raw).format, (*raw).width, (*raw).height)
+        .unwrap_or(0);
+    }
+    total
+  }
 }
 
 fn open_sw_decoder(
@@ -2532,7 +2900,7 @@ fn open_sw_decoder(
   // purpose, at open-time exhaustion, or at the first keyframe after a
   // mid-stream fallback, whose two transactions commit a one-thread
   // decoder opened here too (see `fall_back_to_sw_inner` and
-  // `restore_session_threads`). See [`crate::Threads`] for the cost and
+  // `open_after_drain`). See [`crate::Threads`] for the cost and
   // `request_threads` for why the allocator judge is safe on
   // libavcodec's worker threads.
   crate::decoder::request_threads(&mut ctx, limits.threads());

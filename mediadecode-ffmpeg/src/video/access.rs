@@ -1,6 +1,7 @@
 //! **Where a decoder can start without losing a picture**: the clean
 //! random access points at which a software session returns to its threads
-//! after a fallback (see `CarrierVideoStreamDecoder::restore_session_threads`).
+//! after a fallback, and at which a post-commit resync is anchored (see
+//! `CarrierVideoStreamDecoder::send_on_software`).
 //!
 //! A keyframe is a *clean* random access point when nothing after it in
 //! decode order references a picture before it. A decoder opened there

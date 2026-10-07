@@ -147,10 +147,12 @@ pub enum Error {
   #[error(transparent)]
   FallbackFailed(#[from] FallbackFailed),
 
-  /// The software video road's queue of decoded pictures waiting for
-  /// delivery would pass its cap — the pictures a fallback replay decoded,
-  /// or the tail a one-thread decoder is drained of when a session returns
-  /// to its threads at a keyframe. Refused rather than grown; see
+  /// A decoded picture alone exceeds the byte budget of the software video
+  /// road's queue of pictures waiting for delivery
+  /// ([`DecoderLimits::max_replay_bytes`](crate::DecoderLimits::max_replay_bytes))
+  /// — a picture a fallback replay decoded, or one of the tail a one-thread
+  /// decoder is drained of where the session restarts it at a keyframe. No
+  /// drain can make room for it, so it is refused by name; see
   /// [`ReplayQueueFull`].
   #[error(transparent)]
   ReplayQueueFull(#[from] ReplayQueueFull),
@@ -159,27 +161,39 @@ pub enum Error {
 /// Payload for [`Error::ReplayQueueFull`].
 ///
 /// One budget spans the whole queue — what a replay left waiting and any
-/// tail drained behind it — so no sequence of fallbacks and switches can
-/// grow it past the cap; the pictures past it are refused, by this name.
+/// tail drained behind it. A drain that reaches it stops and resumes once
+/// the caller has taken pictures, so pictures are never refused for the
+/// queue being full; only a picture that alone exceeds the budget, which no
+/// draining could make room for, is refused, by this name. The picture is
+/// released with the refusal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error(
-  "the software video decoder's queue of decoded pictures waiting for delivery is full at {cap}; \
-   drain it before sending more"
+  "a decoded picture of {frame_bytes} bytes alone exceeds the software video decoder's replay \
+   budget of {budget} bytes"
 )]
 pub struct ReplayQueueFull {
-  cap: usize,
+  frame_bytes: usize,
+  budget: usize,
 }
 
 impl ReplayQueueFull {
   /// Constructs a [`ReplayQueueFull`] payload.
   #[inline]
-  pub const fn new(cap: usize) -> Self {
-    Self { cap }
+  pub const fn new(frame_bytes: usize, budget: usize) -> Self {
+    Self {
+      frame_bytes,
+      budget,
+    }
   }
-  /// The most pictures the queue holds.
+  /// The bytes the refused picture holds.
   #[inline]
-  pub const fn cap(&self) -> usize {
-    self.cap
+  pub const fn frame_bytes(&self) -> usize {
+    self.frame_bytes
+  }
+  /// The queue's byte budget it exceeds.
+  #[inline]
+  pub const fn budget(&self) -> usize {
+    self.budget
   }
 }
 

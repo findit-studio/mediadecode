@@ -3934,6 +3934,187 @@ fn a_keyframe_only_stream_whose_threads_will_not_open_keeps_its_queue_bounded() 
   assert_eq!(delivered, clip.packets.len(), "no picture lost");
 }
 
+/// The bytes one decoded picture of `clip` holds in the replay queue: its
+/// first packet decoded alone, on one thread.
+fn picture_bytes(clip: &SyntheticClip) -> usize {
+  let mut sw = super::open_sw_decoder(
+    &clip.parameters,
+    crate::DecoderLimits::default().with_threads(crate::Threads::Single),
+    None,
+  )
+  .expect("a software decoder");
+  sw.submit(&clip.packets[0]).expect("the first packet");
+  sw.send_eof().expect("the end of the stream");
+  let mut frame = alloc_av_video_frame().expect("a frame");
+  sw.receive_frame(&mut frame).expect("a picture");
+  super::footprint(&frame)
+}
+
+/// LAW (Codex R4, [high]): **a replay whose pictures pass the budget is
+/// drained in rounds, and loses nothing.** A probe-era fallback replays
+/// nine packets of 4K pictures into a queue whose byte budget holds two and
+/// a half of them. The replay stops each time the queue passes it,
+/// answering `MustDrain` with the current packet still the caller's; the
+/// caller drains and sends it again, and the replay resumes where it
+/// stopped. It takes several rounds; every picture comes out once, in
+/// order; and the queue never holds more than one picture past its budget.
+#[test]
+fn a_replay_past_the_budget_is_drained_in_rounds_and_loses_nothing() {
+  let (w, h) = (3840u32, 2160u32);
+  let clip = encode_synthetic_clip(w, h, 12, 12);
+  let picture = picture_bytes(&clip);
+  let budget = picture * 5 / 2;
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test(
+    Box::new(FakeHw::failing(w, h, 0, 9, FailShape::ProbeEra)),
+    clip.parameters.clone(),
+    tb,
+  )
+  .expect("build test decoder")
+  .with_threads_for_test(crate::Threads::Single)
+  .with_max_replay_bytes_for_test(budget);
+
+  let mut dst = crate::empty_owned_video_frame();
+  let mut shown: Vec<i64> = Vec::new();
+  let mut drain = |dec: &mut FfmpegVideoStreamDecoder, shown: &mut Vec<i64>| {
+    while let Received::Frame = dec.receive_frame(&mut dst).expect("receive_frame") {
+      shown.push(dst.pts().map_or(i64::MIN, |t| t.pts()));
+    }
+  };
+  let mut rounds = 0usize;
+  let mut most = 0usize;
+  for av_pkt in &clip.packets {
+    loop {
+      match dec.send_packet(&pushed(av_pkt)).expect("send_packet") {
+        Sent::Accepted => break,
+        Sent::MustDrain => {
+          rounds += 1;
+          most = most.max(dec.sw_replay_bytes_for_test());
+          drain(&mut dec, &mut shown);
+        }
+      }
+    }
+    most = most.max(dec.sw_replay_bytes_for_test());
+    drain(&mut dec, &mut shown);
+  }
+  crate::accepted(dec.send_eof(), "send_eof");
+  drain(&mut dec, &mut shown);
+
+  assert!(dec.is_software(), "the probe-era fallback committed");
+  assert!(
+    rounds >= 2,
+    "the replay was drained in several rounds, not {rounds}"
+  );
+  assert_eq!(
+    shown,
+    (0..clip.packets.len() as i64).collect::<Vec<_>>(),
+    "every picture, once, in order"
+  );
+  assert!(
+    most <= budget + picture,
+    "the queue held {most} bytes, more than one picture past its budget of {budget}"
+  );
+}
+
+/// LAW (Codex R4, [high]): **a switch's drain past the budget waits for the
+/// caller, and loses nothing.** A closed-GOP H.264 stream with B-frames
+/// falls back on its probe at packet 3, on three threads, with a byte
+/// budget of one picture. At the next IDR the one-thread decoder's tail
+/// passes the budget: the send answers `MustDrain` with the IDR still the
+/// caller's, and the drained decoder stays open. Drained and sent again,
+/// the drain resumes, the session switches, and every picture comes out
+/// once, in presentation order — exactly as the same fallback delivers them
+/// on one thread.
+#[test]
+fn a_switch_drain_past_the_budget_waits_for_the_caller_and_loses_nothing() {
+  let clip = encode_h264_closed_gops(128, 96, 40);
+  let picture = picture_bytes(&clip);
+  let idr = keyframe_after(&clip, 3);
+  let three = core::num::NonZeroU32::new(3).expect("nonzero");
+  let (single, _) = threads_through_a_fallback(&clip, 3, crate::Threads::Single);
+
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test(
+    Box::new(FakeHw::failing(16, 16, 0, 3, FailShape::ProbeEra)),
+    clip.parameters.clone(),
+    tb,
+  )
+  .expect("build test decoder")
+  .with_threads_for_test(crate::Threads::Count(three))
+  .with_max_replay_bytes_for_test(picture);
+  let mut dst = crate::empty_owned_video_frame();
+  let mut shown = Vec::new();
+  let mut drained_at = Vec::new();
+  for (index, av_pkt) in clip.packets.iter().enumerate() {
+    loop {
+      match dec.send_packet(&pushed(av_pkt)).expect("send_packet") {
+        Sent::Accepted => break,
+        Sent::MustDrain => {
+          drained_at.push(index);
+          while let Received::Frame = dec.receive_frame(&mut dst).expect("receive_frame") {
+            shown.push(dst.pts());
+          }
+        }
+      }
+    }
+    while let Received::Frame = dec.receive_frame(&mut dst).expect("receive_frame") {
+      shown.push(dst.pts());
+    }
+  }
+  crate::accepted(dec.send_eof(), "send_eof");
+  while let Received::Frame = dec.receive_frame(&mut dst).expect("receive_frame") {
+    shown.push(dst.pts());
+  }
+
+  assert!(
+    drained_at.contains(&idr),
+    "the switch's drain at the IDR {idr} passed the budget and waited: {drained_at:?}"
+  );
+  assert_eq!(dec.active_threads(), Some(three), "the session switched");
+  assert_eq!(shown, single, "no picture lost, none moved");
+}
+
+/// LAW (Codex R4, [high]): **only a picture that alone exceeds the budget
+/// is refused, by name.** With a byte budget of one, no picture can ever be
+/// queued under it: the probe-era replay's first picture is refused as
+/// `ReplayQueueFull`, naming its bytes and the budget, and the fallback
+/// fails whole — `FallbackFailed` hands back every rescued packet, and the
+/// session stays where it was.
+#[test]
+fn only_a_picture_that_alone_exceeds_the_budget_is_refused_by_name() {
+  let clip = encode_synthetic_clip(96, 64, 12, 6);
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test(
+    Box::new(FakeHw::failing(96, 64, 0, 5, FailShape::ProbeEra)),
+    clip.parameters.clone(),
+    tb,
+  )
+  .expect("build test decoder")
+  .with_max_replay_bytes_for_test(1);
+  for av_pkt in &clip.packets[..5] {
+    crate::accepted(dec.send_packet(&pushed(av_pkt)), "send_packet");
+  }
+  match dec.send_packet(&pushed(&clip.packets[5])) {
+    Err(VideoDecodeError::Decode(Error::FallbackFailed(failed))) => {
+      assert!(
+        matches!(
+          failed.source(),
+          Error::ReplayQueueFull(full) if full.budget() == 1 && full.frame_bytes() > 1
+        ),
+        "refused by name: {:?}",
+        failed.source()
+      );
+      assert_eq!(
+        failed.unconsumed_packets().len(),
+        5,
+        "every rescued packet handed back"
+      );
+    }
+    other => panic!("expected the replay refused by name, got {other:?}"),
+  }
+  assert!(dec.is_hardware(), "the session stayed where it was");
+}
+
 /// The post-commit road the resync laws stand on: a clip with keyframes at
 /// 0, 6, 12 and 18; the hardware decodes up to packet 8 and fails there
 /// post-commit (a P-frame the cold decoder takes, as

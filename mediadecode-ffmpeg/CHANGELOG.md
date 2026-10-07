@@ -23,11 +23,26 @@ The backend-agnostic core it adapts has its own log at
   libavcodec takes frame threading where the codec has it, slice
   threading where it has only that, and one thread otherwise.
 
-- **`Error::ReplayQueueFull`** (`ReplayQueueFull { cap }`, exported): the
-  software video road's queue of decoded pictures waiting for delivery —
-  a fallback replay's, or the tail a one-thread decoder is drained of at a
-  thread switch — refuses past its one cap (64 pictures) by this name,
-  where a replay overflow used to surface as a bare `ENOMEM`.
+- **A byte budget for the software video road's queue of decoded
+  pictures waiting for delivery**, `DecoderLimits::max_replay_bytes`
+  (`with_` / `set_`, default `DEFAULT_MAX_REPLAY_BYTES`, 512 MiB, exported),
+  beside the threads it serves. The queue takes a fallback replay's pictures
+  and the tail a one-thread decoder is drained of where the session restarts
+  it at a clean keyframe; each picture counts the buffers it references, and
+  64 pictures bound the queue besides. A replay used to abort at 64 pictures
+  whatever their size — up to 32 GiB of 4K pictures at the per-picture
+  ceiling — and a switch's drain that passed the cap dropped the rest of the
+  tail. Now a drain that reaches either bound stops and answers
+  `Sent::MustDrain` with the packet (or the end of the stream) still the
+  caller's, and resumes once the caller has taken pictures: a replay
+  committed at the budget feeds its remaining packets before anything sent
+  next, and a restart's decoder stays open, draining, until it has given its
+  last. Nothing is dropped.
+
+- **`Error::ReplayQueueFull`** (`ReplayQueueFull { frame_bytes, budget }`,
+  exported): a decoded picture that alone exceeds that budget, which no
+  drain can make room for, is refused by this name, where a replay overflow
+  used to surface as a bare `ENOMEM`.
 
 - **`active_threads()` on the video stream decoder**: the count
   libavcodec settled on, read back from the opened context of the
@@ -87,8 +102,8 @@ The backend-agnostic core it adapts has its own log at
   The session's threads are attempted once: a decoder on them that will
   not open leaves the session on one thread for good. A switch drains the
   old decoder into the session's queue of pictures waiting for delivery,
-  so it is attempted only while that queue is empty — the send answers
-  `MustDrain` until it is — and the queue has one cap across everything
+  so it begins only while that queue is empty — the send answers
+  `MustDrain` until it is — and the queue has one budget across everything
   in it.
 
 ### Fixed
