@@ -111,22 +111,28 @@ The backend-agnostic core it adapts has its own log at
 
 ### Fixed
 
-- **A post-commit resync is proved by construction, at a clean random
-  access point.** Any keyframe the cold software decoder took used to arm
-  the proof, and the next picture delivered — even a concealed one from
-  before the keyframe, delivered late — cleared the guard; a keyframe that
-  decoded to nothing then let the end of the stream pass as clean instead
-  of escalating `PostCommitNeverResynced`. The resync is now anchored only
-  at a clean random access point across the gap, the one definition the
-  thread switch uses. There the session drains its one-thread decoder,
-  every picture it still holds delivered first and in order, resets it
-  with `avcodec_flush_buffers` and feeds it the keyframe. Every picture the
-  decoder outputs after that is decoded from the keyframe or a later
-  packet, so the first one delivered closes the gap; no picture is matched
-  to a packet. A key-flagged packet that is not clean (an H.264 recovery
-  point, an HEVC CRA) never anchors the resync, so a stream with no clean
-  point after a post-commit fallback reports `PostCommitNeverResynced` at
-  its end.
+- **A post-commit resync is proved by the decoder's reorder bound.** Any
+  keyframe the cold software decoder took used to arm the proof, and the
+  next picture delivered — even a concealed one from before the keyframe,
+  delivered late — cleared the guard; a keyframe that decoded to nothing
+  then let the end of the stream pass as clean instead of escalating
+  `PostCommitNeverResynced`. The anchor is still any key-flagged packet fed
+  across the gap — an intra picture resets the references of every picture
+  after it that does not lead it — but it is fed only once the decoder holds
+  no picture the caller has not taken (the send answers `MustDrain` until
+  then), and the gap closes at the delivery of the `has_b_frames + 1`-th
+  picture out after it (`has_b_frames` read live, the larger of its value at
+  the anchor and now; the first picture for VP8, VP9 and AV1): the pictures
+  before it are at most the ones the reorder buffer held from before the
+  anchor. Nothing is drained or reset for the resync, and no picture is
+  matched to a packet. At the end of the stream an anchor with a picture out
+  since closes the gap too; a decode error before the gap closes leaves the
+  anchor in doubt, and the next key-flagged packet anchors again.
+  `PostCommitNeverResynced` is raised only when no key-flagged packet was fed
+  across the gap or none had a picture out after it, still once, as the `Err`
+  of the `receive_frame` that reaches the end, after every picture was
+  delivered; its `packets_lost` counts the packets fed across the gap before
+  an anchor, and never one decoded since.
 
 ## [0.15.1] - 2026-10-05
 
