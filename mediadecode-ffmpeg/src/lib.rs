@@ -134,7 +134,7 @@ pub use limits::{
   DEFAULT_MAX_PACKET_BYTES, DEFAULT_MAX_PIXELS, DEFAULT_MAX_PROBE_BYTES, DEFAULT_MAX_STREAMS,
   DEFAULT_MAX_TOTAL_ATTACHMENT_BYTES, DEFAULT_MAX_TOTAL_CHAPTER_TITLE_BYTES,
   DEFAULT_MAX_TOTAL_CODEC_PARAMETER_BYTES, DEFAULT_MAX_TOTAL_STREAM_METADATA_BYTES, DecoderLimits,
-  DemuxLimits, FrameLimits, PacketLimits,
+  DemuxLimits, FrameLimits, PacketLimits, Threads,
 };
 #[cfg(feature = "resample")]
 #[cfg_attr(docsrs, doc(cfg(feature = "resample")))]

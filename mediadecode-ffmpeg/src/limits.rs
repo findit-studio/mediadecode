@@ -479,12 +479,17 @@ impl PacketLimits {
 /// Taken at `open` by every decoder session in this crate, for the
 /// reason [`FrameLimits`] gives: half of it is written into an
 /// `AVCodecContext` whose ceilings cannot move after `avcodec_open2`.
+///
+/// The same reason carries [`Threads`], the one seat here that is not a
+/// byte ceiling: how many threads a software video decoder may decode
+/// on is also a context field libavcodec reads once, at open.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DecoderLimits {
   frame: FrameLimits,
   max_codec_parameter_bytes: usize,
   max_packet_bytes: usize,
   max_image_input_bytes: usize,
+  threads: Threads,
 }
 
 impl Default for DecoderLimits {
@@ -496,8 +501,8 @@ impl Default for DecoderLimits {
 
 impl DecoderLimits {
   /// The defaults: [`FrameLimits::new`],
-  /// [`DEFAULT_MAX_CODEC_PARAMETER_BYTES`], [`DEFAULT_MAX_PACKET_BYTES`]
-  /// and [`DEFAULT_MAX_IMAGE_INPUT_BYTES`].
+  /// [`DEFAULT_MAX_CODEC_PARAMETER_BYTES`], [`DEFAULT_MAX_PACKET_BYTES`],
+  /// [`DEFAULT_MAX_IMAGE_INPUT_BYTES`] and [`Threads::Auto`].
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new() -> Self {
     Self {
@@ -505,6 +510,7 @@ impl DecoderLimits {
       max_codec_parameter_bytes: DEFAULT_MAX_CODEC_PARAMETER_BYTES,
       max_packet_bytes: DEFAULT_MAX_PACKET_BYTES,
       max_image_input_bytes: DEFAULT_MAX_IMAGE_INPUT_BYTES,
+      threads: Threads::Auto,
     }
   }
 
@@ -543,6 +549,13 @@ impl DecoderLimits {
   pub const fn max_image_input_bytes(&self) -> usize {
     self.max_image_input_bytes
   }
+  /// How many threads a **software video** decoder opened under these
+  /// limits may decode on. See [`Threads`] for what each arm writes and
+  /// which roads read it.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn threads(&self) -> Threads {
+    self.threads
+  }
 
   /// Sets the frame ceilings (consuming builder).
   #[cfg_attr(not(tarpaulin), inline(always))]
@@ -572,6 +585,13 @@ impl DecoderLimits {
     self.max_image_input_bytes = value;
     self
   }
+  /// Sets the software video decoder's threads (consuming builder).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
+  pub const fn with_threads(mut self, value: Threads) -> Self {
+    self.threads = value;
+    self
+  }
 
   /// Sets the frame ceilings in place.
   #[cfg_attr(not(tarpaulin), inline(always))]
@@ -596,6 +616,123 @@ impl DecoderLimits {
   pub const fn set_max_image_input_bytes(&mut self, value: usize) -> &mut Self {
     self.max_image_input_bytes = value;
     self
+  }
+  /// Sets the software video decoder's threads in place.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn set_threads(&mut self, value: Threads) -> &mut Self {
+    self.threads = value;
+    self
+  }
+}
+
+/// How many threads a **software video** decoder may decode on.
+///
+/// Written to `AVCodecContext.thread_count` and `thread_type` before
+/// `avcodec_open2`, because libavcodec reads both once, at open, and
+/// neither can move after it — the same reason the rest of
+/// [`DecoderLimits`] is taken at `open`.
+///
+/// # The default is [`Auto`](Self::Auto)
+///
+/// Through 0.15 nothing was written, and libavcodec kept its option
+/// default of **one** thread: a software decode of 4K H.264 High 4:2:2
+/// 10-bit — a stream VideoToolbox does not take — ran on one core, and
+/// that core was the whole video wall of a library scan
+/// ([mediagraph#537](https://github.com/findit-studio/mediagraph/issues/537)).
+/// `Auto` hands the count to libavcodec, which picks one more thread
+/// than the host has cores, at most 16, for a codec that can thread.
+///
+/// # The kind of threading is libavcodec's to pick
+///
+/// [`Auto`](Self::Auto) and [`Count`](Self::Count) write
+/// `thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE`. libavcodec takes
+/// frame threading where the codec supports it (H.264, HEVC, MPEG-4
+/// part 2, VP8, VP9, …), slice threading where it supports only that,
+/// and one thread where it supports neither. What it settled on is
+/// read back after the open as
+/// [`active_threads`](crate::CarrierVideoStreamDecoder::active_threads).
+///
+/// # What frame threading costs, and what it does not
+///
+/// * **Latency.** A frame-threaded decoder keeps up to one frame per
+///   thread in flight, so its first picture comes out up to that many
+///   packets later, and every picture after it lags by as much.
+///   Nothing a caller does changes: the push face already answers
+///   "needs input" for as long as the decoder wants more, and
+///   `send_eof` drains whatever is still in flight.
+/// * **Memory.** Each frame in flight is a picture of its own — a 4K
+///   4:2:2 10-bit picture is about 33 MB — and each thread holds a copy
+///   of the decoder's state. [`FrameLimits`] still prices every one of
+///   those pictures before it is allocated; it does not bound how many
+///   are in flight at once. A deployment that needs that bound says
+///   [`Count`](Self::Count).
+/// * **Not the pictures.** Frame threading changes *when* a picture
+///   comes out, never its bytes: the same stream decodes to the same
+///   planes under `Auto` and under [`Single`](Self::Single).
+///
+/// A keyframe-only read — the shape of `ffmpeg -skip_frame nokey`, or a
+/// caller that sends only keyframe packets — still gains: keyframes do
+/// not reference one another, so each is decoded on a thread of its
+/// own.
+///
+/// # Every software road, the fallbacks included
+///
+/// A session pinned to software, one that finds no hardware backend at
+/// open, and one that falls back from hardware mid-stream all decode on
+/// these threads. The two fallbacks are transactions — the packets
+/// they hand the software decoder must decode, or the session stays
+/// where it was and the packets go back to the caller — and a
+/// frame-threaded decoder reports a packet's failure only once it has
+/// a packet per thread in flight. So each fallback first proves what it
+/// forwards on a one-thread decoder, exactly as it always has, and then
+/// hands the same packets to a decoder on these threads and continues
+/// on that one. The packets a fallback forwards are decoded twice —
+/// once to prove them, once to go on — and the pictures are the same
+/// pictures.
+///
+/// # The roads it does not reach
+///
+/// The **hardware** road opens its contexts with libavcodec's default
+/// of one thread — the device does the decoding, and its sessions
+/// carry their own probe and replay state that frame threading would
+/// reorder. The **audio**, **subtitle** and **image** decoders read
+/// nothing here either and keep that same one thread: the seat answers
+/// a video wall, and a one-shot image decode has one frame to share
+/// out.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Threads {
+  /// libavcodec's own choice: `thread_count = 0`, resolved at open to
+  /// one more thread than the host has cores, at most 16, for a codec
+  /// that can thread at all.
+  #[default]
+  Auto,
+  /// Exactly this many threads, for a codec that can thread at all.
+  ///
+  /// libavcodec builds one decoding context per thread, so the count is
+  /// also a memory figure; FFmpeg warns above 16. A count above
+  /// `c_int::MAX` is written as `c_int::MAX`, the most the field holds.
+  /// `Count(1)` is [`Single`](Self::Single) by another name.
+  Count(core::num::NonZeroU32),
+  /// One thread: `thread_count = 1`, which is what every software
+  /// decode in this crate ran on through 0.15.
+  Single,
+}
+
+impl Threads {
+  /// The value written to `AVCodecContext.thread_count`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub(crate) const fn thread_count(self) -> core::ffi::c_int {
+    match self {
+      Self::Auto => 0,
+      Self::Count(count) => {
+        if count.get() > core::ffi::c_int::MAX as u32 {
+          core::ffi::c_int::MAX
+        } else {
+          count.get() as core::ffi::c_int
+        }
+      }
+      Self::Single => 1,
+    }
   }
 }
 

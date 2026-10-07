@@ -596,6 +596,30 @@ impl Corpus {
     out
   }
 
+  /// H.264 High 4:2:2 at 10 bits with B-frames, 23.976 fps — the
+  /// shape of the Sony FX3 clips in
+  /// [mediagraph#537](https://github.com/findit-studio/mediagraph/issues/537),
+  /// at 320x240 rather than 3840x2160, two seconds long.
+  ///
+  /// The profile VideoToolbox does not take, so the software road is
+  /// the only road for it; two B-frames between references and a GOP of
+  /// twelve give frame threading reordering and inter prediction to get
+  /// wrong.
+  #[rustfmt::skip]
+  pub fn h264_high422_10bit(&self) -> PathBuf {
+    let out = self.path("high422p10.mp4");
+    if out.exists() {
+      return out;
+    }
+    run_ffmpeg(&[
+      "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=24000/1001:d=2",
+      "-c:v", "libx264", "-profile:v", "high422", "-pix_fmt", "yuv422p10le",
+      "-g", "12", "-bf", "2",
+      out.to_str().expect("utf-8 path"),
+    ]);
+    out
+  }
+
   /// A 6-channel FLAC, whose blocks are the shape the over-divided
   /// sample ruler refused: 65,535 samples x 6 channels is 393,210
   /// channel-samples of ordinary surround media.

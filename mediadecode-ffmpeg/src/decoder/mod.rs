@@ -857,6 +857,14 @@ impl VideoDecoder {
     self.state.backend
   }
 
+  /// The thread count libavcodec settled on for the context serving
+  /// now. The hardware road writes no thread fields, so this reads
+  /// libavcodec's default of one; see [`opened_threads`].
+  pub(crate) fn active_threads(&self) -> Option<core::num::NonZeroU32> {
+    // SAFETY: `inner` is the live opened context of the current state.
+    opened_threads(unsafe { self.state.inner.as_ptr() })
+  }
+
   /// Whether this decoder can emit pictures at a caller-requested size
   /// instead of full coded size.
   ///
@@ -2911,6 +2919,56 @@ pub(crate) fn build_codec_context(
   // SAFETY: ctx_ptr is valid; passing `owner: None` means our wrapper owns
   // the allocation and `Context::drop` will run `avcodec_free_context`.
   Ok((unsafe { Context::wrap(ctx_ptr, None) }, state))
+}
+
+/// Writes `threads` into a context that has not been opened yet.
+///
+/// `thread_count` carries the arm's count; `thread_type` names both
+/// kinds, so libavcodec takes frame threading where the codec has it,
+/// slice threading where it has only that, and one thread otherwise.
+/// Both are read once, by `avcodec_open2`, which is why this runs
+/// before it and why [`DecoderLimits`](crate::DecoderLimits) carries
+/// the choice.
+///
+/// **What frame threading asks of this crate's callbacks.** libavcodec
+/// calls `get_buffer2` from its worker threads, one at a time, with the
+/// worker's copy of the context — whose `opaque` is copied from this
+/// one. [`judge_buffer`] reads nothing there but that pointer and the
+/// immutable `max_frame_bytes` behind it, prices the frame through
+/// libavutil's pure size functions, and leaves a refusal in atomics the
+/// caller's thread collects with acquire ordering; the `CallbackState`
+/// outlives the context, whose free joins the workers. The `get_format`
+/// callback is the hardware road's and is never installed here.
+pub(crate) fn request_threads(ctx: &mut Context, threads: crate::limits::Threads) {
+  // SAFETY: `ctx` is a live, unopened context this crate built;
+  // `thread_count` and `thread_type` are plain `c_int` fields.
+  unsafe {
+    let raw = ctx.as_mut_ptr();
+    (*raw).thread_count = threads.thread_count();
+    (*raw).thread_type = ffmpeg_next::ffi::FF_THREAD_FRAME | ffmpeg_next::ffi::FF_THREAD_SLICE;
+  }
+}
+
+/// The thread count libavcodec settled on when `ctx` was opened.
+///
+/// `avcodec_open2` overwrites a requested `thread_count` with what it
+/// chose: the resolved count when frame or slice threading is active,
+/// one when the codec cannot thread. `None` where it recorded no count
+/// at all — a codec that runs its own threads (an external decoder such
+/// as libdav1d, under [`Threads::Auto`](crate::Threads::Auto)) leaves
+/// the request of zero in place.
+pub(crate) fn opened_threads(
+  ctx: *const ffmpeg_next::ffi::AVCodecContext,
+) -> Option<core::num::NonZeroU32> {
+  if ctx.is_null() {
+    return None;
+  }
+  // SAFETY: non-null per the check above, and the caller hands a live
+  // opened context; `thread_count` is a plain `c_int`.
+  let count = unsafe { (*ctx).thread_count };
+  u32::try_from(count)
+    .ok()
+    .and_then(core::num::NonZeroU32::new)
 }
 
 /// Checked deep-clone of `codec::Parameters`. ffmpeg-next's

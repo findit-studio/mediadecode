@@ -1493,10 +1493,14 @@ fn a_failed_video_frame_conversion_parks_the_frame_instead_of_losing_it() {
           .position(|t| t.kind() == TrackKind::Video)
           .expect("a video track");
         let info = &demuxer.tracks()[track];
+        // On one thread: this lane wants a picture per packet, and the
+        // allocation ceiling below has to land on the carrier — a
+        // frame-threaded decoder holds a packet per thread in flight and
+        // allocates inside libavcodec on the receive.
         let decoder = FfmpegVideoStreamDecoder::open(
           info.extra().clone_parameters().expect("parameters"),
           info.timebase(),
-          DecoderLimits::default(),
+          DecoderLimits::default().with_threads(mediadecode_ffmpeg::Threads::Single),
         )
         .expect("open decoder");
         (demuxer, decoder, track)

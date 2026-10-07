@@ -11,6 +11,56 @@ The backend-agnostic core it adapts has its own log at
 
 ## [Unreleased]
 
+### Added
+
+- **`Threads`, how many threads a software video decoder may decode
+  on**, carried by `DecoderLimits` (`threads`, `with_threads`,
+  `set_threads`) because libavcodec reads it once, at `avcodec_open2`,
+  like the rest of the limits. Three arms: `Auto` (libavcodec's own
+  choice, `thread_count = 0`: one more thread than the host has cores,
+  at most 16), `Count(NonZeroU32)` and `Single`. Every arm but `Single`
+  also writes `thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE`, so
+  libavcodec takes frame threading where the codec has it, slice
+  threading where it has only that, and one thread otherwise.
+
+- **`active_threads()` on the video stream decoder**: the count
+  libavcodec settled on, read back from the opened context of the
+  decoder serving now — the resolved count on the software road, one on
+  the hardware road, which writes no thread fields, and `None` for a
+  codec that runs its own threads (libdav1d under `Auto`).
+
+### Changed
+
+- **A software video decode runs on libavcodec's own thread count by
+  default.** Through 0.15 no thread field was written and libavcodec
+  kept its option default of one thread, so a software decode of 4K
+  H.264 High 4:2:2 10-bit — a stream VideoToolbox does not take — ran
+  on one core, and that core was the whole video wall of a library scan
+  ([mediagraph#537](https://github.com/findit-studio/mediagraph/issues/537)).
+  `DecoderLimits::default()` now carries `Threads::Auto`. A
+  frame-threaded decoder keeps up to one packet per thread in flight:
+  its pictures come out up to that many packets later, the push face
+  answers "needs input" until then, and `send_eof` drains the rest. The
+  pictures themselves do not change — pinned byte for byte against
+  `Single` on MPEG-4 part 2 and on H.264 High 4:2:2 10-bit with
+  B-frames. Each frame in flight is a picture of its own, priced by
+  `FrameLimits` like any other; a deployment that needs to bound how
+  many are in flight says `Count`. The hardware road, and the audio,
+  subtitle and image decoders, keep one thread.
+
+- **The two software fallbacks prove what they forward on one thread,
+  then continue on the session's threads.** Both are transactions — the
+  packets they hand the software decoder must decode, or the session
+  stays where it was and the packets go back to the caller — and a
+  frame-threaded decoder reports a packet's failure only once it has a
+  packet per thread in flight. So the probe-era replay and the
+  post-commit cold forward run on a one-thread decoder first, exactly as
+  before, and once that has taken them, and the stream goes on, the same
+  packets are handed to a decoder on the session's threads, which is
+  the one committed. A session whose end is already committed keeps the
+  one-thread decoder, and so does one whose threaded decoder cannot be
+  opened.
+
 ## [0.15.1] - 2026-10-05
 
 ### Added

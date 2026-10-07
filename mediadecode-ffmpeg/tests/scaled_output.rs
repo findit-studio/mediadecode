@@ -35,6 +35,9 @@ struct Session {
   input: ffmpeg_next::format::context::Input,
   stream_index: usize,
   time_base: Timebase,
+  /// Whether the end of the input has been sent, so the decoder is
+  /// draining what it still holds.
+  draining: bool,
 }
 
 impl Session {
@@ -70,6 +73,7 @@ impl Session {
       input,
       stream_index,
       time_base,
+      draining: false,
     }
   }
 
@@ -95,7 +99,17 @@ impl Session {
         return Some((frame.width(), frame.height()));
       }
     }
-    None
+    // **The end of the input is the drain.** A frame-threaded software
+    // decoder keeps a packet per thread in flight, so a short clip can
+    // run out before its first picture has come back.
+    if !self.draining {
+      self.draining = true;
+      assert_eq!(self.decoder.send_eof().expect("send eof"), Sent::Accepted);
+    }
+    match self.decoder.receive_frame(frame).expect("receive frame") {
+      Received::Frame => Some((frame.width(), frame.height())),
+      _ => None,
+    }
   }
 }
 

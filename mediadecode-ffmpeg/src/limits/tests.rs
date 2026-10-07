@@ -103,3 +103,32 @@ fn demux_limits_bound_the_chapter_table() {
   assert_eq!(mutated.max_chapters(), 9);
   assert_eq!(mutated.max_total_chapter_title_bytes(), 10);
 }
+
+#[test]
+fn decoder_limits_default_to_auto_threads_and_take_overrides() {
+  assert_eq!(DecoderLimits::default().threads(), Threads::Auto);
+  assert_eq!(Threads::default(), Threads::Auto);
+
+  let three = core::num::NonZeroU32::new(3).expect("nonzero");
+  let tuned = DecoderLimits::new().with_threads(Threads::Count(three));
+  assert_eq!(tuned.threads(), Threads::Count(three));
+  // The other seats are untouched by the thread choice.
+  assert_eq!(tuned.frame(), FrameLimits::new());
+  assert_eq!(
+    tuned.max_codec_parameter_bytes(),
+    DEFAULT_MAX_CODEC_PARAMETER_BYTES
+  );
+
+  let mut mutated = DecoderLimits::new();
+  mutated.set_threads(Threads::Single);
+  assert_eq!(mutated.threads(), Threads::Single);
+
+  // What each arm writes to `AVCodecContext.thread_count`.
+  assert_eq!(Threads::Auto.thread_count(), 0);
+  assert_eq!(Threads::Count(three).thread_count(), 3);
+  assert_eq!(
+    Threads::Count(core::num::NonZeroU32::MAX).thread_count(),
+    core::ffi::c_int::MAX
+  );
+  assert_eq!(Threads::Single.thread_count(), 1);
+}

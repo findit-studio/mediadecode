@@ -1904,7 +1904,9 @@ fn the_cold_fallback_forwards_keep_the_allocator_refusal() {
   };
 
   // **The packet arm**, exactly as `degrade_to_sw_inner` drives it:
-  // capture the state, forward, route the error.
+  // on the one-thread decoder that proves the forward, capture the
+  // state, forward, route the error.
+  let limits = limits.with_threads(crate::Threads::Single);
   let mut sw = super::open_sw_decoder(&clip.parameters, limits, None).expect("open sw");
   let state = sw.state();
   let refusal = sw
@@ -1934,7 +1936,8 @@ fn the_cold_fallback_forwards_keep_the_allocator_refusal() {
   // And under a budget that fits, the same forward succeeds — the seat
   // refuses cost, not fallbacks.
   let generous = DecoderLimits::new()
-    .with_frame(FrameLimits::new().with_max_frame_bytes(crate::DEFAULT_MAX_FRAME_BYTES));
+    .with_frame(FrameLimits::new().with_max_frame_bytes(crate::DEFAULT_MAX_FRAME_BYTES))
+    .with_threads(crate::Threads::Single);
   let mut sw = super::open_sw_decoder(&clip.parameters, generous, None).expect("open sw");
   let state = sw.state();
   sw.send_packet(&clip.packets[0])
@@ -2077,12 +2080,18 @@ fn the_receive_time_fallback_queue_survives_a_failed_carrier() {
       // own emptiness, so the lane cannot drift onto the scratch road
       // and quietly assert nothing.
       let drive = |cap_when_queued: bool| -> (Vec<Vec<u8>>, bool) {
+        // On one thread: the queue holds the whole history only when the
+        // committed decoder decodes each packet as it is fed, and a
+        // frame-threaded one keeps a packet per thread in flight. The
+        // threaded fallback is pinned by
+        // `a_probe_era_fallback_continues_on_the_session_threads`.
         let mut dec = CarrierVideoStreamDecoder::<View>::from_hw_inner_for_test(
           Box::new(FakeHw::failing_at_receive(w, h)),
           clip.parameters.clone(),
           tb,
         )
-        .expect("build test decoder");
+        .expect("build test decoder")
+        .with_threads_for_test(crate::Threads::Single);
 
         let mut frame = crate::boundary::empty_video_frame();
         let mut planes = Vec::new();
@@ -2212,9 +2221,13 @@ fn eof_with_a_parked_frame(
   } else {
     Box::new(FakeHw::failing(w, h, 0, 2, FailShape::ProbeEra))
   };
+  // On one thread: the allocation ceiling below has to land on the
+  // carrier, and a frame-threaded receive allocates inside libavcodec
+  // before the carrier is reached.
   let mut dec =
     CarrierVideoStreamDecoder::<View>::from_hw_inner_for_test(seam, clip.parameters.clone(), tb)
-      .expect("build test decoder");
+      .expect("build test decoder")
+      .with_threads_for_test(crate::Threads::Single);
 
   let packet = |index: usize| {
     video_packet_from_ffmpeg_in(
@@ -3149,4 +3162,270 @@ fn the_auto_path_still_degrades_where_a_pin_would_not() {
     "the same seam, the same failure, and the Auto arm degrades — which is what makes the \
      pin's refusal a choice rather than a breakage",
   );
+}
+
+// ---------------------------------------------------------------------------
+//  Decoder threads (mediagraph#537)
+// ---------------------------------------------------------------------------
+
+/// Decodes every packet of `clip` on the software road under `limits`,
+/// draining after each send and at EOF, and answers each picture's
+/// timestamp and plane bytes in output order, with the thread count the
+/// session settled on.
+#[allow(clippy::type_complexity)]
+fn decode_on_software(
+  clip: &SyntheticClip,
+  limits: DecoderLimits,
+) -> (
+  Vec<(Option<mediadecode::Timestamp>, Vec<Vec<u8>>)>,
+  Option<core::num::NonZeroU32>,
+) {
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let mut dec =
+    FfmpegVideoStreamDecoder::open_as(clip.parameters.clone(), tb, limits, DecodePath::Software)
+      .expect("the software road opens");
+  let threads = dec.active_threads();
+  let mut dst = crate::empty_owned_video_frame();
+  let mut pictures = Vec::new();
+  let mut keep = |dst: &crate::OwnedVideoFrame| {
+    let planes = dst
+      .planes()
+      .iter()
+      .map(|plane| plane.data_ref().as_ref().to_vec())
+      .collect();
+    pictures.push((dst.pts(), planes));
+  };
+  for av_pkt in &clip.packets {
+    let vpkt = boundary::video_packet_from_ffmpeg(av_pkt, mediadecode::Timebase::SECONDS)
+      .expect("a wrappable payload")
+      .expect("packet has a buffer");
+    crate::accepted(dec.send_packet(&vpkt), "send_packet");
+    while let Received::Frame = dec.receive_frame(&mut dst).expect("receive_frame") {
+      keep(&dst);
+    }
+  }
+  crate::accepted(dec.send_eof(), "send_eof");
+  while let Received::Frame = dec.receive_frame(&mut dst).expect("receive_frame") {
+    keep(&dst);
+  }
+  (pictures, threads)
+}
+
+/// **The request reaches the context.** Each arm writes its count into
+/// `thread_count` and names both kinds in `thread_type`, on a context
+/// built the way every software session's is and not yet opened — the
+/// only moment libavcodec reads either field.
+#[test]
+fn each_threads_arm_writes_its_count_and_both_kinds_before_the_open() {
+  let clip = encode_synthetic_clip(64, 48, 8, 4);
+  let both = ffmpeg_next::ffi::FF_THREAD_FRAME | ffmpeg_next::ffi::FF_THREAD_SLICE;
+  let three = core::num::NonZeroU32::new(3).expect("nonzero");
+  let huge = core::num::NonZeroU32::new(u32::MAX).expect("nonzero");
+  for (threads, count) in [
+    (crate::Threads::Auto, 0),
+    (crate::Threads::Count(three), 3),
+    (crate::Threads::Count(huge), core::ffi::c_int::MAX),
+    (crate::Threads::Single, 1),
+  ] {
+    let (mut ctx, _state) =
+      build_codec_context(&clip.parameters, DecoderLimits::default(), None).expect("a context");
+    crate::decoder::request_threads(&mut ctx, threads);
+    // SAFETY: `ctx` is the live context just built; both fields are
+    // plain integers.
+    let (written_count, written_type) = unsafe {
+      let raw = ctx.as_ptr();
+      ((*raw).thread_count, (*raw).thread_type)
+    };
+    assert_eq!(
+      written_count, count,
+      "{threads:?} writes thread_count {count}"
+    );
+    assert_eq!(
+      written_type, both,
+      "{threads:?} names frame and slice threading"
+    );
+  }
+}
+
+/// **Auto is the default, and it is not one thread.** The limits every
+/// session takes by default carry `Auto`, and a software session opened
+/// on them reports the count libavcodec resolved — more than one on a
+/// multi-core host, for MPEG-4 part 2, which libavcodec frame-threads.
+/// The explicit arms read back as asked.
+#[test]
+fn a_software_session_reports_the_threads_libavcodec_settled_on() {
+  let clip = encode_synthetic_clip(64, 48, 8, 4);
+  assert_eq!(DecoderLimits::default().threads(), crate::Threads::Auto);
+
+  let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+  let (_, auto) = decode_on_software(&clip, DecoderLimits::default());
+  let auto = auto.expect("mpeg4 runs on libavcodec's own threads").get();
+  if cores > 1 {
+    assert!(
+      auto > 1,
+      "Auto on a {cores}-core host resolved to {auto} thread(s) for mpeg4"
+    );
+  }
+  assert!(
+    auto <= 16,
+    "Auto resolved past libavcodec's ceiling: {auto}"
+  );
+
+  let three = core::num::NonZeroU32::new(3).expect("nonzero");
+  let (_, counted) = decode_on_software(
+    &clip,
+    DecoderLimits::default().with_threads(crate::Threads::Count(three)),
+  );
+  assert_eq!(
+    counted,
+    Some(three),
+    "Count(3) frame-threads mpeg4 on three"
+  );
+
+  let (_, single) = decode_on_software(
+    &clip,
+    DecoderLimits::default().with_threads(crate::Threads::Single),
+  );
+  assert_eq!(single, Some(core::num::NonZeroU32::MIN), "Single is one");
+}
+
+/// **Frame threading changes when a picture comes out, never its
+/// bytes.** The same MPEG-4 part 2 clip, with P-frames across several
+/// GOPs, decodes to the same pictures — the same count, the same
+/// timestamps in the same order, byte-identical planes — under `Auto`,
+/// `Count(3)` and `Single`.
+#[test]
+fn frame_threads_decode_the_same_pictures_as_one_thread() {
+  let clip = encode_synthetic_clip(96, 64, 40, 6);
+  let (single, _) = decode_on_software(
+    &clip,
+    DecoderLimits::default().with_threads(crate::Threads::Single),
+  );
+  assert_eq!(single.len(), clip.packets.len(), "one picture per packet");
+
+  let three = core::num::NonZeroU32::new(3).expect("nonzero");
+  for limits in [
+    DecoderLimits::default(),
+    DecoderLimits::default().with_threads(crate::Threads::Count(three)),
+  ] {
+    let (threaded, _) = decode_on_software(&clip, limits);
+    assert_eq!(
+      threaded.len(),
+      single.len(),
+      "{:?}: picture count",
+      limits.threads()
+    );
+    for (index, (threaded, single)) in threaded.iter().zip(&single).enumerate() {
+      assert_eq!(
+        threaded.0,
+        single.0,
+        "{:?}: picture {index}'s timestamp",
+        limits.threads()
+      );
+      assert!(
+        threaded.1 == single.1,
+        "{:?}: picture {index}'s planes differ from the one-thread decode",
+        limits.threads()
+      );
+    }
+  }
+}
+
+/// One picture a fallback session delivered: its timestamp, and its
+/// planes when the software decoder produced it (a [`FakeHw`] picture's
+/// planes are whatever its allocation held, so they are not compared).
+type Delivered = (Option<mediadecode::Timestamp>, Option<Vec<Vec<u8>>>);
+
+/// Drives every packet of `clip` through a session over `seam` on
+/// `threads`, draining after each send and at EOF, and answers what it
+/// delivered and the threads it settled on at the end.
+fn decode_through_a_fallback(
+  clip: &SyntheticClip,
+  seam: FakeHw,
+  threads: crate::Threads,
+) -> (Vec<Delivered>, Option<core::num::NonZeroU32>) {
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let mut dec =
+    FfmpegVideoStreamDecoder::from_hw_inner_for_test(Box::new(seam), clip.parameters.clone(), tb)
+      .expect("build test decoder")
+      .with_threads_for_test(threads);
+  let mut dst = crate::empty_owned_video_frame();
+  let mut delivered = Vec::new();
+  let mut drain = |dec: &mut FfmpegVideoStreamDecoder, delivered: &mut Vec<Delivered>| {
+    while let Received::Frame = dec.receive_frame(&mut dst).expect("receive_frame") {
+      let planes = dec.is_software().then(|| {
+        dst
+          .planes()
+          .iter()
+          .map(|plane| plane.data_ref().as_ref().to_vec())
+          .collect()
+      });
+      delivered.push((dst.pts(), planes));
+    }
+  };
+  for av_pkt in &clip.packets {
+    let vpkt = boundary::video_packet_from_ffmpeg(av_pkt, mediadecode::Timebase::SECONDS)
+      .expect("a wrappable payload")
+      .expect("packet has a buffer");
+    crate::accepted(dec.send_packet(&vpkt), "send_packet");
+    drain(&mut dec, &mut delivered);
+  }
+  crate::accepted(dec.send_eof(), "send_eof");
+  drain(&mut dec, &mut delivered);
+  assert!(
+    dec.is_software(),
+    "the seam failed, so the session ends on software"
+  );
+  (delivered, dec.active_threads())
+}
+
+/// **The probe-era fallback decodes on the session's threads and loses
+/// nothing.** A seam that buffers five packets and then exhausts hands
+/// them back as history; the fallback proves them on one thread, replays
+/// them into a decoder on the session's threads, and continues there —
+/// and the session delivers the same pictures, every one of them, as
+/// the same fallback on one thread.
+#[test]
+fn a_probe_era_fallback_continues_on_the_session_threads() {
+  let (w, h) = (96u32, 64u32);
+  let clip = encode_synthetic_clip(w, h, 40, 6);
+  let seam = || FakeHw::failing(w, h, 0, 5, FailShape::ProbeEra);
+
+  let (single, single_threads) = decode_through_a_fallback(&clip, seam(), crate::Threads::Single);
+  assert_eq!(single_threads, Some(core::num::NonZeroU32::MIN));
+  assert_eq!(single.len(), clip.packets.len(), "a lossless replay");
+
+  let three = core::num::NonZeroU32::new(3).expect("nonzero");
+  let (threaded, threaded_threads) =
+    decode_through_a_fallback(&clip, seam(), crate::Threads::Count(three));
+  assert_eq!(
+    threaded_threads,
+    Some(three),
+    "the committed decoder runs on the session's threads, not the proving one's"
+  );
+  assert_eq!(threaded, single, "the same pictures, in the same order");
+}
+
+/// **The post-commit degrade continues on the session's threads.** A
+/// seam that delivers two GOPs and then fails mid-GOP leaves the session
+/// on a cold software decoder; the forward is proved on one thread and
+/// the session continues on its own, delivering what the same degrade
+/// on one thread delivers.
+#[test]
+fn a_post_commit_degrade_continues_on_the_session_threads() {
+  let (w, h) = (96u32, 64u32);
+  let clip = encode_synthetic_clip(w, h, 30, 6);
+  let fail_at = nth_keyframe(&clip, 2) + 2;
+  let seam = || FakeHw::failing(w, h, fail_at, fail_at, FailShape::PostCommit);
+
+  let (single, _) = decode_through_a_fallback(&clip, seam(), crate::Threads::Single);
+  let three = core::num::NonZeroU32::new(3).expect("nonzero");
+  let (threaded, threaded_threads) =
+    decode_through_a_fallback(&clip, seam(), crate::Threads::Count(three));
+  assert_eq!(threaded_threads, Some(three));
+  assert!(
+    single.iter().filter(|(_, planes)| planes.is_some()).count() >= 6,
+    "the software decoder delivered the GOPs after the resync"
+  );
+  assert_eq!(threaded, single, "the same pictures, in the same order");
 }

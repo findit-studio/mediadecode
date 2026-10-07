@@ -3097,6 +3097,17 @@ fn the_software_video_road_names_its_budget_refusals() {
           }
         }
         Ok(()) => continue,
+        // **The end of the input is the drain.** A frame-threaded
+        // decoder keeps a packet per thread in flight, so this short clip
+        // can run out before any picture — or any refusal — has come back;
+        // both arrive once the end of the stream is sent.
+        Err(ffmpeg_next::Error::Eof) => {
+          let _ = decoder.send_eof()?;
+          return match decoder.receive_frame(&mut frame)? {
+            Received::Frame => Ok(()),
+            other => panic!("the clip drained to {other:?} without a picture"),
+          };
+        }
         Err(e) => panic!("read: {e}"),
       }
     }
