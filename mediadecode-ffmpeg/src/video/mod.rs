@@ -55,10 +55,10 @@
 //!   decoder that kept decoding keeps every picture. A concealed picture a
 //!   lenient codec makes of a lone P-frame from the dropped span does not
 //!   close the gap, nor a picture still in the reorder buffer at the
-//!   anchor. At the end of the stream, where everything is drained, an
-//!   anchor that has had a picture out since closes it too. If EOF is
-//!   reached while the mode is still pending — no key-flagged packet was
-//!   fed across the gap, or no picture came out after one — `receive_frame`
+//!   anchor. The end of the stream proves nothing more: the same bound
+//!   applies there. If EOF is reached while the mode is still pending — no
+//!   key-flagged packet was fed across the gap, or the pictures out after
+//!   one never passed the bound — `receive_frame`
 //!   escalates with a distinct [`VideoDecodeError::PostCommitNeverResynced`]
 //!   (and a `tracing::error!`), counting the packets fed before an anchor,
 //!   rather than surfacing a clean end-of-stream that would swallow the tail
@@ -1902,13 +1902,12 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// flag is cleared as it fires so a caller draining to the end sees
   /// the escalation once and the plain end afterwards.
   fn ended(&mut self) -> Result<Received, VideoDecodeError> {
+    // The end proves nothing the reorder bound has not: an anchor that
+    // decoded has had more pictures out since than the bound — the ones held
+    // from before it, then its own — and one that decoded to nothing has had
+    // only the held ones, which is not a resync. A gap still open here never
+    // closed.
     if !self.degraded_resync_pending {
-      return Ok(Received::Ended);
-    }
-    // At the end everything is drained: an anchor with a picture out since
-    // has resynced, short of the bound or not.
-    if self.degraded_anchored && self.outputs_since_anchor > 0 {
-      self.clear_degraded_resync();
       return Ok(Received::Ended);
     }
     let packets_lost = self.degraded_packets_since_fallback;
@@ -3075,9 +3074,10 @@ fn open_sw_decoder(
 /// A **post-commit** HW->SW fallback degraded the stream (dropping the
 /// bounded span up to the next keyframe), and the software decoder reached
 /// EOF without resyncing: no key-flagged packet was fed across the gap, or
-/// none had a picture out after it. The "bounded, logged gap" the
-/// post-commit path promises did not materialise, so the loss is surfaced
-/// loudly here instead of being silently swallowed as a clean end-of-stream.
+/// the pictures out after one never passed the reorder bound. The "bounded,
+/// logged gap" the post-commit path promises did not materialise, so the
+/// loss is surfaced loudly here instead of being silently swallowed as a
+/// clean end-of-stream.
 ///
 /// It is returned once, as the `Err` of the `receive_frame` that reaches the
 /// end, after every picture the decoder produced was delivered; the next
@@ -3144,9 +3144,10 @@ pub enum VideoDecodeError {
   Convert(#[from] ConvertError),
   /// A **post-commit** HW->SW fallback degraded the stream and the
   /// software decoder reached EOF without resyncing — no key-flagged packet
-  /// fed across the gap, or none with a picture out after it. Returned once,
-  /// after every picture was delivered; the next `receive_frame` answers
-  /// `Ended`; see the payload's own documentation.
+  /// fed across the gap, or the pictures out after one never passed the
+  /// reorder bound. Returned once, after every picture was delivered; the
+  /// next `receive_frame` answers `Ended`; see the payload's own
+  /// documentation.
   #[error(transparent)]
   PostCommitNeverResynced(#[from] PostCommitNeverResynced),
 }

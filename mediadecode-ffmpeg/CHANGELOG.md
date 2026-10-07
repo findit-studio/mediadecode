@@ -126,15 +126,17 @@ The backend-agnostic core it adapts has its own log at
   parameters that lower it, an HEVC SPS with fewer `num_reorder_pics`, while
   the pictures from before it still wait; the first picture for VP8, VP9 and
   AV1): the pictures before it are at most the ones the reorder buffer held
-  from before the anchor. Nothing is drained or reset for the resync, and no picture is
-  matched to a packet. At the end of the stream an anchor with a picture out
-  since closes the gap too; a decode error before the gap closes leaves the
-  anchor in doubt, and the next key-flagged packet anchors again.
-  `PostCommitNeverResynced` is raised only when no key-flagged packet was fed
-  across the gap or none had a picture out after it, still once, as the `Err`
-  of the `receive_frame` that reaches the end, after every picture was
-  delivered; its `packets_lost` counts the packets fed across the gap before
-  an anchor, and never one decoded since.
+  from before the anchor. Nothing is drained or reset for the resync, and no
+  picture is matched to a packet. The end of the stream proves nothing more:
+  the same bound applies there, so an anchor that decoded to nothing, with
+  only the pictures held from before it out since, is not a resync. A decode
+  error before the gap closes leaves the anchor in doubt, and the next
+  key-flagged packet anchors again. `PostCommitNeverResynced` is raised when
+  no key-flagged packet was fed across the gap or the pictures out after one
+  never passed the bound, still once, as the `Err` of the `receive_frame`
+  that reaches the end, after every picture was delivered; its `packets_lost`
+  counts the packets fed across the gap before an anchor, and never one
+  decoded since.
 
 ## [0.15.1] - 2026-10-05
 

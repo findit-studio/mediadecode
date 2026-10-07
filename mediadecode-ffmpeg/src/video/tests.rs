@@ -4593,3 +4593,111 @@ fn the_reorder_bound_keeps_the_largest_depth_from_before_the_anchor_on() {
      4, and closes at the fifth"
   );
 }
+
+/// The MPEG-4 B-frame road the depth-1 laws stand on: a clip whose decoder
+/// holds a picture back (`has_b_frames` 1). The hardware fails post-commit
+/// at a mid-GOP packet a cold decoder takes, a few packets before the
+/// keyframe after packet 8, and every packet up to that keyframe goes to the
+/// cold software decoder, drained — a decode error a picture the gap
+/// dropped earns tolerated. Answers the decoder, the keyframe's index, the
+/// timestamps of the packets before it, and how many of them the cold
+/// decoder took.
+fn across_a_b_frame_gap(clip: &SyntheticClip) -> (FfmpegVideoStreamDecoder, usize, Vec<i64>, u64) {
+  let anchor = keyframe_after(clip, 8);
+  // A mid-GOP packet a cold decoder takes, before the anchor.
+  let at = (anchor.saturating_sub(4)..anchor)
+    .find(|&index| {
+      !clip.packets[index].is_key() && {
+        let mut sw = super::open_sw_decoder(
+          &clip.parameters,
+          crate::DecoderLimits::default().with_threads(crate::Threads::Single),
+          None,
+        )
+        .expect("a software decoder");
+        sw.submit(&clip.packets[index]).is_ok()
+      }
+    })
+    .expect("a mid-GOP packet a cold decoder takes");
+  let pre: Vec<i64> = clip.packets[..anchor]
+    .iter()
+    .filter_map(Packet::pts)
+    .collect();
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test(
+    Box::new(FakeHw::failing(128, 96, at, at, FailShape::PostCommit)),
+    clip.parameters.clone(),
+    tb,
+  )
+  .expect("build test decoder");
+  let mut dst = crate::empty_owned_video_frame();
+  let mut drain_quiet = |dec: &mut FfmpegVideoStreamDecoder| loop {
+    match dec.receive_frame(&mut dst) {
+      Ok(Received::Frame) | Err(VideoDecodeError::Decode(_)) => {}
+      Ok(Received::NeedsInput | Received::Ended) => break,
+      Err(other) => panic!("unexpected: {other:?}"),
+    }
+  };
+  let mut taken = 0u64;
+  for (index, av_pkt) in clip.packets[..anchor].iter().enumerate() {
+    match dec.send_packet(&pushed(av_pkt)) {
+      Ok(Sent::Accepted) => taken += u64::from(index >= at),
+      Err(VideoDecodeError::Decode(_)) => {}
+      other => panic!("send_packet: {other:?}"),
+    }
+    drain_quiet(&mut dec);
+  }
+  assert!(dec.is_software(), "the hardware failed post-commit");
+  assert!(dec.degraded_resync_pending_for_test(), "the gap is open");
+  (dec, anchor, pre, taken)
+}
+
+/// LAW (Codex R5 row 2, [high]): **at the end of the stream the reorder
+/// bound is the proof too.** On the MPEG-4 B-frame road (`has_b_frames` 1)
+/// the cold decoder holds one picture from before the keyframe. In the
+/// keyframe's place it is fed a stale B-frame flagged as a keyframe, which
+/// it takes and, its time out of order, decodes to nothing: an anchor with
+/// no resync behind it. At the end the held picture comes out — one picture
+/// since the anchor, within the bound — so the gap never closed, and the end
+/// escalates `PostCommitNeverResynced` after that picture rather than pass
+/// as clean because a picture came out.
+#[test]
+fn an_anchor_that_decodes_to_nothing_is_not_proved_by_the_end_of_the_stream() {
+  let clip = encode_mpeg4_with_b_frames(128, 96, 30);
+  let (mut dec, anchor, pre, _) = across_a_b_frame_gap(&clip);
+  assert_eq!(
+    dec.reorder_for_test(),
+    1,
+    "the decoder holds one picture back"
+  );
+  // A B-frame from the first GOP: decode order puts it after a later picture.
+  let stale = (1..anchor)
+    .find(|&index| clip.packets[index].pts() < clip.packets[index - 1].pts())
+    .expect("a B-frame");
+  // A copy of its own: the push face takes no payload the clip still shares.
+  let mut flagged = Packet::copy(clip.packets[stale].data().expect("a payload"));
+  flagged.set_pts(clip.packets[stale].pts());
+  flagged.set_dts(clip.packets[stale].dts());
+  flagged.set_flags(ffmpeg_next::packet::Flags::KEY);
+  crate::accepted(
+    dec.send_packet(&pushed(&flagged)),
+    "the stale B-frame, flagged a keyframe",
+  );
+  assert!(dec.degraded_anchored_for_test(), "it anchors the resync");
+  assert_eq!(drain_ready(&mut dec), 0, "and decodes to nothing");
+  crate::accepted(dec.send_eof(), "send_eof");
+  let mut dst = crate::empty_owned_video_frame();
+  let mut out = Vec::new();
+  let escalated = loop {
+    match dec.receive_frame(&mut dst) {
+      Ok(Received::Frame) => out.push(dst.pts().map_or(i64::MIN, |t| t.pts())),
+      Ok(Received::Ended) => break false,
+      Err(VideoDecodeError::PostCommitNeverResynced(_)) => break true,
+      other => panic!("draining to the end: {other:?}"),
+    }
+  };
+  assert!(
+    out.len() == 1 && pre.contains(&out[0]),
+    "the one picture held from before the anchor comes out: {out:?}"
+  );
+  assert!(escalated, "the gap never closed, so the end escalates");
+}
