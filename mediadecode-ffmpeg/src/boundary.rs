@@ -904,13 +904,10 @@ pub(crate) fn with_ffmpeg_video_packet<C: crate::FfmpegCarrier + crate::CarrierO
   packet: &mediadecode::packet::VideoPacket<VideoPacketExtra, C::Buffer>,
   limits: PacketLimits,
   route: BodyRoute,
-  submit: impl FnOnce(&mut Packet) -> T,
+  submit: impl FnOnce(&Packet) -> T,
 ) -> std::result::Result<T, PacketBuildError> {
-  // Mutable for the submitter's own bookkeeping on the built packet — the
-  // video session stamps its sequence number into `opaque` — never for the
-  // body, which may be the caller's.
-  let mut av_packet = build_video_packet::<C>(packet, limits, route)?;
-  let out = submit(&mut av_packet);
+  let av_packet = build_video_packet::<C>(packet, limits, route)?;
+  let out = submit(&av_packet);
   drop(av_packet);
   Ok(out)
 }

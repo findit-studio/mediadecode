@@ -90,16 +90,22 @@ The backend-agnostic core it adapts has its own log at
 
 ### Fixed
 
-- **A post-commit resync is proved by a picture decoded at or after its
-  anchor keyframe.** Any keyframe the cold software decoder took used to
-  arm the proof, and the next picture delivered — even a concealed one
-  from before the keyframe, delivered late — cleared the guard; a
-  keyframe that decoded to nothing then let the end of the stream pass as
-  clean instead of escalating `PostCommitNeverResynced`. Every packet now
-  carries the session's sequence number in `opaque`, which software
-  contexts copy onto the frames they decode from it
-  (`AV_CODEC_FLAG_COPY_OPAQUE`), and the guard clears only on a picture
-  from the anchor or a later packet.
+- **A post-commit resync is proved by construction, at a clean random
+  access point.** Any keyframe the cold software decoder took used to arm
+  the proof, and the next picture delivered — even a concealed one from
+  before the keyframe, delivered late — cleared the guard; a keyframe that
+  decoded to nothing then let the end of the stream pass as clean instead
+  of escalating `PostCommitNeverResynced`. The resync is now anchored only
+  at a clean random access point across the gap, the one definition the
+  thread switch uses. There the session drains its one-thread decoder,
+  every picture it still holds delivered first and in order, resets it
+  with `avcodec_flush_buffers` and feeds it the keyframe. Every picture the
+  decoder outputs after that is decoded from the keyframe or a later
+  packet, so the first one delivered closes the gap; no picture is matched
+  to a packet. A key-flagged packet that is not clean (an H.264 recovery
+  point, an HEVC CRA) never anchors the resync, so a stream with no clean
+  point after a post-commit fallback reports `PostCommitNeverResynced` at
+  its end.
 
 ## [0.15.1] - 2026-10-05
 
