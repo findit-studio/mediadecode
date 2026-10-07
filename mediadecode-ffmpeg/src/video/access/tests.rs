@@ -186,3 +186,94 @@ fn the_other_codecs_are_read_by_their_references_and_their_reordering() {
   assert!(mpeg2.is_clean(&[], false));
   assert!(!mpeg2.is_clean(&[], true));
 }
+
+/// LAW (Codex R4, [medium]): **a start code is read whole, a unit's trailing
+/// zeros are not its own, and every unit is validated.** Codex's bytes: in
+/// `00 00 00 01 26 01 | 00 00 00 01 02 01 80` a three-byte-only reader finds
+/// the second prefix at its second byte and leaves its first zero on the IDR
+/// unit, which then reads `26 01 00` — a header with a byte after it — and
+/// is taken for a whole IDR. Read whole, the IDR unit is its header alone
+/// and not clean; so is H.264's `65` in the same shape, and an IDR followed
+/// by `trailing_zero_8bits` before a three-byte prefix. With a slice header
+/// the same layouts are clean. A malformed unit AFTER the first picture
+/// makes the access unit not clean too, and so do bytes before the first
+/// start code that are not zeros, a short extended header, an IDR whose
+/// `nal_ref_idc` is zero, and an HEVC IRAP picture with a temporal id.
+#[test]
+fn every_unit_is_read_whole_and_validated() {
+  let hevc = KeyframeRule::of(CodecId::HEVC.raw(), &[]);
+  let h264 = KeyframeRule::of(CodecId::H264.raw(), &[]);
+  for (rule, data, why) in [
+    (
+      hevc,
+      vec![0u8, 0, 0, 1, 0x26, 1, 0, 0, 0, 1, 2, 1, 0x80],
+      "Codex's bytes: the IDR is its header alone",
+    ),
+    (
+      h264,
+      vec![0u8, 0, 0, 1, 0x65, 0, 0, 0, 1, 0x41, 0x9a],
+      "H.264's 65 in the same shape",
+    ),
+    (
+      hevc,
+      vec![0u8, 0, 1, 0x26, 1, 0, 0, 0, 0, 1, 2, 1, 0x80],
+      "a header-only IDR, then trailing zeros and a four-byte prefix",
+    ),
+    (
+      hevc,
+      vec![0u8, 0, 1, 0x26, 1, 0, 0, 0, 1, 2, 1, 0x80],
+      "a header-only IDR, then a trailing zero and a three-byte prefix",
+    ),
+    (
+      hevc,
+      annex_b(&[&[19 << 1, 1, 0xaf], &[0x80 | (1 << 1), 1, 0x80]]),
+      "a malformed unit after the first picture",
+    ),
+    (
+      hevc,
+      [&[7u8][..], &annex_b(&[&[19 << 1, 1, 0xaf]])].concat(),
+      "a byte before the first start code",
+    ),
+    (
+      hevc,
+      annex_b(&[&[19 << 1, 2, 0xaf]]),
+      "an IDR with a temporal id",
+    ),
+    (
+      h264,
+      annex_b(&[&[0x6e, 1], &[0x65, 0x88]]),
+      "a prefix unit with a short extended header",
+    ),
+    (
+      h264,
+      annex_b(&[&[0x05, 0x88]]),
+      "an IDR whose nal_ref_idc is zero",
+    ),
+  ] {
+    assert!(!rule.is_clean(&data, true), "{rule:?}: {why}");
+  }
+  for (rule, data, why) in [
+    (
+      hevc,
+      vec![0u8, 0, 0, 1, 0x26, 1, 0xaf, 0, 0, 0, 1, 2, 1, 0x80],
+      "four-byte prefixes around a whole IDR",
+    ),
+    (
+      hevc,
+      vec![0u8, 0, 1, 0x26, 1, 0xaf, 0, 0, 0, 0, 1, 2, 1, 0x80],
+      "a whole IDR, its trailing zeros stripped",
+    ),
+    (
+      h264,
+      vec![0u8, 0, 0, 1, 0x65, 0x88, 0, 0, 0, 1, 0x41, 0x9a],
+      "four-byte prefixes around a whole H.264 IDR",
+    ),
+    (
+      hevc,
+      [&[0u8, 0][..], &annex_b(&[&[19 << 1, 1, 0xaf]])].concat(),
+      "leading zeros before the first start code",
+    ),
+  ] {
+    assert!(rule.is_clean(&data, true), "{rule:?}: {why}");
+  }
+}

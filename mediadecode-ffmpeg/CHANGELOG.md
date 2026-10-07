@@ -95,10 +95,13 @@ The backend-agnostic core it adapts has its own log at
   stream keeps its one-thread decoder until a seek. An H.264 or HEVC
   keyframe is clean only when the first picture's NAL unit in its packet is
   the IDR (or, for HEVC, the BLA) — a packet with any picture before it is
-  not — and only when its NAL units parse whole — every header byte present
-  and valid (H.264's and HEVC's forbidden bit, HEVC's second header byte and
-  a non-zero temporal id), a picture's unit carrying a slice past its
-  header.
+  not — and only when every NAL unit in it parses whole: a four-byte start
+  code read whole and the zero bytes after a unit (`trailing_zero_8bits`)
+  stripped from it, every header byte present and valid (H.264's and HEVC's
+  forbidden bit, H.264's extended headers and an IDR's non-zero
+  `nal_ref_idc`, HEVC's second header byte, a non-zero temporal id and an
+  IRAP picture's zero one), a picture's unit carrying a slice past its
+  header, and nothing but zeros before the first start code.
   The session's threads are attempted once: a decoder on them that will
   not open leaves the session on one thread for good. A switch drains the
   old decoder into the session's queue of pictures waiting for delivery,

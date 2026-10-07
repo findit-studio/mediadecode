@@ -75,13 +75,14 @@ impl KeyframeRule {
 
   /// Whether the keyframe `data` is a clean random access point, for a
   /// decoder that `reorders` pictures. Bytes that do not parse are not
-  /// clean: nothing is proved about them. A NAL unit is read whole —
+  /// clean: nothing is proved about them. EVERY NAL unit is read whole —
   /// every header byte present and valid, a picture's unit carrying
-  /// payload past its header — or the access unit is not clean.
+  /// payload past its header — or the access unit is not clean; the first
+  /// picture's unit then decides.
   pub(crate) fn is_clean(self, data: &[u8], reorders: bool) -> bool {
     match self {
       Self::H264 { nal_length } => nal_units(data, nal_length).is_some_and(|units| {
-        // The first picture's unit decides, as HEVC's does.
+        // Every unit whole; the first picture's unit decides, as HEVC's does.
         let mut first_picture = None;
         for unit in units {
           // `forbidden_zero_bit` (1) · `nal_ref_idc` (2) · `nal_unit_type` (5).
@@ -92,18 +93,29 @@ impl KeyframeRule {
             return false;
           }
           let kind = header & 0x1f;
-          // An IDR slice: its header byte and a slice header after it.
-          if kind == 5 && unit.len() < 2 {
+          // A prefix unit and a slice extension carry three more header
+          // bytes; a picture's unit (1–5) carries a slice header past its own.
+          let picture = (1..=5).contains(&kind);
+          let header_bytes = if matches!(kind, 14 | 20 | 21) { 4 } else { 1 };
+          if unit.len() < header_bytes + usize::from(picture) {
             return false;
           }
-          if (1..=5).contains(&kind) {
+          // An IDR picture is a reference picture: `nal_ref_idc` is not zero.
+          if kind == 5 && header & 0x60 == 0 {
+            return false;
+          }
+          if picture {
             first_picture.get_or_insert(kind);
           }
         }
         first_picture == Some(5)
       }),
       Self::Hevc { nal_length } => nal_units(data, nal_length).is_some_and(|units| {
+        // Every unit whole; the first picture's unit decides.
+        let mut first_picture = None;
         for unit in units {
+          // `forbidden_zero_bit` (1) · `nal_unit_type` (6) · `nuh_layer_id`
+          // (6) · `nuh_temporal_id_plus1` (3), which is never zero.
           let [first, second, ..] = unit else {
             return false;
           };
@@ -112,12 +124,15 @@ impl KeyframeRule {
           }
           let kind = (first >> 1) & 0x3f;
           if kind < 32 {
-            // The first picture's unit decides: it must carry a slice
-            // header past its two header bytes.
-            return unit.len() > 2 && (16..=20).contains(&kind);
+            // A picture's unit carries a slice segment header past its two
+            // header bytes, and an IRAP picture (16–23) a temporal id of 0.
+            if unit.len() <= 2 || ((16..=23).contains(&kind) && second & 0x07 != 1) {
+              return false;
+            }
+            first_picture.get_or_insert(kind);
           }
         }
-        false
+        first_picture.is_some_and(|kind| (16..=20).contains(&kind))
       }),
       Self::Resets => true,
       Self::Reordering => !reorders,
@@ -143,8 +158,17 @@ impl KeyframeRule {
 }
 
 /// Every NAL unit in `data`, whole: length-prefixed by `nal_length`
-/// bytes, or start-coded when `None`. `None` when a length-prefixed unit
-/// runs past the end or is empty, or a start code ends the data.
+/// bytes, or start-coded (Annex B) when `None`. `None` when a
+/// length-prefixed unit runs past the end or is empty, when anything but
+/// zeros precedes the first start code, or when a start-coded unit is empty
+/// once its `trailing_zero_8bits` are stripped — a start code ending the
+/// data among them.
+///
+/// A four-byte start code (`00 00 00 01`) is read whole before a three-byte
+/// one, so its leading zero is never left on the unit before it; and the
+/// zero bytes Annex B allows after a unit (`trailing_zero_8bits`) are
+/// stripped from it — a NAL unit never ends in a zero byte, since one whose
+/// data would is given a final `03`.
 fn nal_units(data: &[u8], nal_length: Option<usize>) -> Option<Vec<&[u8]>> {
   let mut units = Vec::new();
   match nal_length {
@@ -165,20 +189,33 @@ fn nal_units(data: &[u8], nal_length: Option<usize>) -> Option<Vec<&[u8]>> {
       }
     }
     None => {
-      // Every start code's position, then each unit runs to the next one.
-      let mut starts = Vec::new();
+      // Every start code — where it begins and where its unit does — the
+      // four-byte prefix read before the three-byte one.
+      let mut codes: Vec<(usize, usize)> = Vec::new();
       let mut at = 0usize;
       while at + 3 <= data.len() {
-        if data[at..at + 3] == [0, 0, 1] {
-          starts.push(at + 3);
+        if data[at..].starts_with(&[0, 0, 0, 1]) {
+          codes.push((at, at + 4));
+          at += 4;
+        } else if data[at..].starts_with(&[0, 0, 1]) {
+          codes.push((at, at + 3));
           at += 3;
         } else {
           at += 1;
         }
       }
-      for (index, &start) in starts.iter().enumerate() {
-        let end = starts.get(index + 1).map_or(data.len(), |&next| next - 3);
-        let unit = data.get(start..end)?;
+      // Only zeros (`leading_zero_8bits`) may come before the first.
+      let first = codes.first().map_or(data.len(), |&(code, _)| code);
+      if data[..first].iter().any(|&byte| byte != 0) {
+        return None;
+      }
+      // Each unit runs to the next start code, less its trailing zeros.
+      for (index, &(_, start)) in codes.iter().enumerate() {
+        let end = codes.get(index + 1).map_or(data.len(), |&(next, _)| next);
+        let mut unit = data.get(start..end)?;
+        while let [rest @ .., 0] = unit {
+          unit = rest;
+        }
         if unit.is_empty() {
           return None;
         }
