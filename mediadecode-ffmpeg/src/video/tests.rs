@@ -4701,3 +4701,70 @@ fn an_anchor_that_decodes_to_nothing_is_not_proved_by_the_end_of_the_stream() {
   );
   assert!(escalated, "the gap never closed, so the end escalates");
 }
+
+/// LAW (Codex R5 row 3, [high]): **a packet the decoder reports failed
+/// leaves the output unsettled, and the next anchor waits for a drain.**
+/// FFmpeg's submission is not transactional: a packet it reports failed may
+/// have left a picture ready. Drained of everything before it, the cold
+/// decoder takes packet 11 and reports it failed, its concealed picture left
+/// ready. Keyframe 12 then answers `MustDrain` — no anchor before a drain has
+/// answered "needs input". Drained, packet 11's picture comes out with the
+/// gap still open; sent again, keyframe 12 anchors, and its own picture, not
+/// packet 11's, closes the gap.
+#[test]
+fn a_packet_reported_failed_leaves_the_output_unsettled_until_a_drain() {
+  let clip = encode_synthetic_clip(128, 96, 24, 6);
+  assert_eq!(nth_keyframe(&clip, 3), 12);
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test(
+    Box::new(FakeHw::failing(128, 96, 8, 8, FailShape::PostCommit)),
+    clip.parameters.clone(),
+    tb,
+  )
+  .expect("build test decoder");
+  for av_pkt in &clip.packets[..11] {
+    crate::accepted(dec.send_packet(&pushed(av_pkt)), "send_packet");
+    drain_ready(&mut dec);
+  }
+  assert!(dec.degraded_resync_pending_for_test(), "the gap is open");
+
+  dec.fail_next_packet_for_test();
+  match dec.send_packet(&pushed(&clip.packets[11])) {
+    Err(VideoDecodeError::Decode(_)) => {}
+    other => panic!("packet 11 is reported failed: {other:?}"),
+  }
+  assert_eq!(
+    dec
+      .send_packet(&pushed(&clip.packets[12]))
+      .expect("send_packet"),
+    Sent::MustDrain,
+    "no anchor before a drain"
+  );
+  assert!(!dec.degraded_anchored_for_test(), "not anchored yet");
+
+  let mut dst = crate::empty_owned_video_frame();
+  let mut delivered: Vec<(i64, bool)> = Vec::new();
+  let mut drain = |dec: &mut FfmpegVideoStreamDecoder, delivered: &mut Vec<(i64, bool)>| {
+    while let Received::Frame = dec.receive_frame(&mut dst).expect("receive_frame") {
+      let pts = dst.pts().map_or(i64::MIN, |t| t.pts());
+      delivered.push((pts, dec.degraded_resync_pending_for_test()));
+    }
+  };
+  drain(&mut dec, &mut delivered);
+  assert_eq!(
+    delivered,
+    [(11, true)],
+    "packet 11's picture, the gap still open"
+  );
+  crate::accepted(dec.send_packet(&pushed(&clip.packets[12])), "the anchor");
+  assert!(
+    dec.degraded_anchored_for_test(),
+    "keyframe 12 anchors the resync"
+  );
+  drain(&mut dec, &mut delivered);
+  assert_eq!(
+    delivered,
+    [(11, true), (12, false)],
+    "keyframe 12's own picture closes the gap"
+  );
+}

@@ -272,6 +272,10 @@ pub struct CarrierVideoStreamDecoder<C: crate::FfmpegCarrier> {
   /// it.
   #[cfg(test)]
   reorder_on_submit: Option<usize>,
+  /// Test-only: the next packet the decoder serving takes is reported
+  /// failed, as FFmpeg reports a packet it decoded with an error.
+  #[cfg(test)]
+  fail_after_submit: bool,
   /// `true` once `send_eof` has been called on the active decoder.
   /// Used to propagate EOF to the SW decoder when fallback fires
   /// during the drain phase — without this, codecs that hold tail
@@ -314,7 +318,9 @@ pub struct CarrierVideoStreamDecoder<C: crate::FfmpegCarrier> {
   outputs_since_anchor: usize,
   /// `true` while the software decoder holds no picture the caller has not
   /// taken: it answered "needs input" (or the end) since the last packet it
-  /// took. A key-flagged packet anchors only then, so the pictures from
+  /// took, or was reported failed on — FFmpeg's submission is not
+  /// transactional, and a packet it reports failed may have left pictures
+  /// ready. A key-flagged packet anchors only then, so the pictures from
   /// before it are the reorder buffer's alone.
   sw_output_settled: bool,
   /// Packets fed to the SW decoder since the post-commit fallback fired while
@@ -824,6 +830,8 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       reorder_override: None,
       #[cfg(test)]
       reorder_on_submit: None,
+      #[cfg(test)]
+      fail_after_submit: false,
       scratch_pending: false,
       _carrier: core::marker::PhantomData,
     })
@@ -1363,7 +1371,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// ([`Self::resync_on_output`]). The buffer's depth is read before the
   /// packet is submitted — its parameters can lower it while those pictures
   /// still wait — and the bound keeps the largest it reads from there on
-  /// ([`Self::anchor_reorder`]).
+  /// ([`Self::anchor_reorder`]). A packet the decoder reports failed leaves
+  /// the output unsettled — the submission is not transactional — so the
+  /// next anchor waits for a drain too.
   ///
   /// A decode error met while feeding what was pending is kept for the
   /// drain ([`Self::deferred_error`]), and this send answers `MustDrain`
@@ -1438,7 +1448,15 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       )));
     };
     let st = sw.state();
-    if let Err(e) = sw.submit(pkt) {
+    let submitted = sw.submit(pkt);
+    #[cfg(test)]
+    let submitted = match submitted {
+      Ok(()) if core::mem::take(&mut self.fail_after_submit) => {
+        Err(ffmpeg_next::Error::InvalidData)
+      }
+      other => other,
+    };
+    if let Err(e) = submitted {
       // Funnel, then gate. **Nothing below runs on back pressure**,
       // which is the point of returning here rather than falling
       // through: a packet libavcodec did not take must not be
@@ -1447,6 +1465,11 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       return match crate::decoder::software_send(st, e, phase) {
         Ok(sent) => Ok(sent),
         Err(error) => {
+          // FFmpeg's submission is not transactional: a packet it reports
+          // failed may have left pictures ready. The output is unsettled
+          // until a drain answers "needs input" or the end, and no packet
+          // anchors before that.
+          self.sw_output_settled = false;
           // A packet that failed after the anchor: what follows it may
           // reference it, so the anchor is in doubt.
           self.unanchor();
@@ -2021,6 +2044,8 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       reorder_override: None,
       #[cfg(test)]
       reorder_on_submit: None,
+      #[cfg(test)]
+      fail_after_submit: false,
       scratch_pending: false,
       _carrier: core::marker::PhantomData,
     })
@@ -2071,6 +2096,13 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// it.
   pub(crate) fn reorder_on_next_packet_for_test(&mut self, depth: usize) {
     self.reorder_on_submit = Some(depth);
+  }
+
+  /// The next packet the decoder serving takes is reported failed — taken
+  /// and decoded, its pictures left ready — as FFmpeg reports a packet it
+  /// decoded with an error.
+  pub(crate) fn fail_next_packet_for_test(&mut self) {
+    self.fail_after_submit = true;
   }
 
   /// Every open on the session's threads fails from here on.
@@ -2447,8 +2479,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
                 return self.settle(status);
               }
               Err(error) => {
-                // A decode error before the resync is proven leaves its
-                // anchor in doubt.
+                // A decode error leaves the output unsettled, and one before
+                // the resync is proven leaves its anchor in doubt.
+                self.sw_output_settled = false;
                 self.unanchor();
                 return Err(VideoDecodeError::Decode(error));
               }

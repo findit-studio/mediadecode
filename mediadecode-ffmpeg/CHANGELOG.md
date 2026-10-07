@@ -120,13 +120,14 @@ The backend-agnostic core it adapts has its own log at
   across the gap — an intra picture resets the references of every picture
   after it that does not lead it — but it is fed only once the decoder holds
   no picture the caller has not taken (the send answers `MustDrain` until
-  then), and the gap closes at the delivery of the `has_b_frames + 1`-th
-  picture out after it (`has_b_frames` the largest value read from just
-  before the anchoring packet was submitted on — a keyframe can activate
-  parameters that lower it, an HEVC SPS with fewer `num_reorder_pics`, while
-  the pictures from before it still wait; the first picture for VP8, VP9 and
-  AV1): the pictures before it are at most the ones the reorder buffer held
-  from before the anchor. Nothing is drained or reset for the resync, and no
+  then; a packet the decoder reports failed, which FFmpeg may have decoded
+  in part, wants a drain behind it too), and the gap closes at the delivery
+  of the `has_b_frames + 1`-th picture out after it (`has_b_frames` the
+  largest value read from just before the anchoring packet was submitted on
+  — a keyframe can activate parameters that lower it, an HEVC SPS with fewer
+  `num_reorder_pics`, while the pictures from before it still wait; the
+  first picture for VP8, VP9 and AV1): the pictures before it are at most
+  the ones the reorder buffer held from before the anchor. Nothing is drained or reset for the resync, and no
   picture is matched to a packet. The end of the stream proves nothing more:
   the same bound applies there, so an anchor that decoded to nothing, with
   only the pictures held from before it out since, is not a resync. A decode
