@@ -78,13 +78,21 @@ impl KeyframeRule {
   /// clean: nothing is proved about them. EVERY NAL unit is read whole —
   /// every header byte present and valid, a picture's unit carrying
   /// payload past its header — or the access unit is not clean; the first
-  /// picture's unit then decides.
+  /// picture's unit decides, and one that is not clean ends the walk.
+  ///
+  /// The units are walked one at a time ([`NalUnits`]) and never collected,
+  /// so the memory a packet costs here does not grow with how many units it
+  /// packs: a hostile keyframe of one-byte units costs a walk, not a slice
+  /// entry per unit.
   pub(crate) fn is_clean(self, data: &[u8], reorders: bool) -> bool {
     match self {
-      Self::H264 { nal_length } => nal_units(data, nal_length).is_some_and(|units| {
+      Self::H264 { nal_length } => {
         // Every unit whole; the first picture's unit decides, as HEVC's does.
         let mut first_picture = None;
-        for unit in units {
+        for unit in NalUnits::new(data, nal_length) {
+          let Ok(unit) = unit else {
+            return false;
+          };
           // `forbidden_zero_bit` (1) · `nal_ref_idc` (2) · `nal_unit_type` (5).
           let Some(&header) = unit.first() else {
             return false;
@@ -104,16 +112,19 @@ impl KeyframeRule {
           if kind == 5 && header & 0x60 == 0 {
             return false;
           }
-          if picture {
-            first_picture.get_or_insert(kind);
+          if picture && *first_picture.get_or_insert(kind) != 5 {
+            return false;
           }
         }
         first_picture == Some(5)
-      }),
-      Self::Hevc { nal_length } => nal_units(data, nal_length).is_some_and(|units| {
+      }
+      Self::Hevc { nal_length } => {
         // Every unit whole; the first picture's unit decides.
         let mut first_picture = None;
-        for unit in units {
+        for unit in NalUnits::new(data, nal_length) {
+          let Ok(unit) = unit else {
+            return false;
+          };
           // `forbidden_zero_bit` (1) · `nal_unit_type` (6) · `nuh_layer_id`
           // (6) · `nuh_temporal_id_plus1` (3), which is never zero.
           let [first, second, ..] = unit else {
@@ -129,11 +140,13 @@ impl KeyframeRule {
             if unit.len() <= 2 || ((16..=23).contains(&kind) && second & 0x07 != 1) {
               return false;
             }
-            first_picture.get_or_insert(kind);
+            if !(16..=20).contains(first_picture.get_or_insert(kind)) {
+              return false;
+            }
           }
         }
         first_picture.is_some_and(|kind| (16..=20).contains(&kind))
-      }),
+      }
       Self::Resets => true,
       Self::Reordering => !reorders,
     }
@@ -157,71 +170,144 @@ impl KeyframeRule {
   }
 }
 
-/// Every NAL unit in `data`, whole: length-prefixed by `nal_length`
-/// bytes, or start-coded (Annex B) when `None`. `None` when a
-/// length-prefixed unit runs past the end or is empty, when anything but
-/// zeros precedes the first start code, or when a start-coded unit is empty
-/// once its `trailing_zero_8bits` are stripped — a start code ending the
-/// data among them.
+/// A unit that does not parse whole: the walk ends there, and the access
+/// unit is not clean.
+struct Malformed;
+
+/// **Every NAL unit in `data`, whole, one at a time**: length-prefixed by
+/// `nal_length` bytes, or start-coded (Annex B) when `None`. Each unit is
+/// found as the walk reaches it and nothing is collected, so a walk takes
+/// the same memory for one unit as for a billion.
+///
+/// The walk answers [`Malformed`] and ends when a length-prefixed unit runs
+/// past the end or is empty, when anything but zeros precedes the first
+/// start code, or when a start-coded unit is empty once its
+/// `trailing_zero_8bits` are stripped — a start code ending the data among
+/// them. Data with no start code at all, zeros only, has no unit.
 ///
 /// A four-byte start code (`00 00 00 01`) is read whole before a three-byte
 /// one, so its leading zero is never left on the unit before it; and the
 /// zero bytes Annex B allows after a unit (`trailing_zero_8bits`) are
 /// stripped from it — a NAL unit never ends in a zero byte, since one whose
 /// data would is given a final `03`.
-fn nal_units(data: &[u8], nal_length: Option<usize>) -> Option<Vec<&[u8]>> {
-  let mut units = Vec::new();
-  match nal_length {
-    Some(width) => {
-      let mut at = 0usize;
-      while at < data.len() {
-        let field = data.get(at..at.checked_add(width)?)?;
-        let length = field
-          .iter()
-          .fold(0usize, |length, &byte| (length << 8) | usize::from(byte));
-        at += width;
-        let unit = data.get(at..at.checked_add(length)?)?;
-        if unit.is_empty() {
+struct NalUnits<'a> {
+  data: &'a [u8],
+  /// The NAL length field's width, or `None` for start codes.
+  nal_length: Option<usize>,
+  walk: Walk,
+}
+
+/// Where a walk over NAL units stands.
+#[derive(Clone, Copy)]
+enum Walk {
+  /// The next unit begins here: at its length field, or after its start
+  /// code.
+  At(usize),
+  /// The next item is [`Malformed`], and the walk ends with it.
+  Malformed,
+  /// The walk is over.
+  Done,
+}
+
+impl<'a> NalUnits<'a> {
+  fn new(data: &'a [u8], nal_length: Option<usize>) -> Self {
+    let walk = if nal_length.is_some() {
+      Walk::At(0)
+    } else {
+      // The first unit begins after the first start code, and only zeros
+      // (`leading_zero_8bits`) may come before it.
+      let first = start_code(data, 0);
+      let leading = first.map_or(data.len(), |(code, _)| code);
+      if data[..leading].iter().any(|&byte| byte != 0) {
+        Walk::Malformed
+      } else {
+        first.map_or(Walk::Done, |(_, unit)| Walk::At(unit))
+      }
+    };
+    Self {
+      data,
+      nal_length,
+      walk,
+    }
+  }
+}
+
+impl<'a> Iterator for NalUnits<'a> {
+  type Item = Result<&'a [u8], Malformed>;
+
+  fn next(&mut self) -> Option<Self::Item> {
+    let at = match self.walk {
+      Walk::At(at) => at,
+      Walk::Malformed => {
+        self.walk = Walk::Done;
+        return Some(Err(Malformed));
+      }
+      Walk::Done => return None,
+    };
+    let data = self.data;
+    let unit = match self.nal_length {
+      Some(width) => {
+        if at == data.len() {
+          self.walk = Walk::Done;
           return None;
         }
-        units.push(unit);
-        at += length;
-      }
-    }
-    None => {
-      // Every start code — where it begins and where its unit does — the
-      // four-byte prefix read before the three-byte one.
-      let mut codes: Vec<(usize, usize)> = Vec::new();
-      let mut at = 0usize;
-      while at + 3 <= data.len() {
-        if data[at..].starts_with(&[0, 0, 0, 1]) {
-          codes.push((at, at + 4));
-          at += 4;
-        } else if data[at..].starts_with(&[0, 0, 1]) {
-          codes.push((at, at + 3));
-          at += 3;
-        } else {
-          at += 1;
+        // The length field, then that many bytes.
+        let start = at.checked_add(width);
+        let length = start.and_then(|start| data.get(at..start)).map(|field| {
+          field
+            .iter()
+            .fold(0usize, |length, &byte| (length << 8) | usize::from(byte))
+        });
+        match (start, length) {
+          (Some(start), Some(length)) => start.checked_add(length).and_then(|end| {
+            self.walk = Walk::At(end);
+            data.get(start..end)
+          }),
+          _ => None,
         }
       }
-      // Only zeros (`leading_zero_8bits`) may come before the first.
-      let first = codes.first().map_or(data.len(), |&(code, _)| code);
-      if data[..first].iter().any(|&byte| byte != 0) {
-        return None;
-      }
-      // Each unit runs to the next start code, less its trailing zeros.
-      for (index, &(_, start)) in codes.iter().enumerate() {
-        let end = codes.get(index + 1).map_or(data.len(), |&(next, _)| next);
-        let mut unit = data.get(start..end)?;
+      None => {
+        // To the next start code, or to the end; the zeros that trail the
+        // unit are not its own.
+        let end = match start_code(data, at) {
+          Some((code, next)) => {
+            self.walk = Walk::At(next);
+            code
+          }
+          None => {
+            self.walk = Walk::Done;
+            data.len()
+          }
+        };
+        let mut unit = &data[at..end];
         while let [rest @ .., 0] = unit {
           unit = rest;
         }
-        if unit.is_empty() {
-          return None;
-        }
-        units.push(unit);
+        Some(unit)
+      }
+    };
+    match unit {
+      Some(unit) if !unit.is_empty() => Some(Ok(unit)),
+      _ => {
+        self.walk = Walk::Done;
+        Some(Err(Malformed))
       }
     }
   }
-  Some(units)
+}
+
+/// The first start code at or after `from`: where it begins and where its
+/// unit does, a four-byte prefix read before a three-byte one.
+fn start_code(data: &[u8], from: usize) -> Option<(usize, usize)> {
+  let mut at = from;
+  while at + 3 <= data.len() {
+    if data[at..].starts_with(&[0, 0, 0, 1]) {
+      return Some((at, at + 4));
+    }
+    if data[at..].starts_with(&[0, 0, 1]) {
+      return Some((at, at + 3));
+    }
+    at += 1;
+  }
+  None
 }

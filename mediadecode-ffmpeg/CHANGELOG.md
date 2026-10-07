@@ -101,7 +101,9 @@ The backend-agnostic core it adapts has its own log at
   forbidden bit, H.264's extended headers and an IDR's non-zero
   `nal_ref_idc`, HEVC's second header byte, a non-zero temporal id and an
   IRAP picture's zero one), a picture's unit carrying a slice past its
-  header, and nothing but zeros before the first start code.
+  header, and nothing but zeros before the first start code. The units are
+  read one at a time and never collected, so a keyframe packed with
+  millions of one-byte units costs a walk, not memory per unit.
   The session's threads are attempted once: a decoder on them that will
   not open leaves the session on one thread for good. A switch drains the
   old decoder into the session's queue of pictures waiting for delivery,

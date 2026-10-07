@@ -40,6 +40,8 @@ mod reader_guard;
 mod resampler;
 mod sample_format;
 mod subtitle;
+#[cfg(test)]
+mod test_alloc;
 pub mod ticket;
 mod video;
 mod view;

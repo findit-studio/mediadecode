@@ -277,3 +277,61 @@ fn every_unit_is_read_whole_and_validated() {
     assert!(rule.is_clean(&data, true), "{rule:?}: {why}");
   }
 }
+
+/// LAW (Codex R5 row 4, [high]): **millions of tiny units are classified
+/// in constant memory.** The units are walked one at a time, each header
+/// validated as the walk reaches it and the first picture deciding, and
+/// never collected: a hostile keyframe of one-byte length fields and
+/// one-byte units used to cost a slice entry — 16 bytes of `Vec` — for
+/// every two bytes of input. Four million one-byte H.264 filler units and
+/// an IDR slice, length-prefixed by one-byte fields and start-coded, and
+/// four million two-byte HEVC SEI units and an IDR: each access unit is
+/// clean, and is classified without a single allocation.
+#[test]
+fn millions_of_tiny_units_are_classified_without_allocating() {
+  const UNITS: usize = 4_000_000;
+  // An `avcC` record whose `lengthSizeMinusOne` is 0: one-byte fields.
+  let one_byte = KeyframeRule::of(CodecId::H264.raw(), &[1, 0x64, 0, 0x1f, 0xfc, 0xe1, 0]);
+  assert_eq!(
+    one_byte,
+    KeyframeRule::H264 {
+      nal_length: Some(1)
+    }
+  );
+  let mut length_prefixed_au = Vec::with_capacity(UNITS * 2 + 3);
+  let mut annex_b_au = Vec::with_capacity(UNITS * 4 + 5);
+  let mut hevc_au = Vec::with_capacity(UNITS * 5 + 6);
+  for _ in 0..UNITS {
+    length_prefixed_au.extend_from_slice(&[1, 0x0c]);
+    annex_b_au.extend_from_slice(&[0, 0, 1, 0x0c]);
+    hevc_au.extend_from_slice(&[0, 0, 1, 39 << 1, 1]);
+  }
+  length_prefixed_au.extend_from_slice(&[2, 0x65, 0x88]);
+  annex_b_au.extend_from_slice(&[0, 0, 1, 0x65, 0x88]);
+  hevc_au.extend_from_slice(&[0, 0, 1, 19 << 1, 1, 0xaf]);
+  for (rule, data, why) in [
+    (
+      one_byte,
+      &length_prefixed_au,
+      "H.264, one-byte length fields",
+    ),
+    (
+      KeyframeRule::of(CodecId::H264.raw(), &[]),
+      &annex_b_au,
+      "H.264, start codes",
+    ),
+    (
+      KeyframeRule::of(CodecId::HEVC.raw(), &[]),
+      &hevc_au,
+      "HEVC, start codes",
+    ),
+  ] {
+    let (clean, allocations, bytes) = crate::test_alloc::measured(|| rule.is_clean(data, true));
+    assert!(clean, "{why}: the IDR after the units is clean");
+    assert_eq!(
+      (allocations, bytes),
+      (0, 0),
+      "{why}: classified without allocating"
+    );
+  }
+}
