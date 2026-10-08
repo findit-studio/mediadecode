@@ -4066,7 +4066,7 @@ fn picture_bytes(clip: &SyntheticClip) -> usize {
   sw.send_eof().expect("the end of the stream");
   let mut frame = alloc_av_video_frame().expect("a frame");
   sw.receive_frame(&mut frame).expect("a picture");
-  super::footprint(&frame)
+  super::footprint(&frame).expect("a picture the budget prices")
 }
 
 /// A probe-era fallback replaying nine packets of 4K pictures into a queue
@@ -4378,6 +4378,75 @@ fn a_replay_whose_last_packet_parks_a_picture_takes_no_input_until_it_is_out() {
   }
   let every: Vec<Option<i64>> = (0..clip.packets.len() as i64).map(Some).collect();
   assert_eq!(shown, every, "every picture once, in order");
+}
+
+/// LAW (Codex R10, [high]): **a picture is priced by every allocation it
+/// owns, and one it cannot price is refused by name.** A 16x16 picture's
+/// pixel buffers, then 100 MiB of side data attached to it: the footprint
+/// grows by exactly the side data's 100 MiB; a metadata entry and an
+/// `opaque_ref` count too. With the side data's bytes owned by no buffer
+/// reference, the picture is refused as `UnpricedFrame`, naming the side
+/// data. Pricing the pixel buffers alone, the picture cost its 16x16 pixels
+/// whatever it carried — 64 such pictures fit a budget of a few hundred
+/// kilobytes and held gigabytes.
+#[test]
+fn a_picture_is_priced_by_every_allocation_it_owns_and_refused_where_it_cannot_be() {
+  use ffmpeg_next::ffi;
+  const SIDE_DATA: usize = 100 << 20;
+  let mut picture = frame::Video::new(ffmpeg_next::format::Pixel::YUV420P, 16, 16);
+  let pixels = super::footprint(&picture).expect("a picture of pixels alone");
+  assert!(pixels > 0, "its pixel buffers are priced");
+  // SAFETY: `picture` is a live frame this test owns; FFmpeg allocates the
+  // side data, the dictionary entry and the buffer, and frees them with it.
+  let side = unsafe {
+    ffi::av_frame_new_side_data(
+      picture.as_mut_ptr(),
+      ffi::AVFrameSideDataType::AV_FRAME_DATA_SEI_UNREGISTERED,
+      SIDE_DATA,
+    )
+  };
+  assert!(!side.is_null(), "100 MiB of side data attached");
+  assert_eq!(
+    super::footprint(&picture),
+    Ok(pixels + SIDE_DATA),
+    "the side data counts its 100 MiB"
+  );
+  let (key, value) = (c"comment", c"a frame metadata entry");
+  // SAFETY: as above.
+  let set = unsafe {
+    ffi::av_dict_set(
+      &mut (*picture.as_mut_ptr()).metadata,
+      key.as_ptr(),
+      value.as_ptr(),
+      0,
+    )
+  };
+  assert_eq!(set, 0, "a metadata entry set");
+  let entry = core::mem::size_of::<ffi::AVDictionaryEntry>()
+    + key.to_bytes().len()
+    + 1
+    + value.to_bytes().len()
+    + 1;
+  // SAFETY: as above; the frame takes the reference.
+  unsafe { (*picture.as_mut_ptr()).opaque_ref = ffi::av_buffer_allocz(4096) };
+  assert_eq!(
+    super::footprint(&picture),
+    Ok(pixels + SIDE_DATA + entry + 4096),
+    "its metadata and its opaque reference count too"
+  );
+  // SAFETY: the side data's buffer reference is taken off it for the
+  // refusal and put back before the frame frees it.
+  unsafe {
+    let buf = (*side).buf;
+    (*side).buf = core::ptr::null_mut();
+    let refused = super::footprint(&picture);
+    (*side).buf = buf;
+    assert_eq!(
+      refused,
+      Err(crate::UnpricedFrame::new(crate::UnpricedHolding::SideData)),
+      "side data no buffer reference owns is refused by name"
+    );
+  }
 }
 
 /// LAW (Codex R4, [high]): **a switch's drain past the budget waits for the

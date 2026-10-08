@@ -163,6 +163,66 @@ pub enum Error {
   /// [`UnrecoveredOutput`].
   #[error(transparent)]
   UnrecoveredOutput(#[from] UnrecoveredOutput),
+
+  /// A decoded picture holds an allocation the software video road's queue
+  /// of pictures waiting for delivery cannot price — of no stated size, or
+  /// owned by no buffer reference — so it is refused by name rather than
+  /// queued as costing nothing; see [`UnpricedFrame`].
+  #[error(transparent)]
+  UnpricedFrame(#[from] UnpricedFrame),
+}
+
+/// What a decoded picture holds that the replay queue's budget cannot price
+/// ([`UnpricedFrame`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum UnpricedHolding {
+  /// `AVFrame.private_ref`: a reference libavcodec keeps for itself, of no
+  /// stated size, which it clears before a frame leaves a decoder.
+  PrivateRef,
+  /// A side data entry whose bytes no buffer reference owns, or a side data
+  /// table that does not hold its entries.
+  SideData,
+}
+
+impl core::fmt::Display for UnpricedHolding {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.write_str(match self {
+      Self::PrivateRef => "a private reference",
+      Self::SideData => "side data no buffer reference owns",
+    })
+  }
+}
+
+/// Payload for [`Error::UnpricedFrame`].
+///
+/// The software video road's queue prices a decoded picture by every
+/// allocation it owns — its pixel buffers, every side data entry's buffer,
+/// its metadata and the side data's, `opaque_ref` and `hw_frames_ctx` —
+/// against [`DecoderLimits::max_replay_bytes`](crate::DecoderLimits::max_replay_bytes).
+/// A picture holding an allocation whose size it cannot read is never
+/// admitted as costing nothing: it is refused by this name, naming what it
+/// holds, and released.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+  "a decoded picture holds an allocation the software video decoder's replay budget cannot \
+   price: {holding}"
+)]
+pub struct UnpricedFrame {
+  holding: UnpricedHolding,
+}
+
+impl UnpricedFrame {
+  /// Constructs an [`UnpricedFrame`] payload.
+  #[inline]
+  pub const fn new(holding: UnpricedHolding) -> Self {
+    Self { holding }
+  }
+  /// What the picture holds that cannot be priced.
+  #[inline]
+  pub const fn holding(&self) -> UnpricedHolding {
+    self.holding
+  }
 }
 
 /// Payload for [`Error::UnrecoveredOutput`].

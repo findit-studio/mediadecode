@@ -28,8 +28,12 @@ The backend-agnostic core it adapts has its own log at
   (`with_` / `set_`, default `DEFAULT_MAX_REPLAY_BYTES`, 512 MiB, exported),
   beside the threads it serves. The queue takes a fallback replay's pictures
   and the tail a one-thread decoder is drained of where the session restarts
-  it at a clean keyframe; each picture counts the buffers it references, and
-  64 pictures bound the queue besides. A replay used to abort at 64 pictures
+  it at a clean keyframe; each picture counts every allocation it owns — the
+  buffers its pixels reference, every side data entry's buffer (SEI
+  payloads, ICC profiles, …), its metadata and the side data's,
+  `opaque_ref` and `hw_frames_ctx` — so small pictures carrying large side
+  data cannot fill memory under a small budget, and 64 pictures bound the
+  queue besides. A replay used to abort at 64 pictures
   whatever their size — up to 32 GiB of 4K pictures at the per-picture
   ceiling — and a switch's drain that passed the cap dropped the rest of the
   tail. Now a drain stops at either bound and answers `Sent::MustDrain`
@@ -61,6 +65,12 @@ The backend-agnostic core it adapts has its own log at
   exported): a decoded picture that alone exceeds that budget, which no
   drain can make room for, is refused by this name, where a replay overflow
   used to surface as a bare `ENOMEM`.
+
+- **`Error::UnpricedFrame`** (`UnpricedFrame { holding }`, with
+  `UnpricedHolding { PrivateRef, SideData }`, exported): a decoded picture
+  holding an allocation the budget cannot price — a `private_ref`, of no
+  stated size, or side data no buffer reference owns — is refused by this
+  name and released, never queued as costing nothing.
 
 - **`Error::UnrecoveredOutput`** (`UnrecoveredOutput { output_corrupt,
   show_all }`, exported): a software video decoder found after its open

@@ -3397,7 +3397,9 @@ fn replay_history(
 /// picture that would not fit until the caller has taken enough, and nothing
 /// received is dropped. A picture whose footprint alone exceeds `budget` can never be
 /// queued under it — no progress is possible — and is refused by name,
-/// [`Error::ReplayQueueFull`].
+/// [`Error::ReplayQueueFull`]; one whose footprint cannot be read — an
+/// allocation of no stated size ([`footprint`]) — is refused by name too,
+/// [`Error::UnpricedFrame`].
 ///
 /// Error discipline: stop the drain **only** on the transient signals
 /// EAGAIN / EOF (the decoder has no more output for now). Every other
@@ -3418,7 +3420,7 @@ fn drain_into(
     let mut tmp = alloc_av_video_frame()?;
     match sw.receive_frame(&mut tmp) {
       Ok(()) => {
-        let bytes = footprint(&tmp);
+        let bytes = footprint(&tmp).map_err(Error::UnpricedFrame)?;
         if bytes > budget {
           tracing::error!(
             bytes,
@@ -3450,37 +3452,110 @@ fn drain_into(
   }
 }
 
-/// The bytes a decoded picture holds: the sizes of the buffers it
-/// references — `buf[]` and `extended_buf` — or, for one that references
-/// none, an upper bound on what its format and dimensions allocate
-/// (`crate::footprint::video_frame_bytes`).
-fn footprint(frame: &frame::Video) -> usize {
-  // SAFETY: `frame` is a live `AVFrame`; its buffer pointers, their
-  // `size`, the extended buffer count and three plain integers are read,
-  // and no reference into FFmpeg memory is kept.
+/// The bytes a decoded picture holds, every allocation it owns priced: the
+/// buffers its pixels reference — `buf[]` and `extended_buf` — or, for one
+/// that references none, an upper bound on what its format and dimensions
+/// allocate (`crate::footprint::video_frame_bytes`); every side data entry's
+/// buffer (SEI payloads, ICC profiles, …), whatever the pixels weigh; the
+/// frame's metadata and each side data entry's; `opaque_ref` and
+/// `hw_frames_ctx`. Pricing the pixels alone let small pictures carrying
+/// large side data fill memory under a small budget.
+///
+/// A picture holding an allocation of no stated size is refused by name
+/// ([`UnpricedFrame`](crate::UnpricedFrame)): a `private_ref` — libavcodec's
+/// own, which it clears before a frame leaves a decoder — and side data no
+/// buffer reference owns. What the budget cannot price is never admitted as
+/// costing nothing.
+fn footprint(frame: &frame::Video) -> Result<usize, crate::UnpricedFrame> {
+  use crate::UnpricedHolding;
+  let refused = |holding| Err(crate::UnpricedFrame::new(holding));
+  // SAFETY: `frame` is a live `AVFrame`; its buffer reference pointers and
+  // their `size`, its side data table — each entry's buffer reference,
+  // payload pointer, size and metadata, never its type, which is a bindgen
+  // enum — its dictionaries, read through FFmpeg's iterator, and three plain
+  // integers are read, and no reference into FFmpeg memory is kept.
   unsafe {
     let raw = frame.as_ptr();
-    let mut total: usize = 0;
+    let referenced = |buf: *const ffmpeg_next::ffi::AVBufferRef| {
+      if buf.is_null() { 0 } else { (*buf).size }
+    };
+    let mut pixels: usize = 0;
     for &buf in &(*raw).buf {
-      if !buf.is_null() {
-        total = total.saturating_add((*buf).size);
-      }
+      pixels = pixels.saturating_add(referenced(buf));
     }
     let extended = (*raw).extended_buf;
     let count = usize::try_from((*raw).nb_extended_buf).unwrap_or(0);
     if !extended.is_null() {
       for index in 0..count {
-        let buf = *extended.add(index);
-        if !buf.is_null() {
-          total = total.saturating_add((*buf).size);
-        }
+        pixels = pixels.saturating_add(referenced(*extended.add(index)));
       }
     }
-    if total == 0 {
-      total = crate::footprint::video_frame_bytes((*raw).format, (*raw).width, (*raw).height)
+    if pixels == 0 {
+      pixels = crate::footprint::video_frame_bytes((*raw).format, (*raw).width, (*raw).height)
         .unwrap_or(0);
     }
-    total
+    if !(*raw).private_ref.is_null() {
+      return refused(UnpricedHolding::PrivateRef);
+    }
+    let mut total = pixels
+      .saturating_add(referenced((*raw).opaque_ref))
+      .saturating_add(referenced((*raw).hw_frames_ctx))
+      .saturating_add(dictionary_bytes((*raw).metadata));
+    let entries = usize::try_from((*raw).nb_side_data).unwrap_or(0);
+    let table = (*raw).side_data;
+    if entries > 0 && table.is_null() {
+      return refused(UnpricedHolding::SideData);
+    }
+    for index in 0..entries {
+      let entry = *table.add(index);
+      if entry.is_null() {
+        return refused(UnpricedHolding::SideData);
+      }
+      let buf = core::ptr::read(core::ptr::addr_of!((*entry).buf));
+      let data = core::ptr::read(core::ptr::addr_of!((*entry).data));
+      let size = core::ptr::read(core::ptr::addr_of!((*entry).size));
+      if buf.is_null() && (!data.is_null() || size > 0) {
+        return refused(UnpricedHolding::SideData);
+      }
+      let metadata = core::ptr::read(core::ptr::addr_of!((*entry).metadata));
+      total = total
+        .saturating_add(referenced(buf))
+        .saturating_add(dictionary_bytes(metadata));
+    }
+    Ok(total)
+  }
+}
+
+/// The bytes an `AVDictionary`'s entries hold: each entry and its two
+/// NUL-terminated strings. Zero for a null dictionary.
+///
+/// # Safety
+/// `dict` is null or a live `AVDictionary`.
+unsafe fn dictionary_bytes(dict: *const ffmpeg_next::ffi::AVDictionary) -> usize {
+  let mut total: usize = 0;
+  if dict.is_null() {
+    return total;
+  }
+  let mut entry: *const ffmpeg_next::ffi::AVDictionaryEntry = core::ptr::null();
+  loop {
+    // SAFETY: `dict` is live (the caller's promise) and `entry` is null or
+    // the entry this iterator answered last.
+    entry = unsafe { ffmpeg_next::ffi::av_dict_iterate(dict, entry) };
+    if entry.is_null() {
+      return total;
+    }
+    // SAFETY: a live entry's key and value are NUL-terminated strings the
+    // dictionary owns.
+    let (key, value) = unsafe {
+      (
+        core::ffi::CStr::from_ptr((*entry).key).to_bytes().len(),
+        core::ffi::CStr::from_ptr((*entry).value).to_bytes().len(),
+      )
+    };
+    total = total
+      .saturating_add(core::mem::size_of::<ffmpeg_next::ffi::AVDictionaryEntry>())
+      .saturating_add(key + 1)
+      .saturating_add(value + 1);
   }
 }
 
