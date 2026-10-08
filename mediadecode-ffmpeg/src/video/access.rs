@@ -167,9 +167,7 @@ impl KeyframeRule {
         }
         match kind {
           5 => Some(anchor(None)),
-          1 | 2 => {
-            recovery_point(data, nal_length).map(|frames| anchor(Some(RecoveryPoint { frames })))
-          }
+          1 | 2 => recovery_point(data, nal_length).map(|point| anchor(Some(point))),
           _ => None,
         }
       }
@@ -229,17 +227,40 @@ impl Anchor {
 }
 
 /// An H.264 recovery point SEI message's account of its recovery (H.264
-/// D.2.8).
+/// D.2.8), read field by field and carried for reporting.
+///
+/// **What anchoring at one proves**, exact or approximate: the pictures from
+/// the anchor on are the pictures a decoder STARTED at this random-access
+/// point produces — FFmpeg starts at recovery points whatever the message's
+/// flags say — not that they match a decode that ran through the gap bit for
+/// bit. An approximate recovery point ([`Self::exact_match`] `false`) says
+/// they need not; it anchors all the same.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RecoveryPoint {
   frames: u32,
+  exact_match: bool,
+  broken_link: bool,
 }
 
 impl RecoveryPoint {
-  /// `recovery_frame_cnt`: the pictures are correct from the recovery point
-  /// on, that many frames after it in output order.
+  /// `recovery_frame_cnt`: the pictures are recovered from the recovery
+  /// point on, that many frames after it in output order.
   pub(crate) const fn frames(self) -> u32 {
     self.frames
+  }
+
+  /// `exact_match_flag`: whether the pictures from the recovery on match a
+  /// decode that started before the recovery point exactly — `false` for an
+  /// approximate recovery, whose pictures need not.
+  pub(crate) const fn exact_match(self) -> bool {
+    self.exact_match
+  }
+
+  /// `broken_link_flag`: whether the pictures at the recovery point may hold
+  /// serious visual artefacts from what came before it — the stream was
+  /// spliced there. Nothing forward changes for it.
+  pub(crate) const fn broken_link(self) -> bool {
+    self.broken_link
   }
 }
 
@@ -309,11 +330,11 @@ fn slice_header_parses(unit: &[u8]) -> bool {
   bits.ue().is_some() && bits.ue().is_some_and(|slice_type| slice_type <= 9)
 }
 
-/// The `recovery_frame_cnt` of the recovery point SEI message an H.264
-/// access unit carries before its first picture; `None` where none does, or
-/// where an SEI unit before it does not parse. The units are read as
-/// [`first_h264_picture`] reads them, one at a time.
-fn recovery_point(data: &[u8], nal_length: Option<usize>) -> Option<u32> {
+/// The recovery point SEI message an H.264 access unit carries before its
+/// first picture; `None` where none does, or where an SEI unit before it
+/// does not parse. The units are read as [`first_h264_picture`] reads them,
+/// one at a time.
+fn recovery_point(data: &[u8], nal_length: Option<usize>) -> Option<RecoveryPoint> {
   for unit in NalUnits::new(data, nal_length) {
     let unit = unit.ok()?;
     let kind = unit.first()? & 0x1f;
@@ -333,15 +354,15 @@ fn recovery_point(data: &[u8], nal_length: Option<usize>) -> Option<u32> {
 const RECOVERY_POINT: u32 = 6;
 
 /// The recovery point an SEI unit's raw byte sequence payload `rbsp` states:
-/// `Some(Some(recovery_frame_cnt))` for its first recovery point message,
-/// `Some(None)` where it has none, `None` where its messages do not parse.
+/// `Some(Some(point))` for its first recovery point message, `Some(None)`
+/// where it has none, `None` where its messages do not parse.
 /// Every `sei_message` is walked whole by its `payload_size` — its type and
 /// size each a run of `FF` bytes and a last byte — over the payload with its
 /// emulation prevention bytes removed, up to the `rbsp_trailing_bits`; a
 /// payload that runs past the unit does not parse. A recovery point's
 /// `recovery_frame_cnt` (`ue(v)`), `exact_match_flag`, `broken_link_flag`
 /// and `changing_slice_group_idc` (two bits) lie within its payload.
-fn sei_recovery_point(rbsp: &[u8]) -> Option<Option<u32>> {
+fn sei_recovery_point(rbsp: &[u8]) -> Option<Option<RecoveryPoint>> {
   let mut bits = RbspBits::new(rbsp);
   let mut found = None;
   while !bits.at_trailing_bits() {
@@ -352,13 +373,19 @@ fn sei_recovery_point(rbsp: &[u8]) -> Option<Option<u32>> {
       .checked_add(usize::try_from(payload_size).ok()?.checked_mul(8)?)?;
     if payload_type == RECOVERY_POINT && found.is_none() {
       let frames = bits.ue()?;
-      for _ in 0..4 {
-        bits.next_bit()?;
-      }
+      let exact_match = bits.next_bit()?;
+      let broken_link = bits.next_bit()?;
+      // `changing_slice_group_idc`, two bits.
+      bits.next_bit()?;
+      bits.next_bit()?;
       if bits.read() > end {
         return None;
       }
-      found = Some(frames);
+      found = Some(RecoveryPoint {
+        frames,
+        exact_match,
+        broken_link,
+      });
     }
     while bits.read() < end {
       bits.next_bit()?;

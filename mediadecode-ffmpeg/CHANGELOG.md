@@ -160,7 +160,11 @@ The backend-agnostic core it adapts has its own log at
   `PostCommitNeverResynced`. The anchor is a key-flagged packet fed across
   the gap whose first picture the bitstream proves a random-access one — an
   H.264 IDR picture, or an access unit whose recovery point SEI message,
-  before its first picture, says so (every SEI message walked by its size
+  before its first picture, says so — exact or approximate
+  (`exact_match_flag` 0), its flags read and reported: what a resync proves
+  is the pictures a decoder started at the anchor produces, which FFmpeg
+  does at any recovery point, not a bit-for-bit match with a decode that
+  ran through the gap (every SEI message walked by its size
   over the payload with its emulation prevention bytes removed; the first
   slice header parsing, its `slice_type` at most 9; an I picture alone
   anchors nothing, since a slice type describes that slice alone and FFmpeg

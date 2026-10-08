@@ -459,11 +459,12 @@ fn sei(messages: &[(u32, &[u8])]) -> Vec<u8> {
 }
 
 /// A recovery point message's payload: `recovery_frame_cnt` as the
-/// exp-Golomb bits `frames`, `exact_match_flag` 1, `broken_link_flag` as
-/// `broken`, `changing_slice_group_idc` 0, then the payload's alignment —
-/// a one, then zeros.
-fn recovery(frames: &str, broken: bool) -> Vec<u8> {
-  let bits = format!("{frames}1{}001", if broken { "1" } else { "0" });
+/// exp-Golomb bits `frames`, `exact_match_flag` as `exact`,
+/// `broken_link_flag` as `broken`, `changing_slice_group_idc` 0, then the
+/// payload's alignment — a one, then zeros.
+fn recovery(frames: &str, exact: bool, broken: bool) -> Vec<u8> {
+  let bit = |flag: bool| if flag { "1" } else { "0" };
+  let bits = format!("{frames}{}{}001", bit(exact), bit(broken));
   let padded = format!("{bits}{}", "0".repeat((8 - bits.len() % 8) % 8));
   packed(&padded)
 }
@@ -511,7 +512,7 @@ fn a_resync_anchor_is_a_packet_whose_first_picture_is_random_access() {
     far_i_slice.windows(3).any(|w| w == [0, 0, 3]),
     "the fixture carries an emulation prevention byte"
   );
-  let recovers = sei(&[(6, &recovery("1", false))]);
+  let recovers = sei(&[(6, &recovery("1", true, false))]);
   for (units, anchor, why) in [
     (vec![&idr[..]], Some((0, true)), "an IDR slice"),
     (
@@ -585,12 +586,12 @@ fn an_h264_anchor_is_an_idr_or_a_recovery_point_sei() {
   let p_slice = slice(0x41, "1", "00110");
   // ue(12): `0001101`.
   let twelve = slice(0x41, "1", "0001101");
-  let zero = sei(&[(6, &recovery("1", false))]);
-  let two = sei(&[(6, &recovery("011", false))]);
-  let broken = sei(&[(6, &recovery("011", true))]);
+  let zero = sei(&[(6, &recovery("1", true, false))]);
+  let two = sei(&[(6, &recovery("011", true, false))]);
+  let broken = sei(&[(6, &recovery("011", true, true))]);
   // A user-data payload before the recovery point, holding `00 00 01`.
   let user_data: Vec<u8> = [&[0u8; 16][..], &[0, 0, 1, 0x42]].concat();
-  let behind = sei(&[(5, &user_data), (6, &recovery("011", false))]);
+  let behind = sei(&[(5, &user_data), (6, &recovery("011", true, false))]);
   assert!(
     behind.windows(4).any(|w| w == [0, 0, 3, 1]),
     "the fixture carries an emulation prevention byte"
@@ -672,4 +673,31 @@ fn an_intra_only_codec_is_clean_and_anchors_at_every_packet() {
     KeyframeRule::Reordering,
     "MPEG-4 references other pictures"
   );
+}
+
+/// LAW (Codex R8 row 3, [medium]): **an approximate recovery point anchors,
+/// and its flags are read.** H.264 D.2.8: `exact_match_flag` 0 says the
+/// pictures from the recovery on need not match a decode that started
+/// before it — an approximate recovery. What the resync proves is the
+/// pictures a decoder started at the recovery point produces, which FFmpeg
+/// does whatever the flag says, so the approximate point anchors as the
+/// exact one does; the anchor carries both flags, read field by field, and
+/// `broken_link_flag` beside them.
+#[test]
+fn an_approximate_recovery_point_anchors_and_its_flags_are_read() {
+  let h264 = KeyframeRule::of(CodecId::H264.raw(), &[]);
+  let p_slice = slice(0x41, "1", "00110");
+  for (exact, broken) in [(true, false), (false, false), (false, true), (true, true)] {
+    let message = sei(&[(6, &recovery("011", exact, broken))]);
+    let anchor = h264
+      .anchor(&annex_b(&[&message[..], &p_slice[..]]))
+      .expect("a recovery point anchors, exact or approximate");
+    let point = anchor.recovery().expect("the recovery point it stands on");
+    assert_eq!(
+      (point.frames(), point.exact_match(), point.broken_link()),
+      (2, exact, broken),
+      "the message's fields, read"
+    );
+    assert!(!anchor.definitive(), "a recovery point is not definitive");
+  }
 }

@@ -2004,8 +2004,13 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     self.anchor_definitive = anchor.definitive();
     self.anchor_recovery = anchor.recovery();
     if let Some(recovery) = self.anchor_recovery {
+      // An approximate recovery point anchors too: what the resync proves is
+      // the pictures a decoder started at this point produces, not a match
+      // with a decode that ran through the gap (`access::RecoveryPoint`).
       tracing::debug!(
         recovery_frame_cnt = recovery.frames(),
+        exact_match = recovery.exact_match(),
+        broken_link = recovery.broken_link(),
         "mediadecode-ffmpeg: a post-commit resync anchored at an H.264 recovery point; the \
          decoder withholds its pictures until the recovery it signals",
       );
@@ -3471,7 +3476,11 @@ fn outputs_no_corrupt_picture(opened: &ffmpeg_next::decoder::Opened) -> bool {
 /// [`Self::packets_unproven`], decoded and their pictures delivered but never
 /// proved to come from after the gap — through an un-anchor, and any anchor
 /// after the first. The first anchor itself is in neither count;
-/// [`Self::anchor_seen`] says whether there was one. A packet the decoder
+/// [`Self::anchor_seen`] says whether there was one. What a resync proves,
+/// at any anchor, is the pictures a decoder started at that random-access
+/// point produces — not a bit-for-bit match with a decode that ran through
+/// the gap: an approximate H.264 recovery point (`exact_match_flag` 0)
+/// anchors as an exact one does, its flags reported in a debug trace. A packet the decoder
 /// refused with an error was reported by that error, and is counted in
 /// neither.
 #[derive(Debug)]
