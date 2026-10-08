@@ -5296,3 +5296,144 @@ fn a_codec_whose_keyframes_cannot_be_proved_clean_switches_only_at_a_seek() {
     "no switch mid-stream: {threads:?}"
   );
 }
+
+/// A probe-era fallback raised by `send_eof` on an MPEG-4 clip with
+/// B-frames — its decoder holds a picture back until it is told the end —
+/// replayed through a queue whose budget holds two and a half pictures, so
+/// the end is fed in a later round; the ends software decoders are sent are
+/// answered first by `answers`. A caller that obeys every `MustDrain` sends
+/// the end until it is taken, then drains to the end. Answers the clip's
+/// length, the pictures delivered, the decode errors met, and the fault a
+/// sent end met, if any.
+fn an_end_answered(
+  answers: &[ffmpeg_next::Error],
+) -> (usize, usize, usize, Option<VideoDecodeError>) {
+  let (w, h) = (96u32, 64u32);
+  let clip = encode_mpeg4_with_b_frames(w, h, 11);
+  let budget = picture_bytes(&clip) * 5 / 2;
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test(
+    Box::new(FakeHw::failing_at_eof(w, h)),
+    clip.parameters.clone(),
+    tb,
+  )
+  .expect("build test decoder")
+  .with_threads_for_test(crate::Threads::Single)
+  .with_max_replay_bytes_for_test(budget);
+  for av_pkt in &clip.packets {
+    crate::accepted(dec.send_packet(&pushed(av_pkt)), "send_packet");
+  }
+  super::eof_script::push(answers.iter().copied());
+  let mut dst = crate::empty_owned_video_frame();
+  let (mut pictures, mut errors) = (0usize, 0usize);
+  let mut drain = |dec: &mut FfmpegVideoStreamDecoder, pictures: &mut usize, errors: &mut usize| loop {
+    match dec.receive_frame(&mut dst) {
+      Ok(Received::Frame) => *pictures += 1,
+      Err(VideoDecodeError::Decode(_)) => *errors += 1,
+      Ok(Received::NeedsInput | Received::Ended) => break,
+      Err(other) => panic!("draining: {other:?}"),
+    }
+  };
+  let mut fault = None;
+  for _ in 0..32 {
+    match dec.send_eof() {
+      Ok(Sent::Accepted) => break,
+      Ok(Sent::MustDrain) => drain(&mut dec, &mut pictures, &mut errors),
+      Err(error) => {
+        fault = Some(error);
+        break;
+      }
+    }
+  }
+  drain(&mut dec, &mut pictures, &mut errors);
+  (clip.packets.len(), pictures, errors, fault)
+}
+
+/// LAW (Codex R6 row 3, [high]): **an end the decoder answers with back
+/// pressure until the retries run out is still owed, and is sent again.**
+/// The replay's end meets `EAGAIN` seventeen times — past the sixteen one
+/// round tries — and the round reports the back pressure with the end
+/// still pending: the session's end is not committed, the caller's
+/// `send_eof` answers `MustDrain`, and sent again, the end reaches the
+/// decoder, which gives up the picture it held. Taken as told, it was
+/// committed untold: the session drained a decoder that never ended, and
+/// the held picture was lost.
+#[test]
+fn an_end_held_back_past_the_retries_is_owed_and_sent_again() {
+  let eagain = ffmpeg_next::Error::Other {
+    errno: ffmpeg_next::error::EAGAIN,
+  };
+  let (length, pictures, errors, fault) = an_end_answered(&[eagain; 17]);
+  assert!(fault.is_none(), "no end faulted: {fault:?}");
+  assert_eq!(errors, 1, "the back pressure, reported once");
+  assert_eq!(pictures, length, "every picture, the held one too");
+}
+
+/// LAW (Codex R6 row 3, [high]): **an end the decoder refuses is still
+/// owed, and is sent again.** The replay's end is refused once: the round
+/// reports the refusal with the end still pending, and the caller's retry
+/// sends it — the decoder takes it and gives up the picture it held. Taken
+/// as told, the refusal committed the session's end over a decoder that
+/// never had one, and the held picture was lost.
+#[test]
+fn a_refused_end_is_owed_and_sent_again() {
+  let (length, pictures, errors, fault) = an_end_answered(&[ffmpeg_next::Error::InvalidData]);
+  assert!(fault.is_none(), "no end faulted: {fault:?}");
+  assert_eq!(errors, 1, "the refusal, reported once");
+  assert_eq!(pictures, length, "every picture, the held one too");
+}
+
+/// LAW (Codex R6 row 3, [high]): **a switch whose old decoder refuses the
+/// end loses nothing.** A closed-GOP H.264 stream with B-frames falls back
+/// on its probe and switches to three threads at the next IDR, draining the
+/// one-thread decoder first; that decoder refuses the end once. The switch
+/// waits with the refusal reported and the end still owed to the decoder
+/// being switched away from, sends it again, and drains it: every picture
+/// comes out, in the order the same fallback on one thread delivers. Taken as
+/// told, the refused end let the switch close a decoder still holding the
+/// pictures its B-frames kept back.
+#[test]
+fn a_switch_whose_old_decoder_refuses_the_end_loses_nothing() {
+  let clip = encode_h264_closed_gops(128, 96, 40);
+  let idr = keyframe_after(&clip, 3);
+  let three = core::num::NonZeroU32::new(3).expect("nonzero");
+  let (single, _) = threads_through_a_fallback(&clip, 3, crate::Threads::Single);
+
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test(
+    Box::new(FakeHw::failing(16, 16, 0, 3, FailShape::ProbeEra)),
+    clip.parameters.clone(),
+    tb,
+  )
+  .expect("build test decoder")
+  .with_threads_for_test(crate::Threads::Count(three));
+  let mut dst = crate::empty_owned_video_frame();
+  let mut shown = Vec::new();
+  let mut errors = 0usize;
+  let mut drain = |dec: &mut FfmpegVideoStreamDecoder, shown: &mut Vec<_>, errors: &mut usize| loop {
+    match dec.receive_frame(&mut dst) {
+      Ok(Received::Frame) => shown.push(dst.pts()),
+      Err(VideoDecodeError::Decode(_)) => *errors += 1,
+      Ok(Received::NeedsInput | Received::Ended) => break,
+      Err(other) => panic!("draining: {other:?}"),
+    }
+  };
+  for (index, av_pkt) in clip.packets.iter().enumerate() {
+    if index == idr {
+      super::eof_script::push([ffmpeg_next::Error::InvalidData]);
+    }
+    loop {
+      match dec.send_packet(&pushed(av_pkt)).expect("send_packet") {
+        Sent::Accepted => break,
+        Sent::MustDrain => drain(&mut dec, &mut shown, &mut errors),
+      }
+    }
+    drain(&mut dec, &mut shown, &mut errors);
+  }
+  crate::accepted(dec.send_eof(), "send_eof");
+  drain(&mut dec, &mut shown, &mut errors);
+
+  assert_eq!(errors, 1, "the refusal, reported once");
+  assert_eq!(dec.active_threads(), Some(three), "the session switched");
+  assert_eq!(shown, single, "no picture lost, none moved");
+}

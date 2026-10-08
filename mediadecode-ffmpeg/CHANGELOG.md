@@ -42,7 +42,11 @@ The backend-agnostic core it adapts has its own log at
   alike; and the end of the stream the replay owes is the session's the
   moment the decoder takes it — the `send_eof` that fed it is accepted even
   when the drain after it fails, that error waits for the drain, and the
-  end is never sent to the decoder twice.
+  end is never sent to the decoder twice. An end counts as taken only when
+  the decoder takes it or answers that it already has (`AVERROR_EOF`): back
+  pressure past the retries, or a refusal, leaves it owed — reported on the
+  drain and sent again — on a replay and on a switch's drain of the decoder
+  it closes alike.
 
 - **`Error::ReplayQueueFull`** (`ReplayQueueFull { frame_bytes, budget }`,
   exported): a decoded picture that alone exceeds that budget, which no

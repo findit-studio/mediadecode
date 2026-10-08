@@ -708,6 +708,28 @@ pub(crate) mod replay_fault {
   }
 }
 
+/// Test-only: answers a software decoder gives the end of the stream
+/// before it is told — back pressure, or a refusal — scripted in order, the
+/// decoder itself told once the script is spent.
+#[cfg(test)]
+pub(crate) mod eof_script {
+  use std::{cell::RefCell, collections::VecDeque};
+
+  std::thread_local! {
+    static ANSWERS: RefCell<VecDeque<ffmpeg_next::Error>> = const { RefCell::new(VecDeque::new()) };
+  }
+
+  /// The next ends a software decoder is sent are answered with `answers`.
+  pub(crate) fn push(answers: impl IntoIterator<Item = ffmpeg_next::Error>) {
+    ANSWERS.with(|script| script.borrow_mut().extend(answers));
+  }
+
+  /// The scripted answer to this end, if one is left.
+  pub(crate) fn next() -> Option<ffmpeg_next::Error> {
+    ANSWERS.with(|script| script.borrow_mut().pop_front())
+  }
+}
+
 impl SwDecoder {
   /// The callback state this decoder's codec context points at.
   ///
@@ -742,6 +764,10 @@ impl SwDecoder {
   /// software decoder goes through here, so the test census counts each
   /// one the decoder answered.
   pub(crate) fn send_eof(&mut self) -> Result<(), ffmpeg_next::Error> {
+    #[cfg(test)]
+    if let Some(answer) = eof_script::next() {
+      return Err(answer);
+    }
     let told = self.decoder.send_eof();
     #[cfg(test)]
     if !matches!(told, Err(ffmpeg_next::Error::Other { errno }) if errno == ffmpeg_next::error::EAGAIN)
@@ -1376,24 +1402,26 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     let state = sw.state();
     let budget = self.limits.max_replay_bytes();
     let mut attempts: u32 = 0;
+    // The end is taken only when the decoder takes it, or answers that it
+    // already has (`AVERROR_EOF`: it is draining). Back pressure that never
+    // lifts, and a refusal, leave it owed — the error goes to the caller's
+    // drain, and the next send offers the end again. This is the decoder
+    // being switched away from: the session's own end is not touched here.
     while !restart.eof_sent {
       match sw.send_eof() {
-        Ok(()) => restart.eof_sent = true,
+        Ok(()) | Err(ffmpeg_next::Error::Eof) => restart.eof_sent = true,
         Err(ffmpeg_next::Error::Other { errno }) if errno == ffmpeg_next::error::EAGAIN => {
           if drain_into(sw, state, &mut self.sw_replay_frames, budget)? == Drained::Full {
             return Ok(false);
           }
           attempts += 1;
           if attempts > 16 {
-            // A decoder that takes neither the end nor gives a picture:
-            // treated as told, so the drain below ends it.
-            restart.eof_sent = true;
+            return Err(Error::Ffmpeg(ffmpeg_next::Error::Other {
+              errno: ffmpeg_next::error::EAGAIN,
+            }));
           }
         }
-        Err(other) => {
-          restart.eof_sent = true;
-          return Err(crate::decoder::software_exit(state, other));
-        }
+        Err(other) => return Err(crate::decoder::software_exit(state, other)),
       }
     }
     Ok(drain_into(sw, state, &mut self.sw_replay_frames, budget)? == Drained::Empty)
@@ -3072,22 +3100,25 @@ fn replay_history(
           }
           break;
         }
+        // Already draining: the decoder took the end before.
+        Err(ffmpeg_next::Error::Eof) => {
+          progress.eof_sent = true;
+          break;
+        }
+        // Back pressure that never lifts, and a refusal, leave the end owed:
+        // only the decoder taking it — or answering that it has — sends it.
         Err(ffmpeg_next::Error::Other { errno }) if errno == ffmpeg_next::error::EAGAIN => {
           if drain_into(sw, sw_state, queue, budget)? == Drained::Full {
             return Ok(());
           }
           attempts += 1;
           if attempts > 16 {
-            progress.eof_sent = true;
             return Err(Error::Ffmpeg(ffmpeg_next::Error::Other {
               errno: ffmpeg_next::error::EAGAIN,
             }));
           }
         }
-        Err(other) => {
-          progress.eof_sent = true;
-          return Err(crate::decoder::software_exit(sw_state, other));
-        }
+        Err(other) => return Err(crate::decoder::software_exit(sw_state, other)),
       }
     }
   }
