@@ -12,6 +12,10 @@
 //! is a recovery point rather than an IDR. A decoder opened at such a
 //! keyframe drops or conceals those pictures, so switching decoders there
 //! would trade pictures for threads.
+//!
+//! A codec that codes every picture alone — its descriptor carries
+//! `AV_CODEC_PROP_INTRA_ONLY`: ProRes, DNxHD, MJPEG, … — has no reference
+//! to lose, so every one of its packets is both, its key flag or not.
 
 use crate::CodecId;
 
@@ -45,6 +49,12 @@ pub(crate) enum KeyframeRule {
   /// VP8, VP9 and AV1: a keyframe refreshes every reference, and nothing
   /// leads it.
   Resets,
+  /// A codec that codes every picture alone — its descriptor carries
+  /// `AV_CODEC_PROP_INTRA_ONLY`: ProRes, DNxHD, MJPEG, Ut Video, … No
+  /// picture references another, so EVERY packet is a clean random access
+  /// point and a resync anchor, whatever its key flag says; the warning a
+  /// fallback on one thread gives after a minute never fires for it.
+  IntraOnly,
   /// Every other codec: never clean mid-stream. This crate reads none of
   /// its picture headers, and a decoder's `has_b_frames` before a keyframe
   /// proves nothing — FFmpeg raises it when it meets reordering, which an
@@ -80,6 +90,8 @@ impl KeyframeRule {
       || codec_id == CodecId::AV1.raw()
     {
       Self::Resets
+    } else if CodecId::from_raw(codec_id).intra_only() {
+      Self::IntraOnly
     } else {
       Self::Reordering
     }
@@ -105,9 +117,15 @@ impl KeyframeRule {
         first_hevc_picture(data, nal_length).is_some_and(|kind| (16..=20).contains(&kind))
       }
       Self::Mpeg12 => closed_gop(data),
-      Self::Resets => true,
+      Self::Resets | Self::IntraOnly => true,
       Self::Reordering => false,
     }
+  }
+
+  /// Whether every packet of the stream is a random access point, key flag
+  /// or not: a codec that codes every picture alone.
+  pub(crate) const fn every_packet(self) -> bool {
+    matches!(self, Self::IntraOnly)
   }
 
   /// Whether the key-flagged packet `data` anchors a post-commit resync:
@@ -137,7 +155,7 @@ impl KeyframeRule {
       Self::Hevc { nal_length } => {
         first_hevc_picture(data, nal_length).is_some_and(|kind| (16..=23).contains(&kind))
       }
-      Self::Mpeg12 | Self::Resets | Self::Reordering => true,
+      Self::Mpeg12 | Self::Resets | Self::IntraOnly | Self::Reordering => true,
     }
   }
 
@@ -155,6 +173,7 @@ impl KeyframeRule {
         "its GOPs are open (no GOP header before the keyframe says closed_gop), so B pictures after a keyframe may reference the GOP before it"
       }
       Self::Resets => "its keyframes reset every reference",
+      Self::IntraOnly => "it codes every picture alone, so every packet is a clean point",
       Self::Reordering => {
         "this crate cannot prove its keyframes clean from its bitstream, so the session returns to its threads only at a seek"
       }

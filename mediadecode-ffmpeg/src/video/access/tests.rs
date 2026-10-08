@@ -498,3 +498,26 @@ fn a_resync_anchor_is_a_packet_whose_first_picture_is_random_access() {
     );
   }
 }
+
+/// LAW (the coordinator's row 6): **a codec that codes every picture alone
+/// is clean at every packet, and anchors at every one.** ProRes, DNxHD,
+/// MJPEG and Ut Video carry `AV_CODEC_PROP_INTRA_ONLY` in their
+/// descriptors; their rule takes every packet, whatever it holds.
+#[test]
+fn an_intra_only_codec_is_clean_and_anchors_at_every_packet() {
+  for codec in [
+    CodecId::PRORES.raw(),
+    CodecId::DNXHD.raw(),
+    CodecId::MJPEG.raw(),
+    ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_UTVIDEO as i32,
+  ] {
+    let rule = KeyframeRule::of(codec, &[]);
+    assert_eq!(rule, KeyframeRule::IntraOnly, "codec {codec}");
+    assert!(rule.every_packet() && rule.is_clean(&[1, 2, 3]) && rule.anchors(&[1, 2, 3]));
+  }
+  assert_eq!(
+    KeyframeRule::of(CodecId::MPEG4.raw(), &[]),
+    KeyframeRule::Reordering,
+    "MPEG-4 references other pictures"
+  );
+}

@@ -5528,3 +5528,159 @@ fn a_serial_codec_reports_one_thread_and_schedules_no_switch() {
   assert!(dec.is_software(), "the fallback committed");
   assert_eq!(dec.threaded_opens_for_test(), 0, "no switch was scheduled");
 }
+
+/// A Ut Video clip — a codec that codes every picture alone, its decoder
+/// frame-threaded — at 96x64.
+fn encode_utvideo(frames: usize) -> SyntheticClip {
+  use ffmpeg_next as ff;
+  ff::init().expect("ffmpeg init");
+  let codec = ff::codec::encoder::find_by_name("utvideo").expect("utvideo encoder present");
+  encode_clip(codec, 96, 64, frames, ff::Dictionary::new(), |_| {})
+}
+
+/// An Apple ProRes clip — a codec that codes every picture alone, its
+/// decoder frame- and slice-threaded — at 96x64, in the 10-bit 4:2:2 its
+/// encoder takes.
+fn encode_prores(frames: usize) -> SyntheticClip {
+  use ffmpeg_next as ff;
+  ff::init().expect("ffmpeg init");
+  let codec = ff::codec::encoder::find_by_name("prores_ks").expect("prores_ks encoder present");
+  let mut enc = ff::codec::context::Context::new_with_codec(codec)
+    .encoder()
+    .video()
+    .expect("video encoder context");
+  enc.set_width(96);
+  enc.set_height(64);
+  enc.set_format(ff::format::Pixel::YUV422P10LE);
+  enc.set_time_base(ff::Rational::new(1, 25));
+  let mut opened = enc
+    .open_as_with(codec, ff::Dictionary::new())
+    .expect("open encoder");
+  let parameters = ff::codec::Parameters::from(&opened);
+  let drain = |opened: &mut ff::codec::encoder::Video, out: &mut Vec<Packet>| {
+    let mut pkt = Packet::empty();
+    while opened.receive_packet(&mut pkt).is_ok() {
+      out.push(core::mem::replace(&mut pkt, Packet::empty()));
+    }
+  };
+  let mut frame = ff::frame::Video::new(ff::format::Pixel::YUV422P10LE, 96, 64);
+  let mut packets = Vec::new();
+  for i in 0..frames {
+    // Little-endian 10-bit samples; a chroma plane is half as wide.
+    for (plane, samples) in [(0, 96), (1, 48), (2, 48)] {
+      let stride = frame.stride(plane);
+      let data = frame.data_mut(plane);
+      for y in 0..64 {
+        for x in 0..samples {
+          let sample = ((x + y + i * 4 + plane * 128) & 0x3ff) as u16;
+          data[y * stride + 2 * x..][..2].copy_from_slice(&sample.to_le_bytes());
+        }
+      }
+    }
+    frame.set_pts(Some(i as i64));
+    opened.send_frame(&frame).expect("send_frame");
+    drain(&mut opened, &mut packets);
+  }
+  opened.send_eof().expect("encoder send_eof");
+  drain(&mut opened, &mut packets);
+  SyntheticClip {
+    parameters,
+    packets,
+  }
+}
+
+/// Feeds `clip` through a probe-era fallback at packet 3 on three threads,
+/// and checks the session is back on them from the very next packet — the
+/// one the hardware refused — and that every picture comes out as the same
+/// fallback on one thread delivers it.
+fn switches_at_the_very_next_packet(clip: &SyntheticClip, what: &str) {
+  let three = core::num::NonZeroU32::new(3).expect("nonzero");
+  let (single, _) = threads_through_a_fallback(clip, 3, crate::Threads::Single);
+
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test(
+    Box::new(FakeHw::failing(16, 16, 0, 3, FailShape::ProbeEra)),
+    clip.parameters.clone(),
+    tb,
+  )
+  .expect("build test decoder")
+  .with_threads_for_test(crate::Threads::Count(three));
+  let mut dst = crate::empty_owned_video_frame();
+  let mut threaded = Vec::new();
+  let mut threads = Vec::new();
+  for av_pkt in &clip.packets {
+    // The switch drains into the queue the replay filled, so it waits for
+    // the caller to empty it: the packet is sent again after the drain.
+    loop {
+      match dec.send_packet(&pushed(av_pkt)).expect("send_packet") {
+        Sent::Accepted => break,
+        Sent::MustDrain => {
+          while let Received::Frame = dec.receive_frame(&mut dst).expect("receive_frame") {
+            threaded.push(dst.pts());
+          }
+        }
+      }
+    }
+    threads.push(dec.active_threads());
+    while let Received::Frame = dec.receive_frame(&mut dst).expect("receive_frame") {
+      threaded.push(dst.pts());
+    }
+  }
+  crate::accepted(dec.send_eof(), "send_eof");
+  while let Received::Frame = dec.receive_frame(&mut dst).expect("receive_frame") {
+    threaded.push(dst.pts());
+  }
+  assert_eq!(threaded, single, "{what}: no picture lost, none moved");
+  assert_eq!(
+    threads[..3],
+    [Some(core::num::NonZeroU32::MIN); 3],
+    "{what}: the hardware before the fallback reports one"
+  );
+  assert!(
+    threads[3..].iter().all(|&count| count == Some(three)),
+    "{what}: three threads from the very next packet: {threads:?}"
+  );
+}
+
+/// LAW (the coordinator's row 6): **a codec that codes every picture alone
+/// switches at the very next packet, and loses nothing.** ProRes's and Ut
+/// Video's descriptors carry `AV_CODEC_PROP_INTRA_ONLY`: no picture
+/// references another, so every packet is a clean switch point and a
+/// resync anchor. A probe-era fallback at packet 3 on three threads replays
+/// the history on one thread and switches at the packet it was refused —
+/// the very next — on three from there; every picture comes out as the
+/// same fallback on one thread delivers it. The same holds where a
+/// container flags only the first packet key: the rule takes every packet,
+/// its flag or not.
+#[test]
+fn an_intra_only_codec_switches_at_the_very_next_packet_and_loses_nothing() {
+  use ffmpeg_next::ffi::AVCodecID;
+  for (codec, clip) in [
+    (AVCodecID::AV_CODEC_ID_PRORES, encode_prores(20)),
+    (AVCodecID::AV_CODEC_ID_UTVIDEO, encode_utvideo(20)),
+  ] {
+    assert_eq!(
+      super::access::KeyframeRule::of(codec as i32, &[]),
+      super::access::KeyframeRule::IntraOnly,
+      "{codec:?}: the descriptor says intra-only"
+    );
+    assert!(
+      clip.packets.iter().all(Packet::is_key),
+      "{codec:?}: FFmpeg flags every packet of an intra-only codec key"
+    );
+    switches_at_the_very_next_packet(&clip, &format!("{codec:?}"));
+
+    let mut packets = clip.packets.clone();
+    for pkt in &mut packets[1..] {
+      pkt.set_flags(pkt.flags() - ffmpeg_next::packet::Flags::KEY);
+    }
+    let first_only = SyntheticClip {
+      parameters: clip.parameters.clone(),
+      packets,
+    };
+    switches_at_the_very_next_packet(
+      &first_only,
+      &format!("{codec:?}, the first packet alone key"),
+    );
+  }
+}

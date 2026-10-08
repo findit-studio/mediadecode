@@ -98,7 +98,9 @@ The backend-agnostic core it adapts has its own log at
   GOP header that says `closed_gop`, each proved by its bitstream and never
   inferred from the old decoder's `has_b_frames` (FFmpeg raises it only when
   it meets reordering, which an open GOP can introduce at that keyframe);
-  every other codec has none mid-stream — or at the first keyframe after a
+  every packet of a codec that codes every picture alone (its descriptor's
+  `AV_CODEC_PROP_INTRA_ONLY`: ProRes, DNxHD, MJPEG, Ut Video, …); every other
+  codec has none mid-stream — or at the first keyframe after a
   seek, and after a
   post-commit degrade not before its resync, it is drained, every picture
   it still holds delivered first and in order, and closed, and a decoder
@@ -155,8 +157,9 @@ The backend-agnostic core it adapts has its own log at
   `PostCommitNeverResynced`. The anchor is a key-flagged packet fed across
   the gap whose first picture the bitstream proves a random-access one — an
   H.264 IDR slice or a non-IDR slice whose header says I or SI, an HEVC IRAP
-  picture (a CRA among them); for the codecs whose pictures this crate does
-  not read, the key flag FFmpeg's parser set is the proof — since an intra
+  picture (a CRA among them); for a codec that codes every picture alone,
+  every packet; for the other codecs whose pictures this crate does not
+  read, the key flag FFmpeg's parser set is the proof — since an intra
   picture resets the references of every picture after it that does not
   lead it; a stale flag, or a picture before the random-access one, anchors
   nothing. It is fed only once the decoder holds

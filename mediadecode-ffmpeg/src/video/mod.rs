@@ -1649,17 +1649,18 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// can read it — see [`access::KeyframeRule::anchors`]. A stale key flag, or
   /// a picture before the random-access one, anchors nothing.
   fn anchors(&self, pkt: &Packet) -> bool {
-    pkt.is_key()
-      && pkt
-        .data()
-        .is_some_and(|data| self.keyframe_rule().anchors(data))
+    let rule = self.keyframe_rule();
+    (pkt.is_key() || rule.every_packet()) && pkt.data().is_some_and(|data| rule.anchors(data))
   }
 
   /// Whether `pkt` is a point to switch the software decoder at: a keyframe
   /// that is a clean random access point ([`Self::clean_keyframe`]), or the
-  /// first keyframe after a seek, which has discarded what led it.
+  /// first keyframe after a seek, which has discarded what led it. For a
+  /// codec that codes every picture alone, every packet is a keyframe here,
+  /// its flag or not.
   fn switch_point(&self, pkt: &Packet) -> bool {
-    pkt.is_key() && (self.seeked || self.clean_keyframe(pkt))
+    (pkt.is_key() || self.keyframe_rule().every_packet())
+      && (self.seeked || self.clean_keyframe(pkt))
   }
 
   /// The keyframe rule for this session's stream, read off its codec
@@ -1706,7 +1707,8 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// first time a minute of stream time has gone by on one thread, it
   /// names the codec and why its keyframes are not clean.
   fn note_one_thread(&mut self, pkt: &Packet) {
-    if self.one_thread_warned {
+    // A codec that codes every picture alone switches at its next packet.
+    if self.one_thread_warned || self.keyframe_rule().every_packet() {
       return;
     }
     let Some(at) = pkt.pts().or_else(|| pkt.dts()) else {
