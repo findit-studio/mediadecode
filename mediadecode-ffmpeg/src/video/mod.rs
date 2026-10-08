@@ -1749,12 +1749,38 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// fail too, the session is left with no decoder open
   /// ([`DecodeState::SwClosed`]), the error is returned — the packet was
   /// not taken — and the next send opens one again.
-  fn open_after_drain(&mut self) -> Result<(), Error> {
+  ///
+  /// # On the packet's extradata
+  ///
+  /// Where the packet the new decoder is opened for carries a new extradata
+  /// (`replacement`), the decoder opens on a copy of the session's parameters
+  /// carrying it ([`Self::carrying`]), committed once the decoder serves
+  /// ([`Self::commit_opened`]) — never on the retained parameters first,
+  /// whose record may be one a decoder cannot open on.
+  fn open_after_drain(&mut self, replacement: Option<NewExtradata>) -> Result<(), Error> {
     self.state = DecodeState::SwClosed;
+    let carrying = self.carrying(replacement)?;
+    let parameters = carrying.as_ref().unwrap_or(&self.parameters);
     let one_thread = self.limits.with_threads(crate::Threads::Single);
     let sw = if self.sw_threads_pending {
       self.sw_threads_pending = false;
-      match self.open_on_session_threads() {
+      // The one open on the session's own threads. In tests it can be made
+      // to fail, and is counted.
+      #[cfg(test)]
+      let refused = {
+        self.threaded_opens += 1;
+        self.fail_threaded_opens
+      };
+      #[cfg(not(test))]
+      let refused = false;
+      let threaded = if refused {
+        Err(Error::Ffmpeg(ffmpeg_next::Error::Other {
+          errno: libc::ENOMEM,
+        }))
+      } else {
+        open_sw_decoder(parameters, self.limits, Some(self.time_base))
+      };
+      match threaded {
         Ok(sw) => sw,
         Err(error) => {
           tracing::warn!(
@@ -1762,17 +1788,15 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
             "mediadecode-ffmpeg: the software decoder could not be opened on the session's \
              threads at a keyframe; the session stays on one thread for good",
           );
-          open_sw_decoder(&self.parameters, one_thread, Some(self.time_base))?
+          open_sw_decoder(parameters, one_thread, Some(self.time_base))?
         }
       }
     } else {
-      open_sw_decoder(&self.parameters, one_thread, Some(self.time_base))?
+      open_sw_decoder(parameters, one_thread, Some(self.time_base))?
     };
     self.state = DecodeState::Sw(sw);
     self.sw_output_settled = true;
-    // Opened on the parameters, in place of a decoder that may not have read
-    // a provisional extradata's packet.
-    self.extradata_read();
+    self.commit_opened(carrying);
     Ok(())
   }
 
@@ -1827,27 +1851,13 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   }
 
   /// **A drained switch, completed**: the drained decoder is closed and one
-  /// on the session's threads opened ([`Self::open_after_drain`]).
-  fn finish_restart(&mut self) -> Result<(), Error> {
+  /// on the session's threads opened ([`Self::open_after_drain`]), on the
+  /// new extradata the keyframe carries, if it carries one.
+  fn finish_restart(&mut self, replacement: Option<NewExtradata>) -> Result<(), Error> {
     if self.restart.take().is_none() {
       return Ok(());
     }
-    self.open_after_drain()
-  }
-
-  /// The one open a switch attempts on the session's own threads. In tests
-  /// it can be made to fail, and is counted.
-  fn open_on_session_threads(&mut self) -> Result<SwDecoder, Error> {
-    #[cfg(test)]
-    {
-      self.threaded_opens += 1;
-      if self.fail_threaded_opens {
-        return Err(Error::Ffmpeg(ffmpeg_next::Error::Other {
-          errno: libc::ENOMEM,
-        }));
-      }
-    }
-    open_sw_decoder(&self.parameters, self.limits, Some(self.time_base))
+    self.open_after_drain(replacement)
   }
 
   /// The software road's send: what a fallback's replay left fed first,
@@ -1917,9 +1927,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     }
     // The extradata this packet carries, copied before anything of the
     // session moves: it becomes the active extradata once the decoder takes
-    // the packet, and until then the packet is read under it
-    // ([`Self::rule_for`]).
-    let extradata = NewExtradata::of(
+    // the packet — or once a decoder opened on it for the packet serves
+    // ([`Self::open_after_drain`]) — and until then the packet is read under
+    // it ([`Self::rule_for`]).
+    let mut extradata = NewExtradata::of(
       pkt,
       &self.parameters,
       self.limits.max_codec_parameter_bytes(),
@@ -1948,12 +1959,15 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
           return Ok(Sent::MustDrain);
         }
       }
-      self.finish_restart().map_err(VideoDecodeError::Decode)?;
+      self
+        .finish_restart(extradata.take())
+        .map_err(VideoDecodeError::Decode)?;
     }
     if matches!(self.state, DecodeState::SwClosed) {
       // No decoder open: one is opened, on one thread for good — on the
       // session's parameters, none while their extradata is unknown unless
-      // this packet carries its own. The packet stays the caller's.
+      // this packet carries its own, which it opens on. The packet stays the
+      // caller's.
       if let Some(doubt) = self.extradata_unknown
         && new_extradata(pkt).is_none()
       {
@@ -1961,7 +1975,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
           crate::ExtradataUnknown::new(doubt),
         )));
       }
-      self.open_after_drain().map_err(VideoDecodeError::Decode)?;
+      self
+        .open_after_drain(extradata.take())
+        .map_err(VideoDecodeError::Decode)?;
     }
     // A key-flagged packet across an open gap whose first picture is proved
     // a random-access one anchors the resync, fed once the decoder holds no
@@ -2239,6 +2255,45 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     }
   }
 
+  /// **What a decoder opened for a packet carrying `replacement` opens on**:
+  /// with none, nothing here — the session's own parameters
+  /// ([`Self::parameters`]); with one, a copy of them carrying it in place of
+  /// their extradata, which the session commits only once the decoder opened
+  /// on it serves ([`Self::commit_opened`]). The one opening for every road
+  /// that opens a decoder for the packet it then hands it: a reopen
+  /// ([`Self::open_after_drain`]), the post-commit fallback's cold decoder.
+  ///
+  /// The open reads the extradata — FFmpeg's HEVC decoder parses it there
+  /// and fails the open on a record it cannot read (`hevc_decode_init`,
+  /// hevc/hevcdec.c) — so a decoder opened on the retained parameters before
+  /// the packet's record replaced them failed for good on an unreadable
+  /// retained record, while the packet carrying the stream's replacement
+  /// never reached a decoder.
+  fn carrying(&self, replacement: Option<NewExtradata>) -> Result<Option<Parameters>, Error> {
+    replacement
+      .map(|extradata| {
+        let mut parameters =
+          try_clone_parameters(&self.parameters, self.limits.max_codec_parameter_bytes())?;
+        extradata.install(&mut parameters);
+        Ok(parameters)
+      })
+      .transpose()
+  }
+
+  /// The decoder opened on `opened_on` — a copy of the session's parameters
+  /// carrying a packet's new extradata ([`Self::carrying`]), or `None` for
+  /// the session's own — serves: those parameters are the session's, their
+  /// extradata known and read, since the open applied it; opened on the
+  /// session's own, it replaces a decoder that may not have read a
+  /// provisional extradata's packet.
+  fn commit_opened(&mut self, opened_on: Option<Parameters>) {
+    if let Some(parameters) = opened_on {
+      self.parameters = parameters;
+      self.extradata_unknown = None;
+    }
+    self.extradata_read();
+  }
+
   /// Installs what the hardware took while its probe recorded
   /// ([`Self::probe_extradata`]) as the active extradata: the probe's history
   /// will not be replayed.
@@ -2482,9 +2537,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
         return Err(Error::ExtradataUnknown(crate::ExtradataUnknown::new(doubt)));
       }
     }
-    // The extradata the forwarded packet carries, active once committed;
-    // one the parameters' ceiling cannot hold is refused before a decoder
-    // opens.
+    // The extradata the forwarded packet carries — one the parameters'
+    // ceiling cannot hold refused before a decoder opens — is what the cold
+    // decoder opens on, in a copy of the session's parameters committed with
+    // it ([`Self::carrying`]).
     let extradata = match input {
       PostCommitInput::Packet(pkt) => NewExtradata::of(
         pkt,
@@ -2493,8 +2549,13 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       )?,
       PostCommitInput::FrameTime | PostCommitInput::Eof => None,
     };
+    let carrying = self.carrying(extradata)?;
     let one_thread = self.limits.with_threads(crate::Threads::Single);
-    let mut sw = open_sw_decoder(&self.parameters, one_thread, Some(self.time_base))?;
+    let mut sw = open_sw_decoder(
+      carrying.as_ref().unwrap_or(&self.parameters),
+      one_thread,
+      Some(self.time_base),
+    )?;
     // **No proof, no commit.** This is the one road whose commit owes a
     // proof — the resync after the gap — and every proof is an invariant of
     // libavcodec's own decoders ([`resync_proof`]). A decoder that wraps
@@ -2547,16 +2608,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
         .map_err(|e| crate::decoder::software_exit(state, e))?;
     }
     // Commit: only after a clean open + forward. The session's own
-    // threads come back at the next keyframe.
+    // threads come back at the next keyframe. The parameters it opened on
+    // are the session's.
     self.state = DecodeState::Sw(sw);
-    // A decoder opened on the parameters replaces the one that may not have
-    // read a provisional extradata's packet; and this one, fresh, on one
-    // thread and libavcodec's own, decoded the forwarded packet inside its
-    // submission.
-    self.extradata_read();
-    if let Some(extradata) = extradata {
-      self.took_extradata(extradata, false, true);
-    }
+    self.commit_opened(carrying);
     self.sw_threads_pending = self.session_threads_run();
     self.enter_degraded_resync();
     self.sw_output_settled = forwarded.is_none() && !eof_pending;

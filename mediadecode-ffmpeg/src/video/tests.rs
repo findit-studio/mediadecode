@@ -7941,20 +7941,20 @@ fn a_flush_before_the_hardware_reads_a_new_extradata_leaves_it_unknown() {
   }
 }
 
-/// LAW (pre-R14 row 1; restated by Codex R14, [high]): **on the software
+/// LAW (pre-R14 row 1; restated by Codex R14, [medium]): **on the software
 /// road too, a new extradata is provisional until the decoder is seen to
 /// read its packet, and a flush then leaves it unknown.** The R11 stream
 /// through a probe-era fallback at 10: the decoder serving takes the IDR 16
-/// and its two-byte record (on three threads, the decoder the switch at 16
-/// opens), then the caller seeks. Seen read — one thread, decoding what a
-/// call hands it inside that call, answered "needs input" after it, or took
-/// 17 into an input slot it takes packets into only empty; on three threads,
-/// the drain reached the end — the record stays known. Not seen read —
-/// nothing after 16; on three threads 17 taken, or a drain to "needs
-/// input", which a frame-threaded decoder answers once a worker has the
-/// packet, decoded or not — the flush leaves it unknown. Taken for good at
-/// the acceptance, every case read known; read at a frame-threaded "needs
-/// input", the drain read it known.
+/// and its two-byte record, then the caller seeks. On one thread, seen read
+/// — the decoder, decoding what a call hands it inside that call, answered
+/// "needs input" after it, or took 17 into an input slot it takes packets
+/// into only empty — the record stays known; not seen read, nothing after
+/// 16, the flush leaves it unknown. On three threads the switch at 16 opens
+/// its decoder on the record 16 carries, which the open applies: known
+/// whatever follows, 17, a drain or the end. (A frame-threaded decoder that
+/// takes a record with a packet holds it provisional through "needs input":
+/// `on_frame_threads_a_new_extradata_stays_provisional_until_the_end`.)
+/// Taken for good at the acceptance, every case read known.
 #[test]
 fn a_flush_before_the_software_decoder_reads_a_new_extradata_leaves_it_unknown() {
   #[derive(Clone, Copy, Debug)]
@@ -7971,8 +7971,8 @@ fn a_flush_before_the_software_decoder_reads_a_new_extradata_leaves_it_unknown()
     (crate::Threads::Single, After::Nothing, true),
     (crate::Threads::Single, After::Packet, false),
     (crate::Threads::Single, After::Drain, false),
-    (crate::Threads::Count(three), After::Packet, true),
-    (crate::Threads::Count(three), After::Drain, true),
+    (crate::Threads::Count(three), After::Packet, false),
+    (crate::Threads::Count(three), After::Drain, false),
     (crate::Threads::Count(three), After::End, false),
   ] {
     let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test(
@@ -8060,9 +8060,10 @@ fn malformed_hvcc() -> Vec<u8> {
 /// one's send the drain answers "needs input" with the record still
 /// provisional; the drain of the end reports the worker's error, and the
 /// record is unknown (`Reported(InvalidData)`). The H.264 stream whole:
-/// provisional after "needs input", known at the end. Read at a
+/// provisional after "needs input", known at the end, and unknown
+/// (`Flushed`) where the caller seeks after "needs input" instead. Read at a
 /// frame-threaded "needs input", the record was known before any worker had
-/// decoded its packet, and the error after left it so.
+/// decoded its packet: the error after left it so, and so did the seek.
 #[test]
 fn on_frame_threads_a_new_extradata_stays_provisional_until_the_end() {
   let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
@@ -8079,13 +8080,17 @@ fn on_frame_threads_a_new_extradata_stays_provisional_until_the_end() {
   let mut malformed = hevc.packets.clone();
   malformed[malformed_at] =
     with_new_extradata(hevc.packets[malformed_at].clone(), &malformed_hvcc());
-  for (name, parameters, packets, at, fails) in [
+  let reported = Some(crate::ExtradataDoubt::Reported(
+    ffmpeg_next::Error::InvalidData,
+  ));
+  for (name, parameters, packets, at, seek, left) in [
     (
       "h264, its body corrupted",
       &h264.parameters,
       &corrupt,
       change,
-      true,
+      false,
+      reported,
     ),
     (
       "h264, whole",
@@ -8093,13 +8098,23 @@ fn on_frame_threads_a_new_extradata_stays_provisional_until_the_end() {
       &h264.packets,
       change,
       false,
+      None,
+    ),
+    (
+      "h264, whole, a seek after \"needs input\"",
+      &h264.parameters,
+      &h264.packets,
+      change,
+      true,
+      Some(crate::ExtradataDoubt::Flushed),
     ),
     (
       "hevc, its record malformed",
       &hevc.parameters,
       &malformed,
       malformed_at,
-      true,
+      false,
+      reported,
     ),
   ] {
     let mut dec = FfmpegVideoStreamDecoder::open_as(
@@ -8130,24 +8145,197 @@ fn on_frame_threads_a_new_extradata_stays_provisional_until_the_end() {
       None,
       "{name}: not unknown yet"
     );
-    crate::accepted(dec.send_eof(), "send_eof");
-    answered(&mut dec, &mut dst, &mut log);
-    assert_eq!(log.last(), Some(&Answer::Ended), "{name}: the end");
-    if fails {
-      assert_eq!(
-        dec.extradata_unknown_for_test(),
-        Some(crate::ExtradataDoubt::Reported(
-          ffmpeg_next::Error::InvalidData
-        )),
-        "{name}: the error after it leaves the record unknown: {log:?}"
-      );
+    if seek {
+      dec.flush().expect("a seek");
     } else {
-      assert!(
-        !dec.extradata_provisional_for_test() && dec.extradata_unknown_for_test().is_none(),
-        "{name}: the end reads the record: {log:?}"
-      );
+      crate::accepted(dec.send_eof(), "send_eof");
+      answered(&mut dec, &mut dst, &mut log);
+      assert_eq!(log.last(), Some(&Answer::Ended), "{name}: the end");
+    }
+    assert_eq!(
+      dec.extradata_unknown_for_test(),
+      left,
+      "{name}: what the record is left: {log:?}"
+    );
+    assert!(
+      !dec.extradata_provisional_for_test(),
+      "{name}: provisional no more"
+    );
+  }
+}
+
+/// An HEVC clip from `libx265` in closed GOPs with no B-frames: an IDR every
+/// 8 frames carrying its parameter sets, decode order display order — a
+/// decoder on one thread gives each picture back from the call that decodes
+/// it.
+fn encode_hevc_without_b_frames(width: u32, height: u32, frames: usize) -> SyntheticClip {
+  encode_x26x(
+    "libx265",
+    "x265-params",
+    "keyint=8:min-keyint=8:scenecut=0:bframes=0:open-gop=0:repeat-headers=1:log-level=error",
+    width,
+    height,
+    frames,
+  )
+}
+
+/// The parameter sets a start-coded HEVC packet carries — its VPS, SPS and
+/// PPS units — as a start-coded record.
+fn hevc_parameter_sets_of(packet: &Packet) -> Vec<u8> {
+  annexb_units(packet.data().expect("a payload"))
+    .into_iter()
+    .filter(|unit| matches!(unit.first().map(|head| (head >> 1) & 0x3f), Some(32..=34)))
+    .flat_map(|unit| [0u8, 0, 0, 1].into_iter().chain(unit.iter().copied()))
+    .collect()
+}
+
+/// LAW (Codex R14, [medium]): **a decoder opened for a packet carrying a new
+/// extradata opens on it, never first on retained parameters a decoder
+/// cannot open on, and the packet is fed.** FFmpeg's HEVC decoder parses
+/// the extradata at the open and fails the open on a record it cannot read
+/// (`hevc_decode_init`). An `x265` stream, IDRs at 0, 8 and 16 carrying their
+/// parameter sets, the IDR 8 carrying them as `AV_PKT_DATA_NEW_EXTRADATA`
+/// too, and a malformed `hvcC` record left in the session's parameters.
+/// On the software road — a probe-era fallback at 3 on three threads — 7,
+/// carrying the malformed record, is taken unread behind a waiting picture,
+/// fails when decoded, and leaves the record unknown and retained; the
+/// switch at the IDR 8 opens its decoder on a copy of the parameters
+/// carrying 8's record: the send is accepted, three threads serve, the record
+/// is the session's, and the stream decodes to a clean end. On the
+/// hardware, which takes 5 carrying the malformed record and fails
+/// post-commit at 8, the cold decoder opens on 8's record, takes 8, and the
+/// stream ends clean. Opened on the retained parameters first, the switch's
+/// two opens failed and left no decoder open, the re-offered 8's reopen
+/// failed again, and the fallback failed.
+#[test]
+fn a_decoder_opened_for_a_packet_carrying_a_new_extradata_opens_on_it() {
+  let clip = encode_hevc_without_b_frames(128, 96, 24);
+  let (at, before) = (8, 7);
+  assert!(
+    clip.packets[at].is_key() && !clip.packets[before].is_key(),
+    "the IDR 8, after a P picture"
+  );
+  let record = hevc_parameter_sets_of(&clip.packets[at]);
+  assert!(!record.is_empty(), "the IDR carries its parameter sets");
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let three = core::num::NonZeroU32::new(3).expect("nonzero");
+
+  // The software road: the switch at 8.
+  let mut packets = clip.packets.clone();
+  packets[before] = with_new_extradata(packets[before].clone(), &malformed_hvcc());
+  packets[at] = with_new_extradata(packets[at].clone(), &record);
+  let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test(
+    Box::new(FakeHw::failing(128, 96, 0, 3, FailShape::ProbeEra)),
+    clip.parameters.clone(),
+    tb,
+  )
+  .expect("build test decoder")
+  .with_threads_for_test(crate::Threads::Count(three));
+  let mut dst = crate::empty_owned_video_frame();
+  for av_pkt in &packets[..before - 1] {
+    sent_through(&mut dec, &mut dst, av_pkt);
+    drained(&mut dec, &mut dst);
+  }
+  assert!(dec.is_software(), "on the software road");
+  crate::accepted(
+    dec.send_packet(&pushed(&packets[before - 1])),
+    "the picture before 7, left waiting",
+  );
+  crate::accepted(
+    dec.send_packet(&pushed(&packets[before])),
+    "7 taken unread, behind it",
+  );
+  drained(&mut dec, &mut dst);
+  assert_eq!(
+    dec.extradata_unknown_for_test(),
+    Some(crate::ExtradataDoubt::Reported(
+      ffmpeg_next::Error::InvalidData
+    )),
+    "7's record fails when decoded and is unknown"
+  );
+  assert_eq!(
+    extradata_of(&dec.parameters),
+    malformed_hvcc(),
+    "and retained"
+  );
+  let mut accepted = false;
+  let mut refused = Vec::new();
+  for _offer in 0..3 {
+    match dec.send_packet(&pushed(&packets[at])) {
+      Ok(Sent::Accepted) => {
+        accepted = true;
+        break;
+      }
+      Ok(Sent::MustDrain) => {
+        drained(&mut dec, &mut dst);
+      }
+      Err(error) => refused.push(format!("{error:?}")),
     }
   }
+  assert!(
+    accepted && refused.is_empty(),
+    "the switch at 8 opens on 8's record and takes it: {refused:?}"
+  );
+  assert_eq!(
+    dec.active_threads(),
+    Some(three),
+    "three threads serve from 8"
+  );
+  assert_eq!(
+    dec.extradata_unknown_for_test(),
+    None,
+    "8's record is known"
+  );
+  assert_eq!(extradata_of(&dec.parameters), record, "and the session's");
+  let mut delivered = drained(&mut dec, &mut dst).0;
+  for av_pkt in &packets[at + 1..] {
+    sent_through(&mut dec, &mut dst, av_pkt);
+    delivered.extend(drained(&mut dec, &mut dst).0);
+  }
+  crate::accepted(dec.send_eof(), "send_eof");
+  let (tail, escalated) = drained(&mut dec, &mut dst);
+  delivered.extend(tail);
+  assert!(!escalated, "the software road ends clean");
+  let from_8: Vec<i64> = clip.packets[at..]
+    .iter()
+    .map(|packet| packet.pts().expect("a pts"))
+    .collect();
+  assert!(
+    delivered
+      .iter()
+      .map(|&(pts, _)| pts)
+      .filter(|&pts| pts >= from_8[0])
+      .eq(from_8.iter().copied()),
+    "every picture from 8 on, once, in order: {delivered:?}"
+  );
+
+  // The hardware's post-commit fallback at 8.
+  let mut packets = clip.packets.clone();
+  packets[5] = with_new_extradata(packets[5].clone(), &malformed_hvcc());
+  packets[at] = with_new_extradata(packets[at].clone(), &record);
+  let (dec, delivered, refusals, escalated) = through_the_change(
+    &SyntheticClip {
+      parameters: clip.parameters.clone(),
+      packets,
+    },
+    FakeHw::failing(128, 96, usize::MAX, at, FailShape::PostCommit),
+    |_, _| {},
+  );
+  let refused: Vec<String> = refusals
+    .iter()
+    .map(|(index, error)| format!("{index}: {error:?}"))
+    .collect();
+  assert!(
+    refusals.is_empty(),
+    "the fallback at 8 opens on 8's record: {refused:?}"
+  );
+  assert!(dec.is_software(), "the cold decoder serves");
+  assert_eq!(
+    extradata_of(&dec.parameters),
+    record,
+    "8's record is the session's"
+  );
+  assert!(!escalated, "the hardware road ends clean: {delivered:?}");
 }
 
 /// LAW (pre-R14 row 1): **a decode error reported while a new extradata is
