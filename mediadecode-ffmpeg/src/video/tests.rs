@@ -4041,20 +4041,18 @@ fn picture_bytes(clip: &SyntheticClip) -> usize {
   super::footprint(&frame)
 }
 
-/// LAW (Codex R4, [high]): **a replay whose pictures pass the budget is
-/// drained in rounds, and loses nothing.** A probe-era fallback replays
-/// nine packets of 4K pictures into a queue whose byte budget holds two and
-/// a half of them. The replay stops each time the queue passes it,
-/// answering `MustDrain` with the current packet still the caller's; the
-/// caller drains and sends it again, and the replay resumes where it
-/// stopped. It takes several rounds; every picture comes out once, in
-/// order; and the queue never holds more than one picture past its budget.
-#[test]
-fn a_replay_past_the_budget_is_drained_in_rounds_and_loses_nothing() {
+/// A probe-era fallback replaying nine packets of 4K pictures into a queue
+/// whose byte budget is `budget(picture)`, a caller sending each packet
+/// until it is taken and draining whenever it is told to. Answers how many
+/// rounds the replay took, the most bytes the queue held, every picture's
+/// timestamp in delivery order, the budget and one picture's bytes.
+fn a_4k_replay_in_rounds(
+  budget: impl Fn(usize) -> usize,
+) -> (usize, usize, Vec<i64>, usize, usize) {
   let (w, h) = (3840u32, 2160u32);
   let clip = encode_synthetic_clip(w, h, 12, 12);
   let picture = picture_bytes(&clip);
-  let budget = picture * 5 / 2;
+  let budget = budget(picture);
   let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
   let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test(
     Box::new(FakeHw::failing(w, h, 0, 9, FailShape::ProbeEra)),
@@ -4090,21 +4088,53 @@ fn a_replay_past_the_budget_is_drained_in_rounds_and_loses_nothing() {
   }
   crate::accepted(dec.send_eof(), "send_eof");
   drain(&mut dec, &mut shown);
-
   assert!(dec.is_software(), "the probe-era fallback committed");
-  assert!(
-    rounds >= 2,
-    "the replay was drained in several rounds, not {rounds}"
-  );
   assert_eq!(
     shown,
     (0..clip.packets.len() as i64).collect::<Vec<_>>(),
     "every picture, once, in order"
   );
+  (rounds, most, shown, budget, picture)
+}
+
+/// LAW (Codex R4, [high]; R6 row 4): **a replay whose pictures pass the
+/// budget is drained in rounds, and loses nothing.** A probe-era fallback
+/// replays nine packets of 4K pictures into a queue whose byte budget holds
+/// two and a half of them. The replay stops each time another picture would
+/// pass it, answering `MustDrain` with the current packet still the
+/// caller's; the caller drains and sends it again, and the replay resumes
+/// where it stopped. It takes several rounds; every picture comes out once,
+/// in order; and the queue never passes its budget.
+#[test]
+fn a_replay_past_the_budget_is_drained_in_rounds_and_loses_nothing() {
+  let (rounds, most, _, budget, _) = a_4k_replay_in_rounds(|picture| picture * 5 / 2);
   assert!(
-    most <= budget + picture,
-    "the queue held {most} bytes, more than one picture past its budget of {budget}"
+    rounds >= 2,
+    "the replay was drained in several rounds, not {rounds}"
   );
+  assert!(
+    most <= budget,
+    "the queue held {most} bytes, past its budget of {budget}"
+  );
+}
+
+/// LAW (Codex R6 row 4, [high]): **the budget is a hard bound.** Under a
+/// budget of one and a half pictures — Codex's two 500 MiB pictures under
+/// 512 MiB, at 4K — the queue holds one picture at a time: the second
+/// waits in the decoder, never received while the first would make two
+/// past the budget, until the caller has taken the first. The total never
+/// passes the budget, and every picture still comes out once, in order.
+/// A drain that read only the queue's bytes before each receive took the
+/// second as well, two pictures where the budget holds one and a half.
+#[test]
+fn the_replay_budget_is_a_hard_bound() {
+  let (rounds, most, _, budget, picture) = a_4k_replay_in_rounds(|picture| picture * 3 / 2);
+  assert!(
+    most <= budget,
+    "the queue held {most} bytes, past its budget of {budget}"
+  );
+  assert!(most >= picture, "one picture at a time");
+  assert!(rounds >= 8, "a round a picture, not {rounds}");
 }
 
 /// LAW (Codex R4, [high]): **a switch's drain past the budget waits for the
@@ -4895,10 +4925,10 @@ fn past_the_end_a_replay_error_waits_behind_the_pictures_queued_before_it() {
 /// the moment the decoder takes it, and it is never sent again.** A
 /// probe-era fallback raised by `send_eof` replays eleven packets through a
 /// queue whose budget holds two and a half pictures, so each `send_eof`
-/// feeds a round and answers `MustDrain`, until the last, which feeds
-/// pictures 9 and 10 and the end — and the drain after the end fails. That
+/// feeds a round of two and answers `MustDrain`, until the last, which feeds
+/// picture 10 and the end — and the drain after the end fails. That
 /// `send_eof` is accepted: the end was committed when the decoder took it.
-/// The drain then delivers 9 and 10 and then the error, and the decoder is
+/// The drain then delivers picture 10 and then the error, and the decoder is
 /// told the stream ended exactly once — a caller that obeys every
 /// `MustDrain` never sends a second end into a decoder that has one.
 #[test]
@@ -4956,14 +4986,14 @@ fn the_end_a_replay_owed_is_committed_when_the_decoder_takes_it() {
   assert!(dec.eof_sent_for_test(), "the session's end is committed");
   assert_eq!(
     seen,
-    (0..9).map(Some).collect::<Vec<_>>(),
-    "the rounds before the last delivered pictures 0 to 8"
+    (0..10).map(Some).collect::<Vec<_>>(),
+    "the rounds before the last delivered pictures 0 to 9"
   );
   drain(&mut dec, &mut seen);
   assert_eq!(
-    seen[9..],
-    [Some(9), Some(10), None],
-    "the last round's pictures, then the error held behind them: {seen:?}"
+    seen[10..],
+    [Some(10), None],
+    "the last round's picture, then the error held behind it: {seen:?}"
   );
   assert!(
     matches!(dec.receive_frame(&mut dst), Ok(Received::Ended)),

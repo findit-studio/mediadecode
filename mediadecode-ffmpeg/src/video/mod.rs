@@ -512,6 +512,12 @@ enum DecodeState {
 struct ReplayQueue {
   frames: VecDeque<(frame::Video, usize)>,
   bytes: usize,
+  /// The bytes of the last picture received into the queue: the size the
+  /// next one is taken to have, so a drain receives none that would carry
+  /// the queue past its budget — the decoder keeps it until the caller has
+  /// taken enough. Only a picture larger than the one before it can pass
+  /// the budget, by that growth, and the drain stops there.
+  last: usize,
 }
 
 impl ReplayQueue {
@@ -543,25 +549,34 @@ impl ReplayQueue {
 
   fn push_back(&mut self, frame: frame::Video, bytes: usize) {
     self.bytes = self.bytes.saturating_add(bytes);
+    self.last = bytes;
     self.frames.push_back((frame, bytes));
   }
 
   fn append(&mut self, other: &mut Self) {
     self.bytes = self.bytes.saturating_add(other.bytes);
     other.bytes = 0;
+    if !other.frames.is_empty() {
+      self.last = other.last;
+    }
     self.frames.append(&mut other.frames);
   }
 
   fn clear(&mut self) {
     self.frames.clear();
     self.bytes = 0;
+    self.last = 0;
   }
 
-  /// Whether a drain must stop here: past `budget` bytes, or holding the
-  /// [`SW_REPLAY_FRAME_CAP`] pictures. A drain checks before it receives a
-  /// picture, so the queue holds at most one picture past its budget.
+  /// Whether a drain must stop here, before it receives another picture: one
+  /// the size of the last would carry the queue past `budget` bytes, or the
+  /// queue holds the [`SW_REPLAY_FRAME_CAP`] pictures. An empty queue always
+  /// takes one — a picture that alone passes the budget is refused by name
+  /// (see `drain_into`) — so the queue never passes its budget but by a
+  /// picture's growth over the one before it.
   fn full(&self, budget: usize) -> bool {
-    self.bytes > budget || self.frames.len() >= SW_REPLAY_FRAME_CAP
+    self.frames.len() >= SW_REPLAY_FRAME_CAP
+      || (!self.frames.is_empty() && self.bytes.saturating_add(self.last) > budget)
   }
 }
 
@@ -3143,10 +3158,11 @@ fn replay_history(
   Ok(())
 }
 
-/// Pulls the decoder's pictures into `queue` until it has none ready or
-/// the queue reaches `budget` — checked before each picture is received, so
-/// the queue holds at most one picture past it, and nothing received is
-/// dropped. A picture whose footprint alone exceeds `budget` can never be
+/// Pulls the decoder's pictures into `queue` until it has none ready or the
+/// queue would pass `budget` — checked before each picture is received,
+/// taking the next to be the size of the last, so the decoder keeps a
+/// picture that would not fit until the caller has taken enough, and nothing
+/// received is dropped. A picture whose footprint alone exceeds `budget` can never be
 /// queued under it — no progress is possible — and is refused by name,
 /// [`Error::ReplayQueueFull`].
 ///
