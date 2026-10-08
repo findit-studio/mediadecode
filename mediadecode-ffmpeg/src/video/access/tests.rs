@@ -1,6 +1,6 @@
 //! The keyframe reading, over hand-built access units.
 
-use super::KeyframeRule;
+use super::{Anchor, KeyframeRule, RecoveryPoint};
 use crate::CodecId;
 
 /// Start-codes each NAL unit.
@@ -468,15 +468,28 @@ fn recovery(frames: &str, broken: bool) -> Vec<u8> {
   packed(&padded)
 }
 
-/// LAW (Codex R6 row 1, [high]; restated by Codex R7): **a resync anchor is
-/// a packet the bitstream proves a random-access point.** H.264: an IDR
-/// slice anchors; a non-IDR picture anchors only behind a recovery point
-/// SEI message — an I slice, an SI slice, an I slice whose header holds an
+/// An anchor as the laws state it: its recovery point's count (0 where it
+/// stands on none) and whether it is definitive.
+fn read(anchor: Option<Anchor>) -> Option<(u32, bool)> {
+  anchor.map(|anchor| {
+    (
+      anchor.recovery().map_or(0, RecoveryPoint::frames),
+      anchor.definitive(),
+    )
+  })
+}
+
+/// LAW (Codex R6 row 1, [high]; restated by Codex R7 and R8): **a resync
+/// anchor is a packet the bitstream proves a random-access point, and it is
+/// definitive where it is a clean one.** H.264: an IDR slice anchors,
+/// definitively; a non-IDR picture anchors only behind a recovery point SEI
+/// message — an I slice, an SI slice, an I slice whose header holds an
 /// emulation prevention byte: none of them alone — while a packet whose first
 /// slice is P or B does not, though an IDR follows it in the packet. HEVC:
 /// every IRAP picture anchors, a CRA among them, while a trailing or a RASL
-/// picture first does not. Every other codec takes the key flag as FFmpeg's
-/// parser set it.
+/// picture first does not; an IDR or a BLA is definitive, a CRA not. Every
+/// other codec takes the key flag as FFmpeg's parser set it, definitive
+/// where its keyframes reset every reference.
 #[test]
 fn a_resync_anchor_is_a_packet_whose_first_picture_is_random_access() {
   let h264 = KeyframeRule::of(CodecId::H264.raw(), &[]);
@@ -500,17 +513,17 @@ fn a_resync_anchor_is_a_packet_whose_first_picture_is_random_access() {
   );
   let recovers = sei(&[(6, &recovery("1", false))]);
   for (units, anchor, why) in [
-    (vec![&idr[..]], Some(0), "an IDR slice"),
+    (vec![&idr[..]], Some((0, true)), "an IDR slice"),
     (
       vec![&recovers[..], &i_slice[..]],
-      Some(0),
+      Some((0, false)),
       "a recovery point's I slice",
     ),
     (vec![&i_slice[..]], None, "an I slice alone"),
     (vec![&si_slice[..]], None, "an SI slice alone"),
     (
       vec![&recovers[..], &far_i_slice[..]],
-      Some(0),
+      Some((0, false)),
       "a recovery point's I slice read through `00 00 03`",
     ),
     (vec![&p_slice[..]], None, "a P slice, a stale key flag"),
@@ -521,36 +534,40 @@ fn a_resync_anchor_is_a_packet_whose_first_picture_is_random_access() {
       "a P slice before the IDR",
     ),
   ] {
-    assert_eq!(h264.anchor(&annex_b(&units)), anchor, "H.264: {why}");
+    assert_eq!(read(h264.anchor(&annex_b(&units))), anchor, "H.264: {why}");
   }
 
   let hevc = KeyframeRule::of(CodecId::HEVC.raw(), &[]);
   let picture = |kind: u8| -> Vec<u8> { vec![kind << 1, 1, 0xaf] };
   for (kinds, anchor, why) in [
-    (vec![21u8], Some(0), "a CRA"),
-    (vec![19], Some(0), "an IDR"),
-    (vec![16], Some(0), "a BLA"),
+    (vec![21u8], Some((0, false)), "a CRA"),
+    (vec![19], Some((0, true)), "an IDR"),
+    (vec![16], Some((0, true)), "a BLA"),
     (vec![1], None, "a trailing picture"),
     (vec![8], None, "a RASL picture"),
     (vec![1, 21], None, "a trailing picture before the CRA"),
   ] {
     let units: Vec<Vec<u8>> = kinds.iter().map(|&kind| picture(kind)).collect();
     let units: Vec<&[u8]> = units.iter().map(Vec::as_slice).collect();
-    assert_eq!(hevc.anchor(&annex_b(&units)), anchor, "HEVC: {why}");
+    assert_eq!(read(hevc.anchor(&annex_b(&units))), anchor, "HEVC: {why}");
   }
 
-  for codec in [CodecId::MPEG4, CodecId::VP9, CodecId::AV1] {
+  for (codec, definitive) in [
+    (CodecId::MPEG4, false),
+    (CodecId::VP9, true),
+    (CodecId::AV1, true),
+  ] {
     assert_eq!(
-      KeyframeRule::of(codec.raw(), &[]).anchor(&[]),
-      Some(0),
+      read(KeyframeRule::of(codec.raw(), &[]).anchor(&[])),
+      Some((0, definitive)),
       "{codec:?}: the key flag stands"
     );
   }
 }
 
-/// LAW (Codex R7, [high]): **an H.264 resync anchor is an IDR picture, or an
-/// access unit whose recovery point SEI says so — and the gap then stays
-/// open `recovery_frame_cnt` pictures more.** A slice type describes its own
+/// LAW (Codex R7, [high]; restated by Codex R8): **an H.264 resync anchor is
+/// an IDR picture, or an access unit whose recovery point SEI says so — and
+/// the anchor carries its `recovery_frame_cnt`, reported.** A slice type describes its own
 /// slice alone: an access unit whose I slice comes first and a P slice after
 /// it, with no recovery point, anchors nothing. A recovery point anchors at
 /// any slice type, its count the answer — 0, 2, its broken link changing
@@ -621,7 +638,11 @@ fn an_h264_anchor_is_an_idr_or_a_recovery_point_sei() {
       "a recovery point past its payload",
     ),
   ] {
-    assert_eq!(h264.anchor(&annex_b(&units)), anchor, "{why}");
+    assert_eq!(
+      read(h264.anchor(&annex_b(&units))).map(|(frames, _)| frames),
+      anchor,
+      "{why}"
+    );
   }
 }
 
@@ -641,9 +662,9 @@ fn an_intra_only_codec_is_clean_and_anchors_at_every_packet() {
     assert_eq!(rule, KeyframeRule::IntraOnly, "codec {codec}");
     assert!(rule.every_packet() && rule.is_clean(&[1, 2, 3]));
     assert_eq!(
-      rule.anchor(&[1, 2, 3]),
-      Some(0),
-      "codec {codec}: every packet anchors"
+      read(rule.anchor(&[1, 2, 3])),
+      Some((0, true)),
+      "codec {codec}: every packet anchors, definitively"
     );
   }
   assert_eq!(

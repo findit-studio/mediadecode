@@ -4334,10 +4334,18 @@ fn an_h264_recovery_point_stream_resyncs_by_the_reorder_bound() {
     clip.packets[at].is_key(),
     "the packet is flagged a keyframe"
   );
+  let anchor = clip.packets[at]
+    .data()
+    .and_then(|data| rule.anchor(data))
+    .expect("its recovery point SEI anchors it");
   assert_eq!(
-    clip.packets[at].data().and_then(|data| rule.anchor(data)),
+    anchor.recovery().map(super::access::RecoveryPoint::frames),
     Some(0),
-    "its recovery point SEI anchors it, recovery_frame_cnt 0"
+    "recovery_frame_cnt 0"
+  );
+  assert!(
+    !anchor.definitive(),
+    "a recovery point is not a clean point"
   );
   assert!(
     !clip.packets[at..].iter().any(clean),
@@ -4400,41 +4408,164 @@ fn recovering_two_frames_on(clip: &SyntheticClip, at: usize) -> SyntheticClip {
   }
 }
 
-/// LAW (Codex R7, [high]): **a recovery point holds the gap open its
-/// `recovery_frame_cnt` pictures more.** The pictures are correct from the
-/// recovery point on, `recovery_frame_cnt` frames after it in output order:
-/// the gap closes after `max_depth + 1 + recovery_frame_cnt` output
-/// pictures. `libx264`'s open-GOP recovery point says 0; the same stream
-/// with its SEI restated to say 2, the hardware failing post-commit at it,
-/// delivers two pictures more with the gap open before it closes — and the
-/// end is clean both ways.
+/// LAW (Codex R7, [high]; restated by Codex R8): **a recovery point closes
+/// the gap at the reorder bound, whatever its count — FFmpeg withholds the
+/// pictures before its recovery itself.** The session's software decoders
+/// are opened with neither `AV_CODEC_FLAG_OUTPUT_CORRUPT` nor
+/// `AV_CODEC_FLAG2_SHOW_ALL`, so FFmpeg's H.264 decoder outputs no picture
+/// before the recovery a recovery point signals. A 37-frame `libx264`
+/// open-GOP clip, the hardware failing post-commit at its last keyframe
+/// (picture 32): its recovery point says 0, and 32 and 33 come out with the
+/// gap open, 34 closing it; restated to say 2, FFmpeg withholds 32, and 33
+/// and 34 come out with the gap open, 35 closing it — the same two pictures
+/// within the bound. Both tails end clean; counting the 2 again left the
+/// restated tail's four pictures short of the bound, and its end raised
+/// `PostCommitNeverResynced` on pictures that are whole.
 #[test]
-fn a_recovery_point_two_frames_on_closes_the_gap_two_pictures_later() {
-  let clip = encode_h264_open_gops(128, 96, 40);
-  let at = keyframe_after(&clip, 3);
+fn a_recovery_point_closes_the_gap_at_the_reorder_bound_whatever_its_count() {
+  let clip = encode_h264_open_gops(128, 96, 37);
+  let at = clip
+    .packets
+    .iter()
+    .rposition(Packet::is_key)
+    .expect("a keyframe");
   let rule = super::access::KeyframeRule::of(crate::CodecId::H264.raw(), &[]);
   let two = recovering_two_frames_on(&clip, at);
   assert_eq!(
-    two.packets[at].data().and_then(|data| rule.anchor(data)),
+    two.packets[at]
+      .data()
+      .and_then(|data| rule.anchor(data))
+      .and_then(super::access::Anchor::recovery)
+      .map(super::access::RecoveryPoint::frames),
     Some(2),
     "the restated SEI says 2"
   );
-  let open = |clip: &SyntheticClip| {
-    let (_, delivered, escalated) = through_a_post_commit_failure(clip, at);
-    assert!(!escalated, "the end is clean: {delivered:?}");
-    let open = delivered.iter().take_while(|&&(_, open)| open).count();
-    assert!(
-      open < delivered.len(),
-      "the gap closed before the end: {delivered:?}"
-    );
-    (open, delivered)
-  };
-  let (at_zero, zero) = open(&clip);
-  let (at_two, two) = open(&two);
+  let (_, zero, zero_escalated) = through_a_post_commit_failure(&clip, at);
+  let (_, restated, restated_escalated) = through_a_post_commit_failure(&two, at);
+  assert!(
+    !zero_escalated && !restated_escalated,
+    "both tails end clean: {zero:?} / {restated:?}"
+  );
+  let open = |delivered: &[(i64, bool)]| delivered.iter().take_while(|&&(_, open)| open).count();
+  assert!(
+    open(&zero) < zero.len() && open(&restated) < restated.len(),
+    "the gap closes before the end: {zero:?} / {restated:?}"
+  );
   assert_eq!(
-    at_two,
-    at_zero + 2,
-    "two pictures more with the gap open: {zero:?} / {two:?}"
+    open(&restated),
+    open(&zero),
+    "the same pictures within the bound: {zero:?} / {restated:?}"
+  );
+  let recovery_point = clip.packets[at].pts().expect("a pts");
+  assert_eq!(
+    zero.first().map(|&(pts, _)| pts),
+    Some(recovery_point),
+    "said 0, the recovery point's own picture comes out"
+  );
+  assert!(
+    restated.iter().all(|&(pts, _)| pts != recovery_point),
+    "said 2, FFmpeg withholds the recovery point's picture itself: {restated:?}"
+  );
+}
+
+/// LAW (Codex R8, [high]): **a later IDR supersedes a recovery point that
+/// anchored the gap.** A 16-frame `libx264` open-GOP clip, then a 16-frame
+/// closed-GOP one; the hardware fails post-commit at the first clip's
+/// recovery point, which anchors the gap — and the anchor goes stale, the
+/// decoder made to report a reorder depth no tail closes. The second clip's
+/// IDR is a definitive anchor: it supersedes the stale one, its count
+/// restarting at the depth the decoder reports there, and the gap closes;
+/// the end is clean. Kept anchored at the recovery point, the gap never
+/// closed, and the end raised `PostCommitNeverResynced`.
+#[test]
+fn a_later_idr_supersedes_a_recovery_point_anchor() {
+  let open = encode_h264_open_gops(128, 96, 16);
+  let closed = encode_h264_closed_gops(128, 96, 16);
+  let shift = open.packets.len() as i64;
+  let mut packets = open.packets.clone();
+  for packet in &closed.packets {
+    let mut later = packet.clone();
+    later.set_pts(packet.pts().map(|pts| pts + shift));
+    later.set_dts(packet.dts().map(|dts| dts + shift));
+    packets.push(later);
+  }
+  let idr = open.packets.len();
+  let clip = SyntheticClip {
+    parameters: open.parameters.clone(),
+    packets,
+  };
+  let at = keyframe_after(&clip, 3);
+  assert!(at < idr, "the recovery point is the first clip's");
+  let rule = super::access::KeyframeRule::of(crate::CodecId::H264.raw(), &[]);
+  let read = |index: usize| {
+    clip.packets[index]
+      .data()
+      .and_then(|data| rule.anchor(data))
+      .expect("an anchor")
+  };
+  assert!(!read(at).definitive(), "a recovery point is not definitive");
+  assert!(read(idr).definitive(), "an IDR is");
+
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test(
+    Box::new(FakeHw::failing(128, 96, at, at, FailShape::PostCommit)),
+    clip.parameters.clone(),
+    tb,
+  )
+  .expect("build test decoder");
+  // The anchor at the recovery point goes stale: no tail outlasts this depth.
+  dec.set_reorder_for_test(50);
+  let mut dst = crate::empty_owned_video_frame();
+  let mut delivered: Vec<(i64, bool)> = Vec::new();
+  let mut drain = |dec: &mut FfmpegVideoStreamDecoder, delivered: &mut Vec<(i64, bool)>| loop {
+    match dec.receive_frame(&mut dst) {
+      Ok(Received::Frame) => {
+        if dec.is_software() {
+          let pts = dst.pts().map_or(i64::MIN, |t| t.pts());
+          delivered.push((pts, dec.degraded_resync_pending_for_test()));
+        }
+      }
+      Ok(Received::NeedsInput | Received::Ended) => break false,
+      Err(VideoDecodeError::PostCommitNeverResynced(_)) => break true,
+      Err(VideoDecodeError::Decode(_)) => {}
+      Err(other) => panic!("unexpected: {other:?}"),
+    }
+  };
+  for (index, av_pkt) in clip.packets.iter().enumerate() {
+    if index == idr {
+      assert!(
+        dec.degraded_resync_pending_for_test() && dec.degraded_anchored_for_test(),
+        "the stale anchor still holds the gap at the IDR: {delivered:?}"
+      );
+      // The decoder's depth, as it reports it from here on.
+      dec.set_reorder_for_test(2);
+    }
+    loop {
+      match dec.send_packet(&pushed(av_pkt)) {
+        Ok(Sent::Accepted) | Err(VideoDecodeError::Decode(_)) => break,
+        Ok(Sent::MustDrain) => {
+          assert!(
+            !drain(&mut dec, &mut delivered),
+            "no escalation before the end"
+          );
+        }
+        Err(other) => panic!("send_packet: {other:?}"),
+      }
+    }
+    assert!(
+      !drain(&mut dec, &mut delivered),
+      "no escalation before the end"
+    );
+  }
+  crate::accepted(dec.send_eof(), "send_eof");
+  let escalated = drain(&mut dec, &mut delivered);
+  assert!(
+    !escalated,
+    "the IDR superseded the stale anchor: {delivered:?}"
+  );
+  assert!(
+    delivered.iter().any(|&(pts, open)| !open && pts >= shift),
+    "the gap closed after the IDR: {delivered:?}"
   );
 }
 

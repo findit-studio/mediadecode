@@ -128,36 +128,37 @@ impl KeyframeRule {
     matches!(self, Self::IntraOnly)
   }
 
-  /// Whether the key-flagged packet `data` anchors a post-commit resync, and
-  /// how many output pictures past the reorder bound the gap then stays
-  /// open: `Some(recovery)` where the bitstream proves the packet a
-  /// random-access point, where the codec lets this crate read it; `None`
-  /// otherwise, whatever its flag says.
+  /// What the key-flagged packet `data` is as a post-commit resync anchor:
+  /// `Some` where the bitstream proves it a random-access point, where the
+  /// codec lets this crate read it; `None` otherwise, whatever its flag
+  /// says. The anchor is [definitive](Anchor::definitive) where nothing after
+  /// it references anything before it ([`Self::is_clean`]).
   ///
-  /// - **H.264:** the first picture is an IDR picture (NAL unit 5),
-  ///   `Some(0)`; or the access unit carries, before its first picture, a
-  ///   recovery point SEI message (NAL unit 6, payload type 6), `Some` of its
-  ///   `recovery_frame_cnt`: the pictures are correct from the recovery point
-  ///   on, `recovery_frame_cnt` frames after it in output order. Its
-  ///   `broken_link_flag` changes nothing forward. The first picture's slice
-  ///   header parses either way, its `slice_type` at most 9. An I picture with
-  ///   no such message anchors nothing: a slice type describes that slice
-  ///   alone, a non-IDR intra picture resets no reference, H.264 lets the
-  ///   pictures after it reference what the decoder never saw until the
-  ///   signalled recovery point, and FFmpeg's parser flags some such
-  ///   pictures key by heuristic.
+  /// - **H.264:** the first picture is an IDR picture (NAL unit 5); or the
+  ///   access unit carries, before its first picture, a recovery point SEI
+  ///   message (NAL unit 6, payload type 6), which the anchor carries
+  ///   ([`RecoveryPoint`]). The first picture's slice header parses either
+  ///   way, its `slice_type` at most 9. An I picture with no such message
+  ///   anchors nothing: a slice type describes that slice alone, a non-IDR
+  ///   intra picture resets no reference, H.264 lets the pictures after it
+  ///   reference what the decoder never saw until the signalled recovery
+  ///   point, and FFmpeg's parser flags some such pictures key by heuristic.
   /// - **HEVC:** the first picture's NAL unit is an IRAP picture (16–23), a
   ///   CRA (21) among them: the decoder resyncing kept its references, and
-  ///   the reorder bound covers the leading pictures a CRA has. `Some(0)`.
+  ///   the reorder bound covers the leading pictures a CRA has.
   /// - **Every other codec** — one picture per packet: MPEG-4 part 2, VP8,
   ///   VP9, AV1 and the rest — **the key flag FFmpeg's parser set from the
   ///   bitstream is the proof.** That is the trust boundary: this crate
-  ///   reads no picture header of theirs. `Some(0)`.
+  ///   reads no picture header of theirs.
   ///
   /// Every NAL unit is read whole, as for [`Self::is_clean`], and every SEI
   /// message before the first picture walked by its size over the raw byte
   /// sequence payload; bytes that do not parse anchor nothing.
-  pub(crate) fn anchor(self, data: &[u8]) -> Option<usize> {
+  pub(crate) fn anchor(self, data: &[u8]) -> Option<Anchor> {
+    let anchor = |recovery| Anchor {
+      definitive: self.is_clean(data),
+      recovery,
+    };
     match self {
       Self::H264 { nal_length } => {
         let (kind, unit) = first_h264_picture(data, nal_length)?;
@@ -165,15 +166,17 @@ impl KeyframeRule {
           return None;
         }
         match kind {
-          5 => Some(0),
-          1 | 2 => recovery_point(data, nal_length).and_then(|frames| usize::try_from(frames).ok()),
+          5 => Some(anchor(None)),
+          1 | 2 => {
+            recovery_point(data, nal_length).map(|frames| anchor(Some(RecoveryPoint { frames })))
+          }
           _ => None,
         }
       }
       Self::Hevc { nal_length } => first_hevc_picture(data, nal_length)
         .is_some_and(|kind| (16..=23).contains(&kind))
-        .then_some(0),
-      Self::Mpeg12 | Self::Resets | Self::IntraOnly | Self::Reordering => Some(0),
+        .then(|| anchor(None)),
+      Self::Mpeg12 | Self::Resets | Self::IntraOnly | Self::Reordering => Some(anchor(None)),
     }
   }
 
@@ -196,6 +199,47 @@ impl KeyframeRule {
         "this crate cannot prove its keyframes clean from its bitstream, so the session returns to its threads only at a seek"
       }
     }
+  }
+}
+
+/// A post-commit resync anchor, as its bitstream proves it
+/// ([`KeyframeRule::anchor`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Anchor {
+  definitive: bool,
+  recovery: Option<RecoveryPoint>,
+}
+
+impl Anchor {
+  /// Whether nothing after the anchor references anything before it — a
+  /// clean random access point ([`KeyframeRule::is_clean`]): an H.264 IDR
+  /// picture, an HEVC IDR or BLA picture, a closed MPEG-1/2 GOP, a VP8, VP9
+  /// or AV1 keyframe, any packet of a codec that codes every picture alone.
+  /// Such an anchor supersedes one taken across the same gap that is not.
+  pub(crate) const fn definitive(self) -> bool {
+    self.definitive
+  }
+
+  /// The H.264 recovery point the anchor stands on, if any — reported,
+  /// never counted: FFmpeg's decoder withholds the pictures before the
+  /// recovery it signals itself.
+  pub(crate) const fn recovery(self) -> Option<RecoveryPoint> {
+    self.recovery
+  }
+}
+
+/// An H.264 recovery point SEI message's account of its recovery (H.264
+/// D.2.8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RecoveryPoint {
+  frames: u32,
+}
+
+impl RecoveryPoint {
+  /// `recovery_frame_cnt`: the pictures are correct from the recovery point
+  /// on, that many frames after it in output order.
+  pub(crate) const fn frames(self) -> u32 {
+    self.frames
   }
 }
 

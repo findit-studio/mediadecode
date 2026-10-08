@@ -175,11 +175,15 @@ The backend-agnostic core it adapts has its own log at
   largest value read from just before the anchoring packet was submitted on
   — a keyframe can activate parameters that lower it, an HEVC SPS with fewer
   `num_reorder_pics`, while the pictures from before it still wait; the
-  first picture for VP8, VP9 and AV1), and `recovery_frame_cnt` pictures
-  later after an H.264 recovery point, whose pictures are correct only
-  from the recovery it signals: the pictures before it are at most the
-  ones the reorder buffer held from before the anchor, and the ones before
-  the recovery. Nothing is drained or reset for the resync, and no
+  first picture for VP8, VP9 and AV1): the pictures before it are at most
+  the ones the reorder buffer held from before the anchor. At an H.264
+  recovery point the bound is the whole proof too: the software decoders
+  are opened with neither `AV_CODEC_FLAG_OUTPUT_CORRUPT` nor
+  `AV_CODEC_FLAG2_SHOW_ALL` (asserted at the open), so FFmpeg withholds
+  every picture before the recovery it signals itself, and its
+  `recovery_frame_cnt` is reported, never counted again. A definitive
+  anchor — a clean random access point, an IDR among them — supersedes one
+  across the same gap that is not, the count restarting there. Nothing is drained or reset for the resync, and no
   picture is matched to a packet. The end of the stream proves nothing more:
   the same bound applies there, so an anchor that decoded to nothing, with
   only the pictures held from before it out since, is not a resync. A decode
