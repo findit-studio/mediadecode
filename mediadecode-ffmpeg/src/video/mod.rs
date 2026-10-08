@@ -348,6 +348,18 @@ pub struct CarrierVideoStreamDecoder<C: crate::FfmpegCarrier> {
   /// replay itself. Reported on the drain, after the pictures queued before
   /// it.
   deferred_error: Option<Error>,
+  /// **Pictures the allocator judge refused that no call named as its own**,
+  /// waiting to be reported ([`Refusals`]): a frame thread's worker refuses a
+  /// picture for a packet sent before — which FFmpeg's H.264 decoder can
+  /// conceal behind a later picture of the same packet, its worker then
+  /// answering success (`frame_worker_thread`, pthread_frame.c:288-294) — and
+  /// a call that ran a decode in step names the first of its refusals, not
+  /// the rest. Each is reported at the next `receive_frame`, by itself, ahead
+  /// of whatever the decoder answers next — "needs input" and the end among
+  /// it — and attributed to the declined picture's `pts`, not to a packet: no
+  /// error of the decoder's is ever renamed by one. A flush clears them with
+  /// the pictures it abandons.
+  refusals: Refusals,
   /// Resource ceilings for the frames this decoder exports, and for the
   /// `AVCodecContext`s it opens — HW candidates, the SW fallback, and
   /// any decoder a later probe advance builds all get the same number.
@@ -769,6 +781,54 @@ struct Restart {
   eof_sent: bool,
 }
 
+/// The most refusals [`Refusals`] keeps with their `pts` before it counts
+/// the rest.
+const REFUSALS_KEPT: usize = 256;
+
+/// **Frame refusals waiting to be reported, oldest first**
+/// (`CarrierVideoStreamDecoder::refusals`). Past [`REFUSALS_KEPT`] a refusal
+/// is counted, and reported after the kept ones at the cost of the last
+/// counted, without its `pts`: every one is reported, in memory that does
+/// not grow with a stream that refuses without end.
+#[derive(Default)]
+pub(crate) struct Refusals {
+  kept: VecDeque<crate::FrameBudgetExceeded>,
+  counted: u64,
+  last: Option<crate::FrameBudgetExceeded>,
+}
+
+impl Refusals {
+  fn push(&mut self, refusal: crate::FrameBudgetExceeded) {
+    if self.kept.len() < REFUSALS_KEPT {
+      self.kept.push_back(refusal);
+    } else {
+      self.counted = self.counted.saturating_add(1);
+      self.last = Some(refusal.with_pts(None));
+    }
+  }
+
+  fn pop(&mut self) -> Option<crate::FrameBudgetExceeded> {
+    if let Some(refusal) = self.kept.pop_front() {
+      return Some(refusal);
+    }
+    if self.counted == 0 {
+      return None;
+    }
+    self.counted -= 1;
+    self.last
+  }
+
+  fn append(&mut self, other: &mut Self) {
+    while let Some(refusal) = other.pop() {
+      self.push(refusal);
+    }
+  }
+
+  fn clear(&mut self) {
+    *self = Self::default();
+  }
+}
+
 /// A software decoder and the callback state its codec context points
 /// at.
 ///
@@ -961,9 +1021,16 @@ impl SwDecoder {
   /// ([`Self::concealed_refusal`]), is the packet's own failure: this
   /// answers it as the error the allocator judge gave FFmpeg, which every
   /// caller's funnel names ([`crate::decoder::software_exit`]) — the packet
-  /// taken, as one the decoder reports failed is.
-  pub(crate) fn submit(&mut self, packet: &Packet) -> Result<(), ffmpeg_next::Error> {
-    self.decoder.send_packet(packet)?;
+  /// taken, as one the decoder reports failed is. The refusals no call names
+  /// go to `refusals` ([`Self::collect_refusals`]).
+  pub(crate) fn submit(
+    &mut self,
+    packet: &Packet,
+    refusals: &mut Refusals,
+  ) -> Result<(), ffmpeg_next::Error> {
+    let sent = self.decoder.send_packet(packet);
+    self.collect_refusals(refusals);
+    sent?;
     #[cfg(test)]
     live_sw::note_sent();
     self.concealed_refusal().map_or(Ok(()), Err)
@@ -973,19 +1040,65 @@ impl SwDecoder {
   /// software decoder goes through here, so the test census counts each
   /// one the decoder answered. The end runs no decode — FFmpeg 9's
   /// `avcodec_send_packet` decodes inside a submission only before draining
-  /// starts (decode.c) — so it latches no refusal.
-  pub(crate) fn send_eof(&mut self) -> Result<(), ffmpeg_next::Error> {
+  /// starts (decode.c) — but a frame thread's worker may refuse a picture
+  /// meanwhile: it goes to `refusals` ([`Self::collect_refusals`]).
+  pub(crate) fn send_eof(&mut self, refusals: &mut Refusals) -> Result<(), ffmpeg_next::Error> {
     #[cfg(test)]
     if let Some(answer) = eof_script::next() {
       return Err(answer);
     }
     let told = self.decoder.send_eof();
+    self.collect_refusals(refusals);
     #[cfg(test)]
     if !matches!(told, Err(ffmpeg_next::Error::Other { errno }) if errno == ffmpeg_next::error::EAGAIN)
     {
       live_sw::note_eof();
     }
     told
+  }
+
+  /// Receives a picture into `frame`. Every receive this module makes of a
+  /// software decoder goes through here; the refusals no call names go to
+  /// `refusals` ([`Self::collect_refusals`]).
+  fn receive(
+    &mut self,
+    frame: &mut frame::Video,
+    refusals: &mut Refusals,
+  ) -> Result<(), ffmpeg_next::Error> {
+    let received = self.decoder.receive_frame(frame);
+    self.collect_refusals(refusals);
+    received
+  }
+
+  /// **The refusals the allocator judge recorded that no call names as its
+  /// own, moved to `refusals`**, each named with its `pts`
+  /// ([`crate::decoder::frame_budget_exceeded`]). On a decoder that decodes
+  /// in step, the first of a call's refusals stays for the funnel to name as
+  /// that call's error ([`Self::concealed_refusal`]) and the rest move; on a
+  /// frame-threaded or wrapped one every refusal moves, since its workers
+  /// refuse pictures for packets whose answers name nothing of them.
+  fn collect_refusals(&self, refusals: &mut Refusals) {
+    let state = self.state();
+    let first = if self.decodes_in_step() {
+      crate::ffi::pop_frame_refusal(state)
+    } else {
+      None
+    };
+    while let Some(refusal) = crate::ffi::pop_frame_refusal(state) {
+      refusals.push(crate::decoder::frame_budget_exceeded(state, refusal));
+    }
+    if let Some(first) = first {
+      crate::ffi::push_frame_refusal(state, first);
+    }
+  }
+
+  /// Every refusal the allocator judge recorded, moved to `refusals`: this
+  /// decoder is about to close, and no call of its will name one.
+  fn give_up_refusals(&self, refusals: &mut Refusals) {
+    let state = self.state();
+    while let Some(refusal) = crate::ffi::pop_frame_refusal(state) {
+      refusals.push(crate::decoder::frame_budget_exceeded(state, refusal));
+    }
   }
 
   /// **A frame refusal the call just made latched, on a decoder that
@@ -999,9 +1112,11 @@ impl SwDecoder {
   /// reports "no frame" only where no picture started (h264dec.c) — so the
   /// call can report success, or give another picture, with the refusal
   /// latched. Read here, in that call, a refusal is never left for a later
-  /// call to name as its own, or to clear unnamed. `None` on a decoder that
-  /// does not decode in step: its threads latch for packets whose answers
-  /// are still to come ([`Self::funnel`]).
+  /// call to name as its own, or to clear unnamed; a second refusal of the
+  /// call waits in the session's [`Refusals`]. `None` on a decoder that does
+  /// not decode in step: its workers refuse pictures for packets sent
+  /// before, and the session reports those by themselves
+  /// ([`Self::collect_refusals`]).
   fn concealed_refusal(&self) -> Option<ffmpeg_next::Error> {
     (self.decodes_in_step() && crate::ffi::frame_budget_declined(self.state())).then_some(
       ffmpeg_next::Error::Other {
@@ -1010,30 +1125,20 @@ impl SwDecoder {
     )
   }
 
-  /// The callback state the funnel collects a latched frame refusal from,
-  /// for `answer`, which this decoder gave while the session was in
-  /// `phase` ([`crate::decoder::software_exit`]). On a decoder that decodes
-  /// in step, every answer's: a refusal latched in a call is that call's.
-  /// On one that does not, back pressure collects none. A frame-threaded
-  /// decoder decodes each packet on a worker, which allocates — and latches
-  /// — whenever it runs (`frame_worker_thread`, pthread_frame.c), and an
-  /// implementation that wraps another keeps a pipeline of its own; a
-  /// refusal latched there belongs to a packet still in hand, and that
-  /// packet's own answer names it — its error, or, for a picture concealed
-  /// with no error to come, the end of the drain, the first answer the
-  /// decoder gives with nothing left in hand. Null, collecting nothing, for
-  /// that.
-  fn funnel(
-    &self,
-    answer: ffmpeg_next::Error,
-    phase: crate::decoder::SessionPhase,
-  ) -> *const crate::ffi::CallbackState {
-    let back_pressure = phase.accepts_input()
-      && matches!(answer, ffmpeg_next::Error::Other { errno } if errno == ffmpeg_next::error::EAGAIN);
-    if back_pressure && !self.decodes_in_step() {
-      core::ptr::null()
-    } else {
+  /// The callback state the funnel names a frame refusal from, for an
+  /// answer of this decoder's ([`crate::decoder::software_exit`]). On a
+  /// decoder that decodes in step, its own: a refusal recorded in a call is
+  /// that call's. On a frame-threaded or wrapped one, none — null: a worker
+  /// allocates, and refuses, whenever it runs (`frame_worker_thread`,
+  /// pthread_frame.c:241-298), for a packet sent before, and nothing ties
+  /// the decoder's answer to it; folding a refusal into an unrelated error
+  /// would name that error wrongly and lose it. Its refusals are reported by
+  /// themselves ([`Self::collect_refusals`]).
+  fn funnel(&self) -> *const crate::ffi::CallbackState {
+    if self.decodes_in_step() {
       self.state()
+    } else {
+      core::ptr::null()
     }
   }
 
@@ -1236,6 +1341,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       pending_eof: false,
       replay_output_pending: false,
       deferred_error: None,
+      refusals: Refusals::default(),
       eof_sent: false,
       degraded_resync_pending: false,
       degraded_anchored: false,
@@ -1607,6 +1713,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     let one_thread = self.limits.with_threads(crate::Threads::Single);
     let mut sw = open_sw_decoder(&self.parameters, one_thread, Some(self.time_base))?;
     let mut local_replay = ReplayQueue::default();
+    let mut local_refusals = Refusals::default();
     let mut progress = Replay::default();
     let drained = replay_history(
       &mut sw,
@@ -1616,12 +1723,14 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       self.limits,
       &self.parameters,
       &mut progress,
+      &mut local_refusals,
     )?;
     // Commit: only after replay, any EOF forwarding, AND the final drain
     // succeeded — or the queue reached its budget first — do we move the
     // new SW decoder and queue into `self`.
     let in_step = sw.decodes_in_step();
     self.sw_replay_frames.append(&mut local_replay);
+    self.refusals.append(&mut local_refusals);
     self.state = DecodeState::Sw(sw);
     // The history was replayed from the parameters it started on, its own
     // new extradata re-applied in order: the last the decoder took is the
@@ -1693,6 +1802,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       self.limits,
       &self.parameters,
       &mut progress,
+      &mut self.refusals,
     );
     self.pending_history.drain(..progress.fed);
     // A packet the decoder took, the failing one among them where its
@@ -1769,6 +1879,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// ([`Self::commit_opened`]) — never on the retained parameters first,
   /// whose record may be one a decoder cannot open on.
   fn open_after_drain(&mut self, replacement: Option<NewExtradata>) -> Result<(), Error> {
+    if let DecodeState::Sw(sw) = &self.state {
+      sw.give_up_refusals(&mut self.refusals);
+    }
     self.state = DecodeState::SwClosed;
     let carrying = self.carrying(replacement)?;
     let parameters = carrying.as_ref().unwrap_or(&self.parameters);
@@ -1824,8 +1937,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     let DecodeState::Sw(sw) = &mut self.state else {
       return Ok(true);
     };
-    let state = sw.state();
+    let state = sw.funnel();
     let budget = self.limits.max_replay_bytes();
+    let refusals = &mut self.refusals;
     let mut attempts: u32 = 0;
     // The end is taken only when the decoder takes it, or answers that it
     // already has (`AVERROR_EOF`: it is draining). Back pressure that never
@@ -1833,10 +1947,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     // drain, and the next send offers the end again. This is the decoder
     // being switched away from: the session's own end is not touched here.
     while !restart.eof_sent {
-      match sw.send_eof() {
+      match sw.send_eof(refusals) {
         Ok(()) | Err(ffmpeg_next::Error::Eof) => restart.eof_sent = true,
         Err(ffmpeg_next::Error::Other { errno }) if errno == ffmpeg_next::error::EAGAIN => {
-          if drain_into(sw, state, &mut self.sw_replay_frames, budget)? == Drained::Full {
+          if drain_into(sw, &mut self.sw_replay_frames, budget, refusals)? == Drained::Full {
             return Ok(false);
           }
           attempts += 1;
@@ -1849,16 +1963,14 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
         Err(other) => return Err(crate::decoder::software_exit(state, other)),
       }
     }
-    if drain_into(sw, state, &mut self.sw_replay_frames, budget)? == Drained::Full {
+    if drain_into(sw, &mut self.sw_replay_frames, budget, refusals)? == Drained::Full {
       return Ok(false);
     }
     // Told the end and drained, the decoder has nothing left in hand, and it
-    // closes next: a refusal still latched — a picture concealed with no
-    // error to come — is named now.
-    match crate::decoder::frame_budget_declination_of(state) {
-      Some(refusal) => Err(refusal),
-      None => Ok(true),
-    }
+    // closes next: a refusal still recorded — a picture concealed with no
+    // error to come — waits with the others, reported at the next receive.
+    sw.give_up_refusals(refusals);
+    Ok(true)
   }
 
   /// **A drained switch, completed**: the drained decoder is closed and one
@@ -2032,7 +2144,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       )));
     };
     let in_step = sw.decodes_in_step();
-    let submitted = sw.submit(pkt);
+    let submitted = sw.submit(pkt, &mut self.refusals);
     #[cfg(test)]
     let submitted = match submitted {
       Ok(()) => self.fail_after_submit.take().map_or(Ok(()), Err),
@@ -2046,7 +2158,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       // caller's honest re-offer would double-count it. A picture refused
       // while the decoder decoded this packet in step, which it concealed,
       // arrives here as the packet's own failure ([`SwDecoder::submit`]).
-      return match crate::decoder::software_send(sw.funnel(e, phase), e, phase) {
+      return match crate::decoder::software_send(sw.funnel(), e, phase) {
         Ok(sent) => Ok(sent),
         Err(error) => {
           // FFmpeg's submission is not transactional: a packet it reports
@@ -2624,6 +2736,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     // reason is collected here. That was the last software road still
     // wrapping libavcodec's `EINVAL` raw.
     let state = sw.state();
+    let mut refusals = Refusals::default();
     let forwarded = match input {
       // The HW decoder REFUSED this packet, so it was never decoded; forward
       // it to the cold SW. A failure here surfaces (it is not silently
@@ -2636,7 +2749,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     // The cold decoder's reorder depth before the forward, for an anchor.
     let reorder_before = reorder_depth(&sw);
     if let Some(pkt) = forwarded {
-      sw.submit(pkt)
+      sw.submit(pkt, &mut refusals)
         .map_err(|e| crate::decoder::software_exit(state, e))?;
     }
     // **The end of the stream is re-forwarded here, on every arm that
@@ -2657,13 +2770,14 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     // A cold decoder has no buffered output, so this cannot answer
     // `EAGAIN` itself.
     if eof_pending {
-      sw.send_eof()
+      sw.send_eof(&mut refusals)
         .map_err(|e| crate::decoder::software_exit(state, e))?;
     }
     // Commit: only after a clean open + forward. The session's own
     // threads come back at the next keyframe. The parameters it opened on
     // are the session's.
     self.state = DecodeState::Sw(sw);
+    self.refusals.append(&mut refusals);
     self.commit_opened(carrying);
     self.sw_threads_pending = self.session_threads_run();
     self.enter_degraded_resync();
@@ -3065,6 +3179,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       pending_eof: false,
       replay_output_pending: false,
       deferred_error: None,
+      refusals: Refusals::default(),
       eof_sent: false,
       degraded_resync_pending: false,
       degraded_anchored: false,
@@ -3131,6 +3246,22 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   pub(crate) fn decline_picture_for_test(&self, pts: i64) {
     if let DecodeState::Sw(sw) = &self.state {
       crate::ffi::decline_picture_for_test(sw.state(), pts);
+    }
+  }
+
+  /// Test-only: the allocator judge's record of a picture of `pts` it
+  /// refused at `bytes`, as a frame thread's worker leaves it, on the
+  /// software decoder serving.
+  pub(crate) fn declare_refusal_for_test(&self, bytes: u64, pts: i64) {
+    if let DecodeState::Sw(sw) = &self.state {
+      crate::ffi::push_frame_refusal(
+        sw.state(),
+        crate::ffi::FrameRefusal {
+          bytes,
+          audio: false,
+          pts: Some(pts),
+        },
+      );
     }
   }
 
@@ -3466,6 +3597,21 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     &mut self,
     dst: &mut VideoFrame<mediadecode::PixelFormat, VideoFrameExtra, C::Buffer>,
   ) -> Result<Received, VideoDecodeError> {
+    // **A refused picture no call named comes first, by itself** — a frame
+    // thread's worker's, collected now, or a call's second refusal — named
+    // by its `pts`, ahead of whatever is delivered or answered next, so a
+    // stream that never drains to its end still hears it, and no error the
+    // decoder reports later is renamed by it ([`Self::refusals`]).
+    if let DecodeState::Sw(sw) = &self.state
+      && !sw.decodes_in_step()
+    {
+      sw.collect_refusals(&mut self.refusals);
+    }
+    if let Some(refusal) = self.refusals.pop() {
+      return Err(VideoDecodeError::Decode(Error::FrameBudgetExceeded(
+        refusal,
+      )));
+    }
     // Deliver any frames produced during SW fallback replay before
     // pulling new ones from the SW decoder. This is the queue
     // populated by `fall_back_to_sw` when SW returned EAGAIN during
@@ -3609,7 +3755,8 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
           // of `self`) so only the disjoint fields `sw_scratch` / `time_base`
           // are touched alongside the `self.state` borrow `sw` holds.
           let st = sw.state();
-          match sw.receive_frame(&mut self.sw_scratch) {
+          let in_step = sw.decodes_in_step();
+          match sw.receive(&mut self.sw_scratch, &mut self.refusals) {
             Ok(()) => {
               // The frame is out of the decoder's queue from here; the
               // seat is what keeps it if the conversion cannot commit.
@@ -3658,22 +3805,38 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
             // instead of a clean end that would swallow the tail — and
             // it now catches the end however the codec spelled it. See
             // [`Self::settle`] and [`Self::ended`]. A frame-threaded
-            // decoder's back pressure collects no refusal: a worker latched
-            // it for a packet whose own answer names it ([`SwDecoder::funnel`]).
-            Err(e) => match crate::decoder::software_receive(sw.funnel(e, phase), e, phase) {
+            // decoder's answer names no refusal: a worker made it for a
+            // packet nothing ties the answer to ([`SwDecoder::funnel`]).
+            Err(e) => match crate::decoder::software_receive(sw.funnel(), e, phase) {
               Ok(status) => {
                 // Nothing is ready: the decoder holds no picture the caller
                 // has not taken. Whether it has read every packet it took
                 // depends on its threading ([`read_every_packet`]).
-                let read = read_every_packet(status, sw.decodes_in_step());
+                let read = read_every_packet(status, in_step);
                 self.sw_output_settled = true;
                 if read {
                   self.extradata_read();
+                }
+                // A refusal collected with the answer is reported first;
+                // asked again, the decoder answers the same.
+                if let Some(refusal) = self.refusals.pop() {
+                  return Err(VideoDecodeError::Decode(Error::FrameBudgetExceeded(
+                    refusal,
+                  )));
                 }
                 return self.settle(status);
               }
               Err(error) => {
                 self.failed_on_receive(e);
+                // On frame threads the error is the decoder's own and a
+                // refusal collected with it a worker's: the refusal first,
+                // the error kept for the next receive.
+                if !in_step && let Some(refusal) = self.refusals.pop() {
+                  self.deferred_error = Some(error);
+                  return Err(VideoDecodeError::Decode(Error::FrameBudgetExceeded(
+                    refusal,
+                  )));
+                }
                 return Err(VideoDecodeError::Decode(error));
               }
             },
@@ -3814,10 +3977,11 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
         }
         Err(other) => Err(VideoDecodeError::Decode(other)),
       },
-      DecodeState::Sw(sw) => match sw.send_eof() {
+      DecodeState::Sw(sw) => match sw.send_eof(&mut self.refusals) {
         Ok(()) => Ok(Sent::Accepted),
-        Err(e) => crate::decoder::software_send(sw.funnel(e, phase), e, phase)
-          .map_err(VideoDecodeError::Decode),
+        Err(e) => {
+          crate::decoder::software_send(sw.funnel(), e, phase).map_err(VideoDecodeError::Decode)
+        }
       },
       // No decoder is open, so none holds anything to flush out: the end
       // is taken, and the drain answers it once the queue is empty.
@@ -3872,6 +4036,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     // resync tracking from before the flush is moot. Clear it so the next EOF
     // doesn't escalate over a now-irrelevant pre-flush gap.
     self.clear_degraded_resync();
+    // The refused pictures waiting to be reported belong to the position the
+    // caller abandons.
+    self.refusals.clear();
     // The first keyframe after a seek is a switch point whatever its kind:
     // the seek has discarded what led it. And the minute starts over.
     self.seeked = true;
@@ -3887,12 +4054,12 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       // (see [`Self::send_on_software`]); the flushed decoder has nothing
       // left to drain there.
       //
-      // A frame refusal still latched is cleared with it, after the flush:
+      // A frame refusal still recorded is cleared with it, after the flush:
       // it is a picture of the position the caller abandons — a frame
       // thread's for a packet the flush discards with its worker's results,
-      // which the flush first waits for (`ff_thread_flush`), or one a drain
-      // parked behind — and naming it after the seek would name a picture
-      // the caller no longer wants.
+      // which the flush first waits for (`ff_thread_flush`,
+      // pthread_frame.c:971-997), or one a drain parked behind — and naming
+      // it after the seek would name a picture the caller no longer wants.
       DecodeState::Sw(sw) => {
         sw.flush();
         let _ = crate::ffi::take_frame_budget_declination(sw.state());
@@ -4126,7 +4293,9 @@ enum Drained {
 /// them fed, a picture parked or more the decoder may still hold — and
 /// [`Drained::Empty`] where the decoder had no picture ready. A `Full`
 /// replay is not over even when `progress` has fed everything: the caller
-/// owes the decoder's pictures to the queue before it takes any input.
+/// owes the decoder's pictures to the queue before it takes any input. A
+/// refused picture no call of the replay's names goes to `refusals`.
+#[allow(clippy::too_many_arguments)]
 fn replay_history(
   sw: &mut SwDecoder,
   packets: &[ffmpeg_next::Packet],
@@ -4135,11 +4304,12 @@ fn replay_history(
   limits: DecoderLimits,
   parameters: &Parameters,
   progress: &mut Replay,
+  refusals: &mut Refusals,
 ) -> Result<Drained, Error> {
   let budget = limits.max_replay_bytes();
   // Bound before the decoder is mutably borrowed, so the error
   // closures below can still consult it.
-  let sw_state = sw.state();
+  let sw_state = sw.funnel();
   let in_step = sw.decodes_in_step();
   for pkt in packets {
     if queue.full(budget) {
@@ -4149,7 +4319,7 @@ fn replay_history(
     let extradata = NewExtradata::of(pkt, parameters, limits.max_codec_parameter_bytes())?;
     let mut attempts: u32 = 0;
     loop {
-      match sw.submit(pkt) {
+      match sw.submit(pkt, refusals) {
         Ok(()) => {
           // Taken in step: every packet before it was read. Its own record,
           // if it carries one, is read only once something says so.
@@ -4163,7 +4333,7 @@ fn replay_history(
           break;
         }
         Err(ffmpeg_next::Error::Other { errno }) if errno == ffmpeg_next::error::EAGAIN => {
-          if drain_into(sw, sw_state, queue, budget)? == Drained::Full {
+          if drain_into(sw, queue, budget, refusals)? == Drained::Full {
             return Ok(Drained::Full);
           }
           attempts += 1;
@@ -4200,7 +4370,7 @@ fn replay_history(
     progress.fed += 1;
     // What it made, pulled now, so an error it carries surfaces with it. A
     // picture parked here, after the last packet, is the answer too.
-    if drain_into(sw, sw_state, queue, budget)? == Drained::Full {
+    if drain_into(sw, queue, budget, refusals)? == Drained::Full {
       return Ok(Drained::Full);
     }
   }
@@ -4210,7 +4380,7 @@ fn replay_history(
   if eof && !progress.eof_sent {
     let mut attempts: u32 = 0;
     loop {
-      match sw.send_eof() {
+      match sw.send_eof(refusals) {
         Ok(()) => {
           progress.eof_sent = true;
           #[cfg(test)]
@@ -4227,7 +4397,7 @@ fn replay_history(
         // Back pressure that never lifts, and a refusal, leave the end owed:
         // only the decoder taking it — or answering that it has — sends it.
         Err(ffmpeg_next::Error::Other { errno }) if errno == ffmpeg_next::error::EAGAIN => {
-          if drain_into(sw, sw_state, queue, budget)? == Drained::Full {
+          if drain_into(sw, queue, budget, refusals)? == Drained::Full {
             return Ok(Drained::Full);
           }
           attempts += 1;
@@ -4259,7 +4429,7 @@ fn replay_history(
   // thread — see `fall_back_to_sw_inner`. A queue at its budget stops it, and
   // the answer says so: the pictures still in the decoder are owed to the
   // queue before the caller's next input is taken.
-  drain_into(sw, sw_state, queue, budget)
+  drain_into(sw, queue, budget, refusals)
 }
 
 /// Pulls the decoder's pictures into `queue` until it has none ready or the
@@ -4284,22 +4454,24 @@ fn replay_history(
 /// a drain reports an error after the pictures it queued before it. Where
 /// that picture is parked, the refusal stays latched for the receive the
 /// drain resumes with, which names it; where the picture cannot be queued
-/// at all, the refusal is reported in place of the picture's own. The end
-/// of the decoder's output names a refusal still latched whatever its
-/// threading: nothing is left in hand to answer for it.
+/// at all, the refusal is reported in place of the picture's own. A refused
+/// picture no call names — a call's second refusal, or a frame thread's
+/// worker's — goes to `refusals`, and the end of the decoder's output names
+/// a refusal still left to the call that met it.
 fn drain_into(
   sw: &mut SwDecoder,
-  state: *const crate::ffi::CallbackState,
   queue: &mut ReplayQueue,
   budget: usize,
+  refusals: &mut Refusals,
 ) -> std::result::Result<Drained, Error> {
+  let state = sw.funnel();
   loop {
     queue.admit_parked(budget);
     if queue.full(budget) {
       return Ok(Drained::Full);
     }
     let mut tmp = alloc_av_video_frame()?;
-    match sw.receive_frame(&mut tmp) {
+    match sw.receive(&mut tmp, refusals) {
       Ok(()) => {
         let concealed = sw.concealed_refusal();
         let refused = |own: Error| {

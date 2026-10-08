@@ -269,19 +269,18 @@ pub(crate) struct CallbackState {
   /// Carried here instead, so the judge reads the number the caller
   /// actually set.
   pub(crate) max_frame_bytes: u64,
-  /// Set by `judge_buffer` when it refuses a **software** allocation
-  /// over [`Self::max_frame_bytes`].
+  /// What `judge_buffer` refused of a **software** allocation over
+  /// [`Self::max_frame_bytes`], each refusal on its own, oldest first.
   ///
   /// A `get_buffer2` callback can only answer with an errno, and
   /// `AVERROR(EINVAL)` is what libavcodec also reports for corrupt
   /// input — so a caller could not tell a budget refusal this crate
   /// made from a broken file. The reason is left here and collected by
-  /// the decoder funnels, exactly as the `get_format` declination is.
-  pub(crate) frame_budget_declined: core::sync::atomic::AtomicBool,
-  /// What the refused frame would have cost.
-  pub(crate) declined_frame_bytes: core::sync::atomic::AtomicU64,
-  /// Whether the refused frame was audio (`true`) or a picture.
-  pub(crate) declined_frame_audio: core::sync::atomic::AtomicBool,
+  /// the decoder funnels, exactly as the `get_format` declination is. A
+  /// frame-threaded decoder's workers allocate for several packets between
+  /// two calls of the caller's, so each refusal is kept, with the declined
+  /// frame's `pts`, rather than one flag a second refusal would overwrite.
+  pub(crate) frame_refusals: FrameRefusals,
   /// Test-only: the `pts` of the next picture `judge_buffer` refuses as if
   /// it were over [`Self::max_frame_bytes`], once; `i64::MIN` while none is
   /// armed ([`decline_picture_for_test`]). Read on whichever thread
@@ -290,44 +289,169 @@ pub(crate) struct CallbackState {
   pub(crate) declining_pts: core::sync::atomic::AtomicI64,
 }
 
-/// Reads and clears a software frame-budget refusal, if one was left.
+/// One frame `judge_buffer` refused over the byte ceiling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FrameRefusal {
+  /// What the frame would have cost.
+  pub(crate) bytes: u64,
+  /// Whether it was audio (`true`) or a picture.
+  pub(crate) audio: bool,
+  /// The frame's `pts` as FFmpeg set it before the allocation — the
+  /// packet's it is decoded from (`ff_decode_frame_props_from_pkt`,
+  /// decode.c:1569, called by `ff_get_buffer` ahead of `get_buffer2`,
+  /// decode.c:1811-1824) — `None` for `AV_NOPTS_VALUE`.
+  pub(crate) pts: Option<i64>,
+}
+
+/// The refusals [`CallbackState::frame_refusals`] keeps before a refusal
+/// past them is only counted.
+const FRAME_REFUSALS_KEPT: usize = 64;
+
+/// **The frame refusals `judge_buffer` made that no caller has collected
+/// yet**, oldest first. The judge runs on whichever thread allocates — a
+/// frame thread's worker among them, one at a time under FFmpeg's buffer
+/// lock (`thread_get_buffer_internal`, pthread_frame.c:1028-1031) — while
+/// the caller's thread collects, so the record is behind a lock; pushing
+/// allocates nothing and never panics, as a callback FFmpeg calls must not.
+/// Past [`FRAME_REFUSALS_KEPT`] a refusal is counted rather than kept, and
+/// handed out after the kept ones without its `pts`: none is lost.
+pub(crate) struct FrameRefusals {
+  ring: std::sync::Mutex<RefusalRing>,
+}
+
+struct RefusalRing {
+  slots: [FrameRefusal; FRAME_REFUSALS_KEPT],
+  head: usize,
+  len: usize,
+  /// Refusals past the kept ones, and the last of them, for its cost.
+  counted: u64,
+  last: FrameRefusal,
+}
+
+impl FrameRefusals {
+  /// No refusal yet.
+  pub(crate) const fn new() -> Self {
+    const NONE: FrameRefusal = FrameRefusal {
+      bytes: 0,
+      audio: false,
+      pts: None,
+    };
+    Self {
+      ring: std::sync::Mutex::new(RefusalRing {
+        slots: [NONE; FRAME_REFUSALS_KEPT],
+        head: 0,
+        len: 0,
+        counted: 0,
+        last: NONE,
+      }),
+    }
+  }
+
+  fn ring(&self) -> std::sync::MutexGuard<'_, RefusalRing> {
+    self
+      .ring
+      .lock()
+      .unwrap_or_else(std::sync::PoisonError::into_inner)
+  }
+
+  /// Records `refusal` after every refusal recorded before it.
+  pub(crate) fn push(&self, refusal: FrameRefusal) {
+    let mut ring = self.ring();
+    if ring.len < FRAME_REFUSALS_KEPT {
+      let at = (ring.head + ring.len) % FRAME_REFUSALS_KEPT;
+      ring.slots[at] = refusal;
+      ring.len += 1;
+    } else {
+      ring.counted = ring.counted.saturating_add(1);
+      ring.last = FrameRefusal {
+        pts: None,
+        ..refusal
+      };
+    }
+  }
+
+  /// The oldest refusal recorded, taken out.
+  pub(crate) fn pop(&self) -> Option<FrameRefusal> {
+    let mut ring = self.ring();
+    if ring.len > 0 {
+      let refusal = ring.slots[ring.head];
+      ring.head = (ring.head + 1) % FRAME_REFUSALS_KEPT;
+      ring.len -= 1;
+      Some(refusal)
+    } else if ring.counted > 0 {
+      ring.counted -= 1;
+      Some(ring.last)
+    } else {
+      None
+    }
+  }
+
+  /// Whether a refusal is recorded.
+  pub(crate) fn is_empty(&self) -> bool {
+    let ring = self.ring();
+    ring.len == 0 && ring.counted == 0
+  }
+
+  /// Forgets every refusal recorded.
+  pub(crate) fn clear(&self) {
+    let mut ring = self.ring();
+    ring.len = 0;
+    ring.counted = 0;
+  }
+}
+
+/// Reads a software frame-budget refusal, if one was left: the oldest, the
+/// rest cleared with it — one refusal named for each call of a decoder that
+/// decodes inside the call that hands it a packet, as the audio, still,
+/// subtitle and hardware roads' decoders do.
 ///
 /// Clear-on-read for the same reason the `get_format` declination is: a
 /// refusal that latched would be reported again against the next frame,
-/// which never declined anything.
-pub(crate) fn take_frame_budget_declination(
-  state: *const CallbackState,
-) -> Option<(u64, u64, bool)> {
-  use core::sync::atomic::Ordering;
+/// which never declined anything. The software video road keeps every
+/// refusal instead ([`pop_frame_refusal`]).
+pub(crate) fn take_frame_budget_declination(state: *const CallbackState) -> Option<FrameRefusal> {
   if state.is_null() {
     return None;
   }
   // SAFETY: `state` is the live `CallbackState` the caller owns; it is
   // freed only after the codec context it belongs to.
-  let (declined, bytes, limit, audio) = unsafe {
-    (
-      (*state)
-        .frame_budget_declined
-        .swap(false, Ordering::Acquire),
-      (*state).declined_frame_bytes.load(Ordering::Relaxed),
-      (*state).max_frame_bytes,
-      (*state).declined_frame_audio.load(Ordering::Relaxed),
-    )
-  };
-  declined.then_some((bytes, limit, audio))
+  let refusals = unsafe { &(*state).frame_refusals };
+  let refusal = refusals.pop();
+  refusals.clear();
+  refusal
 }
 
-/// Whether a software frame-budget refusal is latched, read without
-/// clearing it — for a caller that hands the latch on to the funnels,
-/// which name it ([`crate::decoder::software_exit`]).
+/// The oldest software frame-budget refusal left, taken out, the rest kept.
+pub(crate) fn pop_frame_refusal(state: *const CallbackState) -> Option<FrameRefusal> {
+  if state.is_null() {
+    return None;
+  }
+  // SAFETY: `state` is the live `CallbackState` the caller owns; it is
+  // freed only after the codec context it belongs to.
+  unsafe { (*state).frame_refusals.pop() }
+}
+
+/// Puts `refusal` back as the only refusal left — for a caller that kept
+/// the first of several for the funnel to name.
+pub(crate) fn push_frame_refusal(state: *const CallbackState, refusal: FrameRefusal) {
+  if state.is_null() {
+    return;
+  }
+  // SAFETY: `state` is the live `CallbackState` the caller owns; it is
+  // freed only after the codec context it belongs to.
+  unsafe { (*state).frame_refusals.push(refusal) }
+}
+
+/// Whether a software frame-budget refusal is left, read without taking it
+/// — for a caller that hands it on to the funnels, which name it
+/// ([`crate::decoder::software_exit`]).
 pub(crate) fn frame_budget_declined(state: *const CallbackState) -> bool {
-  use core::sync::atomic::Ordering;
   if state.is_null() {
     return false;
   }
   // SAFETY: `state` is the live `CallbackState` the caller owns; it is
   // freed only after the codec context it belongs to.
-  unsafe { (*state).frame_budget_declined.load(Ordering::Acquire) }
+  unsafe { !(*state).frame_refusals.is_empty() }
 }
 
 /// Test-only: `judge_buffer` refuses, once, the next picture whose `pts` is
@@ -368,21 +492,16 @@ pub(crate) fn declines_picture_for_test(state: *const CallbackState, pts: i64) -
 /// `state` must be null or a live [`CallbackState`] the caller owns.
 #[cfg(test)]
 pub(crate) fn declare_frame_budget_declined_for_test(state: *mut CallbackState, bytes: u64) {
-  use core::sync::atomic::Ordering;
   if state.is_null() {
     return;
   }
   // SAFETY: the caller guarantees `state` is live for the call.
   unsafe {
-    (*state)
-      .declined_frame_bytes
-      .store(bytes, Ordering::Relaxed);
-    (*state)
-      .declined_frame_audio
-      .store(false, Ordering::Relaxed);
-    (*state)
-      .frame_budget_declined
-      .store(true, Ordering::Release);
+    (*state).frame_refusals.push(FrameRefusal {
+      bytes,
+      audio: false,
+      pts: None,
+    });
   }
 }
 
@@ -688,6 +807,68 @@ pub(crate) fn declare_ceiling_declined_for_test(
 mod tests {
   use super::*;
 
+  /// LAW (Codex R15, [high]): **the judge's record keeps every refusal, in
+  /// order, with its `pts`; past the kept ones it counts them**, handing the
+  /// counted out after the kept, without a `pts`, at the last one's cost —
+  /// none lost, nothing allocated in the callback. `take` hands out the
+  /// oldest and clears the rest, for a road that names one refusal a call.
+  #[test]
+  fn the_refusal_record_keeps_every_refusal_in_order() {
+    let refusals = FrameRefusals::new();
+    let total = FRAME_REFUSALS_KEPT as i64 + 6;
+    for pts in 0..total {
+      refusals.push(FrameRefusal {
+        bytes: 100 + pts as u64,
+        audio: false,
+        pts: Some(pts),
+      });
+    }
+    for pts in 0..FRAME_REFUSALS_KEPT as i64 {
+      assert_eq!(
+        refusals.pop(),
+        Some(FrameRefusal {
+          bytes: 100 + pts as u64,
+          audio: false,
+          pts: Some(pts),
+        }),
+        "kept, in order"
+      );
+    }
+    for _ in FRAME_REFUSALS_KEPT as i64..total {
+      assert_eq!(
+        refusals.pop(),
+        Some(FrameRefusal {
+          bytes: 100 + total as u64 - 1,
+          audio: false,
+          pts: None,
+        }),
+        "counted, at the last one's cost"
+      );
+    }
+    assert!(
+      refusals.pop().is_none() && refusals.is_empty(),
+      "and no more"
+    );
+    let mut state = make_state(AVPixelFormat::AV_PIX_FMT_NONE);
+    let state = &raw mut state;
+    for pts in 0..3 {
+      push_frame_refusal(
+        state,
+        FrameRefusal {
+          bytes: 1,
+          audio: false,
+          pts: Some(pts),
+        },
+      );
+    }
+    assert_eq!(
+      take_frame_budget_declination(state).map(|refusal| refusal.pts),
+      Some(Some(0)),
+      "take: the oldest"
+    );
+    assert!(!frame_budget_declined(state), "the rest cleared with it");
+  }
+
   #[test]
   fn pix_fmt_name_reads_the_linked_librarys_own_table() {
     assert_eq!(
@@ -751,9 +932,7 @@ mod tests {
       declined_pixels: core::sync::atomic::AtomicI64::new(0),
       declined_limit: core::sync::atomic::AtomicI64::new(0),
       max_frame_bytes: u64::MAX,
-      frame_budget_declined: core::sync::atomic::AtomicBool::new(false),
-      declined_frame_bytes: core::sync::atomic::AtomicU64::new(0),
-      declined_frame_audio: core::sync::atomic::AtomicBool::new(false),
+      frame_refusals: FrameRefusals::new(),
       declining_pts: core::sync::atomic::AtomicI64::new(i64::MIN),
     }
   }

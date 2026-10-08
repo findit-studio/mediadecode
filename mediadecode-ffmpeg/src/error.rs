@@ -973,23 +973,59 @@ impl core::fmt::Display for FrameMedium {
 /// input. Without a name, a caller could not tell "this file is broken"
 /// from "your budget refused this frame" — and only one of those is
 /// worth retrying with a larger ceiling.
+///
+/// # Which frame
+///
+/// [`pts`](Self::pts) is the refused frame's presentation timestamp as
+/// FFmpeg set it before the allocation — the timestamp of the packet it was
+/// being decoded from, in the stream's time base. A software video decoder
+/// on frame threads refuses a picture on a worker, for a packet sent
+/// earlier, and FFmpeg's H.264 decoder can conceal it behind a later
+/// picture of the same packet with no error to follow; such a refusal is
+/// reported at the next `receive_frame`, as its own error ahead of the
+/// decoder's next answer, and names no packet but the one its `pts` does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("the {medium} would allocate {bytes} bytes, over a ceiling of {limit}")]
+#[error(
+  "the {medium}{at} would allocate {bytes} bytes, over a ceiling of {limit}",
+  at = at_pts(.pts)
+)]
 pub struct FrameBudgetExceeded {
   bytes: u64,
   limit: u64,
   medium: FrameMedium,
+  pts: Option<i64>,
+}
+
+/// " at pts N" for a known `pts`, for a message; nothing otherwise.
+fn at_pts(pts: &Option<i64>) -> String {
+  pts.map_or_else(String::new, |pts| format!(" at pts {pts}"))
 }
 
 impl FrameBudgetExceeded {
-  /// Constructs a `FrameBudgetExceeded` payload.
+  /// Constructs a `FrameBudgetExceeded` payload, of a frame whose `pts` is
+  /// not known.
   #[inline]
   pub const fn new(bytes: u64, limit: u64, medium: FrameMedium) -> Self {
     Self {
       bytes,
       limit,
       medium,
+      pts: None,
     }
+  }
+  /// This payload, of the frame whose presentation timestamp is `pts`.
+  #[inline]
+  #[must_use]
+  pub const fn with_pts(mut self, pts: Option<i64>) -> Self {
+    self.pts = pts;
+    self
+  }
+  /// The refused frame's presentation timestamp, in the stream's time base,
+  /// as FFmpeg set it before the allocation — the timestamp of the packet it
+  /// was decoded from; `None` where it had none.
+  #[inline]
+  pub const fn pts(&self) -> Option<i64> {
+    self.pts
   }
   /// What the frame would have cost.
   #[inline]

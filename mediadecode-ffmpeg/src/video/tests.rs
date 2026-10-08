@@ -2147,7 +2147,7 @@ fn the_cold_fallback_forwards_keep_the_allocator_refusal() {
   // pending when EOF arrives.
   let _ = sw.send_packet(&clip.packets[0]);
   if let Err(e) = sw
-    .send_eof()
+    .send_eof(&mut super::Refusals::default())
     .map_err(|e| crate::decoder::software_exit(state, e))
   {
     let payload = named(&e).expect("the EOF arm lost the allocator refusal");
@@ -2825,7 +2825,8 @@ fn the_post_eof_fault_is_the_one_the_substrate_gives() {
   let DecodeState::Sw(sw) = &mut dec.state else {
     panic!("the software decoder must be the one in the seat");
   };
-  sw.send_eof().expect("the substrate takes the end");
+  sw.send_eof(&mut super::Refusals::default())
+    .expect("the substrate takes the end");
 
   // What libavcodec actually answers a packet after the flush packet.
   let substrate = sw
@@ -4090,8 +4091,10 @@ fn picture_bytes(clip: &SyntheticClip) -> usize {
     None,
   )
   .expect("a software decoder");
-  sw.submit(&clip.packets[0]).expect("the first packet");
-  sw.send_eof().expect("the end of the stream");
+  sw.submit(&clip.packets[0], &mut super::Refusals::default())
+    .expect("the first packet");
+  sw.send_eof(&mut super::Refusals::default())
+    .expect("the end of the stream");
   let mut frame = alloc_av_video_frame().expect("a frame");
   sw.receive_frame(&mut frame).expect("a picture");
   super::footprint(&frame).expect("a picture the budget prices")
@@ -4570,8 +4573,10 @@ fn side_data_entries_of(clip: &SyntheticClip, packet: &Packet) -> usize {
     None,
   )
   .expect("a software decoder");
-  sw.submit(packet).expect("the packet");
-  sw.send_eof().expect("the end of the stream");
+  sw.submit(packet, &mut super::Refusals::default())
+    .expect("the packet");
+  sw.send_eof(&mut super::Refusals::default())
+    .expect("the end of the stream");
   let mut picture = alloc_av_video_frame().expect("a frame");
   sw.receive_frame(&mut picture).expect("a picture");
   // SAFETY: `picture` is a live frame; one plain integer field is read.
@@ -4618,11 +4623,17 @@ fn a_picture_past_the_side_data_cap_is_refused_by_name_and_released() {
     None,
   )
   .expect("a software decoder");
-  sw.submit(&flooded).expect("the flooded IDR");
-  sw.send_eof().expect("the end of the stream");
-  let state = sw.state();
+  sw.submit(&flooded, &mut super::Refusals::default())
+    .expect("the flooded IDR");
+  sw.send_eof(&mut super::Refusals::default())
+    .expect("the end of the stream");
   let mut queue = super::ReplayQueue::default();
-  match super::drain_into(&mut sw, state, &mut queue, crate::DEFAULT_MAX_REPLAY_BYTES) {
+  match super::drain_into(
+    &mut sw,
+    &mut queue,
+    crate::DEFAULT_MAX_REPLAY_BYTES,
+    &mut super::Refusals::default(),
+  ) {
     Err(Error::UnpricedFrame(refused)) => assert_eq!(
       Err(refused),
       over(own + CAP + 1),
@@ -5673,7 +5684,8 @@ fn the_gap_closes_at_the_picture_past_the_reorder_bound() {
           None,
         )
         .expect("a software decoder");
-        sw.submit(&clip.packets[index]).is_ok()
+        sw.submit(&clip.packets[index], &mut super::Refusals::default())
+          .is_ok()
       }
     })
     .expect("a mid-GOP packet a cold decoder takes");
@@ -5888,7 +5900,8 @@ fn across_a_b_frame_gap(clip: &SyntheticClip) -> (FfmpegVideoStreamDecoder, usiz
           None,
         )
         .expect("a software decoder");
-        sw.submit(&clip.packets[index]).is_ok()
+        sw.submit(&clip.packets[index], &mut super::Refusals::default())
+          .is_ok()
       }
     })
     .expect("a mid-GOP packet a cold decoder takes");
@@ -6732,6 +6745,7 @@ fn a_replay_leaves_unknown_the_new_extradata_of_a_packet_reported_invalid() {
     crate::DecoderLimits::default(),
     &clip.parameters,
     &mut progress,
+    &mut super::Refusals::default(),
   );
   assert!(
     matches!(
@@ -8504,7 +8518,9 @@ fn a_replay_round_applies_the_proof_that_a_record_was_read_before_its_error() {
         if refused {
           answered(&mut dec, &mut dst, &mut answers);
           assert!(
-            answers.contains(&Answer::Refused),
+            answers
+              .iter()
+              .any(|answer| matches!(answer, Answer::Refused(_))),
             "the round that fed 6 met the refusal: {answers:?}"
           );
         } else {
@@ -8691,8 +8707,8 @@ fn with_two_pictures_at(clip: &SyntheticClip, at: usize) -> Vec<Packet> {
 enum Answer {
   /// A picture, by its timestamp.
   Picture(i64),
-  /// A picture refused over the frame budget, by name.
-  Refused,
+  /// A picture refused over the frame budget, by name, with its `pts`.
+  Refused(Option<i64>),
   /// Any other error.
   Failed(String),
   /// "Needs input".
@@ -8713,7 +8729,9 @@ fn answered(
       Ok(Received::Frame) => Answer::Picture(dst.pts().map_or(i64::MIN, |t| t.pts())),
       Ok(Received::NeedsInput) => Answer::NeedsInput,
       Ok(Received::Ended) => Answer::Ended,
-      Err(VideoDecodeError::Decode(Error::FrameBudgetExceeded(_))) => Answer::Refused,
+      Err(VideoDecodeError::Decode(Error::FrameBudgetExceeded(refused))) => {
+        Answer::Refused(refused.pts())
+      }
       Err(other) => Answer::Failed(format!("{other:?}")),
     };
     let settled = matches!(answer, Answer::NeedsInput | Answer::Ended);
@@ -8739,7 +8757,7 @@ fn pictures_in(log: &[Answer]) -> Vec<i64> {
 fn refusals_in(log: &[Answer]) -> usize {
   log
     .iter()
-    .filter(|answer| **answer == Answer::Refused)
+    .filter(|answer| matches!(answer, Answer::Refused(_)))
     .count()
 }
 
@@ -8791,9 +8809,9 @@ fn a_picture_refused_in_a_decode_is_named_by_the_call_that_ran_it() {
   assert!(
     matches!(
       at_k,
-      Err(VideoDecodeError::Decode(Error::FrameBudgetExceeded(_)))
+      Err(VideoDecodeError::Decode(Error::FrameBudgetExceeded(refused))) if refused.pts() == Some(pts[k])
     ),
-    "the send of {k}, which decoded it, names the picture it refused: {at_k:?}"
+    "the send of {k}, which decoded it, names the picture it refused by its pts: {at_k:?}"
   );
   crate::accepted(
     dec.send_packet(&pushed(&packets[k + 1])),
@@ -8837,7 +8855,9 @@ fn a_picture_refused_in_a_decode_is_named_by_the_call_that_ran_it() {
     Ok(Received::Frame) => Answer::Picture(dst.pts().map_or(i64::MIN, |t| t.pts())),
     Ok(Received::NeedsInput) => Answer::NeedsInput,
     Ok(Received::Ended) => Answer::Ended,
-    Err(VideoDecodeError::Decode(Error::FrameBudgetExceeded(_))) => Answer::Refused,
+    Err(VideoDecodeError::Decode(Error::FrameBudgetExceeded(refused))) => {
+      Answer::Refused(refused.pts())
+    }
     Err(other) => Answer::Failed(format!("{other:?}")),
   };
   assert_eq!(
@@ -8847,7 +8867,7 @@ fn a_picture_refused_in_a_decode_is_named_by_the_call_that_ran_it() {
   );
   assert_eq!(
     next(&mut dec),
-    Answer::Refused,
+    Answer::Refused(Some(pts[k])),
     "the receive that decodes {k} names the picture it refused, ahead of the one it gave"
   );
   assert_eq!(
@@ -8881,21 +8901,25 @@ fn a_picture_refused_in_a_decode_is_named_by_the_call_that_ran_it() {
   );
 }
 
-/// LAW (Codex R14, [high]): **on frame threads, a picture a worker refused
-/// and concealed is named at the end of the drain, and cleared by a seek.**
-/// The same stream on three threads. FFmpeg decodes each packet on a worker
-/// (`frame_worker_thread` keeps the decode's result, here success), so the
-/// worker that conceals the refused picture of the two-picture packet 5
-/// leaves a refusal no error of 5's will ever carry. The send of 7 waits for
-/// 5's worker; the drains after it answer "needs input" with the refusal
-/// still latched — back pressure collects none, a worker latching for a
-/// packet whose answer may be to come. The end of the drain, with every
-/// worker done, names it, once, after every picture. A seek after 7 clears
-/// it with the pictures it abandons, and the stream decoded on from the
-/// seek ends clean. Collected at back pressure, the refusal came out of the
-/// drain after 7, mid-stream; kept through the seek, it was named after it.
+/// LAW (Codex R15, [high]; R15 row 1's frame-thread law restated over the
+/// queue): **on frame threads, a picture a worker refused and concealed is
+/// reported at the next receive, named by its `pts`, and the stream goes on;
+/// a seek clears it.** The same stream on three threads. FFmpeg decodes each
+/// packet on a worker (`frame_worker_thread` keeps the decode's result, here
+/// success, pthread_frame.c:288-294), so the worker that conceals the refused
+/// picture of the two-picture packet 5 leaves a refusal no error of 5's will
+/// ever carry. The caller sends a packet and receives until "needs input",
+/// and never sends the end: the refusal comes out of one of those receives,
+/// once, as `FrameBudgetExceeded` with 5's `pts`, by itself; every other
+/// picture comes out once, in order, and the end, sent at last, is clean. A
+/// seek right after 5 is sent — the flush waits for 5's worker, then
+/// discards its results (`ff_thread_flush`, pthread_frame.c:971-997) —
+/// clears the refusal with the pictures it abandons, and the stream decoded
+/// on from the seek ends clean. With the frame-thread exclusion restored the
+/// receives answered "needs input" over it, and the stream heard nothing
+/// before its end.
 #[test]
-fn on_frame_threads_a_concealed_refusal_is_named_at_the_end_and_cleared_by_a_seek() {
+fn on_frame_threads_a_concealed_refusal_is_reported_at_the_next_receive_and_cleared_by_a_seek() {
   let clip = encode_h264_all_intra(128, 96, 12);
   let k = 5;
   let packets = with_two_pictures_at(&clip, k);
@@ -8916,29 +8940,25 @@ fn on_frame_threads_a_concealed_refusal_is_named_at_the_end_and_cleared_by_a_see
     assert_eq!(dec.active_threads(), Some(three), "frame threads");
     let mut dst = crate::empty_owned_video_frame();
     let mut log = Vec::new();
-    for (index, av_pkt) in packets[..=k + 2].iter().enumerate() {
-      if index == k {
-        dec.decline_picture_for_test(pts[k]);
-      }
-      crate::accepted(dec.send_packet(&pushed(av_pkt)), "send_packet");
-      answered(&mut dec, &mut dst, &mut log);
-    }
-    assert_eq!(
-      refusals_in(&log),
-      0,
-      "seek {seek}: {k}'s worker is done, its refusal held through back pressure: {log:?}"
-    );
     if seek {
+      for av_pkt in &packets[..k] {
+        crate::accepted(dec.send_packet(&pushed(av_pkt)), "send_packet");
+        answered(&mut dec, &mut dst, &mut log);
+      }
+      dec.decline_picture_for_test(pts[k]);
+      crate::accepted(dec.send_packet(&pushed(&packets[k])), "send_packet");
+      // A refusal certainly waiting, as a worker records one.
+      dec.declare_refusal_for_test(4096, pts[k]);
+      // The seek before any receive: the flush waits for 5's worker, which
+      // refuses and conceals, then discards what it made.
       dec.flush().expect("a seek");
       log.clear();
-    }
-    for av_pkt in &packets[k + 3..] {
-      crate::accepted(dec.send_packet(&pushed(av_pkt)), "send_packet");
+      for av_pkt in &packets[k + 1..] {
+        crate::accepted(dec.send_packet(&pushed(av_pkt)), "send_packet");
+        answered(&mut dec, &mut dst, &mut log);
+      }
+      crate::accepted(dec.send_eof(), "send_eof");
       answered(&mut dec, &mut dst, &mut log);
-    }
-    crate::accepted(dec.send_eof(), "send_eof");
-    answered(&mut dec, &mut dst, &mut log);
-    if seek {
       assert_eq!(
         refusals_in(&log),
         0,
@@ -8946,27 +8966,96 @@ fn on_frame_threads_a_concealed_refusal_is_named_at_the_end_and_cleared_by_a_see
       );
       assert_eq!(
         pictures_in(&log),
-        pts[k + 3..].to_vec(),
+        pts[k + 1..].to_vec(),
         "after the seek, every picture from it on"
       );
-    } else {
-      assert_eq!(
-        refusals_in(&log),
-        1,
-        "the end names the refusal once: {log:?}"
-      );
-      assert_eq!(
-        &log[log.len() - 2..],
-        &[Answer::Refused, Answer::Ended],
-        "named at the end, after every picture: {log:?}"
-      );
-      assert_eq!(
-        pictures_in(&log),
-        pts,
-        "every picture but the refused one, once, in order"
-      );
+      continue;
     }
+    for (index, av_pkt) in packets.iter().enumerate() {
+      if index == k {
+        dec.decline_picture_for_test(pts[k]);
+      }
+      crate::accepted(dec.send_packet(&pushed(av_pkt)), "send_packet");
+      answered(&mut dec, &mut dst, &mut log);
+    }
+    assert_eq!(
+      log
+        .iter()
+        .filter(|answer| matches!(answer, Answer::Refused(_)))
+        .collect::<Vec<_>>(),
+      vec![&Answer::Refused(Some(pts[k]))],
+      "reported before the end, once, by 5's pts: {log:?}"
+    );
+    crate::accepted(dec.send_eof(), "send_eof");
+    answered(&mut dec, &mut dst, &mut log);
+    assert_eq!(refusals_in(&log), 1, "the end names nothing more: {log:?}");
+    assert_eq!(log.last(), Some(&Answer::Ended), "a clean end: {log:?}");
+    assert_eq!(
+      pictures_in(&log),
+      pts,
+      "every picture but the refused one, once, in order"
+    );
   }
+}
+
+/// LAW (Codex R15, [high]): **on frame threads, a refusal waiting to be
+/// reported is reported by itself, and never renames another error.** A
+/// three-thread H.264 session: a worker's refusal of a picture of `pts` 1000
+/// waits (as the allocator judge records it), and the decoder then reports a
+/// packet failed as invalid data — what `avcodec_send_packet` answers on
+/// frame threads for an earlier packet's stashed result. The send answers
+/// that error, invalid data, by its own name; the receive after it answers
+/// the refusal, `FrameBudgetExceeded` with `pts` 1000; the stream decodes on
+/// to a clean end. With the consumption restored — a decoder's error on
+/// frame threads taking the refusal waiting — the send answered
+/// `FrameBudgetExceeded` and the invalid data was never reported.
+#[test]
+fn on_frame_threads_a_waiting_refusal_never_renames_another_error() {
+  let clip = encode_h264_all_intra(128, 96, 12);
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let three = core::num::NonZeroU32::new(3).expect("nonzero");
+  let mut dec = FfmpegVideoStreamDecoder::open_as(
+    clip.parameters.clone(),
+    tb,
+    DecoderLimits::default().with_threads(crate::Threads::Count(three)),
+    DecodePath::Software,
+  )
+  .expect("the software road opens");
+  assert_eq!(dec.active_threads(), Some(three), "frame threads");
+  let mut dst = crate::empty_owned_video_frame();
+  let mut log = Vec::new();
+  for av_pkt in &clip.packets[..4] {
+    crate::accepted(dec.send_packet(&pushed(av_pkt)), "send_packet");
+    answered(&mut dec, &mut dst, &mut log);
+  }
+  dec.declare_refusal_for_test(4096, 1000);
+  dec.fail_next_packet_with_for_test(ffmpeg_next::Error::InvalidData);
+  let failed = dec.send_packet(&pushed(&clip.packets[4]));
+  assert!(
+    matches!(
+      failed,
+      Err(VideoDecodeError::Decode(Error::Ffmpeg(
+        ffmpeg_next::Error::InvalidData
+      )))
+    ),
+    "the send answers the decoder's error by its own name: {failed:?}"
+  );
+  match dec.receive_frame(&mut dst) {
+    Err(VideoDecodeError::Decode(Error::FrameBudgetExceeded(refused))) => {
+      assert_eq!(refused.pts(), Some(1000), "the refusal names its pts");
+      assert_eq!(refused.bytes(), 4096, "and its cost");
+    }
+    other => panic!("the receive after reports the refusal by itself: {other:?}"),
+  }
+  answered(&mut dec, &mut dst, &mut log);
+  for av_pkt in &clip.packets[5..] {
+    crate::accepted(dec.send_packet(&pushed(av_pkt)), "send_packet");
+    answered(&mut dec, &mut dst, &mut log);
+  }
+  crate::accepted(dec.send_eof(), "send_eof");
+  answered(&mut dec, &mut dst, &mut log);
+  assert_eq!(refusals_in(&log), 0, "nothing more is refused: {log:?}");
+  assert_eq!(log.last(), Some(&Answer::Ended), "a clean end: {log:?}");
 }
 
 /// An HEVC video parameter set NAL unit of id `id` for `layers_minus1` + 1
@@ -9205,7 +9294,10 @@ fn ffmpeg_reads_the_video_parameter_sets_these_laws_build_as_this_crate_does() {
       None,
     )
     .expect("an HEVC decoder");
-    let submitted = sw.submit(&with_vps(&clip.packets[0], &vps));
+    let submitted = sw.submit(
+      &with_vps(&clip.packets[0], &vps),
+      &mut super::Refusals::default(),
+    );
     assert_eq!(
       submitted.is_ok(),
       decoded,
@@ -9415,4 +9507,37 @@ fn a_new_extradata_ffmpeg_would_not_apply_whole_is_refused_before_any_decoder_se
     replacement,
     "a well-formed replacement is the session's once the decoder takes it"
   );
+}
+
+/// LAW (Codex R15, [high]): **the session's refusals waiting to be reported
+/// keep their order and their `pts`, and past the kept ones are counted** —
+/// reported after them, without a `pts`, at the last counted one's cost;
+/// none lost.
+#[test]
+fn the_refusals_waiting_keep_their_order_and_none_is_lost() {
+  let mut refusals = super::Refusals::default();
+  let total = super::REFUSALS_KEPT as i64 + 4;
+  for pts in 0..total {
+    refusals.push(
+      crate::FrameBudgetExceeded::new(1000 + pts as u64, 10, crate::FrameMedium::Video)
+        .with_pts(Some(pts)),
+    );
+  }
+  for pts in 0..super::REFUSALS_KEPT as i64 {
+    let refused = refusals.pop().expect("a kept refusal");
+    assert_eq!(
+      (refused.pts(), refused.bytes()),
+      (Some(pts), 1000 + pts as u64),
+      "kept, in order"
+    );
+  }
+  for _ in super::REFUSALS_KEPT as i64..total {
+    let refused = refusals.pop().expect("a counted refusal");
+    assert_eq!(
+      (refused.pts(), refused.bytes()),
+      (None, 1000 + total as u64 - 1),
+      "counted"
+    );
+  }
+  assert!(refusals.pop().is_none(), "and no more");
 }

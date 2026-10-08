@@ -486,9 +486,7 @@ fn partial_build_state_into_owned_disarms_and_returns_originals() {
     declined_pixels: core::sync::atomic::AtomicI64::new(0),
     declined_limit: core::sync::atomic::AtomicI64::new(0),
     max_frame_bytes: u64::MAX,
-    frame_budget_declined: core::sync::atomic::AtomicBool::new(false),
-    declined_frame_bytes: core::sync::atomic::AtomicU64::new(0),
-    declined_frame_audio: core::sync::atomic::AtomicBool::new(false),
+    frame_refusals: crate::ffi::FrameRefusals::new(),
     declining_pts: core::sync::atomic::AtomicI64::new(i64::MIN),
   }));
 
@@ -1053,9 +1051,7 @@ fn the_declination_reader_reports_then_clears() {
     declined_pixels: AtomicI64::new(0),
     declined_limit: AtomicI64::new(0),
     max_frame_bytes: u64::MAX,
-    frame_budget_declined: core::sync::atomic::AtomicBool::new(false),
-    declined_frame_bytes: core::sync::atomic::AtomicU64::new(0),
-    declined_frame_audio: core::sync::atomic::AtomicBool::new(false),
+    frame_refusals: crate::ffi::FrameRefusals::new(),
     declining_pts: core::sync::atomic::AtomicI64::new(i64::MIN),
   };
   assert!(ceiling_declination_of(&quiet).is_none());
@@ -1069,9 +1065,7 @@ fn the_declination_reader_reports_then_clears() {
     declined_pixels: AtomicI64::new(1920 * 1088),
     declined_limit: AtomicI64::new(1_048_576),
     max_frame_bytes: u64::MAX,
-    frame_budget_declined: core::sync::atomic::AtomicBool::new(false),
-    declined_frame_bytes: core::sync::atomic::AtomicU64::new(0),
-    declined_frame_audio: core::sync::atomic::AtomicBool::new(false),
+    frame_refusals: crate::ffi::FrameRefusals::new(),
     declining_pts: core::sync::atomic::AtomicI64::new(i64::MIN),
   };
   match ceiling_declination_of(&declined) {
@@ -1202,9 +1196,7 @@ impl JudgeCase {
         declined_pixels: core::sync::atomic::AtomicI64::new(0),
         declined_limit: core::sync::atomic::AtomicI64::new(0),
         max_frame_bytes: self.max_frame_bytes,
-        frame_budget_declined: core::sync::atomic::AtomicBool::new(false),
-        declined_frame_bytes: core::sync::atomic::AtomicU64::new(0),
-        declined_frame_audio: core::sync::atomic::AtomicBool::new(false),
+        frame_refusals: crate::ffi::FrameRefusals::new(),
         declining_pts: core::sync::atomic::AtomicI64::new(i64::MIN),
       });
       (*ctx).opaque = (&raw mut *state).cast();

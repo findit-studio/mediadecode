@@ -2921,9 +2921,7 @@ pub(crate) fn build_codec_context(
     declined_pixels: core::sync::atomic::AtomicI64::new(0),
     declined_limit: core::sync::atomic::AtomicI64::new(0),
     max_frame_bytes: limits.frame().max_frame_bytes() as u64,
-    frame_budget_declined: core::sync::atomic::AtomicBool::new(false),
-    declined_frame_bytes: core::sync::atomic::AtomicU64::new(0),
-    declined_frame_audio: core::sync::atomic::AtomicBool::new(false),
+    frame_refusals: crate::ffi::FrameRefusals::new(),
     #[cfg(test)]
     declining_pts: core::sync::atomic::AtomicI64::new(i64::MIN),
   });
@@ -3413,27 +3411,26 @@ unsafe extern "C" fn judge_buffer(
     // input — so a bare refusal here was indistinguishable from a
     // broken file, and only one of those is worth retrying with a
     // larger ceiling. The decoder funnels collect this the same way
-    // they collect the `get_format` declination.
+    // they collect the `get_format` declination. Each refusal is kept on
+    // its own, with the frame's `pts`, which FFmpeg set before calling
+    // here: a frame thread's worker can refuse while another refusal
+    // waits to be collected.
+    // SAFETY: `frame` is live; `pts` is a plain integer field.
+    let pts = unsafe { (*frame).pts };
     let record = |bytes: u64| {
-      use core::sync::atomic::Ordering;
       // SAFETY: `state` was proved non-null above.
       unsafe {
-        (*state)
-          .declined_frame_bytes
-          .store(bytes, Ordering::Relaxed);
-        (*state)
-          .declined_frame_audio
-          .store(width <= 0 && height <= 0, Ordering::Relaxed);
-        (*state)
-          .frame_budget_declined
-          .store(true, Ordering::Release);
+        (*state).frame_refusals.push(crate::ffi::FrameRefusal {
+          bytes,
+          audio: width <= 0 && height <= 0,
+          pts: (pts != ffmpeg_next::ffi::AV_NOPTS_VALUE).then_some(pts),
+        });
       }
       -(libc::EINVAL)
     };
     // Test-only: the picture a law armed to be refused, priced or not.
-    // SAFETY: `frame` is live; `pts` is a plain integer field.
     #[cfg(test)]
-    if crate::ffi::declines_picture_for_test(state, unsafe { (*frame).pts }) {
+    if crate::ffi::declines_picture_for_test(state, pts) {
       return record(priced.map_or(u64::MAX, |bytes| bytes as u64));
     }
     match priced {
@@ -3740,17 +3737,33 @@ pub(crate) fn software_send(
 /// can only answer libavcodec with an errno, so the reason lives in the
 /// callback state and every decoder funnel collects it.
 pub(crate) fn frame_budget_declination_of(state: *const CallbackState) -> Option<Error> {
-  crate::ffi::take_frame_budget_declination(state).map(|(bytes, limit, audio)| {
-    Error::FrameBudgetExceeded(crate::error::FrameBudgetExceeded::new(
-      bytes,
-      limit,
-      if audio {
-        crate::error::FrameMedium::Audio
-      } else {
-        crate::error::FrameMedium::Video
-      },
-    ))
-  })
+  crate::ffi::take_frame_budget_declination(state)
+    .map(|refusal| Error::FrameBudgetExceeded(frame_budget_exceeded(state, refusal)))
+}
+
+/// The name a refusal `judge_buffer` recorded in `state` goes by: its cost,
+/// the ceiling `state` carries, the frame's medium and `pts`.
+pub(crate) fn frame_budget_exceeded(
+  state: *const CallbackState,
+  refusal: crate::ffi::FrameRefusal,
+) -> crate::error::FrameBudgetExceeded {
+  // SAFETY: `state` is null or the live `CallbackState` the caller owns;
+  // `max_frame_bytes` is a plain integer, written once at its build.
+  let limit = if state.is_null() {
+    0
+  } else {
+    unsafe { (*state).max_frame_bytes }
+  };
+  crate::error::FrameBudgetExceeded::new(
+    refusal.bytes,
+    limit,
+    if refusal.audio {
+      crate::error::FrameMedium::Audio
+    } else {
+      crate::error::FrameMedium::Video
+    },
+  )
+  .with_pts(refusal.pts)
 }
 
 /// Proves an opened codec context is a **video** one without going
