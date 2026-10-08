@@ -6265,6 +6265,292 @@ fn encode_h264_with_extradata(width: u32, height: u32, frames: usize) -> Synthet
   })
 }
 
+/// The NAL units of an Annex B byte stream, in order, their start codes and
+/// trailing zero bytes stripped.
+fn annexb_units(data: &[u8]) -> Vec<&[u8]> {
+  let mut begins = Vec::new();
+  let mut at = 0;
+  while at + 3 <= data.len() {
+    if data[at..].starts_with(&[0, 0, 1]) {
+      begins.push(at + 3);
+      at += 3;
+    } else {
+      at += 1;
+    }
+  }
+  begins
+    .iter()
+    .enumerate()
+    .map(|(index, &begin)| {
+      let end = begins.get(index + 1).map_or(data.len(), |&next| next - 3);
+      let mut unit = &data[begin..end];
+      while let [rest @ .., 0] = unit {
+        unit = rest;
+      }
+      unit
+    })
+    .collect()
+}
+
+/// An `avcC` record carrying `sps` and `pps`, whose NAL length fields are
+/// `length_size` bytes wide.
+fn avcc(sps: &[u8], pps: &[u8], length_size: u8) -> Vec<u8> {
+  let mut record = vec![1, sps[1], sps[2], sps[3], 0xFC | (length_size - 1), 0xE1];
+  record.extend_from_slice(&u16::try_from(sps.len()).expect("a short SPS").to_be_bytes());
+  record.extend_from_slice(sps);
+  record.push(1);
+  record.extend_from_slice(&u16::try_from(pps.len()).expect("a short PPS").to_be_bytes());
+  record.extend_from_slice(pps);
+  record
+}
+
+/// `units` one after another, each behind a big-endian length field
+/// `length_size` bytes wide.
+fn length_prefixed(units: &[&[u8]], length_size: usize) -> Vec<u8> {
+  let mut out = Vec::new();
+  for unit in units {
+    assert!(
+      unit.len() < 1 << (8 * length_size),
+      "a unit fits its length field"
+    );
+    let length = unit.len().to_be_bytes();
+    out.extend_from_slice(&length[length.len() - length_size..]);
+    out.extend_from_slice(unit);
+  }
+  out
+}
+
+/// `packet`'s timing and flags around `payload`.
+fn repacked(packet: &Packet, payload: &[u8]) -> Packet {
+  let mut out = Packet::copy(payload);
+  out.set_pts(packet.pts());
+  out.set_dts(packet.dts());
+  out.set_duration(packet.duration());
+  out.set_flags(packet.flags());
+  out
+}
+
+/// `packet` carrying `extradata` as `AV_PKT_DATA_NEW_EXTRADATA`.
+fn with_new_extradata(mut packet: Packet, extradata: &[u8]) -> Packet {
+  use ffmpeg_next::packet::Mut;
+  // SAFETY: `packet` is a live packet this function owns; FFmpeg allocates
+  // the side data, padded, and frees it with the packet; `extradata` is
+  // copied into exactly the bytes it allocated.
+  unsafe {
+    let slot = crate::ffi::packet_new_side_data(
+      packet.as_mut_ptr(),
+      ffmpeg_next::ffi::AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA as i32,
+      extradata.len(),
+    )
+    .expect("new extradata attached");
+    core::ptr::copy_nonoverlapping(extradata.as_ptr(), slot, extradata.len());
+  }
+  packet
+}
+
+/// The extradata `parameters` carry.
+fn extradata_of(parameters: &Parameters) -> Vec<u8> {
+  // SAFETY: `parameters` owns a live `AVCodecParameters`, whose extradata
+  // is null or `extradata_size` bytes long.
+  unsafe {
+    let raw = parameters.as_ptr();
+    let size = usize::try_from((*raw).extradata_size).unwrap_or(0);
+    if (*raw).extradata.is_null() || size == 0 {
+      Vec::new()
+    } else {
+      core::slice::from_raw_parts((*raw).extradata, size).to_vec()
+    }
+  }
+}
+
+/// Replaces `parameters`' extradata with `extradata`, padded as libavcodec
+/// reads it.
+fn set_extradata(parameters: &mut Parameters, extradata: &[u8]) {
+  use ffmpeg_next::ffi;
+  let padded = extradata.len() + ffi::AV_INPUT_BUFFER_PADDING_SIZE as usize;
+  // SAFETY: `parameters` owns a live `AVCodecParameters`; its extradata is
+  // freed and replaced by a zeroed allocation of the padded size holding
+  // `extradata`.
+  unsafe {
+    let raw = parameters.as_mut_ptr();
+    ffi::av_freep(core::ptr::addr_of_mut!((*raw).extradata).cast());
+    let data = ffi::av_mallocz(padded).cast::<u8>();
+    assert!(!data.is_null(), "extradata allocated");
+    core::ptr::copy_nonoverlapping(extradata.as_ptr(), data, extradata.len());
+    (*raw).extradata = data;
+    (*raw).extradata_size = i32::try_from(extradata.len()).expect("a short record");
+  }
+}
+
+/// The SPS and PPS `libx264` put in a clip's extradata.
+fn sps_and_pps(clip: &SyntheticClip) -> (Vec<u8>, Vec<u8>) {
+  let extradata = extradata_of(&clip.parameters);
+  let units = annexb_units(&extradata);
+  let of = |kind: u8| {
+    units
+      .iter()
+      .find(|unit| unit.first().is_some_and(|header| header & 0x1f == kind))
+      .map(|unit| unit.to_vec())
+      .expect("the parameter set")
+  };
+  (of(7), of(8))
+}
+
+/// A `libx264` clip in closed GOPs — an IDR every 8 frames, two B-frames
+/// between references — packed `avcC`, whose NAL length fields change from
+/// four bytes to two at its third IDR (`change`, decode index 16): the codec
+/// parameters carry the four-byte `avcC` record and the packets before
+/// `change` four-byte fields; the packets from `change` on carry two-byte
+/// fields, and `change`'s packet carries the two-byte record as
+/// `AV_PKT_DATA_NEW_EXTRADATA` — what a container's sample description
+/// switch hands a decoder. Answers the clip and `change`.
+fn encode_h264_avcc_whose_length_size_changes(
+  width: u32,
+  height: u32,
+  frames: usize,
+) -> (SyntheticClip, usize) {
+  let annexb = encode_h264_with_extradata(width, height, frames);
+  let (sps, pps) = sps_and_pps(&annexb);
+  let (four, two) = (avcc(&sps, &pps, 4), avcc(&sps, &pps, 2));
+  let change = nth_keyframe(&annexb, 3);
+  let packets = annexb
+    .packets
+    .iter()
+    .enumerate()
+    .map(|(index, packet)| {
+      let units = annexb_units(packet.data().expect("a payload"));
+      let length_size = if index < change { 4 } else { 2 };
+      let packed = repacked(packet, &length_prefixed(&units, length_size));
+      if index == change {
+        with_new_extradata(packed, &two)
+      } else {
+        packed
+      }
+    })
+    .collect();
+  let mut parameters = annexb.parameters.clone();
+  set_extradata(&mut parameters, &four);
+  (
+    SyntheticClip {
+      parameters,
+      packets,
+    },
+    change,
+  )
+}
+
+/// LAW (Codex R11, [medium]): **across a new extradata, the IDR after the
+/// change anchors a post-commit resync, and the gap closes.** A 32-frame
+/// `avcC` stream whose NAL length fields go from four bytes to two at its
+/// IDR 16, which carries the two-byte record as `AV_PKT_DATA_NEW_EXTRADATA`
+/// (the next IDR, 24, carries none). The hardware fails post-commit before
+/// the change, at packet 12: the cold software decoder takes 16 and reads it
+/// under the record it carries, an IDR, which anchors; its picture, out
+/// first, closes the gap, and 16 to 31 come out with the end clean. Then the
+/// hardware fails after the change, at packet 20, having taken 16: the cold
+/// decoder opens on the record the hardware took, and the IDR 24, which
+/// carries none, anchors under it. Read under the parameters as opened, a
+/// two-byte field is half of a four-byte one: nothing anchors, and the end
+/// escalates.
+#[test]
+fn across_a_new_extradata_the_idr_after_the_change_anchors_the_resync() {
+  let (clip, change) = encode_h264_avcc_whose_length_size_changes(128, 96, 32);
+  assert_eq!(change, 16, "the change is at the third IDR");
+  let pts_from = |from: usize| {
+    let mut pts: Vec<i64> = clip.packets[from..]
+      .iter()
+      .map(|packet| packet.pts().expect("a pts"))
+      .collect();
+    pts.sort_unstable();
+    pts
+  };
+  for (fail_at, anchor) in [(12, change), (20, 24)] {
+    let (dec, delivered, escalated) = through_a_post_commit_failure(&clip, fail_at);
+    assert!(
+      dec.is_software(),
+      "failing at {fail_at}: the fallback committed its cold decoder"
+    );
+    assert!(
+      !escalated,
+      "failing at {fail_at}: the end is clean: {delivered:?}"
+    );
+    assert_eq!(
+      delivered.first(),
+      Some(&(clip.packets[anchor].pts().expect("a pts"), false)),
+      "failing at {fail_at}: the IDR {anchor}'s picture, out first, closes the gap: {delivered:?}"
+    );
+    assert_eq!(
+      delivered.iter().map(|&(pts, _)| pts).collect::<Vec<_>>(),
+      pts_from(anchor),
+      "failing at {fail_at}: every picture from the IDR {anchor} on, once, in order"
+    );
+  }
+}
+
+/// LAW (Codex R11, [medium]): **across a new extradata, the session's
+/// threads come back at the IDR after the change, and no picture is lost.**
+/// The same stream, a probe-era fallback at packet 10 on three threads: the
+/// one-thread decoder replays 0 to 9, and the next clean random access point
+/// is the IDR 16, read under the two-byte record it carries — the switch
+/// fires there, one thread up to it and three from it, and every picture
+/// comes out as the same fallback on one thread delivers it. Read under the
+/// parameters as opened, no IDR after the change is clean, and the session
+/// stays on one thread to the end.
+#[test]
+fn across_a_new_extradata_the_switch_fires_at_the_idr_after_the_change() {
+  let (clip, change) = encode_h264_avcc_whose_length_size_changes(128, 96, 32);
+  let three = core::num::NonZeroU32::new(3).expect("nonzero");
+  let (single, _) = threads_through_a_fallback(&clip, 10, crate::Threads::Single);
+  assert_eq!(single.len(), clip.packets.len(), "one picture per packet");
+  let (shown, threads_after) = threads_through_a_fallback(&clip, 10, crate::Threads::Count(three));
+  assert_eq!(
+    (threads_after[change - 1], threads_after[change]),
+    (Some(core::num::NonZeroU32::MIN), Some(three)),
+    "one thread up to the IDR {change}, three from it: {threads_after:?}"
+  );
+  assert_eq!(shown, single, "the same pictures, in the same order");
+}
+
+/// LAW (Codex R11, [medium]): **a decoder opened after a new extradata starts
+/// on it, and decodes what a straight decode does.** The same stream, a
+/// probe-era fallback at packet 18, past the change, on three threads: the
+/// one-thread decoder replays 0 to 17, the change among them, and the session
+/// switches at the IDR 24, which carries no record — the decoder opened there
+/// starts on the session's parameters. Every picture, 24 to 31 among them,
+/// comes out byte-identical to a straight software decode of the stream, in
+/// the same order. Opened on the parameters as they were, the decoder reads
+/// two-byte fields as four.
+#[test]
+fn a_decoder_opened_after_a_new_extradata_decodes_what_a_straight_decode_does() {
+  let (clip, _) = encode_h264_avcc_whose_length_size_changes(128, 96, 32);
+  let (straight, _) = decode_on_software(
+    &clip,
+    DecoderLimits::default().with_threads(crate::Threads::Single),
+  );
+  assert_eq!(
+    straight.len(),
+    clip.packets.len(),
+    "the straight decode is whole"
+  );
+  let three = core::num::NonZeroU32::new(3).expect("nonzero");
+  let (delivered, threads) = decode_through_a_fallback(
+    &clip,
+    FakeHw::failing(128, 96, 0, 18, FailShape::ProbeEra),
+    crate::Threads::Count(three),
+  );
+  assert_eq!(threads, Some(three), "the session switched to its threads");
+  assert_eq!(delivered.len(), straight.len(), "every picture");
+  for (index, ((pts, planes), (straight_pts, straight_planes))) in
+    delivered.iter().zip(&straight).enumerate()
+  {
+    assert_eq!(pts, straight_pts, "picture {index}'s timestamp");
+    assert!(
+      planes.as_ref() == Some(straight_planes),
+      "picture {index}'s planes differ from the straight decode's"
+    );
+  }
+}
+
 /// LAW (Codex R6 row 1, [high]): **a stale key flag anchors nothing.** An
 /// H.264 stream whose SPS and PPS ride in its codec parameters, so the cold
 /// software decoder takes P slices: the hardware fails post-commit on a

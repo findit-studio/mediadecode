@@ -225,7 +225,28 @@ pub struct CarrierVideoStreamDecoder<C: crate::FfmpegCarrier> {
   path: DecodePath,
   /// Codec parameters retained so we can open a software
   /// `ffmpeg::decoder::Video` if the HW probe exhausts.
+  ///
+  /// **Their extradata is the active one.** A packet carrying
+  /// `AV_PKT_DATA_NEW_EXTRADATA` — a container's sample description switch,
+  /// a codec-private change — changes the stream's parameters from that
+  /// packet on, and FFmpeg's H.264 and HEVC decoders apply it before they
+  /// decode the packet.
+  /// Once a decoder takes such a packet its extradata replaces these, in
+  /// place ([`NewExtradata`]), so the keyframe rule reads the framing the
+  /// decoder parses ([`Self::keyframe_rule`]) and every decoder opened
+  /// later — a post-commit fallback's, a switch's — starts on the stream's
+  /// current parameters. While the hardware probe records its history, what
+  /// the hardware takes waits in [`Self::probe_extradata`] instead.
   parameters: Parameters,
+  /// The extradata of the last packet carrying `AV_PKT_DATA_NEW_EXTRADATA`
+  /// the hardware took while its probe recorded a history: a probe-era
+  /// fallback replays that history from the parameters it started on,
+  /// re-applying this in order, so it is not installed in
+  /// [`Self::parameters`] yet. It is installed once nothing will replay it —
+  /// at the hardware's first send after the probe committed, at a
+  /// post-commit fallback and at a flush, which clears the history — and
+  /// dropped by a probe-era fallback, which re-applies it.
+  probe_extradata: Option<NewExtradata>,
   /// HW-side scratch frame (filled by [`VideoDecoder::receive_frame`]).
   hw_scratch: Frame,
   /// SW-side scratch frame (filled by `ffmpeg::decoder::Video::receive_frame`).
@@ -1054,6 +1075,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       state,
       path,
       parameters: owned_parameters,
+      probe_extradata: None,
       hw_scratch,
       sw_scratch,
       sw_replay_frames: ReplayQueue::default(),
@@ -1447,6 +1469,13 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     // new SW decoder and queue into `self`.
     self.sw_replay_frames.append(&mut local_replay);
     self.state = DecodeState::Sw(sw);
+    // The history was replayed from the parameters it started on, its own
+    // new extradata re-applied in order: the last the decoder took is the
+    // active one, and what the hardware took is not installed again.
+    self.probe_extradata = None;
+    if let Some(extradata) = progress.extradata.take() {
+      extradata.install(&mut self.parameters);
+    }
     self.sw_threads_pending = self.session_threads_run();
     self.pending_eof = eof_pending && !progress.eof_sent;
     // A drain the budget stopped: the decoder may hold more of the replay's
@@ -1498,6 +1527,11 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       &mut progress,
     );
     self.pending_history.drain(..progress.fed);
+    // A packet the decoder took before any error: its new extradata, if it
+    // carried one, is the active one.
+    if let Some(extradata) = progress.extradata.take() {
+      extradata.install(&mut self.parameters);
+    }
     if progress.eof_sent {
       self.pending_eof = false;
       self.eof_sent = true;
@@ -1696,6 +1730,11 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
         return Ok(Sent::MustDrain);
       }
     }
+    // The extradata this packet carries, copied before anything of the
+    // session moves: it becomes the active extradata once the decoder takes
+    // the packet, and until then the packet is read under it
+    // ([`Self::rule_for`]).
+    let extradata = NewExtradata::of(pkt).map_err(VideoDecodeError::Decode)?;
     if self.restart.is_none()
       && matches!(self.state, DecodeState::Sw(_))
       && self.sw_threads_pending
@@ -1795,6 +1834,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       self.reorder_override = Some(depth);
     }
     self.sw_output_settled = false;
+    // The decoder took it: its extradata is the stream's now.
+    if let Some(extradata) = extradata {
+      extradata.install(&mut self.parameters);
+    }
     if let Some(anchor) = anchoring {
       self.anchor_resync(reorder_before, anchor);
     } else {
@@ -1825,10 +1868,11 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
 
   /// What `pkt` is as a post-commit resync anchor: a key-flagged packet the
   /// bitstream proves a random-access point, where this crate can read it —
-  /// see [`access::KeyframeRule::anchor`]. A stale key flag, or a picture
-  /// before the random-access one, anchors nothing.
+  /// see [`access::KeyframeRule::anchor`] — read by the rule `pkt` is decoded
+  /// under ([`Self::rule_for`]). A stale key flag, or a picture before the
+  /// random-access one, anchors nothing.
   fn anchor(&self, pkt: &Packet) -> Option<access::Anchor> {
-    let rule = self.keyframe_rule();
+    let rule = self.rule_for(pkt);
     if pkt.is_key() || rule.every_packet() {
       pkt.data().and_then(|data| rule.anchor(data))
     } else {
@@ -1842,12 +1886,12 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// codec that codes every picture alone, every packet is a keyframe here,
   /// its flag or not.
   fn switch_point(&self, pkt: &Packet) -> bool {
-    (pkt.is_key() || self.keyframe_rule().every_packet())
-      && (self.seeked || self.clean_keyframe(pkt))
+    (pkt.is_key() || self.rule_for(pkt).every_packet()) && (self.seeked || self.clean_keyframe(pkt))
   }
 
   /// The keyframe rule for this session's stream, read off its codec
-  /// parameters: the codec, and how its extradata packs NAL units.
+  /// parameters: the codec, and how its active extradata packs NAL units
+  /// ([`Self::parameters`]).
   fn keyframe_rule(&self) -> access::KeyframeRule {
     // SAFETY: the owned, deep-copied parameters' pointer, only read.
     let raw = unsafe { self.parameters.as_ptr() };
@@ -1855,11 +1899,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       return access::KeyframeRule::Reordering;
     }
     // SAFETY: `raw` is that live pointer (checked non-null above).
-    // `codec_id` is read as the 32-bit integer the field holds, never
-    // formed into a bindgen enum; `extradata` is read for `extradata_size`
-    // bytes, which FFmpeg allocated together.
+    // `extradata` is read for `extradata_size` bytes, which FFmpeg
+    // allocated together.
     unsafe {
-      let codec_id = core::ptr::read(core::ptr::addr_of!((*raw).codec_id) as *const i32);
       let data = (*raw).extradata;
       let size = usize::try_from((*raw).extradata_size).unwrap_or(0);
       let extradata = if data.is_null() || size == 0 {
@@ -1867,19 +1909,57 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       } else {
         core::slice::from_raw_parts(data, size)
       };
-      access::KeyframeRule::of(codec_id, extradata)
+      access::KeyframeRule::of(self.codec_id(), extradata)
+    }
+  }
+
+  /// The keyframe rule `pkt` is decoded under: for a packet carrying
+  /// `AV_PKT_DATA_NEW_EXTRADATA`, the rule its extradata gives — FFmpeg's
+  /// H.264 and HEVC decoders apply it before they decode that very packet,
+  /// so a change of NAL length fields or of packing frames the packet's own
+  /// units — and otherwise the active one ([`Self::keyframe_rule`]). The
+  /// extradata becomes the active one when a decoder takes the packet
+  /// ([`NewExtradata`]).
+  fn rule_for(&self, pkt: &Packet) -> access::KeyframeRule {
+    match new_extradata(pkt) {
+      Some(extradata) => access::KeyframeRule::of(self.codec_id(), extradata),
+      None => self.keyframe_rule(),
+    }
+  }
+
+  /// The stream's codec id, as the 32-bit integer its parameters hold.
+  fn codec_id(&self) -> i32 {
+    // SAFETY: the owned, deep-copied parameters' pointer, only read;
+    // `codec_id` is read as the 32-bit integer the field holds, never formed
+    // into a bindgen enum.
+    unsafe {
+      let raw = self.parameters.as_ptr();
+      if raw.is_null() {
+        return crate::CodecId::NONE.raw();
+      }
+      core::ptr::read(core::ptr::addr_of!((*raw).codec_id) as *const i32)
+    }
+  }
+
+  /// Installs what the hardware took while its probe recorded
+  /// ([`Self::probe_extradata`]) as the active extradata: the probe's history
+  /// will not be replayed.
+  fn install_probe_extradata(&mut self) {
+    if let Some(extradata) = self.probe_extradata.take() {
+      extradata.install(&mut self.parameters);
     }
   }
 
   /// Whether `pkt`, a keyframe, is a clean random access point for this
   /// stream — see [`access::KeyframeRule::is_clean`]: proved by its
-  /// bitstream, never inferred from the decoder it would replace, whose
-  /// `has_b_frames` FFmpeg raises only when it meets reordering — which an
-  /// open GOP can introduce at this very keyframe.
+  /// bitstream, under the rule it is decoded under ([`Self::rule_for`]),
+  /// never inferred from the decoder it would replace, whose `has_b_frames`
+  /// FFmpeg raises only when it meets reordering — which an open GOP can
+  /// introduce at this very keyframe.
   fn clean_keyframe(&self, pkt: &Packet) -> bool {
     pkt
       .data()
-      .is_some_and(|data| self.keyframe_rule().is_clean(data))
+      .is_some_and(|data| self.rule_for(pkt).is_clean(data))
   }
 
   /// **A fallback that outlives a minute on one thread says so, once.** A
@@ -2017,6 +2097,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       !(matches!(input, PostCommitInput::Packet(_)) && eof_pending),
       "a current packet and a committed EOF must never be forwarded together",
     );
+    // The cold decoder starts on the stream's current parameters: a new
+    // extradata the hardware took while its probe recorded is the stream's
+    // now, whatever this fallback comes to.
+    self.install_probe_extradata();
     let one_thread = self.limits.with_threads(crate::Threads::Single);
     let mut sw = open_sw_decoder(&self.parameters, one_thread, Some(self.time_base))?;
     // **No proof, no commit.** This is the one road whose commit owes a
@@ -2042,6 +2126,11 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       // Neither of these forwards a packet; the end-of-stream below is
       // the only thing they can hand the cold decoder.
       PostCommitInput::FrameTime | PostCommitInput::Eof => None,
+    };
+    // The extradata the forwarded packet carries, active once committed.
+    let extradata = match forwarded {
+      Some(pkt) => NewExtradata::of(pkt)?,
+      None => None,
     };
     // The cold decoder's reorder depth before the forward, for an anchor.
     let reorder_before = reorder_depth(&sw);
@@ -2073,6 +2162,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     // Commit: only after a clean open + forward. The session's own
     // threads come back at the next keyframe.
     self.state = DecodeState::Sw(sw);
+    if let Some(extradata) = extradata {
+      extradata.install(&mut self.parameters);
+    }
     self.sw_threads_pending = self.session_threads_run();
     self.enter_degraded_resync();
     self.sw_output_settled = forwarded.is_none() && !eof_pending;
@@ -2460,6 +2552,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       state: DecodeState::Hw(hw),
       path,
       parameters: owned_parameters,
+      probe_extradata: None,
       hw_scratch: Frame::empty()?,
       sw_scratch: alloc_av_video_frame()?,
       sw_replay_frames: ReplayQueue::default(),
@@ -2681,7 +2774,21 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       DecodeState::Hw(hw) if hw.records_submissions() => crate::carrier::BodyRoute::Copy,
       _ => crate::carrier::BodyRoute::Submission,
     };
+    // What the hardware takes while its probe records, a probe-era fallback
+    // replays; once the probe has committed, a new extradata it took while it
+    // recorded is the stream's ([`Self::probe_extradata`]).
+    let probing = matches!(&self.state, DecodeState::Hw(hw) if hw.records_submissions());
+    if matches!(self.state, DecodeState::Hw(_)) && !probing {
+      self.install_probe_extradata();
+    }
     boundary::with_ffmpeg_video_packet::<C, _>(packet, limits, route, |av_pkt| {
+      // The extradata a packet for the hardware carries, copied before it
+      // sees the packet: the stream's once it takes it.
+      let extradata = if matches!(self.state, DecodeState::Hw(_)) {
+        NewExtradata::of(av_pkt).map_err(VideoDecodeError::Decode)?
+      } else {
+        None
+      };
       match &mut self.state {
         DecodeState::Hw(hw) => match hw.send_packet(av_pkt) {
           // The seam already classified libavcodec's back pressure, so
@@ -2689,8 +2796,15 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
           // is the first one after a seek, if one was pending: the next
           // keyframe the software road sees is not.
           Ok(status) => {
-            if matches!(status, Sent::Accepted) && av_pkt.is_key() {
-              self.seeked = false;
+            if matches!(status, Sent::Accepted) {
+              if av_pkt.is_key() {
+                self.seeked = false;
+              }
+              match extradata {
+                Some(extradata) if probing => self.probe_extradata = Some(extradata),
+                Some(extradata) => extradata.install(&mut self.parameters),
+                None => {}
+              }
             }
             Ok(status)
           }
@@ -3131,6 +3245,11 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     self.pending_eof = false;
     self.replay_output_pending = false;
     self.restart = None;
+    // The flush clears the probe's history but not what the decoders
+    // applied: a new extradata the hardware took is the stream's from here,
+    // and the active one stays (a container re-sends its own after a seek
+    // that crosses a change).
+    self.install_probe_extradata();
     self.deferred_error = None;
     // And a parked frame belongs to the position being abandoned.
     self.scratch_pending = false;
@@ -3339,6 +3458,10 @@ video_lane_face!(crate::View, crate::Owned);
 struct Replay {
   fed: usize,
   eof_sent: bool,
+  /// The extradata the last packet the decoder took carried as
+  /// `AV_PKT_DATA_NEW_EXTRADATA`, copied: the session's active extradata
+  /// once the replay is its own ([`NewExtradata::install`]).
+  extradata: Option<NewExtradata>,
 }
 
 /// How a drain into the queue stopped.
@@ -3380,10 +3503,17 @@ fn replay_history(
     if queue.full(budget) {
       return Ok(Drained::Full);
     }
+    // Copied before the decoder sees the packet; kept once it takes it.
+    let extradata = NewExtradata::of(pkt)?;
     let mut attempts: u32 = 0;
     loop {
       match sw.submit(pkt) {
-        Ok(()) => break,
+        Ok(()) => {
+          if extradata.is_some() {
+            progress.extradata = extradata;
+          }
+          break;
+        }
         Err(ffmpeg_next::Error::Other { errno }) if errno == ffmpeg_next::error::EAGAIN => {
           if drain_into(sw, sw_state, queue, budget)? == Drained::Full {
             return Ok(Drained::Full);
@@ -3754,6 +3884,101 @@ fn reorder_depth(sw: &SwDecoder) -> usize {
   // SAFETY: `sw` is a live opened software decoder; one plain integer field
   // is read and the pointer is not kept.
   usize::try_from(unsafe { (*sw.as_ptr()).has_b_frames }).unwrap_or(0)
+}
+
+/// The extradata `pkt` carries as `AV_PKT_DATA_NEW_EXTRADATA`, if any: what
+/// `av_packet_get_side_data` answers, the lookup FFmpeg's H.264 and HEVC
+/// decoders make before they decode a packet — the first entry of that type.
+/// An empty entry is none: those decoders apply nothing for it.
+fn new_extradata(pkt: &Packet) -> Option<&[u8]> {
+  use ffmpeg_next::packet::Ref;
+  let mut size: usize = 0;
+  // SAFETY: `pkt` is a live packet. The type is handed to FFmpeg as the
+  // constant this build names, never formed from FFmpeg memory, and FFmpeg
+  // compares it in C; the answer is null or `size` bytes the packet owns,
+  // borrowed here for as long as `pkt` is.
+  unsafe {
+    let data = ffmpeg_next::ffi::av_packet_get_side_data(
+      pkt.as_ptr(),
+      ffmpeg_next::ffi::AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA,
+      &mut size,
+    );
+    (!data.is_null() && size > 0).then(|| core::slice::from_raw_parts(data, size))
+  }
+}
+
+/// Extradata a packet carried as `AV_PKT_DATA_NEW_EXTRADATA`, copied the way
+/// codec parameters hold theirs — `av_malloc`ed with
+/// `AV_INPUT_BUFFER_PADDING_SIZE` zeroed bytes behind it — before the packet
+/// is handed to a decoder ([`Self::of`]), so that installing it once the
+/// decoder has taken the packet cannot fail ([`Self::install`]). A packet the
+/// decoder refuses leaves the active extradata as it was, and this copy is
+/// freed.
+struct NewExtradata {
+  data: core::ptr::NonNull<u8>,
+  size: core::ffi::c_int,
+}
+
+// SAFETY: a `NewExtradata` owns its allocation alone and only frees it;
+// FFmpeg's allocator frees from any thread.
+unsafe impl Send for NewExtradata {}
+
+impl NewExtradata {
+  /// A copy of the extradata `pkt` carries ([`new_extradata`]), or `None`
+  /// where it carries none. Refused where the allocation fails, before the
+  /// packet goes anywhere, so the packet stays the caller's.
+  fn of(pkt: &Packet) -> Result<Option<Self>, Error> {
+    let Some(extradata) = new_extradata(pkt) else {
+      return Ok(None);
+    };
+    let padding = ffmpeg_next::ffi::AV_INPUT_BUFFER_PADDING_SIZE as usize;
+    let Ok(size) = core::ffi::c_int::try_from(extradata.len()) else {
+      return Err(Error::Ffmpeg(ffmpeg_next::Error::InvalidData));
+    };
+    // SAFETY: a plain allocation of the padded size; null on failure.
+    let data = unsafe { ffmpeg_next::ffi::av_malloc(extradata.len() + padding) }.cast::<u8>();
+    let Some(data) = core::ptr::NonNull::new(data) else {
+      return Err(Error::Ffmpeg(ffmpeg_next::Error::Other {
+        errno: libc::ENOMEM,
+      }));
+    };
+    // SAFETY: `data` was just allocated for `extradata.len() + padding`
+    // bytes and overlaps nothing; the extradata is copied in and the padding
+    // zeroed, as libavcodec requires of codec parameters' extradata.
+    unsafe {
+      core::ptr::copy_nonoverlapping(extradata.as_ptr(), data.as_ptr(), extradata.len());
+      core::ptr::write_bytes(data.as_ptr().add(extradata.len()), 0, padding);
+    }
+    Ok(Some(Self { data, size }))
+  }
+
+  /// Installs this as `parameters`' extradata, the old freed: the stream's
+  /// active extradata from here on.
+  fn install(self, parameters: &mut Parameters) {
+    // SAFETY: only the pointer is read.
+    let raw = unsafe { parameters.as_mut_ptr() };
+    if raw.is_null() {
+      return;
+    }
+    let this = core::mem::ManuallyDrop::new(self);
+    // SAFETY: `raw` is the live `AVCodecParameters` the session owns alone
+    // (a deep copy; the hardware decoder holds its own). Its extradata is
+    // null or `av_malloc`ed by FFmpeg, and is freed here; ownership of this
+    // copy's allocation moves into it, so `this` is not dropped.
+    unsafe {
+      ffmpeg_next::ffi::av_freep(core::ptr::addr_of_mut!((*raw).extradata).cast());
+      (*raw).extradata = this.data.as_ptr();
+      (*raw).extradata_size = this.size;
+    }
+  }
+}
+
+impl Drop for NewExtradata {
+  fn drop(&mut self) {
+    // SAFETY: `data` is this copy's own `av_malloc` allocation, not
+    // installed (`install` does not drop).
+    unsafe { ffmpeg_next::ffi::av_free(self.data.as_ptr().cast()) };
+  }
 }
 
 fn open_sw_decoder(

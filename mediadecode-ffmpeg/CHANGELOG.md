@@ -273,6 +273,21 @@ The backend-agnostic core it adapts has its own log at
   in two parts: the packets fed before a keyframe anchored the resync, and
   those fed after it with the resync never proved.
 
+- **A new extradata mid-stream is followed.** A packet carrying
+  `AV_PKT_DATA_NEW_EXTRADATA` — a container's sample description switch, a
+  codec-private change — is read under the extradata it carries, the NAL
+  length fields and packing its own units use (FFmpeg's H.264 and HEVC
+  decoders apply it before they decode that packet), for the resync anchor,
+  the switch point and the clean keyframe alike. Once a decoder takes the
+  packet, that extradata replaces the session's codec parameters' (a packet
+  refused leaves them as they were): later packets are read under it, and
+  every decoder opened later — a post-commit fallback's cold decoder, a
+  switch's — starts on the stream's current parameters. One the hardware
+  took while its probe recorded is installed once nothing will replay it.
+  Read under the parameters as opened, an `avcC` stream whose length fields
+  changed never anchored, ended in a false `PostCommitNeverResynced`, and
+  never returned to the session's threads.
+
 ## [0.15.1] - 2026-10-05
 
 ### Added
