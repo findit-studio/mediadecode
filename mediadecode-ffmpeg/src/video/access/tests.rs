@@ -956,15 +956,76 @@ fn ue(value: u32) -> String {
   format!("{}{coded:b}", "0".repeat(width as usize - 1))
 }
 
+/// What [`vps`] writes: an HEVC video parameter set of one sub-layer, Main
+/// profile at level 3.1, and the extension FFmpeg 9 reads whole for a set
+/// of two layers (`decode_vps_ext`).
+#[derive(Clone, Copy)]
+struct Vps {
+  /// `vps_max_layers_minus1`; as many layer sets as layers, at most two.
+  layers_minus1: u8,
+  /// Timing information and one set of HRD parameters (NAL parameters, one
+  /// CPB).
+  hrd: bool,
+  /// The extension's `scalability_mask_flag`; no extension where `None`.
+  mask: Option<u16>,
+  /// The auxiliary type's `dimension_id`: 1 alpha, 2 depth.
+  aux_id: u8,
+  /// `layer_id_in_nuh[1]`, written where given; FFmpeg takes 1 where not.
+  layer_id: Option<u8>,
+  /// `vps_base_layer_internal_flag`, which FFmpeg requires.
+  base_internal: bool,
+  /// `chroma_and_bit_depth_vps_present_flag`, which FFmpeg requires.
+  chroma_and_depth: bool,
+  /// The extension cut short before its profile and mask.
+  cut: bool,
+}
+
+impl Vps {
+  /// One layer, no timing, no extension.
+  const ONE: Self = Self {
+    layers_minus1: 0,
+    hrd: false,
+    mask: None,
+    aux_id: 1,
+    layer_id: None,
+    base_internal: true,
+    chroma_and_depth: true,
+    cut: false,
+  };
+
+  /// Two layers, the extension's mask `mask`.
+  const fn two(mask: u16) -> Self {
+    Self {
+      layers_minus1: 1,
+      mask: Some(mask),
+      ..Self::ONE
+    }
+  }
+}
+
 /// An HEVC video parameter set NAL unit for `max_layers_minus1` + 1 layers
 /// and one sub-layer, Main profile at level 3.1: where `hrd`, with timing
 /// information and one set of HRD parameters (NAL parameters, one CPB);
-/// where `mask` is given, with a VPS extension whose
-/// `scalability_mask_flag` is it, one bit of `dimension_id` for each type it
-/// sets, cut short where `cut` before the extension's profile and mask.
+/// where `mask` is given, with the VPS extension FFmpeg 9 reads whole, its
+/// `scalability_mask_flag` `mask` and the auxiliary type alpha, cut short
+/// where `cut` before the extension's profile and mask.
 fn vps(max_layers_minus1: u8, hrd: bool, mask: Option<u16>, cut: bool) -> Vec<u8> {
+  vps_of(Vps {
+    layers_minus1: max_layers_minus1,
+    hrd,
+    mask,
+    cut,
+    ..Vps::ONE
+  })
+}
+
+/// The video parameter set NAL unit `of` describes.
+fn vps_of(of: Vps) -> Vec<u8> {
+  const AUXILIARY: u16 = 1 << (15 - 3);
+  let max_layers_minus1 = of.layers_minus1;
   let mut bits = String::from("0000"); // vps_video_parameter_set_id
-  bits += "11"; // vps_base_layer_internal_flag, vps_base_layer_available_flag
+  // vps_base_layer_internal_flag, vps_base_layer_available_flag
+  bits += if of.base_internal { "11" } else { "01" };
   bits += &format!("{max_layers_minus1:06b}");
   bits += "000"; // vps_max_sub_layers_minus1
   bits += "1"; // vps_temporal_id_nesting_flag
@@ -984,7 +1045,7 @@ fn vps(max_layers_minus1: u8, hrd: bool, mask: Option<u16>, cut: bool) -> Vec<u8
   for _ in 0..layer_sets_minus1 {
     bits += &"1".repeat(usize::from(max_layers_minus1) + 1); // layer_id_included_flag
   }
-  if hrd {
+  if of.hrd {
     bits += "1"; // vps_timing_info_present_flag
     bits += &format!("{:032b}{:032b}", 1001u32, 30000u32);
     bits += "0"; // vps_poc_proportional_to_timing_flag
@@ -1000,20 +1061,62 @@ fn vps(max_layers_minus1: u8, hrd: bool, mask: Option<u16>, cut: bool) -> Vec<u8
   } else {
     bits += "0";
   }
-  match mask {
+  match of.mask {
     Some(mask) => {
       bits += "1"; // vps_extension_flag
       while bits.len() % 8 != 0 {
         bits += "1"; // vps_extension_alignment_bit_equal_to_one
       }
-      if !cut {
+      if !of.cut {
         bits += "01011101"; // profile_tier_level(0, 0)
         bits += "0"; // splitting_flag
         bits += &format!("{mask:016b}");
         let types = mask.count_ones() as usize;
-        bits += &"000".repeat(types); // dimension_id_len_minus1
-        bits += "0"; // vps_nuh_layer_id_present_flag
-        bits += &"1".repeat(types); // dimension_id[1][j]
+        bits += &"001".repeat(types); // dimension_id_len_minus1: two bits each
+        match of.layer_id {
+          Some(id) => bits += &format!("1{id:06b}"), // vps_nuh_layer_id_present_flag
+          None => bits += "0",
+        }
+        // dimension_id[1][j], in the mask's order from its first type: the
+        // multiview type's view order index 1, the auxiliary type's AuxId.
+        for index in 0..16 {
+          if mask & (1 << (15 - index)) != 0 {
+            let dimension = if 1 << (15 - index) == AUXILIARY {
+              of.aux_id
+            } else {
+              1
+            };
+            bits += &format!("{dimension:02b}");
+          }
+        }
+        bits += "0000"; // view_id_len
+        bits += "1"; // direct_dependency_flag[1][0]
+        bits += "0"; // vps_sub_layers_max_minus1_present_flag
+        bits += "0"; // max_tid_ref_present_flag
+        bits += "0"; // default_ref_layers_active_flag
+        bits += &ue(0); // vps_num_profile_tier_level_minus1
+        bits += &ue(0); // num_add_olss
+        bits += "00"; // default_output_layer_idc
+        bits += &ue(0); // vps_num_rep_formats_minus1
+        bits += &format!("{:016b}{:016b}", 128u16, 96u16); // the picture's size
+        if of.chroma_and_depth {
+          // chroma_and_bit_depth_vps_present_flag, 4:2:0, eight bits each.
+          bits += "1";
+          bits += "01";
+          bits += "00000000";
+        } else {
+          bits += "0";
+        }
+        bits += "0"; // conformance_window_vps_flag
+        bits += "00"; // max_one_active_ref_layer_flag, vps_poc_lsb_aligned_flag
+        bits += "0"; // sub_layer_flag_info_present_flag
+        // max_vps_dec_pic_buffering_minus1 for both output layers,
+        // max_vps_num_reorder_pics, max_vps_latency_increase_plus1.
+        bits += &ue(0).repeat(4);
+        bits += &ue(0); // direct_dep_type_len_minus2
+        bits += "0"; // direct_dependency_all_layers_flag
+        bits += &ue(0); // vps_non_vui_extension_length
+        bits += "0"; // vps_vui_present_flag
       }
     }
     None => bits += "0", // vps_extension_flag
@@ -1036,20 +1139,30 @@ fn hvcc_holding(units: &[&[u8]]) -> Vec<u8> {
   record
 }
 
-/// LAW (pre-R14 row 4): **an HEVC stream whose video parameter set declares
-/// an auxiliary layer has no clean point and no anchor.** FFmpeg's HEVC
-/// decoder decodes the auxiliary layer of a two-layer stream beside the
-/// base one, as the alpha plane of every picture, so a base-layer IDR
-/// proves nothing of where that layer's pictures start. Read off an `hvcC`
-/// record, off start-coded extradata, and off a packet's own units, in either
-/// packing: a VPS declaring the auxiliary type (3) — alone, with HRD
-/// parameters before the extension, or beside the multiview type as `x265`
-/// writes its alpha streams — and a two-layer VPS whose extension is cut
-/// before its mask, read as one that declares it, leave an IDR starting its
-/// picture neither clean nor an anchor; a single-layer VPS, with or without
-/// HRD parameters, and a two-layer multiview VPS (MV-HEVC) leave it clean and
-/// a definitive anchor. Read without the VPS, every one of them was a clean
-/// point and an anchor.
+/// LAW (pre-R14 row 4; restated by Codex R14, [medium]): **an HEVC stream
+/// whose video parameter set declares an auxiliary layer FFmpeg decodes as
+/// alpha has no clean point and no anchor; one FFmpeg refuses, or whose
+/// extension it ignores, declares none.** FFmpeg 9's HEVC decoder decodes
+/// the auxiliary layer of a two-layer stream beside the base one, as the
+/// alpha plane of every picture (`ff_hevc_is_alpha_video`), so a base-layer
+/// IDR proves nothing of where that layer's pictures start. The set is read
+/// as `ff_hevc_decode_nal_vps` and `decode_vps_ext` read it, off an `hvcC`
+/// record, off start-coded extradata, and off a packet's own units, in
+/// either packing. Declaring: two layers whose extension sets the auxiliary
+/// type (3) — alone, with HRD parameters before the extension, beside the
+/// multiview type as `x265` writes its alpha streams — and one whose
+/// auxiliary type is depth (2), which FFmpeg's "broken VPS extension" road
+/// keeps as alpha video; each leaves an IDR starting its picture neither
+/// clean nor an anchor. Declaring none, the IDR clean and a definitive
+/// anchor: one layer, with or without HRD parameters; two in multiview
+/// (MV-HEVC); three layers with an auxiliary mask, an extension FFmpeg
+/// ignores, decoding the base layer alone; two cut short before the
+/// extension's mask, which FFmpeg reads past the unit; the second layer's
+/// `nuh_layer_id` 0; a set without its base layer internal, which FFmpeg
+/// refuses; an extension without its rep format's chroma and bit depth,
+/// which FFmpeg refuses. Read without the VPS, every declaring one was a
+/// clean point and an anchor; read by the reading of the mask alone, the
+/// three-layer, the cut, the layer-0 and both refused sets declared alpha.
 #[test]
 fn an_hevc_stream_declaring_an_auxiliary_layer_has_no_clean_point_and_no_anchor() {
   const MULTIVIEW: u16 = 1 << (15 - 1);
@@ -1080,9 +1193,46 @@ fn an_hevc_stream_declaring_an_auxiliary_layer_has_no_clean_point_and_no_anchor(
       true,
     ),
     (
+      "auxiliary, of depth",
+      vps_of(Vps {
+        aux_id: 2,
+        ..Vps::two(AUXILIARY)
+      }),
+      true,
+    ),
+    (
+      "three layers, an auxiliary mask",
+      vps(2, false, Some(AUXILIARY), false),
+      false,
+    ),
+    (
       "two layers, cut short",
       vps(1, false, Some(AUXILIARY), true),
-      true,
+      false,
+    ),
+    (
+      "auxiliary, its second layer id 0",
+      vps_of(Vps {
+        layer_id: Some(0),
+        ..Vps::two(AUXILIARY)
+      }),
+      false,
+    ),
+    (
+      "auxiliary, its base layer not internal",
+      vps_of(Vps {
+        base_internal: false,
+        ..Vps::two(AUXILIARY)
+      }),
+      false,
+    ),
+    (
+      "auxiliary, its rep format without chroma and bit depth",
+      vps_of(Vps {
+        chroma_and_depth: false,
+        ..Vps::two(AUXILIARY)
+      }),
+      false,
     ),
   ] {
     for (rule, pack) in [

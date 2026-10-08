@@ -8969,19 +8969,21 @@ fn on_frame_threads_a_concealed_refusal_is_named_at_the_end_and_cleared_by_a_see
   }
 }
 
-/// A spare HEVC video parameter set NAL unit — id 5, which no sequence
-/// parameter set of the `x265` fixtures refers to, so FFmpeg stores it and
-/// decodes the stream as before — for one layer, or for two whose VPS
-/// extension sets `mask` as its scalability types: one sub-layer, Main
-/// profile, no timing information, one bit of `dimension_id` for each type.
-fn spare_vps(mask: Option<u16>) -> Vec<u8> {
+/// An HEVC video parameter set NAL unit of id `id` for `layers_minus1` + 1
+/// layers (as many layer sets, at most two): one sub-layer, Main profile at
+/// level 3.1, no timing information; where `mask` is given, with the
+/// extension FFmpeg 9 reads whole for two layers (`decode_vps_ext`), its
+/// `scalability_mask_flag` `mask`, two bits of `dimension_id` for each type
+/// — the multiview type's view order index 1, the auxiliary type's `AuxId`
+/// `aux_id` (1 alpha, 2 depth) — and the second layer's `nuh_layer_id` 1.
+fn hevc_vps(id: u8, layers_minus1: u8, mask: Option<u16>, aux_id: u8) -> Vec<u8> {
+  const AUXILIARY: u16 = 1 << (15 - 3);
   let ue = |value: u32| -> String {
     let coded = value + 1;
     let width = 32 - coded.leading_zeros();
     format!("{}{coded:b}", "0".repeat(width as usize - 1))
   };
-  let layers_minus1 = u8::from(mask.is_some());
-  let mut bits = String::from("0101"); // vps_video_parameter_set_id
+  let mut bits = format!("{id:04b}"); // vps_video_parameter_set_id
   bits += "11";
   bits += &format!("{layers_minus1:06b}");
   bits += "0001"; // vps_max_sub_layers_minus1, vps_temporal_id_nesting_flag
@@ -8993,8 +8995,11 @@ fn spare_vps(mask: Option<u16>) -> Vec<u8> {
   bits += "01011101";
   bits += &("1".to_owned() + &ue(4) + &ue(2) + &ue(0));
   bits += &format!("{layers_minus1:06b}");
-  bits += &ue(u32::from(layers_minus1));
-  bits += &"1".repeat(usize::from(layers_minus1) * (usize::from(layers_minus1) + 1));
+  let layer_sets_minus1 = u32::from(layers_minus1 > 0);
+  bits += &ue(layer_sets_minus1);
+  for _ in 0..layer_sets_minus1 {
+    bits += &"1".repeat(usize::from(layers_minus1) + 1);
+  }
   bits += "0"; // vps_timing_info_present_flag
   match mask {
     Some(mask) => {
@@ -9002,12 +9007,34 @@ fn spare_vps(mask: Option<u16>) -> Vec<u8> {
       while bits.len() % 8 != 0 {
         bits += "1";
       }
-      bits += "010111010";
+      bits += "010111010"; // profile_tier_level(0, 0), splitting_flag
       bits += &format!("{mask:016b}");
-      let types = mask.count_ones() as usize;
-      bits += &"000".repeat(types);
-      bits += "0";
-      bits += &"1".repeat(types);
+      bits += &"001".repeat(mask.count_ones() as usize);
+      bits += "0"; // vps_nuh_layer_id_present_flag
+      for index in 0..16 {
+        if mask & (1 << (15 - index)) != 0 {
+          let dimension = if 1 << (15 - index) == AUXILIARY {
+            aux_id
+          } else {
+            1
+          };
+          bits += &format!("{dimension:02b}");
+        }
+      }
+      bits += "0000"; // view_id_len
+      bits += "1"; // direct_dependency_flag[1][0]
+      bits += "000"; // sub-layers, max_tid_ref, default_ref_layers_active
+      bits += &(ue(0) + &ue(0)); // one profile_tier_level, num_add_olss
+      bits += "00"; // default_output_layer_idc
+      bits += &ue(0); // vps_num_rep_formats_minus1
+      bits += &format!("{:016b}{:016b}", 128u16, 96u16);
+      bits += "10100000000"; // chroma and bit depth present: 4:2:0, eight bits
+      bits += "0000"; // conformance window, one active ref layer, aligned, sub-layer info
+      bits += &ue(0).repeat(4); // the DPB sizes of both output layers
+      bits += &ue(0); // direct_dep_type_len_minus2
+      bits += "0"; // direct_dependency_all_layers_flag
+      bits += &ue(0); // vps_non_vui_extension_length
+      bits += "0"; // vps_vui_present_flag
     }
     None => bits += "0",
   }
@@ -9036,16 +9063,27 @@ fn spare_vps(mask: Option<u16>) -> Vec<u8> {
   unit
 }
 
-/// LAW (pre-R14 row 4): **an HEVC stream declaring an auxiliary layer
-/// anchors nothing, and a post-commit gap in it ends escalated by name.**
-/// The R6 CRA stream (`x265`, every keyframe carrying its parameter sets),
-/// the hardware failing post-commit at a CRA whose packet also carries a
-/// spare video parameter set. Declaring an auxiliary layer — what FFmpeg
-/// decodes beside the base layer as an alpha plane — the CRA and every
-/// keyframe after it anchor nothing, no picture closes the gap, and the end
-/// escalates by name; declaring one layer, or two in multiview, the CRA
-/// anchors and the end is clean, as without it. Read without the VPS, the
-/// auxiliary stream resynced at the CRA.
+/// A spare HEVC video parameter set NAL unit — id 5, which no sequence
+/// parameter set of the `x265` fixtures refers to, so FFmpeg stores it and
+/// decodes the stream as before ([`hevc_vps`]), its auxiliary type alpha.
+fn spare_vps(layers_minus1: u8, mask: Option<u16>) -> Vec<u8> {
+  hevc_vps(5, layers_minus1, mask, 1)
+}
+
+/// LAW (pre-R14 row 4; restated by Codex R14, [medium]): **an HEVC stream
+/// declaring an auxiliary layer FFmpeg decodes as alpha anchors nothing, and
+/// a post-commit gap in it ends escalated by name; one whose extension
+/// FFmpeg ignores anchors as before.** The R6 CRA stream (`x265`, every
+/// keyframe carrying its parameter sets), the hardware failing post-commit
+/// at a CRA whose packet also carries a spare video parameter set. Two
+/// layers declaring the auxiliary type — what FFmpeg decodes beside the base
+/// layer as an alpha plane — and the CRA and every keyframe after it anchor
+/// nothing, no picture closes the gap, and the end escalates by name; one
+/// layer, two in multiview, or three with an auxiliary mask — more layers
+/// than FFmpeg decodes, its extension ignored and the base layer decoded
+/// alone — and the CRA anchors and the end is clean, as without it. Read
+/// without the VPS, the auxiliary stream resynced at the CRA; read by the
+/// mask alone, the three-layer one escalated.
 #[test]
 fn an_hevc_stream_declaring_an_auxiliary_layer_anchors_nothing_and_escalates() {
   const MULTIVIEW: u16 = 1 << (15 - 1);
@@ -9057,15 +9095,16 @@ fn an_hevc_stream_declaring_an_auxiliary_layer_anchors_nothing_and_escalates() {
     data.starts_with(&[0, 0, 0, 1]) || data.starts_with(&[0, 0, 1]),
     "the fixture is start-coded"
   );
-  for (name, mask, declares) in [
-    ("one layer", None, false),
-    ("multiview", Some(MULTIVIEW), false),
-    ("auxiliary", Some(AUXILIARY), true),
+  for (name, layers_minus1, mask, declares) in [
+    ("one layer", 0, None, false),
+    ("multiview", 1, Some(MULTIVIEW), false),
+    ("auxiliary", 1, Some(AUXILIARY), true),
+    ("three layers, an auxiliary mask", 2, Some(AUXILIARY), false),
   ] {
     let mut packets = clip.packets.clone();
     packets[at] = repacked(
       &clip.packets[at],
-      &[&[0, 0, 0, 1][..], &spare_vps(mask), &data].concat(),
+      &[&[0, 0, 0, 1][..], &spare_vps(layers_minus1, mask), &data].concat(),
     );
     let with = SyntheticClip {
       parameters: clip.parameters.clone(),
@@ -9083,6 +9122,96 @@ fn an_hevc_stream_declaring_an_auxiliary_layer_anchors_nothing_and_escalates() {
       "{name}: a picture closes the gap {}: {delivered:?}",
       !declares
     );
+  }
+}
+
+/// `packet`, a start-coded HEVC packet, with its video parameter set unit
+/// replaced by `vps`.
+fn with_vps(packet: &Packet, vps: &[u8]) -> Packet {
+  let units = annexb_units(packet.data().expect("a payload"));
+  assert!(
+    units
+      .iter()
+      .any(|unit| unit.first().is_some_and(|head| (head >> 1) & 0x3f == 32)),
+    "the packet carries a video parameter set"
+  );
+  let payload: Vec<u8> = units
+    .iter()
+    .flat_map(|unit| {
+      let unit: &[u8] = if unit.first().is_some_and(|head| (head >> 1) & 0x3f == 32) {
+        vps
+      } else {
+        unit
+      };
+      [0u8, 0, 0, 1].into_iter().chain(unit.iter().copied())
+    })
+    .collect();
+  repacked(packet, &payload)
+}
+
+/// LAW (Codex R14, [medium]): **FFmpeg 9 reads the video parameter sets
+/// these laws build as this crate does.** An `x265` stream's first packet,
+/// its own video parameter set (id 0, which its sequence parameter set
+/// refers to) replaced, decoded by FFmpeg's `hevc` on one thread: FFmpeg
+/// negotiates an output format with alpha — `ff_hevc_is_alpha_video`
+/// answering yes as `get_format` builds its list — exactly where this crate
+/// reads the set as declaring an auxiliary layer: two layers, alpha or
+/// depth; not for one layer, two in multiview, or three with an auxiliary
+/// mask, each of which it stores and decodes the packet under; nor for a set
+/// without its base layer internal, which it refuses, failing the packet at
+/// that unit. The laws above rest on this reading.
+#[test]
+fn ffmpeg_reads_the_video_parameter_sets_these_laws_build_as_this_crate_does() {
+  const MULTIVIEW: u16 = 1 << (15 - 1);
+  const AUXILIARY: u16 = 1 << (15 - 3);
+  let clip = encode_hevc_without_b_frames(128, 96, 8);
+  let base_not_internal = {
+    let mut vps = hevc_vps(0, 1, Some(AUXILIARY), 1);
+    // vps_base_layer_internal_flag, the fifth bit of the payload.
+    vps[2] &= !0x08;
+    vps
+  };
+  for (name, vps, alpha, decoded) in [
+    ("one layer", hevc_vps(0, 0, None, 1), false, true),
+    ("multiview", hevc_vps(0, 1, Some(MULTIVIEW), 1), false, true),
+    ("auxiliary", hevc_vps(0, 1, Some(AUXILIARY), 1), true, true),
+    (
+      "auxiliary, of depth",
+      hevc_vps(0, 1, Some(AUXILIARY), 2),
+      true,
+      true,
+    ),
+    (
+      "three layers, an auxiliary mask",
+      hevc_vps(0, 2, Some(AUXILIARY), 1),
+      false,
+      true,
+    ),
+    (
+      "auxiliary, its base layer not internal",
+      base_not_internal,
+      false,
+      false,
+    ),
+  ] {
+    let rule = super::access::KeyframeRule::of(
+      crate::CodecId::HEVC.raw(),
+      &[&[0, 0, 0, 1][..], &vps].concat(),
+    );
+    assert_eq!(rule.declares_alpha(), alpha, "{name}: this crate's reading");
+    let mut sw = super::open_sw_decoder(
+      &clip.parameters,
+      DecoderLimits::default().with_threads(crate::Threads::Single),
+      None,
+    )
+    .expect("an HEVC decoder");
+    let submitted = sw.submit(&with_vps(&clip.packets[0], &vps));
+    assert_eq!(
+      submitted.is_ok(),
+      decoded,
+      "{name}: FFmpeg stores the set and decodes the packet: {submitted:?}"
+    );
+    assert_eq!(sw.outputs_alpha(), alpha, "{name}: FFmpeg's reading");
   }
 }
 
