@@ -1630,10 +1630,12 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       }
       None => false,
     };
-    // A replay whose decoder answered "needs input" last has read every
-    // packet it took where it decodes in step ([`read_every_packet`]); one
-    // the budget stopped may hold its last unread.
-    self.extradata_provisional = installed && !(drained == Drained::Empty && in_step);
+    // A replay that proved its record read ([`Replay::read`]), or whose
+    // decoder answered "needs input" last where it decodes in step
+    // ([`read_every_packet`]), has read every packet it took; one the budget
+    // stopped may hold its last unread.
+    self.extradata_provisional =
+      installed && !(progress.read || (drained == Drained::Empty && in_step));
     self.sw_threads_pending = self.session_threads_run();
     self.pending_eof = eof_pending && !progress.eof_sent;
     // A drain the budget stopped: the decoder may hold more of the replay's
@@ -1689,15 +1691,18 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     self.pending_history.drain(..progress.fed);
     // A packet the decoder took, the failing one among them where its
     // refusal says the decoder decoded it: its new extradata, if it carried
-    // one, is the active one — read once the decoder answered "needs input"
-    // last, on a decoder that decodes in step ([`read_every_packet`]),
-    // provisional otherwise; a failing one whose refusal does not say — a
-    // decode error among them — leaves it unknown, as does an error the
-    // round met while one was provisional.
-    let settled = matches!(replayed, Ok(Drained::Empty)) && in_step;
+    // one, is the active one — read where the round proved it so
+    // ([`Replay::read`]: a later packet taken in step, or its own refusal
+    // saying it was decoded) or the decoder answered "needs input" last, on
+    // a decoder that decodes in step ([`read_every_packet`]); provisional
+    // otherwise. The proof is applied first: an error the round met after
+    // it is no longer the unread packet's. A failing one whose refusal does
+    // not say — a decode error among them — leaves it unknown, as does an
+    // error the round met while one was provisional.
+    let read = progress.read || (matches!(replayed, Ok(Drained::Empty)) && in_step);
     if let Some(extradata) = progress.extradata.take() {
-      self.took_extradata(extradata, false, settled);
-    } else if settled {
+      self.took_extradata(extradata, false, read);
+    } else if read {
       self.extradata_read();
     }
     if let Some(doubt) = progress.unknown {
@@ -4020,6 +4025,15 @@ struct Replay {
   /// decoder decoded it among them ([`taken_despite`]): the session's active
   /// extradata once the replay is its own ([`NewExtradata::install`]).
   extradata: Option<NewExtradata>,
+  /// **Whether the decoder was seen to read the packet the active
+  /// extradata came with** — [`Self::extradata`]'s, or, where the round
+  /// took none, the one provisional before it: a later packet the decoder
+  /// took, where it decodes in step, which libavcodec takes only into an
+  /// empty input slot; or the packet's own refusal saying the decoder
+  /// decoded it ([`Taken::Yes`]). The proof the round carries out, applied
+  /// before its error is ([`CarrierVideoStreamDecoder::replay_pending`]):
+  /// read, an error after it is no longer the unread packet's.
+  read: bool,
   /// What left the replay's extradata unknown: the refusal of its last
   /// packet, which carried a new extradata, where it does not say whether
   /// the decoder took the packet ([`Taken::Unknown`]).
@@ -4077,8 +4091,14 @@ fn replay_history(
     loop {
       match sw.submit(pkt) {
         Ok(()) => {
+          // Taken in step: every packet before it was read. Its own record,
+          // if it carries one, is read only once something says so.
+          if in_step {
+            progress.read = true;
+          }
           if extradata.is_some() {
             progress.extradata = extradata;
+            progress.read = false;
           }
           break;
         }
@@ -4099,15 +4119,19 @@ fn replay_history(
         Err(other) => {
           progress.fed += 1;
           let error = crate::decoder::software_exit(sw_state, other);
-          // The packet is consumed with its error. Its new extradata is the
-          // replay's where the refusal says the decoder decoded the packet,
-          // and unknown where it does not say: a decode error does not.
-          if extradata.is_some() {
-            match taken_despite(other, &error, in_step) {
-              Taken::Yes => progress.extradata = extradata,
-              Taken::Unknown(cause) => progress.unknown = Some(cause),
-              Taken::No => {}
+          // The packet is consumed with its error. Where the refusal says the
+          // decoder decoded it, the decoder read it and every packet before
+          // it, and its new extradata is the replay's, read; where it does
+          // not say — a decode error does not — the extradata is unknown.
+          match taken_despite(other, &error, in_step) {
+            Taken::Yes => {
+              if extradata.is_some() {
+                progress.extradata = extradata;
+              }
+              progress.read = true;
             }
+            Taken::Unknown(cause) if extradata.is_some() => progress.unknown = Some(cause),
+            Taken::Unknown(_) | Taken::No => {}
           }
           return Err(error);
         }

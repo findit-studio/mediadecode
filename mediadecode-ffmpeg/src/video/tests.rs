@@ -8338,6 +8338,102 @@ fn a_decoder_opened_for_a_packet_carrying_a_new_extradata_opens_on_it() {
   assert!(!escalated, "the hardware road ends clean: {delivered:?}");
 }
 
+/// The SPS and PPS units a start-coded H.264 packet carries, as a
+/// start-coded record.
+fn h264_parameter_sets_of(packet: &Packet) -> Vec<u8> {
+  annexb_units(packet.data().expect("a payload"))
+    .into_iter()
+    .filter(|unit| matches!(unit.first().map(|head| head & 0x1f), Some(7 | 8)))
+    .flat_map(|unit| [0u8, 0, 0, 1].into_iter().chain(unit.iter().copied()))
+    .collect()
+}
+
+/// LAW (Codex R14, [medium]): **a replay round carries out the proof that
+/// the decoder read a new extradata's packet, and applies it before its
+/// error.** An all-intra H.264 stream whose packet 6 carries its parameter
+/// sets as `AV_PKT_DATA_NEW_EXTRADATA`, and a probe-era fallback at 10 on
+/// one thread whose replay budget holds two and a half pictures: the history
+/// is fed two packets a round as the caller drains, each packet decoded
+/// inside its submission. With 6's picture refused by the allocator judge
+/// (scripted), the round that feeds 6 meets `FrameBudgetExceeded` — minted
+/// while the decoder decoded 6 in step, after it applied 6's record — and
+/// the record is the session's, known. With 6 whole, the round feeds 6 and 7
+/// and stops at the budget: 7, taken by a decoder that decodes in step,
+/// proves 6 read, and a seek after the round leaves the record known.
+/// Dropped from the round, the proof left the refused one's record unknown
+/// (`Minted`), and the whole one's unknown after the seek (`Flushed`).
+#[test]
+fn a_replay_round_applies_the_proof_that_a_record_was_read_before_its_error() {
+  let clip = encode_h264_all_intra(128, 96, 16);
+  let (with_record, fail_at) = (6, 10);
+  let record = h264_parameter_sets_of(&clip.packets[0]);
+  assert!(!record.is_empty(), "the stream carries its parameter sets");
+  let mut packets = clip.packets.clone();
+  packets[with_record] = with_new_extradata(packets[with_record].clone(), &record);
+  let pts = packets[with_record].pts().expect("a pts");
+  let budget = picture_bytes(&clip) * 5 / 2;
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  for refused in [true, false] {
+    let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test(
+      Box::new(FakeHw::failing(128, 96, 0, fail_at, FailShape::ProbeEra)),
+      clip.parameters.clone(),
+      tb,
+    )
+    .expect("build test decoder")
+    .with_threads_for_test(crate::Threads::Single)
+    .with_max_replay_bytes_for_test(budget);
+    let mut dst = crate::empty_owned_video_frame();
+    for av_pkt in &packets[..fail_at] {
+      crate::accepted(dec.send_packet(&pushed(av_pkt)), "the hardware takes it");
+    }
+    let mut answers = Vec::new();
+    let mut checked = false;
+    for _round in 0..16 {
+      match dec.send_packet(&pushed(&packets[fail_at])) {
+        Ok(Sent::Accepted) => break,
+        Ok(Sent::MustDrain) => {}
+        Err(other) => panic!("send_packet {fail_at}: {other:?}"),
+      }
+      // The packets the replay has yet to feed: 6 is next at four.
+      let left = dec.pending_history.len();
+      if refused && left == 4 {
+        dec.decline_picture_for_test(pts);
+      }
+      if left == if refused { 3 } else { 2 } {
+        if refused {
+          answered(&mut dec, &mut dst, &mut answers);
+          assert!(
+            answers.contains(&Answer::Refused),
+            "the round that fed 6 met the refusal: {answers:?}"
+          );
+        } else {
+          dec
+            .flush()
+            .expect("a seek after the round that fed 6 and 7");
+        }
+        assert_eq!(
+          dec.extradata_unknown_for_test(),
+          None,
+          "refused {refused}: the record is known"
+        );
+        assert!(
+          !dec.extradata_provisional_for_test(),
+          "refused {refused}: and read"
+        );
+        assert_eq!(
+          extradata_of(&dec.parameters),
+          record,
+          "refused {refused}: the record is the session's"
+        );
+        checked = true;
+        break;
+      }
+      answered(&mut dec, &mut dst, &mut answers);
+    }
+    assert!(checked, "refused {refused}: the round that fed 6 ran");
+  }
+}
+
 /// LAW (pre-R14 row 1): **a decode error reported while a new extradata is
 /// unread leaves it unknown.** On one thread, the caller sends 15 without
 /// draining, so a picture 15's submission decoded waits to be received, and
