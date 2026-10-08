@@ -181,13 +181,21 @@ The backend-agnostic core it adapts has its own log at
   and no anchor at all, its slices' order vouching for no picture start: it
   returns to the session's threads only at a seek, a post-commit fallback's
   gap ends escalated, and a warning says so once — as does an HEVC stream
-  whose video parameter set declares an auxiliary layer (the VPS
-  extension's scalability mask, read off the codec parameters, a new
-  extradata or a keyframe's own VPS; a set of more than one layer that does
-  not read as far as the mask taken to declare one) or whose software
-  decoder negotiated an output format with alpha: FFmpeg decodes that layer
-  beside the base one as every picture's alpha plane, and no base-layer
-  picture proves where it starts; and only when
+  whose video parameter set declares an auxiliary layer FFmpeg decodes as
+  alpha (the set read as FFmpeg 9's `ff_hevc_decode_nal_vps` and
+  `decode_vps_ext` read it: two layers and at most two layer sets, the
+  extension's scalability mask setting the auxiliary type and the second
+  layer's `nuh_layer_id` not 0 — a set of more layers, whose extension
+  FFmpeg ignores and decodes the base layer alone, a set it refuses, or one
+  read past its own end declaring none; read off the codec parameters, a
+  new extradata or a keyframe's own VPS) or whose software decoder
+  negotiated an output format with alpha: FFmpeg decodes that layer beside
+  the base one as every picture's alpha plane, and no base-layer picture
+  proves where it starts. A packet's parameter sets make either reading the
+  session's only once a decoder may have taken the packet: one refused
+  before any decoder saw it — past the codec parameters' ceiling, say — or
+  answered with back pressure leaves the session's readings as they were.
+  And a keyframe is clean only when
   every NAL unit in it parses whole: a four-byte start
   code read whole and the zero bytes after a unit (`trailing_zero_8bits`)
   stripped from it, every header byte present and valid (H.264's and HEVC's
@@ -319,13 +327,21 @@ The backend-agnostic core it adapts has its own log at
   packet, that extradata replaces the session's codec parameters': later
   packets are read under it, and every decoder opened later — a post-commit
   fallback's cold decoder, a switch's — starts on the stream's current
-  parameters. A packet the decoder refuses counts as taken only where the
+  parameters. A decoder opened for a packet that carries its own — the
+  post-commit fallback's, a switch's, the reopen from no decoder — opens on
+  a copy of the parameters carrying it, committed once that decoder serves:
+  opened on the retained parameters first, a record no decoder can open on
+  (FFmpeg's HEVC decoder parses it at the open) failed the open for good,
+  and the packet carrying the replacement never reached a decoder. A packet
+  the decoder refuses counts as taken only where the
   refusal says the decoder decoded it, past the point where FFmpeg applies
   the extradata: a frame this crate's allocator judge refused over its
   ceiling while the packet's own picture was allocated, on a software
-  decoder of libavcodec's own on one thread, which forgets at each
-  submission a refusal latched before it (one FFmpeg's H.264 decoder
-  concealed) — on the software send and the replay alike; on the hardware
+  decoder of libavcodec's own on one thread, whose every call reads the
+  refusal its own decode latched (below) — on the software send and the
+  replay alike, a replay applying that proof ahead of its error, as it does
+  a later packet's being taken on that decoder, which says the packet
+  before it was read; on the hardware
   road, whose funnel keeps no raw error and whose probe may replay a
   history inside one submission, such a refusal says nothing; a packet
   refused before it was queued (back pressure, the end) leaves them as they
@@ -344,10 +360,13 @@ The backend-agnostic core it adapts has its own log at
   unread in libavcodec's input slot — behind a picture a submission decoded
   that waits to be received, or a frame thread's results — so its new
   extradata is provisional until the decoder is seen to read it: it answers
-  "needs input" or the end, or, decoding what a submission hands it inside
-  that submission (one thread, libavcodec's own; the hardware), takes a
-  later packet, or a decoder opened on the parameters replaces it. A
-  picture coming out proves nothing, since it can be the waiting one. A
+  the end; or, decoding what a call hands it inside that call (one thread,
+  libavcodec's own; the hardware), it answers "needs input" or takes a
+  later packet; or a decoder opened on the parameters replaces it. A
+  frame-threaded decoder answers "needs input" as soon as a worker has the
+  packet, decoded or not, so there its extradata stays provisional until
+  the end. A picture coming out proves nothing, since it can be the
+  waiting one. A
   flush while it is provisional drops the packet unread, the decoder kept
   on the framing it read before, and a decode error reported then may be
   that packet's own: either leaves the extradata unknown, as does the
@@ -366,6 +385,24 @@ The backend-agnostic core it adapts has its own log at
   budget refusal. Read under the parameters as opened, an `avcC` stream
   whose length fields changed never anchored, ended in a false
   `PostCommitNeverResynced`, and never returned to the session's threads.
+
+- **A picture the allocator judge refused is named even where FFmpeg
+  conceals it.** FFmpeg's H.264 decoder drops a slice whose picture it
+  could not allocate and decodes on, so where a later picture of the same
+  packet starts, the decode reports success — or gives that other picture
+  — with the refusal latched. On a software decoder that decodes in step
+  (libavcodec's own, one thread), the call that ran the decode names it:
+  the send answers `FrameBudgetExceeded` for its packet, taken, as for a
+  packet the decoder reports failed; a receive answers it ahead of the
+  picture its decode gave, which the next receive delivers; a replay's or a
+  restart's drain reports it after the pictures it queued. The next
+  packet's result is its own, and no refusal is reported twice. On a
+  frame-threaded decoder a worker latches whenever it allocates, so back
+  pressure collects no refusal: the packet's own error names it, or, for a
+  picture a worker concealed with no error to come, the end of the drain;
+  a seek clears it with the pictures it abandons. A concealed refusal used
+  to wait for whatever answer the decoder gave next, which named it: a later
+  packet's error, or a back-pressure answer turned into an error.
 
 ## [0.15.1] - 2026-10-05
 
