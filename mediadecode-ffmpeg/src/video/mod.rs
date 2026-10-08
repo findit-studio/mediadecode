@@ -292,19 +292,22 @@ pub struct CarrierVideoStreamDecoder<C: crate::FfmpegCarrier> {
   extradata_provisional: bool,
   /// `true` once an H.264 sequence parameter set the session read — in its
   /// codec parameters, in a new extradata, among the units of a keyframe —
-  /// permits arbitrary slice order (`access::KeyframeRule::H264`). For good:
-  /// from then on no H.264 packet is clean or anchors, so no switch fires and
-  /// an open post-commit gap ends escalated by name; said once ([`Self::note_sps`]).
+  /// permits arbitrary slice order (`access::KeyframeRule::H264`), and a
+  /// decoder may have taken the packet that brought it ([`Self::sets_of`],
+  /// [`Self::commit_sets`]). For good: from then on no H.264 packet is clean
+  /// or anchors, so no switch fires and an open post-commit gap ends
+  /// escalated by name; said once.
   h264_aso: bool,
   /// `true` once an HEVC video parameter set the session read — in its
   /// codec parameters, in a new extradata, among the units of a keyframe —
-  /// declares an auxiliary layer, or the software decoder serving negotiated
-  /// an output format with alpha (`access::KeyframeRule::Hevc`): FFmpeg's
+  /// declares an auxiliary layer, and a decoder may have taken the packet
+  /// that brought it ([`Self::sets_of`], [`Self::commit_sets`]); or once the
+  /// software decoder serving negotiated an output format with alpha
+  /// ([`Self::note_output_alpha`]) (`access::KeyframeRule::Hevc`): FFmpeg's
   /// HEVC decoder decodes that layer beside the base one, as the alpha plane
   /// of every picture, and nothing here proves where its pictures start. For
   /// good: from then on no HEVC packet is clean or anchors, so no switch
-  /// fires and an open post-commit gap ends escalated by name; said once
-  /// ([`Self::note_vps`]).
+  /// fires and an open post-commit gap ends escalated by name; said once.
   hevc_alpha: bool,
   /// HW-side scratch frame (filled by [`VideoDecoder::receive_frame`]).
   hw_scratch: Frame,
@@ -1902,10 +1905,16 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// A decode error met while feeding what was pending is kept for the
   /// drain ([`Self::deferred_error`]), and this send answers `MustDrain`
   /// with the packet still the caller's.
+  ///
+  /// `sets`, what the packet's parameter sets say ([`Self::sets_of`]), are
+  /// the session's once the decoder may have taken the packet — it took it,
+  /// or refused it with an error that does not say it refused it before its
+  /// queue — and never where the packet went back to the caller untaken.
   fn send_on_software(
     &mut self,
     pkt: &Packet,
     phase: crate::decoder::SessionPhase,
+    sets: Sets,
   ) -> Result<Sent, VideoDecodeError> {
     // An error the drain has not reported yet comes before anything more.
     if self.deferred_error.is_some() {
@@ -2054,6 +2063,11 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
             Taken::Unknown(doubt) => self.reported_while_provisional(doubt),
             Taken::No => {}
           }
+          // A decoder that may have taken the packet may have read its
+          // parameter sets.
+          if taken != Taken::No {
+            self.commit_sets(sets);
+          }
           // The new extradata it carries is the session's where the refusal
           // says the decoder decoded the packet, and unknown where it does
           // not say: a decode error does not.
@@ -2068,6 +2082,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     if let Some(depth) = self.reorder_on_submit.take() {
       self.reorder_override = Some(depth);
     }
+    self.commit_sets(sets);
     self.sw_output_settled = false;
     // libavcodec takes a packet only into an empty input slot: a decoder
     // that decodes in step has read every packet before this one.
@@ -2201,62 +2216,90 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     }
   }
 
-  /// Reads the H.264 sequence parameter sets `pkt` brings — in a new
-  /// extradata it carries, and, for a keyframe, among its own units — and
-  /// the active extradata's, for one that permits arbitrary slice order
-  /// ([`Self::h264_aso`]); says so the first time, naming the reason. Every
-  /// packet the session is sent passes here before any road takes it, so a
-  /// sequence parameter set the hardware decoded is read as one the software
-  /// road would decode.
-  fn note_sps(&mut self, pkt: &Packet) {
-    if self.h264_aso || self.codec_id() != crate::CodecId::H264.raw() {
-      return;
+  /// **What `pkt`'s parameter sets say of the stream**, read without
+  /// changing anything: an H.264 sequence parameter set permitting arbitrary
+  /// slice order, an HEVC video parameter set declaring an auxiliary layer —
+  /// in a new extradata `pkt` carries, or the active extradata where it
+  /// carries none, and, for a keyframe, among its own units. Every packet
+  /// the session is sent is read here before any road takes it, so a
+  /// parameter set the hardware decoded is read as one the software road
+  /// would decode; [`Self::commit_sets`] makes it the session's once a
+  /// decoder may have taken the packet. The packet's own reading needs no
+  /// commit: every rule `pkt` is read under reads its own new extradata and
+  /// units ([`Self::rule_for`], `access::KeyframeRule::is_clean`).
+  fn sets_of(&self, pkt: &Packet) -> Sets {
+    let codec = self.codec_id();
+    let (h264, hevc) = (
+      codec == crate::CodecId::H264.raw(),
+      codec == crate::CodecId::HEVC.raw(),
+    );
+    if !h264 && !hevc {
+      return Sets::default();
     }
     let rule = match new_extradata(pkt) {
-      Some(extradata) => access::KeyframeRule::of(self.codec_id(), extradata),
+      Some(extradata) => access::KeyframeRule::of(codec, extradata),
       None => self.keyframe_rule(),
     };
-    let in_band = pkt.is_key() && pkt.data().is_some_and(|data| rule.units_permit_aso(data));
-    if rule.permits_aso() || in_band {
+    let units = pkt.is_key().then(|| pkt.data()).flatten();
+    Sets {
+      aso: h264 && (rule.permits_aso() || units.is_some_and(|data| rule.units_permit_aso(data))),
+      alpha: hevc
+        && (rule.declares_alpha() || units.is_some_and(|data| rule.units_declare_alpha(data))),
+    }
+  }
+
+  /// **A decoder may have taken the packet `sets` were read off**
+  /// ([`Self::sets_of`]): it took it, or refused it with an error that does
+  /// not say it refused it before its queue — so it may have read the
+  /// packet's parameter sets, and they are the session's, for good
+  /// ([`Self::h264_aso`], [`Self::hevc_alpha`]); each is said once, naming
+  /// the reason. A packet refused before any decoder saw it, or answered with
+  /// back pressure or the end, commits nothing: a sequence parameter set no
+  /// decoder read must not take every later anchor and switch.
+  fn commit_sets(&mut self, sets: Sets) {
+    if sets.aso && !self.h264_aso {
       self.h264_aso = true;
       tracing::warn!(
-        reason = rule.permitting_aso(true).reason(),
+        reason = access::KeyframeRule::H264 {
+          nal_length: None,
+          aso: true,
+        }
+        .reason(),
         "mediadecode-ffmpeg: this H.264 stream's sequence parameter set permits arbitrary slice \
          order (Baseline or Extended, without constraint_set1_flag); no keyframe of it is read \
          as a clean point or a resync anchor, so the session returns to its threads only at a \
          seek, and a post-commit fallback's gap ends escalated",
       );
     }
-  }
-
-  /// Reads the HEVC video parameter sets `pkt` brings — in a new extradata
-  /// it carries, and, for a keyframe, among its own units — and the active
-  /// extradata's, and the output format the software decoder serving
-  /// negotiated, for an auxiliary layer, which FFmpeg decodes as an alpha
-  /// plane ([`Self::hevc_alpha`]); says so the first time, naming the
-  /// reason.
-  fn note_vps(&mut self, pkt: &Packet) {
-    if self.hevc_alpha || self.codec_id() != crate::CodecId::HEVC.raw() {
-      return;
-    }
-    let rule = match new_extradata(pkt) {
-      Some(extradata) => access::KeyframeRule::of(self.codec_id(), extradata),
-      None => self.keyframe_rule(),
-    };
-    let in_band = pkt.is_key()
-      && pkt
-        .data()
-        .is_some_and(|data| rule.units_declare_alpha(data));
-    let output = matches!(&self.state, DecodeState::Sw(sw) if sw.outputs_alpha());
-    if rule.declares_alpha() || in_band || output {
+    if sets.alpha && !self.hevc_alpha {
       self.hevc_alpha = true;
       tracing::warn!(
-        reason = rule.declaring_alpha(true).reason(),
+        reason = access::KeyframeRule::Hevc {
+          nal_length: None,
+          alpha: true,
+        }
+        .reason(),
         "mediadecode-ffmpeg: this HEVC stream declares an auxiliary layer, which FFmpeg decodes as \
          an alpha plane beside the base layer; no keyframe of it is read as a clean point or a \
          resync anchor, so the session returns to its threads only at a seek, and a post-commit \
          fallback's gap ends escalated",
       );
+    }
+  }
+
+  /// The HEVC software decoder serving negotiated an output format with
+  /// alpha ([`SwDecoder::outputs_alpha`]): FFmpeg decodes an auxiliary layer
+  /// as the alpha plane of its pictures. The decoder's own fact, not a
+  /// packet's, so the session's at once ([`Self::hevc_alpha`]).
+  fn note_output_alpha(&mut self) {
+    if !self.hevc_alpha
+      && self.codec_id() == crate::CodecId::HEVC.raw()
+      && matches!(&self.state, DecodeState::Sw(sw) if sw.outputs_alpha())
+    {
+      self.commit_sets(Sets {
+        aso: false,
+        alpha: true,
+      });
     }
   }
 
@@ -3270,8 +3313,11 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       self.install_probe_extradata();
     }
     boundary::with_ffmpeg_video_packet::<C, _>(packet, limits, route, |av_pkt| {
-      self.note_sps(av_pkt);
-      self.note_vps(av_pkt);
+      self.note_output_alpha();
+      // What the packet's parameter sets say of the stream, read before any
+      // road takes it and the session's only once a decoder may have taken
+      // it ([`Self::commit_sets`]).
+      let sets = self.sets_of(av_pkt);
       // The extradata a packet for the hardware carries, copied before it
       // sees the packet: the stream's once it takes it.
       let extradata = if matches!(self.state, DecodeState::Hw(_)) {
@@ -3292,6 +3338,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
           // keyframe the software road sees is not.
           Ok(status) => {
             if matches!(status, Sent::Accepted) {
+              self.commit_sets(sets);
               if av_pkt.is_key() {
                 self.seeked = false;
               }
@@ -3314,6 +3361,8 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
             // Reported with the payload intact, so the caller keeps the
             // backend, its error, and any rescued packets.
             if !self.may_open_software() {
+              // The hardware failed on the packet, which it may have read.
+              self.commit_sets(sets);
               return Err(VideoDecodeError::Decode(Error::AllBackendsFailed(p)));
             }
             // Route on the EXPLICIT origin, never on whether `rescued` is empty (a
@@ -3344,6 +3393,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
               // re-forward, and forwarding one alongside a packet is
               // the pairing [`PostCommitInput`] forbids.
               let degraded = self.degrade_to_sw(PostCommitInput::Packet(av_pkt), false);
+              // The cold decoder took the packet, or the hardware, failing on
+              // it, may have read it.
+              self.commit_sets(sets);
               if degraded.is_err() {
                 // The hardware failed on this packet, and nothing replaced it:
                 // whether it applied the new extradata the packet carries, or
@@ -3375,7 +3427,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
             // failure surfaces (it is not silently dropped), and back pressure
             // is reported as such rather than mistaken for one: the fallback
             // committed either way, and the caller re-offers the packet.
-            self.send_on_software(av_pkt, phase)
+            self.send_on_software(av_pkt, phase, sets)
           }
           Err(other) => {
             // No refusal of the hardware's says it decoded this packet
@@ -3387,6 +3439,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
               Taken::Unknown(doubt) => self.reported_while_provisional(doubt),
               Taken::No => {}
             }
+            if taken != Taken::No {
+              self.commit_sets(sets);
+            }
             // The new extradata it carries is the session's where the
             // refusal says the hardware decoded the packet, and unknown
             // where it does not say: a decode error does not.
@@ -3396,7 +3451,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
             Err(VideoDecodeError::Decode(other))
           }
         },
-        DecodeState::Sw(_) | DecodeState::SwClosed => self.send_on_software(av_pkt, phase),
+        DecodeState::Sw(_) | DecodeState::SwClosed => self.send_on_software(av_pkt, phase, sets),
       }
     })
     .map_err(|e| VideoDecodeError::Decode(Error::PacketBuild(e)))?
@@ -4534,6 +4589,18 @@ fn new_extradata(pkt: &Packet) -> Option<&[u8]> {
     );
     (!data.is_null() && size > 0).then(|| core::slice::from_raw_parts(data, size))
   }
+}
+
+/// What a packet's parameter sets say of the stream's slices and layers,
+/// read before any road takes it and changing nothing
+/// (`CarrierVideoStreamDecoder::sets_of`); the session's for good once a
+/// decoder may have taken the packet (`CarrierVideoStreamDecoder::commit_sets`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Sets {
+  /// An H.264 sequence parameter set permitting arbitrary slice order.
+  aso: bool,
+  /// An HEVC video parameter set declaring an auxiliary layer.
+  alpha: bool,
 }
 
 /// Whether a decoder took a packet whose submission it refused, as far as

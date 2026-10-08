@@ -7044,6 +7044,107 @@ fn a_new_extradata_past_the_parameters_ceiling_is_refused_before_the_decoder_tak
   );
 }
 
+/// LAW (Codex R14, [medium]): **a packet no decoder took leaves the
+/// session's sticky readings as they were.** A four-byte `avcC` x264 stream
+/// (High profile), a session whose codec parameters may hold 16 bytes more
+/// than they open with, its packet 5 — no keyframe — carrying as
+/// `AV_PKT_DATA_NEW_EXTRADATA` the stream's record restated as Baseline
+/// without `constraint_set1_flag`, a profile that permits arbitrary slice
+/// order, with nine more copies of its PPS: past the ceiling. On the
+/// software road (a post-commit failure at 3) and on the hardware (which
+/// fails post-commit at the IDR 8), 5 is refused as `ParametersTooLarge`
+/// before any decoder sees it, the session reads no arbitrary slice order,
+/// and the IDR 8 anchors the resync: a picture out after it closes the gap,
+/// and the end is clean. Read before the refusal, the record's profile
+/// stuck: nothing anchored, and the end escalated by name.
+#[test]
+fn a_packet_no_decoder_took_leaves_the_sticky_readings_as_they_were() {
+  let (clip, sps, pps) = encode_h264_avcc(128, 96, 16);
+  let record = extradata_of(&clip.parameters);
+  // SAFETY: the clip's live parameters, measured; nothing is allocated.
+  let opened = unsafe { crate::extras::measure_parameters(clip.parameters.as_ptr()) }
+    .and_then(|footprint| footprint.total())
+    .expect("parameters this crate measures");
+  let ceiling = opened + 16;
+  let mut baseline = record.clone();
+  baseline[1] = 66;
+  baseline[2] = 0x80;
+  baseline[8 + sps.len()] = 10;
+  for _ in 0..9 {
+    baseline.extend_from_slice(&u16::try_from(pps.len()).expect("a short PPS").to_be_bytes());
+    baseline.extend_from_slice(&pps);
+  }
+  assert!(
+    super::access::KeyframeRule::of(crate::CodecId::H264.raw(), &baseline).permits_aso(),
+    "the restated record permits arbitrary slice order"
+  );
+  let mut packets = clip.packets.clone();
+  packets[5] = with_new_extradata(packets[5].clone(), &baseline);
+  assert!(
+    !packets[5].is_key() && packets[8].is_key(),
+    "5 is no keyframe, 8 is the IDR"
+  );
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  // The hardware's seventh send is the packet 8: 5 never reaches it.
+  for (name, fail_at) in [("the software road", 3), ("the hardware", 7)] {
+    let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test(
+      Box::new(FakeHw::failing(
+        128,
+        96,
+        fail_at,
+        fail_at,
+        FailShape::PostCommit,
+      )),
+      clip.parameters.clone(),
+      tb,
+    )
+    .expect("build test decoder")
+    .with_max_codec_parameter_bytes_for_test(ceiling);
+    let mut dst = crate::empty_owned_video_frame();
+    let mut delivered = Vec::new();
+    let mut refusals = Vec::new();
+    for (index, av_pkt) in packets.iter().enumerate() {
+      loop {
+        match dec.send_packet(&pushed(av_pkt)) {
+          Ok(Sent::Accepted) => break,
+          Ok(Sent::MustDrain) => {
+            assert!(
+              !drained(&mut dec, &mut dst).1,
+              "{name}: no escalation before the end"
+            );
+          }
+          Err(VideoDecodeError::Decode(error)) => {
+            refusals.push((index, format!("{error:?}")));
+            break;
+          }
+          Err(other) => panic!("{name}: send_packet {index}: {other:?}"),
+        }
+      }
+      let (shown, escalated) = drained(&mut dec, &mut dst);
+      assert!(!escalated, "{name}: no escalation before the end");
+      if dec.is_software() {
+        delivered.extend(shown);
+      }
+    }
+    crate::accepted(dec.send_eof(), "send_eof");
+    let (tail, escalated) = drained(&mut dec, &mut dst);
+    delivered.extend(tail);
+    assert!(
+      matches!(refusals.as_slice(), [(5, refused)] if refused.starts_with("ParametersTooLarge")),
+      "{name}: 5 alone is refused, before any decoder sees it: {refusals:?}"
+    );
+    assert!(dec.is_software(), "{name}: the fallback committed");
+    assert!(
+      !escalated && delivered.iter().any(|&(_, open)| !open),
+      "{name}: the IDR 8 anchors and the gap closes: {delivered:?}"
+    );
+    assert!(
+      !dec.h264_aso,
+      "{name}: no arbitrary slice order is read off a packet no decoder took"
+    );
+  }
+}
+
 /// LAW (Codex R6 row 1, [high]): **a stale key flag anchors nothing.** An
 /// H.264 stream whose SPS and PPS ride in its codec parameters, so the cold
 /// software decoder takes P slices: the hardware fails post-commit on a
