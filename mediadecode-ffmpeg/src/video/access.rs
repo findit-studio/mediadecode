@@ -128,34 +128,52 @@ impl KeyframeRule {
     matches!(self, Self::IntraOnly)
   }
 
-  /// Whether the key-flagged packet `data` anchors a post-commit resync:
-  /// its FIRST picture is proved a random-access picture by the bitstream,
-  /// where the codec lets this crate read it. A packet whose first picture
-  /// is not one does not anchor, whatever its flag says — the pictures
-  /// before its random-access picture are no part of the reorder bound.
+  /// Whether the key-flagged packet `data` anchors a post-commit resync, and
+  /// how many output pictures past the reorder bound the gap then stays
+  /// open: `Some(recovery)` where the bitstream proves the packet a
+  /// random-access point, where the codec lets this crate read it; `None`
+  /// otherwise, whatever its flag says.
   ///
-  /// - **H.264:** the first picture's NAL unit is an IDR slice (5), or a
-  ///   non-IDR slice (1) whose header says I or SI — `first_mb_in_slice`
-  ///   then `slice_type`, two exp-Golomb codes: the I picture of an open
-  ///   GOP, a recovery point.
+  /// - **H.264:** the first picture is an IDR picture (NAL unit 5),
+  ///   `Some(0)`; or the access unit carries, before its first picture, a
+  ///   recovery point SEI message (NAL unit 6, payload type 6), `Some` of its
+  ///   `recovery_frame_cnt`: the pictures are correct from the recovery point
+  ///   on, `recovery_frame_cnt` frames after it in output order. Its
+  ///   `broken_link_flag` changes nothing forward. The first picture's slice
+  ///   header parses either way, its `slice_type` at most 9. An I picture with
+  ///   no such message anchors nothing: a slice type describes that slice
+  ///   alone, a non-IDR intra picture resets no reference, H.264 lets the
+  ///   pictures after it reference what the decoder never saw until the
+  ///   signalled recovery point, and FFmpeg's parser flags some such
+  ///   pictures key by heuristic.
   /// - **HEVC:** the first picture's NAL unit is an IRAP picture (16–23), a
   ///   CRA (21) among them: the decoder resyncing kept its references, and
-  ///   the reorder bound covers the leading pictures a CRA has.
+  ///   the reorder bound covers the leading pictures a CRA has. `Some(0)`.
   /// - **Every other codec** — one picture per packet: MPEG-4 part 2, VP8,
   ///   VP9, AV1 and the rest — **the key flag FFmpeg's parser set from the
   ///   bitstream is the proof.** That is the trust boundary: this crate
-  ///   reads no picture header of theirs.
+  ///   reads no picture header of theirs. `Some(0)`.
   ///
-  /// Every NAL unit is read whole, as for [`Self::is_clean`]; bytes that do
-  /// not parse anchor nothing.
-  pub(crate) fn anchors(self, data: &[u8]) -> bool {
+  /// Every NAL unit is read whole, as for [`Self::is_clean`], and every SEI
+  /// message before the first picture walked by its size over the raw byte
+  /// sequence payload; bytes that do not parse anchor nothing.
+  pub(crate) fn anchor(self, data: &[u8]) -> Option<usize> {
     match self {
-      Self::H264 { nal_length } => first_h264_picture(data, nal_length)
-        .is_some_and(|(kind, unit)| kind == 5 || (kind == 1 && intra_slice(unit))),
-      Self::Hevc { nal_length } => {
-        first_hevc_picture(data, nal_length).is_some_and(|kind| (16..=23).contains(&kind))
+      Self::H264 { nal_length } => {
+        let (kind, unit) = first_h264_picture(data, nal_length)?;
+        if !slice_header_parses(unit) {
+          return None;
+        }
+        match kind {
+          5 => Some(0),
+          1 | 2 => recovery_point(data, nal_length).and_then(|frames| usize::try_from(frames).ok()),
+          _ => None,
+        }
       }
-      Self::Mpeg12 | Self::Resets | Self::IntraOnly | Self::Reordering => true,
+      Self::Hevc { nal_length } => first_hevc_picture(data, nal_length)
+        .is_some_and(|kind| (16..=23).contains(&kind))
+        .then_some(0),
+      Self::Mpeg12 | Self::Resets | Self::IntraOnly | Self::Reordering => Some(0),
     }
   }
 
@@ -238,16 +256,71 @@ fn first_hevc_picture(data: &[u8], nal_length: Option<usize>) -> Option<u8> {
   first
 }
 
-/// Whether the H.264 slice whose NAL unit is `unit` is an I or SI slice:
-/// its header's `first_mb_in_slice` read past, its `slice_type` (0–9, the
-/// upper five meaning every slice of the picture is that type) read off —
-/// I is 2 and 7, SI is 4 and 9. A header that does not parse says neither.
-fn intra_slice(unit: &[u8]) -> bool {
+/// Whether the slice header of the H.264 slice whose NAL unit is `unit`
+/// opens as a slice header must: `first_mb_in_slice`, then `slice_type`, two
+/// exp-Golomb codes, the type one of the ten there are (0–9; the upper five
+/// say every slice of the picture is that type).
+fn slice_header_parses(unit: &[u8]) -> bool {
   let mut bits = RbspBits::new(unit.get(1..).unwrap_or_default());
-  bits.ue().is_some()
-    && bits
-      .ue()
-      .is_some_and(|slice_type| matches!(slice_type % 5, 2 | 4))
+  bits.ue().is_some() && bits.ue().is_some_and(|slice_type| slice_type <= 9)
+}
+
+/// The `recovery_frame_cnt` of the recovery point SEI message an H.264
+/// access unit carries before its first picture; `None` where none does, or
+/// where an SEI unit before it does not parse. The units are read as
+/// [`first_h264_picture`] reads them, one at a time.
+fn recovery_point(data: &[u8], nal_length: Option<usize>) -> Option<u32> {
+  for unit in NalUnits::new(data, nal_length) {
+    let unit = unit.ok()?;
+    let kind = unit.first()? & 0x1f;
+    if (1..=5).contains(&kind) {
+      return None;
+    }
+    if kind == 6
+      && let Some(frames) = sei_recovery_point(unit.get(1..)?)?
+    {
+      return Some(frames);
+    }
+  }
+  None
+}
+
+/// The SEI payload type of a recovery point message (H.264 D.1.8).
+const RECOVERY_POINT: u32 = 6;
+
+/// The recovery point an SEI unit's raw byte sequence payload `rbsp` states:
+/// `Some(Some(recovery_frame_cnt))` for its first recovery point message,
+/// `Some(None)` where it has none, `None` where its messages do not parse.
+/// Every `sei_message` is walked whole by its `payload_size` — its type and
+/// size each a run of `FF` bytes and a last byte — over the payload with its
+/// emulation prevention bytes removed, up to the `rbsp_trailing_bits`; a
+/// payload that runs past the unit does not parse. A recovery point's
+/// `recovery_frame_cnt` (`ue(v)`), `exact_match_flag`, `broken_link_flag`
+/// and `changing_slice_group_idc` (two bits) lie within its payload.
+fn sei_recovery_point(rbsp: &[u8]) -> Option<Option<u32>> {
+  let mut bits = RbspBits::new(rbsp);
+  let mut found = None;
+  while !bits.at_trailing_bits() {
+    let payload_type = bits.sei_value()?;
+    let payload_size = bits.sei_value()?;
+    let end = bits
+      .read()
+      .checked_add(usize::try_from(payload_size).ok()?.checked_mul(8)?)?;
+    if payload_type == RECOVERY_POINT && found.is_none() {
+      let frames = bits.ue()?;
+      for _ in 0..4 {
+        bits.next_bit()?;
+      }
+      if bits.read() > end {
+        return None;
+      }
+      found = Some(frames);
+    }
+    while bits.read() < end {
+      bits.next_bit()?;
+    }
+  }
+  Some(found)
 }
 
 /// The bits of an H.264 raw byte sequence payload, most significant first,
@@ -257,6 +330,9 @@ struct RbspBits<'a> {
   at: usize,
   bit: u8,
   zeros: usize,
+  /// The payload bits read so far, emulation prevention bytes not among
+  /// them.
+  read: usize,
 }
 
 impl<'a> RbspBits<'a> {
@@ -266,6 +342,34 @@ impl<'a> RbspBits<'a> {
       at: 0,
       bit: 0,
       zeros: 0,
+      read: 0,
+    }
+  }
+
+  /// The payload bits read so far.
+  const fn read(&self) -> usize {
+    self.read
+  }
+
+  /// Whether only the `rbsp_trailing_bits` are left, at a byte boundary:
+  /// the stop bit's `80`, or nothing — a unit never ends in a zero byte.
+  fn at_trailing_bits(&self) -> bool {
+    self.bit == 0 && matches!(self.bytes.get(self.at..), Some([] | [0x80]) | None)
+  }
+
+  /// An SEI message's payload type or size: a run of `FF` bytes, each 255,
+  /// and a last byte.
+  fn sei_value(&mut self) -> Option<u32> {
+    let mut value = 0u32;
+    loop {
+      let mut byte = 0u32;
+      for _ in 0..8 {
+        byte = (byte << 1) | u32::from(self.next_bit()?);
+      }
+      value = value.checked_add(byte)?;
+      if byte != 0xff {
+        return Some(value);
+      }
     }
   }
 
@@ -281,6 +385,7 @@ impl<'a> RbspBits<'a> {
     }
     let byte = *self.bytes.get(self.at)?;
     let value = byte & (0x80 >> self.bit) != 0;
+    self.read += 1;
     self.bit += 1;
     if self.bit == 8 {
       self.bit = 0;

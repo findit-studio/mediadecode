@@ -392,19 +392,30 @@ fn millions_of_tiny_units_are_classified_without_allocating() {
 /// raw byte sequence payload — zero-padded — with an emulation prevention
 /// byte (`03`) before every byte of `00` to `03` that two zero bytes lead.
 fn rbsp(bits: &str) -> Vec<u8> {
-  let mut payload = Vec::new();
-  for chunk in bits.as_bytes().chunks(8) {
-    let mut byte = 0u8;
-    for (index, &bit) in chunk.iter().enumerate() {
-      if bit == b'1' {
-        byte |= 0x80 >> index;
-      }
-    }
-    payload.push(byte);
-  }
+  emulation_prevented(&packed(bits))
+}
+
+/// Packs `bits`, a string of `0`s and `1`s, into bytes, zero-padded.
+fn packed(bits: &str) -> Vec<u8> {
+  bits
+    .as_bytes()
+    .chunks(8)
+    .map(|chunk| {
+      chunk
+        .iter()
+        .enumerate()
+        .filter(|&(_, &bit)| bit == b'1')
+        .fold(0u8, |byte, (index, _)| byte | (0x80 >> index))
+    })
+    .collect()
+}
+
+/// `payload` as a NAL unit carries it: an emulation prevention byte (`03`)
+/// before every byte of `00` to `03` that two zero bytes lead.
+fn emulation_prevented(payload: &[u8]) -> Vec<u8> {
   let mut raw = Vec::new();
   let mut zeros = 0;
-  for byte in payload {
+  for &byte in payload {
     if zeros >= 2 && byte <= 3 {
       raw.push(3);
       zeros = 0;
@@ -425,11 +436,43 @@ fn slice(header: u8, first_mb_in_slice: &str, slice_type: &str) -> Vec<u8> {
   .concat()
 }
 
-/// LAW (Codex R6 row 1, [high]): **a resync anchor is a packet whose first
-/// picture the bitstream proves a random-access one.** H.264: an IDR slice
-/// anchors, and so does a non-IDR slice whose header says I (the I picture
-/// of an open GOP, a recovery point) or SI — read through an emulation
-/// prevention byte where the header holds one — while a packet whose first
+/// An H.264 SEI NAL unit carrying `messages`, each a payload type and its
+/// payload: the type and the size each a run of `FF` bytes and a last byte,
+/// the payload, then the `rbsp_trailing_bits` — every byte of it emulation
+/// prevented.
+fn sei(messages: &[(u32, &[u8])]) -> Vec<u8> {
+  let mut payload = Vec::new();
+  let value = |out: &mut Vec<u8>, mut value: u32| {
+    while value >= 255 {
+      out.push(0xff);
+      value -= 255;
+    }
+    out.push(value as u8);
+  };
+  for &(kind, body) in messages {
+    value(&mut payload, kind);
+    value(&mut payload, body.len() as u32);
+    payload.extend_from_slice(body);
+  }
+  payload.push(0x80);
+  [vec![0x06], emulation_prevented(&payload)].concat()
+}
+
+/// A recovery point message's payload: `recovery_frame_cnt` as the
+/// exp-Golomb bits `frames`, `exact_match_flag` 1, `broken_link_flag` as
+/// `broken`, `changing_slice_group_idc` 0, then the payload's alignment —
+/// a one, then zeros.
+fn recovery(frames: &str, broken: bool) -> Vec<u8> {
+  let bits = format!("{frames}1{}001", if broken { "1" } else { "0" });
+  let padded = format!("{bits}{}", "0".repeat((8 - bits.len() % 8) % 8));
+  packed(&padded)
+}
+
+/// LAW (Codex R6 row 1, [high]; restated by Codex R7): **a resync anchor is
+/// a packet the bitstream proves a random-access point.** H.264: an IDR
+/// slice anchors; a non-IDR picture anchors only behind a recovery point
+/// SEI message — an I slice, an SI slice, an I slice whose header holds an
+/// emulation prevention byte: none of them alone — while a packet whose first
 /// slice is P or B does not, though an IDR follows it in the packet. HEVC:
 /// every IRAP picture anchors, a CRA among them, while a trailing or a RASL
 /// picture first does not. Every other codec takes the key flag as FFmpeg's
@@ -455,47 +498,130 @@ fn a_resync_anchor_is_a_packet_whose_first_picture_is_random_access() {
     far_i_slice.windows(3).any(|w| w == [0, 0, 3]),
     "the fixture carries an emulation prevention byte"
   );
-  let sei: &[u8] = &[0x06, 6, 1, 0x80];
-  for (units, anchors, why) in [
-    (vec![&idr[..]], true, "an IDR slice"),
-    (vec![sei, &i_slice[..]], true, "a recovery point's I slice"),
-    (vec![&si_slice[..]], true, "an SI slice"),
+  let recovers = sei(&[(6, &recovery("1", false))]);
+  for (units, anchor, why) in [
+    (vec![&idr[..]], Some(0), "an IDR slice"),
     (
-      vec![&far_i_slice[..]],
-      true,
-      "an I slice read through `00 00 03`",
+      vec![&recovers[..], &i_slice[..]],
+      Some(0),
+      "a recovery point's I slice",
     ),
-    (vec![&p_slice[..]], false, "a P slice, a stale key flag"),
-    (vec![&b_slice[..]], false, "a B slice"),
+    (vec![&i_slice[..]], None, "an I slice alone"),
+    (vec![&si_slice[..]], None, "an SI slice alone"),
+    (
+      vec![&recovers[..], &far_i_slice[..]],
+      Some(0),
+      "a recovery point's I slice read through `00 00 03`",
+    ),
+    (vec![&p_slice[..]], None, "a P slice, a stale key flag"),
+    (vec![&b_slice[..]], None, "a B slice"),
     (
       vec![&p_slice[..], &idr[..]],
-      false,
+      None,
       "a P slice before the IDR",
     ),
   ] {
-    assert_eq!(h264.anchors(&annex_b(&units)), anchors, "H.264: {why}");
+    assert_eq!(h264.anchor(&annex_b(&units)), anchor, "H.264: {why}");
   }
 
   let hevc = KeyframeRule::of(CodecId::HEVC.raw(), &[]);
   let picture = |kind: u8| -> Vec<u8> { vec![kind << 1, 1, 0xaf] };
-  for (kinds, anchors, why) in [
-    (vec![21u8], true, "a CRA"),
-    (vec![19], true, "an IDR"),
-    (vec![16], true, "a BLA"),
-    (vec![1], false, "a trailing picture"),
-    (vec![8], false, "a RASL picture"),
-    (vec![1, 21], false, "a trailing picture before the CRA"),
+  for (kinds, anchor, why) in [
+    (vec![21u8], Some(0), "a CRA"),
+    (vec![19], Some(0), "an IDR"),
+    (vec![16], Some(0), "a BLA"),
+    (vec![1], None, "a trailing picture"),
+    (vec![8], None, "a RASL picture"),
+    (vec![1, 21], None, "a trailing picture before the CRA"),
   ] {
     let units: Vec<Vec<u8>> = kinds.iter().map(|&kind| picture(kind)).collect();
     let units: Vec<&[u8]> = units.iter().map(Vec::as_slice).collect();
-    assert_eq!(hevc.anchors(&annex_b(&units)), anchors, "HEVC: {why}");
+    assert_eq!(hevc.anchor(&annex_b(&units)), anchor, "HEVC: {why}");
   }
 
   for codec in [CodecId::MPEG4, CodecId::VP9, CodecId::AV1] {
-    assert!(
-      KeyframeRule::of(codec.raw(), &[]).anchors(&[]),
+    assert_eq!(
+      KeyframeRule::of(codec.raw(), &[]).anchor(&[]),
+      Some(0),
       "{codec:?}: the key flag stands"
     );
+  }
+}
+
+/// LAW (Codex R7, [high]): **an H.264 resync anchor is an IDR picture, or an
+/// access unit whose recovery point SEI says so — and the gap then stays
+/// open `recovery_frame_cnt` pictures more.** A slice type describes its own
+/// slice alone: an access unit whose I slice comes first and a P slice after
+/// it, with no recovery point, anchors nothing. A recovery point anchors at
+/// any slice type, its count the answer — 0, 2, its broken link changing
+/// nothing; every SEI message before it is walked by its size, through the
+/// emulation prevention bytes a payload's `00 00 01` takes. A slice type of
+/// 12 is no slice type: the unit anchors nothing. A recovery point after the
+/// first picture, or one whose message runs past its unit or past its own
+/// payload, anchors nothing.
+#[test]
+fn an_h264_anchor_is_an_idr_or_a_recovery_point_sei() {
+  let h264 = KeyframeRule::of(CodecId::H264.raw(), &[]);
+  // ue(2), I: `011`; ue(0), P: `1`; the second slice from macroblock 1.
+  let i_first = slice(0x41, "1", "011");
+  let p_after = slice(0x41, "010", "1");
+  let p_slice = slice(0x41, "1", "00110");
+  // ue(12): `0001101`.
+  let twelve = slice(0x41, "1", "0001101");
+  let zero = sei(&[(6, &recovery("1", false))]);
+  let two = sei(&[(6, &recovery("011", false))]);
+  let broken = sei(&[(6, &recovery("011", true))]);
+  // A user-data payload before the recovery point, holding `00 00 01`.
+  let user_data: Vec<u8> = [&[0u8; 16][..], &[0, 0, 1, 0x42]].concat();
+  let behind = sei(&[(5, &user_data), (6, &recovery("011", false))]);
+  assert!(
+    behind.windows(4).any(|w| w == [0, 0, 3, 1]),
+    "the fixture carries an emulation prevention byte"
+  );
+  // A message whose size runs past the unit, and a recovery point whose
+  // fields overrun the one byte of payload it says it has.
+  let past_the_unit: Vec<u8> = vec![0x06, 6, 9, 0x80];
+  let overrun = sei(&[(6, &[0x00][..])]);
+  for (units, anchor, why) in [
+    (
+      vec![&i_first[..], &p_after[..]],
+      None,
+      "an I slice first, a P slice after, no recovery point",
+    ),
+    (
+      vec![&zero[..], &p_slice[..]],
+      Some(0),
+      "a recovery point, 0",
+    ),
+    (vec![&two[..], &p_slice[..]], Some(2), "a recovery point, 2"),
+    (
+      vec![&broken[..], &p_slice[..]],
+      Some(2),
+      "a broken link changes nothing forward",
+    ),
+    (
+      vec![&behind[..], &p_slice[..]],
+      Some(2),
+      "walked by size past another payload",
+    ),
+    (vec![&zero[..], &twelve[..]], None, "slice type 12"),
+    (
+      vec![&p_slice[..], &two[..]],
+      None,
+      "the recovery point after the picture",
+    ),
+    (
+      vec![&past_the_unit[..], &p_slice[..]],
+      None,
+      "a message past its unit",
+    ),
+    (
+      vec![&overrun[..], &p_slice[..]],
+      None,
+      "a recovery point past its payload",
+    ),
+  ] {
+    assert_eq!(h264.anchor(&annex_b(&units)), anchor, "{why}");
   }
 }
 
@@ -513,7 +639,12 @@ fn an_intra_only_codec_is_clean_and_anchors_at_every_packet() {
   ] {
     let rule = KeyframeRule::of(codec, &[]);
     assert_eq!(rule, KeyframeRule::IntraOnly, "codec {codec}");
-    assert!(rule.every_packet() && rule.is_clean(&[1, 2, 3]) && rule.anchors(&[1, 2, 3]));
+    assert!(rule.every_packet() && rule.is_clean(&[1, 2, 3]));
+    assert_eq!(
+      rule.anchor(&[1, 2, 3]),
+      Some(0),
+      "codec {codec}: every packet anchors"
+    );
   }
   assert_eq!(
     KeyframeRule::of(CodecId::MPEG4.raw(), &[]),

@@ -306,7 +306,7 @@ pub struct CarrierVideoStreamDecoder<C: crate::FfmpegCarrier> {
   /// frames immediately.
   degraded_resync_pending: bool,
   /// `true` once a key-flagged packet fed across the open gap, its first
-  /// picture proved a random-access one ([`Self::anchors`]), anchors the
+  /// picture proved a random-access one ([`Self::anchor`]), anchors the
   /// resync; reset by a decode error before the resync is proven, so the
   /// next such packet anchors again. No picture is matched to a
   /// packet: the anchor only starts the count the reorder bound reads
@@ -323,6 +323,11 @@ pub struct CarrierVideoStreamDecoder<C: crate::FfmpegCarrier> {
   /// Whether the stream's keyframes reset every reference with no
   /// reordering (VP8, VP9, AV1): the bound is the first picture.
   anchor_resets: bool,
+  /// How many output pictures past the reorder bound the anchor leaves the
+  /// gap open: an H.264 recovery point's `recovery_frame_cnt` — its
+  /// pictures are correct from the recovery point on, that many frames
+  /// after it in output order — and none for any other anchor.
+  anchor_recovery: usize,
   /// Pictures the decoder serving has output, and the caller taken, since
   /// the anchor.
   outputs_since_anchor: usize,
@@ -926,6 +931,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       degraded_anchored: false,
       anchor_reorder: 0,
       anchor_resets: false,
+      anchor_recovery: 0,
       outputs_since_anchor: 0,
       sw_output_settled: true,
       packets_before_anchor: 0,
@@ -1486,7 +1492,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   ///
   /// **The resync anchor.** Across an open post-commit gap, a key-flagged
   /// packet the decoder takes anchors the resync when its first picture is
-  /// proved a random-access one ([`Self::anchors`]) — nothing is drained or
+  /// proved a random-access one ([`Self::anchor`]) — nothing is drained or
   /// reset for it. It is fed once the decoder's output is settled
   /// ([`Self::sw_output_settled`]); until then the send answers `MustDrain`,
   /// so the pictures from before the anchor that can still come out are
@@ -1561,13 +1567,21 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     // A key-flagged packet across an open gap whose first picture is proved
     // a random-access one anchors the resync, fed once the decoder holds no
     // picture the caller has not taken.
-    let anchoring = self.degraded_resync_pending && !self.degraded_anchored && self.anchors(pkt);
-    if anchoring && !self.sw_output_settled {
+    let anchoring = if self.degraded_resync_pending && !self.degraded_anchored {
+      self.anchor(pkt)
+    } else {
+      None
+    };
+    if anchoring.is_some() && !self.sw_output_settled {
       return Ok(Sent::MustDrain);
     }
     // The reorder depth before the anchor is submitted: the parameters it
     // activates can lower it while the pictures from before it still wait.
-    let reorder_before = if anchoring { self.live_reorder() } else { 0 };
+    let reorder_before = if anchoring.is_some() {
+      self.live_reorder()
+    } else {
+      0
+    };
     if pkt.is_key() {
       self.seeked = false;
     }
@@ -1616,8 +1630,8 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       self.reorder_override = Some(depth);
     }
     self.sw_output_settled = false;
-    if anchoring {
-      self.anchor_resync(reorder_before);
+    if let Some(recovery) = anchoring {
+      self.anchor_resync(reorder_before, recovery);
     } else {
       // The depth after every packet taken since the anchor, kept if larger.
       self.observe_reorder();
@@ -1644,13 +1658,18 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       })
   }
 
-  /// Whether `pkt` anchors a post-commit resync: a key-flagged packet whose
-  /// first picture the bitstream proves a random-access one, where this crate
-  /// can read it — see [`access::KeyframeRule::anchors`]. A stale key flag, or
-  /// a picture before the random-access one, anchors nothing.
-  fn anchors(&self, pkt: &Packet) -> bool {
+  /// Whether `pkt` anchors a post-commit resync, and how many output pictures
+  /// past the reorder bound the gap then stays open: a key-flagged packet the
+  /// bitstream proves a random-access point, where this crate can read it —
+  /// see [`access::KeyframeRule::anchor`]. A stale key flag, or a picture
+  /// before the random-access one, anchors nothing.
+  fn anchor(&self, pkt: &Packet) -> Option<usize> {
     let rule = self.keyframe_rule();
-    (pkt.is_key() || rule.every_packet()) && pkt.data().is_some_and(|data| rule.anchors(data))
+    if pkt.is_key() || rule.every_packet() {
+      pkt.data().and_then(|data| rule.anchor(data))
+    } else {
+      None
+    }
   }
 
   /// Whether `pkt` is a point to switch the software decoder at: a keyframe
@@ -1881,9 +1900,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       if pkt.is_key() {
         self.seeked = false;
       }
-      if self.anchors(pkt) {
+      if let Some(recovery) = self.anchor(pkt) {
         // The refused current packet is itself the resync anchor.
-        self.anchor_resync(reorder_before);
+        self.anchor_resync(reorder_before, recovery);
       } else {
         self.count_degraded_packet();
       }
@@ -1905,6 +1924,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     self.degraded_anchored = false;
     self.anchor_reorder = 0;
     self.anchor_resets = false;
+    self.anchor_recovery = 0;
     self.outputs_since_anchor = 0;
     self.packets_before_anchor = 0;
     self.packets_unproven = 0;
@@ -1916,8 +1936,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// against the reorder buffer's depth — `reorder_before`, read before the
   /// packet was submitted, or the largest read since
   /// ([`Self::anchor_reorder`]) — or none for a stream whose keyframes reset
-  /// every reference (VP8, VP9, AV1).
-  fn anchor_resync(&mut self, reorder_before: usize) {
+  /// every reference (VP8, VP9, AV1), and `recovery` pictures more for an
+  /// H.264 recovery point ([`Self::anchor_recovery`]).
+  fn anchor_resync(&mut self, reorder_before: usize, recovery: usize) {
     // An anchor after the first — the first un-anchored — is one more packet
     // fed after it.
     if self.anchor_seen {
@@ -1927,6 +1948,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     self.degraded_anchored = true;
     self.anchor_reorder = reorder_before;
     self.anchor_resets = self.keyframe_rule() == access::KeyframeRule::Resets;
+    self.anchor_recovery = recovery;
     self.outputs_since_anchor = 0;
     self.check_reorder_bound();
   }
@@ -1965,7 +1987,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// depth it has shown from just before the anchor on, this reading
   /// included ([`Self::anchor_reorder`]), or none for a stream whose
   /// keyframes reset every reference — the last of them is at or after the
-  /// anchor in decode order, and the gap is closed.
+  /// anchor in decode order; once `recovery_frame_cnt` more have come out
+  /// after an H.264 recovery point ([`Self::anchor_recovery`]), the last is
+  /// at or after the recovery it signals, and the gap is closed.
   fn check_reorder_bound(&mut self) {
     self.observe_reorder();
     let reorder = if self.anchor_resets {
@@ -1973,7 +1997,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     } else {
       self.anchor_reorder
     };
-    if self.outputs_since_anchor > reorder {
+    if self.outputs_since_anchor > reorder.saturating_add(self.anchor_recovery) {
       self.clear_degraded_resync();
     }
   }
@@ -2024,6 +2048,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     self.degraded_anchored = false;
     self.anchor_reorder = 0;
     self.anchor_resets = false;
+    self.anchor_recovery = 0;
     self.outputs_since_anchor = 0;
     self.packets_before_anchor = 0;
     self.packets_unproven = 0;
@@ -2206,6 +2231,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       degraded_anchored: false,
       anchor_reorder: 0,
       anchor_resets: false,
+      anchor_recovery: 0,
       outputs_since_anchor: 0,
       sw_output_settled: true,
       packets_before_anchor: 0,

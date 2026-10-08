@@ -4315,14 +4315,15 @@ fn through_a_post_commit_failure(
   (dec, delivered, escalated)
 }
 
-/// LAW (the authority's row 6): **an H.264 stream of recovery points
-/// resyncs at the first one, by the reorder bound.** `libx264`'s open
+/// LAW (the authority's row 6; Codex R7): **an H.264 stream of recovery
+/// points resyncs at the first one, by the reorder bound.** `libx264`'s open
 /// GOPs flag each keyframe after the first, an I-frame that is a recovery
-/// point rather than an IDR. The hardware fails post-commit at one; the
-/// cold software decoder takes it — the resync anchor, though no packet
-/// after the gap is a clean random access point — and the gap closes once
-/// the reorder bound has passed. The end is clean, and every picture from
-/// the recovery point on comes out once.
+/// point rather than an IDR, and carry before it a recovery point SEI
+/// message whose `recovery_frame_cnt` is 0. The hardware fails post-commit
+/// at one; the cold software decoder takes it — the resync anchor, though no
+/// packet after the gap is a clean random access point — and the gap closes
+/// once the reorder bound has passed. The end is clean, and every picture
+/// from the recovery point on comes out once.
 #[test]
 fn an_h264_recovery_point_stream_resyncs_by_the_reorder_bound() {
   let clip = encode_h264_open_gops(128, 96, 40);
@@ -4332,6 +4333,11 @@ fn an_h264_recovery_point_stream_resyncs_by_the_reorder_bound() {
   assert!(
     clip.packets[at].is_key(),
     "the packet is flagged a keyframe"
+  );
+  assert_eq!(
+    clip.packets[at].data().and_then(|data| rule.anchor(data)),
+    Some(0),
+    "its recovery point SEI anchors it, recovery_frame_cnt 0"
   );
   assert!(
     !clip.packets[at..].iter().any(clean),
@@ -4363,6 +4369,73 @@ fn an_h264_recovery_point_stream_resyncs_by_the_reorder_bound() {
       "picture {pts} from the recovery point on is missing: {shown:?}"
     );
   }
+}
+
+/// `clip` with the recovery point SEI message before packet `at`'s picture
+/// restated to say `recovery_frame_cnt` 2. `libx264` writes 0 —
+/// `ue(v)` `1`, `exact_match_flag`, `broken_link_flag`, two bits of
+/// `changing_slice_group_idc`, the payload's alignment — in one payload
+/// byte, and 2, `011`, fits the same byte: the message keeps its size.
+fn recovering_two_frames_on(clip: &SyntheticClip, at: usize) -> SyntheticClip {
+  let original = &clip.packets[at];
+  let mut data = original.data().expect("a payload").to_vec();
+  let payload = data
+    .windows(6)
+    .position(|window| window == [0, 0, 1, 0x06, 0x06, 0x01])
+    .expect("an SEI unit opening with a one-byte recovery point")
+    + 6;
+  let old = data[payload];
+  assert_eq!(old & 0x80, 0x80, "x264's recovery_frame_cnt is 0");
+  data[payload] = 0x60 | (((old >> 3) & 0x0f) << 1) | 1;
+  let mut restated = Packet::copy(&data);
+  restated.set_pts(original.pts());
+  restated.set_dts(original.dts());
+  restated.set_duration(original.duration());
+  restated.set_flags(original.flags());
+  let mut packets = clip.packets.clone();
+  packets[at] = restated;
+  SyntheticClip {
+    parameters: clip.parameters.clone(),
+    packets,
+  }
+}
+
+/// LAW (Codex R7, [high]): **a recovery point holds the gap open its
+/// `recovery_frame_cnt` pictures more.** The pictures are correct from the
+/// recovery point on, `recovery_frame_cnt` frames after it in output order:
+/// the gap closes after `max_depth + 1 + recovery_frame_cnt` output
+/// pictures. `libx264`'s open-GOP recovery point says 0; the same stream
+/// with its SEI restated to say 2, the hardware failing post-commit at it,
+/// delivers two pictures more with the gap open before it closes — and the
+/// end is clean both ways.
+#[test]
+fn a_recovery_point_two_frames_on_closes_the_gap_two_pictures_later() {
+  let clip = encode_h264_open_gops(128, 96, 40);
+  let at = keyframe_after(&clip, 3);
+  let rule = super::access::KeyframeRule::of(crate::CodecId::H264.raw(), &[]);
+  let two = recovering_two_frames_on(&clip, at);
+  assert_eq!(
+    two.packets[at].data().and_then(|data| rule.anchor(data)),
+    Some(2),
+    "the restated SEI says 2"
+  );
+  let open = |clip: &SyntheticClip| {
+    let (_, delivered, escalated) = through_a_post_commit_failure(clip, at);
+    assert!(!escalated, "the end is clean: {delivered:?}");
+    let open = delivered.iter().take_while(|&&(_, open)| open).count();
+    assert!(
+      open < delivered.len(),
+      "the gap closed before the end: {delivered:?}"
+    );
+    (open, delivered)
+  };
+  let (at_zero, zero) = open(&clip);
+  let (at_two, two) = open(&two);
+  assert_eq!(
+    at_two,
+    at_zero + 2,
+    "two pictures more with the gap open: {zero:?} / {two:?}"
+  );
 }
 
 /// LAW (the authority's row 6): **an HEVC stream of CRAs resyncs and ends

@@ -156,8 +156,13 @@ The backend-agnostic core it adapts has its own log at
   then let the end of the stream pass as clean instead of escalating
   `PostCommitNeverResynced`. The anchor is a key-flagged packet fed across
   the gap whose first picture the bitstream proves a random-access one — an
-  H.264 IDR slice or a non-IDR slice whose header says I or SI, an HEVC IRAP
-  picture (a CRA among them); for a codec that codes every picture alone,
+  H.264 IDR picture, or an access unit whose recovery point SEI message,
+  before its first picture, says so (every SEI message walked by its size
+  over the payload with its emulation prevention bytes removed; the first
+  slice header parsing, its `slice_type` at most 9; an I picture alone
+  anchors nothing, since a slice type describes that slice alone and FFmpeg
+  flags some such pictures key by heuristic), an HEVC IRAP picture (a CRA
+  among them); for a codec that codes every picture alone,
   every packet; for the other codecs whose pictures this crate does not
   read, the key flag FFmpeg's parser set is the proof — since an intra
   picture resets the references of every picture after it that does not
@@ -170,8 +175,11 @@ The backend-agnostic core it adapts has its own log at
   largest value read from just before the anchoring packet was submitted on
   — a keyframe can activate parameters that lower it, an HEVC SPS with fewer
   `num_reorder_pics`, while the pictures from before it still wait; the
-  first picture for VP8, VP9 and AV1): the pictures before it are at most
-  the ones the reorder buffer held from before the anchor. Nothing is drained or reset for the resync, and no
+  first picture for VP8, VP9 and AV1), and `recovery_frame_cnt` pictures
+  later after an H.264 recovery point, whose pictures are correct only
+  from the recovery it signals: the pictures before it are at most the
+  ones the reorder buffer held from before the anchor, and the ones before
+  the recovery. Nothing is drained or reset for the resync, and no
   picture is matched to a packet. The end of the stream proves nothing more:
   the same bound applies there, so an anchor that decoded to nothing, with
   only the pictures held from before it out since, is not a resync. A decode
