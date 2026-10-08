@@ -305,10 +305,17 @@ The backend-agnostic core it adapts has its own log at
   packet is read as an anchor or a switch point under them, no switch opens
   a decoder on them, and a decoder the session must open on them is refused
   by name (`Error::ExtradataUnknown`). One the hardware took while its
-  probe recorded is installed once nothing will replay it. Read under the
-  parameters as opened, an `avcC` stream whose length fields changed never
-  anchored, ended in a false `PostCommitNeverResynced`, and never returned
-  to the session's threads.
+  probe recorded is installed once nothing will replay it. A new extradata
+  that would carry the codec parameters past `max_codec_parameter_bytes` —
+  measured as a decoder's open measures them, the old extradata replaced by
+  the new — is refused by name (`Error::ParametersTooLarge`) before any
+  decoder takes the packet, which stays the caller's, and nothing changes:
+  taken, it was refused instead at the next restart or fallback, after the
+  decoder serving was closed, and at every send after it. A post-commit
+  fallback reports `ParametersTooLarge` by its own name, as it does a frame
+  budget refusal. Read under the parameters as opened, an `avcC` stream
+  whose length fields changed never anchored, ended in a false
+  `PostCommitNeverResynced`, and never returned to the session's threads.
 
 ## [0.15.1] - 2026-10-05
 

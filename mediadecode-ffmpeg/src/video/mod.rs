@@ -1476,7 +1476,8 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       unconsumed_packets,
       eof_pending,
       &mut local_replay,
-      self.limits.max_replay_bytes(),
+      self.limits,
+      &self.parameters,
       &mut progress,
     )?;
     // Commit: only after replay, any EOF forwarding, AND the final drain
@@ -1540,7 +1541,8 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       self.pending_history.make_contiguous(),
       self.pending_eof,
       &mut self.sw_replay_frames,
-      self.limits.max_replay_bytes(),
+      self.limits,
+      &self.parameters,
       &mut progress,
     );
     self.pending_history.drain(..progress.fed);
@@ -1755,7 +1757,12 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     // session moves: it becomes the active extradata once the decoder takes
     // the packet, and until then the packet is read under it
     // ([`Self::rule_for`]).
-    let extradata = NewExtradata::of(pkt).map_err(VideoDecodeError::Decode)?;
+    let extradata = NewExtradata::of(
+      pkt,
+      &self.parameters,
+      self.limits.max_codec_parameter_bytes(),
+    )
+    .map_err(VideoDecodeError::Decode)?;
     if self.restart.is_none()
       && matches!(self.state, DecodeState::Sw(_))
       && self.sw_threads_pending
@@ -2140,8 +2147,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       //   the ceiling, or accept the refusal.
       //
       // So it keeps the same spelling here as on every other road. One
-      // fact, one name.
-      Err(budget @ Error::FrameBudgetExceeded(_)) => Err(budget),
+      // fact, one name. The ceiling on the codec parameters' heap bytes is
+      // a budget refusal the same way.
+      Err(budget @ (Error::FrameBudgetExceeded(_) | Error::ParametersTooLarge(_))) => Err(budget),
       // **Nor is a refusal of the implementation.** Re-driven, the fallback
       // opens the same decoder and is refused the same way; the name says
       // what can change that — a build whose decoder for the codec is
@@ -2200,6 +2208,17 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
         )));
       }
     }
+    // The extradata the forwarded packet carries, active once committed;
+    // one the parameters' ceiling cannot hold is refused before a decoder
+    // opens.
+    let extradata = match input {
+      PostCommitInput::Packet(pkt) => NewExtradata::of(
+        pkt,
+        &self.parameters,
+        self.limits.max_codec_parameter_bytes(),
+      )?,
+      PostCommitInput::FrameTime | PostCommitInput::Eof => None,
+    };
     let one_thread = self.limits.with_threads(crate::Threads::Single);
     let mut sw = open_sw_decoder(&self.parameters, one_thread, Some(self.time_base))?;
     // **No proof, no commit.** This is the one road whose commit owes a
@@ -2225,11 +2244,6 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       // Neither of these forwards a packet; the end-of-stream below is
       // the only thing they can hand the cold decoder.
       PostCommitInput::FrameTime | PostCommitInput::Eof => None,
-    };
-    // The extradata the forwarded packet carries, active once committed.
-    let extradata = match forwarded {
-      Some(pkt) => NewExtradata::of(pkt)?,
-      None => None,
     };
     // The cold decoder's reorder depth before the forward, for an anchor.
     let reorder_before = reorder_depth(&sw);
@@ -2789,6 +2803,13 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     self
   }
 
+  /// The session with the heap bytes its codec parameters may hold at
+  /// `bytes`.
+  pub(crate) const fn with_max_codec_parameter_bytes_for_test(mut self, bytes: usize) -> Self {
+    self.limits = self.limits.with_max_codec_parameter_bytes(bytes);
+    self
+  }
+
   /// The bytes of the picture parked past the replay queue, if one waits.
   pub(crate) fn sw_replay_parked_bytes_for_test(&self) -> usize {
     self.sw_replay_frames.parked_bytes()
@@ -2891,7 +2912,12 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       // The extradata a packet for the hardware carries, copied before it
       // sees the packet: the stream's once it takes it.
       let extradata = if matches!(self.state, DecodeState::Hw(_)) {
-        NewExtradata::of(av_pkt).map_err(VideoDecodeError::Decode)?
+        NewExtradata::of(
+          av_pkt,
+          &self.parameters,
+          self.limits.max_codec_parameter_bytes(),
+        )
+        .map_err(VideoDecodeError::Decode)?
       } else {
         None
       };
@@ -3594,9 +3620,12 @@ enum Drained {
 /// probe-era fallback's transaction (see `fall_back_to_sw_inner`) and of
 /// the replay it leaves for the caller's drains (see `replay_pending`).
 ///
-/// Stops, resumable, between packets once `queue` reaches `budget`
-/// ([`ReplayQueue::full`]): `progress` says how far it got, and the rest is
-/// fed by a later call. Nothing is dropped.
+/// Stops, resumable, between packets once `queue` reaches the budget
+/// `limits` give it ([`ReplayQueue::full`]): `progress` says how far it got,
+/// and the rest is fed by a later call. Nothing is dropped. A packet whose
+/// new extradata would carry the session's `parameters` past the ceiling
+/// `limits` give them is refused before the decoder sees it, unfed
+/// ([`NewExtradata::of`]).
 ///
 /// Answers how its last drain stopped: [`Drained::Full`] where the queue
 /// reached its budget first — packets or the end left unfed, or, with all of
@@ -3609,9 +3638,11 @@ fn replay_history(
   packets: &[ffmpeg_next::Packet],
   eof: bool,
   queue: &mut ReplayQueue,
-  budget: usize,
+  limits: DecoderLimits,
+  parameters: &Parameters,
   progress: &mut Replay,
 ) -> Result<Drained, Error> {
+  let budget = limits.max_replay_bytes();
   // Bound before the decoder is mutably borrowed, so the error
   // closures below can still consult it.
   let sw_state = sw.state();
@@ -3620,7 +3651,7 @@ fn replay_history(
       return Ok(Drained::Full);
     }
     // Copied before the decoder sees the packet; kept once it takes it.
-    let extradata = NewExtradata::of(pkt)?;
+    let extradata = NewExtradata::of(pkt, parameters, limits.max_codec_parameter_bytes())?;
     let mut attempts: u32 = 0;
     loop {
       match sw.submit(pkt) {
@@ -4098,13 +4129,43 @@ unsafe impl Send for NewExtradata {}
 
 impl NewExtradata {
   /// A copy of the extradata `pkt` carries ([`new_extradata`]), or `None`
-  /// where it carries none. Refused where the allocation fails, before the
-  /// packet goes anywhere, so the packet stays the caller's.
-  fn of(pkt: &Packet) -> Result<Option<Self>, Error> {
+  /// where it carries none. Refused before the packet goes anywhere, so the
+  /// packet stays the caller's and nothing changes: where the allocation
+  /// fails, and, by name ([`Error::ParametersTooLarge`]), where the session's
+  /// `parameters` with this extradata in place of theirs would hold more
+  /// heap bytes than `max_parameter_bytes` allows — measured as the open's
+  /// choke point measures them (`crate::decoder::build_codec_context`), which
+  /// would refuse them at the next decoder the session opens on them: a
+  /// switch's, a post-commit fallback's, after the decoder serving is closed.
+  fn of(
+    pkt: &Packet,
+    parameters: &Parameters,
+    max_parameter_bytes: usize,
+  ) -> Result<Option<Self>, Error> {
     let Some(extradata) = new_extradata(pkt) else {
       return Ok(None);
     };
     let padding = ffmpeg_next::ffi::AV_INPUT_BUFFER_PADDING_SIZE as usize;
+    // SAFETY: only the pointer is read; a live one is measured, which
+    // allocates nothing.
+    let rest = unsafe {
+      let raw = parameters.as_ptr();
+      if raw.is_null() {
+        Some(0)
+      } else {
+        crate::extras::measure_parameters(raw)
+          .and_then(|footprint| footprint.total_without_extradata())
+      }
+    };
+    let projected = rest
+      .and_then(|rest| rest.checked_add(extradata.len()))
+      .and_then(|bytes| bytes.checked_add(padding))
+      .unwrap_or(usize::MAX);
+    if projected > max_parameter_bytes {
+      return Err(Error::ParametersTooLarge(
+        crate::demuxer::ParametersTooLarge::new(0, projected, max_parameter_bytes),
+      ));
+    }
     let Ok(size) = core::ffi::c_int::try_from(extradata.len()) else {
       return Err(Error::Ffmpeg(ffmpeg_next::Error::InvalidData));
     };

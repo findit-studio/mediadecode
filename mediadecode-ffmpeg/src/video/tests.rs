@@ -6715,7 +6715,8 @@ fn a_replay_keeps_the_new_extradata_of_a_packet_taken_and_reported_failed() {
     &packets,
     false,
     &mut queue,
-    crate::DEFAULT_MAX_REPLAY_BYTES,
+    crate::DecoderLimits::default(),
+    &clip.parameters,
     &mut progress,
   );
   assert!(
@@ -6879,6 +6880,150 @@ fn a_fallback_onto_unknown_extradata_is_refused_by_name() {
   assert!(
     !dec.degraded_resync_pending_for_test(),
     "and no gap is open"
+  );
+}
+
+/// A `libx264` clip in closed GOPs — an IDR every 8 frames, two B-frames
+/// between references — packed `avcC` with four-byte NAL length fields
+/// throughout, its codec parameters carrying the record. Answers the clip
+/// and its SPS and PPS.
+fn encode_h264_avcc(width: u32, height: u32, frames: usize) -> (SyntheticClip, Vec<u8>, Vec<u8>) {
+  let annexb = encode_h264_with_extradata(width, height, frames);
+  let (sps, pps) = sps_and_pps(&annexb);
+  let packets = annexb
+    .packets
+    .iter()
+    .map(|packet| {
+      let units = annexb_units(packet.data().expect("a payload"));
+      repacked(packet, &length_prefixed(&units, 4))
+    })
+    .collect();
+  let mut parameters = annexb.parameters.clone();
+  set_extradata(&mut parameters, &avcc(&sps, &pps, 4));
+  (
+    SyntheticClip {
+      parameters,
+      packets,
+    },
+    sps,
+    pps,
+  )
+}
+
+/// LAW (Codex R12, [medium]): **a new extradata the parameters' ceiling
+/// cannot hold is refused by name before the decoder takes it, and nothing
+/// changes.** A four-byte `avcC` stream, a session whose codec parameters
+/// may hold 16 bytes more than they open with, its packet 5 — no keyframe —
+/// carrying as `AV_PKT_DATA_NEW_EXTRADATA` the same record with nine more
+/// copies of its PPS. On a probe-era fallback at 3 on three
+/// threads, the send of 5 is refused as `ParametersTooLarge`, naming the
+/// bytes the parameters would hold and the ceiling: no decoder took the
+/// packet, the parameters keep their record, the session stays on one
+/// thread; sent without 5, the stream switches to three threads at the IDR
+/// 8, the decoder that opens there within the ceiling. On the hardware,
+/// probing, the same send is refused before the hardware sees it. Taken,
+/// the record carried the parameters past the ceiling, and the restart at
+/// 8 — the one-thread decoder already drained and closed — was refused as
+/// `ParametersTooLarge`, as was every send after it.
+#[test]
+fn a_new_extradata_past_the_parameters_ceiling_is_refused_before_the_decoder_takes_it() {
+  let (clip, sps, pps) = encode_h264_avcc(128, 96, 16);
+  let record = extradata_of(&clip.parameters);
+  // SAFETY: the clip's live parameters, measured; nothing is allocated.
+  let opened = unsafe { crate::extras::measure_parameters(clip.parameters.as_ptr()) }
+    .and_then(|footprint| footprint.total())
+    .expect("parameters this crate measures");
+  let ceiling = opened + 16;
+  let mut padded = record.clone();
+  let pps_count = 8 + sps.len();
+  let growth = 9 * (2 + pps.len());
+  padded[pps_count] = 10;
+  for _ in 0..9 {
+    padded.extend_from_slice(&u16::try_from(pps.len()).expect("a short PPS").to_be_bytes());
+    padded.extend_from_slice(&pps);
+  }
+  let mut packets = clip.packets.clone();
+  packets[5] = with_new_extradata(packets[5].clone(), &padded);
+  assert!(!packets[5].is_key(), "5 is no keyframe");
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let three = core::num::NonZeroU32::new(3).expect("nonzero");
+  let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test(
+    Box::new(FakeHw::failing(128, 96, 0, 3, FailShape::ProbeEra)),
+    clip.parameters.clone(),
+    tb,
+  )
+  .expect("build test decoder")
+  .with_threads_for_test(crate::Threads::Count(three))
+  .with_max_codec_parameter_bytes_for_test(ceiling);
+  let mut dst = crate::empty_owned_video_frame();
+  let mut drain = |dec: &mut FfmpegVideoStreamDecoder| loop {
+    match dec.receive_frame(&mut dst) {
+      Ok(Received::Frame) | Err(VideoDecodeError::Decode(_)) => {}
+      Ok(Received::NeedsInput | Received::Ended) => break,
+      Err(other) => panic!("unexpected: {other:?}"),
+    }
+  };
+  let mut too_large = Vec::new();
+  for (index, av_pkt) in packets.iter().enumerate() {
+    let taken = super::live_sw::sent();
+    loop {
+      match dec.send_packet(&pushed(av_pkt)) {
+        Ok(Sent::Accepted) => break,
+        Ok(Sent::MustDrain) => drain(&mut dec),
+        Err(VideoDecodeError::Decode(Error::ParametersTooLarge(refused))) => {
+          too_large.push((index, refused.bytes(), refused.limit()));
+          if index == 5 {
+            assert_eq!(super::live_sw::sent(), taken, "no decoder took 5");
+            assert_eq!(
+              extradata_of(&dec.parameters),
+              record,
+              "the parameters keep their record"
+            );
+            assert_eq!(
+              dec.active_threads(),
+              Some(core::num::NonZeroU32::MIN),
+              "the session is still on one thread"
+            );
+          }
+          break;
+        }
+        Err(VideoDecodeError::Decode(_)) => break,
+        Err(other) => panic!("send_packet {index}: {other:?}"),
+      }
+    }
+    drain(&mut dec);
+  }
+  assert_eq!(
+    too_large,
+    vec![(5, ceiling - 16 + growth, ceiling)],
+    "5 alone is refused by name, before the decoder takes it"
+  );
+  assert_eq!(
+    dec.active_threads(),
+    Some(three),
+    "the switch at 8 opened within the ceiling"
+  );
+
+  let mut hw = FfmpegVideoStreamDecoder::from_hw_inner_for_test(
+    Box::new(FakeHw::never_failing(128, 96)),
+    clip.parameters.clone(),
+    tb,
+  )
+  .expect("build test decoder")
+  .with_max_codec_parameter_bytes_for_test(ceiling);
+  for av_pkt in &packets[..5] {
+    crate::accepted(hw.send_packet(&pushed(av_pkt)), "send_packet");
+  }
+  assert!(
+    matches!(
+      hw.send_packet(&pushed(&packets[5])),
+      Err(VideoDecodeError::Decode(Error::ParametersTooLarge(_)))
+    ),
+    "the hardware send is refused by name"
+  );
+  assert!(
+    hw.probe_extradata.is_none() && extradata_of(&hw.parameters) == record,
+    "nothing changes"
   );
 }
 
