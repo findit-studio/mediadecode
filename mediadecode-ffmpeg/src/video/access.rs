@@ -50,9 +50,18 @@ pub(crate) enum KeyframeRule {
   /// (`first_slice_segment_in_pic_flag`). A BLA's RASL pictures are
   /// discarded by every decoder, so a new one loses nothing there. A CRA
   /// (21) is never clean.
+  ///
+  /// A stream whose video parameter set declares an auxiliary layer
+  /// (`alpha`) is read as having neither clean points nor anchors: FFmpeg's
+  /// HEVC decoder decodes that layer beside the base one, as the alpha
+  /// plane of every picture, and nothing here proves where its pictures
+  /// start.
   Hevc {
     /// The NAL length field's width, from the `hvcC` record.
     nal_length: Option<usize>,
+    /// Whether the stream's video parameter set declares an auxiliary
+    /// layer ([`vps_declares_auxiliary`]).
+    alpha: bool,
   },
   /// MPEG-1 and MPEG-2 video: a keyframe is clean when a group-of-pictures
   /// header before its first picture says the GOP is closed (`closed_gop`):
@@ -101,7 +110,13 @@ impl KeyframeRule {
       let start_coded = extradata.starts_with(&[0, 0, 1]) || extradata.starts_with(&[0, 0, 0, 1]);
       let nal_length =
         (extradata.len() >= 23 && !start_coded).then(|| usize::from(extradata[21] & 3) + 1);
-      Self::Hevc { nal_length }
+      // An `hvcC` record carries its parameter sets in arrays of its own;
+      // start-coded extradata, as units.
+      let alpha = match nal_length {
+        Some(_) => hvcc_declares_auxiliary(extradata),
+        None => hevc_units_declare_auxiliary(extradata, None),
+      };
+      Self::Hevc { nal_length, alpha }
     } else if codec_id == CodecId::MPEG2VIDEO.raw()
       || codec_id == ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_MPEG1VIDEO as i32
     {
@@ -128,7 +143,9 @@ impl KeyframeRule {
   /// packet that opens on a later slice of a picture, or whose first
   /// picture's unit is cut before its slice header says so, is not clean. An
   /// H.264 stream whose sequence parameter set permits arbitrary slice order
-  /// — the rule's (`aso`), or one the packet carries — has no clean point.
+  /// — the rule's (`aso`), or one the packet carries — has no clean point,
+  /// nor does an HEVC stream whose video parameter set declares an auxiliary
+  /// layer — the rule's (`alpha`), or one the packet carries.
   ///
   /// The units are walked one at a time ([`NalUnits`]) and never collected,
   /// so the memory a packet costs here does not grow with how many units it
@@ -142,8 +159,13 @@ impl KeyframeRule {
           && first_h264_picture(data, nal_length)
             .is_some_and(|(kind, unit)| kind == 5 && h264_slice_starts_picture(unit))
       }
-      Self::Hevc { nal_length } => first_hevc_picture(data, nal_length)
-        .is_some_and(|(kind, unit)| (16..=20).contains(&kind) && hevc_segment_starts_picture(unit)),
+      Self::Hevc { nal_length, alpha } => {
+        !alpha
+          && !hevc_units_declare_auxiliary(data, nal_length)
+          && first_hevc_picture(data, nal_length).is_some_and(|(kind, unit)| {
+            (16..=20).contains(&kind) && hevc_segment_starts_picture(unit)
+          })
+      }
       Self::Mpeg12 => closed_gop(data),
       Self::Resets | Self::IntraOnly => true,
       Self::Reordering => false,
@@ -183,6 +205,38 @@ impl KeyframeRule {
     }
   }
 
+  /// Whether this HEVC rule's stream declares an auxiliary layer (`alpha`).
+  pub(crate) const fn declares_alpha(self) -> bool {
+    matches!(self, Self::Hevc { alpha: true, .. })
+  }
+
+  /// This rule, for an HEVC stream, with an auxiliary layer declared where
+  /// `alpha` says a video parameter set the session read elsewhere — or the
+  /// output the decoder serving negotiated — declares one; any other rule as
+  /// it is.
+  pub(crate) const fn declaring_alpha(self, alpha: bool) -> Self {
+    match self {
+      Self::Hevc {
+        nal_length,
+        alpha: own,
+      } => Self::Hevc {
+        nal_length,
+        alpha: own || alpha,
+      },
+      other => other,
+    }
+  }
+
+  /// Whether `data`, an HEVC packet read under this rule's packing, carries a
+  /// video parameter set that declares an auxiliary layer; `false` under any
+  /// other rule.
+  pub(crate) fn units_declare_alpha(self, data: &[u8]) -> bool {
+    match self {
+      Self::Hevc { nal_length, .. } => hevc_units_declare_auxiliary(data, nal_length),
+      _ => false,
+    }
+  }
+
   /// Whether `data`, an H.264 packet read under this rule's packing, carries
   /// a sequence parameter set that permits arbitrary slice order; `false`
   /// under any other rule.
@@ -215,7 +269,8 @@ impl KeyframeRule {
   ///   (16–23), a CRA (21) among them, whose first slice segment starts it
   ///   ([`hevc_segment_starts_picture`]): the decoder resyncing kept its
   ///   references, and the reorder bound ([`Proof::ReorderBound`]) covers
-  ///   the leading pictures a CRA has.
+  ///   the leading pictures a CRA has. A stream whose video parameter set
+  ///   declares an auxiliary layer has no anchor ([`Self::is_clean`]).
   /// - **Every other codec** — one picture per packet: MPEG-4 part 2, VP8,
   ///   VP9, AV1 and the rest — **the key flag FFmpeg's parser set from the
   ///   bitstream is the proof.** That is the trust boundary: this crate
@@ -244,9 +299,12 @@ impl KeyframeRule {
           _ => None,
         }
       }
-      Self::Hevc { nal_length } => first_hevc_picture(data, nal_length)
-        .is_some_and(|(kind, unit)| (16..=23).contains(&kind) && hevc_segment_starts_picture(unit))
-        .then(|| anchor(None)),
+      Self::Hevc { nal_length, alpha } => (!alpha
+        && !hevc_units_declare_auxiliary(data, nal_length)
+        && first_hevc_picture(data, nal_length).is_some_and(|(kind, unit)| {
+          (16..=23).contains(&kind) && hevc_segment_starts_picture(unit)
+        }))
+      .then(|| anchor(None)),
       Self::Mpeg12 | Self::Resets | Self::IntraOnly | Self::Reordering => Some(anchor(None)),
     }
   }
@@ -293,6 +351,9 @@ impl KeyframeRule {
       }
       Self::H264 { .. } => {
         "its keyframes are recovery points rather than IDR pictures, and pictures after them may reference the GOP before"
+      }
+      Self::Hevc { alpha: true, .. } => {
+        "its video parameter set declares an auxiliary layer, which FFmpeg decodes as an alpha plane beside the base layer, so no base-layer picture proves where the stream can start"
       }
       Self::Hevc { .. } => {
         "its keyframes are CRA pictures, whose RASL leading pictures reference the GOP before them"
@@ -511,6 +572,216 @@ fn hevc_segment_starts_picture(unit: &[u8]) -> bool {
   unit.get(2).is_some_and(|byte| byte & 0x80 != 0)
 }
 
+/// Whether any of `data`'s HEVC NAL units — length-prefixed by `nal_length`
+/// bytes, or start-coded when `None` — is a video parameter set that
+/// declares an auxiliary layer ([`vps_declares_auxiliary`]). Units that do
+/// not parse prove nothing either way.
+fn hevc_units_declare_auxiliary(data: &[u8], nal_length: Option<usize>) -> bool {
+  NalUnits::new(data, nal_length)
+    .filter_map(Result::ok)
+    .any(|unit| hevc_unit_is_vps(unit) && vps_declares_auxiliary(unit))
+}
+
+/// Whether an `hvcC` record's parameter set arrays hold a video parameter
+/// set that declares an auxiliary layer ([`vps_declares_auxiliary`]): its
+/// 23 bytes, `numOfArrays`, then each array's type byte, unit count and
+/// units, each a 16-bit length and the unit — read as FFmpeg's
+/// `ff_hevc_decode_extradata` reads them, in order, until one does not.
+fn hvcc_declares_auxiliary(record: &[u8]) -> bool {
+  let mut rest = record.get(23..).unwrap_or_default();
+  for _ in 0..record.get(22).copied().unwrap_or(0) {
+    let [_, high, low, tail @ ..] = rest else {
+      return false;
+    };
+    rest = tail;
+    for _ in 0..u16::from_be_bytes([*high, *low]) {
+      let [high, low, tail @ ..] = rest else {
+        return false;
+      };
+      let size = usize::from(u16::from_be_bytes([*high, *low]));
+      let (Some(unit), Some(after)) = (tail.get(..size), tail.get(size..)) else {
+        return false;
+      };
+      if hevc_unit_is_vps(unit) && vps_declares_auxiliary(unit) {
+        return true;
+      }
+      rest = after;
+    }
+  }
+  false
+}
+
+/// Whether `unit` is an HEVC video parameter set (NAL unit type 32) FFmpeg
+/// reads: one of layer 63 its NAL splitter drops.
+fn hevc_unit_is_vps(unit: &[u8]) -> bool {
+  match unit {
+    [head, second, ..] => (head >> 1) & 0x3f == 32 && ((head & 1) << 5) | (second >> 3) != 63,
+    _ => false,
+  }
+}
+
+/// Whether the HEVC video parameter set `unit` — its NAL unit, header and
+/// all — declares an auxiliary layer: two or more layers, and a VPS
+/// extension whose `scalability_mask_flag` sets the auxiliary scalability
+/// type (3, whose `AuxId` 1 is alpha), read as FFmpeg 9's
+/// `ff_hevc_decode_nal_vps` reads it. FFmpeg's HEVC decoder decodes such a
+/// layer of a two-layer stream beside the base one, as the alpha plane of
+/// its pictures (`ff_hevc_is_alpha_video`), even where the extension past
+/// the mask does not parse. A set of one layer declares none, nor does one
+/// too short to say how many it has, which FFmpeg refuses; a set of more
+/// that does not read as far as the mask is taken to declare one.
+fn vps_declares_auxiliary(unit: &[u8]) -> bool {
+  let mut bits = RbspBits::new(unit.get(2..).unwrap_or_default());
+  // vps_video_parameter_set_id (4), vps_base_layer_internal_flag,
+  // vps_base_layer_available_flag, vps_max_layers_minus1 (6).
+  let Some(head) = bits.bits(12) else {
+    return false;
+  };
+  head & 0x3f != 0 && vps_auxiliary(&mut bits, head & 0x80 != 0).unwrap_or(true)
+}
+
+/// [`vps_declares_auxiliary`]'s reading of a video parameter set of more
+/// than one layer, past its first 12 bits: `Some` with the answer, `None`
+/// for a set that does not read as far as its extension's scalability mask.
+/// `base_layer_internal` is its `vps_base_layer_internal_flag`.
+fn vps_auxiliary(bits: &mut RbspBits<'_>, base_layer_internal: bool) -> Option<bool> {
+  let max_sub_layers = bits.bits(3)? + 1;
+  bits.skip(1)?; // vps_temporal_id_nesting_flag
+  if bits.bits(16)? != 0xffff || max_sub_layers > 7 {
+    return None;
+  }
+  profile_tier_level(bits, true, max_sub_layers)?;
+  let ordering_for_each_sub_layer = bits.next_bit()?;
+  let first = if ordering_for_each_sub_layer {
+    0
+  } else {
+    max_sub_layers - 1
+  };
+  for _ in first..max_sub_layers {
+    bits.ue()?; // vps_max_dec_pic_buffering_minus1
+    bits.ue()?; // vps_max_num_reorder_pics
+    bits.ue()?; // vps_max_latency_increase_plus1
+  }
+  let max_layer_id = bits.bits(6)?;
+  let layer_sets = bits.ue()?.checked_add(1)?;
+  if layer_sets > 1024 {
+    return None;
+  }
+  // layer_id_included_flag[i][j], for every layer set after the first.
+  bits.skip((layer_sets as usize - 1) * (max_layer_id as usize + 1))?;
+  if bits.next_bit()? {
+    bits.skip(64)?; // vps_num_units_in_tick, vps_time_scale
+    if bits.next_bit()? {
+      bits.ue()?; // vps_num_ticks_poc_diff_one_minus1
+    }
+    let hrd_parameter_sets = bits.ue()?;
+    if hrd_parameter_sets > layer_sets {
+      return None;
+    }
+    for index in 0..hrd_parameter_sets {
+      bits.ue()?; // hrd_layer_set_idx
+      let common = index == 0 || bits.next_bit()?;
+      hrd_parameters(bits, common, max_sub_layers)?;
+    }
+  }
+  if !bits.next_bit()? {
+    // vps_extension_flag
+    return Some(false);
+  }
+  bits.align()?;
+  if base_layer_internal {
+    profile_tier_level(bits, false, max_sub_layers)?;
+  }
+  bits.skip(1)?; // splitting_flag
+  // scalability_mask_flag[0..16], the first the most significant bit.
+  let mask = bits.bits(16)?;
+  Some(mask & (1 << (15 - 3)) != 0)
+}
+
+/// Reads past a `profile_tier_level(profilePresentFlag,
+/// maxNumSubLayersMinus1)` as FFmpeg's `parse_ptl` does: the general
+/// profile's 88 bits where present, the general level, then each sub-layer's
+/// flags, padding, profile and level.
+fn profile_tier_level(bits: &mut RbspBits<'_>, profile: bool, max_sub_layers: u32) -> Option<()> {
+  if profile {
+    bits.skip(88)?;
+  }
+  bits.skip(8)?; // general_level_idc
+  let sub_layers = (max_sub_layers - 1) as usize;
+  let mut present = [(false, false); 6];
+  for flags in present.iter_mut().take(sub_layers) {
+    *flags = (bits.next_bit()?, bits.next_bit()?);
+  }
+  if sub_layers > 0 {
+    bits.skip(2 * (8 - sub_layers))?; // reserved_zero_2bits
+  }
+  for (profile_present, level_present) in present.into_iter().take(sub_layers) {
+    if profile_present {
+      bits.skip(88)?;
+    }
+    if level_present {
+      bits.skip(8)?;
+    }
+  }
+  Some(())
+}
+
+/// Reads past an `hrd_parameters(commonInfPresentFlag,
+/// maxNumSubLayersMinus1)` as FFmpeg's `decode_hrd` does — an absent common
+/// part reads as no NAL and no VCL parameters, as there.
+fn hrd_parameters(bits: &mut RbspBits<'_>, common: bool, max_sub_layers: u32) -> Option<()> {
+  let (mut nal, mut vcl, mut sub_picture) = (false, false, false);
+  if common {
+    nal = bits.next_bit()?;
+    vcl = bits.next_bit()?;
+    if nal || vcl {
+      sub_picture = bits.next_bit()?;
+      if sub_picture {
+        // tick_divisor_minus2, du_cpb_removal_delay_increment_length_minus1,
+        // sub_pic_cpb_params_in_pic_timing_sei_flag,
+        // dpb_output_delay_du_length_minus1
+        bits.skip(8 + 5 + 1 + 5)?;
+      }
+      bits.skip(4 + 4)?; // bit_rate_scale, cpb_size_scale
+      if sub_picture {
+        bits.skip(4)?; // cpb_size_du_scale
+      }
+      // initial_cpb_removal_delay_length_minus1,
+      // au_cpb_removal_delay_length_minus1, dpb_output_delay_length_minus1
+      bits.skip(5 + 5 + 5)?;
+    }
+  }
+  for _ in 0..max_sub_layers {
+    let fixed_general = bits.next_bit()?;
+    let fixed_within = !fixed_general && bits.next_bit()?;
+    let mut low_delay = false;
+    if fixed_general || fixed_within {
+      bits.ue()?; // elemental_duration_in_tc_minus1
+    } else {
+      low_delay = bits.next_bit()?;
+    }
+    let mut cpbs = 1;
+    if !low_delay {
+      let minus1 = bits.ue()?;
+      if minus1 > 31 {
+        return None;
+      }
+      cpbs = minus1 + 1;
+    }
+    // sub_layer_hrd_parameters, for the NAL and the VCL parameters present.
+    for _ in 0..(u32::from(nal) + u32::from(vcl)) * cpbs {
+      bits.ue()?; // bit_rate_value_minus1
+      bits.ue()?; // cpb_size_value_minus1
+      if sub_picture {
+        bits.ue()?; // cpb_size_du_value_minus1
+        bits.ue()?; // bit_rate_du_value_minus1
+      }
+      bits.skip(1)?; // cbr_flag
+    }
+  }
+  Some(())
+}
+
 /// The recovery point SEI message an H.264 access unit carries before its
 /// first picture; `None` where none does, or where an SEI unit before it
 /// does not parse. The units are read as [`first_h264_picture`] reads them,
@@ -644,6 +915,32 @@ impl<'a> RbspBits<'a> {
       self.at += 1;
     }
     Some(value)
+  }
+
+  /// `u(n)`: `n` bits, the first the most significant; `n` at most 32.
+  fn bits(&mut self, n: u32) -> Option<u32> {
+    let mut value = 0u32;
+    for _ in 0..n {
+      value = (value << 1) | u32::from(self.next_bit()?);
+    }
+    Some(value)
+  }
+
+  /// Reads past `n` bits.
+  fn skip(&mut self, n: usize) -> Option<()> {
+    for _ in 0..n {
+      self.next_bit()?;
+    }
+    Some(())
+  }
+
+  /// Reads past the bits left before the payload's next byte boundary — the
+  /// raw bytes' too, since an emulation prevention byte is a whole byte.
+  fn align(&mut self) -> Option<()> {
+    while self.bit != 0 {
+      self.next_bit()?;
+    }
+    Some(())
   }
 
   /// An unsigned exp-Golomb code, `ue(v)`: `n` zeros, a one, `n` more bits.

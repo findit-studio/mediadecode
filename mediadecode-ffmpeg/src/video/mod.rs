@@ -294,6 +294,16 @@ pub struct CarrierVideoStreamDecoder<C: crate::FfmpegCarrier> {
   /// from then on no H.264 packet is clean or anchors, so no switch fires and
   /// an open post-commit gap ends escalated by name; said once ([`Self::note_sps`]).
   h264_aso: bool,
+  /// `true` once an HEVC video parameter set the session read — in its
+  /// codec parameters, in a new extradata, among the units of a keyframe —
+  /// declares an auxiliary layer, or the software decoder serving negotiated
+  /// an output format with alpha (`access::KeyframeRule::Hevc`): FFmpeg's
+  /// HEVC decoder decodes that layer beside the base one, as the alpha plane
+  /// of every picture, and nothing here proves where its pictures start. For
+  /// good: from then on no HEVC packet is clean or anchors, so no switch
+  /// fires and an open post-commit gap ends escalated by name; said once
+  /// ([`Self::note_vps`]).
+  hevc_alpha: bool,
   /// HW-side scratch frame (filled by [`VideoDecoder::receive_frame`]).
   hw_scratch: Frame,
   /// SW-side scratch frame (filled by `ffmpeg::decoder::Video::receive_frame`).
@@ -982,6 +992,19 @@ impl SwDecoder {
     }
   }
 
+  /// Whether the output format this decoder negotiated carries an alpha
+  /// component — for HEVC, that FFmpeg decodes an auxiliary layer as the
+  /// alpha plane of its pictures. `AVCodecContext.pix_fmt` is read as the
+  /// integer it holds, never formed into a bindgen enum, and mapped through
+  /// the crate's own table ([`crate::boundary::from_av_pixel_format`]).
+  fn outputs_alpha(&self) -> bool {
+    // SAFETY: `self` is a live opened decoder; `pix_fmt` is read as the
+    // 32-bit integer the field holds, and not kept.
+    let raw =
+      unsafe { core::ptr::read(core::ptr::addr_of!((*self.as_ptr()).pix_fmt).cast::<i32>()) };
+    crate::pixdesc::carries_alpha(&crate::boundary::from_av_pixel_format(raw))
+  }
+
   /// Whether this decoder decodes, inside a submission, the packet the
   /// submission queues: libavcodec's own implementation ([`Self::native`])
   /// with no frame threading active. A frame-threaded decoder hands a packet
@@ -1159,6 +1182,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       extradata_unknown: None,
       extradata_provisional: false,
       h264_aso: false,
+      hevc_alpha: false,
       hw_scratch,
       sw_scratch,
       sw_replay_frames: ReplayQueue::default(),
@@ -2060,7 +2084,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       } else {
         core::slice::from_raw_parts(data, size)
       };
-      access::KeyframeRule::of(self.codec_id(), extradata).permitting_aso(self.h264_aso)
+      access::KeyframeRule::of(self.codec_id(), extradata)
+        .permitting_aso(self.h264_aso)
+        .declaring_alpha(self.hevc_alpha)
     }
   }
 
@@ -2075,9 +2101,11 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// frame the packet's units either way.
   fn rule_for(&self, pkt: &Packet) -> Option<access::KeyframeRule> {
     match new_extradata(pkt) {
-      Some(extradata) => {
-        Some(access::KeyframeRule::of(self.codec_id(), extradata).permitting_aso(self.h264_aso))
-      }
+      Some(extradata) => Some(
+        access::KeyframeRule::of(self.codec_id(), extradata)
+          .permitting_aso(self.h264_aso)
+          .declaring_alpha(self.hevc_alpha),
+      ),
       None => {
         let rule = self.keyframe_rule();
         (self.extradata_unknown.is_none() || !rule.reads_extradata()).then_some(rule)
@@ -2123,6 +2151,37 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
          order (Baseline or Extended, without constraint_set1_flag); no keyframe of it is read \
          as a clean point or a resync anchor, so the session returns to its threads only at a \
          seek, and a post-commit fallback's gap ends escalated",
+      );
+    }
+  }
+
+  /// Reads the HEVC video parameter sets `pkt` brings — in a new extradata
+  /// it carries, and, for a keyframe, among its own units — and the active
+  /// extradata's, and the output format the software decoder serving
+  /// negotiated, for an auxiliary layer, which FFmpeg decodes as an alpha
+  /// plane ([`Self::hevc_alpha`]); says so the first time, naming the
+  /// reason.
+  fn note_vps(&mut self, pkt: &Packet) {
+    if self.hevc_alpha || self.codec_id() != crate::CodecId::HEVC.raw() {
+      return;
+    }
+    let rule = match new_extradata(pkt) {
+      Some(extradata) => access::KeyframeRule::of(self.codec_id(), extradata),
+      None => self.keyframe_rule(),
+    };
+    let in_band = pkt.is_key()
+      && pkt
+        .data()
+        .is_some_and(|data| rule.units_declare_alpha(data));
+    let output = matches!(&self.state, DecodeState::Sw(sw) if sw.outputs_alpha());
+    if rule.declares_alpha() || in_band || output {
+      self.hevc_alpha = true;
+      tracing::warn!(
+        reason = rule.declaring_alpha(true).reason(),
+        "mediadecode-ffmpeg: this HEVC stream declares an auxiliary layer, which FFmpeg decodes as \
+         an alpha plane beside the base layer; no keyframe of it is read as a clean point or a \
+         resync anchor, so the session returns to its threads only at a seek, and a post-commit \
+         fallback's gap ends escalated",
       );
     }
   }
@@ -2823,6 +2882,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       extradata_unknown: None,
       extradata_provisional: false,
       h264_aso: false,
+      hevc_alpha: false,
       hw_scratch: Frame::empty()?,
       sw_scratch: alloc_av_video_frame()?,
       sw_replay_frames: ReplayQueue::default(),
@@ -3077,6 +3137,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     }
     boundary::with_ffmpeg_video_packet::<C, _>(packet, limits, route, |av_pkt| {
       self.note_sps(av_pkt);
+      self.note_vps(av_pkt);
       // The extradata a packet for the hardware carries, copied before it
       // sees the packet: the stream's once it takes it.
       let extradata = if matches!(self.state, DecodeState::Hw(_)) {

@@ -106,7 +106,8 @@ fn an_hevc_idr_or_bla_is_clean_and_a_cra_is_not() {
   assert_eq!(
     rule,
     KeyframeRule::Hevc {
-      nal_length: Some(4)
+      nal_length: Some(4),
+      alpha: false,
     }
   );
   assert!(rule.is_clean(&length_prefixed(&[&[19 << 1, 1, 0xaf]])));
@@ -743,9 +744,13 @@ fn a_resync_is_proved_by_withheld_output_on_h264_and_by_the_reorder_bound_elsewh
     );
   }
   for rule in [
-    KeyframeRule::Hevc { nal_length: None },
+    KeyframeRule::Hevc {
+      nal_length: None,
+      alpha: false,
+    },
     KeyframeRule::Hevc {
       nal_length: Some(4),
+      alpha: false,
     },
     KeyframeRule::Mpeg12,
     KeyframeRule::Resets,
@@ -811,7 +816,10 @@ fn a_clean_point_and_an_anchor_start_a_picture() {
     );
   }
   for nal_length in [None, Some(4)] {
-    let hevc = KeyframeRule::Hevc { nal_length };
+    let hevc = KeyframeRule::Hevc {
+      nal_length,
+      alpha: false,
+    };
     let pack = |units: &[&[u8]]| match nal_length {
       None => annex_b(units),
       Some(_) => length_prefixed(units),
@@ -900,7 +908,10 @@ fn an_hevc_packet_is_read_by_its_base_layer() {
     vec![(kind << 1) | (layer >> 5), ((layer & 0x1f) << 3) | 1, 0xaf]
   };
   for nal_length in [None, Some(4)] {
-    let hevc = KeyframeRule::Hevc { nal_length };
+    let hevc = KeyframeRule::Hevc {
+      nal_length,
+      alpha: false,
+    };
     let read = |units: &[&[u8]]| {
       let au = match nal_length {
         None => annex_b(units),
@@ -935,5 +946,194 @@ fn an_hevc_packet_is_read_by_its_base_layer() {
       (false, Some(false)),
       "{hevc:?}: a base-layer CRA after an IDR of layer 63"
     );
+  }
+}
+
+/// `value` as an unsigned exp-Golomb code, `ue(v)`, in `0`s and `1`s.
+fn ue(value: u32) -> String {
+  let coded = value + 1;
+  let width = 32 - coded.leading_zeros();
+  format!("{}{coded:b}", "0".repeat(width as usize - 1))
+}
+
+/// An HEVC video parameter set NAL unit for `max_layers_minus1` + 1 layers
+/// and one sub-layer, Main profile at level 3.1: where `hrd`, with timing
+/// information and one set of HRD parameters (NAL parameters, one CPB);
+/// where `mask` is given, with a VPS extension whose
+/// `scalability_mask_flag` is it, one bit of `dimension_id` for each type it
+/// sets, cut short where `cut` before the extension's profile and mask.
+fn vps(max_layers_minus1: u8, hrd: bool, mask: Option<u16>, cut: bool) -> Vec<u8> {
+  let mut bits = String::from("0000"); // vps_video_parameter_set_id
+  bits += "11"; // vps_base_layer_internal_flag, vps_base_layer_available_flag
+  bits += &format!("{max_layers_minus1:06b}");
+  bits += "000"; // vps_max_sub_layers_minus1
+  bits += "1"; // vps_temporal_id_nesting_flag
+  bits += &"1".repeat(16); // vps_reserved_0xffff_16bits
+  // profile_tier_level(1, 0): space, tier, Main, compatible with Main and
+  // Main 10, progressive frames, 43 reserved bits and one, level 93.
+  bits += "00000001";
+  bits += "01100000000000000000000000000000";
+  bits += "1001";
+  bits += &"0".repeat(44);
+  bits += "01011101";
+  bits += "1"; // vps_sub_layer_ordering_info_present_flag
+  bits += &(ue(4) + &ue(2) + &ue(0));
+  bits += &format!("{max_layers_minus1:06b}"); // vps_max_layer_id
+  let layer_sets_minus1 = u32::from(max_layers_minus1 > 0);
+  bits += &ue(layer_sets_minus1);
+  for _ in 0..layer_sets_minus1 {
+    bits += &"1".repeat(usize::from(max_layers_minus1) + 1); // layer_id_included_flag
+  }
+  if hrd {
+    bits += "1"; // vps_timing_info_present_flag
+    bits += &format!("{:032b}{:032b}", 1001u32, 30000u32);
+    bits += "0"; // vps_poc_proportional_to_timing_flag
+    bits += &ue(1); // vps_num_hrd_parameters
+    bits += &ue(0); // hrd_layer_set_idx
+    // hrd_parameters(1, 0): NAL parameters only, no sub-picture parameters,
+    // scales, three lengths; then the one sub-layer's fixed rate, its
+    // duration, one CPB and its NAL bit rate, size and CBR flag.
+    bits += "100";
+    bits += "00000000";
+    bits += "101111011110111";
+    bits += &("1".to_owned() + &ue(0) + &ue(0) + &ue(2) + &ue(2) + "0");
+  } else {
+    bits += "0";
+  }
+  match mask {
+    Some(mask) => {
+      bits += "1"; // vps_extension_flag
+      while bits.len() % 8 != 0 {
+        bits += "1"; // vps_extension_alignment_bit_equal_to_one
+      }
+      if !cut {
+        bits += "01011101"; // profile_tier_level(0, 0)
+        bits += "0"; // splitting_flag
+        bits += &format!("{mask:016b}");
+        let types = mask.count_ones() as usize;
+        bits += &"000".repeat(types); // dimension_id_len_minus1
+        bits += "0"; // vps_nuh_layer_id_present_flag
+        bits += &"1".repeat(types); // dimension_id[1][j]
+      }
+    }
+    None => bits += "0", // vps_extension_flag
+  }
+  bits += "1"; // rbsp_stop_one_bit
+  [vec![0x40, 0x01], rbsp(&bits)].concat()
+}
+
+/// An `hvcC` record with four-byte NAL length fields whose one array holds
+/// `units`.
+fn hvcc_holding(units: &[&[u8]]) -> Vec<u8> {
+  let mut record = hvcc();
+  record[22] = 1;
+  record.push(0x20);
+  record.extend_from_slice(&(units.len() as u16).to_be_bytes());
+  for unit in units {
+    record.extend_from_slice(&(unit.len() as u16).to_be_bytes());
+    record.extend_from_slice(unit);
+  }
+  record
+}
+
+/// LAW (pre-R14 row 4): **an HEVC stream whose video parameter set declares
+/// an auxiliary layer has no clean point and no anchor.** FFmpeg's HEVC
+/// decoder decodes the auxiliary layer of a two-layer stream beside the
+/// base one, as the alpha plane of every picture, so a base-layer IDR
+/// proves nothing of where that layer's pictures start. Read off an `hvcC`
+/// record, off start-coded extradata, and off a packet's own units, in either
+/// packing: a VPS declaring the auxiliary type (3) — alone, with HRD
+/// parameters before the extension, or beside the multiview type as `x265`
+/// writes its alpha streams — and a two-layer VPS whose extension is cut
+/// before its mask, read as one that declares it, leave an IDR starting its
+/// picture neither clean nor an anchor; a single-layer VPS, with or without
+/// HRD parameters, and a two-layer multiview VPS (MV-HEVC) leave it clean and
+/// a definitive anchor. Read without the VPS, every one of them was a clean
+/// point and an anchor.
+#[test]
+fn an_hevc_stream_declaring_an_auxiliary_layer_has_no_clean_point_and_no_anchor() {
+  const MULTIVIEW: u16 = 1 << (15 - 1);
+  const AUXILIARY: u16 = 1 << (15 - 3);
+  let idr = [0x26, 0x01, 0xaf];
+  for (name, unit, declares) in [
+    ("one layer", vps(0, false, None, false), false),
+    (
+      "one layer, HRD parameters",
+      vps(0, true, None, false),
+      false,
+    ),
+    ("multiview", vps(1, false, Some(MULTIVIEW), false), false),
+    (
+      "multiview, HRD parameters",
+      vps(1, true, Some(MULTIVIEW), false),
+      false,
+    ),
+    ("auxiliary", vps(1, false, Some(AUXILIARY), false), true),
+    (
+      "auxiliary, HRD parameters",
+      vps(1, true, Some(AUXILIARY), false),
+      true,
+    ),
+    (
+      "multiview and auxiliary",
+      vps(1, false, Some(MULTIVIEW | AUXILIARY), false),
+      true,
+    ),
+    (
+      "two layers, cut short",
+      vps(1, false, Some(AUXILIARY), true),
+      true,
+    ),
+  ] {
+    for (rule, pack) in [
+      (
+        KeyframeRule::of(CodecId::HEVC.raw(), &hvcc_holding(&[&unit[..]])),
+        length_prefixed as fn(&[&[u8]]) -> Vec<u8>,
+      ),
+      (
+        KeyframeRule::of(CodecId::HEVC.raw(), &annex_b(&[&unit[..]])),
+        annex_b,
+      ),
+    ] {
+      assert_eq!(
+        rule.declares_alpha(),
+        declares,
+        "{name}: {rule:?}, off the extradata"
+      );
+      let au = pack(&[&idr[..]]);
+      assert_eq!(
+        (rule.is_clean(&au), rule.anchor(&au).map(Anchor::definitive)),
+        if declares {
+          (false, None)
+        } else {
+          (true, Some(true))
+        },
+        "{name}: {rule:?}, an IDR under the extradata's VPS"
+      );
+    }
+    for nal_length in [None, Some(4)] {
+      let rule = KeyframeRule::Hevc {
+        nal_length,
+        alpha: false,
+      };
+      let au = match nal_length {
+        None => annex_b(&[&unit[..], &idr[..]]),
+        Some(_) => length_prefixed(&[&unit[..], &idr[..]]),
+      };
+      assert_eq!(
+        rule.units_declare_alpha(&au),
+        declares,
+        "{name}: {rule:?}, in band"
+      );
+      assert_eq!(
+        (rule.is_clean(&au), rule.anchor(&au).map(Anchor::definitive)),
+        if declares {
+          (false, None)
+        } else {
+          (true, Some(true))
+        },
+        "{name}: {rule:?}, an IDR behind its own VPS"
+      );
+    }
   }
 }

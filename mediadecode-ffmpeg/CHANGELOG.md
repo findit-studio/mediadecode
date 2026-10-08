@@ -180,7 +180,14 @@ The backend-agnostic core it adapts has its own log at
   parameters, a new extradata or a keyframe's own SPS) has no clean point
   and no anchor at all, its slices' order vouching for no picture start: it
   returns to the session's threads only at a seek, a post-commit fallback's
-  gap ends escalated, and a warning says so once; and only when
+  gap ends escalated, and a warning says so once — as does an HEVC stream
+  whose video parameter set declares an auxiliary layer (the VPS
+  extension's scalability mask, read off the codec parameters, a new
+  extradata or a keyframe's own VPS; a set of more than one layer that does
+  not read as far as the mask taken to declare one) or whose software
+  decoder negotiated an output format with alpha: FFmpeg decodes that layer
+  beside the base one as every picture's alpha plane, and no base-layer
+  picture proves where it starts; and only when
   every NAL unit in it parses whole: a four-byte start
   code read whole and the zero bytes after a unit (`trailing_zero_8bits`)
   stripped from it, every header byte present and valid (H.264's and HEVC's
@@ -241,7 +248,8 @@ The backend-agnostic core it adapts has its own log at
   `slice_type` at most 9; an I picture alone anchors nothing, since a slice
   type describes that slice alone and FFmpeg flags some such pictures key
   by heuristic), an HEVC base-layer IRAP picture (a CRA among them) whose
-  first slice segment starts it; for a codec that codes every picture alone,
+  first slice segment starts it, in a stream declaring no auxiliary layer;
+  for a codec that codes every picture alone,
   every packet; for the other codecs whose pictures this crate does not
   read, the key flag FFmpeg's parser set is the proof — since an intra
   picture resets the references of every picture after it that does not

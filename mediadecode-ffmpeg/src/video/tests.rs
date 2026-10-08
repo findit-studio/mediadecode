@@ -8189,3 +8189,161 @@ fn a_refusal_latched_before_a_submission_names_nothing_of_it() {
     "three threads: the latch outlives the submission"
   );
 }
+
+/// A spare HEVC video parameter set NAL unit — id 5, which no sequence
+/// parameter set of the `x265` fixtures refers to, so FFmpeg stores it and
+/// decodes the stream as before — for one layer, or for two whose VPS
+/// extension sets `mask` as its scalability types: one sub-layer, Main
+/// profile, no timing information, one bit of `dimension_id` for each type.
+fn spare_vps(mask: Option<u16>) -> Vec<u8> {
+  let ue = |value: u32| -> String {
+    let coded = value + 1;
+    let width = 32 - coded.leading_zeros();
+    format!("{}{coded:b}", "0".repeat(width as usize - 1))
+  };
+  let layers_minus1 = u8::from(mask.is_some());
+  let mut bits = String::from("0101"); // vps_video_parameter_set_id
+  bits += "11";
+  bits += &format!("{layers_minus1:06b}");
+  bits += "0001"; // vps_max_sub_layers_minus1, vps_temporal_id_nesting_flag
+  bits += &"1".repeat(16);
+  bits += "00000001";
+  bits += "01100000000000000000000000000000";
+  bits += "1001";
+  bits += &"0".repeat(44);
+  bits += "01011101";
+  bits += &("1".to_owned() + &ue(4) + &ue(2) + &ue(0));
+  bits += &format!("{layers_minus1:06b}");
+  bits += &ue(u32::from(layers_minus1));
+  bits += &"1".repeat(usize::from(layers_minus1) * (usize::from(layers_minus1) + 1));
+  bits += "0"; // vps_timing_info_present_flag
+  match mask {
+    Some(mask) => {
+      bits += "1";
+      while bits.len() % 8 != 0 {
+        bits += "1";
+      }
+      bits += "010111010";
+      bits += &format!("{mask:016b}");
+      let types = mask.count_ones() as usize;
+      bits += &"000".repeat(types);
+      bits += "0";
+      bits += &"1".repeat(types);
+    }
+    None => bits += "0",
+  }
+  bits += "1";
+  let payload: Vec<u8> = bits
+    .as_bytes()
+    .chunks(8)
+    .map(|chunk| {
+      chunk
+        .iter()
+        .enumerate()
+        .filter(|&(_, &bit)| bit == b'1')
+        .fold(0u8, |byte, (index, _)| byte | (0x80 >> index))
+    })
+    .collect();
+  let mut unit = vec![0x40, 0x01];
+  let mut zeros = 0;
+  for byte in payload {
+    if zeros >= 2 && byte <= 3 {
+      unit.push(3);
+      zeros = 0;
+    }
+    zeros = if byte == 0 { zeros + 1 } else { 0 };
+    unit.push(byte);
+  }
+  unit
+}
+
+/// LAW (pre-R14 row 4): **an HEVC stream declaring an auxiliary layer
+/// anchors nothing, and a post-commit gap in it ends escalated by name.**
+/// The R6 CRA stream (`x265`, every keyframe carrying its parameter sets),
+/// the hardware failing post-commit at a CRA whose packet also carries a
+/// spare video parameter set. Declaring an auxiliary layer — what FFmpeg
+/// decodes beside the base layer as an alpha plane — the CRA and every
+/// keyframe after it anchor nothing, no picture closes the gap, and the end
+/// escalates by name; declaring one layer, or two in multiview, the CRA
+/// anchors and the end is clean, as without it. Read without the VPS, the
+/// auxiliary stream resynced at the CRA.
+#[test]
+fn an_hevc_stream_declaring_an_auxiliary_layer_anchors_nothing_and_escalates() {
+  const MULTIVIEW: u16 = 1 << (15 - 1);
+  const AUXILIARY: u16 = 1 << (15 - 3);
+  let clip = encode_hevc_cra_with_headers(128, 96, 40);
+  let at = keyframe_after(&clip, 3);
+  let data = clip.packets[at].data().expect("a payload").to_vec();
+  assert!(
+    data.starts_with(&[0, 0, 0, 1]) || data.starts_with(&[0, 0, 1]),
+    "the fixture is start-coded"
+  );
+  for (name, mask, declares) in [
+    ("one layer", None, false),
+    ("multiview", Some(MULTIVIEW), false),
+    ("auxiliary", Some(AUXILIARY), true),
+  ] {
+    let mut packets = clip.packets.clone();
+    packets[at] = repacked(
+      &clip.packets[at],
+      &[&[0, 0, 0, 1][..], &spare_vps(mask), &data].concat(),
+    );
+    let with = SyntheticClip {
+      parameters: clip.parameters.clone(),
+      packets,
+    };
+    let (dec, delivered, escalated) = through_a_post_commit_failure(&with, at);
+    assert!(dec.is_software(), "{name}: the hardware failed post-commit");
+    assert_eq!(
+      escalated, declares,
+      "{name}: the end escalates {declares}: {delivered:?}"
+    );
+    assert_eq!(
+      delivered.iter().any(|&(_, open)| !open),
+      !declares,
+      "{name}: a picture closes the gap {}: {delivered:?}",
+      !declares
+    );
+  }
+}
+
+/// LAW (pre-R14 row 4): **a software decoder whose negotiated output
+/// carries alpha reads as one decoding an auxiliary layer.** FFmpeg's HEVC
+/// decoder negotiates an alpha format (`yuva420p` and kin) only for a stream
+/// whose auxiliary layer it decodes as the alpha plane; the session reads
+/// that off the decoder serving as well as off the video parameter sets it
+/// sees. An HEVC decoder whose context holds `yuva420p` or `yuva444p10le`
+/// reads as one; `yuv420p`, `gray` and no format yet do not. (`libx265` on
+/// this build cannot encode an alpha layer, so no stream here exercises the
+/// negotiation itself.)
+#[test]
+fn a_decoder_whose_output_carries_alpha_reads_as_decoding_an_auxiliary_layer() {
+  use ffmpeg_next::ffi::AVPixelFormat as F;
+  let mut hevc = Parameters::new();
+  // SAFETY: `hevc` owns a fresh `AVCodecParameters`; two fields are written
+  // with values of their own types.
+  unsafe {
+    (*hevc.as_mut_ptr()).codec_type = ffmpeg_next::ffi::AVMediaType::AVMEDIA_TYPE_VIDEO;
+    (*hevc.as_mut_ptr()).codec_id = ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_HEVC;
+  }
+  let mut sw = super::open_sw_decoder(
+    &hevc,
+    DecoderLimits::default().with_threads(crate::Threads::Single),
+    None,
+  )
+  .expect("an HEVC decoder");
+  for (format, alpha) in [
+    (F::AV_PIX_FMT_NONE, false),
+    (F::AV_PIX_FMT_YUV420P, false),
+    (F::AV_PIX_FMT_GRAY8, false),
+    (F::AV_PIX_FMT_YUVA420P, true),
+    (F::AV_PIX_FMT_YUVA444P10LE, true),
+  ] {
+    // SAFETY: the live opened context's `pix_fmt`, written with a known
+    // constant of its own type; nothing is decoded on it after.
+    unsafe {
+      (*sw.as_mut_ptr()).pix_fmt = format;
+    }
+    assert_eq!(sw.outputs_alpha(), alpha, "{format:?}");
+  }
+}
