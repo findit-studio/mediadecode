@@ -332,6 +332,9 @@ struct FakeHw {
   /// A `send_packet` index the seam refuses with this FFmpeg error, the
   /// packet not taken — the hardware reporting a packet failed.
   refuse_at_send: Option<(usize, ffmpeg_next::Error)>,
+  /// A second `send_packet` index at which to raise the exhaustion shape,
+  /// as at `fail_at_send`. `usize::MAX` => none.
+  fail_again_at_send: usize,
 }
 
 impl FakeHw {
@@ -348,6 +351,7 @@ impl FakeHw {
       fail_at_eof: false,
       fail_at_receive: false,
       refuse_at_send: None,
+      fail_again_at_send: usize::MAX,
     }
   }
 
@@ -370,6 +374,7 @@ impl FakeHw {
       fail_at_eof: false,
       fail_at_receive: false,
       refuse_at_send: None,
+      fail_again_at_send: usize::MAX,
     }
   }
 
@@ -400,6 +405,12 @@ impl FakeHw {
     self.refuse_at_send = Some((at, error));
     self
   }
+
+  /// Raises the exhaustion shape again at the `send_packet` index `at`.
+  fn failing_again_at(mut self, at: usize) -> Self {
+    self.fail_again_at_send = at;
+    self
+  }
 }
 
 impl HwInner for FakeHw {
@@ -421,7 +432,7 @@ impl HwInner for FakeHw {
     {
       return Err(Error::Ffmpeg(error));
     }
-    if idx == self.fail_at_send {
+    if idx == self.fail_at_send || idx == self.fail_again_at_send {
       // The packet is NOT accepted; raise the chosen exhaustion shape.
       return match self.shape {
         FailShape::PostCommit => Err(Error::AllBackendsFailed(
@@ -8048,4 +8059,63 @@ fn a_decode_error_while_a_new_extradata_is_unread_leaves_it_unknown() {
     )),
     "the record is unknown, by the error"
   );
+}
+
+/// LAW (pre-R14 row 2): **a hardware that fails post-commit on a packet
+/// carrying a new extradata, and that no fallback replaces, leaves the
+/// extradata unknown.** The R11 stream on hardware that fails post-commit
+/// at the IDR 16, the change. With 16's body corrupted as R12's law
+/// corrupts it, the cold decoder's forward fails too and nothing commits:
+/// the hardware, still serving, may or may not have applied the two-byte
+/// record, so the extradata is unknown (`HardwareFailed`), and when the
+/// hardware fails again at 20, the cold decoder the session would open on
+/// its parameters is refused by name. With 16 whole, the fallback at 16
+/// commits on the record 16 carries and decodes on. Left unclassified, the
+/// failed fallback kept the four-byte record known, and the fallback at 20
+/// opened on it.
+#[test]
+fn a_hardware_failure_on_a_new_extradata_that_no_fallback_replaces_leaves_it_unknown() {
+  let (clip, change) = encode_h264_avcc_whose_length_size_changes(128, 96, 32);
+  let mut corrupt = clip.packets.clone();
+  corrupt[change] = with_corrupt_body(&clip.packets[change]);
+  let corrupt = SyntheticClip {
+    parameters: clip.parameters.clone(),
+    packets: corrupt,
+  };
+  for (stream, whole) in [(&corrupt, false), (&clip, true)] {
+    let (dec, _, refusals, _) = through_the_change(
+      stream,
+      FakeHw::failing(128, 96, usize::MAX, change, FailShape::PostCommit).failing_again_at(20),
+      |_, _| {},
+    );
+    let refused: Vec<String> = refusals
+      .iter()
+      .map(|(index, error)| format!("{index}: {error:?}"))
+      .collect();
+    if whole {
+      assert!(
+        refusals.is_empty(),
+        "whole: the fallback at 16 commits and the stream decodes on: {refused:?}"
+      );
+      assert!(dec.is_software(), "whole: on the cold decoder");
+      assert_eq!(dec.extradata_unknown_for_test(), None, "whole: known");
+      continue;
+    }
+    assert!(
+      matches!(refusals.first(), Some((16, Error::FallbackFailed(_)))),
+      "the fallback at 16 fails: {refused:?}"
+    );
+    assert!(
+      refusals.iter().any(|(index, error)| *index == 20
+        && matches!(error, Error::ExtradataUnknown(unknown)
+          if unknown.doubt() == crate::ExtradataDoubt::HardwareFailed)),
+      "the fallback at 20 is refused by name: {refused:?}"
+    );
+    assert!(!dec.is_software(), "nothing was committed");
+    assert_eq!(
+      dec.extradata_unknown_for_test(),
+      Some(crate::ExtradataDoubt::HardwareFailed),
+      "the extradata is unknown, by the hardware's failure"
+    );
+  }
 }

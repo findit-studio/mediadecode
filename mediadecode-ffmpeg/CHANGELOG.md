@@ -333,7 +333,9 @@ The backend-agnostic core it adapts has its own log at
   flush while it is provisional drops the packet unread, the decoder kept
   on the framing it read before, and a decode error reported then may be
   that packet's own: either leaves the extradata unknown, as does the
-  hardware failing post-commit then with no fallback replacing it. One the
+  hardware failing post-commit then, or on the packet carrying it, with no
+  fallback replacing it — the hardware, still serving, may or may not have
+  applied it. One the
   hardware took while its
   probe recorded is installed once nothing will replay it. A new extradata
   that would carry the codec parameters past `max_codec_parameter_bytes` —

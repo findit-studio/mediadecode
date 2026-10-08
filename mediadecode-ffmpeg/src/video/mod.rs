@@ -3131,9 +3131,15 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
               // the pairing [`PostCommitInput`] forbids.
               let degraded = self.degrade_to_sw(PostCommitInput::Packet(av_pkt), false);
               if degraded.is_err() {
-                // The hardware failed, and nothing replaced it: a provisional
-                // extradata's packet it may never have read.
-                self.reported_while_provisional(crate::ExtradataDoubt::HardwareFailed);
+                // The hardware failed on this packet, and nothing replaced it:
+                // whether it applied the new extradata the packet carries, or
+                // read a provisional one's packet, cannot be told, and it is
+                // still the decoder serving.
+                if extradata.is_some() {
+                  self.extradata_in_doubt(crate::ExtradataDoubt::HardwareFailed);
+                } else {
+                  self.reported_while_provisional(crate::ExtradataDoubt::HardwareFailed);
+                }
               }
               return degraded
                 .map(|()| Sent::Accepted)
