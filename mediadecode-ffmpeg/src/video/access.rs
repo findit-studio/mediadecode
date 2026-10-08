@@ -96,11 +96,17 @@ impl KeyframeRule {
       let nal_length = (extradata.first() == Some(&1) && extradata.len() >= 5)
         .then(|| usize::from(extradata[4] & 3) + 1);
       // An `avcC` record repeats its SPS's profile and constraint bytes in
-      // its own header; Annex B extradata carries the SPS units themselves.
+      // its own header, and carries the SPS units FFmpeg's decoder reads in
+      // its entries (`ff_h264_decode_extradata`): either permitting arbitrary
+      // slice order is read as the stream permitting it. Annex B extradata
+      // carries the SPS units alone.
       let aso = match nal_length {
-        Some(_) => extradata
-          .get(1..3)
-          .is_some_and(|profile| sps_permits_aso(profile[0], profile[1])),
+        Some(_) => {
+          extradata
+            .get(1..3)
+            .is_some_and(|profile| sps_permits_aso(profile[0], profile[1]))
+            || super::params::avcc_units(extradata).any(sps_unit_permits_aso)
+        }
         None => h264_units_permit_aso(extradata, None),
       };
       Self::H264 { nal_length, aso }
@@ -555,12 +561,18 @@ const fn sps_permits_aso(profile_idc: u8, constraint_flags: u8) -> bool {
 fn h264_units_permit_aso(data: &[u8], nal_length: Option<usize>) -> bool {
   NalUnits::new(data, nal_length)
     .filter_map(Result::ok)
-    .any(|unit| match unit {
-      [header, profile_idc, constraint_flags, ..] => {
-        header & 0x1f == 7 && sps_permits_aso(*profile_idc, *constraint_flags)
-      }
-      _ => false,
-    })
+    .any(sps_unit_permits_aso)
+}
+
+/// Whether the H.264 NAL unit `unit` is a sequence parameter set (7) that
+/// permits arbitrary slice order ([`sps_permits_aso`]).
+fn sps_unit_permits_aso(unit: &[u8]) -> bool {
+  match unit {
+    [header, profile_idc, constraint_flags, ..] => {
+      header & 0x1f == 7 && sps_permits_aso(*profile_idc, *constraint_flags)
+    }
+    _ => false,
+  }
 }
 
 /// Whether the HEVC slice segment whose NAL unit is `unit` starts its

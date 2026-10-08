@@ -852,7 +852,9 @@ fn a_clean_point_and_an_anchor_start_a_picture() {
 /// anchor for Baseline or Extended without `constraint_set1_flag`; read off
 /// an Annex B packet's own SPS, the same. With the flag set — Constrained
 /// Baseline, held to the Main profile's in-order slices — or the High
-/// profile, it is clean and anchors as before.
+/// profile, it is clean and anchors as before. An `avcC` record's own SPS
+/// entries, which FFmpeg's decoder reads, count as its header does: a High
+/// header over a Baseline SPS entry permits arbitrary slice order.
 #[test]
 fn a_stream_permitting_arbitrary_slice_order_has_no_clean_point_and_no_anchor() {
   let idr = slice(0x65, "1", "0001000");
@@ -888,6 +890,13 @@ fn a_stream_permitting_arbitrary_slice_order_has_no_clean_point_and_no_anchor() 
       !permits
     );
   }
+  let entry = [
+    1, 100, 0x00, 0x1e, 0xff, 0xe1, 0, 5, 0x67, 66, 0x80, 0x1e, 0xac, 0,
+  ];
+  assert!(
+    KeyframeRule::of(CodecId::H264.raw(), &entry).permits_aso(),
+    "a High header over a Baseline SPS entry: read off the entry"
+  );
 }
 
 /// LAW (Codex R13, [high]): **an HEVC packet is read by its base layer, a

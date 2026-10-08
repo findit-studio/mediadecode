@@ -124,6 +124,9 @@ use std::collections::VecDeque;
 /// Which keyframes a decoder can start at without losing a picture.
 mod access;
 
+/// How FFmpeg 9 reads an H.264 or HEVC parameter set.
+mod params;
+
 /// The most pictures the software road's queue of pictures waiting for
 /// delivery holds at once — a cheap second bound beside its byte budget
 /// ([`DecoderLimits::max_replay_bytes`]). The queue takes a fallback
@@ -2536,8 +2539,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       // random-access point, which owes no proof.
       Err(unprovable @ Error::ResyncUnprovable(_)) => Err(unprovable),
       // Nor is a refusal to open on unknown extradata: re-driven, it meets
-      // the same parameters until a packet carrying extradata is taken.
-      Err(unknown @ Error::ExtradataUnknown(_)) => Err(unknown),
+      // the same parameters until a packet carrying extradata is taken. Nor
+      // a packet's new extradata the decoder would not have applied whole:
+      // re-driven, the same record meets the same reading.
+      Err(unknown @ (Error::ExtradataUnknown(_) | Error::ExtradataRejected(_))) => Err(unknown),
       // Everything else really is the machinery failing, and keeps the
       // envelope — empty rescue set and all, which is what a
       // post-commit failure has to hand back.
@@ -4740,12 +4745,17 @@ impl NewExtradata {
   /// A copy of the extradata `pkt` carries ([`new_extradata`]), or `None`
   /// where it carries none. Refused before the packet goes anywhere, so the
   /// packet stays the caller's and nothing changes: where the allocation
-  /// fails, and, by name ([`Error::ParametersTooLarge`]), where the session's
+  /// fails; by name ([`Error::ParametersTooLarge`]) where the session's
   /// `parameters` with this extradata in place of theirs would hold more
   /// heap bytes than `max_parameter_bytes` allows — measured as the open's
   /// choke point measures them (`crate::decoder::build_codec_context`), which
   /// would refuse them at the next decoder the session opens on them: a
-  /// switch's, a post-commit fallback's, after the decoder serving is closed.
+  /// switch's, a post-commit fallback's, after the decoder serving is closed;
+  /// and by name ([`Error::ExtradataRejected`]) where the stream is H.264 and
+  /// FFmpeg's decoder would not apply the record whole
+  /// ([`params::h264_record`]) — it drops what its own reading answers, so
+  /// the session, and every decoder it opens later, would otherwise stand on
+  /// a record the decoder serving never adopted.
   fn of(
     pkt: &Packet,
     parameters: &Parameters,
@@ -4774,6 +4784,19 @@ impl NewExtradata {
       return Err(Error::ParametersTooLarge(
         crate::demuxer::ParametersTooLarge::new(0, projected, max_parameter_bytes),
       ));
+    }
+    // SAFETY: only the pointer is read, and the codec id as the 32-bit
+    // integer the field holds, never formed into a bindgen enum.
+    let h264 = unsafe {
+      let raw = parameters.as_ptr();
+      !raw.is_null()
+        && core::ptr::read(core::ptr::addr_of!((*raw).codec_id) as *const i32)
+          == crate::CodecId::H264.raw()
+    };
+    if h264 {
+      params::h264_record(extradata).map_err(|reason| {
+        Error::ExtradataRejected(crate::ExtradataRejected::new(crate::CodecId::H264, reason))
+      })?;
     }
     let Ok(size) = core::ffi::c_int::try_from(extradata.len()) else {
       return Err(Error::Ffmpeg(ffmpeg_next::Error::InvalidData));

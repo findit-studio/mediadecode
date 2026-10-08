@@ -186,6 +186,129 @@ pub enum Error {
   /// [`ExtradataUnknown`].
   #[error(transparent)]
   ExtradataUnknown(#[from] ExtradataUnknown),
+
+  /// A packet's `AV_PKT_DATA_NEW_EXTRADATA` is a record FFmpeg's decoder
+  /// would reject, or apply only in part, without saying so — so the packet
+  /// was refused before any decoder saw it, still the caller's; see
+  /// [`ExtradataRejected`].
+  #[error(transparent)]
+  ExtradataRejected(#[from] ExtradataRejected),
+}
+
+/// Payload for [`Error::ExtradataRejected`].
+///
+/// A packet carrying `AV_PKT_DATA_NEW_EXTRADATA` changes a stream's codec
+/// parameters from that packet on. FFmpeg's H.264 decoder applies the
+/// record as it begins to decode the packet and drops what
+/// `ff_h264_decode_extradata` answers (`h264_decode_frame`, FFmpeg 9's
+/// h264dec.c): a record it rejects — an `avcC` record shorter than seven
+/// bytes, one whose parameter set runs past its end — leaves the decoder on
+/// its old NAL length size and parameter sets, and a parameter set it
+/// cannot parse is skipped while the rest of the record applies. A session
+/// that took such a record as the stream's would read every later packet,
+/// and open every later decoder, on parameters the decoder serving never
+/// adopted. So the packet is refused before any decoder sees it: nothing of
+/// the session changes, and the packet is still the caller's — to send
+/// again without the record, or to drop.
+///
+/// The record is read as FFmpeg 9 reads it, its bit reader and parameter
+/// set parsers mirrored; a record whose verdict depends on what the decoder
+/// holds already — a picture parameter set referring to a sequence
+/// parameter set the record does not carry — is refused too, since this
+/// crate does not read that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+  "a packet's new extradata for {codec:?} was refused before any decoder saw it: {reason}; the \
+   decoder would have kept parameters other than the record's"
+)]
+pub struct ExtradataRejected {
+  codec: crate::CodecId,
+  reason: ExtradataRejection,
+}
+
+impl ExtradataRejected {
+  /// Constructs an [`ExtradataRejected`] payload.
+  #[inline]
+  pub const fn new(codec: crate::CodecId, reason: ExtradataRejection) -> Self {
+    Self { codec, reason }
+  }
+  /// The stream's codec.
+  #[inline]
+  pub const fn codec(&self) -> crate::CodecId {
+    self.codec
+  }
+  /// What FFmpeg would have made of the record.
+  #[inline]
+  pub const fn reason(&self) -> ExtradataRejection {
+    self.reason
+  }
+}
+
+/// Why a packet's new extradata was refused ([`ExtradataRejected`]): what
+/// FFmpeg's decoder would have made of the record instead of applying it
+/// whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ExtradataRejection {
+  /// An `avcC` record shorter than the seven bytes FFmpeg reads before its
+  /// first parameter set: rejected whole.
+  TooShort {
+    /// The record's length.
+    size: usize,
+  },
+  /// A parameter set whose length runs past the record: FFmpeg rejects the
+  /// record there, the sets before it applied and its NAL length size not.
+  Overrun(ParameterSet),
+  /// A parameter set FFmpeg fails to parse, read every way it reads one:
+  /// skipped, the decoder keeping the set it had of that id, while the rest
+  /// of the record applies.
+  Unparsed(ParameterSet),
+  /// A parameter set FFmpeg fails to parse that is too large for the
+  /// escaping retry it gives an `avcC` entry: the record rejected there.
+  Oversized(ParameterSet),
+  /// A picture parameter set referring to a sequence parameter set the
+  /// record does not carry: whether FFmpeg stores it depends on what the
+  /// decoder holds already.
+  Unresolved,
+}
+
+impl core::fmt::Display for ExtradataRejection {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    match self {
+      Self::TooShort { size } => write!(
+        f,
+        "an avcC record of {size} bytes, under the seven FFmpeg reads"
+      ),
+      Self::Overrun(set) => write!(f, "a {set} whose length runs past the record"),
+      Self::Unparsed(set) => write!(f, "a {set} FFmpeg fails to parse, and would skip"),
+      Self::Oversized(set) => write!(
+        f,
+        "a {set} FFmpeg fails to parse, too large for its escaping retry"
+      ),
+      Self::Unresolved => f.write_str(
+        "a picture parameter set referring to a sequence parameter set the record does not carry",
+      ),
+    }
+  }
+}
+
+/// A kind of parameter set a codec's extradata carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ParameterSet {
+  /// A sequence parameter set.
+  Sequence,
+  /// A picture parameter set.
+  Picture,
+}
+
+impl core::fmt::Display for ParameterSet {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.write_str(match self {
+      Self::Sequence => "sequence parameter set",
+      Self::Picture => "picture parameter set",
+    })
+  }
 }
 
 /// Payload for [`Error::ExtradataUnknown`].

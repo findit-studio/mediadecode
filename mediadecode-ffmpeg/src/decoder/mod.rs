@@ -1071,7 +1071,10 @@ impl VideoDecoder {
       | Error::ResyncUnprovable(_)
       // The session's open of a software decoder on its parameters; no
       // hardware funnel mints it either.
-      | Error::ExtradataUnknown(_) => VerdictRouting::Direct,
+      | Error::ExtradataUnknown(_)
+      // The session's reading of a packet's new extradata, before any
+      // decoder sees the packet.
+      | Error::ExtradataRejected(_) => VerdictRouting::Direct,
     }
   }
 

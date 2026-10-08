@@ -9255,3 +9255,164 @@ fn a_decoder_whose_output_carries_alpha_reads_as_decoding_an_auxiliary_layer() {
     assert_eq!(sw.outputs_alpha(), alpha, "{format:?}");
   }
 }
+
+/// The extradata `pkt` carries as `AV_PKT_DATA_NEW_EXTRADATA`, if any.
+fn new_extradata_of(pkt: &Packet) -> Option<Vec<u8>> {
+  super::new_extradata(pkt).map(<[u8]>::to_vec)
+}
+
+/// LAW (Codex R15, [high]): **a packet whose new extradata FFmpeg's H.264
+/// decoder would reject, or apply only in part, is refused by name before
+/// any decoder sees it, and nothing of the session changes.** A four-byte
+/// `avcC` x264 stream (High), its packet 5 — no keyframe — carrying as
+/// `AV_PKT_DATA_NEW_EXTRADATA` the five-byte record `01 42 00 1e fc`, which
+/// `ff_h264_decode_extradata` rejects (shorter than seven bytes) after
+/// marking the stream `avcC` and before its NAL length size or parameter
+/// sets — while `h264_decode_frame` drops its answer; or the stream's own
+/// record whose sequence parameter set's id reads as 32, which FFmpeg skips,
+/// the rest applied. On the software road (one thread) and on the hardware,
+/// probing, the send of 5 is refused as `ExtradataRejected`, naming the
+/// reason: no decoder took the packet, the parameters keep their record,
+/// nothing is provisional or unknown, no arbitrary slice order is read (the
+/// five-byte record claims Baseline). Sent again without the record, 5 is
+/// decoded under the old parameters, and every picture comes out as a
+/// straight decode gives it. A well-formed replacement — the record with a
+/// second copy of its PPS — is taken as before, the session's from then on.
+/// Without the refusal, the five-byte record was taken and became the
+/// session's parameters.
+#[test]
+fn a_new_extradata_ffmpeg_would_not_apply_whole_is_refused_before_any_decoder_sees_it() {
+  let (clip, sps, pps) = encode_h264_avcc(128, 96, 16);
+  let record = extradata_of(&clip.parameters);
+  let mut bad_sps = sps.clone();
+  // `seq_parameter_set_id` is the first field after the level byte: `00 00
+  // 01 00 1x...` reads a 32 through `get_ue_golomb_31`.
+  bad_sps[4] = 0x04;
+  let bad_record = avcc(&bad_sps, &pps, 4);
+  let mut replacement = record.clone();
+  let pps_count = 8 + sps.len();
+  replacement[pps_count] = 2;
+  replacement.extend_from_slice(&u16::try_from(pps.len()).expect("a short PPS").to_be_bytes());
+  replacement.extend_from_slice(&pps);
+  assert_eq!(
+    super::params::h264_record(&replacement),
+    Ok(()),
+    "the replacement is one FFmpeg applies whole"
+  );
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let mut straight: Vec<i64> = clip
+    .packets
+    .iter()
+    .map(|packet| packet.pts().expect("a pts"))
+    .collect();
+  straight.sort_unstable();
+  for (name, refused, reason) in [
+    (
+      "five bytes",
+      vec![0x01, 0x42, 0x00, 0x1e, 0xfc],
+      crate::ExtradataRejection::TooShort { size: 5 },
+    ),
+    (
+      "a sequence set FFmpeg skips",
+      bad_record.clone(),
+      crate::ExtradataRejection::Unparsed(crate::ParameterSet::Sequence),
+    ),
+  ] {
+    let carrying = with_new_extradata(clip.packets[5].clone(), &refused);
+    assert!(!carrying.is_key(), "5 is no keyframe");
+
+    // The software road.
+    let mut dec = FfmpegVideoStreamDecoder::open_as(
+      clip.parameters.clone(),
+      tb,
+      DecoderLimits::default().with_threads(crate::Threads::Single),
+      DecodePath::Software,
+    )
+    .expect("the software road opens");
+    let mut dst = crate::empty_owned_video_frame();
+    let mut delivered = Vec::new();
+    for av_pkt in &clip.packets[..5] {
+      sent_through(&mut dec, &mut dst, av_pkt);
+      delivered.extend(drained(&mut dec, &mut dst).0);
+    }
+    let taken = super::live_sw::sent();
+    match dec.send_packet(&pushed(&carrying)) {
+      Err(VideoDecodeError::Decode(Error::ExtradataRejected(rejected))) => {
+        assert_eq!(rejected.reason(), reason, "{name}: the reason");
+        assert_eq!(rejected.codec(), crate::CodecId::H264, "{name}: the codec");
+      }
+      other => panic!("{name}: the send of 5 is refused by name: {other:?}"),
+    }
+    assert_eq!(super::live_sw::sent(), taken, "{name}: no decoder took 5");
+    assert_eq!(
+      extradata_of(&dec.parameters),
+      record,
+      "{name}: the parameters keep their record"
+    );
+    assert!(
+      !dec.extradata_provisional_for_test() && dec.extradata_unknown_for_test().is_none(),
+      "{name}: nothing provisional, nothing unknown"
+    );
+    assert!(!dec.h264_aso, "{name}: no arbitrary slice order is read");
+    for av_pkt in &clip.packets[5..] {
+      sent_through(&mut dec, &mut dst, av_pkt);
+      delivered.extend(drained(&mut dec, &mut dst).0);
+    }
+    crate::accepted(dec.send_eof(), "send_eof");
+    delivered.extend(drained(&mut dec, &mut dst).0);
+    assert_eq!(
+      delivered.iter().map(|&(pts, _)| pts).collect::<Vec<_>>(),
+      straight,
+      "{name}: 5 sent again without the record decodes under the old parameters, every \
+       picture as a straight decode gives it"
+    );
+
+    // The hardware, probing.
+    let mut hw = FfmpegVideoStreamDecoder::from_hw_inner_for_test(
+      Box::new(FakeHw::never_failing(128, 96)),
+      clip.parameters.clone(),
+      tb,
+    )
+    .expect("build test decoder");
+    for av_pkt in &clip.packets[..5] {
+      crate::accepted(hw.send_packet(&pushed(av_pkt)), "send_packet");
+    }
+    assert!(
+      matches!(
+        hw.send_packet(&pushed(&carrying)),
+        Err(VideoDecodeError::Decode(Error::ExtradataRejected(rejected))) if rejected.reason() == reason
+      ),
+      "{name}: the hardware send is refused by name"
+    );
+    assert!(
+      hw.probe_extradata.is_none() && extradata_of(&hw.parameters) == record,
+      "{name}: nothing changes on the hardware road"
+    );
+  }
+
+  // A well-formed replacement is taken, and is the session's.
+  let mut dec = FfmpegVideoStreamDecoder::open_as(
+    clip.parameters.clone(),
+    tb,
+    DecoderLimits::default().with_threads(crate::Threads::Single),
+    DecodePath::Software,
+  )
+  .expect("the software road opens");
+  let mut dst = crate::empty_owned_video_frame();
+  for av_pkt in &clip.packets[..5] {
+    sent_through(&mut dec, &mut dst, av_pkt);
+    drained(&mut dec, &mut dst);
+  }
+  let carrying = with_new_extradata(clip.packets[5].clone(), &replacement);
+  assert_eq!(
+    new_extradata_of(&carrying).as_deref(),
+    Some(&replacement[..]),
+    "the packet carries the replacement"
+  );
+  sent_through(&mut dec, &mut dst, &carrying);
+  assert_eq!(
+    extradata_of(&dec.parameters),
+    replacement,
+    "a well-formed replacement is the session's once the decoder takes it"
+  );
+}
