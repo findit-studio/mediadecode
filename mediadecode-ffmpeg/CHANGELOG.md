@@ -170,7 +170,13 @@ The backend-agnostic core it adapts has its own log at
   not — and starts that picture: an H.264 slice whose `first_mb_in_slice`
   is 0, an HEVC slice segment whose `first_slice_segment_in_pic_flag` is set
   (a packet opening on a later slice of the picture, or on a unit cut inside
-  its slice header, is neither clean nor a resync anchor); and only when
+  its slice header, is neither clean nor a resync anchor) — and an H.264
+  stream whose sequence parameter set permits arbitrary slice order
+  (Baseline or Extended without `constraint_set1_flag`, read off the codec
+  parameters, a new extradata or a keyframe's own SPS) has no clean point
+  and no anchor at all, its slices' order vouching for no picture start: it
+  returns to the session's threads only at a seek, a post-commit fallback's
+  gap ends escalated, and a warning says so once; and only when
   every NAL unit in it parses whole: a four-byte start
   code read whole and the zero bytes after a unit (`trailing_zero_8bits`)
   stripped from it, every header byte present and valid (H.264's and HEVC's

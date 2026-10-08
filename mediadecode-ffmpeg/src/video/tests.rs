@@ -7594,3 +7594,94 @@ fn an_intra_only_codec_switches_at_the_very_next_packet_and_loses_nothing() {
     );
   }
 }
+
+/// An H.264 clip from `libx264`'s Baseline profile — an IDR every 8 frames,
+/// no B-frames, its SPS and PPS repeated before every IDR — as encoded,
+/// Constrained Baseline (`constraint_set1_flag` set), or, with
+/// `arbitrary_slice_order`, with that flag cleared in every SPS: a stream
+/// whose SPS permits arbitrary slice order.
+fn encode_h264_baseline(
+  width: u32,
+  height: u32,
+  frames: usize,
+  arbitrary_slice_order: bool,
+) -> SyntheticClip {
+  use ffmpeg_next as ff;
+  ff::init().expect("ffmpeg init");
+  let codec = ff::codec::encoder::find_by_name("libx264").expect("libx264 is linked");
+  let mut options = ff::Dictionary::new();
+  options.set("profile", "baseline");
+  options.set(
+    "x264-params",
+    "keyint=8:min-keyint=8:scenecut=0:log-level=error",
+  );
+  let clip = encode_clip(codec, width, height, frames, options, |_| {});
+  if !arbitrary_slice_order {
+    return clip;
+  }
+  let packets = clip
+    .packets
+    .iter()
+    .map(|packet| {
+      let units = annexb_units(packet.data().expect("a payload"));
+      let mut bytes = Vec::new();
+      for unit in units {
+        let mut unit = unit.to_vec();
+        if unit[0] & 0x1f == 7 {
+          assert_eq!(unit[1], 66, "a Baseline SPS");
+          assert_ne!(unit[2] & 0x40, 0, "as encoded, Constrained Baseline");
+          unit[2] &= !0x40;
+        }
+        bytes.extend_from_slice(&[0, 0, 0, 1]);
+        bytes.extend_from_slice(&unit);
+      }
+      repacked(packet, &bytes)
+    })
+    .collect();
+  SyntheticClip {
+    parameters: clip.parameters.clone(),
+    packets,
+  }
+}
+
+/// LAW (Codex R13, [high]): **a stream whose sequence parameter set permits
+/// arbitrary slice order never switches at a keyframe and never anchors a
+/// resync.** An x264 Baseline stream, its SPS before every IDR, as encoded
+/// (Constrained Baseline) and with `constraint_set1_flag` cleared in every
+/// SPS. On a probe-era fallback at 3 on three threads the first switches at
+/// its IDR 8 and the second stays on one thread to the end; through a
+/// post-commit failure at that IDR — its SPS and PPS with it, what a cold
+/// decoder of this stream needs — the first resyncs at 8 and ends clean,
+/// the second anchors nothing and its end escalates by name. Reading the MB-0
+/// slice alone, the second switched and resynced at slices its stream's
+/// order does not vouch for.
+#[test]
+fn a_stream_permitting_arbitrary_slice_order_never_switches_or_anchors() {
+  let three = core::num::NonZeroU32::new(3).expect("nonzero");
+  for (arbitrary, name) in [(false, "Constrained Baseline"), (true, "Baseline")] {
+    let clip = encode_h264_baseline(128, 96, 16, arbitrary);
+    assert!(clip.packets[8].is_key(), "an IDR at 8");
+    let (_, threads_after) = threads_through_a_fallback(&clip, 3, crate::Threads::Count(three));
+    assert_eq!(
+      threads_after[8],
+      if arbitrary {
+        Some(core::num::NonZeroU32::MIN)
+      } else {
+        Some(three)
+      },
+      "{name}: the switch at the IDR 8 fires {}: {threads_after:?}",
+      !arbitrary
+    );
+    let (_, delivered, escalated) = through_a_post_commit_failure(&clip, 8);
+    assert_eq!(
+      escalated, arbitrary,
+      "{name}: the end escalates {arbitrary}: {delivered:?}"
+    );
+    assert_eq!(
+      delivered.iter().any(|&(_, open)| !open),
+      !arbitrary,
+      "{name}: a picture closes the gap {}: {delivered:?}",
+      !arbitrary
+    );
+  }
+}

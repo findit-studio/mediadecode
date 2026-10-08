@@ -261,6 +261,12 @@ pub struct CarrierVideoStreamDecoder<C: crate::FfmpegCarrier> {
   /// new extradata is read, and opened on, under that. A probe-era
   /// fallback's replay sets it from the history it replays.
   extradata_unknown: Option<ffmpeg_next::Error>,
+  /// `true` once an H.264 sequence parameter set the session read — in its
+  /// codec parameters, in a new extradata, among the units of a keyframe —
+  /// permits arbitrary slice order (`access::KeyframeRule::H264`). For good:
+  /// from then on no H.264 packet is clean or anchors, so no switch fires and
+  /// an open post-commit gap ends escalated by name; said once ([`Self::note_sps`]).
+  h264_aso: bool,
   /// HW-side scratch frame (filled by [`VideoDecoder::receive_frame`]).
   hw_scratch: Frame,
   /// SW-side scratch frame (filled by `ffmpeg::decoder::Video::receive_frame`).
@@ -1091,6 +1097,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       parameters: owned_parameters,
       probe_extradata: None,
       extradata_unknown: None,
+      h264_aso: false,
       hw_scratch,
       sw_scratch,
       sw_replay_frames: ReplayQueue::default(),
@@ -1957,7 +1964,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       } else {
         core::slice::from_raw_parts(data, size)
       };
-      access::KeyframeRule::of(self.codec_id(), extradata)
+      access::KeyframeRule::of(self.codec_id(), extradata).permitting_aso(self.h264_aso)
     }
   }
 
@@ -1972,7 +1979,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// frame the packet's units either way.
   fn rule_for(&self, pkt: &Packet) -> Option<access::KeyframeRule> {
     match new_extradata(pkt) {
-      Some(extradata) => Some(access::KeyframeRule::of(self.codec_id(), extradata)),
+      Some(extradata) => {
+        Some(access::KeyframeRule::of(self.codec_id(), extradata).permitting_aso(self.h264_aso))
+      }
       None => {
         let rule = self.keyframe_rule();
         (self.extradata_unknown.is_none() || !rule.reads_extradata()).then_some(rule)
@@ -1991,6 +2000,34 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
         return crate::CodecId::NONE.raw();
       }
       core::ptr::read(core::ptr::addr_of!((*raw).codec_id) as *const i32)
+    }
+  }
+
+  /// Reads the H.264 sequence parameter sets `pkt` brings — in a new
+  /// extradata it carries, and, for a keyframe, among its own units — and
+  /// the active extradata's, for one that permits arbitrary slice order
+  /// ([`Self::h264_aso`]); says so the first time, naming the reason. Every
+  /// packet the session is sent passes here before any road takes it, so a
+  /// sequence parameter set the hardware decoded is read as one the software
+  /// road would decode.
+  fn note_sps(&mut self, pkt: &Packet) {
+    if self.h264_aso || self.codec_id() != crate::CodecId::H264.raw() {
+      return;
+    }
+    let rule = match new_extradata(pkt) {
+      Some(extradata) => access::KeyframeRule::of(self.codec_id(), extradata),
+      None => self.keyframe_rule(),
+    };
+    let in_band = pkt.is_key() && pkt.data().is_some_and(|data| rule.units_permit_aso(data));
+    if rule.permits_aso() || in_band {
+      self.h264_aso = true;
+      tracing::warn!(
+        reason = rule.permitting_aso(true).reason(),
+        "mediadecode-ffmpeg: this H.264 stream's sequence parameter set permits arbitrary slice \
+         order (Baseline or Extended, without constraint_set1_flag); no keyframe of it is read \
+         as a clean point or a resync anchor, so the session returns to its threads only at a \
+         seek, and a post-commit fallback's gap ends escalated",
+      );
     }
   }
 
@@ -2667,6 +2704,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       parameters: owned_parameters,
       probe_extradata: None,
       extradata_unknown: None,
+      h264_aso: false,
       hw_scratch: Frame::empty()?,
       sw_scratch: alloc_av_video_frame()?,
       sw_replay_frames: ReplayQueue::default(),
@@ -2909,6 +2947,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       self.install_probe_extradata();
     }
     boundary::with_ffmpeg_video_packet::<C, _>(packet, limits, route, |av_pkt| {
+      self.note_sps(av_pkt);
       // The extradata a packet for the hardware carries, copied before it
       // sees the packet: the stream's once it takes it.
       let extradata = if matches!(self.state, DecodeState::Hw(_)) {

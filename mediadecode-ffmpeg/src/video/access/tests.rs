@@ -347,7 +347,8 @@ fn millions_of_tiny_units_are_classified_without_allocating() {
   assert_eq!(
     one_byte,
     KeyframeRule::H264 {
-      nal_length: Some(1)
+      nal_length: Some(1),
+      aso: false,
     }
   );
   let mut length_prefixed_au = Vec::with_capacity(UNITS * 2 + 3);
@@ -732,7 +733,14 @@ fn an_approximate_recovery_point_anchors_and_its_flags_are_read() {
 #[test]
 fn a_resync_is_proved_by_withheld_output_on_h264_and_by_the_reorder_bound_elsewhere() {
   for nal_length in [None, Some(4)] {
-    assert_eq!(KeyframeRule::H264 { nal_length }.proof(), Proof::Withheld);
+    assert_eq!(
+      KeyframeRule::H264 {
+        nal_length,
+        aso: false
+      }
+      .proof(),
+      Proof::Withheld
+    );
   }
   for rule in [
     KeyframeRule::Hevc { nal_length: None },
@@ -766,7 +774,10 @@ fn a_clean_point_and_an_anchor_start_a_picture() {
   let starts = slice(0x65, "1", "0001000");
   let continues = slice(0x65, "00110", "0001000");
   for nal_length in [None, Some(4)] {
-    let h264 = KeyframeRule::H264 { nal_length };
+    let h264 = KeyframeRule::H264 {
+      nal_length,
+      aso: false,
+    };
     let pack = |units: &[&[u8]]| match nal_length {
       None => annex_b(units),
       Some(_) => length_prefixed(units),
@@ -819,5 +830,54 @@ fn a_clean_point_and_an_anchor_start_a_picture() {
         "{hevc:?}: type {kind} whose first segment has first_slice_segment_in_pic_flag 0"
       );
     }
+  }
+}
+
+/// LAW (Codex R13, [high]): **an H.264 stream whose sequence parameter set
+/// permits arbitrary slice order has no clean point and no anchor.** The
+/// Baseline (66) and Extended (88) profiles let a picture's slices come in
+/// any order, so the slice holding macroblock 0 can follow another slice of
+/// its picture: an IDR split across packets can put a later slice at the
+/// head of one packet and macroblock 0's at the head of the next, which the
+/// MB-0 proof alone took for a picture start. Read off an `avcC` record's
+/// profile bytes, an IDR starting its picture is neither clean nor an
+/// anchor for Baseline or Extended without `constraint_set1_flag`; read off
+/// an Annex B packet's own SPS, the same. With the flag set — Constrained
+/// Baseline, held to the Main profile's in-order slices — or the High
+/// profile, it is clean and anchors as before.
+#[test]
+fn a_stream_permitting_arbitrary_slice_order_has_no_clean_point_and_no_anchor() {
+  let idr = slice(0x65, "1", "0001000");
+  let cases = [
+    (66u8, 0x80u8, true, "Baseline"),
+    (66, 0xc0, false, "Constrained Baseline"),
+    (88, 0x00, true, "Extended"),
+    (88, 0x40, false, "Extended held to Main"),
+    (100, 0x00, false, "High"),
+  ];
+  for (profile, flags, permits, name) in cases {
+    let avcc = KeyframeRule::of(
+      CodecId::H264.raw(),
+      &[1, profile, flags, 0x1e, 0xff, 0xe1, 0],
+    );
+    let au = length_prefixed(&[&idr[..]]);
+    assert_eq!(
+      (avcc.is_clean(&au), avcc.anchor(&au).is_some()),
+      (!permits, !permits),
+      "{name}, read off the avcC record: clean and anchoring {}",
+      !permits
+    );
+    let annex_b_rule = KeyframeRule::of(CodecId::H264.raw(), &[]);
+    let sps = [0x67, profile, flags, 0x1e, 0xac];
+    let au = annex_b(&[&sps[..], &[0x68, 0xce], &idr[..]]);
+    assert_eq!(
+      (
+        annex_b_rule.is_clean(&au),
+        annex_b_rule.anchor(&au).is_some()
+      ),
+      (!permits, !permits),
+      "{name}, read off the packet's own SPS: clean and anchoring {}",
+      !permits
+    );
   }
 }

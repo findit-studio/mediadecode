@@ -33,9 +33,17 @@ pub(crate) enum KeyframeRule {
   /// picture, whose leading slices a decoder started there never sees. Its
   /// NAL units are length-prefixed by `nal_length` bytes (`avcC`), or
   /// start-coded (Annex B) when `None`.
+  ///
+  /// A stream whose sequence parameter set permits arbitrary slice order
+  /// (`aso`) is read as having neither clean points nor anchors: its slices
+  /// may come in any order, so the one holding macroblock 0 proves nothing
+  /// about the slices before it.
   H264 {
     /// The NAL length field's width, from the `avcC` record.
     nal_length: Option<usize>,
+    /// Whether the stream's sequence parameter set permits arbitrary slice
+    /// order ([`sps_permits_aso`]).
+    aso: bool,
   },
   /// HEVC: clean when its first picture is an IDR or a BLA (NAL types
   /// 16–20) whose first slice segment starts it
@@ -78,7 +86,15 @@ impl KeyframeRule {
       // its version byte, 1.
       let nal_length = (extradata.first() == Some(&1) && extradata.len() >= 5)
         .then(|| usize::from(extradata[4] & 3) + 1);
-      Self::H264 { nal_length }
+      // An `avcC` record repeats its SPS's profile and constraint bytes in
+      // its own header; Annex B extradata carries the SPS units themselves.
+      let aso = match nal_length {
+        Some(_) => extradata
+          .get(1..3)
+          .is_some_and(|profile| sps_permits_aso(profile[0], profile[1])),
+        None => h264_units_permit_aso(extradata, None),
+      };
+      Self::H264 { nal_length, aso }
     } else if codec_id == CodecId::HEVC.raw() {
       // FFmpeg's own test (`hevc_decode_extradata`): extradata that does
       // not open with a start code is an `hvcC` record.
@@ -110,7 +126,9 @@ impl KeyframeRule {
   /// picture's unit decides, and it must START its picture
   /// ([`h264_slice_starts_picture`], [`hevc_segment_starts_picture`]): a
   /// packet that opens on a later slice of a picture, or whose first
-  /// picture's unit is cut before its slice header says so, is not clean.
+  /// picture's unit is cut before its slice header says so, is not clean. An
+  /// H.264 stream whose sequence parameter set permits arbitrary slice order
+  /// — the rule's (`aso`), or one the packet carries — has no clean point.
   ///
   /// The units are walked one at a time ([`NalUnits`]) and never collected,
   /// so the memory a packet costs here does not grow with how many units it
@@ -118,8 +136,12 @@ impl KeyframeRule {
   /// entry per unit.
   pub(crate) fn is_clean(self, data: &[u8]) -> bool {
     match self {
-      Self::H264 { nal_length } => first_h264_picture(data, nal_length)
-        .is_some_and(|(kind, unit)| kind == 5 && h264_slice_starts_picture(unit)),
+      Self::H264 { nal_length, aso } => {
+        !aso
+          && !h264_units_permit_aso(data, nal_length)
+          && first_h264_picture(data, nal_length)
+            .is_some_and(|(kind, unit)| kind == 5 && h264_slice_starts_picture(unit))
+      }
       Self::Hevc { nal_length } => first_hevc_picture(data, nal_length)
         .is_some_and(|(kind, unit)| (16..=20).contains(&kind) && hevc_segment_starts_picture(unit)),
       Self::Mpeg12 => closed_gop(data),
@@ -140,6 +162,37 @@ impl KeyframeRule {
     matches!(self, Self::H264 { .. } | Self::Hevc { .. })
   }
 
+  /// Whether this H.264 rule's stream permits arbitrary slice order (`aso`).
+  pub(crate) const fn permits_aso(self) -> bool {
+    matches!(self, Self::H264 { aso: true, .. })
+  }
+
+  /// This rule, for an H.264 stream, with arbitrary slice order permitted
+  /// where `aso` says a sequence parameter set the session read elsewhere
+  /// permits it; any other rule as it is.
+  pub(crate) const fn permitting_aso(self, aso: bool) -> Self {
+    match self {
+      Self::H264 {
+        nal_length,
+        aso: own,
+      } => Self::H264 {
+        nal_length,
+        aso: own || aso,
+      },
+      other => other,
+    }
+  }
+
+  /// Whether `data`, an H.264 packet read under this rule's packing, carries
+  /// a sequence parameter set that permits arbitrary slice order; `false`
+  /// under any other rule.
+  pub(crate) fn units_permit_aso(self, data: &[u8]) -> bool {
+    match self {
+      Self::H264 { nal_length, .. } => h264_units_permit_aso(data, nal_length),
+      _ => false,
+    }
+  }
+
   /// What the key-flagged packet `data` is as a post-commit resync anchor:
   /// `Some` where the bitstream proves it a random-access point, where the
   /// codec lets this crate read it; `None` otherwise, whatever its flag
@@ -156,7 +209,8 @@ impl KeyframeRule {
   ///   non-IDR intra picture resets no reference, H.264 lets the pictures
   ///   after it reference what the decoder never saw until the signalled
   ///   recovery point, and FFmpeg's parser flags some such pictures key by
-  ///   heuristic.
+  ///   heuristic. A stream whose sequence parameter set permits arbitrary
+  ///   slice order has no anchor ([`Self::is_clean`]).
   /// - **HEVC:** the first picture's NAL unit is an IRAP picture (16–23), a
   ///   CRA (21) among them, whose first slice segment starts it
   ///   ([`hevc_segment_starts_picture`]): the decoder resyncing kept its
@@ -176,7 +230,10 @@ impl KeyframeRule {
       recovery,
     };
     match self {
-      Self::H264 { nal_length } => {
+      Self::H264 { nal_length, aso } => {
+        if aso || h264_units_permit_aso(data, nal_length) {
+          return None;
+        }
         let (kind, unit) = first_h264_picture(data, nal_length)?;
         if !h264_slice_starts_picture(unit) {
           return None;
@@ -231,6 +288,9 @@ impl KeyframeRule {
   /// session gives when a fallback has run on one thread for a minute.
   pub(crate) const fn reason(self) -> &'static str {
     match self {
+      Self::H264 { aso: true, .. } => {
+        "its sequence parameter set permits arbitrary slice order, so no slice proves it starts its picture"
+      }
       Self::H264 { .. } => {
         "its keyframes are recovery points rather than IDR pictures, and pictures after them may reference the GOP before"
       }
@@ -392,12 +452,40 @@ fn first_hevc_picture(data: &[u8], nal_length: Option<usize>) -> Option<(u8, &[u
 /// macroblock. A later slice of the picture (what opens a packet that holds
 /// the rest of a picture split across packets), or a unit cut before its
 /// slice type, does not: a decoder started there would never see the slices
-/// before it. A stream coded with arbitrary slice order, whose picture may
-/// open on another slice, is read as starting none — never clean, never an
-/// anchor.
+/// before it. That macroblock 0 is in the first slice holds where the
+/// stream's slices come in order, which every profile but those permitting
+/// arbitrary slice order requires ([`sps_permits_aso`]).
 fn h264_slice_starts_picture(unit: &[u8]) -> bool {
   let mut bits = RbspBits::new(unit.get(1..).unwrap_or_default());
   bits.ue() == Some(0) && bits.ue().is_some_and(|slice_type| slice_type <= 9)
+}
+
+/// Whether an H.264 sequence parameter set with `profile_idc` and the
+/// `constraint_set` flags byte `constraint_flags` after it permits arbitrary
+/// slice order: the Baseline (66) and Extended (88) profiles allow a
+/// picture's slices in any order — the slice holding macroblock 0 may follow
+/// another slice of its picture — unless `constraint_set1_flag` holds the
+/// stream to the Main profile's constraints, in-order slices among them
+/// (Constrained Baseline). Every other profile requires them in order.
+const fn sps_permits_aso(profile_idc: u8, constraint_flags: u8) -> bool {
+  matches!(profile_idc, 66 | 88) && constraint_flags & 0x40 == 0
+}
+
+/// Whether any of `data`'s H.264 NAL units — length-prefixed by
+/// `nal_length` bytes, or start-coded when `None` — is a sequence parameter
+/// set (7) that permits arbitrary slice order ([`sps_permits_aso`]). Its
+/// profile and constraint bytes follow the unit's header byte; the first is
+/// never zero where it matters, so no emulation prevention byte stands
+/// between them. Units that do not parse prove nothing either way.
+fn h264_units_permit_aso(data: &[u8], nal_length: Option<usize>) -> bool {
+  NalUnits::new(data, nal_length)
+    .filter_map(Result::ok)
+    .any(|unit| match unit {
+      [header, profile_idc, constraint_flags, ..] => {
+        header & 0x1f == 7 && sps_permits_aso(*profile_idc, *constraint_flags)
+      }
+      _ => false,
+    })
 }
 
 /// Whether the HEVC slice segment whose NAL unit is `unit` starts its
