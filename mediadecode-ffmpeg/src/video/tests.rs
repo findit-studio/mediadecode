@@ -7941,18 +7941,20 @@ fn a_flush_before_the_hardware_reads_a_new_extradata_leaves_it_unknown() {
   }
 }
 
-/// LAW (pre-R14 row 1): **on the software road too, a new extradata is
-/// provisional until the decoder is seen to read its packet, and a flush
-/// then leaves it unknown.** The R11 stream through a probe-era fallback at
-/// 10: the decoder serving takes the IDR 16 and its two-byte record (on
-/// three threads, the decoder the switch at 16 opens), then the caller
-/// seeks. Seen read — the decoder answered "needs input" after it, or, one
-/// thread decoding what each submission hands it inside it, took 17 into
-/// an input slot it takes packets into only empty — the record stays known.
-/// Not seen read — nothing after 16, or only 17 taken by a frame-threaded
-/// decoder, whose taking it says nothing of a thread having decoded 16 —
-/// the flush leaves it unknown. Taken for good at the acceptance, every
-/// case read known.
+/// LAW (pre-R14 row 1; restated by Codex R14, [high]): **on the software
+/// road too, a new extradata is provisional until the decoder is seen to
+/// read its packet, and a flush then leaves it unknown.** The R11 stream
+/// through a probe-era fallback at 10: the decoder serving takes the IDR 16
+/// and its two-byte record (on three threads, the decoder the switch at 16
+/// opens), then the caller seeks. Seen read — one thread, decoding what a
+/// call hands it inside that call, answered "needs input" after it, or took
+/// 17 into an input slot it takes packets into only empty; on three threads,
+/// the drain reached the end — the record stays known. Not seen read —
+/// nothing after 16; on three threads 17 taken, or a drain to "needs
+/// input", which a frame-threaded decoder answers once a worker has the
+/// packet, decoded or not — the flush leaves it unknown. Taken for good at
+/// the acceptance, every case read known; read at a frame-threaded "needs
+/// input", the drain read it known.
 #[test]
 fn a_flush_before_the_software_decoder_reads_a_new_extradata_leaves_it_unknown() {
   #[derive(Clone, Copy, Debug)]
@@ -7960,6 +7962,7 @@ fn a_flush_before_the_software_decoder_reads_a_new_extradata_leaves_it_unknown()
     Nothing,
     Packet,
     Drain,
+    End,
   }
   let (clip, change) = encode_h264_avcc_whose_length_size_changes(128, 96, 32);
   let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
@@ -7969,7 +7972,8 @@ fn a_flush_before_the_software_decoder_reads_a_new_extradata_leaves_it_unknown()
     (crate::Threads::Single, After::Packet, false),
     (crate::Threads::Single, After::Drain, false),
     (crate::Threads::Count(three), After::Packet, true),
-    (crate::Threads::Count(three), After::Drain, false),
+    (crate::Threads::Count(three), After::Drain, true),
+    (crate::Threads::Count(three), After::End, false),
   ] {
     let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test(
       Box::new(FakeHw::failing(128, 96, 0, 10, FailShape::ProbeEra)),
@@ -7991,6 +7995,10 @@ fn a_flush_before_the_software_decoder_reads_a_new_extradata_leaves_it_unknown()
       After::Drain => {
         drained(&mut dec, &mut dst);
       }
+      After::End => {
+        crate::accepted(dec.send_eof(), "send_eof");
+        drained(&mut dec, &mut dst);
+      }
     }
     dec.flush().expect("a seek");
     assert_eq!(
@@ -7998,6 +8006,147 @@ fn a_flush_before_the_software_decoder_reads_a_new_extradata_leaves_it_unknown()
       unknown.then_some(crate::ExtradataDoubt::Flushed),
       "{threads:?}, {after:?} after 16: what the flush leaves"
     );
+  }
+}
+
+/// LAW (Codex R14, [high]): **"needs input" shows a packet read only on a
+/// decoder that decodes in step; the end shows it on every decoder.** The
+/// witness, over scripted answers: the end, in step or not, reads every
+/// packet the decoder took; "needs input" does in step, and not on a
+/// frame-threaded decoder (or one that wraps another), which answers it
+/// once a worker has the packet; a picture never does. Read as in step on
+/// frame threads, "needs input" marked a packet no worker had decoded read.
+#[test]
+fn needs_input_shows_a_packet_read_only_on_a_decoder_that_decodes_in_step() {
+  use super::read_every_packet;
+  for (status, in_step, read) in [
+    (Received::Ended, true, true),
+    (Received::Ended, false, true),
+    (Received::NeedsInput, true, true),
+    (Received::NeedsInput, false, false),
+    (Received::Frame, true, false),
+    (Received::Frame, false, false),
+  ] {
+    assert_eq!(
+      read_every_packet(status, in_step),
+      read,
+      "{status:?}, in step {in_step}"
+    );
+  }
+}
+
+/// An `hvcC` record FFmpeg cannot read: its one array's one unit claims 64
+/// bytes the record does not hold ("Invalid NAL unit size in extradata",
+/// `ff_hevc_decode_extradata`).
+fn malformed_hvcc() -> Vec<u8> {
+  let mut record = vec![1u8; 23];
+  record[21] = 0x03;
+  record[22] = 1;
+  record.extend_from_slice(&[0x20, 0x00, 0x01, 0x00, 0x40]);
+  record
+}
+
+/// LAW (Codex R14, [high]): **on frame threads, a new extradata stays
+/// provisional through "needs input", and an error after it leaves it
+/// unknown; the end reads it.** FFmpeg 9 hands each packet to a worker and,
+/// while not every thread has one, answers "needs input" without waiting for
+/// it (`submit_packet`, `ff_thread_receive_frame`). Sessions on three
+/// threads of FFmpeg's own decoders: the R11 H.264 stream's IDR 16, its
+/// two-byte record intact and its body corrupted, which `h264` reports
+/// invalid — `h264_decode_frame` applies a packet's record and ignores the
+/// record's own failure, so a body is what fails an H.264 packet — and an
+/// HEVC stream's packet 10 carrying a malformed `hvcC` record, which
+/// `hevc_receive_frame` fails to apply and so fails the packet. After each
+/// one's send the drain answers "needs input" with the record still
+/// provisional; the drain of the end reports the worker's error, and the
+/// record is unknown (`Reported(InvalidData)`). The H.264 stream whole:
+/// provisional after "needs input", known at the end. Read at a
+/// frame-threaded "needs input", the record was known before any worker had
+/// decoded its packet, and the error after left it so.
+#[test]
+fn on_frame_threads_a_new_extradata_stays_provisional_until_the_end() {
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let three = core::num::NonZeroU32::new(3).expect("nonzero");
+  let (h264, change) = encode_h264_avcc_whose_length_size_changes(128, 96, 32);
+  let mut corrupt = h264.packets.clone();
+  corrupt[change] = with_corrupt_body(&h264.packets[change]);
+  let hevc = encode_hevc_idr_with_headers(128, 96, 24);
+  let malformed_at = 10;
+  assert!(
+    !hevc.packets[malformed_at].is_key(),
+    "the HEVC packet is no keyframe"
+  );
+  let mut malformed = hevc.packets.clone();
+  malformed[malformed_at] =
+    with_new_extradata(hevc.packets[malformed_at].clone(), &malformed_hvcc());
+  for (name, parameters, packets, at, fails) in [
+    (
+      "h264, its body corrupted",
+      &h264.parameters,
+      &corrupt,
+      change,
+      true,
+    ),
+    (
+      "h264, whole",
+      &h264.parameters,
+      &h264.packets,
+      change,
+      false,
+    ),
+    (
+      "hevc, its record malformed",
+      &hevc.parameters,
+      &malformed,
+      malformed_at,
+      true,
+    ),
+  ] {
+    let mut dec = FfmpegVideoStreamDecoder::open_as(
+      parameters.clone(),
+      tb,
+      DecoderLimits::default().with_threads(crate::Threads::Count(three)),
+      DecodePath::Software,
+    )
+    .expect("the software road opens");
+    assert_eq!(dec.active_threads(), Some(three), "{name}: frame threads");
+    let mut dst = crate::empty_owned_video_frame();
+    let mut log = Vec::new();
+    for av_pkt in &packets[..=at] {
+      crate::accepted(dec.send_packet(&pushed(av_pkt)), "send_packet");
+      answered(&mut dec, &mut dst, &mut log);
+    }
+    assert_eq!(
+      log.last(),
+      Some(&Answer::NeedsInput),
+      "{name}: the drain after {at} answers \"needs input\""
+    );
+    assert!(
+      dec.extradata_provisional_for_test(),
+      "{name}: the record is still provisional"
+    );
+    assert_eq!(
+      dec.extradata_unknown_for_test(),
+      None,
+      "{name}: not unknown yet"
+    );
+    crate::accepted(dec.send_eof(), "send_eof");
+    answered(&mut dec, &mut dst, &mut log);
+    assert_eq!(log.last(), Some(&Answer::Ended), "{name}: the end");
+    if fails {
+      assert_eq!(
+        dec.extradata_unknown_for_test(),
+        Some(crate::ExtradataDoubt::Reported(
+          ffmpeg_next::Error::InvalidData
+        )),
+        "{name}: the error after it leaves the record unknown: {log:?}"
+      );
+    } else {
+      assert!(
+        !dec.extradata_provisional_for_test() && dec.extradata_unknown_for_test().is_none(),
+        "{name}: the end reads the record: {log:?}"
+      );
+    }
   }
 }
 

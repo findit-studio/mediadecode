@@ -277,15 +277,17 @@ pub struct CarrierVideoStreamDecoder<C: crate::FfmpegCarrier> {
   /// later call: when a picture it decoded earlier still waits to be
   /// received, or a frame thread holds results to hand out first. A picture
   /// coming out proves nothing, since it can be that waiting one. What does:
-  /// the decoder answering "needs input" or the end, which it does only with
-  /// its input slot empty; a later packet taken by a decoder that decodes
-  /// what a submission hands it inside that submission
-  /// ([`SwDecoder::decodes_in_step`]; the hardware), which libavcodec takes
-  /// only into an empty slot; a decoder opened on the parameters in place of
-  /// the one that took it. A flush while it is set drops the packet unread
-  /// — the decoder kept, its framing the one before — and an error reported
-  /// while it is set may be that packet's own (FFmpeg's HEVC decoder reports
-  /// there a new extradata it could not parse): either leaves the extradata
+  /// the decoder answering the end; the decoder answering "needs input",
+  /// which it does with its input slot empty, where it decodes what a call
+  /// hands it inside that call ([`SwDecoder::decodes_in_step`]; the
+  /// hardware) — a frame-threaded decoder answers it as soon as a worker has
+  /// the packet, decoded or not ([`read_every_packet`]); a later packet
+  /// taken by a decoder that decodes in step, which libavcodec takes only
+  /// into an empty slot; a decoder opened on the parameters in place of the
+  /// one that took it. A flush while it is set drops the packet unread — the
+  /// decoder kept, its framing the one before — and an error reported while
+  /// it is set may be that packet's own (FFmpeg's HEVC decoder reports there
+  /// a new extradata it could not parse): either leaves the extradata
   /// unknown ([`Self::extradata_unknown`]).
   extradata_provisional: bool,
   /// `true` once an H.264 sequence parameter set the session read — in its
@@ -1612,6 +1614,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     // Commit: only after replay, any EOF forwarding, AND the final drain
     // succeeded — or the queue reached its budget first — do we move the
     // new SW decoder and queue into `self`.
+    let in_step = sw.decodes_in_step();
     self.sw_replay_frames.append(&mut local_replay);
     self.state = DecodeState::Sw(sw);
     // The history was replayed from the parameters it started on, its own
@@ -1628,8 +1631,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       None => false,
     };
     // A replay whose decoder answered "needs input" last has read every
-    // packet it took; one the budget stopped may hold its last unread.
-    self.extradata_provisional = installed && drained == Drained::Full;
+    // packet it took where it decodes in step ([`read_every_packet`]); one
+    // the budget stopped may hold its last unread.
+    self.extradata_provisional = installed && !(drained == Drained::Empty && in_step);
     self.sw_threads_pending = self.session_threads_run();
     self.pending_eof = eof_pending && !progress.eof_sent;
     // A drain the budget stopped: the decoder may hold more of the replay's
@@ -1671,6 +1675,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     let DecodeState::Sw(sw) = &mut self.state else {
       return Ok(true);
     };
+    let in_step = sw.decodes_in_step();
     let mut progress = Replay::default();
     let replayed = replay_history(
       sw,
@@ -1685,10 +1690,11 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     // A packet the decoder took, the failing one among them where its
     // refusal says the decoder decoded it: its new extradata, if it carried
     // one, is the active one — read once the decoder answered "needs input"
-    // last, provisional if the budget stopped it first; a failing one whose
-    // refusal does not say — a decode error among them — leaves it unknown,
-    // as does an error the round met while one was provisional.
-    let settled = matches!(replayed, Ok(Drained::Empty));
+    // last, on a decoder that decodes in step ([`read_every_packet`]),
+    // provisional otherwise; a failing one whose refusal does not say — a
+    // decode error among them — leaves it unknown, as does an error the
+    // round met while one was provisional.
+    let settled = matches!(replayed, Ok(Drained::Empty)) && in_step;
     if let Some(extradata) = progress.extradata.take() {
       self.took_extradata(extradata, false, settled);
     } else if settled {
@@ -3537,10 +3543,13 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
             Err(e) => match crate::decoder::software_receive(sw.funnel(e, phase), e, phase) {
               Ok(status) => {
                 // Nothing is ready: the decoder holds no picture the caller
-                // has not taken, and its input slot is empty — it has read
-                // every packet it took.
+                // has not taken. Whether it has read every packet it took
+                // depends on its threading ([`read_every_packet`]).
+                let read = read_every_packet(status, sw.decodes_in_step());
                 self.sw_output_settled = true;
-                self.extradata_read();
+                if read {
+                  self.extradata_read();
+                }
                 return self.settle(status);
               }
               Err(error) => {
@@ -4511,6 +4520,37 @@ fn doubt_of(error: &Error) -> crate::ExtradataDoubt {
     Error::Ffmpeg(raw) => crate::ExtradataDoubt::Reported(*raw),
     Error::AllBackendsFailed(_) => crate::ExtradataDoubt::HardwareFailed,
     _ => crate::ExtradataDoubt::Minted,
+  }
+}
+
+/// **Whether a software decoder's flow answer, `status`, shows it has read
+/// every packet it took** — what makes a provisional extradata the stream's
+/// (`extradata_provisional`). `in_step` says the decoder decodes, inside a
+/// call, the packet that call hands it ([`SwDecoder::decodes_in_step`]).
+///
+/// - **The end does, on every decoder:** it answers it once it has decoded
+///   all it took and answered for every packet, every frame thread's
+///   result returned before it (`ff_thread_receive_frame`, pthread_frame.c).
+/// - **"Needs input" does on a decoder that decodes in step**: it answers
+///   `EAGAIN` with its input slot empty and the packet that sat there
+///   decoded. **On a frame-threaded decoder it does not.** FFmpeg 9 hands a
+///   packet to a worker (`submit_packet`) and, while not every thread has
+///   one, returns `EAGAIN` without waiting for it (`ff_thread_receive_frame`,
+///   pthread_frame.c): the worker may not have reached the packet's new
+///   extradata, and a failure to apply it — FFmpeg's HEVC decoder fails a
+///   packet whose extradata it cannot parse (`hevc_receive_frame`,
+///   hevc/hevcdec.c) — is answered later, in thread order. Nor does it on
+///   an implementation that wraps another, which keeps a pipeline of its
+///   own. On such a decoder nothing short of the end proves the read, and
+///   the extradata stays provisional until then: a flush leaves it unknown
+///   ([`crate::ExtradataDoubt::Flushed`]), as does an error before it
+///   ([`crate::ExtradataDoubt::Reported`]).
+/// - **A picture proves nothing**: it can be one decoded before the packet.
+fn read_every_packet(status: Received, in_step: bool) -> bool {
+  match status {
+    Received::Ended => true,
+    Received::NeedsInput => in_step,
+    Received::Frame => false,
   }
 }
 
