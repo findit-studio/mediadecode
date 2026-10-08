@@ -45,8 +45,8 @@ pub(crate) enum KeyframeRule {
     /// order ([`sps_permits_aso`]).
     aso: bool,
   },
-  /// HEVC: clean when its first picture is an IDR or a BLA (NAL types
-  /// 16–20) whose first slice segment starts it
+  /// HEVC: clean when its first base-layer picture is an IDR or a BLA (NAL
+  /// types 16–20) whose first slice segment starts it
   /// (`first_slice_segment_in_pic_flag`). A BLA's RASL pictures are
   /// discarded by every decoder, so a new one loses nothing there. A CRA
   /// (21) is never clean.
@@ -211,8 +211,8 @@ impl KeyframeRule {
   ///   recovery point, and FFmpeg's parser flags some such pictures key by
   ///   heuristic. A stream whose sequence parameter set permits arbitrary
   ///   slice order has no anchor ([`Self::is_clean`]).
-  /// - **HEVC:** the first picture's NAL unit is an IRAP picture (16–23), a
-  ///   CRA (21) among them, whose first slice segment starts it
+  /// - **HEVC:** the first base-layer picture's NAL unit is an IRAP picture
+  ///   (16–23), a CRA (21) among them, whose first slice segment starts it
   ///   ([`hevc_segment_starts_picture`]): the decoder resyncing kept its
   ///   references, and the reorder bound ([`Proof::ReorderBound`]) covers
   ///   the leading pictures a CRA has.
@@ -417,12 +417,20 @@ fn first_h264_picture(data: &[u8], nal_length: Option<usize>) -> Option<(u8, &[u
   first
 }
 
-/// The first picture of an HEVC access unit — its NAL unit type and its
-/// unit — once EVERY unit is read whole and valid; `None` when one is not,
-/// or when no picture is there. `forbidden_zero_bit` (1) · `nal_unit_type`
-/// (6) · `nuh_layer_id` (6) · `nuh_temporal_id_plus1` (3), which is never
-/// zero; a picture's unit carries a slice segment header past its two
-/// header bytes, and an IRAP picture (16–23) a temporal id of 0.
+/// The first picture of an HEVC access unit's base layer — its NAL unit
+/// type and its unit — once EVERY unit is read whole and valid; `None` when
+/// one is not, or when the base layer has no picture there.
+/// `forbidden_zero_bit` (1) · `nal_unit_type` (6) · `nuh_layer_id` (6) ·
+/// `nuh_temporal_id_plus1` (3), which is never zero; a picture's unit
+/// carries a slice segment header past its two header bytes, and an IRAP
+/// picture (16–23) a temporal id of 0.
+///
+/// **The layer FFmpeg decodes.** Its NAL splitter drops every unit of layer
+/// 63, whatever the rest of its header says, and its decoder outputs the
+/// base layer's pictures (layer 0) unless it is asked for more views
+/// (`view_ids`, which this crate never sets): so a unit of layer 63 is
+/// skipped here as there, and the first picture is the base layer's. A unit
+/// of any other layer is still read whole.
 fn first_hevc_picture(data: &[u8], nal_length: Option<usize>) -> Option<(u8, &[u8])> {
   let mut first = None;
   for unit in NalUnits::new(data, nal_length) {
@@ -430,6 +438,10 @@ fn first_hevc_picture(data: &[u8], nal_length: Option<usize>) -> Option<(u8, &[u
     let [head, second, ..] = unit else {
       return None;
     };
+    let layer = ((head & 1) << 5) | (second >> 3);
+    if layer == 63 {
+      continue;
+    }
     if head & 0x80 != 0 || second & 0x07 == 0 {
       return None;
     }
@@ -438,7 +450,9 @@ fn first_hevc_picture(data: &[u8], nal_length: Option<usize>) -> Option<(u8, &[u
       if unit.len() <= 2 || ((16..=23).contains(&kind) && second & 0x07 != 1) {
         return None;
       }
-      first.get_or_insert((kind, unit));
+      if layer == 0 {
+        first.get_or_insert((kind, unit));
+      }
     }
   }
   first

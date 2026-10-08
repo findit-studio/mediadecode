@@ -881,3 +881,59 @@ fn a_stream_permitting_arbitrary_slice_order_has_no_clean_point_and_no_anchor() 
     );
   }
 }
+
+/// LAW (Codex R13, [high]): **an HEVC packet is read by its base layer, a
+/// unit of layer 63 skipped.** FFmpeg's NAL splitter drops every unit of
+/// layer 63, whatever the rest of its header says, and its decoder outputs
+/// the base layer: a packet whose first unit is an IDR of layer 63, or of an
+/// enhancement layer (1), before a base-layer trailing picture is neither
+/// clean nor an anchor, in either packing. A base-layer IDR after a unit of
+/// layer 63 — an IDR, or one with a temporal id of 0, which FFmpeg drops
+/// unread — or before an enhancement layer's trailing picture is clean and a
+/// definitive anchor; a base-layer CRA after an IDR of layer 63 anchors and
+/// is not clean. Read whatever its layer, the IDR of layer 63 made the
+/// packet a clean point and a definitive anchor though FFmpeg never decodes
+/// it.
+#[test]
+fn an_hevc_packet_is_read_by_its_base_layer() {
+  let at_layer = |kind: u8, layer: u8| -> Vec<u8> {
+    vec![(kind << 1) | (layer >> 5), ((layer & 0x1f) << 3) | 1, 0xaf]
+  };
+  for nal_length in [None, Some(4)] {
+    let hevc = KeyframeRule::Hevc { nal_length };
+    let read = |units: &[&[u8]]| {
+      let au = match nal_length {
+        None => annex_b(units),
+        Some(_) => length_prefixed(units),
+      };
+      (hevc.is_clean(&au), hevc.anchor(&au).map(Anchor::definitive))
+    };
+    let (idr, trail, cra) = (at_layer(19, 0), at_layer(1, 0), at_layer(21, 0));
+    for layer in [63, 1] {
+      assert_eq!(
+        read(&[&at_layer(19, layer)[..], &trail[..]]),
+        (false, None),
+        "{hevc:?}: an IDR of layer {layer} before a base-layer trailing picture"
+      );
+    }
+    let mut unread = at_layer(19, 63);
+    unread[1] &= !0x07;
+    for before in [at_layer(19, 63), unread] {
+      assert_eq!(
+        read(&[&before[..], &idr[..]]),
+        (true, Some(true)),
+        "{hevc:?}: a base-layer IDR after the unit of layer 63 {before:02x?}"
+      );
+    }
+    assert_eq!(
+      read(&[&idr[..], &at_layer(1, 1)[..]]),
+      (true, Some(true)),
+      "{hevc:?}: a base-layer IDR before an enhancement layer's trailing picture"
+    );
+    assert_eq!(
+      read(&[&at_layer(19, 63)[..], &cra[..]]),
+      (false, Some(false)),
+      "{hevc:?}: a base-layer CRA after an IDR of layer 63"
+    );
+  }
+}

@@ -166,7 +166,9 @@ The backend-agnostic core it adapts has its own log at
   minute of stream has gone by that way. A fallback at the end of the
   stream keeps its one-thread decoder until a seek. An H.264 or HEVC
   keyframe is clean only when the first picture's NAL unit in its packet is
-  the IDR (or, for HEVC, the BLA) — a packet with any picture before it is
+  the IDR (or, for HEVC, the BLA; HEVC's first picture is its base layer's,
+  the layer FFmpeg outputs, a unit of layer 63 skipped as FFmpeg's NAL
+  splitter skips it) — a packet with any picture before it is
   not — and starts that picture: an H.264 slice whose `first_mb_in_slice`
   is 0, an HEVC slice segment whose `first_slice_segment_in_pic_flag` is set
   (a packet opening on a later slice of the picture, or on a unit cut inside
@@ -236,8 +238,8 @@ The backend-agnostic core it adapts has its own log at
   slice header parsing and starting its picture, `first_mb_in_slice` 0 and
   `slice_type` at most 9; an I picture alone anchors nothing, since a slice
   type describes that slice alone and FFmpeg flags some such pictures key
-  by heuristic), an HEVC IRAP picture (a CRA among them) whose first slice
-  segment starts it; for a codec that codes every picture alone,
+  by heuristic), an HEVC base-layer IRAP picture (a CRA among them) whose
+  first slice segment starts it; for a codec that codes every picture alone,
   every packet; for the other codecs whose pictures this crate does not
   read, the key flag FFmpeg's parser set is the proof — since an intra
   picture resets the references of every picture after it that does not
