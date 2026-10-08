@@ -182,7 +182,8 @@ pub enum Error {
   /// A software video decoder the session would open on its codec
   /// parameters while their extradata is unknown — a packet carrying a new
   /// extradata was refused with an error that does not say whether the
-  /// decoder took it — is refused by name; see [`ExtradataUnknown`].
+  /// decoder took it, a decode error among them — is refused by name; see
+  /// [`ExtradataUnknown`].
   #[error(transparent)]
   ExtradataUnknown(#[from] ExtradataUnknown),
 }
@@ -191,17 +192,21 @@ pub enum Error {
 ///
 /// A packet carrying `AV_PKT_DATA_NEW_EXTRADATA` changes a stream's codec
 /// parameters from that packet on, and FFmpeg's H.264 and HEVC decoders
-/// apply it before they decode the packet's body: a packet a decoder took
+/// apply it as they begin to decode the packet: a packet a decoder decoded
 /// and reported failed has changed its framing. When a decoder refuses such
-/// a packet with an error that does not say whether it took the packet — an
-/// allocation failure or an invalid argument, which can come before the
-/// packet is queued or while it is decoded — the session cannot tell which
-/// extradata the decoder now frames the stream by. Until a packet carrying a
-/// new extradata is taken, it reads no H.264 or HEVC resync anchor or switch
-/// point under its own, switches to no new decoder, and refuses by this name
-/// to open a decoder on it — a post-commit fallback's cold decoder, a
-/// reopen — rather than decode on parameters that may be stale. A packet
-/// carrying its own new extradata is read, and opened on, under that.
+/// a packet with an error that does not say whether it got that far, the
+/// session cannot tell which extradata the decoder now frames the stream by.
+/// No error libavcodec reports says, invalid data included: it can come from
+/// before the decode, which then drops the packet, or, on a frame-threaded
+/// decoder, from an earlier packet while this one still waits. Only a
+/// refusal this crate mints while the packet's own picture is allocated
+/// does. So a corrupt packet at an extradata change leaves the extradata
+/// unknown until a packet carrying a new one is taken: until then the
+/// session reads no H.264 or HEVC resync anchor or switch point under its
+/// own, switches to no new decoder, and refuses by this name to open a
+/// decoder on it — a post-commit fallback's cold decoder, a reopen — rather
+/// than decode on parameters that may be stale. A packet carrying its own
+/// new extradata is read, and opened on, under that.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error(
   "the stream's codec extradata is unknown: a packet carrying a new extradata was refused with \

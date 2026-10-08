@@ -103,8 +103,9 @@ The backend-agnostic core it adapts has its own log at
   software video decoder the session would open on its codec parameters
   while their extradata is unknown — a packet carrying
   `AV_PKT_DATA_NEW_EXTRADATA` was refused with an error that does not say
-  whether the decoder took it — is refused by this name, naming that
-  refusal, rather than opened on extradata that may be stale (below).
+  whether the decoder took it, a decode error among them — is refused by
+  this name, naming that refusal, rather than opened on extradata that may
+  be stale (below).
 
 - **`active_threads()` on the video stream decoder**: the threads the
   decoder serving now decodes with, read off what is active
@@ -302,17 +303,25 @@ The backend-agnostic core it adapts has its own log at
   packet, that extradata replaces the session's codec parameters': later
   packets are read under it, and every decoder opened later — a post-commit
   fallback's cold decoder, a switch's — starts on the stream's current
-  parameters. A packet the decoder takes and reports failed counts as
-  taken, since FFmpeg applies the extradata before it decodes the body —
-  invalid data, an unimplemented feature, a refusal minted while a picture
-  was decoded — on the software send, the hardware send and the replay
-  alike; a packet refused before it was queued (back pressure, the end)
-  leaves them as they were. A refusal that does not say whether the decoder
-  took the packet (an allocation failure, an invalid argument) leaves them
-  unknown: until a packet carrying extradata is taken, no H.264 or HEVC
-  packet is read as an anchor or a switch point under them, no switch opens
-  a decoder on them, and a decoder the session must open on them is refused
-  by name (`Error::ExtradataUnknown`). One the hardware took while its
+  parameters. A packet the decoder refuses counts as taken only where the
+  refusal says the decoder decoded it, past the point where FFmpeg applies
+  the extradata: a frame or a coded surface this crate's callbacks refused
+  over its ceiling while the packet's own picture was allocated — on the
+  hardware, and on a software decoder of libavcodec's own on one thread —
+  on the software send, the hardware send and the replay alike; a packet
+  refused before it was queued (back pressure, the end) leaves them as they
+  were. Any other refusal does not say whether the decoder got that far and
+  leaves them unknown: an allocation failure, an invalid argument, and
+  invalid data or an unimplemented feature too, which FFmpeg can report
+  from before the decode (a parameter change, a bitstream filter, either of
+  which drops the packet; FFmpeg's HEVC decoder failing to parse the new
+  extradata) or, on a frame-threaded decoder, for an earlier packet while
+  this one still waits — where a flush would drop it. So a corrupt packet
+  at an extradata change leaves them unknown: until a packet carrying
+  extradata is taken, no H.264 or HEVC packet is read as an anchor or a
+  switch point under them, no switch opens a decoder on them, and a decoder
+  the session must open on them is refused by name
+  (`Error::ExtradataUnknown`). One the hardware took while its
   probe recorded is installed once nothing will replay it. A new extradata
   that would carry the codec parameters past `max_codec_parameter_bytes` —
   measured as a decoder's open measures them, the old extradata replaced by

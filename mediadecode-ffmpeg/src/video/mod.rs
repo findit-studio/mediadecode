@@ -249,16 +249,22 @@ pub struct CarrierVideoStreamDecoder<C: crate::FfmpegCarrier> {
   probe_extradata: Option<NewExtradata>,
   /// Set when a decoder refused a packet carrying
   /// `AV_PKT_DATA_NEW_EXTRADATA` with an error that does not say whether it
-  /// took the packet ([`Taken::Unknown`]): the refusal. FFmpeg's H.264 and
-  /// HEVC decoders apply a packet's new extradata before they decode its
-  /// body, so a packet they took and reported failed has changed their
-  /// framing, and one refused before it was queued has not; here which is
-  /// not known. Until a packet carrying a new extradata is taken, no H.264
-  /// or HEVC packet is read as a resync anchor or a switch point under the
-  /// session's extradata, no switch opens a decoder on it, and a decoder the
-  /// session must open on it — a post-commit fallback's, a reopen — is
-  /// refused by name ([`Error::ExtradataUnknown`]); a packet carrying its own
-  /// new extradata is read, and opened on, under that. A probe-era
+  /// decoded the packet ([`Taken::Unknown`]): the refusal. FFmpeg's H.264
+  /// and HEVC decoders apply a packet's new extradata as they begin to
+  /// decode it, so a packet they decoded and reported failed has changed
+  /// their framing, and one dropped before its decode — or, on a
+  /// frame-threaded decoder, still waiting behind an earlier packet's error
+  /// — has not; here which is not known. No error libavcodec reports says,
+  /// invalid data included — only this crate's own refusals minted while the
+  /// packet's picture was allocated do ([`taken_despite`]) — so a corrupt
+  /// packet at an extradata change leaves the session's extradata unknown.
+  /// Until a packet carrying a new extradata is taken, no H.264 or HEVC
+  /// packet is read as a resync anchor or a switch point under the session's
+  /// extradata, no switch opens a decoder on it, and a decoder the session
+  /// must open on it — a post-commit fallback's, a reopen — is refused by
+  /// name ([`Error::ExtradataUnknown`]); a packet carrying its own new
+  /// extradata is read, and opened on, under that. A flush keeps it: the
+  /// flushed decoder frames the stream by what it applied. A probe-era
   /// fallback's replay sets it from the history it replays.
   extradata_unknown: Option<ffmpeg_next::Error>,
   /// `true` once an H.264 sequence parameter set the session read — in its
@@ -936,6 +942,20 @@ impl SwDecoder {
     told
   }
 
+  /// Whether this decoder decodes, inside a submission, the packet the
+  /// submission queues: libavcodec's own implementation ([`Self::native`])
+  /// with no frame threading active. A frame-threaded decoder hands a packet
+  /// to a thread and reports what an earlier packet's thread met, and an
+  /// implementation that wraps another keeps a pipeline of its own; on
+  /// either, a picture refused during a submission may be an earlier
+  /// packet's ([`taken_despite`]).
+  fn decodes_in_step(&self) -> bool {
+    // SAFETY: `self` is a live opened decoder; `active_thread_type` is a
+    // plain `c_int`, read and not kept.
+    let active = unsafe { (*self.as_ptr()).active_thread_type };
+    self.native && active & ffmpeg_next::ffi::FF_THREAD_FRAME == 0
+  }
+
   /// The refusal a post-commit fallback onto this decoder meets where its
   /// implementation is not libavcodec's own ([`Self::native`]): the stream's
   /// codec, and the implementation and its wrapper by name.
@@ -1553,9 +1573,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       &mut progress,
     );
     self.pending_history.drain(..progress.fed);
-    // A packet the decoder took, the failing one among them where it took
-    // it: its new extradata, if it carried one, is the active one; a failing
-    // one whose refusal does not say leaves it unknown.
+    // A packet the decoder took, the failing one among them where its
+    // refusal says the decoder decoded it: its new extradata, if it carried
+    // one, is the active one; a failing one whose refusal does not say — a
+    // decode error among them — leaves it unknown.
     if let Some(extradata) = progress.extradata.take() {
       self.took_extradata(extradata, false);
     }
@@ -1844,6 +1865,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       )));
     };
     let st = sw.state();
+    let in_step = sw.decodes_in_step();
     let submitted = sw.submit(pkt);
     #[cfg(test)]
     let submitted = match submitted {
@@ -1867,10 +1889,11 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
           // A packet that failed after the anchor: what follows it may
           // reference it, so the anchor is in doubt.
           self.unanchor();
-          // And one the decoder took applied its new extradata before its
-          // body failed.
+          // The new extradata it carries is the session's where the refusal
+          // says the decoder decoded the packet, and unknown where it does
+          // not say: a decode error does not.
           if let Some(extradata) = extradata {
-            self.refused_with_extradata(extradata, taken_despite(e, &error), false);
+            self.refused_with_extradata(extradata, taken_despite(e, &error, in_step), false);
           }
           Err(VideoDecodeError::Decode(error))
         }
@@ -3038,8 +3061,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
             self.send_on_software(av_pkt, phase)
           }
           Err(other) => {
-            // A packet the hardware took and reported failed applied its
-            // new extradata before its body failed.
+            // The new extradata it carries is the session's where the
+            // refusal says the hardware decoded the packet, and unknown
+            // where it does not say: a decode error does not.
             if let Some(extradata) = extradata {
               self.refused_with_extradata(extradata, taken_by_hardware_despite(&other), probing);
             }
@@ -3424,7 +3448,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     // The flush clears the probe's history but not what the decoders
     // applied: a new extradata the hardware took is the stream's from here,
     // and the active one stays (a container re-sends its own after a seek
-    // that crosses a change).
+    // that crosses a change), as does one left unknown.
     self.install_probe_extradata();
     self.deferred_error = None;
     // And a parked frame belongs to the position being abandoned.
@@ -3635,9 +3659,9 @@ struct Replay {
   fed: usize,
   eof_sent: bool,
   /// The extradata the last packet the decoder took carried as
-  /// `AV_PKT_DATA_NEW_EXTRADATA`, copied — a packet it took and reported
-  /// failed among them: the session's active extradata once the replay is
-  /// its own ([`NewExtradata::install`]).
+  /// `AV_PKT_DATA_NEW_EXTRADATA`, copied — a packet whose refusal says the
+  /// decoder decoded it among them ([`taken_despite`]): the session's active
+  /// extradata once the replay is its own ([`NewExtradata::install`]).
   extradata: Option<NewExtradata>,
   /// The refusal of the replay's last packet, which carried a new
   /// extradata, where it does not say whether the decoder took the packet
@@ -3685,6 +3709,7 @@ fn replay_history(
   // Bound before the decoder is mutably borrowed, so the error
   // closures below can still consult it.
   let sw_state = sw.state();
+  let in_step = sw.decodes_in_step();
   for pkt in packets {
     if queue.full(budget) {
       return Ok(Drained::Full);
@@ -3717,10 +3742,11 @@ fn replay_history(
         Err(other) => {
           progress.fed += 1;
           let error = crate::decoder::software_exit(sw_state, other);
-          // The packet is consumed with its error; one the decoder took
-          // applied its new extradata before its body failed.
+          // The packet is consumed with its error. Its new extradata is the
+          // replay's where the refusal says the decoder decoded the packet,
+          // and unknown where it does not say: a decode error does not.
           if extradata.is_some() {
-            match taken_despite(other, &error) {
+            match taken_despite(other, &error, in_step) {
               Taken::Yes => progress.extradata = extradata,
               Taken::Unknown(cause) => progress.unknown = Some(cause),
               Taken::No => {}
@@ -4103,48 +4129,67 @@ fn new_extradata(pkt: &Packet) -> Option<&[u8]> {
   }
 }
 
-/// Whether a decoder took a packet whose submission it refused — what a
-/// new extradata the packet carries means for the session's
-/// ([`taken_despite`]).
+/// Whether a decoder took a packet whose submission it refused, as far as
+/// the packet's new extradata goes: whether the decoder reached the point
+/// where it applies it ([`taken_despite`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Taken {
-  /// It took the packet, and the extradata with it.
+  /// It decoded the packet, the extradata applied.
   Yes,
-  /// It refused the packet before taking it.
+  /// It refused the packet before queueing it.
   No,
   /// The refusal, this error, does not say.
   Unknown(ffmpeg_next::Error),
 }
 
 /// Whether a software decoder took the packet whose submission it refused
-/// with `raw`, which the software road's funnel named `named`.
+/// with `raw`, which the software road's funnel named `named`; `in_step`
+/// says the decoder decodes, inside a submission, the packet the submission
+/// queues ([`SwDecoder::decodes_in_step`]).
 ///
-/// FFmpeg queues a packet before it decodes it and reports what decoding
-/// met, and its H.264 and HEVC decoders apply a packet's new extradata
-/// before they decode its body. So an error only decoding makes says the
-/// decoder took the packet: invalid data (`AVERROR_INVALIDDATA`), an
-/// unimplemented feature (`AVERROR_PATCHWELCOME`), and the refusals this
-/// crate's callbacks mint while a picture is decoded — a frame or a coded
-/// surface over the allocation ceiling. Back pressure and the end refuse a
-/// packet before it is queued. An allocation failure, an invalid argument
-/// and the rest can come from either side of the queue.
-fn taken_despite(raw: ffmpeg_next::Error, named: &Error) -> Taken {
+/// **Only a refusal this crate minted while it decoded the packet says.**
+/// FFmpeg's H.264 and HEVC decoders apply a packet's new extradata as they
+/// begin to decode it, and nothing FFmpeg reports ties an error to the
+/// packet that was just submitted, or says that packet got that far:
+///
+/// - **Invalid data and unimplemented features** (`AVERROR_INVALIDDATA`,
+///   `AVERROR_PATCHWELCOME`) can come from before the codec sees the
+///   packet — a parameter change it carries, a bitstream filter between the
+///   queue and the decoder, either of which drops it — or from FFmpeg's
+///   HEVC decoder failing to parse the new extradata itself; and on a
+///   frame-threaded decoder from a packet submitted before it, reported
+///   while this one still waits to be handed to a thread, where a flush
+///   drops it. So they do not say, nor do an allocation failure, an invalid
+///   argument and the rest.
+/// - **The refusals this crate's callbacks mint while a picture is
+///   allocated** — a frame or a coded surface over its ceiling
+///   ([`Error::FrameBudgetExceeded`], [`Error::HwSurfaceTooLarge`]) — come
+///   from inside a decode, past the point where the extradata is applied.
+///   Where the decoder decodes the packet a submission queues inside that
+///   submission (`in_step`), the picture is that packet's: they say it was
+///   taken. On a frame-threaded decoder the picture may be one an earlier
+///   packet's thread allocates: they do not say.
+/// - **Back pressure and the end** refuse a packet before it is queued,
+///   whatever a callback left latched: it was not taken.
+fn taken_despite(raw: ffmpeg_next::Error, named: &Error, in_step: bool) -> Taken {
   match (raw, named) {
-    (_, Error::FrameBudgetExceeded(_) | Error::HwSurfaceTooLarge(_))
-    | (ffmpeg_next::Error::InvalidData | ffmpeg_next::Error::PatchWelcome, _) => Taken::Yes,
     (ffmpeg_next::Error::Eof, _) => Taken::No,
     (ffmpeg_next::Error::Other { errno }, _) if errno == ffmpeg_next::error::EAGAIN => Taken::No,
+    (_, Error::FrameBudgetExceeded(_) | Error::HwSurfaceTooLarge(_)) if in_step => Taken::Yes,
     _ => Taken::Unknown(raw),
   }
 }
 
 /// [`taken_despite`] for the hardware road, whose decoder answers this
 /// crate's own errors: its funnel's raw FFmpeg error, or a refusal minted
-/// while a picture was decoded. Any other error of its is this crate's own
-/// refusal, made before FFmpeg saw the packet.
+/// while a picture was allocated. The hardware decoder is libavcodec's own
+/// under a hardware accelerator, on one thread, so it decodes the packet a
+/// submission queues inside that submission: such a refusal is that
+/// packet's. Any other error of its is this crate's own refusal, made
+/// before FFmpeg saw the packet.
 fn taken_by_hardware_despite(error: &Error) -> Taken {
   match error {
-    Error::Ffmpeg(raw) => taken_despite(*raw, error),
+    Error::Ffmpeg(raw) => taken_despite(*raw, error, true),
     Error::FrameBudgetExceeded(_) | Error::HwSurfaceTooLarge(_) => Taken::Yes,
     _ => Taken::No,
   }
@@ -4223,15 +4268,6 @@ impl NewExtradata {
       core::ptr::write_bytes(data.as_ptr().add(extradata.len()), 0, padding);
     }
     Ok(Some(Self { data, size }))
-  }
-
-  /// The copied extradata.
-  #[cfg(test)]
-  fn bytes(&self) -> &[u8] {
-    // SAFETY: `data` holds the `size` bytes this copy was made of.
-    unsafe {
-      core::slice::from_raw_parts(self.data.as_ptr(), usize::try_from(self.size).unwrap_or(0))
-    }
   }
 
   /// Installs this as `parameters`' extradata, the old freed: the stream's
