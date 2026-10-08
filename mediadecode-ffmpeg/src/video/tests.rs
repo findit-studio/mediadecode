@@ -5144,6 +5144,41 @@ fn after_a_decode_error_across_the_gap_the_next_h264_anchor_is_proved_by_the_bou
   assert!(!escalated, "the end is clean");
 }
 
+/// LAW (Codex R10, [high]): **the withheld proof is FFmpeg's own `h264`'s:
+/// a session opened on another implementation of the codec proves its
+/// resync by the reorder bound.** A 16-frame `libx264` open-GOP clip, the
+/// hardware failing post-commit at its recovery point (8). On FFmpeg's own
+/// `h264`, which the software road opens by name, the recovery point's
+/// picture, out first, closes the gap. Taken to be another implementation —
+/// `h264_cuvid`, which keeps no such gate (a test seam names it) — the same
+/// session proves the resync by the bound, a depth of 2: 8 and 9 come out
+/// with the gap open, and 10 closes it. Chosen by the codec id alone, the
+/// proof was the withheld output whatever implementation decoded, and a
+/// picture from before the anchor could certify the recovery.
+#[test]
+fn a_session_on_another_implementation_of_h264_proves_its_resync_by_the_bound() {
+  let clip = encode_h264_open_gops(128, 96, 16);
+  let at = keyframe_after(&clip, 3);
+  let recovery_point = clip.packets[at].pts().expect("a pts");
+  let (_, native, native_escalated) = through_a_post_commit_failure(&clip, at);
+  assert_eq!(
+    native.first(),
+    Some(&(recovery_point, false)),
+    "on `h264` the first picture out closes the gap: {native:?}"
+  );
+  super::sw_implementation::name_next("h264_cuvid");
+  let (_, other, other_escalated) = through_a_post_commit_failure(&clip, at);
+  assert_eq!(
+    other.iter().take_while(|&&(_, open)| open).count(),
+    2,
+    "on another implementation the bound, a depth of 2, holds two pictures open: {other:?}"
+  );
+  assert!(
+    !native_escalated && !other_escalated,
+    "both ends clean: {native:?} / {other:?}"
+  );
+}
+
 /// LAW (Codex R9, [high]): **a software video decoder set to output
 /// pictures before their recovery is refused at the open, by name, in every
 /// build.** The session clears `AV_CODEC_FLAG_OUTPUT_CORRUPT` and

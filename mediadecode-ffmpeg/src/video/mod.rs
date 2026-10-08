@@ -47,13 +47,16 @@
 //!   codec whose pictures this crate does not read, the key flag FFmpeg's
 //!   parser set — since an intra picture resets the references of every picture
 //!   after it that does not lead it; it is fed once the decoder's output is
-//!   settled (drained to "needs input" since the last packet). For H.264 the
-//!   first picture out after the anchor closes the gap: FFmpeg's decoder,
-//!   opened with neither `AV_CODEC_FLAG_OUTPUT_CORRUPT` nor
-//!   `AV_CODEC_FLAG2_SHOW_ALL` (an open that finds either set is refused,
-//!   [`Error::UnrecoveredOutput`]), outputs only pictures its recovery tracking
-//!   has marked recovered, and a decoder opened cold across the gap starts with
-//!   nothing recovered. For every other codec the only pictures from before the
+//!   settled (drained to "needs input" since the last packet). For H.264 on
+//!   FFmpeg's own `h264` decoder, the implementation the software road opens
+//!   by name, the first picture out after the anchor closes the gap: opened
+//!   with neither `AV_CODEC_FLAG_OUTPUT_CORRUPT` nor `AV_CODEC_FLAG2_SHOW_ALL`
+//!   (an open that finds either set is refused, [`Error::UnrecoveredOutput`]),
+//!   it outputs only pictures its recovery tracking has marked recovered, and
+//!   a decoder opened cold across the gap starts with nothing recovered;
+//!   another implementation of the codec, and an anchor after a decode error
+//!   across the gap, take the reorder bound. For every other codec the only
+//!   pictures from before the
 //!   anchor that can still come out are the ones its reorder buffer holds, at
 //!   most `has_b_frames` of them (the largest value read from just before the
 //!   anchoring packet was submitted on — a keyframe can activate parameters
@@ -689,6 +692,13 @@ struct Restart {
 /// a new abstraction.
 pub(crate) struct SwDecoder {
   decoder: ffmpeg_next::decoder::Video,
+  /// Whether the implementation opened is FFmpeg's own H.264 decoder,
+  /// `h264` by name — the one whose output gate withholds every picture it
+  /// has not recovered, which the withheld resync proof stands on
+  /// ([`access::KeyframeRule::proof`]). Any other implementation of the
+  /// codec — a hardware wrapper such as `h264_cuvid`, `h264_qsv`, a V4L2
+  /// memory-to-memory or a MediaCodec one — keeps no such gate.
+  native_h264: bool,
   /// Declared **after** the decoder: fields drop in declaration order,
   /// so the codec context is freed before the state it points at.
   _callback_state: Box<crate::ffi::CallbackState>,
@@ -1758,7 +1768,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   fn session_threads_run(&self) -> bool {
     use ffmpeg_next::codec::Capabilities;
     self.limits.threads().thread_count() != 1
-      && crate::decoder::find_decoder(&self.parameters).is_ok_and(|codec| {
+      && sw_codec(&self.parameters).is_ok_and(|codec| {
         codec.capabilities().intersects(
           Capabilities::FRAME_THREADS | Capabilities::SLICE_THREADS | Capabilities::OTHER_THREADS,
         )
@@ -2061,9 +2071,12 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     self.anchor_reorder = reorder_before;
     let rule = self.keyframe_rule();
     self.anchor_resets = rule == access::KeyframeRule::Resets;
+    // The withheld proof is FFmpeg's own H.264 decoder's, and holds only
+    // while no decode error across the gap has left its recovery state in
+    // doubt.
+    let native = matches!(&self.state, DecodeState::Sw(sw) if sw.native_h264);
     self.anchor_proof = match rule.proof() {
-      // A decode error across the gap left FFmpeg's recovery state in doubt.
-      access::Proof::Withheld if self.withheld_poisoned => access::Proof::ReorderBound,
+      access::Proof::Withheld if !native || self.withheld_poisoned => access::Proof::ReorderBound,
       proof => proof,
     };
     self.anchor_definitive = anchor.definitive();
@@ -2125,8 +2138,11 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// **The resync's proof**, by the stream's codec rule
   /// ([`Self::anchor_proof`]); either closes the gap.
   ///
-  /// - **Withheld output (H.264):** the first picture out since the anchor.
-  ///   The session's software decoders are opened with neither
+  /// - **Withheld output (H.264, on FFmpeg's own `h264`):** the first
+  ///   picture out since the anchor. Another implementation of the codec
+  ///   keeps no such gate, and its anchors take the reorder bound
+  ///   ([`SwDecoder::native_h264`]). The session's software decoders are
+  ///   opened with neither
   ///   `AV_CODEC_FLAG_OUTPUT_CORRUPT` nor `AV_CODEC_FLAG2_SHOW_ALL` — an
   ///   open that finds either set is refused by name
   ///   ([`Error::UnrecoveredOutput`], [`open_sw_decoder`]) — so FFmpeg's
@@ -3599,7 +3615,12 @@ fn open_sw_decoder(
   // Opened without forming a bindgen enum from FFmpeg memory: the codec
   // is resolved off a raw `codec_id`, and the medium is proved off a raw
   // `codec_type`. See `crate::decoder::ensure_codec_type`.
-  let codec = crate::decoder::find_decoder(parameters)?;
+  let codec = sw_codec(parameters)?;
+  // The implementation, by name: the resync's proof is bound to it.
+  let implementation = codec.name();
+  #[cfg(test)]
+  let implementation = sw_implementation::named().unwrap_or(implementation);
+  let native_h264 = implementation == NATIVE_H264;
   let opened = ctx.decoder().open_as(codec).map_err(Error::Ffmpeg)?;
   // Checked in every build, after the open, which is what FFmpeg reads: a
   // decoder that would output unrecovered pictures is closed and refused by
@@ -3608,10 +3629,57 @@ fn open_sw_decoder(
   crate::decoder::ensure_video_codec_type(&opened)?;
   Ok(SwDecoder {
     decoder: ffmpeg_next::decoder::Video(opened),
+    native_h264,
     _callback_state: callback_state,
     #[cfg(test)]
     _live: live_sw::Guard::new(),
   })
+}
+
+/// FFmpeg's own H.264 decoder, by name.
+const NATIVE_H264: &str = "h264";
+
+/// The software decoder for `parameters`' codec: for H.264, FFmpeg's own
+/// [`NATIVE_H264`], by name — the implementation whose output gate the
+/// withheld resync proof stands on — and otherwise, or where it is not built
+/// in, the one `avcodec_find_decoder` answers (`crate::decoder::find_decoder`),
+/// which may be any implementation of the codec. The session reads which it
+/// opened ([`SwDecoder::native_h264`]).
+fn sw_codec(parameters: &Parameters) -> Result<ffmpeg_next::Codec, Error> {
+  // SAFETY: the parameters' pointer, only read; `codec_id` is read as the
+  // 32-bit integer the field holds, never formed into a bindgen enum.
+  let codec_id = unsafe {
+    let raw = parameters.as_ptr();
+    (!raw.is_null()).then(|| core::ptr::read(core::ptr::addr_of!((*raw).codec_id) as *const i32))
+  };
+  if codec_id == Some(crate::CodecId::H264.raw())
+    && let Some(native) = ffmpeg_next::decoder::find_by_name(NATIVE_H264)
+  {
+    return Ok(native);
+  }
+  crate::decoder::find_decoder(parameters)
+}
+
+/// Test-only: the name the next software video decoder opened is taken to
+/// have, in place of its own — how a session opened on another
+/// implementation of a codec reads.
+#[cfg(test)]
+pub(crate) mod sw_implementation {
+  use core::cell::Cell;
+
+  std::thread_local! {
+    static NAMED: Cell<Option<&'static str>> = const { Cell::new(None) };
+  }
+
+  /// The next open is taken to be of the implementation `name`.
+  pub(crate) fn name_next(name: &'static str) {
+    NAMED.with(|named| named.set(Some(name)));
+  }
+
+  /// The name armed for this open, once.
+  pub(super) fn named() -> Option<&'static str> {
+    NAMED.with(Cell::take)
+  }
 }
 
 /// Clears `AV_CODEC_FLAG_OUTPUT_CORRUPT` and `AV_CODEC_FLAG2_SHOW_ALL` on a

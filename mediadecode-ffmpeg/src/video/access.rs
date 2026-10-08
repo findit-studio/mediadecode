@@ -179,7 +179,13 @@ impl KeyframeRule {
     }
   }
 
-  /// How a post-commit resync anchored on this rule's stream is proved.
+  /// How a post-commit resync anchored on this rule's stream is proved, where
+  /// FFmpeg's own decoder for the codec decodes it: the session binds the
+  /// withheld proof to the implementation it opened, FFmpeg's own `h264` by
+  /// name, and proves any other implementation of the codec — a hardware
+  /// wrapper such as `h264_cuvid` or `h264_qsv`, a V4L2 memory-to-memory or
+  /// a MediaCodec one, which keep no such gate — by the reorder bound, as it
+  /// does an anchor after a decode error across the gap.
   ///
   /// - **H.264: [`Proof::Withheld`].** FFmpeg's H.264 decoder outputs only
   ///   pictures its own recovery tracking has marked recovered — an IDR

@@ -208,8 +208,13 @@ The backend-agnostic core it adapts has its own log at
   nothing. It is fed only once the decoder holds
   no picture the caller has not taken (the send answers `MustDrain` until
   then; a packet the decoder reports failed, which FFmpeg may have decoded
-  in part, wants a drain behind it too). On H.264 the first picture out
-  after the anchor closes the gap: the software decoders are opened with
+  in part, wants a drain behind it too). On H.264, decoded by FFmpeg's own
+  `h264` — which the software road opens by name, falling back to what
+  `avcodec_find_decoder` answers where it is not built in — the first
+  picture out after the anchor closes the gap; another implementation of
+  the codec (a hardware wrapper such as `h264_cuvid` or `h264_qsv`, a V4L2
+  memory-to-memory or a MediaCodec one) keeps no such gate, and its anchors
+  take the reorder bound. The software decoders are opened with
   neither `AV_CODEC_FLAG_OUTPUT_CORRUPT` nor `AV_CODEC_FLAG2_SHOW_ALL` —
   checked after the open in every build, an open that finds either set
   refused by name (`Error::UnrecoveredOutput`, below) — so FFmpeg's H.264
