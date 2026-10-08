@@ -78,7 +78,7 @@ impl KeyframeRule {
   /// clean: nothing is proved about them. EVERY NAL unit is read whole —
   /// every header byte present and valid, a picture's unit carrying
   /// payload past its header — or the access unit is not clean; the first
-  /// picture's unit decides, and one that is not clean ends the walk.
+  /// picture's unit decides.
   ///
   /// The units are walked one at a time ([`NalUnits`]) and never collected,
   /// so the memory a packet costs here does not grow with how many units it
@@ -87,68 +87,44 @@ impl KeyframeRule {
   pub(crate) fn is_clean(self, data: &[u8], reorders: bool) -> bool {
     match self {
       Self::H264 { nal_length } => {
-        // Every unit whole; the first picture's unit decides, as HEVC's does.
-        let mut first_picture = None;
-        for unit in NalUnits::new(data, nal_length) {
-          let Ok(unit) = unit else {
-            return false;
-          };
-          // `forbidden_zero_bit` (1) · `nal_ref_idc` (2) · `nal_unit_type` (5).
-          let Some(&header) = unit.first() else {
-            return false;
-          };
-          if header & 0x80 != 0 {
-            return false;
-          }
-          let kind = header & 0x1f;
-          // A prefix unit and a slice extension carry three more header
-          // bytes; a picture's unit (1–5) carries a slice header past its own.
-          let picture = (1..=5).contains(&kind);
-          let header_bytes = if matches!(kind, 14 | 20 | 21) { 4 } else { 1 };
-          if unit.len() < header_bytes + usize::from(picture) {
-            return false;
-          }
-          // An IDR picture is a reference picture: `nal_ref_idc` is not zero.
-          if kind == 5 && header & 0x60 == 0 {
-            return false;
-          }
-          if picture && *first_picture.get_or_insert(kind) != 5 {
-            return false;
-          }
-        }
-        first_picture == Some(5)
+        first_h264_picture(data, nal_length).is_some_and(|(kind, _)| kind == 5)
       }
       Self::Hevc { nal_length } => {
-        // Every unit whole; the first picture's unit decides.
-        let mut first_picture = None;
-        for unit in NalUnits::new(data, nal_length) {
-          let Ok(unit) = unit else {
-            return false;
-          };
-          // `forbidden_zero_bit` (1) · `nal_unit_type` (6) · `nuh_layer_id`
-          // (6) · `nuh_temporal_id_plus1` (3), which is never zero.
-          let [first, second, ..] = unit else {
-            return false;
-          };
-          if first & 0x80 != 0 || second & 0x07 == 0 {
-            return false;
-          }
-          let kind = (first >> 1) & 0x3f;
-          if kind < 32 {
-            // A picture's unit carries a slice segment header past its two
-            // header bytes, and an IRAP picture (16–23) a temporal id of 0.
-            if unit.len() <= 2 || ((16..=23).contains(&kind) && second & 0x07 != 1) {
-              return false;
-            }
-            if !(16..=20).contains(first_picture.get_or_insert(kind)) {
-              return false;
-            }
-          }
-        }
-        first_picture.is_some_and(|kind| (16..=20).contains(&kind))
+        first_hevc_picture(data, nal_length).is_some_and(|kind| (16..=20).contains(&kind))
       }
       Self::Resets => true,
       Self::Reordering => !reorders,
+    }
+  }
+
+  /// Whether the key-flagged packet `data` anchors a post-commit resync:
+  /// its FIRST picture is proved a random-access picture by the bitstream,
+  /// where the codec lets this crate read it. A packet whose first picture
+  /// is not one does not anchor, whatever its flag says — the pictures
+  /// before its random-access picture are no part of the reorder bound.
+  ///
+  /// - **H.264:** the first picture's NAL unit is an IDR slice (5), or a
+  ///   non-IDR slice (1) whose header says I or SI — `first_mb_in_slice`
+  ///   then `slice_type`, two exp-Golomb codes: the I picture of an open
+  ///   GOP, a recovery point.
+  /// - **HEVC:** the first picture's NAL unit is an IRAP picture (16–23), a
+  ///   CRA (21) among them: the decoder resyncing kept its references, and
+  ///   the reorder bound covers the leading pictures a CRA has.
+  /// - **Every other codec** — one picture per packet: MPEG-4 part 2, VP8,
+  ///   VP9, AV1 and the rest — **the key flag FFmpeg's parser set from the
+  ///   bitstream is the proof.** That is the trust boundary: this crate
+  ///   reads no picture header of theirs.
+  ///
+  /// Every NAL unit is read whole, as for [`Self::is_clean`]; bytes that do
+  /// not parse anchor nothing.
+  pub(crate) fn anchors(self, data: &[u8]) -> bool {
+    match self {
+      Self::H264 { nal_length } => first_h264_picture(data, nal_length)
+        .is_some_and(|(kind, unit)| kind == 5 || (kind == 1 && intra_slice(unit))),
+      Self::Hevc { nal_length } => {
+        first_hevc_picture(data, nal_length).is_some_and(|kind| (16..=23).contains(&kind))
+      }
+      Self::Resets | Self::Reordering => true,
     }
   }
 
@@ -167,6 +143,131 @@ impl KeyframeRule {
         "it reorders pictures, and this crate does not read its GOP headers to tell a closed GOP from an open one"
       }
     }
+  }
+}
+
+/// The first picture of an H.264 access unit — its NAL unit type (1–5) and
+/// its unit — once EVERY unit is read whole and valid; `None` when one is
+/// not, or when no picture is there. `forbidden_zero_bit` (1) ·
+/// `nal_ref_idc` (2) · `nal_unit_type` (5); a prefix unit and a slice
+/// extension carry three more header bytes; a picture's unit carries a
+/// slice header past its own; an IDR picture is a reference picture.
+fn first_h264_picture(data: &[u8], nal_length: Option<usize>) -> Option<(u8, &[u8])> {
+  let mut first = None;
+  for unit in NalUnits::new(data, nal_length) {
+    let unit = unit.ok()?;
+    let &header = unit.first()?;
+    if header & 0x80 != 0 {
+      return None;
+    }
+    let kind = header & 0x1f;
+    let picture = (1..=5).contains(&kind);
+    let header_bytes = if matches!(kind, 14 | 20 | 21) { 4 } else { 1 };
+    if unit.len() < header_bytes + usize::from(picture) {
+      return None;
+    }
+    if kind == 5 && header & 0x60 == 0 {
+      return None;
+    }
+    if picture && first.is_none() {
+      first = Some((kind, unit));
+    }
+  }
+  first
+}
+
+/// The first picture's NAL unit type of an HEVC access unit, once EVERY
+/// unit is read whole and valid; `None` when one is not, or when no picture
+/// is there. `forbidden_zero_bit` (1) · `nal_unit_type` (6) · `nuh_layer_id`
+/// (6) · `nuh_temporal_id_plus1` (3), which is never zero; a picture's unit
+/// carries a slice segment header past its two header bytes, and an IRAP
+/// picture (16–23) a temporal id of 0.
+fn first_hevc_picture(data: &[u8], nal_length: Option<usize>) -> Option<u8> {
+  let mut first = None;
+  for unit in NalUnits::new(data, nal_length) {
+    let unit = unit.ok()?;
+    let [head, second, ..] = unit else {
+      return None;
+    };
+    if head & 0x80 != 0 || second & 0x07 == 0 {
+      return None;
+    }
+    let kind = (head >> 1) & 0x3f;
+    if kind < 32 {
+      if unit.len() <= 2 || ((16..=23).contains(&kind) && second & 0x07 != 1) {
+        return None;
+      }
+      first.get_or_insert(kind);
+    }
+  }
+  first
+}
+
+/// Whether the H.264 slice whose NAL unit is `unit` is an I or SI slice:
+/// its header's `first_mb_in_slice` read past, its `slice_type` (0–9, the
+/// upper five meaning every slice of the picture is that type) read off —
+/// I is 2 and 7, SI is 4 and 9. A header that does not parse says neither.
+fn intra_slice(unit: &[u8]) -> bool {
+  let mut bits = RbspBits::new(unit.get(1..).unwrap_or_default());
+  bits.ue().is_some()
+    && bits
+      .ue()
+      .is_some_and(|slice_type| matches!(slice_type % 5, 2 | 4))
+}
+
+/// The bits of an H.264 raw byte sequence payload, most significant first,
+/// its emulation prevention bytes — the `03` of a `00 00 03` — skipped.
+struct RbspBits<'a> {
+  bytes: &'a [u8],
+  at: usize,
+  bit: u8,
+  zeros: usize,
+}
+
+impl<'a> RbspBits<'a> {
+  fn new(bytes: &'a [u8]) -> Self {
+    Self {
+      bytes,
+      at: 0,
+      bit: 0,
+      zeros: 0,
+    }
+  }
+
+  fn next_bit(&mut self) -> Option<bool> {
+    if self.bit == 0 {
+      // A new byte: an emulation prevention byte is not payload.
+      if self.zeros >= 2 && self.bytes.get(self.at) == Some(&3) {
+        self.at += 1;
+        self.zeros = 0;
+      }
+      let &byte = self.bytes.get(self.at)?;
+      self.zeros = if byte == 0 { self.zeros + 1 } else { 0 };
+    }
+    let byte = *self.bytes.get(self.at)?;
+    let value = byte & (0x80 >> self.bit) != 0;
+    self.bit += 1;
+    if self.bit == 8 {
+      self.bit = 0;
+      self.at += 1;
+    }
+    Some(value)
+  }
+
+  /// An unsigned exp-Golomb code, `ue(v)`: `n` zeros, a one, `n` more bits.
+  fn ue(&mut self) -> Option<u32> {
+    let mut zeros = 0u32;
+    while !self.next_bit()? {
+      zeros += 1;
+      if zeros > 31 {
+        return None;
+      }
+    }
+    let mut value = 0u32;
+    for _ in 0..zeros {
+      value = (value << 1) | u32::from(self.next_bit()?);
+    }
+    Some((1u32 << zeros) - 1 + value)
   }
 }
 

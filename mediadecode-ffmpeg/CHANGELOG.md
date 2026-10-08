@@ -137,9 +137,14 @@ The backend-agnostic core it adapts has its own log at
   next picture delivered — even a concealed one from before the keyframe,
   delivered late — cleared the guard; a keyframe that decoded to nothing
   then let the end of the stream pass as clean instead of escalating
-  `PostCommitNeverResynced`. The anchor is still any key-flagged packet fed
-  across the gap — an intra picture resets the references of every picture
-  after it that does not lead it — but it is fed only once the decoder holds
+  `PostCommitNeverResynced`. The anchor is a key-flagged packet fed across
+  the gap whose first picture the bitstream proves a random-access one — an
+  H.264 IDR slice or a non-IDR slice whose header says I or SI, an HEVC IRAP
+  picture (a CRA among them); for the codecs whose pictures this crate does
+  not read, the key flag FFmpeg's parser set is the proof — since an intra
+  picture resets the references of every picture after it that does not
+  lead it; a stale flag, or a picture before the random-access one, anchors
+  nothing. It is fed only once the decoder holds
   no picture the caller has not taken (the send answers `MustDrain` until
   then; a packet the decoder reports failed, which FFmpeg may have decoded
   in part, wants a drain behind it too), and the gap closes at the delivery

@@ -40,10 +40,13 @@
 //!   reorder bound**, never by matching a picture to a packet. A post-commit
 //!   fallback enters a degraded-resync mode that holds until a picture the
 //!   decoder outputs is decoded from a keyframe fed across the gap. The
-//!   anchor is ANY key-flagged packet the decoder takes after the commit —
-//!   an intra picture resets the references of every picture after it that
-//!   does not lead it, in every codec — fed once the decoder's output is
-//!   settled (drained to "needs input" since the last packet). Then the
+//!   anchor is a key-flagged packet the decoder takes after the commit whose
+//!   first picture the bitstream proves a random-access one — an H.264 IDR
+//!   or I slice, an HEVC IRAP picture; for a codec whose pictures this crate
+//!   does not read, the key flag FFmpeg's parser set — since an intra
+//!   picture resets the references of every picture after it that does not
+//!   lead it; it is fed once the decoder's output is settled (drained to
+//!   "needs input" since the last packet). Then the
 //!   only pictures from before the anchor that can still come out are the
 //!   ones its reorder buffer holds, at most `has_b_frames` of them (the
 //!   largest value read from just before the anchoring packet was
@@ -301,9 +304,10 @@ pub struct CarrierVideoStreamDecoder<C: crate::FfmpegCarrier> {
   /// Probe-era fallbacks never set it — they replay losslessly and produce
   /// frames immediately.
   degraded_resync_pending: bool,
-  /// `true` once a key-flagged packet fed across the open gap anchors the
+  /// `true` once a key-flagged packet fed across the open gap, its first
+  /// picture proved a random-access one ([`Self::anchors`]), anchors the
   /// resync; reset by a decode error before the resync is proven, so the
-  /// next key-flagged packet anchors again. No picture is matched to a
+  /// next such packet anchors again. No picture is matched to a
   /// packet: the anchor only starts the count the reorder bound reads
   /// ([`Self::outputs_since_anchor`]).
   degraded_anchored: bool,
@@ -1436,8 +1440,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// pictures the closed decoder could decode, and the session never trades
   /// a picture for threads.
   ///
-  /// **The resync anchor.** Across an open post-commit gap, any key-flagged
-  /// packet the decoder takes anchors the resync — nothing is drained or
+  /// **The resync anchor.** Across an open post-commit gap, a key-flagged
+  /// packet the decoder takes anchors the resync when its first picture is
+  /// proved a random-access one ([`Self::anchors`]) — nothing is drained or
   /// reset for it. It is fed once the decoder's output is settled
   /// ([`Self::sw_output_settled`]); until then the send answers `MustDrain`,
   /// so the pictures from before the anchor that can still come out are
@@ -1509,9 +1514,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       // No decoder open: one is opened, on one thread for good.
       self.open_after_drain().map_err(VideoDecodeError::Decode)?;
     }
-    // A key-flagged packet across an open gap anchors the resync, fed once
-    // the decoder holds no picture the caller has not taken.
-    let anchoring = pkt.is_key() && self.degraded_resync_pending && !self.degraded_anchored;
+    // A key-flagged packet across an open gap whose first picture is proved
+    // a random-access one anchors the resync, fed once the decoder holds no
+    // picture the caller has not taken.
+    let anchoring = self.degraded_resync_pending && !self.degraded_anchored && self.anchors(pkt);
     if anchoring && !self.sw_output_settled {
       return Ok(Sent::MustDrain);
     }
@@ -1576,6 +1582,17 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       self.count_degraded_packet();
     }
     Ok(Sent::Accepted)
+  }
+
+  /// Whether `pkt` anchors a post-commit resync: a key-flagged packet whose
+  /// first picture the bitstream proves a random-access one, where this crate
+  /// can read it — see [`access::KeyframeRule::anchors`]. A stale key flag, or
+  /// a picture before the random-access one, anchors nothing.
+  fn anchors(&self, pkt: &Packet) -> bool {
+    pkt.is_key()
+      && pkt
+        .data()
+        .is_some_and(|data| self.keyframe_rule().anchors(data))
   }
 
   /// Whether `pkt` is a point to switch the software decoder at: a keyframe
@@ -1804,8 +1821,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     self.sw_output_settled = forwarded.is_none() && !eof_pending;
     if let Some(pkt) = forwarded {
       if pkt.is_key() {
-        // The refused current packet is itself the resync anchor.
         self.seeked = false;
+      }
+      if self.anchors(pkt) {
+        // The refused current packet is itself the resync anchor.
         self.anchor_resync(reorder_before);
       } else {
         self.count_degraded_packet();

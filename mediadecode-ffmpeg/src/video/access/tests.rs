@@ -335,3 +335,114 @@ fn millions_of_tiny_units_are_classified_without_allocating() {
     );
   }
 }
+
+/// Packs `bits`, a string of `0`s and `1`s, into the bytes of an H.264
+/// raw byte sequence payload — zero-padded — with an emulation prevention
+/// byte (`03`) before every byte of `00` to `03` that two zero bytes lead.
+fn rbsp(bits: &str) -> Vec<u8> {
+  let mut payload = Vec::new();
+  for chunk in bits.as_bytes().chunks(8) {
+    let mut byte = 0u8;
+    for (index, &bit) in chunk.iter().enumerate() {
+      if bit == b'1' {
+        byte |= 0x80 >> index;
+      }
+    }
+    payload.push(byte);
+  }
+  let mut raw = Vec::new();
+  let mut zeros = 0;
+  for byte in payload {
+    if zeros >= 2 && byte <= 3 {
+      raw.push(3);
+      zeros = 0;
+    }
+    zeros = if byte == 0 { zeros + 1 } else { 0 };
+    raw.push(byte);
+  }
+  raw
+}
+
+/// An H.264 slice NAL unit: `header`, then a slice header opening with
+/// `first_mb_in_slice` and `slice_type` as exp-Golomb codes.
+fn slice(header: u8, first_mb_in_slice: &str, slice_type: &str) -> Vec<u8> {
+  [
+    vec![header],
+    rbsp(&format!("{first_mb_in_slice}{slice_type}1")),
+  ]
+  .concat()
+}
+
+/// LAW (Codex R6 row 1, [high]): **a resync anchor is a packet whose first
+/// picture the bitstream proves a random-access one.** H.264: an IDR slice
+/// anchors, and so does a non-IDR slice whose header says I (the I picture
+/// of an open GOP, a recovery point) or SI — read through an emulation
+/// prevention byte where the header holds one — while a packet whose first
+/// slice is P or B does not, though an IDR follows it in the packet. HEVC:
+/// every IRAP picture anchors, a CRA among them, while a trailing or a RASL
+/// picture first does not. Every other codec takes the key flag as FFmpeg's
+/// parser set it.
+#[test]
+fn a_resync_anchor_is_a_packet_whose_first_picture_is_random_access() {
+  let h264 = KeyframeRule::of(CodecId::H264.raw(), &[]);
+  // ue(0) is `1`; ue(7), I for every slice, `0001000`; ue(5), P,
+  // `00110`; ue(4), SI, `00101`; ue(6), B, `00111`.
+  let idr = slice(0x65, "1", "0001000");
+  let i_slice = slice(0x41, "1", "0001000");
+  let si_slice = slice(0x41, "1", "00101");
+  let p_slice = slice(0x41, "1", "00110");
+  let b_slice = slice(0x01, "1", "00111");
+  // `first_mb_in_slice` with 22 leading zeros: the payload runs `00 00 02`,
+  // which the bitstream carries as `00 00 03 02`.
+  let far_i_slice = slice(
+    0x41,
+    &format!("{}1{}", "0".repeat(22), "0".repeat(22)),
+    "0001000",
+  );
+  assert!(
+    far_i_slice.windows(3).any(|w| w == [0, 0, 3]),
+    "the fixture carries an emulation prevention byte"
+  );
+  let sei: &[u8] = &[0x06, 6, 1, 0x80];
+  for (units, anchors, why) in [
+    (vec![&idr[..]], true, "an IDR slice"),
+    (vec![sei, &i_slice[..]], true, "a recovery point's I slice"),
+    (vec![&si_slice[..]], true, "an SI slice"),
+    (
+      vec![&far_i_slice[..]],
+      true,
+      "an I slice read through `00 00 03`",
+    ),
+    (vec![&p_slice[..]], false, "a P slice, a stale key flag"),
+    (vec![&b_slice[..]], false, "a B slice"),
+    (
+      vec![&p_slice[..], &idr[..]],
+      false,
+      "a P slice before the IDR",
+    ),
+  ] {
+    assert_eq!(h264.anchors(&annex_b(&units)), anchors, "H.264: {why}");
+  }
+
+  let hevc = KeyframeRule::of(CodecId::HEVC.raw(), &[]);
+  let picture = |kind: u8| -> Vec<u8> { vec![kind << 1, 1, 0xaf] };
+  for (kinds, anchors, why) in [
+    (vec![21u8], true, "a CRA"),
+    (vec![19], true, "an IDR"),
+    (vec![16], true, "a BLA"),
+    (vec![1], false, "a trailing picture"),
+    (vec![8], false, "a RASL picture"),
+    (vec![1, 21], false, "a trailing picture before the CRA"),
+  ] {
+    let units: Vec<Vec<u8>> = kinds.iter().map(|&kind| picture(kind)).collect();
+    let units: Vec<&[u8]> = units.iter().map(Vec::as_slice).collect();
+    assert_eq!(hevc.anchors(&annex_b(&units)), anchors, "HEVC: {why}");
+  }
+
+  for codec in [CodecId::MPEG4, CodecId::VP9, CodecId::AV1] {
+    assert!(
+      KeyframeRule::of(codec.raw(), &[]).anchors(&[]),
+      "{codec:?}: the key flag stands"
+    );
+  }
+}

@@ -5024,3 +5024,84 @@ fn the_packets_after_the_anchor_are_counted_through_an_unanchor() {
     "packets 8 to 11 before the keyframe; 13, 14, 16 and 17 after it: {loss}"
   );
 }
+
+/// An H.264 clip from `libx264` in closed GOPs — an IDR every 8 frames, two
+/// B-frames between references — with its SPS and PPS in the codec
+/// parameters' extradata, so a decoder opened cold from them takes a P
+/// slice without waiting for an IDR's.
+fn encode_h264_with_extradata(width: u32, height: u32, frames: usize) -> SyntheticClip {
+  use ffmpeg_next as ff;
+  ff::init().expect("ffmpeg init");
+  let codec = ff::codec::encoder::find_by_name("libx264").expect("libx264 is linked");
+  let mut options = ff::Dictionary::new();
+  options.set(
+    "x264-params",
+    "keyint=8:min-keyint=8:scenecut=0:bframes=2:b-adapt=0:open-gop=0:log-level=error",
+  );
+  encode_clip(codec, width, height, frames, options, |enc| {
+    enc.set_flags(ff::codec::Flags::GLOBAL_HEADER);
+  })
+}
+
+/// LAW (Codex R6 row 1, [high]): **a stale key flag anchors nothing.** An
+/// H.264 stream whose SPS and PPS ride in its codec parameters, so the cold
+/// software decoder takes P slices: the hardware fails post-commit on a
+/// P-frame and the decoder decodes across the gap. A P-frame packet flagged
+/// a keyframe — a stale flag — is taken and anchors nothing: its first
+/// picture is a P slice, which no rule of the bitstream makes a random-access
+/// one, and the pictures it leads are no part of the reorder bound. The IDR
+/// after it anchors the resync.
+#[test]
+fn a_stale_key_flag_anchors_nothing() {
+  let clip = encode_h264_with_extradata(128, 96, 40);
+  let second = keyframe_after(&clip, 0);
+  let third = keyframe_after(&clip, second);
+  let at = second + 1;
+  assert!(
+    !clip.packets[at].is_key() && !clip.packets[third - 1].is_key(),
+    "P and B packets around the GOP boundary"
+  );
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test(
+    Box::new(FakeHw::failing(128, 96, at, at, FailShape::PostCommit)),
+    clip.parameters.clone(),
+    tb,
+  )
+  .expect("build test decoder");
+  let mut dst = crate::empty_owned_video_frame();
+  let mut drain = |dec: &mut FfmpegVideoStreamDecoder| loop {
+    match dec.receive_frame(&mut dst) {
+      Ok(Received::Frame) | Err(VideoDecodeError::Decode(_)) => {}
+      Ok(Received::NeedsInput | Received::Ended) => break,
+      Err(other) => panic!("unexpected: {other:?}"),
+    }
+  };
+  for av_pkt in &clip.packets[..third - 1] {
+    match dec.send_packet(&pushed(av_pkt)) {
+      Ok(Sent::Accepted) | Err(VideoDecodeError::Decode(_)) => {}
+      other => panic!("send_packet: {other:?}"),
+    }
+    drain(&mut dec);
+  }
+  assert!(dec.degraded_resync_pending_for_test(), "the gap is open");
+
+  let original = &clip.packets[third - 1];
+  let mut stale = Packet::copy(original.data().expect("a payload"));
+  stale.set_pts(original.pts());
+  stale.set_dts(original.dts());
+  stale.set_flags(ffmpeg_next::packet::Flags::KEY);
+  crate::accepted(
+    dec.send_packet(&pushed(&stale)),
+    "the P-frame flagged a keyframe",
+  );
+  assert!(
+    !dec.degraded_anchored_for_test(),
+    "a stale key flag anchors nothing"
+  );
+  drain(&mut dec);
+  crate::accepted(dec.send_packet(&pushed(&clip.packets[third])), "the IDR");
+  assert!(
+    dec.degraded_anchored_for_test(),
+    "the IDR anchors the resync"
+  );
+}
