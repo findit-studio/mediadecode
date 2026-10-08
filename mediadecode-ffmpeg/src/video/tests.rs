@@ -9541,3 +9541,149 @@ fn the_refusals_waiting_keep_their_order_and_none_is_lost() {
   }
   assert!(refusals.pop().is_none(), "and no more");
 }
+
+/// A Constrained Baseline x264 stream of 24 frames — IDRs at 0, 8 and 16,
+/// each carrying its SPS and PPS — restated: its packet 5, a P picture and
+/// no keyframe, carries the stream's SPS ahead of its slices, and its PPS.
+/// Where `arbitrary`, that SPS has `constraint_set1_flag` cleared (a Baseline
+/// set that permits arbitrary slice order) and the IDRs 8 and 16 carry no
+/// parameter set, decoded under 5's.
+fn h264_with_sets_on_a_non_key_packet(arbitrary: bool) -> SyntheticClip {
+  let clip = encode_h264_baseline(128, 96, 24, false);
+  let first = annexb_units(clip.packets[0].data().expect("a payload"));
+  let set = |kind: u8| {
+    first
+      .iter()
+      .find(|unit| unit[0] & 0x1f == kind)
+      .expect("the parameter set")
+      .to_vec()
+  };
+  let (mut sps, pps) = (set(7), set(8));
+  if arbitrary {
+    sps[2] &= !0x40;
+  }
+  let packets = clip
+    .packets
+    .iter()
+    .enumerate()
+    .map(|(index, packet)| {
+      let units = annexb_units(packet.data().expect("a payload"));
+      let units: Vec<&[u8]> = match index {
+        5 => [&sps[..], &pps[..]]
+          .into_iter()
+          .chain(units.iter().copied())
+          .collect(),
+        8 | 16 if arbitrary => units
+          .iter()
+          .copied()
+          .filter(|unit| !matches!(unit[0] & 0x1f, 7 | 8))
+          .collect(),
+        _ => units,
+      };
+      let payload: Vec<u8> = units
+        .iter()
+        .flat_map(|unit| [0u8, 0, 0, 1].into_iter().chain(unit.iter().copied()))
+        .collect();
+      repacked(packet, &payload)
+    })
+    .collect();
+  SyntheticClip {
+    parameters: clip.parameters.clone(),
+    packets,
+  }
+}
+
+/// LAW (Codex R15, [high]): **a sequence parameter set on a packet that is
+/// no keyframe is read as one on a keyframe is.** A Baseline x264 stream
+/// whose packet 5 — a P picture — carries the stream's sequence parameter
+/// set, `constraint_set1_flag` cleared (a Baseline set, which permits
+/// arbitrary slice order), and its picture parameter set ahead of its
+/// slices, and whose IDRs 8 and 16 carry none: FFmpeg's decoder takes 5's
+/// sets for its own and decodes the IDRs under them. Through a post-commit
+/// failure at 5, the cold decoder taking the sets from it, no IDR anchors,
+/// no picture closes the gap, and the end escalates by name; on a probe-era
+/// fallback at 3 on three threads the session is still on one thread after
+/// the IDR 8. With 5 carrying the set as encoded — Constrained Baseline —
+/// and the IDRs their own, the IDR 8 anchors and the end is clean, and the
+/// switch fires at 8. Read off keyframes alone, the Baseline set on 5 went
+/// unread: the IDR 8 anchored and the switch fired.
+#[test]
+fn a_sequence_parameter_set_on_a_packet_that_is_no_keyframe_is_read() {
+  let three = core::num::NonZeroU32::new(3).expect("nonzero");
+  for (arbitrary, name) in [(false, "Constrained Baseline"), (true, "Baseline")] {
+    let clip = h264_with_sets_on_a_non_key_packet(arbitrary);
+    assert!(
+      !clip.packets[5].is_key() && clip.packets[8].is_key() && clip.packets[16].is_key(),
+      "5 is no keyframe; 8 and 16 are IDRs"
+    );
+    let (_, delivered, escalated) = through_a_post_commit_failure(&clip, 5);
+    assert_eq!(
+      escalated, arbitrary,
+      "{name}: the end escalates {arbitrary}: {delivered:?}"
+    );
+    assert_eq!(
+      delivered.iter().any(|&(_, open)| !open),
+      !arbitrary,
+      "{name}: a picture closes the gap {}: {delivered:?}",
+      !arbitrary
+    );
+    let (_, threads_after) = threads_through_a_fallback(&clip, 3, crate::Threads::Count(three));
+    assert_eq!(
+      threads_after[8],
+      if arbitrary {
+        Some(core::num::NonZeroU32::MIN)
+      } else {
+        Some(three)
+      },
+      "{name}: the switch at the IDR 8 fires {}: {threads_after:?}",
+      !arbitrary
+    );
+  }
+}
+
+/// LAW (Codex R15, [high]): **an HEVC video parameter set on a packet that
+/// is no keyframe is read too.** The R6 CRA stream, a spare video parameter
+/// set in the packet just before the CRA where the hardware fails
+/// post-commit — a packet that is no keyframe, which the hardware takes.
+/// Two layers declaring the auxiliary type, and the CRA and every keyframe
+/// after it anchor nothing and the end escalates by name; one layer, and the
+/// CRA anchors and the end is clean. Read off keyframes alone, the
+/// auxiliary set went unread and the CRA resynced.
+#[test]
+fn a_video_parameter_set_on_a_packet_that_is_no_keyframe_is_read() {
+  const AUXILIARY: u16 = 1 << (15 - 3);
+  let clip = encode_hevc_cra_with_headers(128, 96, 40);
+  let at = keyframe_after(&clip, 3);
+  let before = at - 1;
+  assert!(
+    !clip.packets[before].is_key(),
+    "the packet before is no keyframe"
+  );
+  let data = clip.packets[before].data().expect("a payload").to_vec();
+  for (name, layers_minus1, mask, declares) in [
+    ("one layer", 0, None, false),
+    ("auxiliary", 1, Some(AUXILIARY), true),
+  ] {
+    let mut packets = clip.packets.clone();
+    packets[before] = repacked(
+      &clip.packets[before],
+      &[&[0, 0, 0, 1][..], &spare_vps(layers_minus1, mask), &data].concat(),
+    );
+    let with = SyntheticClip {
+      parameters: clip.parameters.clone(),
+      packets,
+    };
+    let (dec, delivered, escalated) = through_a_post_commit_failure(&with, at);
+    assert!(dec.is_software(), "{name}: the hardware failed post-commit");
+    assert_eq!(
+      escalated, declares,
+      "{name}: the end escalates {declares}: {delivered:?}"
+    );
+    assert_eq!(
+      delivered.iter().any(|&(_, open)| !open),
+      !declares,
+      "{name}: a picture closes the gap {}: {delivered:?}",
+      !declares
+    );
+  }
+}

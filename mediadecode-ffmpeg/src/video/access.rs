@@ -554,14 +554,27 @@ const fn sps_permits_aso(profile_idc: u8, constraint_flags: u8) -> bool {
 
 /// Whether any of `data`'s H.264 NAL units — length-prefixed by
 /// `nal_length` bytes, or start-coded when `None` — is a sequence parameter
-/// set (7) that permits arbitrary slice order ([`sps_permits_aso`]). Its
-/// profile and constraint bytes follow the unit's header byte; the first is
-/// never zero where it matters, so no emulation prevention byte stands
-/// between them. Units that do not parse prove nothing either way.
+/// set (7) that permits arbitrary slice order ([`sps_permits_aso`]), the
+/// units found as FFmpeg's H.264 decoder splits a packet
+/// (`ff_h2645_packet_split`, called by `decode_nal_units`, h264dec.c:609-610;
+/// [`super::params::Walk`]), one at a time in constant memory: a unit whose
+/// header does not parse, or that is empty, is passed over and the walk goes
+/// on, so it hides no set behind it; a buffer FFmpeg's split refuses gives
+/// the decoder nothing. Its profile and constraint bytes follow the unit's
+/// header byte.
 fn h264_units_permit_aso(data: &[u8], nal_length: Option<usize>) -> bool {
-  NalUnits::new(data, nal_length)
-    .filter_map(Result::ok)
-    .any(sps_unit_permits_aso)
+  let units = super::params::Walk::new(
+    data,
+    data.len(),
+    nal_length.unwrap_or(0),
+    super::params::Codec::H264,
+    nal_length.is_some(),
+    false,
+  );
+  units.accepted()
+    && units
+      .filter_map(Result::ok)
+      .any(|unit| unit.kind == 7 && sps_unit_permits_aso(&unit.head::<3>()))
 }
 
 /// Whether the H.264 NAL unit `unit` is a sequence parameter set (7) that

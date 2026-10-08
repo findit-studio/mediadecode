@@ -253,230 +253,356 @@ impl<'a> Reader<'a> {
   }
 }
 
-/// The codec whose NAL unit headers a split reads.
+/// The codec whose NAL unit headers a walk reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Codec {
   H264,
   Hevc,
 }
 
-/// Where a unit's bytes are, as the splitter hands them over.
+/// One NAL unit as FFmpeg's splitter cuts it out of a buffer (`H2645NAL`),
+/// found without anything collected or copied.
 #[derive(Clone, Copy, Debug)]
-enum Region {
-  /// In place, at this offset into the buffer: the unit had no emulation
-  /// prevention byte, and the reader runs on into the buffer behind it.
-  Source(usize),
-  /// Copied without its emulation prevention bytes, at this offset into
-  /// the splitter's own buffer, zeros behind it.
-  Rbsp(usize),
-}
-
-/// One NAL unit as FFmpeg's splitter hands it on (`H2645NAL`).
-#[derive(Clone, Copy, Debug)]
-pub(super) struct Nal {
+pub(super) struct Unit<'m> {
   /// `nal_unit_type`.
   pub(super) kind: u8,
   /// HEVC's `nuh_layer_id`; 0 for H.264.
   pub(super) layer: u8,
-  data: Region,
+  /// The unit as it stands in the buffer, from its header to where the
+  /// splitter cut it.
+  raw: &'m [u8],
+  /// Where its first `00 00 03`, or the `00 00 01` that cut it, stands in
+  /// `raw` — what a copy begins removing emulation prevention from; `raw`'s
+  /// length where there is neither.
+  found: usize,
+  /// Whether the splitter hands it over copied, its emulation prevention
+  /// bytes removed, rather than in place (`ff_h2645_extract_rbsp`).
+  copied: bool,
+  /// `nal->raw_size`: the raw bytes the splitter took for it.
+  consumed: usize,
+  /// `nal->size`: its bytes as handed over.
+  size: usize,
   /// `nal->size_bits`: its payload bits, to the stop bit (`get_bit_length`).
   pub(super) size_bits: u64,
-  /// `nal->raw_data`, as an offset into the buffer, and `nal->raw_size`.
-  raw_at: usize,
-  raw_size: usize,
-  /// The bits its header took: the reader's index once it is read.
+  /// The bits its header took: a reader's index once it is read.
   header_bits: u64,
+  /// Its offset in the buffer.
+  at: usize,
 }
 
-/// **A buffer as `ff_h2645_packet_split` cuts it** (h2645_parse.c): its NAL
-/// units, and the memory each one's reader sees.
-pub(super) struct Split<'m> {
+/// A walk FFmpeg's splitter refuses: a length field past the buffer, or no
+/// start code at all — the decoder then reads none of the buffer's units.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Refused;
+
+/// **`ff_h2645_packet_split`** (h2645_parse.c:527-665) over the first
+/// `length` bytes of `mem`, one unit at a time and in constant memory —
+/// `mem` holding what follows them too, which a unit handed over in place
+/// shows its reader. Units are length-prefixed by `nal_length_size` bytes
+/// where `nalff` (`H2645_FLAG_IS_NALFF`), or start-coded; `small_padding`
+/// (`H2645_FLAG_SMALL_PADDING`) lets a unit with no emulation prevention byte
+/// stay in place, where without it every unit is copied. A unit whose header
+/// does not parse — a forbidden bit set, an HEVC temporal id of -1 — or of
+/// HEVC layer 63, or with no payload bits, is passed over, as there.
+///
+/// FFmpeg cuts the whole buffer before its parser reads a unit, so a walk
+/// that ends [`Refused`] gives the parser nothing: a reader of the units
+/// walks to the end first ([`Self::accepted`]).
+#[derive(Clone)]
+pub(super) struct Walk<'m> {
   mem: &'m [u8],
-  rbsp: Vec<u8>,
-  pub(super) nals: Vec<Nal>,
+  length: usize,
+  nal_length_size: usize,
+  codec: Codec,
+  small_padding: bool,
+  at: usize,
+  next_avc: usize,
+  /// Units handed out (`nb_nals`).
+  units: usize,
+  over: bool,
 }
 
-impl Split<'_> {
-  fn data(&self, nal: &Nal) -> &[u8] {
-    match nal.data {
-      Region::Source(at) => self.mem.get(at..).unwrap_or_default(),
-      Region::Rbsp(at) => self.rbsp.get(at..).unwrap_or_default(),
+impl<'m> Walk<'m> {
+  pub(super) fn new(
+    mem: &'m [u8],
+    length: usize,
+    nal_length_size: usize,
+    codec: Codec,
+    nalff: bool,
+    small_padding: bool,
+  ) -> Self {
+    let length = length.min(mem.len());
+    Self {
+      mem,
+      length,
+      nal_length_size,
+      codec,
+      small_padding,
+      at: 0,
+      next_avc: if nalff { 0 } else { length },
+      units: 0,
+      over: false,
     }
   }
 
-  /// `nal->gb` as the splitter leaves it: over the unit's payload bits, its
-  /// index past the header.
-  pub(super) fn reader(&self, nal: &Nal) -> Reader<'_> {
+  /// Whether FFmpeg's splitter cuts the whole buffer: its parser reads the
+  /// units only then.
+  pub(super) fn accepted(&self) -> bool {
+    self.clone().all(|unit| unit.is_ok())
+  }
+
+  /// The memory a reader of `unit` — a unit this walk handed out, the walk
+  /// standing just past it — sees from the unit's first byte: in place, the
+  /// buffer from there on; copied, the copy, then zeros up to where the next
+  /// copied unit lands — the raw bytes the unit took on — and that unit's
+  /// copy, and so on as far as a reader reads past a unit's end (the safe
+  /// reader stops eight bits past it and loads eight bytes there). Built in
+  /// `scratch` where the unit is copied.
+  pub(super) fn memory<'s>(&self, unit: &Unit<'m>, scratch: &'s mut Vec<u8>) -> &'s [u8]
+  where
+    'm: 's,
+  {
+    if !unit.copied {
+      return self.mem.get(unit.at..).unwrap_or_default();
+    }
+    scratch.clear();
+    copy_unit(unit.raw, unit.found, |byte| scratch.push(byte));
+    let reach = unit.size + 16;
+    scratch.resize(unit.consumed.max(scratch.len()), 0);
+    let mut rest = self.clone();
+    while scratch.len() < reach {
+      match rest.next_cut() {
+        Some(Ok(next)) if next.copied => {
+          let start = scratch.len();
+          copy_unit(next.raw, next.found, |byte| scratch.push(byte));
+          scratch.resize(start + next.consumed, 0);
+        }
+        Some(Ok(_)) => {}
+        Some(Err(Refused)) | None => break,
+      }
+    }
+    scratch
+  }
+
+  /// The next unit the splitter cuts, its header unread: every unit
+  /// FFmpeg extracts, the ones it then passes over among them.
+  fn next_cut(&mut self) -> Option<Result<Unit<'m>, Refused>> {
+    loop {
+      if self.over || self.length - self.at < 4 {
+        self.over = true;
+        return None;
+      }
+      let mem = self.mem;
+      let extract_length;
+      if self.at == self.next_avc {
+        // `get_nalsize`: the field must leave a byte, and the unit fit.
+        let left = self.length - self.at;
+        if left <= self.nal_length_size {
+          self.over = true;
+          return Some(Err(Refused));
+        }
+        let size = mem[self.at..self.at + self.nal_length_size]
+          .iter()
+          .fold(0u64, |size, &byte| (size << 8) | u64::from(byte));
+        if size == 0 || size > (left - self.nal_length_size) as u64 {
+          self.over = true;
+          return Some(Err(Refused));
+        }
+        extract_length = size as usize;
+        self.at += self.nal_length_size;
+        self.next_avc = self.at + extract_length;
+      } else {
+        // `find_next_start_code`, bounded by the next length field.
+        let bound = self.next_avc.saturating_sub(self.at);
+        let skip = if bound <= 3 {
+          bound
+        } else {
+          let mut offset = 0;
+          while offset + 3 < bound {
+            if mem[self.at + offset..self.at + offset + 3] == [0, 0, 1] {
+              break;
+            }
+            offset += 1;
+          }
+          offset + 3
+        };
+        self.at += skip;
+        if self.at >= self.length {
+          self.over = true;
+          return (self.units == 0).then_some(Err(Refused));
+        }
+        extract_length = (self.length - self.at).min(self.next_avc - self.at);
+        if self.at >= self.next_avc {
+          continue;
+        }
+      }
+      let unit = cut(&mem[self.at..], extract_length, self.small_padding, self.at);
+      self.at += unit.consumed;
+      return Some(Ok(unit));
+    }
+  }
+}
+
+impl<'m> Iterator for Walk<'m> {
+  type Item = Result<Unit<'m>, Refused>;
+
+  fn next(&mut self) -> Option<Self::Item> {
+    loop {
+      let mut unit = match self.next_cut()? {
+        Ok(unit) => unit,
+        Err(refused) => return Some(Err(refused)),
+      };
+      // "see commit 3566042a0": a unit followed by `00 00 01 E0` keeps its
+      // trailing zeros.
+      let skip_trailing_zeros =
+        !(self.length - self.at >= 4 && self.mem[self.at..self.at + 4] == [0, 0, 1, 0xE0]);
+      let min_size = 1 + usize::from(self.codec == Codec::Hevc);
+      let mut stats = Stats::default();
+      if unit.copied {
+        copy_unit(unit.raw, unit.found, |byte| stats.push(byte));
+      } else {
+        unit.raw.iter().for_each(|&byte| stats.push(byte));
+      }
+      unit.size = stats.size;
+      let Some(size_bits) = stats.bit_length(min_size, skip_trailing_zeros) else {
+        continue;
+      };
+      if unit.size == 0 || size_bits == 0 {
+        continue;
+      }
+      unit.size_bits = size_bits;
+      let [head, second] = stats.head;
+      let parsed = match self.codec {
+        Codec::H264 => {
+          unit.kind = head & 0x1f;
+          unit.header_bits = 8;
+          head & 0x80 == 0
+        }
+        Codec::Hevc => {
+          unit.kind = (head >> 1) & 0x3f;
+          unit.layer = ((head & 1) << 5) | (second >> 3);
+          unit.header_bits = 16;
+          head & 0x80 == 0 && second & 0x07 != 0
+        }
+      };
+      if self.codec == Codec::Hevc && unit.layer == 63 {
+        continue;
+      }
+      if parsed {
+        self.units += 1;
+        return Some(Ok(unit));
+      }
+    }
+  }
+}
+
+impl Unit<'_> {
+  /// `nal->gb` as the splitter leaves it, over `memory` ([`Walk::memory`]):
+  /// the unit's payload bits, the index past its header.
+  pub(super) fn reader<'s>(&self, memory: &'s [u8]) -> Reader<'s> {
     Reader {
-      mem: self.data(nal),
-      index: nal.header_bits,
-      size: nal.size_bits,
+      mem: memory,
+      index: self.header_bits,
+      size: self.size_bits,
     }
   }
 
   /// A reader over the unit's raw bytes after its first —
   /// `init_get_bits8(nal->raw_data + 1, nal->raw_size - 1)`, the second of
   /// the three readings `decode_extradata_ps` gives a sequence parameter set
-  /// (h264_parse.c).
-  pub(super) fn raw_reader(&self, nal: &Nal) -> Reader<'_> {
+  /// (h264_parse.c:390) — the buffer, `mem`, read on past them.
+  pub(super) fn raw_reader<'s>(&self, mem: &'s [u8]) -> Reader<'s> {
     Reader::new(
-      self.mem.get(nal.raw_at + 1..).unwrap_or_default(),
-      (nal.raw_size.saturating_sub(1) * 8) as u64,
+      mem.get(self.at + 1..).unwrap_or_default(),
+      (self.consumed.saturating_sub(1) * 8) as u64,
     )
   }
-}
 
-/// **`ff_h2645_packet_split`** over the first `length` bytes of `mem` —
-/// `mem` holding what follows them in memory too, which a unit handed over
-/// in place shows its reader. NAL units are length-prefixed by
-/// `nal_length_size` bytes where `nalff` (`H2645_FLAG_IS_NALFF`), or
-/// start-coded; `small_padding` (`H2645_FLAG_SMALL_PADDING`) lets a unit
-/// with no emulation prevention byte stay in place. `None` where FFmpeg's
-/// split fails: a length field past the end, or no start code at all.
-///
-/// A unit whose header does not parse — a forbidden bit set, an HEVC
-/// temporal id of -1 — or of HEVC layer 63 is dropped, as there, and so is
-/// one with no payload bits.
-pub(super) fn split(
-  mem: &[u8],
-  length: usize,
-  nal_length_size: usize,
-  codec: Codec,
-  nalff: bool,
-  small_padding: bool,
-) -> Option<Split<'_>> {
-  let length = length.min(mem.len());
-  let mut out = Split {
-    mem,
-    rbsp: vec![0; length + PADDING],
-    nals: Vec::new(),
-  };
-  let mut rbsp_size = 0usize;
-  let mut next_avc = if nalff { 0 } else { length };
-  let mut at = 0usize;
-  while length - at >= 4 {
-    let extract_length;
-    let mut skip_trailing_zeros = true;
-    if at == next_avc {
-      // `get_nalsize`: the field must leave a byte, and the unit fit.
-      let left = length - at;
-      if left <= nal_length_size {
-        return None;
+  /// The first `N` bytes the unit is handed over as — its header and what
+  /// follows — zeros past its end.
+  pub(super) fn head<const N: usize>(&self) -> [u8; N] {
+    let mut head = [0u8; N];
+    let mut at = 0;
+    let mut put = |byte| {
+      if at < N {
+        head[at] = byte;
+        at += 1;
       }
-      let size = mem[at..at + nal_length_size]
-        .iter()
-        .fold(0u64, |size, &byte| (size << 8) | u64::from(byte));
-      if size == 0 || size > (left - nal_length_size) as u64 {
-        return None;
-      }
-      extract_length = size as usize;
-      at += nal_length_size;
-      next_avc = at + extract_length;
+    };
+    if self.copied {
+      copy_unit(self.raw, self.found, put);
     } else {
-      // `find_next_start_code`, bounded by the next length field.
-      let bound = next_avc.saturating_sub(at);
-      let skip = if bound <= 3 {
-        bound
-      } else {
-        let mut offset = 0;
-        while offset + 3 < bound {
-          if mem[at + offset..at + offset + 3] == [0, 0, 1] {
-            break;
-          }
-          offset += 1;
-        }
-        offset + 3
-      };
-      at += skip;
-      if at >= length {
-        return if out.nals.is_empty() { None } else { Some(out) };
-      }
-      extract_length = (length - at).min(next_avc - at);
-      if at >= next_avc {
-        continue;
-      }
+      self.raw.iter().take(N).for_each(|&byte| put(byte));
     }
-    let (consumed, data, size, raw_size) = extract(
-      &mem[at..],
-      extract_length,
-      small_padding,
-      &mut out.rbsp,
-      &mut rbsp_size,
-      at,
-    );
-    let raw_at = at;
-    at += consumed;
-    // "see commit 3566042a0": a unit followed by `00 00 01 E0` keeps its
-    // trailing zeros.
-    if length - at >= 4 && mem[at..at + 4] == [0, 0, 1, 0xE0] {
-      skip_trailing_zeros = false;
-    }
-    let bytes = match data {
-      Region::Source(offset) => &mem[offset..offset + size],
-      Region::Rbsp(offset) => &out.rbsp[offset..offset + size],
-    };
-    let min_size = 1 + usize::from(codec == Codec::Hevc);
-    let Some(size_bits) = bit_length(bytes, min_size, skip_trailing_zeros) else {
-      continue;
-    };
-    if size == 0 || size_bits == 0 {
-      continue;
-    }
-    let mut nal = Nal {
-      kind: 0,
-      layer: 0,
-      data,
-      size_bits,
-      raw_at,
-      raw_size,
-      header_bits: 0,
-    };
-    let mut header = out.reader(&nal);
-    let parsed = match codec {
-      Codec::H264 => {
-        let forbidden = header.bit();
-        header.bits(2); // nal_ref_idc
-        nal.kind = header.bits(5) as u8;
-        !forbidden
-      }
-      Codec::Hevc => {
-        let forbidden = header.bit();
-        nal.kind = header.bits(6) as u8;
-        nal.layer = header.bits(6) as u8;
-        let temporal_id_plus1 = header.bits(3);
-        !forbidden && temporal_id_plus1 != 0
-      }
-    };
-    nal.header_bits = header.count();
-    if codec == Codec::Hevc && nal.layer == 63 {
-      continue;
-    }
-    if parsed {
-      out.nals.push(nal);
-    }
+    head
   }
-  Some(out)
 }
 
-/// **`ff_h2645_extract_rbsp`** for the unit at the start of `src`, at most
-/// `length` bytes long: cut at the first start code (`00 00 01`), its
-/// emulation prevention bytes (`00 00 03`'s `03`) removed. A unit with
-/// neither stays in place under `small_padding`; any other is copied to the
-/// splitter's buffer at `rbsp_size`, and 64 zero bytes written behind it —
-/// where a later unit's copy may land, at the raw bytes the earlier one took.
-/// Answers the raw bytes consumed, where the unit is, its size and its raw
-/// size. `at` is `src`'s offset into the split buffer.
-fn extract(
-  src: &[u8],
-  length: usize,
-  small_padding: bool,
-  rbsp: &mut [u8],
-  rbsp_size: &mut usize,
-  at: usize,
-) -> (usize, Region, usize, usize) {
+/// What a unit's bytes say of its size and payload bits, gathered as they
+/// are handed over.
+#[derive(Default)]
+struct Stats {
+  size: usize,
+  head: [u8; 2],
+  /// The last byte that is not zero, and where: `get_bit_length`'s stop bit.
+  last_nonzero: Option<(usize, u8)>,
+  last: u8,
+}
+
+impl Stats {
+  fn push(&mut self, byte: u8) {
+    if self.size < 2 {
+      self.head[self.size] = byte;
+    }
+    if byte != 0 {
+      self.last_nonzero = Some((self.size, byte));
+    }
+    self.last = byte;
+    self.size += 1;
+  }
+
+  /// **`get_bit_length`** (h2645_parse.c:348-376): the payload bits — the
+  /// trailing zero bytes stripped (unless kept), then the last byte's stop
+  /// bit and the zero bits after it; a unit no longer than `min_size` bytes,
+  /// its header alone, keeps them. `None` where FFmpeg answers an error,
+  /// and the unit is passed over.
+  fn bit_length(&self, min_size: usize, skip_trailing_zeros: bool) -> Option<u64> {
+    let stripped = if skip_trailing_zeros {
+      self.last_nonzero.map_or(0, |(at, _)| at + 1)
+    } else {
+      self.size
+    };
+    if stripped == 0 {
+      return Some(0);
+    }
+    if stripped <= min_size {
+      if self.size < min_size {
+        return None;
+      }
+      return Some(min_size as u64 * 8);
+    }
+    let last = if skip_trailing_zeros {
+      self.last_nonzero.map_or(0, |(_, byte)| byte)
+    } else {
+      self.last
+    };
+    let trailing = if last != 0 {
+      u64::from(last.trailing_zeros()) + 1
+    } else {
+      0
+    };
+    Some(stripped as u64 * 8 - trailing)
+  }
+}
+
+/// **`ff_h2645_extract_rbsp`** (h2645_parse.c:37-150) for the unit at the
+/// start of `src`, at most `length` bytes long, its bytes not yet read: cut
+/// at the first `00 00 01` wholly inside, and copied where a `00 00 03`
+/// comes first — or wherever `small_padding` is not set — else handed over
+/// in place. `at` is `src`'s offset into the buffer.
+fn cut(src: &[u8], length: usize, small_padding: bool, at: usize) -> Unit<'_> {
   let byte = |index: usize| src.get(index).copied().unwrap_or(0);
   let mut length = length;
-  // The scan for the first `00 00 01` or `00 00 03` wholly inside.
   let mut found = length;
   let mut index = 0;
   while index + 2 < length {
@@ -489,74 +615,59 @@ fn extract(
     }
     index += 1;
   }
-  if found + 1 >= length && small_padding {
-    return (length, Region::Source(at), length, length);
+  let raw = &src[..length.min(src.len())];
+  let copied = !(found + 1 >= length && small_padding);
+  let consumed = if copied {
+    copy_unit(raw, found, |_| {})
+  } else {
+    length
+  };
+  Unit {
+    kind: 0,
+    layer: 0,
+    raw,
+    found,
+    copied,
+    consumed,
+    size: 0,
+    size_bits: 0,
+    header_bits: 0,
+    at,
   }
-  let start = *rbsp_size;
-  let copied = found.min(length);
-  rbsp[start..start + copied].copy_from_slice(&src[..copied]);
-  let (mut si, mut di) = (copied, copied);
-  let mut cut = false;
+}
+
+/// The bytes FFmpeg's splitter writes for a unit it copies, handed to
+/// `sink` one at a time: `raw[..found]` as it stands, then each `00 00 03`'s
+/// `03` dropped, the copy ending at a `00 00 01` or `00 00 02`
+/// (h2645_parse.c:99-138). Answers the raw bytes it took (`si`).
+fn copy_unit(raw: &[u8], found: usize, mut sink: impl FnMut(u8)) -> usize {
+  let length = raw.len();
+  let byte = |index: usize| raw.get(index).copied().unwrap_or(0);
+  let start = found.min(length);
+  raw[..start].iter().for_each(|&byte| sink(byte));
+  let mut si = start;
   while si + 2 < length {
     if byte(si + 2) > 3 {
-      rbsp[start + di] = byte(si);
-      rbsp[start + di + 1] = byte(si + 1);
-      di += 2;
+      sink(byte(si));
+      sink(byte(si + 1));
       si += 2;
     } else if byte(si) == 0 && byte(si + 1) == 0 && byte(si + 2) != 0 {
       if byte(si + 2) == 3 {
-        rbsp[start + di] = 0;
-        rbsp[start + di + 1] = 0;
-        di += 2;
+        sink(0);
+        sink(0);
         si += 3;
         continue;
       }
-      cut = true;
-      break;
+      return si;
     }
-    rbsp[start + di] = byte(si);
-    di += 1;
+    sink(byte(si));
     si += 1;
   }
-  if !cut {
-    while si < length {
-      rbsp[start + di] = byte(si);
-      di += 1;
-      si += 1;
-    }
+  while si < length {
+    sink(byte(si));
+    si += 1;
   }
-  let end = (start + di + PADDING).min(rbsp.len());
-  rbsp[start + di..end].fill(0);
-  *rbsp_size += si;
-  (si, Region::Rbsp(start), di, si)
-}
-
-/// **`get_bit_length`** (h2645_parse.c): a unit's payload bits — its
-/// trailing zero bytes stripped (unless kept), then its last byte's stop
-/// bit and the zero bits after it; a unit no longer than `min_size` bytes,
-/// its header alone, keeps them. `None` where FFmpeg answers an error, and
-/// the unit is dropped.
-fn bit_length(data: &[u8], min_size: usize, skip_trailing_zeros: bool) -> Option<u64> {
-  let mut size = data.len();
-  while skip_trailing_zeros && size > 0 && data[size - 1] == 0 {
-    size -= 1;
-  }
-  if size == 0 {
-    return Some(0);
-  }
-  let mut trailing = 0u64;
-  if size <= min_size {
-    if data.len() < min_size {
-      return None;
-    }
-    size = min_size;
-  } else {
-    let last = data[size - 1];
-    if last != 0 {
-      trailing = u64::from(last.trailing_zeros()) + 1;
-    }
-  }
-  Some(size as u64 * 8 - trailing)
+  si
 }
 
 /// What a sequence parameter set FFmpeg stores says to a picture parameter
@@ -948,25 +1059,31 @@ fn h264_sets(
   nalff: bool,
   sps: &mut [Option<Sps>; 32],
 ) -> Result<(), Unstored> {
-  let Some(split) = split(mem, length, 2, Codec::H264, nalff, true) else {
+  let mut units = Walk::new(mem, length, 2, Codec::H264, nalff, true);
+  if !units.accepted() {
     return Ok(());
-  };
-  for nal in &split.nals {
-    match nal.kind {
+  }
+  let mut scratch = Vec::new();
+  while let Some(Ok(unit)) = units.next() {
+    match unit.kind {
       7 => {
-        let stored = h264_sps(&mut split.reader(nal), false)
-          .or_else(|| h264_sps(&mut split.raw_reader(nal), false))
-          .or_else(|| h264_sps(&mut split.reader(nal), true));
+        let memory = units.memory(&unit, &mut scratch);
+        let stored = h264_sps(&mut unit.reader(memory), false)
+          .or_else(|| h264_sps(&mut unit.raw_reader(mem), false))
+          .or_else(|| h264_sps(&mut unit.reader(memory), true));
         let Some((id, set)) = stored else {
           return Err(Unstored::Failed(crate::ParameterSet::Sequence));
         };
         sps[id] = Some(set);
       }
-      8 => match h264_pps(&mut split.reader(nal), nal.size_bits, sps) {
-        Pps::Stored => {}
-        Pps::Failed => return Err(Unstored::Failed(crate::ParameterSet::Picture)),
-        Pps::Unresolved => return Err(Unstored::Unresolved),
-      },
+      8 => {
+        let memory = units.memory(&unit, &mut scratch);
+        match h264_pps(&mut unit.reader(memory), unit.size_bits, sps) {
+          Pps::Stored => {}
+          Pps::Failed => return Err(Unstored::Failed(crate::ParameterSet::Picture)),
+          Pps::Unresolved => return Err(Unstored::Unresolved),
+        }
+      }
       _ => {}
     }
   }

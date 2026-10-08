@@ -2335,13 +2335,17 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// changing anything: an H.264 sequence parameter set permitting arbitrary
   /// slice order, an HEVC video parameter set declaring an auxiliary layer —
   /// in a new extradata `pkt` carries, or the active extradata where it
-  /// carries none, and, for a keyframe, among its own units. Every packet
-  /// the session is sent is read here before any road takes it, so a
-  /// parameter set the hardware decoded is read as one the software road
-  /// would decode; [`Self::commit_sets`] makes it the session's once a
-  /// decoder may have taken the packet. The packet's own reading needs no
-  /// commit: every rule `pkt` is read under reads its own new extradata and
-  /// units ([`Self::rule_for`], `access::KeyframeRule::is_clean`).
+  /// carries none, and among its own units, whatever its key flag: FFmpeg's
+  /// decoders read a parameter set wherever it comes — a non-key packet's
+  /// sequence parameter set ahead of its P picture is the decoder's from then
+  /// on (`decode_nal_units`, h264dec.c; `decode_nal_unit`, hevc/hevcdec.c),
+  /// and an IDR later carrying none is decoded under it. Every packet the
+  /// session is sent is read here before any road takes it, so a parameter
+  /// set the hardware decoded is read as one the software road would decode;
+  /// [`Self::commit_sets`] makes it the session's once a decoder may have
+  /// taken the packet. The packet's own reading needs no commit: every rule
+  /// `pkt` is read under reads its own new extradata and units
+  /// ([`Self::rule_for`], `access::KeyframeRule::is_clean`).
   fn sets_of(&self, pkt: &Packet) -> Sets {
     let codec = self.codec_id();
     let (h264, hevc) = (
@@ -2355,7 +2359,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       Some(extradata) => access::KeyframeRule::of(codec, extradata),
       None => self.keyframe_rule(),
     };
-    let units = pkt.is_key().then(|| pkt.data()).flatten();
+    let units = pkt.data();
     Sets {
       aso: h264 && (rule.permits_aso() || units.is_some_and(|data| rule.units_permit_aso(data))),
       alpha: hevc
