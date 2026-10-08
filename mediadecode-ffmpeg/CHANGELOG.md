@@ -108,6 +108,23 @@ The backend-agnostic core it adapts has its own log at
   unread — is refused by this name, naming what left it unknown, rather
   than opened on extradata that may be stale (below).
 
+- **`Error::ExtradataRejected`** (`ExtradataRejected { codec, reason }`,
+  with `ExtradataRejection` and `ParameterSet`, all exported;
+  `ExtradataRejection` and `ParameterSet` are `#[non_exhaustive]`): a packet
+  whose `AV_PKT_DATA_NEW_EXTRADATA` is an H.264 record FFmpeg's decoder would
+  reject — an `avcC` record under seven bytes, a parameter set running past
+  it, a set too large for the escaping retry — or apply only in part, a
+  parameter set it cannot parse skipped (or a picture parameter set
+  referring to a sequence parameter set the record does not carry, whose
+  fate depends on what the decoder holds), is refused by this name before
+  any decoder sees it, naming the reason; the packet stays the caller's and
+  nothing of the session changes (below).
+
+- **`FrameBudgetExceeded::pts`** (and `with_pts`): the refused frame's
+  presentation timestamp as FFmpeg set it before the allocation — the
+  packet's it was decoded from — so a refusal reported apart from the call
+  that ran its decode says which picture was lost; `new` keeps none.
+
 - **`active_threads()` on the video stream decoder**: the threads the
   decoder serving now decodes with, read off what is active
   (`active_thread_type`), never off what was asked — the count libavcodec
@@ -177,18 +194,24 @@ The backend-agnostic core it adapts has its own log at
   its slice header, is neither clean nor a resync anchor) — and an H.264
   stream whose sequence parameter set permits arbitrary slice order
   (Baseline or Extended without `constraint_set1_flag`, read off the codec
-  parameters, a new extradata or a keyframe's own SPS) has no clean point
+  parameters — an `avcC` record's header and its SPS entries — a new
+  extradata or any packet's own SPS, a keyframe's or not, each found as
+  FFmpeg's NAL splitter cuts the packet) has no clean point
   and no anchor at all, its slices' order vouching for no picture start: it
   returns to the session's threads only at a seek, a post-commit fallback's
   gap ends escalated, and a warning says so once — as does an HEVC stream
   whose video parameter set declares an auxiliary layer FFmpeg decodes as
   alpha (the set read as FFmpeg 9's `ff_hevc_decode_nal_vps` and
-  `decode_vps_ext` read it: two layers and at most two layer sets, the
-  extension's scalability mask setting the auxiliary type and the second
-  layer's `nuh_layer_id` not 0 — a set of more layers, whose extension
-  FFmpeg ignores and decodes the base layer alone, a set it refuses, or one
-  read past its own end declaring none; read off the codec parameters, a
-  new extradata or a keyframe's own VPS) or whose software decoder
+  `decode_vps_ext` read it, on a mirror of its bit reader, past the set's
+  end into the memory after it too: two layers and at most two layer sets,
+  the extension's scalability mask setting the auxiliary type and the second
+  layer's `nuh_layer_id` not 0, read whole or up to the unsupported value
+  that leaves FFmpeg treating the set as alpha video — a set of more layers,
+  whose extension FFmpeg ignores and decodes the base layer alone, and a set
+  it refuses declaring none, as does a set read past its end under an id the
+  decoder is known to hold, which FFmpeg refuses; read off the codec
+  parameters, a new extradata or any packet's own VPS, a keyframe's or not)
+  or whose software decoder
   negotiated an output format with alpha: FFmpeg decodes that layer beside
   the base one as every picture's alpha plane, and no base-layer picture
   proves where it starts. A packet's parameter sets make either reading the
@@ -382,7 +405,14 @@ The backend-agnostic core it adapts has its own log at
   taken, it was refused instead at the next restart or fallback, after the
   decoder serving was closed, and at every send after it. A post-commit
   fallback reports `ParametersTooLarge` by its own name, as it does a frame
-  budget refusal. Read under the parameters as opened, an `avcC` stream
+  budget refusal. An H.264 new extradata FFmpeg's decoder would reject or
+  apply only in part — which `h264_decode_frame` does without a word, the
+  decoder keeping its old NAL length size or parameter sets — is refused by
+  name (`Error::ExtradataRejected`) before any decoder takes the packet, the
+  record read as FFmpeg 9 reads it, its bit reader and parameter set parsers
+  mirrored: taken, the session read later packets, and opened later
+  decoders, on a record the decoder serving never adopted. Read under the
+  parameters as opened, an `avcC` stream
   whose length fields changed never anchored, ended in a false
   `PostCommitNeverResynced`, and never returned to the session's threads.
 
@@ -397,12 +427,16 @@ The backend-agnostic core it adapts has its own log at
   picture its decode gave, which the next receive delivers; a replay's or a
   restart's drain reports it after the pictures it queued. The next
   packet's result is its own, and no refusal is reported twice. On a
-  frame-threaded decoder a worker latches whenever it allocates, so back
-  pressure collects no refusal: the packet's own error names it, or, for a
-  picture a worker concealed with no error to come, the end of the drain;
-  a seek clears it with the pictures it abandons. A concealed refusal used
-  to wait for whatever answer the decoder gave next, which named it: a later
-  packet's error, or a back-pressure answer turned into an error.
+  frame-threaded decoder a worker refuses a picture for a packet sent
+  before, and nothing ties the decoder's answers to it: each refusal is
+  kept on its own, with the declined picture's `pts`, and reported at the
+  next `receive_frame` — by itself, ahead of whatever the decoder answers
+  next, "needs input" and the end included — so a stream that never drains
+  to its end still hears it; no error of the decoder's is renamed by one,
+  and a second refusal of a call is reported after the first, not folded
+  into it. A seek clears them with the pictures it abandons. A concealed
+  refusal used to wait for whatever answer the decoder gave next, which
+  named it: a later packet's error, renamed, or the end of the drain.
 
 ## [0.15.1] - 2026-10-05
 
