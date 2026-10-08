@@ -6736,7 +6736,9 @@ fn a_replay_leaves_unknown_the_new_extradata_of_a_packet_reported_invalid() {
   );
   assert_eq!(
     progress.unknown,
-    Some(ffmpeg_next::Error::InvalidData),
+    Some(crate::ExtradataDoubt::Reported(
+      ffmpeg_next::Error::InvalidData
+    )),
     "the refusal leaves it unknown"
   );
 }
@@ -6875,7 +6877,8 @@ fn a_fallback_onto_unknown_extradata_is_refused_by_name() {
     );
     assert!(
       refusals.iter().any(|(index, error)| *index == 20
-        && matches!(error, Error::ExtradataUnknown(unknown) if unknown.refusal() == refusal)),
+        && matches!(error, Error::ExtradataUnknown(unknown)
+          if unknown.doubt() == crate::ExtradataDoubt::Reported(refusal))),
       "{refusal:?}: the fallback at 20 is refused by name, naming the refusal: {refused:?}"
     );
     assert!(!dec.is_software(), "{refusal:?}: nothing was committed");
@@ -7724,13 +7727,13 @@ fn only_a_refusal_minted_while_its_picture_was_allocated_says_a_packet_was_taken
     for in_step in [true, false] {
       assert_eq!(
         taken_despite(raw, &Error::Ffmpeg(raw), in_step),
-        Taken::Unknown(raw),
+        Taken::Unknown(crate::ExtradataDoubt::Reported(raw)),
         "{raw:?}, in step {in_step}"
       );
     }
     assert_eq!(
       taken_by_hardware_despite(&Error::Ffmpeg(raw)),
-      Taken::Unknown(raw),
+      Taken::Unknown(crate::ExtradataDoubt::Reported(raw)),
       "{raw:?} on the hardware"
     );
   }
@@ -7750,7 +7753,7 @@ fn only_a_refusal_minted_while_its_picture_was_allocated_says_a_packet_was_taken
     );
     assert_eq!(
       taken_despite(einval, named, false),
-      Taken::Unknown(einval),
+      Taken::Unknown(crate::ExtradataDoubt::Reported(einval)),
       "{named:?} on frame threads"
     );
     assert_eq!(
@@ -7804,5 +7807,245 @@ fn only_a_refusal_minted_while_its_picture_was_allocated_says_a_packet_was_taken
   assert!(
     !in_step_on(crate::Threads::Single),
     "nor does one that reads as wrapped"
+  );
+}
+
+/// Receives until the session answers "needs input" or the end, a decode
+/// error a picture meets tolerated; answers the timestamps of the pictures
+/// out, each with whether a post-commit gap was still open, and whether the
+/// end escalated.
+fn drained(
+  dec: &mut FfmpegVideoStreamDecoder,
+  dst: &mut VideoFrame<mediadecode::PixelFormat, VideoFrameExtra, FfmpegBytes>,
+) -> (Vec<(i64, bool)>, bool) {
+  let mut delivered = Vec::new();
+  loop {
+    match dec.receive_frame(dst) {
+      Ok(Received::Frame) => delivered.push((
+        dst.pts().map_or(i64::MIN, |t| t.pts()),
+        dec.degraded_resync_pending_for_test(),
+      )),
+      Ok(Received::NeedsInput | Received::Ended) => return (delivered, false),
+      Err(VideoDecodeError::PostCommitNeverResynced(_)) => return (delivered, true),
+      Err(VideoDecodeError::Decode(_)) => {}
+      Err(other) => panic!("unexpected: {other:?}"),
+    }
+  }
+}
+
+/// Sends `pkt` until the session takes it, draining whenever it asks.
+fn sent_through(
+  dec: &mut FfmpegVideoStreamDecoder,
+  dst: &mut VideoFrame<mediadecode::PixelFormat, VideoFrameExtra, FfmpegBytes>,
+  pkt: &Packet,
+) {
+  loop {
+    match dec.send_packet(&pushed(pkt)) {
+      Ok(Sent::Accepted) => return,
+      Ok(Sent::MustDrain) => {
+        drained(dec, dst);
+      }
+      Err(other) => panic!("send_packet: {other:?}"),
+    }
+  }
+}
+
+/// LAW (pre-R14 row 1): **a new extradata the hardware has not been seen to
+/// read is provisional, and a flush then leaves it unknown.** The R11
+/// stream: the hardware takes 0 to 16, the IDR 16 carrying the two-byte
+/// record, and the caller seeks before draining 16 — libavcodec may still
+/// hold it unread in its input slot, which the flush empties, the decoder
+/// kept on the framing it read before. The extradata is unknown, by the
+/// flush: at the seek's IDR 24, which carries no record, the hardware fails
+/// post-commit, and the cold decoder the session would open on its
+/// parameters is refused by name. Drained to "needs input" before the seek,
+/// the hardware has read 16: the extradata is known, the fallback at 24
+/// opens on the two-byte record, 24 anchors, and the end is clean. Taken
+/// for good at the hardware's acceptance, the record opened the cold decoder
+/// after the flush.
+#[test]
+fn a_flush_before_the_hardware_reads_a_new_extradata_leaves_it_unknown() {
+  let (clip, change) = encode_h264_avcc_whose_length_size_changes(128, 96, 32);
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  for drain_before_the_seek in [false, true] {
+    let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test(
+      Box::new(FakeHw::failing(
+        128,
+        96,
+        usize::MAX,
+        change + 1,
+        FailShape::PostCommit,
+      )),
+      clip.parameters.clone(),
+      tb,
+    )
+    .expect("build test decoder");
+    let mut dst = crate::empty_owned_video_frame();
+    for (index, av_pkt) in clip.packets[..=change].iter().enumerate() {
+      sent_through(&mut dec, &mut dst, av_pkt);
+      if index < change || drain_before_the_seek {
+        drained(&mut dec, &mut dst);
+      }
+    }
+    dec.flush().expect("a seek");
+    let left = dec.extradata_unknown_for_test();
+    let at_24 = dec.send_packet(&pushed(&clip.packets[24]));
+    if drain_before_the_seek {
+      assert!(
+        matches!(at_24, Ok(Sent::Accepted)),
+        "the fallback at 24 commits: {at_24:?}"
+      );
+      assert!(dec.is_software(), "on the cold decoder");
+      let mut delivered = drained(&mut dec, &mut dst).0;
+      for av_pkt in &clip.packets[25..] {
+        sent_through(&mut dec, &mut dst, av_pkt);
+        delivered.extend(drained(&mut dec, &mut dst).0);
+      }
+      crate::accepted(dec.send_eof(), "send_eof");
+      let (tail, escalated) = drained(&mut dec, &mut dst);
+      delivered.extend(tail);
+      assert!(!escalated, "the end is clean: {delivered:?}");
+      assert!(
+        delivered.iter().any(|&(_, open)| !open),
+        "24 anchored and the gap closed: {delivered:?}"
+      );
+    } else {
+      assert!(
+        matches!(
+          at_24,
+          Err(VideoDecodeError::Decode(Error::ExtradataUnknown(unknown)))
+            if unknown.doubt() == crate::ExtradataDoubt::Flushed
+        ),
+        "the fallback at 24 is refused by name: {at_24:?}"
+      );
+      assert!(!dec.is_software(), "nothing was committed");
+    }
+    assert_eq!(
+      left,
+      (!drain_before_the_seek).then_some(crate::ExtradataDoubt::Flushed),
+      "drained {drain_before_the_seek}: what the flush leaves"
+    );
+  }
+}
+
+/// LAW (pre-R14 row 1): **on the software road too, a new extradata is
+/// provisional until the decoder is seen to read its packet, and a flush
+/// then leaves it unknown.** The R11 stream through a probe-era fallback at
+/// 10: the decoder serving takes the IDR 16 and its two-byte record (on
+/// three threads, the decoder the switch at 16 opens), then the caller
+/// seeks. Seen read — the decoder answered "needs input" after it, or, one
+/// thread decoding what each submission hands it inside it, took 17 into
+/// an input slot it takes packets into only empty — the record stays known.
+/// Not seen read — nothing after 16, or only 17 taken by a frame-threaded
+/// decoder, whose taking it says nothing of a thread having decoded 16 —
+/// the flush leaves it unknown. Taken for good at the acceptance, every
+/// case read known.
+#[test]
+fn a_flush_before_the_software_decoder_reads_a_new_extradata_leaves_it_unknown() {
+  #[derive(Clone, Copy, Debug)]
+  enum After {
+    Nothing,
+    Packet,
+    Drain,
+  }
+  let (clip, change) = encode_h264_avcc_whose_length_size_changes(128, 96, 32);
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let three = core::num::NonZeroU32::new(3).expect("nonzero");
+  for (threads, after, unknown) in [
+    (crate::Threads::Single, After::Nothing, true),
+    (crate::Threads::Single, After::Packet, false),
+    (crate::Threads::Single, After::Drain, false),
+    (crate::Threads::Count(three), After::Packet, true),
+    (crate::Threads::Count(three), After::Drain, false),
+  ] {
+    let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test(
+      Box::new(FakeHw::failing(128, 96, 0, 10, FailShape::ProbeEra)),
+      clip.parameters.clone(),
+      tb,
+    )
+    .expect("build test decoder")
+    .with_threads_for_test(threads);
+    let mut dst = crate::empty_owned_video_frame();
+    for av_pkt in &clip.packets[..change] {
+      sent_through(&mut dec, &mut dst, av_pkt);
+      drained(&mut dec, &mut dst);
+    }
+    sent_through(&mut dec, &mut dst, &clip.packets[change]);
+    assert!(dec.is_software(), "{threads:?}: on the software road");
+    match after {
+      After::Nothing => {}
+      After::Packet => sent_through(&mut dec, &mut dst, &clip.packets[change + 1]),
+      After::Drain => {
+        drained(&mut dec, &mut dst);
+      }
+    }
+    dec.flush().expect("a seek");
+    assert_eq!(
+      dec.extradata_unknown_for_test(),
+      unknown.then_some(crate::ExtradataDoubt::Flushed),
+      "{threads:?}, {after:?} after 16: what the flush leaves"
+    );
+  }
+}
+
+/// LAW (pre-R14 row 1): **a decode error reported while a new extradata is
+/// unread leaves it unknown.** On one thread, the caller sends 15 without
+/// draining, so a picture 15's submission decoded waits to be received, and
+/// libavcodec takes the IDR 16 — its body corrupted as R12's law corrupts
+/// it, its two-byte record intact — into its input slot without decoding it:
+/// the send answers taken. The drain hands out the waiting picture, then
+/// decodes 16 and reports it invalid. Nothing ties that error to 16, and
+/// FFmpeg's HEVC decoder reports there a new extradata it could not parse:
+/// the record is unknown, by the error. Left provisional, the drain's "needs
+/// input" after the error read it as known.
+#[test]
+fn a_decode_error_while_a_new_extradata_is_unread_leaves_it_unknown() {
+  let (clip, change) = encode_h264_avcc_whose_length_size_changes(128, 96, 32);
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test(
+    Box::new(FakeHw::failing(128, 96, 0, 10, FailShape::ProbeEra)),
+    clip.parameters.clone(),
+    tb,
+  )
+  .expect("build test decoder")
+  .with_threads_for_test(crate::Threads::Single);
+  let mut dst = crate::empty_owned_video_frame();
+  for av_pkt in &clip.packets[..change - 1] {
+    sent_through(&mut dec, &mut dst, av_pkt);
+    drained(&mut dec, &mut dst);
+  }
+  sent_through(&mut dec, &mut dst, &clip.packets[change - 1]);
+  let corrupt = with_corrupt_body(&clip.packets[change]);
+  let at_16 = dec.send_packet(&pushed(&corrupt));
+  assert!(
+    matches!(at_16, Ok(Sent::Accepted)),
+    "16 waits in the input slot, taken without a decode: {at_16:?}"
+  );
+  assert!(
+    dec.extradata_provisional_for_test(),
+    "its record is provisional"
+  );
+  let mut errors = Vec::new();
+  loop {
+    match dec.receive_frame(&mut dst) {
+      Ok(Received::Frame) => {}
+      Ok(Received::NeedsInput | Received::Ended) => break,
+      Err(VideoDecodeError::Decode(error)) => errors.push(error),
+      Err(other) => panic!("unexpected: {other:?}"),
+    }
+  }
+  assert!(
+    matches!(
+      errors.as_slice(),
+      [Error::Ffmpeg(ffmpeg_next::Error::InvalidData)]
+    ),
+    "the drain decodes 16 and reports it invalid: {errors:?}"
+  );
+  assert_eq!(
+    dec.extradata_unknown_for_test(),
+    Some(crate::ExtradataDoubt::Reported(
+      ffmpeg_next::Error::InvalidData
+    )),
+    "the record is unknown, by the error"
   );
 }

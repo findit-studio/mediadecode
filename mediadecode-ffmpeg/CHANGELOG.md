@@ -99,13 +99,14 @@ The backend-agnostic core it adapts has its own log at
   the gap could close it. On a build whose AV1 decoder is `libdav1d`, a
   post-commit fallback on AV1 is refused this way.
 
-- **`Error::ExtradataUnknown`** (`ExtradataUnknown { refusal }`, exported): a
-  software video decoder the session would open on its codec parameters
-  while their extradata is unknown — a packet carrying
-  `AV_PKT_DATA_NEW_EXTRADATA` was refused with an error that does not say
-  whether the decoder took it, a decode error among them — is refused by
-  this name, naming that refusal, rather than opened on extradata that may
-  be stale (below).
+- **`Error::ExtradataUnknown`** (`ExtradataUnknown { doubt }`, with
+  `ExtradataDoubt`, both exported; `ExtradataDoubt` is `#[non_exhaustive]`):
+  a software video decoder the session would open on its codec parameters
+  while their extradata is unknown — whether the decoder applied a packet's
+  `AV_PKT_DATA_NEW_EXTRADATA` cannot be told: the packet was refused with an
+  error that does not say, a decode error among them, or a flush dropped it
+  unread — is refused by this name, naming what left it unknown, rather
+  than opened on extradata that may be stale (below).
 
 - **`active_threads()` on the video stream decoder**: the threads the
   decoder serving now decodes with, read off what is active
@@ -321,7 +322,19 @@ The backend-agnostic core it adapts has its own log at
   extradata is taken, no H.264 or HEVC packet is read as an anchor or a
   switch point under them, no switch opens a decoder on them, and a decoder
   the session must open on them is refused by name
-  (`Error::ExtradataUnknown`). One the hardware took while its
+  (`Error::ExtradataUnknown`). A packet a decoder takes may still wait
+  unread in libavcodec's input slot — behind a picture a submission decoded
+  that waits to be received, or a frame thread's results — so its new
+  extradata is provisional until the decoder is seen to read it: it answers
+  "needs input" or the end, or, decoding what a submission hands it inside
+  that submission (one thread, libavcodec's own; the hardware), takes a
+  later packet, or a decoder opened on the parameters replaces it. A
+  picture coming out proves nothing, since it can be the waiting one. A
+  flush while it is provisional drops the packet unread, the decoder kept
+  on the framing it read before, and a decode error reported then may be
+  that packet's own: either leaves the extradata unknown, as does the
+  hardware failing post-commit then with no fallback replacing it. One the
+  hardware took while its
   probe recorded is installed once nothing will replay it. A new extradata
   that would carry the codec parameters past `max_codec_parameter_bytes` —
   measured as a decoder's open measures them, the old extradata replaced by

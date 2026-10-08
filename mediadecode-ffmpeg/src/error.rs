@@ -192,41 +192,91 @@ pub enum Error {
 ///
 /// A packet carrying `AV_PKT_DATA_NEW_EXTRADATA` changes a stream's codec
 /// parameters from that packet on, and FFmpeg's H.264 and HEVC decoders
-/// apply it as they begin to decode the packet: a packet a decoder decoded
-/// and reported failed has changed its framing. When a decoder refuses such
-/// a packet with an error that does not say whether it got that far, the
-/// session cannot tell which extradata the decoder now frames the stream by.
-/// No error libavcodec reports says, invalid data included: it can come from
-/// before the decode, which then drops the packet, or, on a frame-threaded
-/// decoder, from an earlier packet while this one still waits. Only a
-/// refusal this crate mints while the packet's own picture is allocated
-/// does. So a corrupt packet at an extradata change leaves the extradata
-/// unknown until a packet carrying a new one is taken: until then the
-/// session reads no H.264 or HEVC resync anchor or switch point under its
-/// own, switches to no new decoder, and refuses by this name to open a
-/// decoder on it — a post-commit fallback's cold decoder, a reopen — rather
-/// than decode on parameters that may be stale. A packet carrying its own
-/// new extradata is read, and opened on, under that.
+/// apply it as they begin to decode the packet. The session takes the new
+/// extradata for its own once the decoder takes the packet, and holds it
+/// provisionally until the decoder is seen to have read the packet — it
+/// answers "needs input" or the end, or, decoding a packet inside the
+/// submission that hands it over, takes a later one: until then the packet
+/// may still wait in libavcodec's input slot, unread. The extradata is
+/// unknown when that cannot be told any more ([`ExtradataDoubt`]): a
+/// decoder refuses the packet with an error that does not say whether it
+/// got that far — any error libavcodec reports, invalid data among them —
+/// or reports one before it was seen to read it, a flush drops the packet
+/// unread, or the hardware fails and no fallback replaces it. A corrupt
+/// packet at an extradata change leaves it unknown, then, until a packet
+/// carrying a new one is taken: until then the session reads no H.264 or
+/// HEVC resync anchor or switch point under its own, switches to no new
+/// decoder, and refuses by this name to open a decoder on it — a
+/// post-commit fallback's cold decoder, a reopen — rather than decode on
+/// parameters that may be stale. A packet carrying its own new extradata is
+/// read, and opened on, under that.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error(
-  "the stream's codec extradata is unknown: a packet carrying a new extradata was refused with \
-   \"{refusal}\", which does not say whether the decoder took it, so no decoder is opened on \
-   extradata that may be stale"
+  "the stream's codec extradata is unknown: {doubt}; no decoder is opened on extradata that may \
+   be stale"
 )]
 pub struct ExtradataUnknown {
-  refusal: ffmpeg_next::Error,
+  doubt: ExtradataDoubt,
 }
 
 impl ExtradataUnknown {
   /// Constructs an [`ExtradataUnknown`] payload.
   #[inline]
-  pub const fn new(refusal: ffmpeg_next::Error) -> Self {
-    Self { refusal }
+  pub const fn new(doubt: ExtradataDoubt) -> Self {
+    Self { doubt }
   }
-  /// The refusal that left the extradata unknown.
+  /// What left the extradata unknown.
   #[inline]
-  pub const fn refusal(&self) -> ffmpeg_next::Error {
-    self.refusal
+  pub const fn doubt(&self) -> ExtradataDoubt {
+    self.doubt
+  }
+}
+
+/// What left a stream's codec extradata unknown ([`ExtradataUnknown`]):
+/// each says a decoder may, or may not, have applied a packet's new
+/// extradata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ExtradataDoubt {
+  /// libavcodec reported this error before the decoder was seen to read the
+  /// packet carrying the new extradata — refusing that packet, or later —
+  /// and nothing ties an error to a packet: it can come from before the
+  /// decode, which then drops the packet, or from an earlier packet.
+  Reported(ffmpeg_next::Error),
+  /// A refusal this crate made itself — a frame or a coded surface over its
+  /// ceiling, among others — before the decoder was seen to read the packet
+  /// carrying the new extradata, the error libavcodec reported with it not
+  /// kept.
+  Minted,
+  /// A flush dropped what the decoder had not yet been seen to read, the
+  /// packet carrying the new extradata among it.
+  Flushed,
+  /// The hardware decoder failed post-commit before it was seen to read the
+  /// packet carrying the new extradata — on that packet, or later — and the
+  /// software fallback that would have replaced it did not commit.
+  HardwareFailed,
+}
+
+impl core::fmt::Display for ExtradataDoubt {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    match self {
+      Self::Reported(error) => write!(
+        f,
+        "the decoder reported \"{error}\" before it was seen to read a packet carrying a new \
+         extradata"
+      ),
+      Self::Minted => f.write_str(
+        "this crate refused a picture before the decoder was seen to read a packet carrying a \
+         new extradata",
+      ),
+      Self::Flushed => f.write_str(
+        "a flush dropped a packet carrying a new extradata before the decoder was seen to read it",
+      ),
+      Self::HardwareFailed => f.write_str(
+        "the hardware failed before it was seen to read a packet carrying a new extradata, and \
+         the software fallback did not commit",
+      ),
+    }
   }
 }
 
