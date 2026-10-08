@@ -156,6 +156,55 @@ pub enum Error {
   /// [`ReplayQueueFull`].
   #[error(transparent)]
   ReplayQueueFull(#[from] ReplayQueueFull),
+
+  /// A software video decoder opened set to output pictures before their
+  /// recovery — `AV_CODEC_FLAG_OUTPUT_CORRUPT` or `AV_CODEC_FLAG2_SHOW_ALL`
+  /// set on its codec context after the open — is refused by name; see
+  /// [`UnrecoveredOutput`].
+  #[error(transparent)]
+  UnrecoveredOutput(#[from] UnrecoveredOutput),
+}
+
+/// Payload for [`Error::UnrecoveredOutput`].
+///
+/// The session clears both flags on every software video decoder's codec
+/// context before the open, and checks them after it, in every build. A
+/// decoder found with either set would output pictures it has not
+/// recovered — FFmpeg's H.264 decoder conceals the pictures it decodes from
+/// references it never saw and hands them out — and the proof that a
+/// post-commit resync happened on an H.264 stream is that FFmpeg withholds
+/// every such picture. The decoder is closed and the open refused, with the
+/// flags it found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+  "a software video decoder opened set to output pictures before their recovery \
+   (AV_CODEC_FLAG_OUTPUT_CORRUPT: {output_corrupt}, AV_CODEC_FLAG2_SHOW_ALL: {show_all}); \
+   the post-commit resync of an H.264 stream is proved by FFmpeg withholding them"
+)]
+pub struct UnrecoveredOutput {
+  output_corrupt: bool,
+  show_all: bool,
+}
+
+impl UnrecoveredOutput {
+  /// Constructs an [`UnrecoveredOutput`] payload.
+  #[inline]
+  pub const fn new(output_corrupt: bool, show_all: bool) -> Self {
+    Self {
+      output_corrupt,
+      show_all,
+    }
+  }
+  /// Whether `AV_CODEC_FLAG_OUTPUT_CORRUPT` was set.
+  #[inline]
+  pub const fn output_corrupt(&self) -> bool {
+    self.output_corrupt
+  }
+  /// Whether `AV_CODEC_FLAG2_SHOW_ALL` was set.
+  #[inline]
+  pub const fn show_all(&self) -> bool {
+    self.show_all
+  }
 }
 
 /// Payload for [`Error::ReplayQueueFull`].

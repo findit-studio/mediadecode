@@ -1,6 +1,6 @@
 //! The keyframe reading, over hand-built access units.
 
-use super::{Anchor, KeyframeRule, RecoveryPoint};
+use super::{Anchor, KeyframeRule, Proof, RecoveryPoint};
 use crate::CodecId;
 
 /// Start-codes each NAL unit.
@@ -699,5 +699,28 @@ fn an_approximate_recovery_point_anchors_and_its_flags_are_read() {
       "the message's fields, read"
     );
     assert!(!anchor.definitive(), "a recovery point is not definitive");
+  }
+}
+
+/// LAW (Codex R9, [high]): **a resync's proof is its codec rule's.** For
+/// H.264, either packing, it is FFmpeg withholding every picture it has not
+/// recovered, so the first picture out after the anchor closes the gap; for
+/// HEVC and every other rule, the reorder bound.
+#[test]
+fn a_resync_is_proved_by_withheld_output_on_h264_and_by_the_reorder_bound_elsewhere() {
+  for nal_length in [None, Some(4)] {
+    assert_eq!(KeyframeRule::H264 { nal_length }.proof(), Proof::Withheld);
+  }
+  for rule in [
+    KeyframeRule::Hevc { nal_length: None },
+    KeyframeRule::Hevc {
+      nal_length: Some(4),
+    },
+    KeyframeRule::Mpeg12,
+    KeyframeRule::Resets,
+    KeyframeRule::IntraOnly,
+    KeyframeRule::Reordering,
+  ] {
+    assert_eq!(rule.proof(), Proof::ReorderBound, "{rule:?}");
   }
 }

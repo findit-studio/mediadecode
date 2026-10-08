@@ -145,7 +145,8 @@ impl KeyframeRule {
   ///   point, and FFmpeg's parser flags some such pictures key by heuristic.
   /// - **HEVC:** the first picture's NAL unit is an IRAP picture (16–23), a
   ///   CRA (21) among them: the decoder resyncing kept its references, and
-  ///   the reorder bound covers the leading pictures a CRA has.
+  ///   the reorder bound ([`Proof::ReorderBound`]) covers the leading
+  ///   pictures a CRA has.
   /// - **Every other codec** — one picture per packet: MPEG-4 part 2, VP8,
   ///   VP9, AV1 and the rest — **the key flag FFmpeg's parser set from the
   ///   bitstream is the proof.** That is the trust boundary: this crate
@@ -178,6 +179,33 @@ impl KeyframeRule {
     }
   }
 
+  /// How a post-commit resync anchored on this rule's stream is proved.
+  ///
+  /// - **H.264: [`Proof::Withheld`].** FFmpeg's H.264 decoder outputs only
+  ///   pictures its own recovery tracking has marked recovered — an IDR
+  ///   picture and every picture after it in decode order, a recovery
+  ///   point's recovery and every picture after it in output order — as long
+  ///   as neither `AV_CODEC_FLAG_OUTPUT_CORRUPT` nor
+  ///   `AV_CODEC_FLAG2_SHOW_ALL` is set, which the session's software
+  ///   decoders refuse at the open. A decoder opened cold across the gap
+  ///   starts with nothing recovered, so every picture it delivers is one its
+  ///   tracking recovered: the first out after the anchor closes the gap, and
+  ///   a picture from before the anchor that comes out after it is one of
+  ///   those. That tracking is FFmpeg's, and this crate takes its word, as it
+  ///   takes the parser's key flag for the codecs whose pictures it does not
+  ///   read.
+  /// - **Every other codec: [`Proof::ReorderBound`].** FFmpeg's HEVC decoder
+  ///   keeps no such gate for a stream it is already decoding, and this
+  ///   crate reads nothing of the other codecs' recovery.
+  pub(crate) const fn proof(self) -> Proof {
+    match self {
+      Self::H264 { .. } => Proof::Withheld,
+      Self::Hevc { .. } | Self::Mpeg12 | Self::Resets | Self::IntraOnly | Self::Reordering => {
+        Proof::ReorderBound
+      }
+    }
+  }
+
   /// Why a keyframe this rule reads may not be clean, for the warning a
   /// session gives when a fallback has run on one thread for a minute.
   pub(crate) const fn reason(self) -> &'static str {
@@ -200,6 +228,20 @@ impl KeyframeRule {
   }
 }
 
+/// How a post-commit resync is proved once a packet has anchored it
+/// ([`KeyframeRule::proof`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Proof {
+  /// **The decoder withholds every picture it has not recovered**, so the
+  /// first picture out after the anchor closes the gap.
+  Withheld,
+  /// **The reorder bound**: the pictures from before the anchor that can
+  /// still come out are the ones its reorder buffer holds, so the gap closes
+  /// at the picture out past them — the first for a stream that does not
+  /// reorder (VP8, VP9, AV1).
+  ReorderBound,
+}
+
 /// A post-commit resync anchor, as its bitstream proves it
 /// ([`KeyframeRule::anchor`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -220,7 +262,7 @@ impl Anchor {
 
   /// The H.264 recovery point the anchor stands on, if any — reported,
   /// never counted: FFmpeg's decoder withholds the pictures before the
-  /// recovery it signals itself.
+  /// recovery it signals itself ([`Proof::Withheld`]).
   pub(crate) const fn recovery(self) -> Option<RecoveryPoint> {
     self.recovery
   }

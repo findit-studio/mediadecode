@@ -1061,7 +1061,9 @@ impl VideoDecoder {
       | Error::AllBackendsFailed(_)
       | Error::FallbackFailed(_)
       // The software road's own queue; no hardware funnel mints it.
-      | Error::ReplayQueueFull(_) => VerdictRouting::Direct,
+      | Error::ReplayQueueFull(_)
+      // The software road's open; no hardware funnel mints it either.
+      | Error::UnrecoveredOutput(_) => VerdictRouting::Direct,
     }
   }
 

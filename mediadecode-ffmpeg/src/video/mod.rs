@@ -28,46 +28,52 @@
 //!   to `AllBackendsFailed` by the inner decoder with an **empty**
 //!   `unconsumed_packets` (the probe buffer no longer exists). Here we
 //!   **degrade and continue** rather than reconstruct: open the SW decoder with
-//!   an empty replay set and let it **resync at the next keyframe**. Fed forward
-//!   packets from the failure point, the SW decoder naturally produces nothing
-//!   until that keyframe, then decodes normally from there. The bounded span
-//!   from the failure point to the next keyframe is dropped — an accepted,
+//!   an empty replay set and let it **resync at the next keyframe**. Fed
+//!   forward packets from the failure point, the SW decoder naturally produces
+//!   nothing until that keyframe, then decodes normally from there. The bounded
+//!   span from the failure point to the next keyframe is dropped — an accepted,
 //!   **loudly logged** gap (a single `tracing::warn!`), not a silent one. The
 //!   indexing pipeline this serves prefers a small logged gap over the
 //!   error-prone mid-stream-reconstruction state machine a lossless replay
 //!   would require (see findit-studio/mediadecode#12). The *bounded*-ness is
-//!   **enforced, not assumed**, and the resync is **proved by the decoder's
-//!   reorder bound**, never by matching a picture to a packet. A post-commit
+//!   **enforced, not assumed**, and the resync is **proved** — by FFmpeg's own
+//!   output withholding for H.264, by the decoder's reorder bound for every
+//!   other codec — never by matching a picture to a packet. A post-commit
 //!   fallback enters a degraded-resync mode that holds until a picture the
-//!   decoder outputs is decoded from a keyframe fed across the gap. The
-//!   anchor is a key-flagged packet the decoder takes after the commit whose
-//!   first picture the bitstream proves a random-access one — an H.264 IDR
-//!   or I slice, an HEVC IRAP picture; for a codec whose pictures this crate
-//!   does not read, the key flag FFmpeg's parser set — since an intra
-//!   picture resets the references of every picture after it that does not
-//!   lead it; it is fed once the decoder's output is settled (drained to
-//!   "needs input" since the last packet). Then the
-//!   only pictures from before the anchor that can still come out are the
-//!   ones its reorder buffer holds, at most `has_b_frames` of them (the
-//!   largest value read from just before the anchoring packet was
-//!   submitted on — a keyframe can activate parameters that lower it while
-//!   the pictures from before it still wait; none for VP8, VP9 and AV1,
-//!   which do not reorder): the `has_b_frames + 1`-th picture
+//!   decoder outputs is decoded from a keyframe fed across the gap. The anchor
+//!   is a key-flagged packet the decoder takes after the commit whose first
+//!   picture the bitstream proves a random-access one — an H.264 IDR picture or
+//!   a picture behind a recovery point SEI message, an HEVC IRAP picture; for a
+//!   codec whose pictures this crate does not read, the key flag FFmpeg's
+//!   parser set — since an intra picture resets the references of every picture
+//!   after it that does not lead it; it is fed once the decoder's output is
+//!   settled (drained to "needs input" since the last packet). For H.264 the
+//!   first picture out after the anchor closes the gap: FFmpeg's decoder,
+//!   opened with neither `AV_CODEC_FLAG_OUTPUT_CORRUPT` nor
+//!   `AV_CODEC_FLAG2_SHOW_ALL` (an open that finds either set is refused,
+//!   [`Error::UnrecoveredOutput`]), outputs only pictures its recovery tracking
+//!   has marked recovered, and a decoder opened cold across the gap starts with
+//!   nothing recovered. For every other codec the only pictures from before the
+//!   anchor that can still come out are the ones its reorder buffer holds, at
+//!   most `has_b_frames` of them (the largest value read from just before the
+//!   anchoring packet was submitted on — a keyframe can activate parameters
+//!   that lower it while the pictures from before it still wait; none for VP8,
+//!   VP9 and AV1, which do not reorder): the `has_b_frames + 1`-th picture
 //!   output after the anchor is at or after it in decode order, and its
-//!   delivery closes the gap. Nothing is drained or reset for it — the
-//!   decoder that kept decoding keeps every picture. A concealed picture a
-//!   lenient codec makes of a lone P-frame from the dropped span does not
-//!   close the gap, nor a picture still in the reorder buffer at the
-//!   anchor. The end of the stream proves nothing more: the same bound
-//!   applies there. If EOF is reached while the mode is still pending — no
-//!   key-flagged packet was fed across the gap, or the pictures out after
-//!   one never passed the bound — `receive_frame`
-//!   escalates with a distinct [`VideoDecodeError::PostCommitNeverResynced`]
-//!   (and a `tracing::error!`), counting the packets fed before a keyframe
-//!   anchored the resync and those fed after it with the resync unproved,
-//!   rather than surfacing a clean end-of-stream that would swallow the tail
-//!   silently. So the gap is either bounded-and-logged (a resync happened)
-//!   or reported-at-EOF (it never did) — never silent-and-unbounded.
+//!   delivery closes the gap. Nothing is drained or reset for it — the decoder
+//!   that kept decoding keeps every picture. A concealed picture a lenient
+//!   codec makes of a lone P-frame from the dropped span does not close the
+//!   gap, nor, outside H.264, a picture still in the reorder buffer at the
+//!   anchor. The end of the stream proves nothing more: the same proof applies
+//!   there. If EOF is reached while the mode is still pending — no key-flagged
+//!   packet was fed across the gap, or the pictures out after one never proved
+//!   it — `receive_frame` escalates with a distinct
+//!   [`VideoDecodeError::PostCommitNeverResynced`] (and a `tracing::error!`),
+//!   counting the packets fed before a keyframe anchored the resync and those
+//!   fed after it with the resync unproved, rather than surfacing a clean
+//!   end-of-stream that would swallow the tail silently. So the gap is either
+//!   bounded-and-logged (a resync happened) or reported-at-EOF (it never did) —
+//!   never silent-and-unbounded.
 //!
 //!   The post-commit path retains and reconstructs **zero** frames: it opens
 //!   SW cold, forwards only the failure arm's current packet (or EOF), and
@@ -299,15 +305,16 @@ pub struct CarrierVideoStreamDecoder<C: crate::FfmpegCarrier> {
   /// the HW path.
   eof_sent: bool,
   /// `true` between a **post-commit** fallback firing and its resync: the
-  /// delivery of a picture the reorder bound places at or after a
+  /// delivery of a picture the stream's proof places at or after a
   /// key-flagged packet fed across the gap ([`Self::resync_on_output`]). A
   /// post-commit fallback opens SW cold and drops the bounded span up to the
   /// next keyframe; the promise is that the span is *bounded* — SW resyncs
   /// there. This flag makes the promise enforced rather than assumed: while
   /// it is set we have no proof SW ever recovered at a keyframe. A
   /// concealed picture a lenient codec emits from the gap does **not**
-  /// clear it, nor does a picture still in the reorder buffer at the
-  /// anchor; if EOF is reached while it is still set the loss is escalated
+  /// clear it, nor, outside H.264, does a picture still in the reorder
+  /// buffer at the anchor; if EOF is reached while it is still set the loss
+  /// is escalated
   /// (a distinct loud error) rather than silently swallowing the whole tail.
   /// Probe-era fallbacks never set it — they replay losslessly and produce
   /// frames immediately.
@@ -316,8 +323,8 @@ pub struct CarrierVideoStreamDecoder<C: crate::FfmpegCarrier> {
   /// picture proved a random-access one ([`Self::anchor`]), anchors the
   /// resync; reset by a decode error before the resync is proven, so the
   /// next such packet anchors again. No picture is matched to a
-  /// packet: the anchor only starts the count the reorder bound reads
-  /// ([`Self::outputs_since_anchor`]).
+  /// packet: the anchor only starts the count the proof reads
+  /// ([`Self::outputs_since_anchor`], [`Self::anchor_proof`]).
   degraded_anchored: bool,
   /// The largest `has_b_frames` the decoder serving has shown since just
   /// before the anchoring packet was submitted — how many pictures from
@@ -330,12 +337,17 @@ pub struct CarrierVideoStreamDecoder<C: crate::FfmpegCarrier> {
   /// Whether the stream's keyframes reset every reference with no
   /// reordering (VP8, VP9, AV1): the bound is the first picture.
   anchor_resets: bool,
+  /// How the anchored resync is proved, the stream's codec rule
+  /// ([`access::KeyframeRule::proof`]): FFmpeg withholding every picture it
+  /// has not recovered (H.264), so the first picture out closes the gap, or
+  /// the reorder bound.
+  anchor_proof: access::Proof,
   /// Whether the anchor is definitive — a clean random access point
   /// ([`access::Anchor::definitive`]); one that is not is superseded by the
   /// next that is, the count restarting there.
   anchor_definitive: bool,
   /// The H.264 recovery point the anchor stands on, if any: reported, never
-  /// counted ([`Self::check_reorder_bound`]).
+  /// counted ([`Self::check_resync_proof`]).
   anchor_recovery: Option<access::RecoveryPoint>,
   /// Pictures the decoder serving has output, and the caller taken, since
   /// the anchor.
@@ -987,6 +999,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       degraded_anchored: false,
       anchor_reorder: 0,
       anchor_resets: false,
+      anchor_proof: access::Proof::ReorderBound,
       anchor_definitive: false,
       anchor_recovery: None,
       outputs_since_anchor: 0,
@@ -1573,13 +1586,15 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// reset for it. It is fed once the decoder's output is settled
   /// ([`Self::sw_output_settled`]); until then the send answers `MustDrain`,
   /// so the pictures from before the anchor that can still come out are
-  /// the ones the reorder buffer holds, which the bound counts
-  /// ([`Self::resync_on_output`]). The buffer's depth is read before the
-  /// packet is submitted — its parameters can lower it while those pictures
-  /// still wait — and the bound keeps the largest it reads from there on
-  /// ([`Self::anchor_reorder`]). A packet the decoder reports failed leaves
-  /// the output unsettled — the submission is not transactional — so the
-  /// next anchor waits for a drain too.
+  /// the ones the reorder buffer holds. The stream's proof reads the
+  /// pictures out after it ([`Self::resync_on_output`]): for H.264 the
+  /// first closes the gap, FFmpeg withholding every picture it has not
+  /// recovered; for the other codecs the bound counts past the buffer, its
+  /// depth read before the packet is submitted — its parameters can lower it
+  /// while those pictures still wait — and the largest read from there on
+  /// kept ([`Self::anchor_reorder`]). A packet the decoder reports failed
+  /// leaves the output unsettled — the submission is not transactional — so
+  /// the next anchor waits for a drain too.
   ///
   /// A decode error met while feeding what was pending is kept for the
   /// drain ([`Self::deferred_error`]), and this send answers `MustDrain`
@@ -1993,7 +2008,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// Enter post-commit degraded mode after a post-commit fallback commits: the
   /// SW decoder opened cold and the span up to the next keyframe is being
   /// dropped. We hold this mode until a key-flagged packet anchors the resync
-  /// ([`Self::anchor_resync`]) and the reorder bound places a delivered
+  /// ([`Self::anchor_resync`]) and the stream's proof places a delivered
   /// picture at or after it ([`Self::resync_on_output`]), and the EOF
   /// escalation in [`VideoStreamDecoder::receive_frame`] reports it
   /// otherwise. Called only on the post-commit path, only after a clean
@@ -2004,6 +2019,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     self.degraded_anchored = false;
     self.anchor_reorder = 0;
     self.anchor_resets = false;
+    self.anchor_proof = access::Proof::ReorderBound;
     self.anchor_definitive = false;
     self.anchor_recovery = None;
     self.outputs_since_anchor = 0;
@@ -2014,11 +2030,14 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
 
   /// **The resync anchored** at the key-flagged packet the decoder serving
   /// just took across the open gap: the count of pictures out since starts,
-  /// against the reorder buffer's depth — `reorder_before`, read before the
-  /// packet was submitted, or the largest read since
-  /// ([`Self::anchor_reorder`]) — or none for a stream whose keyframes reset
-  /// every reference (VP8, VP9, AV1). A definitive `anchor` taken while one
-  /// that is not holds the gap supersedes it, the count restarting there.
+  /// against the stream's proof ([`Self::check_resync_proof`]) — for H.264
+  /// the first picture out, for the other codecs the reorder buffer's depth,
+  /// `reorder_before`, read before the packet was submitted, or the largest
+  /// read since ([`Self::anchor_reorder`]), or none for a stream whose
+  /// keyframes reset every reference (VP8, VP9, AV1). A definitive `anchor`
+  /// taken while one that is not holds the gap supersedes it, the count
+  /// restarting there — which costs an H.264 stream nothing, its first
+  /// picture out closing the gap either way.
   fn anchor_resync(&mut self, reorder_before: usize, anchor: access::Anchor) {
     // An anchor after the first — the first un-anchored — is one more packet
     // fed after it.
@@ -2028,7 +2047,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     self.anchor_seen = true;
     self.degraded_anchored = true;
     self.anchor_reorder = reorder_before;
-    self.anchor_resets = self.keyframe_rule() == access::KeyframeRule::Resets;
+    let rule = self.keyframe_rule();
+    self.anchor_resets = rule == access::KeyframeRule::Resets;
+    self.anchor_proof = rule.proof();
     self.anchor_definitive = anchor.definitive();
     self.anchor_recovery = anchor.recovery();
     if let Some(recovery) = self.anchor_recovery {
@@ -2044,7 +2065,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       );
     }
     self.outputs_since_anchor = 0;
-    self.check_reorder_bound();
+    self.check_resync_proof();
   }
 
   /// A decode error before the resync is proven: the anchor is in doubt, and
@@ -2078,30 +2099,38 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     }
   }
 
-  /// **The reorder bound**: once more pictures have come out since the
-  /// anchor than the reorder buffer could hold from before it — the largest
-  /// depth it has shown from just before the anchor on, this reading
-  /// included ([`Self::anchor_reorder`]), or none for a stream whose
-  /// keyframes reset every reference — the last of them is at or after the
-  /// anchor in decode order, and the gap is closed.
+  /// **The resync's proof**, by the stream's codec rule
+  /// ([`Self::anchor_proof`]); either closes the gap.
   ///
-  /// **The bound is the whole proof at an H.264 recovery point too**, and
-  /// that rests on an invariant [`open_sw_decoder`] holds: the session's
-  /// software decoders are opened with neither `AV_CODEC_FLAG_OUTPUT_CORRUPT`
-  /// nor `AV_CODEC_FLAG2_SHOW_ALL`, so FFmpeg's H.264 decoder withholds every
-  /// picture before the recovery a recovery point signals (`frame_num +
-  /// recovery_frame_cnt`) itself. The first picture it delivers past the
-  /// reorder allowance is already recovered; counting `recovery_frame_cnt`
-  /// again would close the gap late, and at the end of a short tail raise
-  /// `PostCommitNeverResynced` on pictures that are whole.
-  fn check_reorder_bound(&mut self) {
+  /// - **Withheld output (H.264):** the first picture out since the anchor.
+  ///   The session's software decoders are opened with neither
+  ///   `AV_CODEC_FLAG_OUTPUT_CORRUPT` nor `AV_CODEC_FLAG2_SHOW_ALL` — an
+  ///   open that finds either set is refused by name
+  ///   ([`Error::UnrecoveredOutput`], [`open_sw_decoder`]) — so FFmpeg's
+  ///   H.264 decoder outputs only pictures it has recovered: from an IDR
+  ///   picture on, from the recovery a recovery point signals (`frame_num +
+  ///   recovery_frame_cnt`) on. A decoder opened cold across the gap starts
+  ///   with nothing recovered, so the first picture it delivers after the
+  ///   anchor is one its tracking recovered, and so is a picture from before
+  ///   the anchor that comes out after it. Allowing the reorder
+  ///   buffer's depth on top, as the bound does, left a short tail — a
+  ///   one-picture tail at a depth of 2 — open at the end, and raised
+  ///   `PostCommitNeverResynced` on a resync that happened.
+  /// - **The reorder bound (every other codec):** once more pictures have
+  ///   come out since the anchor than the reorder buffer could hold from
+  ///   before it — the largest depth it has shown from just before the
+  ///   anchor on, this reading included ([`Self::anchor_reorder`]), or none
+  ///   for a stream whose keyframes reset every reference — the last of them
+  ///   is at or after the anchor in decode order. FFmpeg's HEVC decoder
+  ///   keeps no recovery gate for a stream it is already decoding.
+  fn check_resync_proof(&mut self) {
     self.observe_reorder();
-    let reorder = if self.anchor_resets {
-      0
-    } else {
-      self.anchor_reorder
+    let allowance = match self.anchor_proof {
+      access::Proof::Withheld => 0,
+      access::Proof::ReorderBound if self.anchor_resets => 0,
+      access::Proof::ReorderBound => self.anchor_reorder,
     };
-    if self.outputs_since_anchor > reorder {
+    if self.outputs_since_anchor > allowance {
       self.clear_degraded_resync();
     }
   }
@@ -2125,8 +2154,8 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   }
 
   /// The software decoder output a picture, and it was delivered: one more
-  /// picture since the anchor, against the reorder bound
-  /// ([`Self::check_reorder_bound`]). Before an anchor — a concealed P-frame
+  /// picture since the anchor, against the stream's proof
+  /// ([`Self::check_resync_proof`]). Before an anchor — a concealed P-frame
   /// from the dropped span — the guard stays set, so the one-GOP bound stays
   /// enforced and the EOF escalation still fires if no picture comes out
   /// after a keyframe. Pictures the queue holds never reach here.
@@ -2136,7 +2165,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   fn resync_on_output(&mut self) {
     if self.degraded_resync_pending && self.degraded_anchored {
       self.outputs_since_anchor = self.outputs_since_anchor.saturating_add(1);
-      self.check_reorder_bound();
+      self.check_resync_proof();
     }
   }
 
@@ -2152,6 +2181,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     self.degraded_anchored = false;
     self.anchor_reorder = 0;
     self.anchor_resets = false;
+    self.anchor_proof = access::Proof::ReorderBound;
     self.anchor_definitive = false;
     self.anchor_recovery = None;
     self.outputs_since_anchor = 0;
@@ -2183,7 +2213,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   ) {
     // The seat is free once a carrier exists for what it held.
     self.scratch_pending = false;
-    // A picture the decoder output is what the reorder bound counts toward
+    // A picture the decoder output is what the resync's proof counts toward
     // closing the gap. A no-op on every road that never entered degraded
     // mode, which is why it can be unconditional here.
     if decoded {
@@ -2233,11 +2263,11 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// flag is cleared as it fires so a caller draining to the end sees
   /// the escalation once and the plain end afterwards.
   fn ended(&mut self) -> Result<Received, VideoDecodeError> {
-    // The end proves nothing the reorder bound has not: an anchor that
-    // decoded has had more pictures out since than the bound — the ones held
-    // from before it, then its own — and one that decoded to nothing has had
-    // only the held ones, which is not a resync. A gap still open here never
-    // closed.
+    // The end proves nothing the resync's proof has not: an anchor that
+    // decoded has had a recovered picture out since (H.264), or more than the
+    // bound — the ones held from before it, then its own — and one that
+    // decoded to nothing has had none, or only the held ones, which is not a
+    // resync. A gap still open here never closed.
     if !self.degraded_resync_pending {
       return Ok(Received::Ended);
     }
@@ -2337,6 +2367,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       degraded_anchored: false,
       anchor_reorder: 0,
       anchor_resets: false,
+      anchor_proof: access::Proof::ReorderBound,
       anchor_definitive: false,
       anchor_recovery: None,
       outputs_since_anchor: 0,
@@ -2392,6 +2423,12 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// not anchor it.
   pub(crate) const fn degraded_anchored_for_test(&self) -> bool {
     self.degraded_anchored
+  }
+
+  /// Whether the anchor holding the open gap is definitive — a clean random
+  /// access point that supersedes one that is not.
+  pub(crate) const fn anchor_definitive_for_test(&self) -> bool {
+    self.anchor_definitive
   }
 
   /// The decoder serving's `has_b_frames`, read live.
@@ -2778,11 +2815,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
                   return Err(VideoDecodeError::Convert(e));
                 }
               };
-              // SW output a picture. The commit point clears degraded mode only
-              // once the resync is anchored — the decoder was reset at a clean
-              // keyframe since the gap opened, so this picture is decoded from
-              // it or after it. A concealed P-frame from before the anchor
-              // does not clear it (see `resync_on_output`).
+              // SW output a picture. The commit point counts it toward the
+              // resync's proof only once a keyframe fed across the gap has
+              // anchored it; a concealed P-frame from before the anchor does
+              // not count (see `resync_on_output`).
               self.commit_delivery(new_frame, true, dst);
               return Ok(Received::Frame);
             }
@@ -3449,20 +3485,22 @@ fn open_sw_decoder(
   // `request_threads` for why the allocator judge is safe on
   // libavcodec's worker threads.
   crate::decoder::request_threads(&mut ctx, limits.threads());
-  // **No corrupt picture out, ever.** The post-commit resync's bound rests on
-  // it (`CarrierVideoStreamDecoder::check_reorder_bound`): with neither flag,
-  // FFmpeg's H.264 decoder withholds the pictures before a recovery point's
-  // recovery itself.
+  // **No unrecovered picture out, ever.** The post-commit resync's proof for
+  // H.264 is FFmpeg withholding them
+  // (`CarrierVideoStreamDecoder::check_resync_proof`): with neither flag,
+  // FFmpeg's H.264 decoder outputs only the pictures it has recovered.
   withhold_unrecovered(&mut ctx);
+  #[cfg(test)]
+  unrecovered_output::apply(&mut ctx);
   // Opened without forming a bindgen enum from FFmpeg memory: the codec
   // is resolved off a raw `codec_id`, and the medium is proved off a raw
   // `codec_type`. See `crate::decoder::ensure_codec_type`.
   let codec = crate::decoder::find_decoder(parameters)?;
   let opened = ctx.decoder().open_as(codec).map_err(Error::Ffmpeg)?;
-  debug_assert!(
-    outputs_no_corrupt_picture(&opened),
-    "a session's software decoder opened outputting pictures before their recovery"
-  );
+  // Checked in every build, after the open, which is what FFmpeg reads: a
+  // decoder that would output unrecovered pictures is closed and refused by
+  // name, never opened on the strength of a debug assertion.
+  refuse_unrecovered_output(&opened)?;
   crate::decoder::ensure_video_codec_type(&opened)?;
   Ok(SwDecoder {
     decoder: ffmpeg_next::decoder::Video(opened),
@@ -3474,7 +3512,8 @@ fn open_sw_decoder(
 
 /// Clears `AV_CODEC_FLAG_OUTPUT_CORRUPT` and `AV_CODEC_FLAG2_SHOW_ALL` on a
 /// codec context about to be opened: a session's software decoder outputs
-/// no picture before its recovery (see `open_sw_decoder`).
+/// no picture before its recovery (see `open_sw_decoder`, which checks the
+/// opened decoder again with [`refuse_unrecovered_output`]).
 fn withhold_unrecovered(ctx: &mut ffmpeg_next::codec::Context) {
   // SAFETY: `ctx` owns a live, not yet opened `AVCodecContext`; two plain
   // integer fields are read and written, and no reference into it is kept.
@@ -3485,15 +3524,59 @@ fn withhold_unrecovered(ctx: &mut ffmpeg_next::codec::Context) {
   }
 }
 
-/// Whether an opened decoder outputs no picture before its recovery: neither
-/// `AV_CODEC_FLAG_OUTPUT_CORRUPT` nor `AV_CODEC_FLAG2_SHOW_ALL` is set.
-fn outputs_no_corrupt_picture(opened: &ffmpeg_next::decoder::Opened) -> bool {
+/// Refuses an opened decoder that would output pictures before their
+/// recovery — `AV_CODEC_FLAG_OUTPUT_CORRUPT` or `AV_CODEC_FLAG2_SHOW_ALL` set
+/// — by name ([`Error::UnrecoveredOutput`]), with the flags it found.
+fn refuse_unrecovered_output(opened: &ffmpeg_next::decoder::Opened) -> Result<(), Error> {
   // SAFETY: `opened` owns a live `AVCodecContext`; two plain integer fields
   // are read.
-  unsafe {
+  let (output_corrupt, show_all) = unsafe {
     let raw = opened.as_ptr();
-    (*raw).flags & ffmpeg_next::ffi::AV_CODEC_FLAG_OUTPUT_CORRUPT as core::ffi::c_int == 0
-      && (*raw).flags2 & ffmpeg_next::ffi::AV_CODEC_FLAG2_SHOW_ALL as core::ffi::c_int == 0
+    (
+      (*raw).flags & ffmpeg_next::ffi::AV_CODEC_FLAG_OUTPUT_CORRUPT as core::ffi::c_int != 0,
+      (*raw).flags2 & ffmpeg_next::ffi::AV_CODEC_FLAG2_SHOW_ALL as core::ffi::c_int != 0,
+    )
+  };
+  if output_corrupt || show_all {
+    return Err(Error::UnrecoveredOutput(crate::UnrecoveredOutput::new(
+      output_corrupt,
+      show_all,
+    )));
+  }
+  Ok(())
+}
+
+/// Test-only: the next software video decoder opened has the named flags
+/// set on its codec context after the session clears them — what an open
+/// that leaves either set looks like to the check after it.
+#[cfg(test)]
+pub(crate) mod unrecovered_output {
+  use core::cell::Cell;
+
+  std::thread_local! {
+    static ARMED: Cell<(bool, bool)> = const { Cell::new((false, false)) };
+  }
+
+  /// The next open sets `AV_CODEC_FLAG_OUTPUT_CORRUPT` when
+  /// `output_corrupt`, and `AV_CODEC_FLAG2_SHOW_ALL` when `show_all`.
+  pub(crate) fn arm(output_corrupt: bool, show_all: bool) {
+    ARMED.with(|armed| armed.set((output_corrupt, show_all)));
+  }
+
+  /// Sets what is armed on `ctx`, once.
+  pub(super) fn apply(ctx: &mut ffmpeg_next::codec::Context) {
+    let (output_corrupt, show_all) = ARMED.with(|armed| armed.replace((false, false)));
+    // SAFETY: `ctx` owns a live, not yet opened `AVCodecContext`; two plain
+    // integer fields are written, and no reference into it is kept.
+    unsafe {
+      let raw = ctx.as_mut_ptr();
+      if output_corrupt {
+        (*raw).flags |= ffmpeg_next::ffi::AV_CODEC_FLAG_OUTPUT_CORRUPT as core::ffi::c_int;
+      }
+      if show_all {
+        (*raw).flags2 |= ffmpeg_next::ffi::AV_CODEC_FLAG2_SHOW_ALL as core::ffi::c_int;
+      }
+    }
   }
 }
 
@@ -3502,7 +3585,8 @@ fn outputs_no_corrupt_picture(opened: &ffmpeg_next::decoder::Opened) -> bool {
 /// A **post-commit** HW->SW fallback degraded the stream (dropping the
 /// bounded span up to the next keyframe), and the software decoder reached
 /// EOF without resyncing: no key-flagged packet was fed across the gap, or
-/// the pictures out after one never passed the reorder bound. The "bounded,
+/// the pictures out after one never proved it — for H.264 none came out, for
+/// the other codecs they never passed the reorder bound. The "bounded,
 /// logged gap" the post-commit path promises did not materialise, so the
 /// loss is surfaced loudly here instead of being silently swallowed as a
 /// clean end-of-stream.
@@ -3621,8 +3705,9 @@ pub enum VideoDecodeError {
   Convert(#[from] ConvertError),
   /// A **post-commit** HW->SW fallback degraded the stream and the
   /// software decoder reached EOF without resyncing — no key-flagged packet
-  /// fed across the gap, or the pictures out after one never passed the
-  /// reorder bound. Returned once, after every picture was delivered; the
+  /// fed across the gap, or the pictures out after one never proved it (for
+  /// H.264 none came out; for the other codecs they never passed the reorder
+  /// bound). Returned once, after every picture was delivered; the
   /// next `receive_frame` answers `Ended`; see the payload's own
   /// documentation.
   #[error(transparent)]

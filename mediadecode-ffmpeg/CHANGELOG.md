@@ -62,6 +62,14 @@ The backend-agnostic core it adapts has its own log at
   drain can make room for, is refused by this name, where a replay overflow
   used to surface as a bare `ENOMEM`.
 
+- **`Error::UnrecoveredOutput`** (`UnrecoveredOutput { output_corrupt,
+  show_all }`, exported): a software video decoder found after its open
+  with `AV_CODEC_FLAG_OUTPUT_CORRUPT` or `AV_CODEC_FLAG2_SHOW_ALL` set —
+  which the session clears before the open — is closed and refused by this
+  name, the flags it found named. Such a decoder would output pictures it
+  has not recovered, and the post-commit resync of an H.264 stream is
+  proved by FFmpeg withholding them (below).
+
 - **`active_threads()` on the video stream decoder**: the threads the
   decoder serving now decodes with, read off what is active
   (`active_thread_type`), never off what was asked — the count libavcodec
@@ -164,7 +172,8 @@ The backend-agnostic core it adapts has its own log at
 
 ### Fixed
 
-- **A post-commit resync is proved by the decoder's reorder bound.** Any
+- **A post-commit resync is proved: by FFmpeg's withheld output for H.264,
+  by the decoder's reorder bound for every other codec.** Any
   keyframe the cold software decoder took used to arm the proof, and the
   next picture delivered — even a concealed one from before the keyframe,
   delivered late — cleared the guard; a keyframe that decoded to nothing
@@ -189,27 +198,35 @@ The backend-agnostic core it adapts has its own log at
   nothing. It is fed only once the decoder holds
   no picture the caller has not taken (the send answers `MustDrain` until
   then; a packet the decoder reports failed, which FFmpeg may have decoded
-  in part, wants a drain behind it too), and the gap closes at the delivery
-  of the `has_b_frames + 1`-th picture out after it (`has_b_frames` the
-  largest value read from just before the anchoring packet was submitted on
-  — a keyframe can activate parameters that lower it, an HEVC SPS with fewer
-  `num_reorder_pics`, while the pictures from before it still wait; the
-  first picture for VP8, VP9 and AV1): the pictures before it are at most
-  the ones the reorder buffer held from before the anchor. At an H.264
-  recovery point the bound is the whole proof too: the software decoders
-  are opened with neither `AV_CODEC_FLAG_OUTPUT_CORRUPT` nor
-  `AV_CODEC_FLAG2_SHOW_ALL` (asserted at the open), so FFmpeg withholds
-  every picture before the recovery it signals itself, and its
-  `recovery_frame_cnt` is reported, never counted again. A definitive
-  anchor — a clean random access point, an IDR among them — supersedes one
-  across the same gap that is not, the count restarting there. Nothing is drained or reset for the resync, and no
-  picture is matched to a packet. The end of the stream proves nothing more:
-  the same bound applies there, so an anchor that decoded to nothing, with
-  only the pictures held from before it out since, is not a resync. A decode
-  error before the gap closes leaves the anchor in doubt, and the next
-  key-flagged packet anchors again. `PostCommitNeverResynced` is raised when
-  no key-flagged packet was fed across the gap or the pictures out after one
-  never passed the bound, still once, as the `Err` of the `receive_frame`
+  in part, wants a drain behind it too). On H.264 the first picture out
+  after the anchor closes the gap: the software decoders are opened with
+  neither `AV_CODEC_FLAG_OUTPUT_CORRUPT` nor `AV_CODEC_FLAG2_SHOW_ALL` —
+  checked after the open in every build, an open that finds either set
+  refused by name (`Error::UnrecoveredOutput`, below) — so FFmpeg's H.264
+  decoder outputs only the pictures it has recovered, from an IDR picture
+  on and from a recovery point's recovery on, and a decoder opened cold
+  across the gap starts with nothing recovered; a recovery point's
+  `recovery_frame_cnt` is reported, never counted. On every other
+  codec the gap closes at the delivery of the `has_b_frames + 1`-th picture
+  out after the anchor (`has_b_frames` the largest value read from just
+  before the anchoring packet was submitted on — a keyframe can activate
+  parameters that lower it, an HEVC SPS with fewer `num_reorder_pics`,
+  while the pictures from before it still wait; the first picture for VP8,
+  VP9 and AV1): the pictures before it are at most the ones the reorder
+  buffer held from before the anchor. Allowing that depth on H.264 too left
+  a short tail open — at a depth of 2, a one-picture tail after an IDR —
+  and raised `PostCommitNeverResynced` on a resync that happened. A
+  definitive anchor — a clean random access point, an IDR among them —
+  supersedes one across the same gap that is not, the count restarting
+  there, which costs an H.264 stream nothing. Nothing is drained or reset
+  for the resync, and no picture is matched to a packet. The end of the
+  stream proves nothing more: the same proof applies there, so an anchor
+  that decoded to nothing, with none or only the pictures held from before
+  it out since, is not a resync. A decode error before the gap closes
+  leaves the anchor in doubt, and the next key-flagged packet anchors
+  again. `PostCommitNeverResynced` is raised when no key-flagged packet was
+  fed across the gap or the pictures out after one never proved it, still
+  once, as the `Err` of the `receive_frame`
   that reaches the end, after every picture was delivered, and counts the gap
   in two parts: the packets fed before a keyframe anchored the resync, and
   those fed after it with the resync never proved.
