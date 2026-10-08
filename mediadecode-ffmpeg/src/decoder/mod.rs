@@ -2921,6 +2921,8 @@ pub(crate) fn build_codec_context(
     frame_budget_declined: core::sync::atomic::AtomicBool::new(false),
     declined_frame_bytes: core::sync::atomic::AtomicU64::new(0),
     declined_frame_audio: core::sync::atomic::AtomicBool::new(false),
+    #[cfg(test)]
+    declining_pts: core::sync::atomic::AtomicI64::new(i64::MIN),
   });
   // SAFETY: `ctx_ptr` is the non-null context; `opaque` is a public
   // field FFmpeg never reads or frees.
@@ -3425,6 +3427,12 @@ unsafe extern "C" fn judge_buffer(
       }
       -(libc::EINVAL)
     };
+    // Test-only: the picture a law armed to be refused, priced or not.
+    // SAFETY: `frame` is live; `pts` is a plain integer field.
+    #[cfg(test)]
+    if crate::ffi::declines_picture_for_test(state, unsafe { (*frame).pts }) {
+      return record(priced.map_or(u64::MAX, |bytes| bytes as u64));
+    }
     match priced {
       // Fail closed. An allocation whose size cannot be established is
       // not a small one — the same stance every other judge here takes.

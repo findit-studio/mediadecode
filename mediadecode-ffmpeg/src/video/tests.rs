@@ -8122,72 +8122,317 @@ fn a_hardware_failure_on_a_new_extradata_that_no_fallback_replaces_leaves_it_unk
   }
 }
 
-/// LAW (pre-R14 row 3): **a frame refusal latched before a submission names
-/// nothing of it, on a decoder that decodes in step.** FFmpeg's `h264` on
-/// one thread, a refusal left latched as one a decode concealed would leave
-/// it: the next submission, which libavcodec refuses with invalid data, is
-/// reported as that, not as the refusal — and its extradata, were it
-/// carrying one, reads unknown rather than taken; after the end, a
-/// submission libavcodec answers with the end is reported as that too. On
-/// three threads, frame-threaded, the latch outlives a submission: a thread
-/// latches for an earlier packet whenever it decodes it, and that refusal's
-/// error has yet to come. Read across the submission, the latch named the
-/// invalid data as the budget refusal.
-#[test]
-fn a_refusal_latched_before_a_submission_names_nothing_of_it() {
-  let mut h264 = Parameters::new();
-  // SAFETY: `h264` owns a fresh `AVCodecParameters`; two fields are written
-  // with values of their own types.
-  unsafe {
-    (*h264.as_mut_ptr()).codec_type = ffmpeg_next::ffi::AVMediaType::AVMEDIA_TYPE_VIDEO;
-    (*h264.as_mut_ptr()).codec_id = ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_H264;
-  }
-  let open = |threads| {
-    super::open_sw_decoder(&h264, DecoderLimits::default().with_threads(threads), None)
-      .expect("an H.264 decoder")
-  };
-  let latch = |sw: &super::SwDecoder| {
-    crate::ffi::declare_frame_budget_declined_for_test(sw.state().cast_mut(), 1 << 30);
-  };
-  // An access unit delimiter alone: a packet with no picture, which FFmpeg's
-  // H.264 decoder refuses as invalid data.
-  let no_picture = crate::boundary::try_packet_copy(&[0, 0, 0, 1, 0x09, 0xf0]).expect("a packet");
+/// An all-intra H.264 clip from `libx264`: every picture an IDR behind its
+/// own parameter sets, no B-frames — each packet decodes alone, and a
+/// decoder on one thread gives each picture back at once.
+fn encode_h264_all_intra(width: u32, height: u32, frames: usize) -> SyntheticClip {
+  encode_x26x(
+    "libx264",
+    "x264-params",
+    "keyint=1:min-keyint=1:scenecut=0:bframes=0",
+    width,
+    height,
+    frames,
+  )
+}
 
-  let mut one = open(crate::Threads::Single);
-  latch(&one);
-  let refused = one.submit(&no_picture).expect_err("no picture");
-  let named = crate::decoder::software_exit(one.state(), refused);
-  assert!(
-    matches!(named, Error::Ffmpeg(ffmpeg_next::Error::InvalidData)),
-    "one thread: the submission is reported as what it met: {named:?}"
-  );
-  assert_eq!(
-    super::taken_despite(refused, &named, one.decodes_in_step()),
-    super::Taken::Unknown(crate::ExtradataDoubt::Reported(
-      ffmpeg_next::Error::InvalidData
-    )),
-    "one thread: unknown, not taken"
-  );
-  one.send_eof().expect("the end");
-  latch(&one);
-  let ended = one.submit(&no_picture).expect_err("after the end");
+/// `clip`'s packets with `at` and the one after it sent as one packet,
+/// stamped as `at`: two pictures, the second of which starts where the
+/// first is refused its allocation — behind which FFmpeg's H.264 decoder
+/// conceals the refused one.
+fn with_two_pictures_at(clip: &SyntheticClip, at: usize) -> Vec<Packet> {
+  let mut packets = clip.packets.clone();
+  let both = [
+    clip.packets[at].data().expect("a payload"),
+    clip.packets[at + 1].data().expect("a payload"),
+  ]
+  .concat();
+  packets[at] = repacked(&clip.packets[at], &both);
+  packets.remove(at + 1);
+  packets
+}
+
+/// One answer a session gave a receive.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Answer {
+  /// A picture, by its timestamp.
+  Picture(i64),
+  /// A picture refused over the frame budget, by name.
+  Refused,
+  /// Any other error.
+  Failed(String),
+  /// "Needs input".
+  NeedsInput,
+  /// The end.
+  Ended,
+}
+
+/// Receives from `dec` until it answers "needs input" or the end, every
+/// answer recorded in `log`.
+fn answered(
+  dec: &mut FfmpegVideoStreamDecoder,
+  dst: &mut VideoFrame<mediadecode::PixelFormat, VideoFrameExtra, FfmpegBytes>,
+  log: &mut Vec<Answer>,
+) {
+  loop {
+    let answer = match dec.receive_frame(dst) {
+      Ok(Received::Frame) => Answer::Picture(dst.pts().map_or(i64::MIN, |t| t.pts())),
+      Ok(Received::NeedsInput) => Answer::NeedsInput,
+      Ok(Received::Ended) => Answer::Ended,
+      Err(VideoDecodeError::Decode(Error::FrameBudgetExceeded(_))) => Answer::Refused,
+      Err(other) => Answer::Failed(format!("{other:?}")),
+    };
+    let settled = matches!(answer, Answer::NeedsInput | Answer::Ended);
+    log.push(answer);
+    if settled {
+      return;
+    }
+  }
+}
+
+/// The timestamps of the pictures `log` records, in order.
+fn pictures_in(log: &[Answer]) -> Vec<i64> {
+  log
+    .iter()
+    .filter_map(|answer| match answer {
+      Answer::Picture(pts) => Some(*pts),
+      _ => None,
+    })
+    .collect()
+}
+
+/// How many refusals `log` records.
+fn refusals_in(log: &[Answer]) -> usize {
+  log
+    .iter()
+    .filter(|answer| **answer == Answer::Refused)
+    .count()
+}
+
+/// LAW (Codex R14, [high]): **a picture refused while a decode on one
+/// thread gave another is named by the call that ran the decode, and by no
+/// other.** An all-intra H.264 stream on FFmpeg's `h264`, one thread, its
+/// packet 5 carrying two pictures, the first refused its allocation by the
+/// allocator judge (scripted): FFmpeg conceals it — `decode_nal_units` drops
+/// the slice's error and the second picture starts — so the decode reports
+/// success. Sent with no picture waiting, 5 is decoded inside its send,
+/// which answers `FrameBudgetExceeded`; the packet after it, sent at once, is
+/// taken. Sent while a picture waits, 5 is taken unread, and the receive
+/// that decodes it answers `FrameBudgetExceeded` ahead of the picture it
+/// gave, which the next receive delivers; a send right after is taken. Every
+/// picture but the refused one comes out, once, in order, and no second
+/// refusal comes. Forgotten at the next submission, the refusal was named
+/// by nothing: the send of 5 answered `Accepted`, the receive gave the
+/// picture, and the picture's loss was silent.
+#[test]
+fn a_picture_refused_in_a_decode_is_named_by_the_call_that_ran_it() {
+  let clip = encode_h264_all_intra(128, 96, 12);
+  let k = 5;
+  let packets = with_two_pictures_at(&clip, k);
+  let pts: Vec<i64> = packets
+    .iter()
+    .map(|packet| packet.pts().expect("a pts"))
+    .collect();
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let open = || {
+    FfmpegVideoStreamDecoder::open_as(
+      clip.parameters.clone(),
+      tb,
+      DecoderLimits::default().with_threads(crate::Threads::Single),
+      DecodePath::Software,
+    )
+    .expect("the software road opens")
+  };
+
+  // Decoded inside its send.
+  let mut dec = open();
+  let mut dst = crate::empty_owned_video_frame();
+  let mut log = Vec::new();
+  for av_pkt in &packets[..k] {
+    crate::accepted(dec.send_packet(&pushed(av_pkt)), "send_packet");
+    answered(&mut dec, &mut dst, &mut log);
+  }
+  dec.decline_picture_for_test(pts[k]);
+  let at_k = dec.send_packet(&pushed(&packets[k]));
   assert!(
     matches!(
-      crate::decoder::software_exit(one.state(), ended),
-      Error::Ffmpeg(ffmpeg_next::Error::Eof)
+      at_k,
+      Err(VideoDecodeError::Decode(Error::FrameBudgetExceeded(_)))
     ),
-    "one thread: a submission after the end is reported as the end"
+    "the send of {k}, which decoded it, names the picture it refused: {at_k:?}"
+  );
+  crate::accepted(
+    dec.send_packet(&pushed(&packets[k + 1])),
+    "the packet after, sent at once",
+  );
+  answered(&mut dec, &mut dst, &mut log);
+  for av_pkt in &packets[k + 2..] {
+    crate::accepted(dec.send_packet(&pushed(av_pkt)), "send_packet");
+    answered(&mut dec, &mut dst, &mut log);
+  }
+  crate::accepted(dec.send_eof(), "send_eof");
+  answered(&mut dec, &mut dst, &mut log);
+  assert_eq!(
+    refusals_in(&log),
+    0,
+    "decoded at the send: no other call names a refusal: {log:?}"
+  );
+  assert_eq!(
+    pictures_in(&log),
+    pts,
+    "decoded at the send: every picture but the refused one, once, in order"
   );
 
-  let mut three = open(crate::Threads::Count(
-    core::num::NonZeroU32::new(3).expect("nonzero"),
-  ));
-  latch(&three);
-  let _ = three.submit(&no_picture);
-  assert!(
-    crate::ffi::take_frame_budget_declination(three.state()).is_some(),
-    "three threads: the latch outlives the submission"
+  // Decoded inside a receive.
+  let mut dec = open();
+  let mut log = Vec::new();
+  for av_pkt in &packets[..k - 1] {
+    crate::accepted(dec.send_packet(&pushed(av_pkt)), "send_packet");
+    answered(&mut dec, &mut dst, &mut log);
+  }
+  crate::accepted(
+    dec.send_packet(&pushed(&packets[k - 1])),
+    "the picture before, left waiting",
   );
+  dec.decline_picture_for_test(pts[k]);
+  crate::accepted(
+    dec.send_packet(&pushed(&packets[k])),
+    "taken unread, behind the waiting picture",
+  );
+  let mut next = |dec: &mut FfmpegVideoStreamDecoder| match dec.receive_frame(&mut dst) {
+    Ok(Received::Frame) => Answer::Picture(dst.pts().map_or(i64::MIN, |t| t.pts())),
+    Ok(Received::NeedsInput) => Answer::NeedsInput,
+    Ok(Received::Ended) => Answer::Ended,
+    Err(VideoDecodeError::Decode(Error::FrameBudgetExceeded(_))) => Answer::Refused,
+    Err(other) => Answer::Failed(format!("{other:?}")),
+  };
+  assert_eq!(
+    next(&mut dec),
+    Answer::Picture(pts[k - 1]),
+    "the waiting picture"
+  );
+  assert_eq!(
+    next(&mut dec),
+    Answer::Refused,
+    "the receive that decodes {k} names the picture it refused, ahead of the one it gave"
+  );
+  assert_eq!(
+    next(&mut dec),
+    Answer::Picture(pts[k]),
+    "the picture it gave"
+  );
+  crate::accepted(
+    dec.send_packet(&pushed(&packets[k + 1])),
+    "a send right after",
+  );
+  let mut rest = Vec::new();
+  answered(&mut dec, &mut dst, &mut rest);
+  for av_pkt in &packets[k + 2..] {
+    crate::accepted(dec.send_packet(&pushed(av_pkt)), "send_packet");
+    answered(&mut dec, &mut dst, &mut rest);
+  }
+  crate::accepted(dec.send_eof(), "send_eof");
+  answered(&mut dec, &mut dst, &mut rest);
+  assert_eq!(
+    refusals_in(&log) + refusals_in(&rest),
+    0,
+    "decoded in a receive: no other call names a refusal: {log:?} {rest:?}"
+  );
+  let mut shown = pictures_in(&log);
+  shown.extend([pts[k - 1], pts[k]]);
+  shown.extend(pictures_in(&rest));
+  assert_eq!(
+    shown, pts,
+    "decoded in a receive: every picture but the refused one, once, in order"
+  );
+}
+
+/// LAW (Codex R14, [high]): **on frame threads, a picture a worker refused
+/// and concealed is named at the end of the drain, and cleared by a seek.**
+/// The same stream on three threads. FFmpeg decodes each packet on a worker
+/// (`frame_worker_thread` keeps the decode's result, here success), so the
+/// worker that conceals the refused picture of the two-picture packet 5
+/// leaves a refusal no error of 5's will ever carry. The send of 7 waits for
+/// 5's worker; the drains after it answer "needs input" with the refusal
+/// still latched — back pressure collects none, a worker latching for a
+/// packet whose answer may be to come. The end of the drain, with every
+/// worker done, names it, once, after every picture. A seek after 7 clears
+/// it with the pictures it abandons, and the stream decoded on from the
+/// seek ends clean. Collected at back pressure, the refusal came out of the
+/// drain after 7, mid-stream; kept through the seek, it was named after it.
+#[test]
+fn on_frame_threads_a_concealed_refusal_is_named_at_the_end_and_cleared_by_a_seek() {
+  let clip = encode_h264_all_intra(128, 96, 12);
+  let k = 5;
+  let packets = with_two_pictures_at(&clip, k);
+  let pts: Vec<i64> = packets
+    .iter()
+    .map(|packet| packet.pts().expect("a pts"))
+    .collect();
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let three = core::num::NonZeroU32::new(3).expect("nonzero");
+  for seek in [false, true] {
+    let mut dec = FfmpegVideoStreamDecoder::open_as(
+      clip.parameters.clone(),
+      tb,
+      DecoderLimits::default().with_threads(crate::Threads::Count(three)),
+      DecodePath::Software,
+    )
+    .expect("the software road opens");
+    assert_eq!(dec.active_threads(), Some(three), "frame threads");
+    let mut dst = crate::empty_owned_video_frame();
+    let mut log = Vec::new();
+    for (index, av_pkt) in packets[..=k + 2].iter().enumerate() {
+      if index == k {
+        dec.decline_picture_for_test(pts[k]);
+      }
+      crate::accepted(dec.send_packet(&pushed(av_pkt)), "send_packet");
+      answered(&mut dec, &mut dst, &mut log);
+    }
+    assert_eq!(
+      refusals_in(&log),
+      0,
+      "seek {seek}: {k}'s worker is done, its refusal held through back pressure: {log:?}"
+    );
+    if seek {
+      dec.flush().expect("a seek");
+      log.clear();
+    }
+    for av_pkt in &packets[k + 3..] {
+      crate::accepted(dec.send_packet(&pushed(av_pkt)), "send_packet");
+      answered(&mut dec, &mut dst, &mut log);
+    }
+    crate::accepted(dec.send_eof(), "send_eof");
+    answered(&mut dec, &mut dst, &mut log);
+    if seek {
+      assert_eq!(
+        refusals_in(&log),
+        0,
+        "after the seek the stream ends clean: {log:?}"
+      );
+      assert_eq!(
+        pictures_in(&log),
+        pts[k + 3..].to_vec(),
+        "after the seek, every picture from it on"
+      );
+    } else {
+      assert_eq!(
+        refusals_in(&log),
+        1,
+        "the end names the refusal once: {log:?}"
+      );
+      assert_eq!(
+        &log[log.len() - 2..],
+        &[Answer::Refused, Answer::Ended],
+        "named at the end, after every picture: {log:?}"
+      );
+      assert_eq!(
+        pictures_in(&log),
+        pts,
+        "every picture but the refused one, once, in order"
+      );
+    }
+  }
 }
 
 /// A spare HEVC video parameter set NAL unit — id 5, which no sequence

@@ -282,6 +282,12 @@ pub(crate) struct CallbackState {
   pub(crate) declined_frame_bytes: core::sync::atomic::AtomicU64,
   /// Whether the refused frame was audio (`true`) or a picture.
   pub(crate) declined_frame_audio: core::sync::atomic::AtomicBool,
+  /// Test-only: the `pts` of the next picture `judge_buffer` refuses as if
+  /// it were over [`Self::max_frame_bytes`], once; `i64::MIN` while none is
+  /// armed ([`decline_picture_for_test`]). Read on whichever thread
+  /// allocates, a frame thread's among them.
+  #[cfg(test)]
+  pub(crate) declining_pts: core::sync::atomic::AtomicI64,
 }
 
 /// Reads and clears a software frame-budget refusal, if one was left.
@@ -309,6 +315,49 @@ pub(crate) fn take_frame_budget_declination(
     )
   };
   declined.then_some((bytes, limit, audio))
+}
+
+/// Whether a software frame-budget refusal is latched, read without
+/// clearing it — for a caller that hands the latch on to the funnels,
+/// which name it ([`crate::decoder::software_exit`]).
+pub(crate) fn frame_budget_declined(state: *const CallbackState) -> bool {
+  use core::sync::atomic::Ordering;
+  if state.is_null() {
+    return false;
+  }
+  // SAFETY: `state` is the live `CallbackState` the caller owns; it is
+  // freed only after the codec context it belongs to.
+  unsafe { (*state).frame_budget_declined.load(Ordering::Acquire) }
+}
+
+/// Test-only: `judge_buffer` refuses, once, the next picture whose `pts` is
+/// `pts`, as one over the frame budget — what a decoder that cannot
+/// allocate a picture meets.
+#[cfg(test)]
+pub(crate) fn decline_picture_for_test(state: *const CallbackState, pts: i64) {
+  use core::sync::atomic::Ordering;
+  if state.is_null() {
+    return;
+  }
+  // SAFETY: the caller guarantees `state` is live for the call.
+  unsafe { (*state).declining_pts.store(pts, Ordering::Release) };
+}
+
+/// Test-only, for `judge_buffer`: whether the picture of `pts` is the one
+/// armed to be refused ([`decline_picture_for_test`]); disarms it.
+#[cfg(test)]
+pub(crate) fn declines_picture_for_test(state: *const CallbackState, pts: i64) -> bool {
+  use core::sync::atomic::Ordering;
+  pts != i64::MIN
+    && !state.is_null()
+    // SAFETY: `judge_buffer` calls this with the live state it read off
+    // the context.
+    && unsafe {
+      (*state)
+        .declining_pts
+        .compare_exchange(pts, i64::MIN, Ordering::AcqRel, Ordering::Relaxed)
+        .is_ok()
+    }
 }
 
 /// Latches an allocator-judge frame-budget refusal, as `judge_buffer`
@@ -705,6 +754,7 @@ mod tests {
       frame_budget_declined: core::sync::atomic::AtomicBool::new(false),
       declined_frame_bytes: core::sync::atomic::AtomicU64::new(0),
       declined_frame_audio: core::sync::atomic::AtomicBool::new(false),
+      declining_pts: core::sync::atomic::AtomicI64::new(i64::MIN),
     }
   }
 
