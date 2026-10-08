@@ -26,17 +26,22 @@ mod tests;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum KeyframeRule {
   /// H.264: a keyframe is clean when its first picture's NAL unit (types
-  /// 1–5) is an IDR slice (5). A packet with any picture before the IDR is
+  /// 1–5) is an IDR slice (5) that starts its picture — its
+  /// `first_mb_in_slice` is 0. A packet with any picture before the IDR is
   /// not: a decoder started there would begin on a picture that references
-  /// what it never saw. Its NAL units are length-prefixed by `nal_length`
-  /// bytes (`avcC`), or start-coded (Annex B) when `None`.
+  /// what it never saw; nor is one that opens on a later slice of the IDR
+  /// picture, whose leading slices a decoder started there never sees. Its
+  /// NAL units are length-prefixed by `nal_length` bytes (`avcC`), or
+  /// start-coded (Annex B) when `None`.
   H264 {
     /// The NAL length field's width, from the `avcC` record.
     nal_length: Option<usize>,
   },
   /// HEVC: clean when its first picture is an IDR or a BLA (NAL types
-  /// 16–20). A BLA's RASL pictures are discarded by every decoder, so a
-  /// new one loses nothing there. A CRA (21) is never clean.
+  /// 16–20) whose first slice segment starts it
+  /// (`first_slice_segment_in_pic_flag`). A BLA's RASL pictures are
+  /// discarded by every decoder, so a new one loses nothing there. A CRA
+  /// (21) is never clean.
   Hevc {
     /// The NAL length field's width, from the `hvcC` record.
     nal_length: Option<usize>,
@@ -102,7 +107,10 @@ impl KeyframeRule {
   /// that do not parse are not clean: nothing is proved about them. EVERY NAL unit is read whole —
   /// every header byte present and valid, a picture's unit carrying
   /// payload past its header — or the access unit is not clean; the first
-  /// picture's unit decides.
+  /// picture's unit decides, and it must START its picture
+  /// ([`h264_slice_starts_picture`], [`hevc_segment_starts_picture`]): a
+  /// packet that opens on a later slice of a picture, or whose first
+  /// picture's unit is cut before its slice header says so, is not clean.
   ///
   /// The units are walked one at a time ([`NalUnits`]) and never collected,
   /// so the memory a packet costs here does not grow with how many units it
@@ -110,12 +118,10 @@ impl KeyframeRule {
   /// entry per unit.
   pub(crate) fn is_clean(self, data: &[u8]) -> bool {
     match self {
-      Self::H264 { nal_length } => {
-        first_h264_picture(data, nal_length).is_some_and(|(kind, _)| kind == 5)
-      }
-      Self::Hevc { nal_length } => {
-        first_hevc_picture(data, nal_length).is_some_and(|kind| (16..=20).contains(&kind))
-      }
+      Self::H264 { nal_length } => first_h264_picture(data, nal_length)
+        .is_some_and(|(kind, unit)| kind == 5 && h264_slice_starts_picture(unit)),
+      Self::Hevc { nal_length } => first_hevc_picture(data, nal_length)
+        .is_some_and(|(kind, unit)| (16..=20).contains(&kind) && hevc_segment_starts_picture(unit)),
       Self::Mpeg12 => closed_gop(data),
       Self::Resets | Self::IntraOnly => true,
       Self::Reordering => false,
@@ -137,16 +143,19 @@ impl KeyframeRule {
   /// - **H.264:** the first picture is an IDR picture (NAL unit 5); or the
   ///   access unit carries, before its first picture, a recovery point SEI
   ///   message (NAL unit 6, payload type 6), which the anchor carries
-  ///   ([`RecoveryPoint`]). The first picture's slice header parses either
-  ///   way, its `slice_type` at most 9. An I picture with no such message
-  ///   anchors nothing: a slice type describes that slice alone, a non-IDR
-  ///   intra picture resets no reference, H.264 lets the pictures after it
-  ///   reference what the decoder never saw until the signalled recovery
-  ///   point, and FFmpeg's parser flags some such pictures key by heuristic.
+  ///   ([`RecoveryPoint`]). Either way the first picture's slice header
+  ///   parses and starts the picture: `first_mb_in_slice` is 0, `slice_type`
+  ///   at most 9 ([`h264_slice_starts_picture`]). An I picture with no such
+  ///   message anchors nothing: a slice type describes that slice alone, a
+  ///   non-IDR intra picture resets no reference, H.264 lets the pictures
+  ///   after it reference what the decoder never saw until the signalled
+  ///   recovery point, and FFmpeg's parser flags some such pictures key by
+  ///   heuristic.
   /// - **HEVC:** the first picture's NAL unit is an IRAP picture (16–23), a
-  ///   CRA (21) among them: the decoder resyncing kept its references, and
-  ///   the reorder bound ([`Proof::ReorderBound`]) covers the leading
-  ///   pictures a CRA has.
+  ///   CRA (21) among them, whose first slice segment starts it
+  ///   ([`hevc_segment_starts_picture`]): the decoder resyncing kept its
+  ///   references, and the reorder bound ([`Proof::ReorderBound`]) covers
+  ///   the leading pictures a CRA has.
   /// - **Every other codec** — one picture per packet: MPEG-4 part 2, VP8,
   ///   VP9, AV1 and the rest — **the key flag FFmpeg's parser set from the
   ///   bitstream is the proof.** That is the trust boundary: this crate
@@ -163,7 +172,7 @@ impl KeyframeRule {
     match self {
       Self::H264 { nal_length } => {
         let (kind, unit) = first_h264_picture(data, nal_length)?;
-        if !slice_header_parses(unit) {
+        if !h264_slice_starts_picture(unit) {
           return None;
         }
         match kind {
@@ -173,7 +182,7 @@ impl KeyframeRule {
         }
       }
       Self::Hevc { nal_length } => first_hevc_picture(data, nal_length)
-        .is_some_and(|kind| (16..=23).contains(&kind))
+        .is_some_and(|(kind, unit)| (16..=23).contains(&kind) && hevc_segment_starts_picture(unit))
         .then(|| anchor(None)),
       Self::Mpeg12 | Self::Resets | Self::IntraOnly | Self::Reordering => Some(anchor(None)),
     }
@@ -342,13 +351,13 @@ fn first_h264_picture(data: &[u8], nal_length: Option<usize>) -> Option<(u8, &[u
   first
 }
 
-/// The first picture's NAL unit type of an HEVC access unit, once EVERY
-/// unit is read whole and valid; `None` when one is not, or when no picture
-/// is there. `forbidden_zero_bit` (1) · `nal_unit_type` (6) · `nuh_layer_id`
-/// (6) · `nuh_temporal_id_plus1` (3), which is never zero; a picture's unit
-/// carries a slice segment header past its two header bytes, and an IRAP
-/// picture (16–23) a temporal id of 0.
-fn first_hevc_picture(data: &[u8], nal_length: Option<usize>) -> Option<u8> {
+/// The first picture of an HEVC access unit — its NAL unit type and its
+/// unit — once EVERY unit is read whole and valid; `None` when one is not,
+/// or when no picture is there. `forbidden_zero_bit` (1) · `nal_unit_type`
+/// (6) · `nuh_layer_id` (6) · `nuh_temporal_id_plus1` (3), which is never
+/// zero; a picture's unit carries a slice segment header past its two
+/// header bytes, and an IRAP picture (16–23) a temporal id of 0.
+fn first_hevc_picture(data: &[u8], nal_length: Option<usize>) -> Option<(u8, &[u8])> {
   let mut first = None;
   for unit in NalUnits::new(data, nal_length) {
     let unit = unit.ok()?;
@@ -363,19 +372,35 @@ fn first_hevc_picture(data: &[u8], nal_length: Option<usize>) -> Option<u8> {
       if unit.len() <= 2 || ((16..=23).contains(&kind) && second & 0x07 != 1) {
         return None;
       }
-      first.get_or_insert(kind);
+      first.get_or_insert((kind, unit));
     }
   }
   first
 }
 
-/// Whether the slice header of the H.264 slice whose NAL unit is `unit`
-/// opens as a slice header must: `first_mb_in_slice`, then `slice_type`, two
-/// exp-Golomb codes, the type one of the ten there are (0–9; the upper five
-/// say every slice of the picture is that type).
-fn slice_header_parses(unit: &[u8]) -> bool {
+/// Whether the H.264 slice whose NAL unit is `unit` starts its picture: its
+/// header opens as a slice header must — `first_mb_in_slice`, then
+/// `slice_type`, two exp-Golomb codes, the type one of the ten there are
+/// (0–9; the upper five say every slice of the picture is that type) — and
+/// `first_mb_in_slice` is 0, the slice holding the picture's first
+/// macroblock. A later slice of the picture (what opens a packet that holds
+/// the rest of a picture split across packets), or a unit cut before its
+/// slice type, does not: a decoder started there would never see the slices
+/// before it. A stream coded with arbitrary slice order, whose picture may
+/// open on another slice, is read as starting none — never clean, never an
+/// anchor.
+fn h264_slice_starts_picture(unit: &[u8]) -> bool {
   let mut bits = RbspBits::new(unit.get(1..).unwrap_or_default());
-  bits.ue().is_some() && bits.ue().is_some_and(|slice_type| slice_type <= 9)
+  bits.ue() == Some(0) && bits.ue().is_some_and(|slice_type| slice_type <= 9)
+}
+
+/// Whether the HEVC slice segment whose NAL unit is `unit` starts its
+/// picture: the first bit of its slice segment header,
+/// `first_slice_segment_in_pic_flag`, is 1. The header's first byte follows
+/// the two NAL header bytes, the second never zero, so no emulation
+/// prevention byte can stand there.
+fn hevc_segment_starts_picture(unit: &[u8]) -> bool {
+  unit.get(2).is_some_and(|byte| byte & 0x80 != 0)
 }
 
 /// The recovery point SEI message an H.264 access unit carries before its

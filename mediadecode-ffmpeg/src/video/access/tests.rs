@@ -480,13 +480,17 @@ fn read(anchor: Option<Anchor>) -> Option<(u32, bool)> {
   })
 }
 
-/// LAW (Codex R6 row 1, [high]; restated by Codex R7 and R8): **a resync
-/// anchor is a packet the bitstream proves a random-access point, and it is
-/// definitive where it is a clean one.** H.264: an IDR slice anchors,
+/// LAW (Codex R6 row 1, [high]; restated by Codex R7, R8 and R12): **a
+/// resync anchor is a packet the bitstream proves a random-access point, and
+/// it is definitive where it is a clean one.** H.264: an IDR slice anchors,
 /// definitively; a non-IDR picture anchors only behind a recovery point SEI
-/// message — an I slice, an SI slice, an I slice whose header holds an
-/// emulation prevention byte: none of them alone — while a packet whose first
-/// slice is P or B does not, though an IDR follows it in the packet. HEVC:
+/// message — an I slice, an SI slice: neither alone — and a recovery point
+/// read through an emulation prevention byte in its own payload anchors with
+/// the count it carries, while a packet whose first slice is P or B does
+/// not, though an IDR follows it in the packet, nor one whose first slice is
+/// a later slice of its picture (R12): an I slice whose `first_mb_in_slice`
+/// runs to 22 leading zeros, its header holding the emulation prevention
+/// byte, behind a recovery point. HEVC:
 /// every IRAP picture anchors, a CRA among them, while a trailing or a RASL
 /// picture first does not; an IDR or a BLA is definitive, a CRA not. Every
 /// other codec takes the key flag as FFmpeg's parser set it, definitive
@@ -513,6 +517,20 @@ fn a_resync_anchor_is_a_packet_whose_first_picture_is_random_access() {
     "the fixture carries an emulation prevention byte"
   );
   let recovers = sei(&[(6, &recovery("1", true, false))]);
+  // `recovery_frame_cnt` with 22 leading zeros, 4 194 303: the message's
+  // payload runs `00 00 02`, carried as `00 00 03 02`.
+  let recovers_far = sei(&[(
+    6,
+    &recovery(
+      &format!("{}1{}", "0".repeat(22), "0".repeat(22)),
+      true,
+      false,
+    ),
+  )]);
+  assert!(
+    recovers_far.windows(3).any(|w| w == [0, 0, 3]),
+    "the message carries an emulation prevention byte"
+  );
   for (units, anchor, why) in [
     (vec![&idr[..]], Some((0, true)), "an IDR slice"),
     (
@@ -523,9 +541,14 @@ fn a_resync_anchor_is_a_packet_whose_first_picture_is_random_access() {
     (vec![&i_slice[..]], None, "an I slice alone"),
     (vec![&si_slice[..]], None, "an SI slice alone"),
     (
+      vec![&recovers_far[..], &i_slice[..]],
+      Some(((1 << 22) - 1, false)),
+      "a recovery point read through `00 00 03`",
+    ),
+    (
       vec![&recovers[..], &far_i_slice[..]],
-      Some((0, false)),
-      "a recovery point's I slice read through `00 00 03`",
+      None,
+      "a later slice of its picture behind a recovery point",
     ),
     (vec![&p_slice[..]], None, "a P slice, a stale key flag"),
     (vec![&b_slice[..]], None, "a B slice"),
@@ -722,5 +745,79 @@ fn a_resync_is_proved_by_withheld_output_on_h264_and_by_the_reorder_bound_elsewh
     KeyframeRule::Reordering,
   ] {
     assert_eq!(rule.proof(), Proof::ReorderBound, "{rule:?}");
+  }
+}
+
+/// LAW (Codex R12, [high]): **a clean point and an anchor START a picture.**
+/// An H.264 IDR slice whose `first_mb_in_slice` is 5 — a later slice of the
+/// IDR picture, what opens a packet holding the rest of a picture split
+/// across packets — is neither clean nor an anchor, in either packing, nor
+/// is a recovery point whose first slice is a later one; an HEVC IDR or CRA
+/// whose first slice segment has `first_slice_segment_in_pic_flag` 0 is
+/// neither either; an H.264 IDR unit cut inside its slice header, before
+/// its `slice_type`, is not clean. The same units starting their pictures —
+/// `first_mb_in_slice` 0, the flag 1 — stay clean and anchor. Reading
+/// `first_mb_in_slice` and discarding its value, the continuation slice was
+/// a clean point and a definitive anchor: the switch drained the decoder
+/// that had the picture's leading slices and handed the rest to one that
+/// never saw them.
+#[test]
+fn a_clean_point_and_an_anchor_start_a_picture() {
+  let starts = slice(0x65, "1", "0001000");
+  let continues = slice(0x65, "00110", "0001000");
+  for nal_length in [None, Some(4)] {
+    let h264 = KeyframeRule::H264 { nal_length };
+    let pack = |units: &[&[u8]]| match nal_length {
+      None => annex_b(units),
+      Some(_) => length_prefixed(units),
+    };
+    let start = pack(&[&[0x67, 1], &[0x68, 1], &starts[..]]);
+    let continuation = pack(&[&continues[..]]);
+    assert!(
+      h264.is_clean(&start),
+      "{h264:?}: an IDR starting its picture is clean"
+    );
+    assert!(
+      h264.anchor(&start).is_some_and(Anchor::definitive),
+      "{h264:?}: and a definitive anchor"
+    );
+    assert!(
+      !h264.is_clean(&continuation),
+      "{h264:?}: an IDR slice whose first_mb_in_slice is 5 is not clean"
+    );
+    assert_eq!(h264.anchor(&continuation), None, "{h264:?}: nor an anchor");
+    let message = sei(&[(6, &recovery("1", true, false))]);
+    let later_p = slice(0x41, "00110", "00110");
+    assert_eq!(
+      h264.anchor(&pack(&[&message[..], &later_p[..]])),
+      None,
+      "{h264:?}: a recovery point whose first slice is a later one anchors nothing"
+    );
+    let truncated = pack(&[&[0x65, 0x80]]);
+    assert!(
+      !h264.is_clean(&truncated) && h264.anchor(&truncated).is_none(),
+      "{h264:?}: an IDR unit cut before its slice_type is neither"
+    );
+  }
+  for nal_length in [None, Some(4)] {
+    let hevc = KeyframeRule::Hevc { nal_length };
+    let pack = |units: &[&[u8]]| match nal_length {
+      None => annex_b(units),
+      Some(_) => length_prefixed(units),
+    };
+    for (kind, clean) in [(19u8, true), (21, false)] {
+      let start = pack(&[&[kind << 1, 1, 0xaf]]);
+      let continuation = pack(&[&[kind << 1, 1, 0x2f]]);
+      assert_eq!(
+        (hevc.is_clean(&start), hevc.anchor(&start).is_some()),
+        (clean, true),
+        "{hevc:?}: type {kind} starting its picture"
+      );
+      assert_eq!(
+        (hevc.is_clean(&continuation), hevc.anchor(&continuation)),
+        (false, None),
+        "{hevc:?}: type {kind} whose first segment has first_slice_segment_in_pic_flag 0"
+      );
+    }
   }
 }
