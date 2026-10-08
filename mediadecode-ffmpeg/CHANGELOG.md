@@ -32,12 +32,15 @@ The backend-agnostic core it adapts has its own log at
   64 pictures bound the queue besides. A replay used to abort at 64 pictures
   whatever their size — up to 32 GiB of 4K pictures at the per-picture
   ceiling — and a switch's drain that passed the cap dropped the rest of the
-  tail. Now a drain stops before a picture that would carry the queue past
-  either bound — the next taken to be the size of the last, so the queue
-  passes its budget only by a picture's growth over the one before it — and
-  answers `Sent::MustDrain` with the packet (or the end of the stream) still
-  the
-  caller's, and resumes once the caller has taken pictures: a replay
+  tail. Now a drain stops at either bound and answers `Sent::MustDrain`
+  with the packet (or the end of the stream) still the caller's: the
+  budget is a hard bound on the queue at each picture's ACTUAL size — a
+  received picture the queue cannot take within it (a resolution or
+  pixel-format change, outgrowing the one before it) is never queued but
+  parked, the one picture held past the queue, and nothing more is
+  received while it waits; the size of the last picture is only the hint
+  that stops a drain before it receives. The drain resumes once the
+  caller has taken pictures: a replay
   committed at the budget feeds its remaining packets before anything sent
   next, and a restart's decoder stays open, draining, until it has given its
   last. Nothing is dropped. An error the resumed replay meets is reported

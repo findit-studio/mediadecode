@@ -515,16 +515,27 @@ enum DecodeState {
 /// [`SW_REPLAY_FRAME_CAP`] pictures: a drain stops once either is reached
 /// (see [`ReplayQueue::full`]) and resumes after the caller has taken
 /// pictures, so nothing is dropped to keep within them.
+///
+/// **The budget is a hard bound on the queue, at the picture's ACTUAL
+/// size.** A picture's size is known only once it has been received, and a
+/// picture may outgrow the one before it — a resolution or pixel-format
+/// change. One that the queue cannot take within its budget is never
+/// queued: it is [parked](Self::parked), the ONE picture held past the
+/// queue, and the drain stops until the caller has taken enough for it.
 #[derive(Default)]
 struct ReplayQueue {
   frames: VecDeque<(frame::Video, usize)>,
   bytes: usize,
   /// The bytes of the last picture received into the queue: the size the
-  /// next one is taken to have, so a drain receives none that would carry
-  /// the queue past its budget — the decoder keeps it until the caller has
-  /// taken enough. Only a picture larger than the one before it can pass
-  /// the budget, by that growth, and the drain stops there.
+  /// next one is taken to have, a hint that stops a drain before it
+  /// receives a picture the queue would likely not take. The admission is
+  /// the picture's own size ([`Self::parked`]).
   last: usize,
+  /// A picture received that the queue could not take within its budget:
+  /// held here, after every queued picture in delivery order, until the
+  /// caller has taken enough for it. At most one, and nothing more is
+  /// received while it waits.
+  parked: Option<(frame::Video, usize)>,
 }
 
 impl ReplayQueue {
@@ -535,7 +546,7 @@ impl ReplayQueue {
   }
 
   fn is_empty(&self) -> bool {
-    self.frames.is_empty()
+    self.frames.is_empty() && self.parked.is_none()
   }
 
   /// The bytes the queued pictures hold.
@@ -544,12 +555,25 @@ impl ReplayQueue {
     self.bytes
   }
 
+  /// The bytes of the parked picture, if one waits.
+  #[cfg(test)]
+  fn parked_bytes(&self) -> usize {
+    self.parked.as_ref().map_or(0, |(_, bytes)| *bytes)
+  }
+
   fn front(&self) -> Option<&frame::Video> {
-    self.frames.front().map(|(frame, _)| frame)
+    self
+      .frames
+      .front()
+      .or(self.parked.as_ref())
+      .map(|(frame, _)| frame)
   }
 
   fn pop_front(&mut self) -> Option<frame::Video> {
-    let (frame, bytes) = self.frames.pop_front()?;
+    let Some((frame, bytes)) = self.frames.pop_front() else {
+      // The queue is empty: the parked picture, the last in order, is next.
+      return self.parked.take().map(|(frame, _)| frame);
+    };
     self.bytes = self.bytes.saturating_sub(bytes);
     Some(frame)
   }
@@ -561,29 +585,51 @@ impl ReplayQueue {
   }
 
   fn append(&mut self, other: &mut Self) {
+    // A picture parked here would come before `other`'s in delivery order;
+    // the one caller appends a fresh replay to an empty queue.
+    debug_assert!(
+      self.parked.is_none(),
+      "a replay appended behind a parked picture"
+    );
     self.bytes = self.bytes.saturating_add(other.bytes);
     other.bytes = 0;
     if !other.frames.is_empty() {
       self.last = other.last;
     }
     self.frames.append(&mut other.frames);
+    if self.parked.is_none() {
+      self.parked = other.parked.take();
+    }
   }
 
   fn clear(&mut self) {
     self.frames.clear();
     self.bytes = 0;
     self.last = 0;
+    self.parked = None;
   }
 
-  /// Whether a drain must stop here, before it receives another picture: one
-  /// the size of the last would carry the queue past `budget` bytes, or the
-  /// queue holds the [`SW_REPLAY_FRAME_CAP`] pictures. An empty queue always
-  /// takes one — a picture that alone passes the budget is refused by name
-  /// (see `drain_into`) — so the queue never passes its budget but by a
-  /// picture's growth over the one before it.
+  /// Whether a drain must stop here, before it receives another picture: a
+  /// picture is parked, one the size of the last would likely carry the queue
+  /// past `budget` bytes (the hint), or the queue holds the
+  /// [`SW_REPLAY_FRAME_CAP`] pictures. An empty queue always takes one — a
+  /// picture that alone passes the budget is refused by name (see
+  /// `drain_into`).
   fn full(&self, budget: usize) -> bool {
-    self.frames.len() >= SW_REPLAY_FRAME_CAP
+    self.parked.is_some()
+      || self.frames.len() >= SW_REPLAY_FRAME_CAP
       || (!self.frames.is_empty() && self.bytes.saturating_add(self.last) > budget)
+  }
+
+  /// Moves the parked picture into the queue where the queue can now take it
+  /// within `budget` — the caller has taken enough, or taken everything.
+  fn admit_parked(&mut self, budget: usize) {
+    let fits = self.parked.as_ref().is_some_and(|(_, bytes)| {
+      self.frames.is_empty() || self.bytes.saturating_add(*bytes) <= budget
+    });
+    if fits && let Some((frame, bytes)) = self.parked.take() {
+      self.push_back(frame, bytes);
+    }
   }
 }
 
@@ -2366,6 +2412,11 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     self
   }
 
+  /// The bytes of the picture parked past the replay queue, if one waits.
+  pub(crate) fn sw_replay_parked_bytes_for_test(&self) -> usize {
+    self.sw_replay_frames.parked_bytes()
+  }
+
   /// Whether the post-commit path retained any replay frames — must always be
   /// empty for a post-commit fallback (it retains zero). Lets the finding-1
   /// dissolution test assert no replay frame was ever queued.
@@ -3249,6 +3300,7 @@ fn drain_into(
   budget: usize,
 ) -> std::result::Result<Drained, Error> {
   loop {
+    queue.admit_parked(budget);
     if queue.full(budget) {
       return Ok(Drained::Full);
     }
@@ -3266,6 +3318,12 @@ fn drain_into(
           return Err(Error::ReplayQueueFull(crate::ReplayQueueFull::new(
             bytes, budget,
           )));
+        }
+        // The admission is the picture's own size: one the queue cannot take
+        // within its budget waits parked, and the drain stops for the caller.
+        if !queue.frames.is_empty() && queue.bytes.saturating_add(bytes) > budget {
+          queue.parked = Some((tmp, bytes));
+          return Ok(Drained::Full);
         }
         queue.push_back(tmp, bytes);
       }

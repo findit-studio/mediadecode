@@ -4137,6 +4137,102 @@ fn the_replay_budget_is_a_hard_bound() {
   assert!(rounds >= 8, "a round a picture, not {rounds}");
 }
 
+/// LAW (Codex R8, [high]): **a picture that outgrows the one before it waits
+/// parked, and the queue never passes its budget.** A 128x96 GOP, then a
+/// 256x192 one — the resolution changes mid-replay, and the first large
+/// picture is four times the size the queue takes the next one to have. The
+/// budget holds a large picture and half a small one: queued behind a small
+/// picture, the large one would pass it. A probe-era fallback replays the
+/// whole history on one thread, to a caller that takes one picture each time
+/// it is told to drain. The large picture is received and found too large
+/// for the queue: it is parked, the ONE picture held past the queue, and the
+/// drain stops until the caller has taken enough. The queue never
+/// holds more than its budget, and every picture comes out once, in order,
+/// as the same fallback delivers them under the default budget. The drain
+/// that pushed whatever it received past its check queued the large picture
+/// behind the small ones, past the budget.
+#[test]
+fn a_picture_that_outgrows_the_last_waits_parked_and_the_queue_stays_within_its_budget() {
+  let small = encode_h264_closed_gops(128, 96, 8);
+  let large = encode_h264_closed_gops(256, 192, 8);
+  let (small_bytes, large_bytes) = (picture_bytes(&small), picture_bytes(&large));
+  let shift = small.packets.len() as i64;
+  let mut packets = small.packets.clone();
+  for packet in &large.packets {
+    let mut later = packet.clone();
+    later.set_pts(packet.pts().map(|pts| pts + shift));
+    later.set_dts(packet.dts().map(|dts| dts + shift));
+    packets.push(later);
+  }
+  let clip = SyntheticClip {
+    parameters: small.parameters.clone(),
+    packets,
+  };
+  let budget = large_bytes + small_bytes / 2;
+  assert!(
+    2 * small_bytes <= budget && budget < small_bytes + large_bytes,
+    "a small picture queued, the hint lets a large one be received that the queue cannot \
+     take: {small_bytes} / {large_bytes} under {budget}"
+  );
+  let fail_at = clip.packets.len() - 1;
+  let (single, _) = threads_through_a_fallback(&clip, fail_at, crate::Threads::Single);
+
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test(
+    Box::new(FakeHw::failing(16, 16, 0, fail_at, FailShape::ProbeEra)),
+    clip.parameters.clone(),
+    tb,
+  )
+  .expect("build test decoder")
+  .with_threads_for_test(crate::Threads::Single)
+  .with_max_replay_bytes_for_test(budget);
+  let mut dst = crate::empty_owned_video_frame();
+  let mut shown = Vec::new();
+  let (mut most, mut parked) = (0usize, 0usize);
+  let watch = |dec: &FfmpegVideoStreamDecoder, most: &mut usize, parked: &mut usize| {
+    *most = (*most).max(dec.sw_replay_bytes_for_test());
+    *parked = (*parked).max(dec.sw_replay_parked_bytes_for_test());
+  };
+  for av_pkt in &clip.packets {
+    loop {
+      match dec.send_packet(&pushed(av_pkt)).expect("send_packet") {
+        Sent::Accepted => break,
+        // A caller that takes one picture each time it is told to drain: the
+        // queue stays near its budget, small pictures in it when the large
+        // one comes.
+        Sent::MustDrain => {
+          watch(&dec, &mut most, &mut parked);
+          if let Received::Frame = dec.receive_frame(&mut dst).expect("receive_frame") {
+            shown.push(dst.pts());
+          }
+          watch(&dec, &mut most, &mut parked);
+        }
+      }
+    }
+    watch(&dec, &mut most, &mut parked);
+    while let Received::Frame = dec.receive_frame(&mut dst).expect("receive_frame") {
+      watch(&dec, &mut most, &mut parked);
+      shown.push(dst.pts());
+    }
+  }
+  crate::accepted(dec.send_eof(), "send_eof");
+  while let Received::Frame = dec.receive_frame(&mut dst).expect("receive_frame") {
+    watch(&dec, &mut most, &mut parked);
+    shown.push(dst.pts());
+  }
+
+  assert!(dec.is_software(), "the probe-era fallback committed");
+  assert!(
+    most <= budget,
+    "the queue held {most} bytes, past its budget of {budget}"
+  );
+  assert_eq!(
+    parked, large_bytes,
+    "a large picture waited parked, the one picture past the queue"
+  );
+  assert_eq!(shown, single, "every picture once, in order");
+}
+
 /// LAW (Codex R4, [high]): **a switch's drain past the budget waits for the
 /// caller, and loses nothing.** A closed-GOP H.264 stream with B-frames
 /// falls back on its probe at packet 3, on three threads, with a byte
