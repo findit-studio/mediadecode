@@ -1299,7 +1299,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     // new SW decoder and queue into `self`.
     self.sw_replay_frames.append(&mut local_replay);
     self.state = DecodeState::Sw(sw);
-    self.sw_threads_pending = self.limits.threads().thread_count() != 1;
+    self.sw_threads_pending = self.session_threads_run();
     self.pending_eof = eof_pending && !progress.eof_sent;
     Ok(progress.fed)
   }
@@ -1628,6 +1628,22 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     Ok(Sent::Accepted)
   }
 
+  /// Whether a decoder opened on the session's [`Threads`](crate::Threads)
+  /// would decode on more than one: the session asks for more than one, and
+  /// the codec threads — by frames, by slices, or on its own
+  /// (`AV_CODEC_CAP_OTHER_THREADS`). A codec that cannot thread decodes on
+  /// one whatever is asked, so a switch to the session's threads would only
+  /// drain and reopen it: none is scheduled.
+  fn session_threads_run(&self) -> bool {
+    use ffmpeg_next::codec::Capabilities;
+    self.limits.threads().thread_count() != 1
+      && crate::decoder::find_decoder(&self.parameters).is_ok_and(|codec| {
+        codec.capabilities().intersects(
+          Capabilities::FRAME_THREADS | Capabilities::SLICE_THREADS | Capabilities::OTHER_THREADS,
+        )
+      })
+  }
+
   /// Whether `pkt` anchors a post-commit resync: a key-flagged packet whose
   /// first picture the bitstream proves a random-access one, where this crate
   /// can read it — see [`access::KeyframeRule::anchors`]. A stale key flag, or
@@ -1856,7 +1872,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     // Commit: only after a clean open + forward. The session's own
     // threads come back at the next keyframe.
     self.state = DecodeState::Sw(sw);
-    self.sw_threads_pending = self.limits.threads().thread_count() != 1;
+    self.sw_threads_pending = self.session_threads_run();
     self.enter_degraded_resync();
     self.sw_output_settled = forwarded.is_none() && !eof_pending;
     if let Some(pkt) = forwarded {

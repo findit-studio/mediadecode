@@ -2951,14 +2951,17 @@ pub(crate) fn request_threads(ctx: &mut Context, threads: crate::limits::Threads
   }
 }
 
-/// The thread count libavcodec settled on when `ctx` was opened.
+/// The threads the decoder `ctx` was opened on decodes with — read off what
+/// is active, never off what was asked.
 ///
-/// `avcodec_open2` overwrites a requested `thread_count` with what it
-/// chose: the resolved count when frame or slice threading is active,
-/// one when the codec cannot thread. `None` where it recorded no count
-/// at all — a codec that runs its own threads (an external decoder such
-/// as libdav1d, under [`Threads::Auto`](crate::Threads::Auto)) leaves
-/// the request of zero in place.
+/// - **Frame or slice threading active** (`active_thread_type`): the count
+///   libavcodec settled on, `thread_count`.
+/// - **A codec that runs its own threads** (`AV_CODEC_CAP_OTHER_THREADS`,
+///   an external decoder such as libdav1d): the count it was handed, `None`
+///   where that was zero — under [`Threads::Auto`](crate::Threads::Auto)
+///   the library chooses, and records no count.
+/// - **Anything else** decodes on one thread, whatever was asked: a codec
+///   that cannot thread, or a context opened on one.
 pub(crate) fn opened_threads(
   ctx: *const ffmpeg_next::ffi::AVCodecContext,
 ) -> Option<core::num::NonZeroU32> {
@@ -2966,11 +2969,24 @@ pub(crate) fn opened_threads(
     return None;
   }
   // SAFETY: non-null per the check above, and the caller hands a live
-  // opened context; `thread_count` is a plain `c_int`.
-  let count = unsafe { (*ctx).thread_count };
-  u32::try_from(count)
-    .ok()
-    .and_then(core::num::NonZeroU32::new)
+  // opened context: `thread_count` and `active_thread_type` are plain
+  // `c_int`s, and `codec` points at the codec's static description, whose
+  // `capabilities` is a plain `c_int`.
+  let (count, active, external) = unsafe {
+    let codec = (*ctx).codec;
+    let external = !codec.is_null()
+      && ((*codec).capabilities as u32) & ffmpeg_next::ffi::AV_CODEC_CAP_OTHER_THREADS != 0;
+    ((*ctx).thread_count, (*ctx).active_thread_type, external)
+  };
+  let threaded =
+    active & (ffmpeg_next::ffi::FF_THREAD_FRAME | ffmpeg_next::ffi::FF_THREAD_SLICE) != 0;
+  if threaded || external {
+    u32::try_from(count)
+      .ok()
+      .and_then(core::num::NonZeroU32::new)
+  } else {
+    Some(core::num::NonZeroU32::MIN)
+  }
 }
 
 /// Checked deep-clone of `codec::Parameters`. ffmpeg-next's

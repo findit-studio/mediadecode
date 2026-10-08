@@ -5467,3 +5467,64 @@ fn a_switch_whose_old_decoder_refuses_the_end_loses_nothing() {
   assert_eq!(dec.active_threads(), Some(three), "the session switched");
   assert_eq!(shown, single, "no picture lost, none moved");
 }
+
+/// An H.263 clip — a codec FFmpeg decodes serially, with neither frame nor
+/// slice threading — at 128x96, a keyframe every `gop` frames.
+fn encode_h263(frames: usize, gop: u32) -> SyntheticClip {
+  use ffmpeg_next as ff;
+  ff::init().expect("ffmpeg init");
+  let codec = ff::codec::encoder::find(ff::codec::Id::H263).expect("h263 encoder present");
+  encode_clip(codec, 128, 96, frames, ff::Dictionary::new(), |enc| {
+    enc.set_gop(gop);
+    enc.set_max_b_frames(0);
+    enc.set_bit_rate(200_000);
+  })
+}
+
+/// LAW (Codex R6 row 5, [medium]): **a serial codec reports one thread,
+/// and schedules no switch.** H.263 decodes on one thread whatever is
+/// asked. Opened on the software road under `Threads::Count(8)`, the
+/// session reports the threads its decoder decodes on — one, read off what
+/// is active, not the eight asked for. After a fallback on the same request,
+/// a seek makes the next keyframe a switch point; none is taken: reopening
+/// a decoder that cannot thread would only drain and close the one serving,
+/// so no switch is scheduled, and the session stays on its one thread.
+#[test]
+fn a_serial_codec_reports_one_thread_and_schedules_no_switch() {
+  let clip = encode_h263(24, 6);
+  let eight = core::num::NonZeroU32::new(8).expect("nonzero");
+  let (pictures, threads) = decode_on_software(
+    &clip,
+    crate::DecoderLimits::default().with_threads(crate::Threads::Count(eight)),
+  );
+  assert_eq!(pictures.len(), clip.packets.len(), "the clip decodes");
+  assert_eq!(
+    threads,
+    Some(core::num::NonZeroU32::MIN),
+    "the decoder decodes on one thread"
+  );
+
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test(
+    Box::new(FakeHw::failing(16, 16, 0, 3, FailShape::ProbeEra)),
+    clip.parameters.clone(),
+    tb,
+  )
+  .expect("build test decoder")
+  .with_threads_for_test(crate::Threads::Count(eight));
+  for _ in 0..2 {
+    for av_pkt in &clip.packets {
+      crate::accepted(dec.send_packet(&pushed(av_pkt)), "send_packet");
+      drain_ready(&mut dec);
+      assert_eq!(
+        dec.active_threads(),
+        Some(core::num::NonZeroU32::MIN),
+        "one thread"
+      );
+    }
+    // A seek: the first keyframe after it is a switch point.
+    dec.flush().expect("a flush");
+  }
+  assert!(dec.is_software(), "the fallback committed");
+  assert_eq!(dec.threaded_opens_for_test(), 0, "no switch was scheduled");
+}

@@ -56,11 +56,15 @@ The backend-agnostic core it adapts has its own log at
   drain can make room for, is refused by this name, where a replay overflow
   used to surface as a bare `ENOMEM`.
 
-- **`active_threads()` on the video stream decoder**: the count
-  libavcodec settled on, read back from the opened context of the
-  decoder serving now — the resolved count on the software road, one on
-  the hardware road, which writes no thread fields, and `None` for a
-  codec that runs its own threads (libdav1d under `Auto`).
+- **`active_threads()` on the video stream decoder**: the threads the
+  decoder serving now decodes with, read off what is active
+  (`active_thread_type`), never off what was asked — the count libavcodec
+  settled on when frame or slice threading is active, the count handed to
+  a codec that runs its own threads (`None` for libdav1d under `Auto`),
+  and one otherwise: a codec that cannot thread, whatever is asked, and
+  the hardware road, which writes no thread fields. A codec that cannot
+  thread schedules no switch to the session's threads after a fallback:
+  the reopen would decode on one thread all the same.
 
 ### Changed
 
