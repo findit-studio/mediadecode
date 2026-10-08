@@ -1280,7 +1280,7 @@ fn an_hevc_stream_declaring_an_auxiliary_layer_has_no_clean_point_and_no_anchor(
         Some(_) => length_prefixed(&[&unit[..], &idr[..]]),
       };
       assert_eq!(
-        rule.units_declare_alpha(&au),
+        rule.units_declare_alpha(&au, &mut Default::default()),
         declares,
         "{name}: {rule:?}, in band"
       );

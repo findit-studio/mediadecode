@@ -9066,6 +9066,24 @@ fn on_frame_threads_a_waiting_refusal_never_renames_another_error() {
 /// — the multiview type's view order index 1, the auxiliary type's `AuxId`
 /// `aux_id` (1 alpha, 2 depth) — and the second layer's `nuh_layer_id` 1.
 fn hevc_vps(id: u8, layers_minus1: u8, mask: Option<u16>, aux_id: u8) -> Vec<u8> {
+  hevc_vps_cut(id, layers_minus1, mask, aux_id, VpsCut::Whole)
+}
+
+/// Where [`hevc_vps_cut`] ends a set's payload, its stop bit after.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VpsCut {
+  /// Whole.
+  Whole,
+  /// Before the extension's `scalability_mask_flag`.
+  BeforeMask,
+  /// Before the extension's `direct_dependency_flag` — the mask, the
+  /// dimension ids and `view_id_len` read; the second layer's
+  /// `nuh_layer_id` 1.
+  BeforeDirectDependency,
+}
+
+/// [`hevc_vps`], its payload ended at `cut`.
+fn hevc_vps_cut(id: u8, layers_minus1: u8, mask: Option<u16>, aux_id: u8, cut: VpsCut) -> Vec<u8> {
   const AUXILIARY: u16 = 1 << (15 - 3);
   let ue = |value: u32| -> String {
     let coded = value + 1;
@@ -9097,33 +9115,37 @@ fn hevc_vps(id: u8, layers_minus1: u8, mask: Option<u16>, aux_id: u8) -> Vec<u8>
         bits += "1";
       }
       bits += "010111010"; // profile_tier_level(0, 0), splitting_flag
-      bits += &format!("{mask:016b}");
-      bits += &"001".repeat(mask.count_ones() as usize);
-      bits += "0"; // vps_nuh_layer_id_present_flag
-      for index in 0..16 {
-        if mask & (1 << (15 - index)) != 0 {
-          let dimension = if 1 << (15 - index) == AUXILIARY {
-            aux_id
-          } else {
-            1
-          };
-          bits += &format!("{dimension:02b}");
+      if cut != VpsCut::BeforeMask {
+        bits += &format!("{mask:016b}");
+        bits += &"001".repeat(mask.count_ones() as usize);
+        bits += "0"; // vps_nuh_layer_id_present_flag
+        for index in 0..16 {
+          if mask & (1 << (15 - index)) != 0 {
+            let dimension = if 1 << (15 - index) == AUXILIARY {
+              aux_id
+            } else {
+              1
+            };
+            bits += &format!("{dimension:02b}");
+          }
+        }
+        bits += "0000"; // view_id_len
+        if cut == VpsCut::Whole {
+          bits += "1"; // direct_dependency_flag[1][0]
+          bits += "000"; // sub-layers, max_tid_ref, default_ref_layers_active
+          bits += &(ue(0) + &ue(0)); // one profile_tier_level, num_add_olss
+          bits += "00"; // default_output_layer_idc
+          bits += &ue(0); // vps_num_rep_formats_minus1
+          bits += &format!("{:016b}{:016b}", 128u16, 96u16);
+          bits += "10100000000"; // chroma and bit depth present: 4:2:0, eight bits
+          bits += "0000"; // conformance window, one active ref layer, aligned, sub-layer info
+          bits += &ue(0).repeat(4); // the DPB sizes of both output layers
+          bits += &ue(0); // direct_dep_type_len_minus2
+          bits += "0"; // direct_dependency_all_layers_flag
+          bits += &ue(0); // vps_non_vui_extension_length
+          bits += "0"; // vps_vui_present_flag
         }
       }
-      bits += "0000"; // view_id_len
-      bits += "1"; // direct_dependency_flag[1][0]
-      bits += "000"; // sub-layers, max_tid_ref, default_ref_layers_active
-      bits += &(ue(0) + &ue(0)); // one profile_tier_level, num_add_olss
-      bits += "00"; // default_output_layer_idc
-      bits += &ue(0); // vps_num_rep_formats_minus1
-      bits += &format!("{:016b}{:016b}", 128u16, 96u16);
-      bits += "10100000000"; // chroma and bit depth present: 4:2:0, eight bits
-      bits += "0000"; // conformance window, one active ref layer, aligned, sub-layer info
-      bits += &ue(0).repeat(4); // the DPB sizes of both output layers
-      bits += &ue(0); // direct_dep_type_len_minus2
-      bits += "0"; // direct_dependency_all_layers_flag
-      bits += &ue(0); // vps_non_vui_extension_length
-      bits += "0"; // vps_vui_present_flag
     }
     None => bits += "0",
   }
@@ -9238,17 +9260,29 @@ fn with_vps(packet: &Packet, vps: &[u8]) -> Packet {
   repacked(packet, &payload)
 }
 
-/// LAW (Codex R14, [medium]): **FFmpeg 9 reads the video parameter sets
-/// these laws build as this crate does.** An `x265` stream's first packet,
-/// its own video parameter set (id 0, which its sequence parameter set
-/// refers to) replaced, decoded by FFmpeg's `hevc` on one thread: FFmpeg
-/// negotiates an output format with alpha — `ff_hevc_is_alpha_video`
-/// answering yes as `get_format` builds its list — exactly where this crate
-/// reads the set as declaring an auxiliary layer: two layers, alpha or
-/// depth; not for one layer, two in multiview, or three with an auxiliary
-/// mask, each of which it stores and decodes the packet under; nor for a set
-/// without its base layer internal, which it refuses, failing the packet at
-/// that unit. The laws above rest on this reading.
+/// LAW (Codex R14, [medium]; extended by Codex R15, [high]): **FFmpeg 9
+/// reads the video parameter sets these laws build as this crate does — past
+/// a set's end too.** An `x265` stream's first packet, its own video
+/// parameter set (id 0, which its sequence parameter set refers to)
+/// replaced, decoded by FFmpeg's `hevc` on one thread: FFmpeg negotiates an
+/// output format with alpha — `ff_hevc_is_alpha_video` answering yes as
+/// `get_format` builds its list — exactly where this crate reads the set,
+/// in the packet and as extradata, as one FFmpeg stores as alpha video: two
+/// layers, alpha or depth; and two layers whose payload ends before
+/// `direct_dependency_flag`, the mask, the auxiliary type and the second
+/// layer's id read (Codex's construction) — FFmpeg's reader goes on past the
+/// end, meets an unsupported value and keeps the alpha it read ("Broken VPS
+/// extension, treating as alpha video"), and stores the set, its id holding
+/// nothing yet. Not for one layer, two in multiview, three with an auxiliary
+/// mask, or two whose payload ends before the mask, each of which it stores
+/// and decodes the packet under; nor for a set without its base layer
+/// internal, which it refuses, failing the packet at that unit. **And
+/// FFmpeg's storage rule:** where the decoder already holds a set of that
+/// id — a one-layer set, in its extradata or earlier in the same packet —
+/// the set read past its end is refused, the held one stands, and FFmpeg
+/// decodes without alpha, as this crate reads it against what the decoder
+/// holds. Read by a reader that stops at a set's end, Codex's construction
+/// declared nothing where FFmpeg decodes alpha.
 #[test]
 fn ffmpeg_reads_the_video_parameter_sets_these_laws_build_as_this_crate_does() {
   const MULTIVIEW: u16 = 1 << (15 - 1);
@@ -9260,6 +9294,17 @@ fn ffmpeg_reads_the_video_parameter_sets_these_laws_build_as_this_crate_does() {
     vps[2] &= !0x08;
     vps
   };
+  let cut_before_dependency =
+    hevc_vps_cut(0, 1, Some(AUXILIARY), 1, VpsCut::BeforeDirectDependency);
+  let decoder = |parameters: &Parameters| {
+    super::open_sw_decoder(
+      parameters,
+      DecoderLimits::default().with_threads(crate::Threads::Single),
+      None,
+    )
+    .expect("an HEVC decoder")
+  };
+  let in_band = super::access::KeyframeRule::of(crate::CodecId::HEVC.raw(), &[]);
   for (name, vps, alpha, decoded) in [
     ("one layer", hevc_vps(0, 0, None, 1), false, true),
     ("multiview", hevc_vps(0, 1, Some(MULTIVIEW), 1), false, true),
@@ -9277,6 +9322,18 @@ fn ffmpeg_reads_the_video_parameter_sets_these_laws_build_as_this_crate_does() {
       true,
     ),
     (
+      "auxiliary, ended before direct_dependency_flag",
+      cut_before_dependency.clone(),
+      true,
+      true,
+    ),
+    (
+      "two layers, ended before the mask",
+      hevc_vps_cut(0, 1, Some(AUXILIARY), 1, VpsCut::BeforeMask),
+      false,
+      true,
+    ),
+    (
       "auxiliary, its base layer not internal",
       base_not_internal,
       false,
@@ -9287,17 +9344,19 @@ fn ffmpeg_reads_the_video_parameter_sets_these_laws_build_as_this_crate_does() {
       crate::CodecId::HEVC.raw(),
       &[&[0, 0, 0, 1][..], &vps].concat(),
     );
-    assert_eq!(rule.declares_alpha(), alpha, "{name}: this crate's reading");
-    let mut sw = super::open_sw_decoder(
-      &clip.parameters,
-      DecoderLimits::default().with_threads(crate::Threads::Single),
-      None,
-    )
-    .expect("an HEVC decoder");
-    let submitted = sw.submit(
-      &with_vps(&clip.packets[0], &vps),
-      &mut super::Refusals::default(),
+    assert_eq!(
+      rule.declares_alpha(),
+      alpha,
+      "{name}: this crate's reading, as extradata"
     );
+    let packet = with_vps(&clip.packets[0], &vps);
+    assert_eq!(
+      in_band.units_declare_alpha(packet.data().expect("a payload"), &mut Default::default()),
+      alpha,
+      "{name}: this crate's reading, in the packet"
+    );
+    let mut sw = decoder(&clip.parameters);
+    let submitted = sw.submit(&packet, &mut super::Refusals::default());
     assert_eq!(
       submitted.is_ok(),
       decoded,
@@ -9305,6 +9364,42 @@ fn ffmpeg_reads_the_video_parameter_sets_these_laws_build_as_this_crate_does() {
     );
     assert_eq!(sw.outputs_alpha(), alpha, "{name}: FFmpeg's reading");
   }
+
+  // A one-layer set of id 0 the decoder holds — its extradata's, or the
+  // packet's own before it — and the set read past its end is refused.
+  let one_layer = hevc_vps(0, 0, None, 1);
+  let held_extradata = [&[0, 0, 0, 1][..], &one_layer].concat();
+  let mut parameters = clip.parameters.clone();
+  set_extradata(&mut parameters, &held_extradata);
+  let packet = with_vps(&clip.packets[0], &cut_before_dependency);
+  let mut held = super::params::VpsTable::default();
+  held.read_extradata(&held_extradata);
+  assert!(
+    !in_band.units_declare_alpha(packet.data().expect("a payload"), &mut held),
+    "held in the extradata: this crate reads the set refused"
+  );
+  let mut sw = decoder(&parameters);
+  sw.submit(&packet, &mut super::Refusals::default())
+    .expect("FFmpeg decodes the packet under the set it holds");
+  assert!(
+    !sw.outputs_alpha(),
+    "held in the extradata: FFmpeg refuses the set read past its end"
+  );
+  let both = {
+    let data = packet.data().expect("a payload");
+    repacked(&packet, &[&[0, 0, 0, 1][..], &one_layer, data].concat())
+  };
+  assert!(
+    !in_band.units_declare_alpha(both.data().expect("a payload"), &mut Default::default()),
+    "held from earlier in the packet: this crate reads the set refused"
+  );
+  let mut sw = decoder(&clip.parameters);
+  sw.submit(&both, &mut super::Refusals::default())
+    .expect("FFmpeg decodes the packet under the set it stored first");
+  assert!(
+    !sw.outputs_alpha(),
+    "held from earlier in the packet: FFmpeg refuses the set read past its end"
+  );
 }
 
 /// LAW (pre-R14 row 4): **a software decoder whose negotiated output
@@ -9672,6 +9767,66 @@ fn a_video_parameter_set_on_a_packet_that_is_no_keyframe_is_read() {
     let with = SyntheticClip {
       parameters: clip.parameters.clone(),
       packets,
+    };
+    let (dec, delivered, escalated) = through_a_post_commit_failure(&with, at);
+    assert!(dec.is_software(), "{name}: the hardware failed post-commit");
+    assert_eq!(
+      escalated, declares,
+      "{name}: the end escalates {declares}: {delivered:?}"
+    );
+    assert_eq!(
+      delivered.iter().any(|&(_, open)| !open),
+      !declares,
+      "{name}: a picture closes the gap {}: {delivered:?}",
+      !declares
+    );
+  }
+}
+
+/// LAW (Codex R15, [high]): **a video parameter set FFmpeg reads past its
+/// end is read as FFmpeg stores it: alpha under an id the decoder holds
+/// nothing of, refused under one it holds.** The R6 CRA stream, the hardware
+/// failing post-commit at a CRA; the packet before it — no keyframe —
+/// carries a spare video parameter set of id 5, two layers whose payload
+/// ends before `direct_dependency_flag`, the auxiliary mask and the second
+/// layer's id read. With nothing of id 5 held, FFmpeg's reader goes on past
+/// the end and keeps the set as alpha video (hevc/ps.c:921-934, 944-952):
+/// the CRA anchors nothing and the end escalates by name. With the codec
+/// parameters' extradata holding a one-layer set of id 5 — the decoder
+/// serving opened on it — FFmpeg refuses the set read past its end
+/// (ps.c:944-949): the CRA anchors and the end is clean. Read by a reader
+/// that stops at a set's end, the first resynced at the CRA.
+#[test]
+fn a_video_parameter_set_read_past_its_end_is_stored_only_under_an_id_held_by_nothing() {
+  const AUXILIARY: u16 = 1 << (15 - 3);
+  let clip = encode_hevc_cra_with_headers(128, 96, 40);
+  let at = keyframe_after(&clip, 3);
+  let before = at - 1;
+  assert!(
+    !clip.packets[before].is_key(),
+    "the packet before is no keyframe"
+  );
+  let data = clip.packets[before].data().expect("a payload").to_vec();
+  let cut = hevc_vps_cut(5, 1, Some(AUXILIARY), 1, VpsCut::BeforeDirectDependency);
+  let mut packets = clip.packets.clone();
+  packets[before] = repacked(
+    &clip.packets[before],
+    &[&[0, 0, 0, 1][..], &cut, &data].concat(),
+  );
+  for (name, held, declares) in [
+    ("nothing of id 5 held", false, true),
+    ("id 5 held", true, false),
+  ] {
+    let mut parameters = clip.parameters.clone();
+    if held {
+      set_extradata(
+        &mut parameters,
+        &[&[0, 0, 0, 1][..], &spare_vps(0, None)].concat(),
+      );
+    }
+    let with = SyntheticClip {
+      parameters,
+      packets: packets.clone(),
     };
     let (dec, delivered, escalated) = through_a_post_commit_failure(&with, at);
     assert!(dec.is_software(), "{name}: the hardware failed post-commit");

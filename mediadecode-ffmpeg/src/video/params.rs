@@ -177,8 +177,25 @@ impl<'a> Reader<'a> {
     self.show(1) != 0
   }
 
+  /// `get_bits64(n)`, `n` from 1 to 64: past 32, the high bits and then 32
+  /// more, each read clamped on its own.
+  pub(super) fn bits64(&mut self, n: u32) -> u64 {
+    if n <= 32 {
+      u64::from(self.bits(n))
+    } else {
+      let high = u64::from(self.bits(n - 32));
+      (high << 32) | u64::from(self.bits(32))
+    }
+  }
+
   /// `skip_bits` and `skip_bits_long`.
   pub(super) fn skip(&mut self, n: u64) {
+    self.advance(n);
+  }
+
+  /// `align_get_bits`: to the next byte boundary.
+  pub(super) fn align(&mut self) {
+    let n = self.index.wrapping_neg() & 7;
     self.advance(n);
   }
 
@@ -1232,4 +1249,580 @@ pub(super) fn avcc_units<'r>(record: &'r [u8]) -> impl Iterator<Item = &'r [u8]>
     at += 2 + length;
     Some(unit)
   })
+}
+
+/// What `ff_hevc_decode_nal_vps` (hevc/ps.c:786-959) does with a video
+/// parameter set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Vps {
+  /// Refused: the decoder keeps the set it held of that id. `aborts` where
+  /// the error is other than invalid data — the base layer flags'
+  /// `AVERROR_PATCHWELCOME` (ps.c:818-824) — which ends a decoder's reading
+  /// of the packet's units (`decode_nal_unit`, hevc/hevcdec.c:3665-3672).
+  Refused { aborts: bool },
+  /// The very bytes of the set held of its id: nothing changes
+  /// (ps.c:797-802).
+  Kept,
+  /// Stored as the set of its id; `alpha` where FFmpeg reads it as alpha
+  /// video (`ff_hevc_is_alpha_video`, hevc/hevcdec.c:440-457): two layers,
+  /// the second's `nuh_layer_id` not 0, the auxiliary scalability type set.
+  Stored { alpha: bool },
+}
+
+/// The auxiliary scalability type's flag in `scalability_mask_flag`
+/// (`HEVC_SCALABILITY_AUXILIARY`, hevc/hevc.h:169).
+const SCALABILITY_AUXILIARY: u32 = 1 << (15 - 3);
+
+/// The multiview scalability type's flag (`HEVC_SCALABILITY_MULTIVIEW`,
+/// hevc/hevc.h:167).
+const SCALABILITY_MULTIVIEW: u32 = 1 << (15 - 1);
+
+/// **The video parameter sets an HEVC decoder holds, by id, as far as a
+/// reading knows them**: each one's bytes, for the identity test
+/// `ff_hevc_decode_nal_vps` makes before it reads a set (ps.c:797-802), or
+/// `None` for an id the reading does not know the decoder to hold. A set
+/// that runs past its unit is stored only under an id the decoder holds
+/// nothing of (ps.c:944-949); an id this table does not hold is taken as
+/// one the decoder holds nothing of, so a set FFmpeg might refuse there is
+/// read as stored — the reading errs toward alpha, never away from it. So
+/// the table holds only what the decoder certainly holds: a set read after
+/// a unit whose reading may have ended the buffer's — a sequence or picture
+/// parameter set, an SEI message, a slice, which this crate does not parse
+/// — is read for alpha and not kept.
+#[derive(Clone, Default)]
+pub(super) struct VpsTable {
+  held: [Option<Vec<u8>>; 16],
+}
+
+impl VpsTable {
+  /// FFmpeg's reading of `unit`, a video parameter set `walk` handed out
+  /// (the walk standing past it), this table updated as the decoder's
+  /// would be where the decoder `certainly` reads it.
+  fn read(
+    &mut self,
+    walk: &Walk<'_>,
+    unit: &Unit<'_>,
+    scratch: &mut Vec<u8>,
+    certainly: bool,
+  ) -> Vps {
+    let memory = walk.memory(unit, scratch);
+    let mut reader = unit.reader(memory);
+    let id = reader.bits(4) as usize;
+    let size = ((unit.size_bits + 7) >> 3) as usize;
+    let bytes = memory.get(..size).unwrap_or(memory);
+    if self.held[id].as_deref() == Some(bytes) {
+      return Vps::Kept;
+    }
+    let read = hevc_vps(&mut reader);
+    let alpha = match read {
+      Err(aborts) => return Vps::Refused { aborts },
+      Ok(alpha) => alpha,
+    };
+    // Read past its unit: kept only where nothing of its id is held.
+    if reader.left() < 0 && self.held[id].is_some() {
+      return Vps::Refused { aborts: false };
+    }
+    if certainly {
+      self.held[id] = Some(bytes.to_vec());
+    }
+    Vps::Stored { alpha }
+  }
+
+  /// **The video parameter sets FFmpeg's HEVC decoder stores from codec
+  /// extradata** — at its open, or from a packet's `AV_PKT_DATA_NEW_EXTRADATA`
+  /// (`hevc_decode_extradata`, hevc/hevcdec.c:3795-3825) — read as
+  /// `ff_hevc_decode_extradata` reads them (hevc/parse.c:79-140): an `hvcC`
+  /// record (23 bytes or more, its first byte 1, or 0 with a second or third
+  /// byte that is not a start code's) entry by entry, each its own buffer,
+  /// a set FFmpeg refuses ending its entry's reading; anything else as a
+  /// start-coded buffer, a set FFmpeg refuses ending its reading. An entry
+  /// running past the record ends the reading of the record. Answers whether
+  /// a set stored is alpha video, this table updated.
+  pub(super) fn read_extradata(&mut self, record: &[u8]) -> bool {
+    let size = record.len();
+    let hvcc =
+      size >= 23 && (record[0] == 1 || (record[0] == 0 && (record[1] != 0 || record[2] > 1)));
+    if !hvcc {
+      return self.read_units(record, record.len(), None, true);
+    }
+    let byte = |at: usize| record.get(at).copied().unwrap_or(0);
+    let mut at = 23usize;
+    let mut alpha = false;
+    for _ in 0..byte(22) {
+      at = (at + 1).min(size); // the array's type
+      // `bytestream2_get_be16`: 0, at the end, where fewer than two bytes
+      // are left.
+      let count = if size - at < 2 {
+        0
+      } else {
+        (usize::from(byte(at)) << 8) | usize::from(byte(at + 1))
+      };
+      at = (at + 2).min(size);
+      for _ in 0..count {
+        let nalsize = ((usize::from(byte(at)) << 8) | usize::from(byte(at + 1))) + 2;
+        if size - at < nalsize {
+          return alpha;
+        }
+        alpha |= self.read_units(&record[at..], nalsize, Some(2), true);
+        at += nalsize;
+      }
+    }
+    alpha
+  }
+
+  /// **The video parameter sets FFmpeg's HEVC decoder stores from a packet**,
+  /// its units framed as `nal_length` says — length-prefixed by so many
+  /// bytes, or start-coded — read as `decode_nal_units` reads them
+  /// (hevc/hevcdec.c:3681-3776): nothing where FFmpeg's split refuses the
+  /// packet; a set refused for invalid data passed over, one refused for
+  /// another reason ending the packet's reading. Answers whether a set
+  /// stored is alpha video, this table updated.
+  pub(super) fn read_packet(&mut self, data: &[u8], nal_length: Option<usize>) -> bool {
+    self.read_units(data, data.len(), nal_length, false)
+  }
+
+  /// The units of the first `length` bytes of `mem`, as one of FFmpeg's
+  /// readings splits them (`H2645_FLAG_SMALL_PADDING`); `extradata`, as
+  /// `hevc_decode_nal_units` (hevc/parse.c:24-77), where any refusal ends the
+  /// reading, or as a packet's, where only one other than invalid data does.
+  /// A unit of another kind is passed over as though its parser met
+  /// nothing — on, whatever it met — and from the first one whose parser may
+  /// end the reading (a sequence or picture parameter set, an SEI message,
+  /// in a packet a slice too) the sets read after are read for alpha and not
+  /// kept ([`Self::read`]). A set a hardware accelerator's `decode_params`
+  /// refuses (hevc/hevcdec.c:3597-3607) is taken as read: VideoToolbox's only
+  /// copies the unit (videotoolbox.c:1122-1128).
+  fn read_units(
+    &mut self,
+    mem: &[u8],
+    length: usize,
+    nal_length: Option<usize>,
+    extradata: bool,
+  ) -> bool {
+    let mut units = Walk::new(
+      mem,
+      length,
+      nal_length.unwrap_or(0),
+      Codec::Hevc,
+      nal_length.is_some(),
+      true,
+    );
+    if !units.accepted() {
+      return false;
+    }
+    let mut scratch = Vec::new();
+    let mut alpha = false;
+    let mut certainly = true;
+    while let Some(Ok(unit)) = units.next() {
+      if unit.kind != 32 {
+        // SPS, PPS, the SEI messages; in a packet the slices (`decode_slice`).
+        certainly &= !(matches!(unit.kind, 33 | 34 | 39 | 40)
+          || (!extradata && matches!(unit.kind, 0..=9 | 16..=21)));
+        continue;
+      }
+      match self.read(&units, &unit, &mut scratch, certainly) {
+        Vps::Stored { alpha: true } => alpha = true,
+        Vps::Refused { aborts } if extradata || aborts => break,
+        Vps::Stored { alpha: false } | Vps::Refused { .. } | Vps::Kept => {}
+      }
+    }
+    alpha
+  }
+}
+
+/// **`ff_hevc_decode_nal_vps`** (hevc/ps.c:786-959) from the reader past the
+/// set's id, as far as its verdict goes: `Ok` with whether the set it stores
+/// is alpha video, `Err` with whether its refusal ends a decoder's reading of
+/// the packet. The test for a reading run past the unit, which needs the
+/// table, is the caller's ([`VpsTable::read`]).
+fn hevc_vps(r: &mut Reader<'_>) -> Result<bool, bool> {
+  const INVALID: Result<bool, bool> = Err(false);
+  // vps_base_layer_internal_flag, vps_base_layer_available_flag.
+  let (internal, available) = (r.bit(), r.bit());
+  if !internal || !available {
+    return Err(true);
+  }
+  let max_layers = r.bits(6) as i32 + 1;
+  let max_sub_layers = r.bits(3) as i32 + 1;
+  r.bit(); // vps_temporal_id_nesting_flag
+  if r.bits(16) != 0xffff || max_sub_layers > 7 || !parse_ptl(r, true, max_sub_layers) {
+    return INVALID;
+  }
+  let ordering = r.bit();
+  for _ in (if ordering { 0 } else { max_sub_layers - 1 })..max_sub_layers {
+    // vps_max_dec_pic_buffering, an unsigned of minus1 + 1, from 1 to 16;
+    // vps_max_num_reorder_pics over its bound is a warning only.
+    let buffering = r.ue_long().wrapping_add(1);
+    r.ue_long();
+    r.ue_long();
+    if buffering > 16 || buffering == 0 {
+      return INVALID;
+    }
+  }
+  let max_layer_id = i64::from(r.bits(6));
+  let layer_sets = r.ue_long().wrapping_add(1) as i32;
+  if !(1..=1024).contains(&layer_sets)
+    || (i64::from(layer_sets) - 1) * (max_layer_id + 1) > r.left()
+  {
+    return INVALID;
+  }
+  let layer1_included = if layer_sets > 1 {
+    r.bits64((max_layer_id + 1) as u32)
+  } else {
+    0
+  };
+  if layer_sets > 2 {
+    r.skip((i64::from(layer_sets) - 2) as u64 * (max_layer_id + 1) as u64);
+  }
+  if r.bit() {
+    // vps_timing_info_present_flag
+    r.bits(32);
+    r.bits(32);
+    if r.bit() {
+      r.ue_long(); // vps_num_ticks_poc_diff_one_minus1
+    }
+    let hrd_sets = r.ue_long() as i32;
+    if hrd_sets as u32 > layer_sets as u32 {
+      return INVALID;
+    }
+    for index in 0..hrd_sets {
+      r.ue_long(); // hrd_layer_set_idx
+      let common = index == 0 || r.bit();
+      hevc_hrd(r, common, max_sub_layers);
+    }
+  }
+  if max_layers > 1 && r.bit() {
+    // vps_extension_flag
+    let mut ext = Extension {
+      layers: 1,
+      mask: 0,
+      layer_id: 0,
+    };
+    match vps_extension(
+      r,
+      &mut ext,
+      max_layers,
+      max_sub_layers,
+      layer_sets,
+      layer1_included,
+    ) {
+      Ok(()) => return Ok(ext.alpha()),
+      // "Broken VPS extension, treating as alpha video" where two layers,
+      // the second's id and the auxiliary type were read; one layer
+      // otherwise (ps.c:921-939).
+      Err(Unsupported::PatchWelcome) => return Ok(ext.alpha()),
+      Err(Unsupported::Invalid) => return INVALID,
+    }
+  }
+  Ok(false)
+}
+
+/// What `decode_vps_ext` set before it returned: the layers, the mask and
+/// the second layer's `nuh_layer_id`.
+struct Extension {
+  layers: i32,
+  mask: u32,
+  layer_id: u32,
+}
+
+impl Extension {
+  /// `ff_hevc_is_alpha_video` over what was set.
+  const fn alpha(&self) -> bool {
+    self.layers == 2 && self.layer_id != 0 && self.mask & SCALABILITY_AUXILIARY != 0
+  }
+}
+
+/// How `decode_vps_ext` failed.
+enum Unsupported {
+  PatchWelcome,
+  Invalid,
+}
+
+/// **`decode_vps_ext`** (hevc/ps.c:483-784), recording in `ext` what it sets
+/// as it sets it.
+fn vps_extension(
+  r: &mut Reader<'_>,
+  ext: &mut Extension,
+  max_layers: i32,
+  max_sub_layers: i32,
+  layer_sets: i32,
+  layer1_included: u64,
+) -> Result<(), Unsupported> {
+  use Unsupported::{Invalid, PatchWelcome};
+  if max_layers > 2 || layer_sets > 2 {
+    return Err(PatchWelcome);
+  }
+  r.align();
+  ext.layers = 2;
+  if !parse_ptl(r, false, max_sub_layers) {
+    return Err(Invalid);
+  }
+  let splitting = r.bit();
+  ext.mask = r.bits(16);
+  let types = ext.mask.count_ones() as i32;
+  if types == 0 {
+    return Err(Invalid);
+  }
+  if ext.mask & (SCALABILITY_MULTIVIEW | SCALABILITY_AUXILIARY) == 0 {
+    return Err(PatchWelcome);
+  }
+  let mut lengths = [0u32; 16];
+  for length in lengths
+    .iter_mut()
+    .take((types - i32::from(splitting)).max(0) as usize)
+  {
+    *length = r.bits(3) + 1; // dimension_id_len_minus1
+  }
+  ext.layer_id = if r.bit() {
+    // vps_nuh_layer_id_present_flag, then layer_id_in_nuh[1]
+    let id = r.bits(6);
+    if id > 62 {
+      return Err(Invalid);
+    }
+    id
+  } else {
+    1
+  };
+  if !splitting {
+    let mut dimensions = [0u32; 16];
+    for (dimension, &length) in dimensions.iter_mut().zip(&lengths).take(types as usize) {
+      *dimension = r.bits(length);
+    }
+    let index = usize::from(ext.mask & SCALABILITY_MULTIVIEW != 0);
+    if ext.mask & SCALABILITY_AUXILIARY != 0 && dimensions[index] != 1 {
+      // AuxId 1 is alpha; another is unsupported (ps.c:603-610).
+      return Err(PatchWelcome);
+    }
+  }
+  let view_id_len = r.bits(4);
+  if view_id_len != 0 {
+    let views = if ext.mask & SCALABILITY_MULTIVIEW != 0 {
+      2
+    } else {
+      1
+    };
+    for _ in 0..views {
+      r.bits(view_id_len);
+    }
+  }
+  let direct_dependency = r.bit();
+  let mut add_layer_sets = 0u8;
+  if !direct_dependency {
+    // An `uint8_t`: an error value of `get_ue_golomb` truncated.
+    add_layer_sets = r.ue() as u8;
+    if add_layer_sets > 1 {
+      return Err(PatchWelcome);
+    }
+    if add_layer_sets != 0 && !r.bit() {
+      // highest_layer_idx_plus1
+      return Err(PatchWelcome);
+    }
+  }
+  if (layer_sets + i32::from(add_layer_sets)) as u8 != 2 {
+    // num_output_layer_sets, an `uint8_t`
+    return Err(PatchWelcome);
+  }
+  let mut sub_layers = [1u32; 2];
+  if r.bit() {
+    // vps_sub_layers_max_minus1_present_flag
+    for count in &mut sub_layers {
+      *count = r.bits(3) + 1;
+    }
+  }
+  if r.bit() {
+    // max_tid_ref_present_flag
+    r.skip(3);
+  }
+  r.bit(); // default_ref_layers_active_flag
+  let profiles = r.ue().wrapping_add(1);
+  for _ in 2..profiles {
+    let present = r.bit();
+    if !parse_ptl(r, present, max_sub_layers) {
+      return Err(Invalid);
+    }
+  }
+  if r.ue() != 0 {
+    // num_add_olss
+    return Err(PatchWelcome);
+  }
+  if r.bits(2) != 0 {
+    // default_output_layer_idc
+    return Err(PatchWelcome);
+  }
+  if layer1_included != 0 && layer1_included != (1 | (1u64 << ext.layer_id)) {
+    return Err(PatchWelcome);
+  }
+  let output_layers = if layer1_included == 0 { 1 } else { 2 };
+  if layer_sets == 1 {
+    r.bit();
+  }
+  if profiles > 1 {
+    let width = log2((profiles as u32 - 1) << 1);
+    for _ in 0..output_layers {
+      if r.bits(width) as i32 >= profiles {
+        // profile_tier_level_idx
+        return Err(Invalid);
+      }
+    }
+  }
+  if r.ue_31() != 0 {
+    // vps_num_rep_formats_minus1
+    return Err(PatchWelcome);
+  }
+  let width = i64::from(r.bits(16));
+  let height = i64::from(r.bits(16));
+  if !r.bit() {
+    // chroma_and_bit_depth_vps_present_flag
+    return Err(Invalid);
+  }
+  let chroma_format_idc = r.bits(2) as usize;
+  if chroma_format_idc == 3 {
+    r.bit(); // separate_colour_plane_flag
+  }
+  let luma = r.bits(4) + 8;
+  let chroma = r.bits(4) + 8;
+  if luma > 16 || chroma > 16 || luma != chroma {
+    return Err(PatchWelcome);
+  }
+  if r.bit() {
+    // conformance_window_vps_flag: `read_window` (ps.c:66-87), offsets in
+    // chroma units that must leave a picture.
+    const SUB_WIDTH: [i64; 4] = [1, 2, 2, 1];
+    const SUB_HEIGHT: [i64; 4] = [1, 2, 1, 1];
+    let left = i64::from(r.ue_long()) * SUB_WIDTH[chroma_format_idc];
+    let right = i64::from(r.ue_long()) * SUB_WIDTH[chroma_format_idc];
+    let top = i64::from(r.ue_long()) * SUB_HEIGHT[chroma_format_idc];
+    let bottom = i64::from(r.ue_long()) * SUB_HEIGHT[chroma_format_idc];
+    if width <= left + right || height <= top + bottom {
+      return Err(Invalid);
+    }
+  }
+  r.bit(); // max_one_active_ref_layer_flag
+  r.bit(); // vps_poc_lsb_aligned_flag
+  if !direct_dependency {
+    r.bit(); // poc_lsb_not_present_flag
+  }
+  let sub_layer_flag_info = r.bit();
+  for sub_layer in 0..sub_layers[0].max(sub_layers[1]) {
+    if sub_layer == 0 || !sub_layer_flag_info || r.bit() {
+      for _ in 0..output_layers {
+        r.ue_long(); // max_vps_dec_pic_buffering_minus1
+      }
+      r.ue_long(); // max_vps_num_reorder_pics
+      r.ue_long(); // max_vps_latency_increase_plus1
+    }
+  }
+  let dependency_type_len = r.ue_31() + 2;
+  if dependency_type_len > 32 {
+    return Err(Invalid);
+  }
+  if r.bit() && r.bits(dependency_type_len as u32) > 2 {
+    // direct_dependency_all_layers_flag, then direct_dependency_all_layers_type
+    return Err(PatchWelcome);
+  }
+  let non_vui_extension_length = r.ue() as u32;
+  if non_vui_extension_length > 4096 {
+    return Err(Invalid);
+  }
+  r.skip(u64::from(non_vui_extension_length) * 8);
+  r.bit(); // vps_vui_present_flag
+  Ok(())
+}
+
+/// **`parse_ptl`** (hevc/ps.c:337-381), its general and sub-layer
+/// `profile_tier_level`s (`decode_profile_tier_level`, ps.c:262-335, 88 bits
+/// whichever profile it names) each refused where fewer bits are left than
+/// it reads: `false` where it fails.
+fn parse_ptl(r: &mut Reader<'_>, profile_present: bool, max_sub_layers: i32) -> bool {
+  let common = |r: &mut Reader<'_>| {
+    if r.left() < 88 {
+      return false;
+    }
+    r.skip(88);
+    true
+  };
+  if profile_present && !common(r) {
+    return false;
+  }
+  let sub_layers = (max_sub_layers - 1).max(0) as usize;
+  if r.left() < 8 + if sub_layers > 0 { 16 } else { 0 } {
+    return false;
+  }
+  r.bits(8); // general_level_idc
+  let mut present = [(false, false); 6];
+  for flags in present.iter_mut().take(sub_layers) {
+    *flags = (r.bit(), r.bit());
+  }
+  if sub_layers > 0 {
+    r.skip(2 * (8 - sub_layers) as u64); // reserved_zero_2bits
+  }
+  for (profile, level) in present.into_iter().take(sub_layers) {
+    if profile && !common(r) {
+      return false;
+    }
+    if level {
+      if r.left() < 8 {
+        return false;
+      }
+      r.bits(8);
+    }
+  }
+  true
+}
+
+/// **`decode_hrd`** (hevc/ps.c:401-467), whose answer the video parameter
+/// set's reading does not look at (ps.c:909-910): a sub-layer counting more
+/// than 32 CPBs stops it there.
+fn hevc_hrd(r: &mut Reader<'_>, common: bool, max_sub_layers: i32) {
+  let (mut nal, mut vcl, mut sub_picture) = (false, false, false);
+  if common {
+    nal = r.bit();
+    vcl = r.bit();
+    if nal || vcl {
+      sub_picture = r.bit();
+      if sub_picture {
+        r.bits(8);
+        r.bits(5);
+        r.bit();
+        r.bits(5);
+      }
+      r.bits(4);
+      r.bits(4);
+      if sub_picture {
+        r.bits(4);
+      }
+      r.bits(5);
+      r.bits(5);
+      r.bits(5);
+    }
+  }
+  for _ in 0..max_sub_layers {
+    let fixed_general = r.bit();
+    let fixed_within = !fixed_general && r.bit();
+    let mut low_delay = false;
+    if fixed_general || fixed_within {
+      r.ue_long(); // elemental_duration_in_tc_minus1
+    } else {
+      low_delay = r.bit();
+    }
+    // `cpb_cnt_minus1`, zeroed with the set's HRD parameters, is kept where
+    // a low-delay sub-layer reads none.
+    let mut cpbs = 1u32;
+    if !low_delay {
+      let minus1 = r.ue_long();
+      if minus1 > 31 {
+        return;
+      }
+      cpbs = minus1 + 1;
+    }
+    for _ in 0..(u32::from(nal) + u32::from(vcl)) * cpbs {
+      r.ue_long(); // bit_rate_value_minus1
+      r.ue_long(); // cpb_size_value_minus1
+      if sub_picture {
+        r.ue_long(); // cpb_size_du_value_minus1
+        r.ue_long(); // bit_rate_du_value_minus1
+      }
+      r.bit(); // cbr_flag
+    }
+  }
 }
