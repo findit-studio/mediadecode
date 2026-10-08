@@ -21,6 +21,13 @@ The backend-agnostic core it adapts has its own log at
   [`mediadecode`'s note](../mediadecode/CHANGELOG.md#unreleased). No
   adapter source line moved.
 
+- **(BREAKING) `mediaframe` 0.11 → 0.12**: mediaframe 0.12, on mediatime
+  0.5 like this crate — one mediatime in the tree. The channel layout
+  descriptions this adapter hands out are `mediaframe`'s, so a consumer
+  holding a `mediaframe 0.11` value no longer type-checks against this
+  release; 0.12's source is 0.11's but for documentation, and no adapter
+  source line moved.
+
 ## [0.15.1] - 2026-10-05
 
 ### Changed

@@ -48,19 +48,23 @@ The sibling FFmpeg adapter has its own log at
     `Duration` never were. The serde shapes, and the message an inverted
     range is refused with, are unchanged.
 
-  `mediaframe` stays at 0.11, which depends on `mediatime` 0.4, so both
-  minors are in the graph. Nothing this crate exposes carries a
-  `mediaframe` value with a time in it — the re-exported vocabulary is
-  color, pixel format and frame geometry — and no line here hands a time
-  to `mediaframe`. A consumer that puts this crate's `Timestamp` into
-  `mediaframe::frame::TimestampedFrame` waits for `mediaframe` to cross
-  as well.
+  `mediaframe` crosses with it (below), so one `mediatime` is in the
+  graph.
 
   No other source line changed. Verified: `cargo hack test` and
   `cargo hack clippy` over `-p mediadecode --each-feature
   --exclude-no-default-features`; the FFmpeg adapter's tests, doc tests,
   clippy and rustdoc; and the WebCodecs adapter's `wasm32` clippy lane —
   all pass unchanged.
+
+- **`mediaframe` 0.11 → 0.12**: mediaframe 0.12, on mediatime 0.5 like this
+  crate — one mediatime in the tree. The color, pixel format and frame
+  geometry vocabulary this crate re-exports is `mediaframe`'s, so a
+  consumer holding a `mediaframe 0.11` value no longer type-checks against
+  this release. Nothing else in 0.12 reaches a consumer here: its source
+  is 0.11's but for documentation. A consumer that puts this crate's
+  `Timestamp` into `mediaframe::frame::TimestampedFrame` no longer needs a
+  second `mediatime`. No source line here moved.
 
 ## [0.15.1] - 2026-10-05
 

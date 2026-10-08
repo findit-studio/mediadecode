@@ -227,6 +227,13 @@ The backend-agnostic core it adapts has its own log at
   rational still goes through `Timebase::try_new`, whose contract is
   unchanged.
 
+- **(BREAKING) `mediaframe` 0.11 → 0.12**: mediaframe 0.12, on mediatime
+  0.5 like this crate — one mediatime in the tree. This crate's API carries
+  `mediaframe` values (the channel layout descriptions, the text fields, the
+  re-exported vocabulary), so a consumer holding a `mediaframe 0.11` value
+  no longer type-checks against this release; 0.12's source is 0.11's but
+  for documentation, and no source line here moved.
+
 ### Fixed
 
 - **A post-commit resync is proved: by FFmpeg's withheld output for H.264,
