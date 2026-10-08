@@ -342,6 +342,16 @@ pub struct CarrierVideoStreamDecoder<C: crate::FfmpegCarrier> {
   /// has not recovered (H.264), so the first picture out closes the gap, or
   /// the reorder bound.
   anchor_proof: access::Proof,
+  /// `true` once the software decoder reported a decode error across the
+  /// open gap — on a send or a receive, before any proof closed it — until a
+  /// proof closes the gap, a seek resets it, or a new post-commit gap opens
+  /// on a new decoder. FFmpeg's H.264 decoder sets its recovery state, which
+  /// it keeps, while it parses a picture, and a packet it reports failed may
+  /// have been parsed in part: pictures from before the next anchor may come
+  /// out marked recovered. So the next anchor is proved by the reorder bound
+  /// instead of the withheld output ([`Self::check_resync_proof`]): the bound
+  /// is sound whatever the decoder's own state.
+  withheld_poisoned: bool,
   /// Whether the anchor is definitive — a clean random access point
   /// ([`access::Anchor::definitive`]); one that is not is superseded by the
   /// next that is, the count restarting there.
@@ -1000,6 +1010,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       anchor_reorder: 0,
       anchor_resets: false,
       anchor_proof: access::Proof::ReorderBound,
+      withheld_poisoned: false,
       anchor_definitive: false,
       anchor_recovery: None,
       outputs_since_anchor: 0,
@@ -2020,6 +2031,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     self.anchor_reorder = 0;
     self.anchor_resets = false;
     self.anchor_proof = access::Proof::ReorderBound;
+    self.withheld_poisoned = false;
     self.anchor_definitive = false;
     self.anchor_recovery = None;
     self.outputs_since_anchor = 0;
@@ -2049,7 +2061,11 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     self.anchor_reorder = reorder_before;
     let rule = self.keyframe_rule();
     self.anchor_resets = rule == access::KeyframeRule::Resets;
-    self.anchor_proof = rule.proof();
+    self.anchor_proof = match rule.proof() {
+      // A decode error across the gap left FFmpeg's recovery state in doubt.
+      access::Proof::Withheld if self.withheld_poisoned => access::Proof::ReorderBound,
+      proof => proof,
+    };
     self.anchor_definitive = anchor.definitive();
     self.anchor_recovery = anchor.recovery();
     if let Some(recovery) = self.anchor_recovery {
@@ -2069,9 +2085,16 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   }
 
   /// A decode error before the resync is proven: the anchor is in doubt, and
-  /// the next key-flagged packet anchors again. A no-op otherwise.
+  /// the next key-flagged packet anchors again — proved by the reorder bound,
+  /// whatever the codec: the error may have left FFmpeg's recovery state
+  /// marking pictures from before that anchor recovered
+  /// ([`Self::withheld_poisoned`]). A no-op outside an open gap.
   fn unanchor(&mut self) {
-    if self.degraded_resync_pending && self.degraded_anchored {
+    if !self.degraded_resync_pending {
+      return;
+    }
+    self.withheld_poisoned = true;
+    if self.degraded_anchored {
       self.degraded_anchored = false;
       self.anchor_definitive = false;
       self.anchor_recovery = None;
@@ -2115,7 +2138,11 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   ///   the anchor that comes out after it. Allowing the reorder
   ///   buffer's depth on top, as the bound does, left a short tail — a
   ///   one-picture tail at a depth of 2 — open at the end, and raised
-  ///   `PostCommitNeverResynced` on a resync that happened.
+  ///   `PostCommitNeverResynced` on a resync that happened. After a decode
+  ///   error across the gap the next anchor takes the reorder bound instead
+  ///   ([`Self::withheld_poisoned`]): a packet FFmpeg reports failed may
+  ///   have been parsed in part, its recovery state set, and pictures from
+  ///   before that anchor come out marked recovered.
   /// - **The reorder bound (every other codec):** once more pictures have
   ///   come out since the anchor than the reorder buffer could hold from
   ///   before it — the largest depth it has shown from just before the
@@ -2182,6 +2209,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     self.anchor_reorder = 0;
     self.anchor_resets = false;
     self.anchor_proof = access::Proof::ReorderBound;
+    self.withheld_poisoned = false;
     self.anchor_definitive = false;
     self.anchor_recovery = None;
     self.outputs_since_anchor = 0;
@@ -2368,6 +2396,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       anchor_reorder: 0,
       anchor_resets: false,
       anchor_proof: access::Proof::ReorderBound,
+      withheld_poisoned: false,
       anchor_definitive: false,
       anchor_recovery: None,
       outputs_since_anchor: 0,

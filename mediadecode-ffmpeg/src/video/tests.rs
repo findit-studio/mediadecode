@@ -4969,6 +4969,112 @@ fn a_definitive_anchor_superseding_a_recovery_point_costs_an_h264_stream_nothing
   assert!(!escalated, "the end is clean");
 }
 
+/// LAW (Codex R10, [high]): **after a decode error across the gap, the next
+/// H.264 anchor is proved by the reorder bound.** A closed-GOP `libx264`
+/// clip with two B-frames between references, IDR pictures at 0, 8 and 16,
+/// its parameter sets in the codec parameters so the cold decoder takes the
+/// gap's pictures; the hardware fails post-commit at packet 3. The IDR at 8 is taken by the
+/// decoder and reported failed, as FFmpeg reports a packet it parsed in part
+/// — its recovery state set all the same — and anchors nothing; the IDR at
+/// 16 anchors. Its first picture out is from before it — the reorder buffer
+/// held it, and FFmpeg's decoder, recovered at 8, marks it recovered — so
+/// it does not close the gap: the bound, a depth of 2, does, at the third
+/// picture out, and the end is clean. With the withheld proof kept after the
+/// error, that picture from before the anchor closed the gap.
+#[test]
+fn after_a_decode_error_across_the_gap_the_next_h264_anchor_is_proved_by_the_bound() {
+  let clip = encode_h264_with_extradata(128, 96, 24);
+  let idrs: Vec<usize> = clip
+    .packets
+    .iter()
+    .enumerate()
+    .filter(|(_, packet)| packet.is_key())
+    .map(|(index, _)| index)
+    .collect();
+  assert_eq!(idrs.len(), 3, "three closed GOPs");
+  let (failing, good, at) = (idrs[1], idrs[2], 3);
+  let good_pts = clip.packets[good].pts().expect("a pts");
+
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test(
+    Box::new(FakeHw::failing(128, 96, at, at, FailShape::PostCommit)),
+    clip.parameters.clone(),
+    tb,
+  )
+  .expect("build test decoder");
+  let mut dst = crate::empty_owned_video_frame();
+  let mut delivered: Vec<(i64, bool)> = Vec::new();
+  let mut drain = |dec: &mut FfmpegVideoStreamDecoder, delivered: &mut Vec<(i64, bool)>| loop {
+    match dec.receive_frame(&mut dst) {
+      Ok(Received::Frame) => {
+        if dec.is_software() {
+          let pts = dst.pts().map_or(i64::MIN, |t| t.pts());
+          delivered.push((pts, dec.degraded_resync_pending_for_test()));
+        }
+      }
+      Ok(Received::NeedsInput | Received::Ended) => break false,
+      Err(VideoDecodeError::PostCommitNeverResynced(_)) => break true,
+      Err(VideoDecodeError::Decode(_)) => {}
+      Err(other) => panic!("unexpected: {other:?}"),
+    }
+  };
+  let mut anchored_at = None;
+  let mut failed = false;
+  for (index, av_pkt) in clip.packets.iter().enumerate() {
+    if index == failing {
+      dec.fail_next_packet_for_test();
+    }
+    loop {
+      match dec.send_packet(&pushed(av_pkt)) {
+        Ok(Sent::Accepted) => break,
+        Err(VideoDecodeError::Decode(_)) => {
+          failed |= index == failing;
+          break;
+        }
+        Ok(Sent::MustDrain) => {
+          assert!(
+            !drain(&mut dec, &mut delivered),
+            "no escalation before the end"
+          );
+        }
+        Err(other) => panic!("send_packet: {other:?}"),
+      }
+    }
+    if index == failing {
+      assert!(
+        failed && !dec.degraded_anchored_for_test(),
+        "the IDR at {failing} is reported failed and anchors nothing"
+      );
+    }
+    if index == good {
+      assert!(
+        dec.degraded_resync_pending_for_test() && dec.degraded_anchored_for_test(),
+        "the IDR at {good} anchors the open gap: {delivered:?}"
+      );
+      anchored_at = Some(delivered.len());
+    }
+    assert!(
+      !drain(&mut dec, &mut delivered),
+      "no escalation before the end"
+    );
+  }
+  crate::accepted(dec.send_eof(), "send_eof");
+  let escalated = drain(&mut dec, &mut delivered);
+  let after = &delivered[anchored_at.expect("the good IDR anchored")..];
+  assert!(
+    after
+      .first()
+      .is_some_and(|&(pts, open)| pts < good_pts && open),
+    "the first picture out after the anchor is from before it and leaves the gap open: {after:?}"
+  );
+  assert_eq!(
+    after.iter().position(|&(_, open)| !open),
+    Some(2),
+    "the bound, a depth of 2, closes the gap at the third picture out: {after:?}"
+  );
+  assert!(!escalated, "the end is clean");
+}
+
 /// LAW (Codex R9, [high]): **a software video decoder set to output
 /// pictures before their recovery is refused at the open, by name, in every
 /// build.** The session clears `AV_CODEC_FLAG_OUTPUT_CORRUPT` and

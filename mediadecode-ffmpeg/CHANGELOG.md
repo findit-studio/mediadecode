@@ -206,7 +206,13 @@ The backend-agnostic core it adapts has its own log at
   decoder outputs only the pictures it has recovered, from an IDR picture
   on and from a recovery point's recovery on, and a decoder opened cold
   across the gap starts with nothing recovered; a recovery point's
-  `recovery_frame_cnt` is reported, never counted. On every other
+  `recovery_frame_cnt` is reported, never counted. After a decode error
+  across the gap — a packet the decoder reported failed, or a picture it
+  could not give — the next anchor is proved by the reorder bound instead,
+  until a proof closes the gap or a seek: FFmpeg's H.264 decoder keeps the
+  recovery state it sets while it parses a picture, a packet it reports
+  failed may have been parsed in part, and pictures from before the next
+  anchor may then come out marked recovered. On every other
   codec the gap closes at the delivery of the `has_b_frames + 1`-th picture
   out after the anchor (`has_b_frames` the largest value read from just
   before the anchoring packet was submitted on — a keyframe can activate
