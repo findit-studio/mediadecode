@@ -42,8 +42,11 @@ The backend-agnostic core it adapts has its own log at
   that stops a drain before it receives. The drain resumes once the
   caller has taken pictures: a replay
   committed at the budget feeds its remaining packets before anything sent
-  next, and a restart's decoder stays open, draining, until it has given its
-  last. Nothing is dropped. An error the resumed replay meets is reported
+  next, and with every packet fed it still drains the pictures the decoder
+  holds — a picture its last packet made that waits parked among them —
+  before it takes any input: both sends answer `MustDrain` until a drain
+  finds the decoder with none ready. A restart's decoder stays open,
+  draining, until it has given its last. Nothing is dropped. An error the resumed replay meets is reported
   after the pictures it queued before it, on a send's drain and past the end
   alike; and the end of the stream the replay owes is the session's the
   moment the decoder takes it — the `send_eof` that fed it is accepted even

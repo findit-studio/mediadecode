@@ -70,6 +70,21 @@ fn encode_h264_open_gops(width: u32, height: u32, frames: usize) -> SyntheticCli
   )
 }
 
+/// An H.264 clip from `libx264` with no B-frames: an IDR every 8 frames,
+/// no scene cuts, and decode order display order — its reorder depth 0, so
+/// a decoder on one thread gives each picture back on the drain after its
+/// packet.
+fn encode_h264_without_b_frames(width: u32, height: u32, frames: usize) -> SyntheticClip {
+  encode_x26x(
+    "libx264",
+    "x264-params",
+    "keyint=8:min-keyint=8:scenecut=0:bframes=0",
+    width,
+    height,
+    frames,
+  )
+}
+
 /// An HEVC clip from `libx265` in **open** GOPs: a keyframe every 8
 /// frames, each after the first a CRA whose two RASL leading pictures
 /// reference the GOP before it.
@@ -4231,6 +4246,125 @@ fn a_picture_that_outgrows_the_last_waits_parked_and_the_queue_stays_within_its_
     "a large picture waited parked, the one picture past the queue"
   );
   assert_eq!(shown, single, "every picture once, in order");
+}
+
+/// LAW (Codex R9, [high]): **a replay whose last packet parks a picture
+/// takes no input until the decoder has given the replay's last picture.**
+/// Two 128x96 pictures, then a 256x192 IDR, all without B-frames: the
+/// history a probe-era fallback replays on one thread, with a byte budget of
+/// one large picture and half a small one. The two small pictures queue; the
+/// large one, made by the history's last packet, does not fit behind them
+/// and waits parked. The send that fell back answers `MustDrain` with the
+/// caller's packet untaken — the software decoder took the history's three
+/// packets and nothing more — and so does the end of the stream, sent then;
+/// the drain gives the two small pictures, then the parked one. Sent again,
+/// the packet is taken, and every picture comes out once, in order. Every history packet fed, the replay used to
+/// count as over: the caller's packet went to the decoder behind a parked
+/// picture.
+#[test]
+fn a_replay_whose_last_packet_parks_a_picture_takes_no_input_until_it_is_out() {
+  let small = encode_h264_without_b_frames(128, 96, 8);
+  let large = encode_h264_without_b_frames(256, 192, 8);
+  let (small_bytes, large_bytes) = (picture_bytes(&small), picture_bytes(&large));
+  let mut packets: Vec<Packet> = small.packets[..2].to_vec();
+  for packet in &large.packets {
+    let mut later = packet.clone();
+    later.set_pts(packet.pts().map(|pts| pts + 2));
+    later.set_dts(packet.dts().map(|dts| dts + 2));
+    packets.push(later);
+  }
+  let clip = SyntheticClip {
+    parameters: small.parameters.clone(),
+    packets,
+  };
+  // The history: two small pictures, then the large IDR. The hardware fails
+  // at the packet after it, which the fallback hands to the software road.
+  let fail_at = 3;
+  let budget = large_bytes + small_bytes / 2;
+  assert!(
+    3 * small_bytes <= budget && 2 * small_bytes + large_bytes > budget,
+    "two small pictures queue and leave room for a third, and the large one does not fit \
+     behind them: {small_bytes} / {large_bytes} under {budget}"
+  );
+
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test(
+    Box::new(FakeHw::failing(16, 16, 0, fail_at, FailShape::ProbeEra)),
+    clip.parameters.clone(),
+    tb,
+  )
+  .expect("build test decoder")
+  .with_threads_for_test(crate::Threads::Single)
+  .with_max_replay_bytes_for_test(budget);
+  let mut dst = crate::empty_owned_video_frame();
+  for av_pkt in &clip.packets[..fail_at] {
+    crate::accepted(
+      dec.send_packet(&pushed(av_pkt)),
+      "the hardware takes the history",
+    );
+    assert!(matches!(
+      dec.receive_frame(&mut dst).expect("receive_frame"),
+      Received::NeedsInput
+    ));
+  }
+  super::live_sw::reset_sent();
+  let answer = dec
+    .send_packet(&pushed(&clip.packets[fail_at]))
+    .expect("send_packet");
+  assert!(dec.is_software(), "the probe-era fallback committed");
+  assert!(
+    matches!(answer, Sent::MustDrain),
+    "the replay's last picture is parked: the send waits for the drain"
+  );
+  assert_eq!(
+    super::live_sw::sent(),
+    fail_at,
+    "the decoder took the history's packets and not the caller's"
+  );
+  assert_eq!(
+    dec.sw_replay_parked_bytes_for_test(),
+    large_bytes,
+    "the large picture waits parked"
+  );
+  // The end of the stream is input too: it waits the same way.
+  super::live_sw::reset_eofs();
+  assert!(
+    matches!(dec.send_eof().expect("send_eof"), Sent::MustDrain),
+    "the end waits for the drain as well"
+  );
+  assert_eq!(super::live_sw::eofs(), 0, "no end reached the decoder");
+  assert_eq!(super::live_sw::sent(), fail_at, "nor any packet");
+  let pts = |dst: &crate::OwnedVideoFrame| dst.pts().map(|t| t.pts());
+  let mut shown = Vec::new();
+  while let Received::Frame = dec.receive_frame(&mut dst).expect("receive_frame") {
+    shown.push(pts(&dst));
+  }
+  assert_eq!(
+    shown,
+    [Some(0), Some(1), Some(2)],
+    "the queued pictures, then the parked one"
+  );
+  for av_pkt in &clip.packets[fail_at..] {
+    loop {
+      match dec.send_packet(&pushed(av_pkt)).expect("send_packet") {
+        Sent::Accepted => break,
+        Sent::MustDrain => {
+          while let Received::Frame = dec.receive_frame(&mut dst).expect("receive_frame") {
+            shown.push(pts(&dst));
+          }
+        }
+      }
+    }
+    while let Received::Frame = dec.receive_frame(&mut dst).expect("receive_frame") {
+      shown.push(pts(&dst));
+    }
+  }
+  crate::accepted(dec.send_eof(), "send_eof");
+  while let Received::Frame = dec.receive_frame(&mut dst).expect("receive_frame") {
+    shown.push(pts(&dst));
+  }
+  let every: Vec<Option<i64>> = (0..clip.packets.len() as i64).map(Some).collect();
+  assert_eq!(shown, every, "every picture once, in order");
 }
 
 /// LAW (Codex R4, [high]): **a switch's drain past the budget waits for the
