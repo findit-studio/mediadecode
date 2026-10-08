@@ -89,10 +89,11 @@
 //! before it commits — a frame-threaded decoder reports a packet's failure
 //! a packet per thread later. The session returns to its threads at the
 //! next CLEAN random access point — a keyframe nothing after it references
-//! past, such as an H.264 IDR; never an HEVC CRA or an H.264 recovery
-//! point, whose leading pictures reference the GOP before them — or at the
-//! first keyframe after a seek, which discards leading pictures by its own
-//! nature. There the one-thread decoder is drained, every picture it holds
+//! past, proved so by its bitstream, such as an H.264 IDR; never an HEVC
+//! CRA or an H.264 recovery point, whose leading pictures reference the GOP
+//! before them, and never one inferred from the old decoder's
+//! `has_b_frames` — or at the first keyframe after a seek, which discards
+//! leading pictures by its own nature. There the one-thread decoder is drained, every picture it holds
 //! delivered in order, and closed, and a decoder on the session's threads is
 //! opened and fed from the keyframe on; after a post-commit degrade, not
 //! before its resync. One software decoder is open at any instant, no
@@ -1628,18 +1629,14 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   }
 
   /// Whether `pkt`, a keyframe, is a clean random access point for this
-  /// stream — see [`access::KeyframeRule::is_clean`]. Whether the decoder
-  /// reorders is read off the one serving now.
+  /// stream — see [`access::KeyframeRule::is_clean`]: proved by its
+  /// bitstream, never inferred from the decoder it would replace, whose
+  /// `has_b_frames` FFmpeg raises only when it meets reordering — which an
+  /// open GOP can introduce at this very keyframe.
   fn clean_keyframe(&self, pkt: &Packet) -> bool {
-    let reorders = match &self.state {
-      // SAFETY: `sw` is the live opened software decoder; one plain
-      // integer field is read and the pointer is not kept.
-      DecodeState::Sw(sw) => (unsafe { (*sw.as_ptr()).has_b_frames }) != 0,
-      _ => true,
-    };
     pkt
       .data()
-      .is_some_and(|data| self.keyframe_rule().is_clean(data, reorders))
+      .is_some_and(|data| self.keyframe_rule().is_clean(data))
   }
 
   /// **A fallback that outlives a minute on one thread says so, once.** A

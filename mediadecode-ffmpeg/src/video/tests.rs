@@ -112,6 +112,28 @@ fn encode_mpeg4_with_b_frames(width: u32, height: u32, frames: usize) -> Synthet
   })
 }
 
+/// An MPEG-2 video clip in closed GOPs: a keyframe every `gop` frames, its
+/// GOP header saying `closed_gop`, no B pictures — a stream whose every
+/// keyframe its bitstream proves a clean random access point — its sequence
+/// header in the codec parameters' extradata.
+fn encode_mpeg2_closed_gops(width: u32, height: u32, frames: usize, gop: u32) -> SyntheticClip {
+  use ffmpeg_next as ff;
+  ff::init().expect("ffmpeg init");
+  let codec = ff::codec::encoder::find(ff::codec::Id::MPEG2VIDEO).expect("mpeg2video encoder");
+  // FFmpeg takes closed GOPs only with scene-change detection off.
+  let mut options = ff::Dictionary::new();
+  options.set("sc_threshold", "1000000000");
+  encode_clip(codec, width, height, frames, options, |enc| {
+    enc.set_gop(gop);
+    enc.set_max_b_frames(0);
+    enc.set_bit_rate(500_000);
+    enc.set_frame_rate(Some(ff::Rational::new(25, 1)));
+    // The sequence header in the codec parameters too, so a decoder opened
+    // cold mid-GOP takes the pictures it is handed.
+    enc.set_flags(ff::codec::Flags::CLOSED_GOP | ff::codec::Flags::GLOBAL_HEADER);
+  })
+}
+
 /// A clip from the named external encoder, under its own parameter string.
 fn encode_x26x(
   encoder: &str,
@@ -140,6 +162,22 @@ fn encode_clip(
   frames: usize,
   options: ffmpeg_next::Dictionary<'_>,
   configure: impl FnOnce(&mut ffmpeg_next::codec::encoder::video::Video),
+) -> SyntheticClip {
+  encode_clip_typed(codec, width, height, frames, options, configure, |_| {
+    ffmpeg_next::picture::Type::None
+  })
+}
+
+/// [`encode_clip`], frame `i` given the picture type `kind(i)` — the
+/// encoder's own choice where that is `None`.
+fn encode_clip_typed(
+  codec: ffmpeg_next::Codec,
+  width: u32,
+  height: u32,
+  frames: usize,
+  options: ffmpeg_next::Dictionary<'_>,
+  configure: impl FnOnce(&mut ffmpeg_next::codec::encoder::video::Video),
+  kind: impl Fn(usize) -> ffmpeg_next::picture::Type,
 ) -> SyntheticClip {
   use ffmpeg_next as ff;
   let ctx = ff::codec::context::Context::new_with_codec(codec);
@@ -184,6 +222,7 @@ fn encode_clip(
       }
     }
     frame.set_pts(Some(i));
+    frame.set_kind(kind(i as usize));
     opened.send_frame(&frame).expect("send_frame");
     drain(&mut opened, &mut packets);
   }
@@ -3514,7 +3553,7 @@ fn decode_through_a_fallback(
 #[test]
 fn a_probe_era_fallback_returns_to_the_session_threads_at_the_next_keyframe() {
   let (w, h) = (96u32, 64u32);
-  let clip = encode_synthetic_clip(w, h, 40, 6);
+  let clip = encode_mpeg2_closed_gops(w, h, 40, 6);
   let seam = || FakeHw::failing(w, h, 0, 5, FailShape::ProbeEra);
 
   let (single, single_threads) = decode_through_a_fallback(&clip, seam(), crate::Threads::Single);
@@ -3533,16 +3572,19 @@ fn a_probe_era_fallback_returns_to_the_session_threads_at_the_next_keyframe() {
 }
 
 /// **The post-commit degrade returns to the session's threads at the
-/// keyframe after its resync.** A seam that delivers two GOPs and then
-/// fails mid-GOP leaves the session on a cold one-thread decoder; that
-/// decoder resyncs at the next keyframe, and at the one after it the
-/// session goes on on its own threads, delivering what the same degrade
-/// on one thread delivers.
+/// keyframe after its resync.** A seam that delivers two GOPs of a
+/// closed-GOP MPEG-2 stream and then fails at the third's keyframe leaves
+/// the session on a cold one-thread decoder; that decoder resyncs at the
+/// keyframe it was handed, and at the next — a closed GOP's, a clean random
+/// access point — the session goes on on its own threads, delivering what
+/// the same degrade on one thread delivers.
 #[test]
 fn a_post_commit_degrade_returns_to_the_session_threads_at_the_keyframe_after_its_resync() {
   let (w, h) = (96u32, 64u32);
-  let clip = encode_synthetic_clip(w, h, 30, 6);
-  let fail_at = nth_keyframe(&clip, 2) + 2;
+  let clip = encode_mpeg2_closed_gops(w, h, 30, 6);
+  // A keyframe: a cold MPEG-2 decoder takes no picture with nothing
+  // before it to reference.
+  let fail_at = nth_keyframe(&clip, 3);
   let seam = || FakeHw::failing(w, h, fail_at, fail_at, FailShape::PostCommit);
 
   let (single, _) = decode_through_a_fallback(&clip, seam(), crate::Threads::Single);
@@ -3573,10 +3615,12 @@ fn pushed(av_pkt: &Packet) -> mediadecode::packet::VideoPacket<VideoPacketExtra,
 #[test]
 fn one_software_decoder_is_open_at_any_instant_and_no_packet_is_decoded_twice() {
   let (w, h) = (96u32, 64u32);
-  let clip = encode_synthetic_clip(w, h, 30, 6);
+  let clip = encode_mpeg2_closed_gops(w, h, 30, 6);
   let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
   let three = core::num::NonZeroU32::new(3).expect("nonzero");
-  let post_commit_at = nth_keyframe(&clip, 2) + 2;
+  // A keyframe: a cold MPEG-2 decoder takes no picture with nothing
+  // before it to reference.
+  let post_commit_at = nth_keyframe(&clip, 2);
 
   for (road, seam, software_packets) in [
     // History 0..5, the refused current packet 5, then the rest.
@@ -3808,7 +3852,7 @@ fn an_open_gop_hevc_stream_stays_on_one_thread_until_a_seek_and_loses_no_picture
 #[test]
 fn the_session_threads_return_at_the_first_keyframe_after_a_fallback() {
   let (w, h) = (96u32, 64u32);
-  let clip = encode_synthetic_clip(w, h, 20, 6);
+  let clip = encode_mpeg2_closed_gops(w, h, 20, 6);
   let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
   let three = core::num::NonZeroU32::new(3).expect("nonzero");
   let next_keyframe = nth_keyframe(&clip, 2);
@@ -3933,7 +3977,7 @@ fn drain_ready(dec: &mut FfmpegVideoStreamDecoder) -> usize {
 #[test]
 fn a_keyframe_only_stream_whose_threads_will_not_open_keeps_its_queue_bounded() {
   let (w, h) = (96u32, 64u32);
-  let clip = encode_synthetic_clip(w, h, 40, 1);
+  let clip = encode_mpeg2_closed_gops(w, h, 40, 1);
   assert!(
     clip.packets.iter().all(Packet::is_key),
     "every packet a keyframe"
@@ -4254,7 +4298,7 @@ fn an_h264_recovery_point_stream_resyncs_by_the_reorder_bound() {
   let clip = encode_h264_open_gops(128, 96, 40);
   let at = keyframe_after(&clip, 3);
   let rule = super::access::KeyframeRule::of(crate::CodecId::H264.raw(), &[]);
-  let clean = |packet: &Packet| packet.data().is_some_and(|data| rule.is_clean(data, true));
+  let clean = |packet: &Packet| packet.data().is_some_and(|data| rule.is_clean(data));
   assert!(
     clip.packets[at].is_key(),
     "the packet is flagged a keyframe"
@@ -5103,5 +5147,152 @@ fn a_stale_key_flag_anchors_nothing() {
   assert!(
     dec.degraded_anchored_for_test(),
     "the IDR anchors the resync"
+  );
+}
+
+/// Rewrites the VOL header in an MPEG-4 part 2 `packet` (start code
+/// `00 00 01 2x`) to declare low delay, answering whether it found one.
+/// FFmpeg's encoder writes `random_accessible_vol` (1 bit), the object type
+/// (8), an object layer identifier (1, set: its version 4 and priority 3),
+/// `aspect_ratio_info` (4; 15 adds 16 bits of ratio), `vol_control_parameters`
+/// (1, set), `chroma_format` (2), then `low_delay`.
+fn declare_low_delay(packet: &mut [u8]) -> bool {
+  let Some(at) = packet
+    .windows(4)
+    .position(|w| w[..3] == [0, 0, 1] && w[3] & 0xf0 == 0x20)
+  else {
+    return false;
+  };
+  let bit = |packet: &[u8], index: usize| packet[index / 8] & (0x80 >> (index % 8)) != 0;
+  let mut index = (at + 4) * 8 + 1 + 8;
+  if bit(packet, index) {
+    index += 4 + 3;
+  }
+  index += 1;
+  let aspect = (0..4).fold(0u8, |value, offset| {
+    (value << 1) | u8::from(bit(packet, index + offset))
+  });
+  index += 4 + if aspect == 15 { 16 } else { 0 };
+  if !bit(packet, index) {
+    return false;
+  }
+  index += 1 + 2;
+  packet[index / 8] |= 0x80 >> (index % 8);
+  true
+}
+
+/// An MPEG-4 part 2 clip whose first B picture leads its second keyframe,
+/// in a stream that declares low delay. Frames 1 to 4 are forced P, so no B
+/// picture comes before frame 5, which the encoder makes a B picture before
+/// the keyframe at 6 — an open GOP there, its B picture referencing frame 4
+/// — and every VOL header is rewritten to declare low delay, as encoders
+/// that pack B pictures in low-delay streams do: FFmpeg's decoder reports no
+/// reordering until it meets that B picture, after the keyframe.
+fn encode_mpeg4_first_b_gop_at_a_keyframe(width: u32, height: u32, frames: usize) -> SyntheticClip {
+  use ffmpeg_next as ff;
+  ff::init().expect("ffmpeg init");
+  let codec = ff::codec::encoder::find(ff::codec::Id::MPEG4).expect("mpeg4 encoder present");
+  let clip = encode_clip_typed(
+    codec,
+    width,
+    height,
+    frames,
+    ff::Dictionary::new(),
+    |enc| {
+      enc.set_gop(6);
+      enc.set_max_b_frames(1);
+      enc.set_bit_rate(500_000);
+    },
+    |index| {
+      if (1..=4).contains(&index) {
+        ff::picture::Type::P
+      } else {
+        ff::picture::Type::None
+      }
+    },
+  );
+  let mut declared = 0;
+  let packets = clip
+    .packets
+    .iter()
+    .map(|original| {
+      let mut copy = Packet::copy(original.data().expect("a payload"));
+      if declare_low_delay(copy.data_mut().expect("a writable copy")) {
+        declared += 1;
+      }
+      copy.set_pts(original.pts());
+      copy.set_dts(original.dts());
+      copy.set_flags(original.flags());
+      copy
+    })
+    .collect();
+  assert!(
+    declared >= 2,
+    "every keyframe carries a VOL header to rewrite"
+  );
+  SyntheticClip {
+    parameters: clip.parameters,
+    packets,
+  }
+}
+
+/// LAW (Codex R6 row 2, [high]): **a codec whose keyframes this crate
+/// cannot prove clean returns to the session's threads only at a seek, and
+/// loses nothing.** An MPEG-4 part 2 stream whose first B picture leads its
+/// second keyframe — an open GOP there — in a stream declaring low delay:
+/// before that keyframe the decoder reports `has_b_frames` 0, and a switch
+/// trusting it would close the decoder holding frame 4 and open one at the
+/// keyframe that cannot decode the B picture leading it. A probe-era
+/// fallback on three threads stays on one through the stream, and delivers
+/// every picture the same fallback on one thread delivers.
+#[test]
+fn a_codec_whose_keyframes_cannot_be_proved_clean_switches_only_at_a_seek() {
+  let clip = encode_mpeg4_first_b_gop_at_a_keyframe(96, 64, 24);
+  let keyframe = keyframe_after(&clip, 0);
+  assert!(
+    clip.packets[keyframe + 1].pts() < clip.packets[keyframe].pts(),
+    "a B picture leads the second keyframe"
+  );
+  let (single, _) = threads_through_a_fallback(&clip, 2, crate::Threads::Single);
+
+  let three = core::num::NonZeroU32::new(3).expect("nonzero");
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test(
+    Box::new(FakeHw::failing(16, 16, 0, 2, FailShape::ProbeEra)),
+    clip.parameters.clone(),
+    tb,
+  )
+  .expect("build test decoder")
+  .with_threads_for_test(crate::Threads::Count(three));
+  let mut dst = crate::empty_owned_video_frame();
+  let mut shown = Vec::new();
+  let mut threads = Vec::new();
+  for (index, av_pkt) in clip.packets.iter().enumerate() {
+    if index == keyframe {
+      assert_eq!(
+        dec.reorder_for_test(),
+        0,
+        "the decoder reports no reordering before the keyframe"
+      );
+    }
+    crate::accepted(dec.send_packet(&pushed(av_pkt)), "send_packet");
+    threads.push(dec.active_threads());
+    while let Received::Frame = dec.receive_frame(&mut dst).expect("receive_frame") {
+      shown.push(dst.pts());
+    }
+  }
+  crate::accepted(dec.send_eof(), "send_eof");
+  while let Received::Frame = dec.receive_frame(&mut dst).expect("receive_frame") {
+    shown.push(dst.pts());
+  }
+  assert_eq!(
+    shown, single,
+    "every picture the one-thread fallback delivers"
+  );
+  assert!(
+    threads
+      .iter()
+      .all(|&count| count == Some(core::num::NonZeroU32::MIN)),
+    "no switch mid-stream: {threads:?}"
   );
 }

@@ -1,7 +1,8 @@
 //! **Where a decoder can start without losing a picture**: the clean
 //! random access points at which a software session returns to its threads
-//! after a fallback, and at which a post-commit resync is anchored (see
-//! `CarrierVideoStreamDecoder::send_on_software`).
+//! after a fallback, and the random-access pictures at which a post-commit
+//! resync is anchored (see `CarrierVideoStreamDecoder::send_on_software`) —
+//! each proved by the bitstream, never inferred from a decoder's state.
 //!
 //! A keyframe is a *clean* random access point when nothing after it in
 //! decode order references a picture before it. A decoder opened there
@@ -36,13 +37,20 @@ pub(crate) enum KeyframeRule {
     /// The NAL length field's width, from the `hvcC` record.
     nal_length: Option<usize>,
   },
+  /// MPEG-1 and MPEG-2 video: a keyframe is clean when a group-of-pictures
+  /// header before its first picture says the GOP is closed (`closed_gop`):
+  /// no B picture after the I picture references the GOP before it. A packet
+  /// with no GOP header before its picture proves nothing.
+  Mpeg12,
   /// VP8, VP9 and AV1: a keyframe refreshes every reference, and nothing
   /// leads it.
   Resets,
-  /// Every other codec: clean only while the decoder reorders nothing
-  /// (`has_b_frames == 0`), so no picture can lead a keyframe. This crate
-  /// does not read those codecs' GOP headers, so it does not try to tell
-  /// a closed GOP from an open one where pictures do reorder.
+  /// Every other codec: never clean mid-stream. This crate reads none of
+  /// its picture headers, and a decoder's `has_b_frames` before a keyframe
+  /// proves nothing — FFmpeg raises it when it meets reordering, which an
+  /// open GOP can introduce at that very keyframe — so the session returns to
+  /// its threads only at a seek, whose first keyframe is a switch point
+  /// whatever its kind.
   Reordering,
 }
 
@@ -63,6 +71,10 @@ impl KeyframeRule {
       let nal_length =
         (extradata.len() >= 23 && !start_coded).then(|| usize::from(extradata[21] & 3) + 1);
       Self::Hevc { nal_length }
+    } else if codec_id == CodecId::MPEG2VIDEO.raw()
+      || codec_id == ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_MPEG1VIDEO as i32
+    {
+      Self::Mpeg12
     } else if codec_id == CodecId::VP8.raw()
       || codec_id == CodecId::VP9.raw()
       || codec_id == CodecId::AV1.raw()
@@ -73,9 +85,9 @@ impl KeyframeRule {
     }
   }
 
-  /// Whether the keyframe `data` is a clean random access point, for a
-  /// decoder that `reorders` pictures. Bytes that do not parse are not
-  /// clean: nothing is proved about them. EVERY NAL unit is read whole —
+  /// Whether the keyframe `data` is a clean random access point: proved so by
+  /// its bitstream, never by the state of the decoder it would replace. Bytes
+  /// that do not parse are not clean: nothing is proved about them. EVERY NAL unit is read whole —
   /// every header byte present and valid, a picture's unit carrying
   /// payload past its header — or the access unit is not clean; the first
   /// picture's unit decides.
@@ -84,7 +96,7 @@ impl KeyframeRule {
   /// so the memory a packet costs here does not grow with how many units it
   /// packs: a hostile keyframe of one-byte units costs a walk, not a slice
   /// entry per unit.
-  pub(crate) fn is_clean(self, data: &[u8], reorders: bool) -> bool {
+  pub(crate) fn is_clean(self, data: &[u8]) -> bool {
     match self {
       Self::H264 { nal_length } => {
         first_h264_picture(data, nal_length).is_some_and(|(kind, _)| kind == 5)
@@ -92,8 +104,9 @@ impl KeyframeRule {
       Self::Hevc { nal_length } => {
         first_hevc_picture(data, nal_length).is_some_and(|kind| (16..=20).contains(&kind))
       }
+      Self::Mpeg12 => closed_gop(data),
       Self::Resets => true,
-      Self::Reordering => !reorders,
+      Self::Reordering => false,
     }
   }
 
@@ -124,7 +137,7 @@ impl KeyframeRule {
       Self::Hevc { nal_length } => {
         first_hevc_picture(data, nal_length).is_some_and(|kind| (16..=23).contains(&kind))
       }
-      Self::Resets | Self::Reordering => true,
+      Self::Mpeg12 | Self::Resets | Self::Reordering => true,
     }
   }
 
@@ -138,9 +151,12 @@ impl KeyframeRule {
       Self::Hevc { .. } => {
         "its keyframes are CRA pictures, whose RASL leading pictures reference the GOP before them"
       }
+      Self::Mpeg12 => {
+        "its GOPs are open (no GOP header before the keyframe says closed_gop), so B pictures after a keyframe may reference the GOP before it"
+      }
       Self::Resets => "its keyframes reset every reference",
       Self::Reordering => {
-        "it reorders pictures, and this crate does not read its GOP headers to tell a closed GOP from an open one"
+        "this crate cannot prove its keyframes clean from its bitstream, so the session returns to its threads only at a seek"
       }
     }
   }
@@ -269,6 +285,32 @@ impl<'a> RbspBits<'a> {
     }
     Some((1u32 << zeros) - 1 + value)
   }
+}
+
+/// Whether an MPEG-1 or MPEG-2 video packet carries, before its first
+/// picture (start code `00`), a group-of-pictures header (`B8`) whose
+/// `closed_gop` flag is set: `time_code` is the header's first 25 bits, and
+/// `closed_gop` the next. Start codes are walked one at a time, in constant
+/// memory.
+fn closed_gop(data: &[u8]) -> bool {
+  let mut closed = false;
+  let mut at = 0usize;
+  while let Some((_, value)) = start_code(data, at) {
+    match data.get(value) {
+      Some(0x00) => return closed,
+      Some(0xb8) => {
+        // The start code's value, then `time_code`'s 25 bits: `closed_gop`
+        // is the second bit of the fourth byte after the value.
+        let Some(&flags) = data.get(value + 4) else {
+          return false;
+        };
+        closed = flags & 0x40 != 0;
+      }
+      _ => {}
+    }
+    at = value;
+  }
+  false
 }
 
 /// A unit that does not parse whole: the walk ends there, and the access

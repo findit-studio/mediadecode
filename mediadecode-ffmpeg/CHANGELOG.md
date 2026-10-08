@@ -83,8 +83,12 @@ The backend-agnostic core it adapts has its own log at
   the probe-era replay and the post-commit cold forward run on a
   one-thread decoder, and that decoder is the one committed. At the next
   clean random access point the session sends — an H.264 IDR, an HEVC IDR
-  or BLA, a VP8, VP9 or AV1 keyframe, any keyframe of a stream that
-  reorders nothing — or at the first keyframe after a seek, and after a
+  or BLA, a VP8, VP9 or AV1 keyframe, an MPEG-1 or MPEG-2 keyframe behind a
+  GOP header that says `closed_gop`, each proved by its bitstream and never
+  inferred from the old decoder's `has_b_frames` (FFmpeg raises it only when
+  it meets reordering, which an open GOP can introduce at that keyframe);
+  every other codec has none mid-stream — or at the first keyframe after a
+  seek, and after a
   post-commit degrade not before its resync, it is drained, every picture
   it still holds delivered first and in order, and closed, and a decoder
   on the session's threads is opened and fed from the keyframe on. One

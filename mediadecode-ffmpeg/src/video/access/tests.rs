@@ -53,9 +53,9 @@ fn an_h264_idr_is_clean_and_a_recovery_point_is_not() {
       length_prefixed,
     ),
   ] {
-    assert!(rule.is_clean(&pack(&idr), true), "{rule:?}: the IDR");
+    assert!(rule.is_clean(&pack(&idr)), "{rule:?}: the IDR");
     assert!(
-      !rule.is_clean(&pack(&recovery), true),
+      !rule.is_clean(&pack(&recovery)),
       "{rule:?}: the recovery point"
     );
   }
@@ -81,13 +81,10 @@ fn an_h264_packet_with_a_picture_before_its_idr_is_not_clean() {
     ),
   ] {
     assert!(
-      !rule.is_clean(&pack(&picture_first), true),
+      !rule.is_clean(&pack(&picture_first)),
       "{rule:?}: a picture before the IDR"
     );
-    assert!(
-      rule.is_clean(&pack(&idr_first), true),
-      "{rule:?}: the IDR first"
-    );
+    assert!(rule.is_clean(&pack(&idr_first)), "{rule:?}: the IDR first");
   }
 }
 
@@ -101,9 +98,9 @@ fn an_hevc_idr_or_bla_is_clean_and_a_cra_is_not() {
   };
   let rule = KeyframeRule::of(CodecId::HEVC.raw(), &[]);
   for kind in [16u8, 17, 18, 19, 20] {
-    assert!(rule.is_clean(&picture(kind), true), "NAL type {kind}");
+    assert!(rule.is_clean(&picture(kind)), "NAL type {kind}");
   }
-  assert!(!rule.is_clean(&picture(21), true), "a CRA");
+  assert!(!rule.is_clean(&picture(21)), "a CRA");
 
   let rule = KeyframeRule::of(CodecId::HEVC.raw(), &hvcc());
   assert_eq!(
@@ -112,8 +109,8 @@ fn an_hevc_idr_or_bla_is_clean_and_a_cra_is_not() {
       nal_length: Some(4)
     }
   );
-  assert!(rule.is_clean(&length_prefixed(&[&[19 << 1, 1, 0xaf]]), true));
-  assert!(!rule.is_clean(&length_prefixed(&[&[21 << 1, 1, 0xaf]]), true));
+  assert!(rule.is_clean(&length_prefixed(&[&[19 << 1, 1, 0xaf]])));
+  assert!(!rule.is_clean(&length_prefixed(&[&[21 << 1, 1, 0xaf]])));
 }
 
 /// LAW (Codex R3): **a unit that is not whole is not clean.** Every header
@@ -142,10 +139,10 @@ fn a_unit_that_is_not_whole_is_not_clean() {
       "a start code ending the data",
     ),
   ] {
-    assert!(!hevc.is_clean(&data, true), "HEVC: {why}");
+    assert!(!hevc.is_clean(&data), "HEVC: {why}");
   }
   assert!(
-    hevc.is_clean(&annex_b(&[&[19 << 1, 1, 0xaf]]), true),
+    hevc.is_clean(&annex_b(&[&[19 << 1, 1, 0xaf]])),
     "the whole IDR is clean"
   );
 
@@ -158,10 +155,10 @@ fn a_unit_that_is_not_whole_is_not_clean() {
       "a malformed SPS beside the IDR",
     ),
   ] {
-    assert!(!h264.is_clean(&data, true), "H.264: {why}");
+    assert!(!h264.is_clean(&data), "H.264: {why}");
   }
   let avcc = KeyframeRule::of(CodecId::H264.raw(), &AVCC);
-  assert!(!avcc.is_clean(&[0, 0, 0, 0], true), "an empty unit");
+  assert!(!avcc.is_clean(&[0, 0, 0, 0]), "an empty unit");
 }
 
 /// **Bytes that do not parse prove nothing**: a length field running past
@@ -171,20 +168,75 @@ fn a_truncated_unit_is_not_clean() {
   let rule = KeyframeRule::of(CodecId::H264.raw(), &AVCC);
   let mut idr = length_prefixed(&[&[0x65, 0x88, 0x84]]);
   idr.truncate(idr.len() - 1);
-  assert!(!rule.is_clean(&idr, false));
+  assert!(!rule.is_clean(&idr));
 }
 
-/// **The other codecs**: VP8, VP9 and AV1 keyframes reset every reference;
-/// anything else is clean only while its decoder reorders nothing.
+/// **The other codecs** (Codex R6 row 2): VP8, VP9 and AV1 keyframes reset
+/// every reference; any codec this crate reads no picture header of is
+/// never clean mid-stream — its decoder's `has_b_frames` proves nothing,
+/// since FFmpeg raises it only when it meets reordering — and returns to the
+/// session's threads at a seek alone.
 #[test]
-fn the_other_codecs_are_read_by_their_references_and_their_reordering() {
+fn the_other_codecs_are_read_by_their_references_alone() {
   for codec in [CodecId::VP8, CodecId::VP9, CodecId::AV1] {
-    assert!(KeyframeRule::of(codec.raw(), &[]).is_clean(&[], true));
+    assert!(KeyframeRule::of(codec.raw(), &[]).is_clean(&[]));
   }
-  let mpeg2 = KeyframeRule::of(CodecId::MPEG2VIDEO.raw(), &[]);
-  assert_eq!(mpeg2, KeyframeRule::Reordering);
-  assert!(mpeg2.is_clean(&[], false));
-  assert!(!mpeg2.is_clean(&[], true));
+  let mpeg4 = KeyframeRule::of(CodecId::MPEG4.raw(), &[]);
+  assert_eq!(mpeg4, KeyframeRule::Reordering);
+  assert!(!mpeg4.is_clean(&[]), "never clean mid-stream");
+}
+
+/// LAW (Codex R6 row 2, [high]): **an MPEG-2 keyframe is clean only behind
+/// a closed GOP header.** A packet whose group-of-pictures header before
+/// its picture sets `closed_gop` is a clean random access point; one whose
+/// header leaves it unset, one with no GOP header, one whose GOP header
+/// comes after its picture, and one whose header is cut short are not.
+#[test]
+fn an_mpeg2_keyframe_is_clean_only_behind_a_closed_gop_header() {
+  let rule = KeyframeRule::of(CodecId::MPEG2VIDEO.raw(), &[]);
+  assert_eq!(rule, KeyframeRule::Mpeg12);
+  let sequence: &[u8] = &[
+    0, 0, 1, 0xb3, 0x08, 0x00, 0x60, 0x13, 0xff, 0xff, 0xe0, 0x18,
+  ];
+  // `time_code` zero but for its marker bit; then `closed_gop`, `broken_link`.
+  let gop = |closed: bool| -> Vec<u8> {
+    vec![
+      0,
+      0,
+      1,
+      0xb8,
+      0x00,
+      0x08,
+      0x00,
+      if closed { 0x40 } else { 0x00 },
+    ]
+  };
+  let picture: &[u8] = &[0, 0, 1, 0x00, 0x00, 0x0f, 0xff, 0xf8];
+  for (data, clean, why) in [
+    (
+      [sequence, &gop(true), picture].concat(),
+      true,
+      "a closed GOP",
+    ),
+    (
+      [sequence, &gop(false), picture].concat(),
+      false,
+      "an open GOP",
+    ),
+    ([sequence, picture].concat(), false, "no GOP header"),
+    (
+      [picture, &gop(true)[..]].concat(),
+      false,
+      "the GOP header after the picture",
+    ),
+    (
+      [sequence, &gop(true)[..6]].concat(),
+      false,
+      "a GOP header cut short",
+    ),
+  ] {
+    assert_eq!(rule.is_clean(&data), clean, "{why}");
+  }
 }
 
 /// LAW (Codex R4, [medium]): **a start code is read whole, a unit's trailing
@@ -250,7 +302,7 @@ fn every_unit_is_read_whole_and_validated() {
       "an IDR whose nal_ref_idc is zero",
     ),
   ] {
-    assert!(!rule.is_clean(&data, true), "{rule:?}: {why}");
+    assert!(!rule.is_clean(&data), "{rule:?}: {why}");
   }
   for (rule, data, why) in [
     (
@@ -274,7 +326,7 @@ fn every_unit_is_read_whole_and_validated() {
       "leading zeros before the first start code",
     ),
   ] {
-    assert!(rule.is_clean(&data, true), "{rule:?}: {why}");
+    assert!(rule.is_clean(&data), "{rule:?}: {why}");
   }
 }
 
@@ -326,7 +378,7 @@ fn millions_of_tiny_units_are_classified_without_allocating() {
       "HEVC, start codes",
     ),
   ] {
-    let (clean, allocations, bytes) = crate::test_alloc::measured(|| rule.is_clean(data, true));
+    let (clean, allocations, bytes) = crate::test_alloc::measured(|| rule.is_clean(data));
     assert!(clean, "{why}: the IDR after the units is clean");
     assert_eq!(
       (allocations, bytes),
