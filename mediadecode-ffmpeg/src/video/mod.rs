@@ -938,6 +938,7 @@ impl SwDecoder {
   /// software decoder goes through here, so the test census counts each
   /// one the decoder took.
   pub(crate) fn submit(&mut self, packet: &Packet) -> Result<(), ffmpeg_next::Error> {
+    self.forget_an_earlier_refusal();
     let taken = self.decoder.send_packet(packet);
     #[cfg(test)]
     if taken.is_ok() {
@@ -954,6 +955,7 @@ impl SwDecoder {
     if let Some(answer) = eof_script::next() {
       return Err(answer);
     }
+    self.forget_an_earlier_refusal();
     let told = self.decoder.send_eof();
     #[cfg(test)]
     if !matches!(told, Err(ffmpeg_next::Error::Other { errno }) if errno == ffmpeg_next::error::EAGAIN)
@@ -961,6 +963,23 @@ impl SwDecoder {
       live_sw::note_eof();
     }
     told
+  }
+
+  /// **A frame refusal the allocator judge latched before this submission
+  /// is forgotten here, on a decoder that decodes in step**
+  /// ([`Self::decodes_in_step`]): every decode such a decoder runs belongs
+  /// to the call that runs it, and that call's funnel collects what it
+  /// latched — so one still latched was met by a decode that reported no
+  /// error (FFmpeg's H.264 decoder conceals a slice whose picture it could
+  /// not allocate), and would otherwise name the next error this decoder
+  /// reports, and read it as the next packet's own. A frame-threaded
+  /// decoder keeps it: its threads latch for earlier packets whenever they
+  /// decode them, so a refusal latched between two submissions is a thread's
+  /// whose error has yet to come.
+  fn forget_an_earlier_refusal(&self) {
+    if self.decodes_in_step() {
+      let _ = crate::ffi::take_frame_budget_declination(self.state());
+    }
   }
 
   /// Whether this decoder decodes, inside a submission, the packet the
@@ -3164,8 +3183,8 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
             self.send_on_software(av_pkt, phase)
           }
           Err(other) => {
-            // Its own picture refused while it decoded in step: the hardware
-            // read every packet before it. Any other refusal may be an earlier
+            // No refusal of the hardware's says it decoded this packet
+            // (`taken_by_hardware_despite`), and any may be an earlier
             // packet's, a provisional extradata's unread one among them.
             let taken = taken_by_hardware_despite(&other);
             match taken {
@@ -4298,9 +4317,11 @@ enum Taken {
 ///   ([`Error::FrameBudgetExceeded`], [`Error::HwSurfaceTooLarge`]) — come
 ///   from inside a decode, past the point where the extradata is applied.
 ///   Where the decoder decodes the packet a submission queues inside that
-///   submission (`in_step`), the picture is that packet's: they say it was
-///   taken. On a frame-threaded decoder the picture may be one an earlier
-///   packet's thread allocates: they do not say.
+///   submission (`in_step`), the picture is that packet's — such a decoder
+///   forgets, at each submission, a refusal latched before it
+///   ([`SwDecoder::forget_an_earlier_refusal`]) — so they say it was taken.
+///   On a frame-threaded decoder the picture may be one an earlier packet's
+///   thread allocates: they do not say.
 /// - **Back pressure and the end** refuse a packet before it is queued,
 ///   whatever a callback left latched: it was not taken.
 fn taken_despite(raw: ffmpeg_next::Error, named: &Error, in_step: bool) -> Taken {
@@ -4327,15 +4348,20 @@ fn doubt_of(error: &Error) -> crate::ExtradataDoubt {
 
 /// [`taken_despite`] for the hardware road, whose decoder answers this
 /// crate's own errors: its funnel's raw FFmpeg error, or a refusal minted
-/// while a picture was allocated. The hardware decoder is libavcodec's own
-/// under a hardware accelerator, on one thread, so it decodes the packet a
-/// submission queues inside that submission: such a refusal is that
-/// packet's. Any other error of its is this crate's own refusal, made
-/// before FFmpeg saw the packet.
+/// while a picture was allocated, named in place of the raw error. Such a
+/// refusal names no packet here, and is read as unknown: the raw error it
+/// stands for — back pressure or the end, which refuse before the queue,
+/// among what it may be — is not kept, and a probe advancing inside one
+/// submission replays its history into the next candidate before it retries
+/// the packet, so the picture refused may be a replayed one. Any other
+/// error of its is this crate's own refusal, made before FFmpeg saw the
+/// packet.
 fn taken_by_hardware_despite(error: &Error) -> Taken {
   match error {
     Error::Ffmpeg(raw) => taken_despite(*raw, error, true),
-    Error::FrameBudgetExceeded(_) | Error::HwSurfaceTooLarge(_) => Taken::Yes,
+    Error::FrameBudgetExceeded(_) | Error::HwSurfaceTooLarge(_) => {
+      Taken::Unknown(crate::ExtradataDoubt::Minted)
+    }
     _ => Taken::No,
   }
 }

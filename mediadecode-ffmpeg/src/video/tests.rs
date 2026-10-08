@@ -7703,21 +7703,23 @@ fn a_stream_permitting_arbitrary_slice_order_never_switches_or_anchors() {
   }
 }
 
-/// LAW (Codex R13, [medium]): **only a refusal this crate minted while the
-/// packet's own picture was allocated says a decoder took the packet.**
-/// Invalid data, `AVERROR_PATCHWELCOME`, an allocation failure and an
-/// invalid argument leave a packet's new extradata unknown, on the software
-/// road and the hardware's alike, whatever the decoder: none ties an error
-/// to the packet just submitted. A frame or a coded surface refused over its
-/// ceiling says the packet was decoded where the decoder decodes, inside a
-/// submission, the packet it queues — the hardware's, and a software decoder
-/// of libavcodec's own on one thread — and nothing on a frame-threaded one,
-/// whose picture may be an earlier packet's. Back pressure and the end say
-/// the packet was not taken, whatever a callback left latched. FFmpeg's
-/// `h264` opened on one thread decodes in step; on three, frame-threaded, it
-/// does not, nor does a decoder that reads as wrapped. Taken for the
-/// decoder's, invalid data installed an extradata the decoder may never have
-/// applied.
+/// LAW (Codex R13, [medium]; restated by pre-R14 row 3): **only a refusal
+/// this crate minted while the packet's own picture was allocated says a
+/// decoder took the packet.** Invalid data, `AVERROR_PATCHWELCOME`, an
+/// allocation failure and an invalid argument leave a packet's new
+/// extradata unknown, on the software road and the hardware's alike,
+/// whatever the decoder: none ties an error to the packet just submitted. A
+/// frame or a coded surface refused over its ceiling says the packet was
+/// decoded where the decoder decodes, inside a submission, the packet it
+/// queues — a software decoder of libavcodec's own on one thread — and
+/// nothing on a frame-threaded one, whose picture may be an earlier
+/// packet's, nor on the hardware, whose funnel keeps no raw error and whose
+/// probe may replay a history inside one submission: there it is unknown,
+/// minted. Back pressure and the end say the packet was not taken, whatever
+/// a callback left latched. FFmpeg's `h264` opened on one thread decodes in
+/// step; on three, frame-threaded, it does not, nor does a decoder that
+/// reads as wrapped. Taken for the decoder's, invalid data installed an
+/// extradata the decoder may never have applied.
 #[test]
 fn only_a_refusal_minted_while_its_picture_was_allocated_says_a_packet_was_taken() {
   use super::{Taken, taken_by_hardware_despite, taken_despite};
@@ -7769,7 +7771,7 @@ fn only_a_refusal_minted_while_its_picture_was_allocated_says_a_packet_was_taken
     );
     assert_eq!(
       taken_by_hardware_despite(named),
-      Taken::Yes,
+      Taken::Unknown(crate::ExtradataDoubt::Minted),
       "{named:?} on the hardware"
     );
     for before_the_queue in [eagain, ffmpeg_next::Error::Eof] {
@@ -8118,4 +8120,72 @@ fn a_hardware_failure_on_a_new_extradata_that_no_fallback_replaces_leaves_it_unk
       "the extradata is unknown, by the hardware's failure"
     );
   }
+}
+
+/// LAW (pre-R14 row 3): **a frame refusal latched before a submission names
+/// nothing of it, on a decoder that decodes in step.** FFmpeg's `h264` on
+/// one thread, a refusal left latched as one a decode concealed would leave
+/// it: the next submission, which libavcodec refuses with invalid data, is
+/// reported as that, not as the refusal — and its extradata, were it
+/// carrying one, reads unknown rather than taken; after the end, a
+/// submission libavcodec answers with the end is reported as that too. On
+/// three threads, frame-threaded, the latch outlives a submission: a thread
+/// latches for an earlier packet whenever it decodes it, and that refusal's
+/// error has yet to come. Read across the submission, the latch named the
+/// invalid data as the budget refusal.
+#[test]
+fn a_refusal_latched_before_a_submission_names_nothing_of_it() {
+  let mut h264 = Parameters::new();
+  // SAFETY: `h264` owns a fresh `AVCodecParameters`; two fields are written
+  // with values of their own types.
+  unsafe {
+    (*h264.as_mut_ptr()).codec_type = ffmpeg_next::ffi::AVMediaType::AVMEDIA_TYPE_VIDEO;
+    (*h264.as_mut_ptr()).codec_id = ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_H264;
+  }
+  let open = |threads| {
+    super::open_sw_decoder(&h264, DecoderLimits::default().with_threads(threads), None)
+      .expect("an H.264 decoder")
+  };
+  let latch = |sw: &super::SwDecoder| {
+    crate::ffi::declare_frame_budget_declined_for_test(sw.state().cast_mut(), 1 << 30);
+  };
+  // An access unit delimiter alone: a packet with no picture, which FFmpeg's
+  // H.264 decoder refuses as invalid data.
+  let no_picture = crate::boundary::try_packet_copy(&[0, 0, 0, 1, 0x09, 0xf0]).expect("a packet");
+
+  let mut one = open(crate::Threads::Single);
+  latch(&one);
+  let refused = one.submit(&no_picture).expect_err("no picture");
+  let named = crate::decoder::software_exit(one.state(), refused);
+  assert!(
+    matches!(named, Error::Ffmpeg(ffmpeg_next::Error::InvalidData)),
+    "one thread: the submission is reported as what it met: {named:?}"
+  );
+  assert_eq!(
+    super::taken_despite(refused, &named, one.decodes_in_step()),
+    super::Taken::Unknown(crate::ExtradataDoubt::Reported(
+      ffmpeg_next::Error::InvalidData
+    )),
+    "one thread: unknown, not taken"
+  );
+  one.send_eof().expect("the end");
+  latch(&one);
+  let ended = one.submit(&no_picture).expect_err("after the end");
+  assert!(
+    matches!(
+      crate::decoder::software_exit(one.state(), ended),
+      Error::Ffmpeg(ffmpeg_next::Error::Eof)
+    ),
+    "one thread: a submission after the end is reported as the end"
+  );
+
+  let mut three = open(crate::Threads::Count(
+    core::num::NonZeroU32::new(3).expect("nonzero"),
+  ));
+  latch(&three);
+  let _ = three.submit(&no_picture);
+  assert!(
+    crate::ffi::take_frame_budget_declination(three.state()).is_some(),
+    "three threads: the latch outlives the submission"
+  );
 }

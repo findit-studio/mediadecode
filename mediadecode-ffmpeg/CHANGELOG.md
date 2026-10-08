@@ -306,10 +306,13 @@ The backend-agnostic core it adapts has its own log at
   fallback's cold decoder, a switch's — starts on the stream's current
   parameters. A packet the decoder refuses counts as taken only where the
   refusal says the decoder decoded it, past the point where FFmpeg applies
-  the extradata: a frame or a coded surface this crate's callbacks refused
-  over its ceiling while the packet's own picture was allocated — on the
-  hardware, and on a software decoder of libavcodec's own on one thread —
-  on the software send, the hardware send and the replay alike; a packet
+  the extradata: a frame this crate's allocator judge refused over its
+  ceiling while the packet's own picture was allocated, on a software
+  decoder of libavcodec's own on one thread, which forgets at each
+  submission a refusal latched before it (one FFmpeg's H.264 decoder
+  concealed) — on the software send and the replay alike; on the hardware
+  road, whose funnel keeps no raw error and whose probe may replay a
+  history inside one submission, such a refusal says nothing; a packet
   refused before it was queued (back pressure, the end) leaves them as they
   were. Any other refusal does not say whether the decoder got that far and
   leaves them unknown: an allocation failure, an invalid argument, and
