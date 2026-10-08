@@ -1068,7 +1068,10 @@ impl VideoDecoder {
       | Error::UnpricedFrame(_)
       // The software road's post-commit fallback; no hardware funnel mints
       // it.
-      | Error::ResyncUnprovable(_) => VerdictRouting::Direct,
+      | Error::ResyncUnprovable(_)
+      // The session's open of a software decoder on its parameters; no
+      // hardware funnel mints it either.
+      | Error::ExtradataUnknown(_) => VerdictRouting::Direct,
     }
   }
 

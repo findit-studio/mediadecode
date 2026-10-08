@@ -247,6 +247,20 @@ pub struct CarrierVideoStreamDecoder<C: crate::FfmpegCarrier> {
   /// post-commit fallback and at a flush, which clears the history — and
   /// dropped by a probe-era fallback, which re-applies it.
   probe_extradata: Option<NewExtradata>,
+  /// Set when a decoder refused a packet carrying
+  /// `AV_PKT_DATA_NEW_EXTRADATA` with an error that does not say whether it
+  /// took the packet ([`Taken::Unknown`]): the refusal. FFmpeg's H.264 and
+  /// HEVC decoders apply a packet's new extradata before they decode its
+  /// body, so a packet they took and reported failed has changed their
+  /// framing, and one refused before it was queued has not; here which is
+  /// not known. Until a packet carrying a new extradata is taken, no H.264
+  /// or HEVC packet is read as a resync anchor or a switch point under the
+  /// session's extradata, no switch opens a decoder on it, and a decoder the
+  /// session must open on it — a post-commit fallback's, a reopen — is
+  /// refused by name ([`Error::ExtradataUnknown`]); a packet carrying its own
+  /// new extradata is read, and opened on, under that. A probe-era
+  /// fallback's replay sets it from the history it replays.
+  extradata_unknown: Option<ffmpeg_next::Error>,
   /// HW-side scratch frame (filled by [`VideoDecoder::receive_frame`]).
   hw_scratch: Frame,
   /// SW-side scratch frame (filled by `ffmpeg::decoder::Video::receive_frame`).
@@ -324,7 +338,7 @@ pub struct CarrierVideoStreamDecoder<C: crate::FfmpegCarrier> {
   /// Test-only: the next packet the decoder serving takes is reported
   /// failed, as FFmpeg reports a packet it decoded with an error.
   #[cfg(test)]
-  fail_after_submit: bool,
+  fail_after_submit: Option<ffmpeg_next::Error>,
   /// `true` once `send_eof` has been called on the active decoder.
   /// Used to propagate EOF to the SW decoder when fallback fires
   /// during the drain phase — without this, codecs that hold tail
@@ -1076,6 +1090,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       path,
       parameters: owned_parameters,
       probe_extradata: None,
+      extradata_unknown: None,
       hw_scratch,
       sw_scratch,
       sw_replay_frames: ReplayQueue::default(),
@@ -1113,7 +1128,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       #[cfg(test)]
       reorder_on_submit: None,
       #[cfg(test)]
-      fail_after_submit: false,
+      fail_after_submit: None,
       scratch_pending: false,
       _carrier: core::marker::PhantomData,
     })
@@ -1471,8 +1486,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     self.state = DecodeState::Sw(sw);
     // The history was replayed from the parameters it started on, its own
     // new extradata re-applied in order: the last the decoder took is the
-    // active one, and what the hardware took is not installed again.
+    // active one, what the hardware took is not installed again, and what
+    // its refusals left in doubt is the replaced decoder's, not this one's.
     self.probe_extradata = None;
+    self.extradata_unknown = None;
     if let Some(extradata) = progress.extradata.take() {
       extradata.install(&mut self.parameters);
     }
@@ -1527,10 +1544,14 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       &mut progress,
     );
     self.pending_history.drain(..progress.fed);
-    // A packet the decoder took before any error: its new extradata, if it
-    // carried one, is the active one.
+    // A packet the decoder took, the failing one among them where it took
+    // it: its new extradata, if it carried one, is the active one; a failing
+    // one whose refusal does not say leaves it unknown.
     if let Some(extradata) = progress.extradata.take() {
-      extradata.install(&mut self.parameters);
+      self.took_extradata(extradata, false);
+    }
+    if let Some(cause) = progress.unknown {
+      self.extradata_in_doubt(cause);
     }
     if progress.eof_sent {
       self.pending_eof = false;
@@ -1761,7 +1782,16 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       self.finish_restart().map_err(VideoDecodeError::Decode)?;
     }
     if matches!(self.state, DecodeState::SwClosed) {
-      // No decoder open: one is opened, on one thread for good.
+      // No decoder open: one is opened, on one thread for good — on the
+      // session's parameters, none while their extradata is unknown unless
+      // this packet carries its own. The packet stays the caller's.
+      if let Some(refusal) = self.extradata_unknown
+        && new_extradata(pkt).is_none()
+      {
+        return Err(VideoDecodeError::Decode(Error::ExtradataUnknown(
+          crate::ExtradataUnknown::new(refusal),
+        )));
+      }
       self.open_after_drain().map_err(VideoDecodeError::Decode)?;
     }
     // A key-flagged packet across an open gap whose first picture is proved
@@ -1803,9 +1833,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     let submitted = sw.submit(pkt);
     #[cfg(test)]
     let submitted = match submitted {
-      Ok(()) if core::mem::take(&mut self.fail_after_submit) => {
-        Err(ffmpeg_next::Error::InvalidData)
-      }
+      Ok(()) => self.fail_after_submit.take().map_or(Ok(()), Err),
       other => other,
     };
     if let Err(e) = submitted {
@@ -1825,6 +1853,11 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
           // A packet that failed after the anchor: what follows it may
           // reference it, so the anchor is in doubt.
           self.unanchor();
+          // And one the decoder took applied its new extradata before its
+          // body failed.
+          if let Some(extradata) = extradata {
+            self.refused_with_extradata(extradata, taken_despite(e, &error), false);
+          }
           Err(VideoDecodeError::Decode(error))
         }
       };
@@ -1836,7 +1869,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     self.sw_output_settled = false;
     // The decoder took it: its extradata is the stream's now.
     if let Some(extradata) = extradata {
-      extradata.install(&mut self.parameters);
+      self.took_extradata(extradata, false);
     }
     if let Some(anchor) = anchoring {
       self.anchor_resync(reorder_before, anchor);
@@ -1869,10 +1902,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// What `pkt` is as a post-commit resync anchor: a key-flagged packet the
   /// bitstream proves a random-access point, where this crate can read it —
   /// see [`access::KeyframeRule::anchor`] — read by the rule `pkt` is decoded
-  /// under ([`Self::rule_for`]). A stale key flag, or a picture before the
-  /// random-access one, anchors nothing.
+  /// under ([`Self::rule_for`]); none where that rule is unknown. A stale
+  /// key flag, or a picture before the random-access one, anchors nothing.
   fn anchor(&self, pkt: &Packet) -> Option<access::Anchor> {
-    let rule = self.rule_for(pkt);
+    let rule = self.rule_for(pkt)?;
     if pkt.is_key() || rule.every_packet() {
       pkt.data().and_then(|data| rule.anchor(data))
     } else {
@@ -1884,9 +1917,17 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// that is a clean random access point ([`Self::clean_keyframe`]), or the
   /// first keyframe after a seek, which has discarded what led it. For a
   /// codec that codes every picture alone, every packet is a keyframe here,
-  /// its flag or not.
+  /// its flag or not. None while the session's extradata is unknown
+  /// ([`Self::extradata_unknown`]) but a packet carrying its own: a switch
+  /// opens a decoder on the session's parameters, and that decoder takes
+  /// the packet's.
   fn switch_point(&self, pkt: &Packet) -> bool {
-    (pkt.is_key() || self.rule_for(pkt).every_packet()) && (self.seeked || self.clean_keyframe(pkt))
+    if self.extradata_unknown.is_some() && new_extradata(pkt).is_none() {
+      return false;
+    }
+    self.rule_for(pkt).is_some_and(|rule| {
+      (pkt.is_key() || rule.every_packet()) && (self.seeked || self.clean_keyframe(pkt))
+    })
   }
 
   /// The keyframe rule for this session's stream, read off its codec
@@ -1919,11 +1960,16 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// so a change of NAL length fields or of packing frames the packet's own
   /// units — and otherwise the active one ([`Self::keyframe_rule`]). The
   /// extradata becomes the active one when a decoder takes the packet
-  /// ([`NewExtradata`]).
-  fn rule_for(&self, pkt: &Packet) -> access::KeyframeRule {
+  /// ([`NewExtradata`]). `None` for a rule that reads the extradata while
+  /// the session's is unknown ([`Self::extradata_unknown`]): the decoder may
+  /// frame the packet's units either way.
+  fn rule_for(&self, pkt: &Packet) -> Option<access::KeyframeRule> {
     match new_extradata(pkt) {
-      Some(extradata) => access::KeyframeRule::of(self.codec_id(), extradata),
-      None => self.keyframe_rule(),
+      Some(extradata) => Some(access::KeyframeRule::of(self.codec_id(), extradata)),
+      None => {
+        let rule = self.keyframe_rule();
+        (self.extradata_unknown.is_none() || !rule.reads_extradata()).then_some(rule)
+      }
     }
   }
 
@@ -1950,6 +1996,46 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     }
   }
 
+  /// The decoder serving took a packet carrying `extradata`: it is the
+  /// stream's now — installed, or, while the hardware's probe records
+  /// (`probing`), kept for it ([`Self::probe_extradata`]) — and the
+  /// session's extradata is known again.
+  fn took_extradata(&mut self, extradata: NewExtradata, probing: bool) {
+    if probing {
+      self.probe_extradata = Some(extradata);
+    } else {
+      extradata.install(&mut self.parameters);
+    }
+    self.extradata_unknown = None;
+  }
+
+  /// The decoder serving refused a packet carrying `extradata`: where it
+  /// took the packet all the same, the extradata is the stream's
+  /// ([`Self::took_extradata`]); where that cannot be told, the session's
+  /// extradata is unknown ([`Self::extradata_unknown`]); where it did not
+  /// take it, nothing changes.
+  fn refused_with_extradata(&mut self, extradata: NewExtradata, taken: Taken, probing: bool) {
+    match taken {
+      Taken::Yes => self.took_extradata(extradata, probing),
+      Taken::Unknown(cause) => self.extradata_in_doubt(cause),
+      Taken::No => {}
+    }
+  }
+
+  /// A packet carrying a new extradata was refused with `cause`, which does
+  /// not say whether the decoder took it: the session's extradata is unknown
+  /// ([`Self::extradata_unknown`]).
+  fn extradata_in_doubt(&mut self, cause: ffmpeg_next::Error) {
+    tracing::warn!(
+      %cause,
+      "mediadecode-ffmpeg: a packet carrying new codec extradata was refused with an error that \
+       does not say whether the decoder took it; until a packet carrying extradata is taken, no \
+       resync anchor or switch is read under the session's extradata, and no decoder is opened \
+       on it",
+    );
+    self.extradata_unknown = Some(cause);
+  }
+
   /// Whether `pkt`, a keyframe, is a clean random access point for this
   /// stream — see [`access::KeyframeRule::is_clean`]: proved by its
   /// bitstream, under the rule it is decoded under ([`Self::rule_for`]),
@@ -1959,7 +2045,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   fn clean_keyframe(&self, pkt: &Packet) -> bool {
     pkt
       .data()
-      .is_some_and(|data| self.rule_for(pkt).is_clean(data))
+      .is_some_and(|data| self.rule_for(pkt).is_some_and(|rule| rule.is_clean(data)))
   }
 
   /// **A fallback that outlives a minute on one thread says so, once.** A
@@ -2062,6 +2148,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       // libavcodec's own, or a session opened on software at a
       // random-access point, which owes no proof.
       Err(unprovable @ Error::ResyncUnprovable(_)) => Err(unprovable),
+      // Nor is a refusal to open on unknown extradata: re-driven, it meets
+      // the same parameters until a packet carrying extradata is taken.
+      Err(unknown @ Error::ExtradataUnknown(_)) => Err(unknown),
       // Everything else really is the machinery failing, and keeps the
       // envelope — empty rescue set and all, which is what a
       // post-commit failure has to hand back.
@@ -2101,6 +2190,16 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     // extradata the hardware took while its probe recorded is the stream's
     // now, whatever this fallback comes to.
     self.install_probe_extradata();
+    // Parameters whose extradata is unknown open no decoder, unless the
+    // packet it is handed carries its own, which it takes before its body.
+    if let Some(refusal) = self.extradata_unknown {
+      let carries = matches!(input, PostCommitInput::Packet(pkt) if new_extradata(pkt).is_some());
+      if !carries {
+        return Err(Error::ExtradataUnknown(crate::ExtradataUnknown::new(
+          refusal,
+        )));
+      }
+    }
     let one_thread = self.limits.with_threads(crate::Threads::Single);
     let mut sw = open_sw_decoder(&self.parameters, one_thread, Some(self.time_base))?;
     // **No proof, no commit.** This is the one road whose commit owes a
@@ -2163,7 +2262,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     // threads come back at the next keyframe.
     self.state = DecodeState::Sw(sw);
     if let Some(extradata) = extradata {
-      extradata.install(&mut self.parameters);
+      self.took_extradata(extradata, false);
     }
     self.sw_threads_pending = self.session_threads_run();
     self.enter_degraded_resync();
@@ -2553,6 +2652,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       path,
       parameters: owned_parameters,
       probe_extradata: None,
+      extradata_unknown: None,
       hw_scratch: Frame::empty()?,
       sw_scratch: alloc_av_video_frame()?,
       sw_replay_frames: ReplayQueue::default(),
@@ -2590,7 +2690,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       #[cfg(test)]
       reorder_on_submit: None,
       #[cfg(test)]
-      fail_after_submit: false,
+      fail_after_submit: None,
       scratch_pending: false,
       _carrier: core::marker::PhantomData,
     })
@@ -2653,7 +2753,13 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// and decoded, its pictures left ready — as FFmpeg reports a packet it
   /// decoded with an error.
   pub(crate) fn fail_next_packet_for_test(&mut self) {
-    self.fail_after_submit = true;
+    self.fail_after_submit = Some(ffmpeg_next::Error::InvalidData);
+  }
+
+  /// The next packet the decoder serving takes is reported failed with
+  /// `error`.
+  pub(crate) fn fail_next_packet_with_for_test(&mut self, error: ffmpeg_next::Error) {
+    self.fail_after_submit = Some(error);
   }
 
   /// Every open on the session's threads fails from here on.
@@ -2800,10 +2906,8 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
               if av_pkt.is_key() {
                 self.seeked = false;
               }
-              match extradata {
-                Some(extradata) if probing => self.probe_extradata = Some(extradata),
-                Some(extradata) => extradata.install(&mut self.parameters),
-                None => {}
+              if let Some(extradata) = extradata {
+                self.took_extradata(extradata, probing);
               }
             }
             Ok(status)
@@ -2868,7 +2972,14 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
             // committed either way, and the caller re-offers the packet.
             self.send_on_software(av_pkt, phase)
           }
-          Err(other) => Err(VideoDecodeError::Decode(other)),
+          Err(other) => {
+            // A packet the hardware took and reported failed applied its
+            // new extradata before its body failed.
+            if let Some(extradata) = extradata {
+              self.refused_with_extradata(extradata, taken_by_hardware_despite(&other), probing);
+            }
+            Err(VideoDecodeError::Decode(other))
+          }
         },
         DecodeState::Sw(_) | DecodeState::SwClosed => self.send_on_software(av_pkt, phase),
       }
@@ -3459,9 +3570,14 @@ struct Replay {
   fed: usize,
   eof_sent: bool,
   /// The extradata the last packet the decoder took carried as
-  /// `AV_PKT_DATA_NEW_EXTRADATA`, copied: the session's active extradata
-  /// once the replay is its own ([`NewExtradata::install`]).
+  /// `AV_PKT_DATA_NEW_EXTRADATA`, copied — a packet it took and reported
+  /// failed among them: the session's active extradata once the replay is
+  /// its own ([`NewExtradata::install`]).
   extradata: Option<NewExtradata>,
+  /// The refusal of the replay's last packet, which carried a new
+  /// extradata, where it does not say whether the decoder took the packet
+  /// ([`Taken::Unknown`]).
+  unknown: Option<ffmpeg_next::Error>,
 }
 
 /// How a drain into the queue stopped.
@@ -3530,7 +3646,17 @@ fn replay_history(
         }
         Err(other) => {
           progress.fed += 1;
-          return Err(crate::decoder::software_exit(sw_state, other));
+          let error = crate::decoder::software_exit(sw_state, other);
+          // The packet is consumed with its error; one the decoder took
+          // applied its new extradata before its body failed.
+          if extradata.is_some() {
+            match taken_despite(other, &error) {
+              Taken::Yes => progress.extradata = extradata,
+              Taken::Unknown(cause) => progress.unknown = Some(cause),
+              Taken::No => {}
+            }
+          }
+          return Err(error);
         }
       }
     }
@@ -3907,6 +4033,53 @@ fn new_extradata(pkt: &Packet) -> Option<&[u8]> {
   }
 }
 
+/// Whether a decoder took a packet whose submission it refused — what a
+/// new extradata the packet carries means for the session's
+/// ([`taken_despite`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Taken {
+  /// It took the packet, and the extradata with it.
+  Yes,
+  /// It refused the packet before taking it.
+  No,
+  /// The refusal, this error, does not say.
+  Unknown(ffmpeg_next::Error),
+}
+
+/// Whether a software decoder took the packet whose submission it refused
+/// with `raw`, which the software road's funnel named `named`.
+///
+/// FFmpeg queues a packet before it decodes it and reports what decoding
+/// met, and its H.264 and HEVC decoders apply a packet's new extradata
+/// before they decode its body. So an error only decoding makes says the
+/// decoder took the packet: invalid data (`AVERROR_INVALIDDATA`), an
+/// unimplemented feature (`AVERROR_PATCHWELCOME`), and the refusals this
+/// crate's callbacks mint while a picture is decoded — a frame or a coded
+/// surface over the allocation ceiling. Back pressure and the end refuse a
+/// packet before it is queued. An allocation failure, an invalid argument
+/// and the rest can come from either side of the queue.
+fn taken_despite(raw: ffmpeg_next::Error, named: &Error) -> Taken {
+  match (raw, named) {
+    (_, Error::FrameBudgetExceeded(_) | Error::HwSurfaceTooLarge(_))
+    | (ffmpeg_next::Error::InvalidData | ffmpeg_next::Error::PatchWelcome, _) => Taken::Yes,
+    (ffmpeg_next::Error::Eof, _) => Taken::No,
+    (ffmpeg_next::Error::Other { errno }, _) if errno == ffmpeg_next::error::EAGAIN => Taken::No,
+    _ => Taken::Unknown(raw),
+  }
+}
+
+/// [`taken_despite`] for the hardware road, whose decoder answers this
+/// crate's own errors: its funnel's raw FFmpeg error, or a refusal minted
+/// while a picture was decoded. Any other error of its is this crate's own
+/// refusal, made before FFmpeg saw the packet.
+fn taken_by_hardware_despite(error: &Error) -> Taken {
+  match error {
+    Error::Ffmpeg(raw) => taken_despite(*raw, error),
+    Error::FrameBudgetExceeded(_) | Error::HwSurfaceTooLarge(_) => Taken::Yes,
+    _ => Taken::No,
+  }
+}
+
 /// Extradata a packet carried as `AV_PKT_DATA_NEW_EXTRADATA`, copied the way
 /// codec parameters hold theirs — `av_malloc`ed with
 /// `AV_INPUT_BUFFER_PADDING_SIZE` zeroed bytes behind it — before the packet
@@ -3950,6 +4123,15 @@ impl NewExtradata {
       core::ptr::write_bytes(data.as_ptr().add(extradata.len()), 0, padding);
     }
     Ok(Some(Self { data, size }))
+  }
+
+  /// The copied extradata.
+  #[cfg(test)]
+  fn bytes(&self) -> &[u8] {
+    // SAFETY: `data` holds the `size` bytes this copy was made of.
+    unsafe {
+      core::slice::from_raw_parts(self.data.as_ptr(), usize::try_from(self.size).unwrap_or(0))
+    }
   }
 
   /// Installs this as `parameters`' extradata, the old freed: the stream's

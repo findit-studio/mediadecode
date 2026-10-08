@@ -126,8 +126,8 @@ pub use demuxer::{
   TrackMetadataBudgetExhausted, TrackMetadataTooLong, TrackTableAlloc, TrackTimebaseInvalid,
 };
 pub use error::{
-  Error, FrameBudgetExceeded, FrameMedium, HwSurfaceTooLarge, HwTransferTooLarge, ReplayQueueFull,
-  Result, ResyncUnprovable, UnpricedFrame, UnpricedHolding, UnrecoveredOutput,
+  Error, ExtradataUnknown, FrameBudgetExceeded, FrameMedium, HwSurfaceTooLarge, HwTransferTooLarge,
+  ReplayQueueFull, Result, ResyncUnprovable, UnpricedFrame, UnpricedHolding, UnrecoveredOutput,
 };
 pub use frame::Frame;
 pub use image::{CarrierImageDecoder, Corrupt, CorruptSource, ImageDecodeError, InputTooLarge};

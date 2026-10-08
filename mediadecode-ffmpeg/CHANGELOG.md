@@ -99,6 +99,13 @@ The backend-agnostic core it adapts has its own log at
   the gap could close it. On a build whose AV1 decoder is `libdav1d`, a
   post-commit fallback on AV1 is refused this way.
 
+- **`Error::ExtradataUnknown`** (`ExtradataUnknown { refusal }`, exported): a
+  software video decoder the session would open on its codec parameters
+  while their extradata is unknown — a packet carrying
+  `AV_PKT_DATA_NEW_EXTRADATA` was refused with an error that does not say
+  whether the decoder took it — is refused by this name, naming that
+  refusal, rather than opened on extradata that may be stale (below).
+
 - **`active_threads()` on the video stream decoder**: the threads the
   decoder serving now decodes with, read off what is active
   (`active_thread_type`), never off what was asked — the count libavcodec
@@ -284,14 +291,24 @@ The backend-agnostic core it adapts has its own log at
   length fields and packing its own units use (FFmpeg's H.264 and HEVC
   decoders apply it before they decode that packet), for the resync anchor,
   the switch point and the clean keyframe alike. Once a decoder takes the
-  packet, that extradata replaces the session's codec parameters' (a packet
-  refused leaves them as they were): later packets are read under it, and
-  every decoder opened later — a post-commit fallback's cold decoder, a
-  switch's — starts on the stream's current parameters. One the hardware
-  took while its probe recorded is installed once nothing will replay it.
-  Read under the parameters as opened, an `avcC` stream whose length fields
-  changed never anchored, ended in a false `PostCommitNeverResynced`, and
-  never returned to the session's threads.
+  packet, that extradata replaces the session's codec parameters': later
+  packets are read under it, and every decoder opened later — a post-commit
+  fallback's cold decoder, a switch's — starts on the stream's current
+  parameters. A packet the decoder takes and reports failed counts as
+  taken, since FFmpeg applies the extradata before it decodes the body —
+  invalid data, an unimplemented feature, a refusal minted while a picture
+  was decoded — on the software send, the hardware send and the replay
+  alike; a packet refused before it was queued (back pressure, the end)
+  leaves them as they were. A refusal that does not say whether the decoder
+  took the packet (an allocation failure, an invalid argument) leaves them
+  unknown: until a packet carrying extradata is taken, no H.264 or HEVC
+  packet is read as an anchor or a switch point under them, no switch opens
+  a decoder on them, and a decoder the session must open on them is refused
+  by name (`Error::ExtradataUnknown`). One the hardware took while its
+  probe recorded is installed once nothing will replay it. Read under the
+  parameters as opened, an `avcC` stream whose length fields changed never
+  anchored, ended in a false `PostCommitNeverResynced`, and never returned
+  to the session's threads.
 
 ## [0.15.1] - 2026-10-05
 

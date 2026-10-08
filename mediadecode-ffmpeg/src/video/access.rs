@@ -134,6 +134,12 @@ impl KeyframeRule {
     matches!(self, Self::IntraOnly)
   }
 
+  /// Whether this rule reads its codec parameters' extradata: how H.264 and
+  /// HEVC pack their NAL units.
+  pub(crate) const fn reads_extradata(self) -> bool {
+    matches!(self, Self::H264 { .. } | Self::Hevc { .. })
+  }
+
   /// What the key-flagged packet `data` is as a post-commit resync anchor:
   /// `Some` where the bitstream proves it a random-access point, where the
   /// codec lets this crate read it; `None` otherwise, whatever its flag

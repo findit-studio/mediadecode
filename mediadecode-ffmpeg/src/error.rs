@@ -178,6 +178,51 @@ pub enum Error {
   /// open it would commit; see [`ResyncUnprovable`].
   #[error(transparent)]
   ResyncUnprovable(#[from] ResyncUnprovable),
+
+  /// A software video decoder the session would open on its codec
+  /// parameters while their extradata is unknown — a packet carrying a new
+  /// extradata was refused with an error that does not say whether the
+  /// decoder took it — is refused by name; see [`ExtradataUnknown`].
+  #[error(transparent)]
+  ExtradataUnknown(#[from] ExtradataUnknown),
+}
+
+/// Payload for [`Error::ExtradataUnknown`].
+///
+/// A packet carrying `AV_PKT_DATA_NEW_EXTRADATA` changes a stream's codec
+/// parameters from that packet on, and FFmpeg's H.264 and HEVC decoders
+/// apply it before they decode the packet's body: a packet a decoder took
+/// and reported failed has changed its framing. When a decoder refuses such
+/// a packet with an error that does not say whether it took the packet — an
+/// allocation failure or an invalid argument, which can come before the
+/// packet is queued or while it is decoded — the session cannot tell which
+/// extradata the decoder now frames the stream by. Until a packet carrying a
+/// new extradata is taken, it reads no H.264 or HEVC resync anchor or switch
+/// point under its own, switches to no new decoder, and refuses by this name
+/// to open a decoder on it — a post-commit fallback's cold decoder, a
+/// reopen — rather than decode on parameters that may be stale. A packet
+/// carrying its own new extradata is read, and opened on, under that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+  "the stream's codec extradata is unknown: a packet carrying a new extradata was refused with \
+   \"{refusal}\", which does not say whether the decoder took it, so no decoder is opened on \
+   extradata that may be stale"
+)]
+pub struct ExtradataUnknown {
+  refusal: ffmpeg_next::Error,
+}
+
+impl ExtradataUnknown {
+  /// Constructs an [`ExtradataUnknown`] payload.
+  #[inline]
+  pub const fn new(refusal: ffmpeg_next::Error) -> Self {
+    Self { refusal }
+  }
+  /// The refusal that left the extradata unknown.
+  #[inline]
+  pub const fn refusal(&self) -> ffmpeg_next::Error {
+    self.refusal
+  }
 }
 
 /// Payload for [`Error::ResyncUnprovable`].
