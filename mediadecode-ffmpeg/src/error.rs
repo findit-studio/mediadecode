@@ -267,26 +267,42 @@ pub enum UnpricedHolding {
   /// A side data entry whose bytes no buffer reference owns, or a side data
   /// table that does not hold its entries.
   SideData,
+  /// More side data entries than a picture the queue takes may carry. A
+  /// decoder makes one for each message it reads — FFmpeg's H.264 decoder
+  /// one per unregistered SEI message, with no cap of its own — and the
+  /// queue prices each alone, so it walks no table past the cap.
+  SideDataEntries {
+    /// The entries the picture carries.
+    count: usize,
+    /// The most a picture the queue takes may carry.
+    cap: usize,
+  },
 }
 
 impl core::fmt::Display for UnpricedHolding {
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-    f.write_str(match self {
-      Self::PrivateRef => "a private reference",
-      Self::SideData => "side data no buffer reference owns",
-    })
+    match self {
+      Self::PrivateRef => f.write_str("a private reference"),
+      Self::SideData => f.write_str("side data no buffer reference owns"),
+      Self::SideDataEntries { count, cap } => write!(
+        f,
+        "{count} side data entries, more than the {cap} a queued picture may carry"
+      ),
+    }
   }
 }
 
 /// Payload for [`Error::UnpricedFrame`].
 ///
 /// The software video road's queue prices a decoded picture by every
-/// allocation it owns — its pixel buffers, every side data entry's buffer,
-/// its metadata and the side data's, `opaque_ref` and `hw_frames_ctx` —
-/// against [`DecoderLimits::max_replay_bytes`](crate::DecoderLimits::max_replay_bytes).
-/// A picture holding an allocation whose size it cannot read is never
-/// admitted as costing nothing: it is refused by this name, naming what it
-/// holds, and released.
+/// allocation it owns — its pixel buffers, the side data table and every
+/// entry in it, each entry's buffer, its metadata and the side data's,
+/// `opaque_ref` and `hw_frames_ctx`, each at its payload rounded to the
+/// allocator's alignment and the allocator's and the buffer's own overhead
+/// — against [`DecoderLimits::max_replay_bytes`](crate::DecoderLimits::max_replay_bytes).
+/// A picture holding an allocation whose size it cannot read, or more side
+/// data entries than the queue prices, is never admitted as costing nothing:
+/// it is refused by this name, naming what it holds, and released.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error(
   "a decoded picture holds an allocation the software video decoder's replay budget cannot \

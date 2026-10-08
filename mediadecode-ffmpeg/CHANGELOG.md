@@ -29,11 +29,13 @@ The backend-agnostic core it adapts has its own log at
   beside the threads it serves. The queue takes a fallback replay's pictures
   and the tail a one-thread decoder is drained of where the session restarts
   it at a clean keyframe; each picture counts every allocation it owns — the
-  buffers its pixels reference, every side data entry's buffer (SEI
-  payloads, ICC profiles, …), its metadata and the side data's,
-  `opaque_ref` and `hw_frames_ctx` — so small pictures carrying large side
-  data cannot fill memory under a small budget, and 64 pictures bound the
-  queue besides. A replay used to abort at 64 pictures
+  buffers its pixels reference, the side data table, every side data entry
+  and its buffer (SEI payloads, ICC profiles, …), its metadata and the side
+  data's, `opaque_ref` and `hw_frames_ctx` — each at its payload rounded up
+  to 64 bytes and 256 bytes for the allocator's and the buffer's own
+  overhead, so small pictures carrying large side data, or many small
+  entries, cannot fill memory under a small budget, and 64 pictures bound
+  the queue besides. A replay used to abort at 64 pictures
   whatever their size — up to 32 GiB of 4K pictures at the per-picture
   ceiling — and a switch's drain that passed the cap dropped the rest of the
   tail. Now a drain stops at either bound and answers `Sent::MustDrain`
@@ -67,10 +69,14 @@ The backend-agnostic core it adapts has its own log at
   used to surface as a bare `ENOMEM`.
 
 - **`Error::UnpricedFrame`** (`UnpricedFrame { holding }`, with
-  `UnpricedHolding { PrivateRef, SideData }`, exported): a decoded picture
-  holding an allocation the budget cannot price — a `private_ref`, of no
-  stated size, or side data no buffer reference owns — is refused by this
-  name and released, never queued as costing nothing.
+  `UnpricedHolding { PrivateRef, SideData, SideDataEntries { count, cap } }`,
+  exported): a decoded picture holding an allocation the budget cannot
+  price — a `private_ref`, of no stated size, or side data no buffer
+  reference owns — or more than 256 side data entries is refused by this
+  name and released, never queued as costing nothing. FFmpeg's H.264
+  decoder makes a side data entry for every unregistered SEI message, with
+  no cap of its own; a legitimate stream carries a handful, and the queue
+  walks no table past the cap.
 
 - **`Error::UnrecoveredOutput`** (`UnrecoveredOutput { output_corrupt,
   show_all }`, exported): a software video decoder found after its open

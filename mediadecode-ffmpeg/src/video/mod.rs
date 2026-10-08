@@ -3530,32 +3530,86 @@ fn drain_into(
   }
 }
 
-/// The bytes a decoded picture holds, every allocation it owns priced: the
-/// buffers its pixels reference — `buf[]` and `extended_buf` — or, for one
-/// that references none, an upper bound on what its format and dimensions
-/// allocate (`crate::footprint::video_frame_bytes`); every side data entry's
-/// buffer (SEI payloads, ICC profiles, …), whatever the pixels weigh; the
-/// frame's metadata and each side data entry's; `opaque_ref` and
-/// `hw_frames_ctx`. Pricing the pixels alone let small pictures carrying
-/// large side data fill memory under a small budget.
+/// The alignment every allocation a decoded picture owns is priced at:
+/// `av_malloc` aligns to 64 bytes where libavutil is built with AVX-512
+/// (`ALIGN` in its `mem.c`; 32 or 16 otherwise), and an allocation's payload
+/// is taken to fill whole units of it ([`allocation`]).
+const ALLOCATION_ALIGN: usize = 64;
+
+/// What each allocation a decoded picture owns costs besides its payload
+/// ([`allocation`]): the allocator's own header and rounding, and, for a
+/// buffer, the two reference-counting structs `av_buffer_alloc` allocates
+/// beside its payload — FFmpeg 9's `AVBufferRef` (24 bytes: the buffer, its
+/// data and its size) and `AVBuffer` (48 bytes: data, size, reference count,
+/// free callback, opaque pointer and two flag words), each its own
+/// `av_malloc`, so 64 bytes apiece once aligned. With a header of up to 16
+/// bytes for each of the three allocations that is 176 bytes; it is taken as
+/// 256, for allocators whose size classes round coarser, and charged to
+/// every allocation priced, a buffer or not.
+const ALLOCATION_OVERHEAD: usize = 256;
+
+/// The most side data entries a picture the replay queue takes may carry. A
+/// decoder makes one for each message it reads — FFmpeg's H.264 decoder one
+/// per unregistered SEI message, with no cap of its own — and each is
+/// priced alone, so a picture past this is refused by name before its table
+/// is walked ([`crate::UnpricedHolding::SideDataEntries`]), and the walk is
+/// bounded by it. A legitimate stream carries a handful — HDR metadata,
+/// captions, a timecode and film grain are under 16 — and the frame
+/// conversion keeps at most 64 (`crate::convert::SIDE_DATA_MAX_ENTRIES`).
+const MAX_SIDE_DATA_ENTRIES: usize = 256;
+
+/// What one allocation of `payload` bytes that a decoded picture owns is
+/// priced at: the payload rounded up to [`ALLOCATION_ALIGN`], and
+/// [`ALLOCATION_OVERHEAD`].
+const fn allocation(payload: usize) -> usize {
+  payload
+    .div_ceil(ALLOCATION_ALIGN)
+    .saturating_mul(ALLOCATION_ALIGN)
+    .saturating_add(ALLOCATION_OVERHEAD)
+}
+
+/// The bytes a decoded picture holds, every separately allocated object it
+/// owns priced as an [`allocation`] — its payload rounded up to the
+/// allocator's alignment, and the allocator's and the buffer's own overhead:
+///
+/// - each buffer its pixels reference — `buf[]` and `extended_buf` — or, for
+///   a picture that references none, an upper bound on what its format and
+///   dimensions allocate (`crate::footprint::video_frame_bytes`);
+/// - `opaque_ref` and `hw_frames_ctx`;
+/// - its side data, whatever the pixels weigh: the table of entries, and for
+///   each entry the entry, its buffer (SEI payloads, ICC profiles, …) and
+///   its metadata;
+/// - each dictionary — the frame's metadata, each side data entry's — and
+///   each of its entries' two strings ([`dictionary_bytes`]).
+///
+/// Pricing payloads alone charged a minimal SEI entry its 16 bytes while it
+/// held several allocations, so a picture admitted under the budget could
+/// hold several times it.
 ///
 /// A picture holding an allocation of no stated size is refused by name
 /// ([`UnpricedFrame`](crate::UnpricedFrame)): a `private_ref` — libavcodec's
 /// own, which it clears before a frame leaves a decoder — and side data no
-/// buffer reference owns. What the budget cannot price is never admitted as
-/// costing nothing.
+/// buffer reference owns, or a side data table that does not hold its
+/// entries; so is one carrying more than [`MAX_SIDE_DATA_ENTRIES`] side data
+/// entries. What the budget cannot price is never admitted as costing
+/// nothing.
 fn footprint(frame: &frame::Video) -> Result<usize, crate::UnpricedFrame> {
   use crate::UnpricedHolding;
   let refused = |holding| Err(crate::UnpricedFrame::new(holding));
   // SAFETY: `frame` is a live `AVFrame`; its buffer reference pointers and
-  // their `size`, its side data table — each entry's buffer reference,
-  // payload pointer, size and metadata, never its type, which is a bindgen
-  // enum — its dictionaries, read through FFmpeg's iterator, and three plain
-  // integers are read, and no reference into FFmpeg memory is kept.
+  // their `size`, its side data table — at most `MAX_SIDE_DATA_ENTRIES`
+  // entries, each entry's buffer reference, payload pointer, size and
+  // metadata, never its type, which is a bindgen enum — its dictionaries,
+  // read through FFmpeg's iterator, and four plain integers are read, and no
+  // reference into FFmpeg memory is kept.
   unsafe {
     let raw = frame.as_ptr();
     let referenced = |buf: *const ffmpeg_next::ffi::AVBufferRef| {
-      if buf.is_null() { 0 } else { (*buf).size }
+      if buf.is_null() {
+        0
+      } else {
+        allocation((*buf).size)
+      }
     };
     let mut pixels: usize = 0;
     for &buf in &(*raw).buf {
@@ -3579,11 +3633,26 @@ fn footprint(frame: &frame::Video) -> Result<usize, crate::UnpricedFrame> {
       .saturating_add(referenced((*raw).opaque_ref))
       .saturating_add(referenced((*raw).hw_frames_ctx))
       .saturating_add(dictionary_bytes((*raw).metadata));
-    let entries = usize::try_from((*raw).nb_side_data).unwrap_or(0);
+    let Ok(entries) = usize::try_from((*raw).nb_side_data) else {
+      return refused(UnpricedHolding::SideData);
+    };
+    if entries > MAX_SIDE_DATA_ENTRIES {
+      return refused(UnpricedHolding::SideDataEntries {
+        count: entries,
+        cap: MAX_SIDE_DATA_ENTRIES,
+      });
+    }
+    if entries == 0 {
+      return Ok(total);
+    }
     let table = (*raw).side_data;
-    if entries > 0 && table.is_null() {
+    if table.is_null() {
       return refused(UnpricedHolding::SideData);
     }
+    // The table holds a pointer per entry, one allocation.
+    total = total.saturating_add(allocation(
+      entries * core::mem::size_of::<*mut ffmpeg_next::ffi::AVFrameSideData>(),
+    ));
     for index in 0..entries {
       let entry = *table.add(index);
       if entry.is_null() {
@@ -3597,6 +3666,9 @@ fn footprint(frame: &frame::Video) -> Result<usize, crate::UnpricedFrame> {
       }
       let metadata = core::ptr::read(core::ptr::addr_of!((*entry).metadata));
       total = total
+        .saturating_add(allocation(core::mem::size_of::<
+          ffmpeg_next::ffi::AVFrameSideData,
+        >()))
         .saturating_add(referenced(buf))
         .saturating_add(dictionary_bytes(metadata));
     }
@@ -3604,23 +3676,29 @@ fn footprint(frame: &frame::Video) -> Result<usize, crate::UnpricedFrame> {
   }
 }
 
-/// The bytes an `AVDictionary`'s entries hold: each entry and its two
-/// NUL-terminated strings. Zero for a null dictionary.
+/// What an `AVDictionary` holds, each allocation priced ([`allocation`]): the
+/// dictionary itself — its count and its entry array's pointer, 16 bytes in
+/// FFmpeg 9's `dict.c` — the array of entries, and each entry's key and
+/// value, NUL-terminated strings of their own. Zero for a null dictionary.
 ///
 /// # Safety
 /// `dict` is null or a live `AVDictionary`.
 unsafe fn dictionary_bytes(dict: *const ffmpeg_next::ffi::AVDictionary) -> usize {
-  let mut total: usize = 0;
+  /// FFmpeg 9's `struct AVDictionary`, opaque to its users: an `int` count
+  /// and the entry array's pointer.
+  const DICTIONARY_BYTES: usize = 16;
   if dict.is_null() {
-    return total;
+    return 0;
   }
+  let mut entries: usize = 0;
+  let mut strings: usize = 0;
   let mut entry: *const ffmpeg_next::ffi::AVDictionaryEntry = core::ptr::null();
   loop {
     // SAFETY: `dict` is live (the caller's promise) and `entry` is null or
     // the entry this iterator answered last.
     entry = unsafe { ffmpeg_next::ffi::av_dict_iterate(dict, entry) };
     if entry.is_null() {
-      return total;
+      break;
     }
     // SAFETY: a live entry's key and value are NUL-terminated strings the
     // dictionary owns.
@@ -3630,11 +3708,16 @@ unsafe fn dictionary_bytes(dict: *const ffmpeg_next::ffi::AVDictionary) -> usize
         core::ffi::CStr::from_ptr((*entry).value).to_bytes().len(),
       )
     };
-    total = total
-      .saturating_add(core::mem::size_of::<ffmpeg_next::ffi::AVDictionaryEntry>())
-      .saturating_add(key + 1)
-      .saturating_add(value + 1);
+    entries += 1;
+    strings = strings
+      .saturating_add(allocation(key + 1))
+      .saturating_add(allocation(value + 1));
   }
+  allocation(DICTIONARY_BYTES)
+    .saturating_add(allocation(entries.saturating_mul(core::mem::size_of::<
+      ffmpeg_next::ffi::AVDictionaryEntry,
+    >())))
+    .saturating_add(strings)
 }
 
 /// **The proof table**: how a post-commit resync anchored on `rule`'s stream

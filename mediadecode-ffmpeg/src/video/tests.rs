@@ -4380,19 +4380,23 @@ fn a_replay_whose_last_packet_parks_a_picture_takes_no_input_until_it_is_out() {
   assert_eq!(shown, every, "every picture once, in order");
 }
 
-/// LAW (Codex R10, [high]): **a picture is priced by every allocation it
-/// owns, and one it cannot price is refused by name.** A 16x16 picture's
-/// pixel buffers, then 100 MiB of side data attached to it: the footprint
-/// grows by exactly the side data's 100 MiB; a metadata entry and an
-/// `opaque_ref` count too. With the side data's bytes owned by no buffer
-/// reference, the picture is refused as `UnpricedFrame`, naming the side
-/// data. Pricing the pixel buffers alone, the picture cost its 16x16 pixels
-/// whatever it carried — 64 such pictures fit a budget of a few hundred
-/// kilobytes and held gigabytes.
+/// LAW (Codex R10, [high]; restated by Codex R11): **a picture is priced by
+/// every allocation it owns, and one it cannot price is refused by name.** A
+/// 16x16 picture's pixel buffers, then 100 MiB of side data attached to it:
+/// the footprint grows by the side data's 100 MiB and the three allocations
+/// it took — the table, the entry and the buffer, each its payload rounded
+/// up to 64 bytes and the overhead an allocation costs; a metadata entry
+/// (the dictionary, its entry array, its key and its value) and an
+/// `opaque_ref` count the same way. With the side data's bytes owned by no
+/// buffer reference, the picture is refused as `UnpricedFrame`, naming the
+/// side data. Pricing the pixel buffers alone, the picture cost its 16x16
+/// pixels whatever it carried — 64 such pictures fit a budget of a few
+/// hundred kilobytes and held gigabytes.
 #[test]
 fn a_picture_is_priced_by_every_allocation_it_owns_and_refused_where_it_cannot_be() {
   use ffmpeg_next::ffi;
   const SIDE_DATA: usize = 100 << 20;
+  const OVERHEAD: usize = super::ALLOCATION_OVERHEAD;
   let mut picture = frame::Video::new(ffmpeg_next::format::Pixel::YUV420P, 16, 16);
   let pixels = super::footprint(&picture).expect("a picture of pixels alone");
   assert!(pixels > 0, "its pixel buffers are priced");
@@ -4406,10 +4410,13 @@ fn a_picture_is_priced_by_every_allocation_it_owns_and_refused_where_it_cannot_b
     )
   };
   assert!(!side.is_null(), "100 MiB of side data attached");
+  // The table holds one 8-byte pointer and the entry is 40 bytes: 64 each
+  // once aligned. 100 MiB is a multiple of 64.
+  let side_data = (64 + OVERHEAD) + (64 + OVERHEAD) + (SIDE_DATA + OVERHEAD);
   assert_eq!(
     super::footprint(&picture),
-    Ok(pixels + SIDE_DATA),
-    "the side data counts its 100 MiB"
+    Ok(pixels + side_data),
+    "the side data counts its 100 MiB and its three allocations"
   );
   let (key, value) = (c"comment", c"a frame metadata entry");
   // SAFETY: as above.
@@ -4422,16 +4429,18 @@ fn a_picture_is_priced_by_every_allocation_it_owns_and_refused_where_it_cannot_b
     )
   };
   assert_eq!(set, 0, "a metadata entry set");
-  let entry = core::mem::size_of::<ffi::AVDictionaryEntry>()
-    + key.to_bytes().len()
-    + 1
-    + value.to_bytes().len()
-    + 1;
+  assert!(
+    key.to_bytes_with_nul().len() <= 64 && value.to_bytes_with_nul().len() <= 64,
+    "each string fits one aligned unit"
+  );
+  // The dictionary (16 bytes), its one-entry array (16), the key and the
+  // value: four allocations of one aligned unit each.
+  let metadata = 4 * (64 + OVERHEAD);
   // SAFETY: as above; the frame takes the reference.
   unsafe { (*picture.as_mut_ptr()).opaque_ref = ffi::av_buffer_allocz(4096) };
   assert_eq!(
     super::footprint(&picture),
-    Ok(pixels + SIDE_DATA + entry + 4096),
+    Ok(pixels + side_data + metadata + (4096 + OVERHEAD)),
     "its metadata and its opaque reference count too"
   );
   // SAFETY: the side data's buffer reference is taken off it for the
@@ -4447,6 +4456,157 @@ fn a_picture_is_priced_by_every_allocation_it_owns_and_refused_where_it_cannot_b
       "side data no buffer reference owns is refused by name"
     );
   }
+}
+
+/// A 16x16 picture carrying `entries` side data entries of `payload` bytes
+/// each, attached the way a decoder attaches an unregistered SEI message.
+fn picture_with_side_data(entries: usize, payload: usize) -> frame::Video {
+  use ffmpeg_next::ffi;
+  let mut picture = frame::Video::new(ffmpeg_next::format::Pixel::YUV420P, 16, 16);
+  for _ in 0..entries {
+    // SAFETY: `picture` is a live frame this function owns; FFmpeg allocates
+    // the entry and its buffer, and frees them with the frame.
+    let side = unsafe {
+      ffi::av_frame_new_side_data(
+        picture.as_mut_ptr(),
+        ffi::AVFrameSideDataType::AV_FRAME_DATA_SEI_UNREGISTERED,
+        payload,
+      )
+    };
+    assert!(!side.is_null(), "a side data entry attached");
+  }
+  picture
+}
+
+/// LAW (Codex R11, [high]): **every side data entry is priced at the
+/// allocations it holds, however small its payload: at least 256 bytes.** A
+/// 16x16 picture carrying 64 entries of 16 bytes each — what an unregistered
+/// SEI message holding only its UUID makes. Each entry holds the entry
+/// itself, its slot in the table, its buffer's two reference-counting
+/// structs and its payload, every one an allocation of its own, aligned and
+/// with its allocator's header; the footprint grows by at least 256 bytes
+/// for each. Priced by payload, each cost its 16 bytes, and a picture
+/// admitted under the budget could hold several times it.
+#[test]
+fn every_side_data_entry_is_priced_at_the_allocations_it_holds() {
+  const ENTRIES: usize = 64;
+  const PAYLOAD: usize = 16;
+  let pixels = super::footprint(&picture_with_side_data(0, PAYLOAD)).expect("pixels alone");
+  let priced = super::footprint(&picture_with_side_data(ENTRIES, PAYLOAD)).expect("priced");
+  assert!(
+    priced - pixels >= ENTRIES * 256,
+    "{ENTRIES} entries of {PAYLOAD} bytes priced at {} bytes, under {} — 256 apiece",
+    priced - pixels,
+    ENTRIES * 256
+  );
+}
+
+/// `packet`, an Annex B access unit, with an SEI NAL unit carrying
+/// `messages` unregistered user data messages — each its 16-byte UUID and
+/// nothing more — before its first picture's unit.
+fn with_unregistered_seis(packet: &Packet, messages: usize) -> Packet {
+  let data = packet.data().expect("a payload");
+  let start = (0..data.len().saturating_sub(3))
+    .find(|&at| data[at..].starts_with(&[0, 0, 1]) && (1..=5).contains(&(data[at + 3] & 0x1f)))
+    .expect("a picture's unit behind a start code");
+  // Before a four-byte start code's leading zero, too.
+  let start = if start > 0 && data[start - 1] == 0 {
+    start - 1
+  } else {
+    start
+  };
+  let mut sei = vec![0, 0, 0, 1, 0x06];
+  for _ in 0..messages {
+    // `payload_type` 5, user data unregistered; `payload_size` 16; a UUID
+    // with no zero byte, so no emulation prevention is due.
+    sei.extend_from_slice(&[0x05, 0x10]);
+    sei.extend_from_slice(&[0x55; 16]);
+  }
+  sei.push(0x80);
+  let mut bytes = data[..start].to_vec();
+  bytes.extend_from_slice(&sei);
+  bytes.extend_from_slice(&data[start..]);
+  let mut out = Packet::copy(&bytes);
+  out.set_pts(packet.pts());
+  out.set_dts(packet.dts());
+  out.set_flags(packet.flags());
+  out
+}
+
+/// The side data entries the picture `packet` decodes to carries, decoded
+/// alone on one thread.
+fn side_data_entries_of(clip: &SyntheticClip, packet: &Packet) -> usize {
+  let mut sw = super::open_sw_decoder(
+    &clip.parameters,
+    crate::DecoderLimits::default().with_threads(crate::Threads::Single),
+    None,
+  )
+  .expect("a software decoder");
+  sw.submit(packet).expect("the packet");
+  sw.send_eof().expect("the end of the stream");
+  let mut picture = alloc_av_video_frame().expect("a frame");
+  sw.receive_frame(&mut picture).expect("a picture");
+  // SAFETY: `picture` is a live frame; one plain integer field is read.
+  usize::try_from(unsafe { (*picture.as_ptr()).nb_side_data }).expect("a count")
+}
+
+/// LAW (Codex R11, [high]): **a picture carrying more side data entries
+/// than the queue prices is refused by name, and released.** By hand: a
+/// picture with 257 entries, one past the cap, is refused by `footprint` as
+/// `UnpricedFrame`, naming the count and the cap (256), before its table is
+/// walked; at the cap it is priced. From the decoder: an H.264 IDR picture
+/// whose access unit carries an SEI NAL unit of 257 unregistered user data
+/// messages — FFmpeg's decoder makes one side data entry for each, with no
+/// cap of its own — decoded on one thread and drained into a queue whose
+/// budget holds the picture many times over. The drain answers the refusal,
+/// naming the count, and the picture is neither queued nor parked: it is
+/// released with the error. Uncapped, the queue walked and admitted every
+/// entry a stream could make.
+#[test]
+fn a_picture_past_the_side_data_cap_is_refused_by_name_and_released() {
+  const CAP: usize = 256;
+  let over = |count| {
+    Err(crate::UnpricedFrame::new(
+      crate::UnpricedHolding::SideDataEntries { count, cap: CAP },
+    ))
+  };
+  assert!(
+    super::footprint(&picture_with_side_data(CAP, 1)).is_ok(),
+    "at the cap a picture is priced"
+  );
+  assert_eq!(
+    super::footprint(&picture_with_side_data(CAP + 1, 1)),
+    over(CAP + 1),
+    "one past the cap is refused by name"
+  );
+
+  let clip = encode_h264_without_b_frames(64, 64, 8);
+  let idr = &clip.packets[0];
+  let own = side_data_entries_of(&clip, idr);
+  let flooded = with_unregistered_seis(idr, CAP + 1);
+  let mut sw = super::open_sw_decoder(
+    &clip.parameters,
+    crate::DecoderLimits::default().with_threads(crate::Threads::Single),
+    None,
+  )
+  .expect("a software decoder");
+  sw.submit(&flooded).expect("the flooded IDR");
+  sw.send_eof().expect("the end of the stream");
+  let state = sw.state();
+  let mut queue = super::ReplayQueue::default();
+  match super::drain_into(&mut sw, state, &mut queue, crate::DEFAULT_MAX_REPLAY_BYTES) {
+    Err(Error::UnpricedFrame(refused)) => assert_eq!(
+      Err(refused),
+      over(own + CAP + 1),
+      "one side data entry per message, on top of the picture's own {own}"
+    ),
+    Err(other) => panic!("refused by another name: {other:?}"),
+    Ok(drained) => panic!("the flooded picture was admitted: {drained:?}"),
+  }
+  assert!(
+    queue.frames.is_empty() && queue.parked.is_none() && queue.bytes == 0,
+    "the picture is neither queued nor parked"
+  );
 }
 
 /// LAW (Codex R4, [high]): **a switch's drain past the budget waits for the
