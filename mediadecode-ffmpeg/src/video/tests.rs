@@ -5144,19 +5144,21 @@ fn after_a_decode_error_across_the_gap_the_next_h264_anchor_is_proved_by_the_bou
   assert!(!escalated, "the end is clean");
 }
 
-/// LAW (Codex R10, [high]): **the withheld proof is FFmpeg's own `h264`'s:
-/// a session opened on another implementation of the codec proves its
-/// resync by the reorder bound.** A 16-frame `libx264` open-GOP clip, the
-/// hardware failing post-commit at its recovery point (8). On FFmpeg's own
-/// `h264`, which the software road opens by name, the recovery point's
-/// picture, out first, closes the gap. Taken to be another implementation —
-/// `h264_cuvid`, which keeps no such gate (a test seam names it) — the same
-/// session proves the resync by the bound, a depth of 2: 8 and 9 come out
-/// with the gap open, and 10 closes it. Chosen by the codec id alone, the
-/// proof was the withheld output whatever implementation decoded, and a
-/// picture from before the anchor could certify the recovery.
+/// LAW (Codex R11, [high]; restating Codex R10's): **a post-commit fallback
+/// onto a decoder that wraps another implementation is refused by name, and
+/// nothing is committed.** A 16-frame `libx264` open-GOP clip, the hardware
+/// failing post-commit at its recovery point (8). On FFmpeg's own `h264` the
+/// recovery point's picture, out first, closes the gap. With the next open
+/// reading as wrapped (a test seam: `cuvid`, whose `h264_cuvid` keeps a
+/// display delay it never publishes), the send that would commit the
+/// fallback answers `Error::ResyncUnprovable`, naming the codec, the
+/// implementation opened and its wrapper: the wrapped decoder took no
+/// packet and is closed, the session is still on the hardware, and no gap
+/// is open. A session opened on software, and a probe-era fallback, decode
+/// the same clip whole on a wrapped decoder: they owe no proof. R10 proved a
+/// wrapped decoder by the reorder bound, which it does not publish.
 #[test]
-fn a_session_on_another_implementation_of_h264_proves_its_resync_by_the_bound() {
+fn a_post_commit_fallback_onto_a_wrapped_decoder_is_refused_by_name() {
   let clip = encode_h264_open_gops(128, 96, 16);
   let at = keyframe_after(&clip, 3);
   let recovery_point = clip.packets[at].pts().expect("a pts");
@@ -5166,17 +5168,147 @@ fn a_session_on_another_implementation_of_h264_proves_its_resync_by_the_bound() 
     Some(&(recovery_point, false)),
     "on `h264` the first picture out closes the gap: {native:?}"
   );
-  super::sw_implementation::name_next("h264_cuvid");
-  let (_, other, other_escalated) = through_a_post_commit_failure(&clip, at);
+  assert!(!native_escalated, "the end is clean: {native:?}");
+
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test(
+    Box::new(FakeHw::failing(128, 96, at, at, FailShape::PostCommit)),
+    clip.parameters.clone(),
+    tb,
+  )
+  .expect("build test decoder");
+  for av_pkt in &clip.packets[..at] {
+    crate::accepted(dec.send_packet(&pushed(av_pkt)), "send_packet");
+    drain_ready(&mut dec);
+  }
+  super::live_sw::reset_peak();
+  super::live_sw::reset_sent();
+  super::sw_implementation::wrapped_next("cuvid");
+  match dec.send_packet(&pushed(&clip.packets[at])) {
+    Err(VideoDecodeError::Decode(Error::ResyncUnprovable(refused))) => assert_eq!(
+      (refused.codec(), refused.implementation(), refused.wrapper()),
+      (crate::CodecId::H264, Some("h264"), Some("cuvid")),
+      "the codec, the implementation opened and its wrapper are named"
+    ),
+    Err(other) => panic!("refused by another name: {other:?}"),
+    Ok(sent) => panic!("the fallback onto a wrapped decoder committed: {sent:?}"),
+  }
+  assert_eq!(super::live_sw::peak(), 1, "the wrapped decoder was opened");
+  assert_eq!(super::live_sw::sent(), 0, "and handed nothing");
+  super::live_sw::reset_peak();
   assert_eq!(
-    other.iter().take_while(|&&(_, open)| open).count(),
-    2,
-    "on another implementation the bound, a depth of 2, holds two pictures open: {other:?}"
+    super::live_sw::peak(),
+    0,
+    "and closed: no software decoder is open"
   );
+  assert!(!dec.is_software(), "the session is still on the hardware");
   assert!(
-    !native_escalated && !other_escalated,
-    "both ends clean: {native:?} / {other:?}"
+    !dec.degraded_resync_pending_for_test(),
+    "no gap is open: nothing was committed"
   );
+
+  // Opened on software, the same clip decodes whole on a wrapped decoder.
+  super::sw_implementation::wrapped_next("cuvid");
+  let mut software = FfmpegVideoStreamDecoder::open_as(
+    clip.parameters.clone(),
+    tb,
+    DecoderLimits::default(),
+    DecodePath::Software,
+  )
+  .expect("a session opened on software, on a wrapped decoder");
+  let mut dst = crate::empty_owned_video_frame();
+  let mut decoded = 0;
+  for av_pkt in &clip.packets {
+    crate::accepted(software.send_packet(&pushed(av_pkt)), "send_packet");
+    while let Received::Frame = software.receive_frame(&mut dst).expect("receive_frame") {
+      decoded += 1;
+    }
+  }
+  crate::accepted(software.send_eof(), "send_eof");
+  while let Received::Frame = software.receive_frame(&mut dst).expect("receive_frame") {
+    decoded += 1;
+  }
+  assert_eq!(
+    decoded,
+    clip.packets.len(),
+    "every picture, opened on software"
+  );
+
+  // So does a probe-era fallback, which replays the whole history.
+  super::sw_implementation::wrapped_next("cuvid");
+  let (replayed, _) = threads_through_a_fallback(&clip, 3, crate::Threads::Single);
+  assert_eq!(
+    replayed.len(),
+    clip.packets.len(),
+    "every picture, through a probe-era fallback"
+  );
+}
+
+/// LAW (Codex R11, [high]): **every codec this suite decodes is decoded, in
+/// this build, by libavcodec's own decoder.** For each codec the fixtures
+/// encode — H.264, HEVC, MPEG-4 part 2, MPEG-2, H.263, ProRes, Ut Video, VP8
+/// — and VP9, whose keyframes reset every reference, the decoder
+/// `avcodec_find_decoder` answers, which the software road opens, has a null
+/// `wrapper_name`: the invariant the post-commit resync laws, and that
+/// fallback in CI's builds, stand on. AV1 is held to it only where the build
+/// answers a native decoder first: FFmpeg's own `av1` decodes only through a
+/// hardware accelerator and is listed after `libdav1d`, a wrapper. Where
+/// `libdav1d` answers (Homebrew's FFmpeg 9 does), the software road reads it
+/// as wrapped and names it, and a post-commit fallback on AV1 is refused by
+/// name.
+#[test]
+fn the_software_road_opens_libavcodecs_own_decoder_for_every_fixture_codec() {
+  use ffmpeg_next::ffi::{AVCodecID, AVMediaType};
+  let parameters_of = |id: AVCodecID| {
+    let mut parameters = Parameters::new();
+    // SAFETY: `parameters` owns a fresh `AVCodecParameters`; two fields are
+    // written with values of their own types.
+    unsafe {
+      (*parameters.as_mut_ptr()).codec_type = AVMediaType::AVMEDIA_TYPE_VIDEO;
+      (*parameters.as_mut_ptr()).codec_id = id;
+    }
+    parameters
+  };
+  for id in [
+    AVCodecID::AV_CODEC_ID_H264,
+    AVCodecID::AV_CODEC_ID_HEVC,
+    AVCodecID::AV_CODEC_ID_MPEG4,
+    AVCodecID::AV_CODEC_ID_MPEG2VIDEO,
+    AVCodecID::AV_CODEC_ID_H263,
+    AVCodecID::AV_CODEC_ID_PRORES,
+    AVCodecID::AV_CODEC_ID_UTVIDEO,
+    AVCodecID::AV_CODEC_ID_VP8,
+    AVCodecID::AV_CODEC_ID_VP9,
+  ] {
+    let codec = crate::decoder::find_decoder(&parameters_of(id)).expect("a decoder for the codec");
+    assert!(
+      super::wrapper_name(codec).is_null(),
+      "{id:?}: the software road opens `{}`, a wrapper",
+      codec.name()
+    );
+  }
+  let av1 = parameters_of(AVCodecID::AV_CODEC_ID_AV1);
+  let Ok(codec) = crate::decoder::find_decoder(&av1) else {
+    return;
+  };
+  let sw = super::open_sw_decoder(&av1, DecoderLimits::default(), None).expect("an AV1 decoder");
+  assert_eq!(
+    (sw.native, sw.wrapper.is_some()),
+    (
+      super::wrapper_name(codec).is_null(),
+      !super::wrapper_name(codec).is_null()
+    ),
+    "AV1 on `{}`: the software road reads its wrapper as the codec list holds it",
+    codec.name()
+  );
+  if !sw.native {
+    let refused = sw.resync_unprovable();
+    assert_eq!(
+      (refused.codec(), refused.implementation()),
+      (crate::CodecId::AV1, Some(codec.name())),
+      "the refusal names the codec and the implementation: {refused}"
+    );
+  }
 }
 
 /// LAW (Codex R9, [high]): **a software video decoder set to output

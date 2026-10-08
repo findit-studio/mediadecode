@@ -1065,7 +1065,10 @@ impl VideoDecoder {
       // The software road's open; no hardware funnel mints it either.
       | Error::UnrecoveredOutput(_)
       // The software road's queue again.
-      | Error::UnpricedFrame(_) => VerdictRouting::Direct,
+      | Error::UnpricedFrame(_)
+      // The software road's post-commit fallback; no hardware funnel mints
+      // it.
+      | Error::ResyncUnprovable(_) => VerdictRouting::Direct,
     }
   }
 

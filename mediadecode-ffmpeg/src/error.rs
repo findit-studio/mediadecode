@@ -170,6 +170,90 @@ pub enum Error {
   /// queued as costing nothing; see [`UnpricedFrame`].
   #[error(transparent)]
   UnpricedFrame(#[from] UnpricedFrame),
+
+  /// A post-commit fallback's software decoder wraps another implementation
+  /// of the codec — a hardware or OS framework, or an external library —
+  /// rather than being one of libavcodec's own, so the resync the fallback
+  /// owes could never be proved; the fallback is refused by name at the
+  /// open it would commit; see [`ResyncUnprovable`].
+  #[error(transparent)]
+  ResyncUnprovable(#[from] ResyncUnprovable),
+}
+
+/// Payload for [`Error::ResyncUnprovable`].
+///
+/// A post-commit fallback opens a software decoder cold, mid-stream, and
+/// drops the pictures up to the next random-access point; the session then
+/// owes a proof that the pictures it delivers past that point come from
+/// after it. Both proofs it has are invariants of libavcodec's own decoders:
+/// FFmpeg's `h264` withholds every picture it has not recovered, and
+/// libavcodec's decoders publish how many pictures their reorder buffer can
+/// hold back (`has_b_frames`), holding none past that once they answer
+/// "needs input". A decoder that wraps another implementation —
+/// `h264_cuvid`, `h264_qsv`, `h264_v4l2m2m`, `h264_mediacodec`, `libdav1d`,
+/// `libvpx-vp9`, … (`AVCodec.wrapper_name` set) — publishes no reorder bound
+/// (`h264_cuvid` keeps a display delay of several pictures and leaves
+/// `has_b_frames` at zero) and withholds nothing, and its "needs input" does
+/// not say its pipeline is empty, so a picture from before the gap could
+/// close it. The fallback is refused at the open it would commit: that
+/// decoder is closed, nothing is committed, and the session stays where it
+/// was.
+///
+/// Only this road needs a proof. A session opened on software from the
+/// start, and a probe-era fallback, which replays the whole history, decode
+/// on a wrapped implementation as on any other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+  "a post-commit fallback was refused: the software decoder for {codec:?}, {implementation}, \
+   wraps {wrapper}, which publishes no reorder bound and withholds no unrecovered picture, so \
+   the resync after the gap could not be proved",
+  implementation = name_or_unread(.implementation),
+  wrapper = name_or_unread(.wrapper),
+)]
+pub struct ResyncUnprovable {
+  codec: crate::CodecId,
+  implementation: Option<&'static str>,
+  wrapper: Option<&'static str>,
+}
+
+impl ResyncUnprovable {
+  /// Constructs a [`ResyncUnprovable`] payload.
+  #[inline]
+  pub const fn new(
+    codec: crate::CodecId,
+    implementation: Option<&'static str>,
+    wrapper: Option<&'static str>,
+  ) -> Self {
+    Self {
+      codec,
+      implementation,
+      wrapper,
+    }
+  }
+  /// The stream's codec.
+  #[inline]
+  pub const fn codec(&self) -> crate::CodecId {
+    self.codec
+  }
+  /// The software decoder that was opened and refused, by FFmpeg's name for
+  /// it (`AVCodec.name`: `h264_cuvid`, `libdav1d`), or `None` where that
+  /// name does not read as FFmpeg's ASCII.
+  #[inline]
+  pub const fn implementation(&self) -> Option<&'static str> {
+    self.implementation
+  }
+  /// What it wraps (`AVCodec.wrapper_name`: `cuvid`, `libdav1d`), or `None`
+  /// where that name does not read as FFmpeg's ASCII.
+  #[inline]
+  pub const fn wrapper(&self) -> Option<&'static str> {
+    self.wrapper
+  }
+}
+
+/// A name FFmpeg's tables gave, for a message — or what to say where it did
+/// not read.
+fn name_or_unread(name: &Option<&'static str>) -> &'static str {
+  name.unwrap_or("(a name that does not read)")
 }
 
 /// What a decoded picture holds that the replay queue's budget cannot price

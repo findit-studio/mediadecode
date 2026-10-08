@@ -47,16 +47,19 @@
 //!   codec whose pictures this crate does not read, the key flag FFmpeg's
 //!   parser set — since an intra picture resets the references of every picture
 //!   after it that does not lead it; it is fed once the decoder's output is
-//!   settled (drained to "needs input" since the last packet). For H.264 on
-//!   FFmpeg's own `h264` decoder, the implementation the software road opens
-//!   by name, the first picture out after the anchor closes the gap: opened
+//!   settled (drained to "needs input" since the last packet). Both proofs
+//!   are invariants of libavcodec's own decoders, so the post-commit fallback
+//!   refuses, by name, a software decoder that wraps another implementation
+//!   (`AVCodec.wrapper_name` set: `h264_cuvid`, `libdav1d`, …), which
+//!   publishes no reorder bound and withholds nothing
+//!   ([`Error::ResyncUnprovable`]). For H.264 on FFmpeg's own `h264`
+//!   decoder, the first picture out after the anchor closes the gap: opened
 //!   with neither `AV_CODEC_FLAG_OUTPUT_CORRUPT` nor `AV_CODEC_FLAG2_SHOW_ALL`
 //!   (an open that finds either set is refused, [`Error::UnrecoveredOutput`]),
 //!   it outputs only pictures its recovery tracking has marked recovered, and
-//!   a decoder opened cold across the gap starts with nothing recovered;
-//!   another implementation of the codec, and an anchor after a decode error
-//!   across the gap, take the reorder bound. For every other codec the only
-//!   pictures from before the
+//!   a decoder opened cold across the gap starts with nothing recovered; an
+//!   anchor after a decode error across the gap takes the reorder bound. For
+//!   every other codec the only pictures from before the
 //!   anchor that can still come out are the ones its reorder buffer holds, at
 //!   most `has_b_frames` of them (the largest value read from just before the
 //!   anchoring packet was submitted on — a keyframe can activate parameters
@@ -340,11 +343,12 @@ pub struct CarrierVideoStreamDecoder<C: crate::FfmpegCarrier> {
   /// Whether the stream's keyframes reset every reference with no
   /// reordering (VP8, VP9, AV1): the bound is the first picture.
   anchor_resets: bool,
-  /// How the anchored resync is proved, the stream's codec rule
-  /// ([`access::KeyframeRule::proof`]): FFmpeg withholding every picture it
-  /// has not recovered (H.264), so the first picture out closes the gap, or
-  /// the reorder bound.
-  anchor_proof: access::Proof,
+  /// How the anchored resync is proved ([`resync_proof`]): FFmpeg
+  /// withholding every picture it has not recovered (H.264), so the first
+  /// picture out closes the gap, or the reorder bound — on one of
+  /// libavcodec's own decoders; `None`, nothing closing the gap, on an
+  /// implementation that wraps another, and before an anchor.
+  anchor_proof: Option<access::Proof>,
   /// `true` once the software decoder reported a decode error across the
   /// open gap — on a send or a receive, before any proof closed it — until a
   /// proof closes the gap, a seek resets it, or a new post-commit gap opens
@@ -692,13 +696,20 @@ struct Restart {
 /// a new abstraction.
 pub(crate) struct SwDecoder {
   decoder: ffmpeg_next::decoder::Video,
-  /// Whether the implementation opened is FFmpeg's own H.264 decoder,
-  /// `h264` by name — the one whose output gate withholds every picture it
-  /// has not recovered, which the withheld resync proof stands on
-  /// ([`access::KeyframeRule::proof`]). Any other implementation of the
-  /// codec — a hardware wrapper such as `h264_cuvid`, `h264_qsv`, a V4L2
-  /// memory-to-memory or a MediaCodec one — keeps no such gate.
-  native_h264: bool,
+  /// Whether the implementation opened is one of libavcodec's own decoders:
+  /// its `AVCodec.wrapper_name` is null. The post-commit resync's proofs
+  /// ([`resync_proof`]) are invariants of those decoders alone — FFmpeg's
+  /// `h264` withholding every picture it has not recovered, the reorder
+  /// bound `has_b_frames` that libavcodec's decoders publish — and an
+  /// implementation that wraps another (`h264_cuvid`, `h264_qsv`,
+  /// `h264_v4l2m2m`, `h264_mediacodec`, `libdav1d`, `libvpx-vp9`, …) keeps
+  /// neither, so a post-commit fallback onto one is refused
+  /// ([`Error::ResyncUnprovable`]).
+  native: bool,
+  /// What the implementation opened wraps, as its `wrapper_name` reads —
+  /// `cuvid`, `libdav1d` — for that refusal's message alone; `None` for a
+  /// native one, or a name that does not read. [`Self::native`] decides.
+  wrapper: Option<&'static str>,
   /// Declared **after** the decoder: fields drop in declaration order,
   /// so the codec context is freed before the state it points at.
   _callback_state: Box<crate::ffi::CallbackState>,
@@ -883,7 +894,44 @@ impl SwDecoder {
     }
     told
   }
+
+  /// The refusal a post-commit fallback onto this decoder meets where its
+  /// implementation is not libavcodec's own ([`Self::native`]): the stream's
+  /// codec, and the implementation and its wrapper by name.
+  fn resync_unprovable(&self) -> crate::ResyncUnprovable {
+    // SAFETY: `self` is a live opened decoder. Its context's `codec_id` is
+    // read as the 32-bit integer the field holds, never formed into a
+    // bindgen enum; its `codec` is null or the `AVCodec` it was opened with,
+    // an entry of libavcodec's static codec list, whose `name` pointer is
+    // read through `addr_of!` without forming a reference to the entry
+    // (whose `type` and `id` are bindgen enums) and is a string literal
+    // valid for the process, as `table_text` requires.
+    let (codec_id, implementation) = unsafe {
+      let raw = self.as_ptr();
+      let codec_id = core::ptr::read(core::ptr::addr_of!((*raw).codec_id) as *const i32);
+      let codec = (*raw).codec;
+      let implementation = if codec.is_null() {
+        None
+      } else {
+        crate::ffi::table_text(
+          core::ptr::addr_of!((*codec).name).read(),
+          IMPLEMENTATION_NAME_MAX_BYTES,
+        )
+      };
+      (codec_id, implementation)
+    };
+    crate::ResyncUnprovable::new(
+      crate::CodecId::from_raw(codec_id),
+      implementation,
+      self.wrapper,
+    )
+  }
 }
+
+/// Upper bound on the NUL search for a codec implementation's name or its
+/// wrapper's — FFmpeg's run to a couple of dozen bytes; the cap exists only
+/// so that a corrupt table cannot turn the walk into an unbounded read.
+const IMPLEMENTATION_NAME_MAX_BYTES: usize = 128;
 
 impl core::ops::Deref for SwDecoder {
   type Target = ffmpeg_next::decoder::Video;
@@ -1019,7 +1067,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       degraded_anchored: false,
       anchor_reorder: 0,
       anchor_resets: false,
-      anchor_proof: access::Proof::ReorderBound,
+      anchor_proof: None,
       withheld_poisoned: false,
       anchor_definitive: false,
       anchor_recovery: None,
@@ -1768,7 +1816,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   fn session_threads_run(&self) -> bool {
     use ffmpeg_next::codec::Capabilities;
     self.limits.threads().thread_count() != 1
-      && sw_codec(&self.parameters).is_ok_and(|codec| {
+      && crate::decoder::find_decoder(&self.parameters).is_ok_and(|codec| {
         codec.capabilities().intersects(
           Capabilities::FRAME_THREADS | Capabilities::SLICE_THREADS | Capabilities::OTHER_THREADS,
         )
@@ -1881,7 +1929,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// `open_sw_decoder` and the input forward succeed. On any failure the new SW
   /// decoder is dropped and the decoder is left on its prior HW state, the error
   /// surfaced as [`Error::FallbackFailed`] (with an empty rescue set — a
-  /// post-commit failure never carries unconsumed packets). With no replay-frame
+  /// post-commit failure never carries unconsumed packets), or, for a budget
+  /// refusal or a software decoder whose resync could not be proved
+  /// ([`Error::ResyncUnprovable`]), by its own name. With no replay-frame
   /// retention there is nothing else to roll back.
   ///
   /// On a clean commit it enters degraded-resync mode (see
@@ -1926,6 +1976,12 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       // So it keeps the same spelling here as on every other road. One
       // fact, one name.
       Err(budget @ Error::FrameBudgetExceeded(_)) => Err(budget),
+      // **Nor is a refusal of the implementation.** Re-driven, the fallback
+      // opens the same decoder and is refused the same way; the name says
+      // what can change that — a build whose decoder for the codec is
+      // libavcodec's own, or a session opened on software at a
+      // random-access point, which owes no proof.
+      Err(unprovable @ Error::ResyncUnprovable(_)) => Err(unprovable),
       // Everything else really is the machinery failing, and keeps the
       // envelope — empty rescue set and all, which is what a
       // post-commit failure has to hand back.
@@ -1963,6 +2019,14 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     );
     let one_thread = self.limits.with_threads(crate::Threads::Single);
     let mut sw = open_sw_decoder(&self.parameters, one_thread, Some(self.time_base))?;
+    // **No proof, no commit.** This is the one road whose commit owes a
+    // proof — the resync after the gap — and every proof is an invariant of
+    // libavcodec's own decoders ([`resync_proof`]). A decoder that wraps
+    // another implementation is closed here, before it is handed anything,
+    // and the fallback refused by name.
+    if !sw.native {
+      return Err(Error::ResyncUnprovable(sw.resync_unprovable()));
+    }
     // Captured before the decoder is borrowed for the forward, and
     // before it can be dropped on the error road: this temporary
     // decoder owns the callback state, so a `judge_buffer` refusal
@@ -2040,7 +2104,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     self.degraded_anchored = false;
     self.anchor_reorder = 0;
     self.anchor_resets = false;
-    self.anchor_proof = access::Proof::ReorderBound;
+    self.anchor_proof = None;
     self.withheld_poisoned = false;
     self.anchor_definitive = false;
     self.anchor_recovery = None;
@@ -2071,14 +2135,8 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     self.anchor_reorder = reorder_before;
     let rule = self.keyframe_rule();
     self.anchor_resets = rule == access::KeyframeRule::Resets;
-    // The withheld proof is FFmpeg's own H.264 decoder's, and holds only
-    // while no decode error across the gap has left its recovery state in
-    // doubt.
-    let native = matches!(&self.state, DecodeState::Sw(sw) if sw.native_h264);
-    self.anchor_proof = match rule.proof() {
-      access::Proof::Withheld if !native || self.withheld_poisoned => access::Proof::ReorderBound,
-      proof => proof,
-    };
+    let native = matches!(&self.state, DecodeState::Sw(sw) if sw.native);
+    self.anchor_proof = resync_proof(rule, native, self.withheld_poisoned);
     self.anchor_definitive = anchor.definitive();
     self.anchor_recovery = anchor.recovery();
     if let Some(recovery) = self.anchor_recovery {
@@ -2135,13 +2193,12 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     }
   }
 
-  /// **The resync's proof**, by the stream's codec rule
-  /// ([`Self::anchor_proof`]); either closes the gap.
+  /// **The resync's proof**, by the stream's codec rule on one of
+  /// libavcodec's own decoders ([`Self::anchor_proof`], [`resync_proof`]);
+  /// either closes the gap, and without one the gap stays open.
   ///
   /// - **Withheld output (H.264, on FFmpeg's own `h264`):** the first
-  ///   picture out since the anchor. Another implementation of the codec
-  ///   keeps no such gate, and its anchors take the reorder bound
-  ///   ([`SwDecoder::native_h264`]). The session's software decoders are
+  ///   picture out since the anchor. The session's software decoders are
   ///   opened with neither
   ///   `AV_CODEC_FLAG_OUTPUT_CORRUPT` nor `AV_CODEC_FLAG2_SHOW_ALL` — an
   ///   open that finds either set is refused by name
@@ -2166,12 +2223,17 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   ///   for a stream whose keyframes reset every reference — the last of them
   ///   is at or after the anchor in decode order. FFmpeg's HEVC decoder
   ///   keeps no recovery gate for a stream it is already decoding.
+  /// - **None (an implementation that wraps another):** nothing closes the
+  ///   gap, and the end escalates. No such decoder serves across a gap — the
+  ///   post-commit fallback refuses one ([`Error::ResyncUnprovable`]) — so
+  ///   this is the binding stated where the proof is read.
   fn check_resync_proof(&mut self) {
     self.observe_reorder();
     let allowance = match self.anchor_proof {
-      access::Proof::Withheld => 0,
-      access::Proof::ReorderBound if self.anchor_resets => 0,
-      access::Proof::ReorderBound => self.anchor_reorder,
+      Some(access::Proof::Withheld) => 0,
+      Some(access::Proof::ReorderBound) if self.anchor_resets => 0,
+      Some(access::Proof::ReorderBound) => self.anchor_reorder,
+      None => return,
     };
     if self.outputs_since_anchor > allowance {
       self.clear_degraded_resync();
@@ -2224,7 +2286,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     self.degraded_anchored = false;
     self.anchor_reorder = 0;
     self.anchor_resets = false;
-    self.anchor_proof = access::Proof::ReorderBound;
+    self.anchor_proof = None;
     self.withheld_poisoned = false;
     self.anchor_definitive = false;
     self.anchor_recovery = None;
@@ -2411,7 +2473,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       degraded_anchored: false,
       anchor_reorder: 0,
       anchor_resets: false,
-      anchor_proof: access::Proof::ReorderBound,
+      anchor_proof: None,
       withheld_poisoned: false,
       anchor_definitive: false,
       anchor_recovery: None,
@@ -3575,6 +3637,33 @@ unsafe fn dictionary_bytes(dict: *const ffmpeg_next::ffi::AVDictionary) -> usize
   }
 }
 
+/// **The proof table**: how a post-commit resync anchored on `rule`'s stream
+/// is proved, on the implementation decoding it.
+///
+/// - **libavcodec's own, H.264:** [`access::Proof::Withheld`]; the reorder
+///   bound after a decode error across the gap (`poisoned`).
+/// - **libavcodec's own, every other codec:** [`access::Proof::ReorderBound`],
+///   with none allowed where every keyframe resets every reference (VP8,
+///   VP9, AV1).
+/// - **An implementation that wraps another, any codec:** none.
+///
+/// Every proof is an invariant of libavcodec's own decoders: FFmpeg's `h264`
+/// withholding every picture it has not recovered, the reorder depth
+/// `has_b_frames` its decoders publish, and their "needs input" saying
+/// nothing more is held. An implementation that wraps another publishes no
+/// depth and withholds nothing, so it proves nothing — and the post-commit
+/// fallback, the one road that owes a proof, refuses it at the open
+/// ([`Error::ResyncUnprovable`]).
+fn resync_proof(rule: access::KeyframeRule, native: bool, poisoned: bool) -> Option<access::Proof> {
+  if !native {
+    return None;
+  }
+  Some(match rule.proof() {
+    access::Proof::Withheld if poisoned => access::Proof::ReorderBound,
+    proof => proof,
+  })
+}
+
 /// A software decoder's `has_b_frames`: how many pictures its reorder buffer
 /// holds back. FFmpeg raises it as it discovers reordering, and the
 /// parameters a keyframe activates can lower it.
@@ -3615,12 +3704,24 @@ fn open_sw_decoder(
   // Opened without forming a bindgen enum from FFmpeg memory: the codec
   // is resolved off a raw `codec_id`, and the medium is proved off a raw
   // `codec_type`. See `crate::decoder::ensure_codec_type`.
-  let codec = sw_codec(parameters)?;
-  // The implementation, by name: the resync's proof is bound to it.
-  let implementation = codec.name();
+  // `avcodec_find_decoder` answers libavcodec's own decoder for the codec
+  // ahead of every wrapper wherever one is built in that decodes on its own
+  // (FFmpeg's `av1`, which decodes only through a hardware accelerator, is
+  // listed after the external AV1 libraries), so no implementation is
+  // chosen by name here.
+  let codec = crate::decoder::find_decoder(parameters)?;
+  // Who implements it: libavcodec itself, or a wrapper around another
+  // implementation. The resync's proofs hold on the first alone.
+  let wrapper = wrapper_name(codec);
+  let native = wrapper.is_null();
+  // SAFETY: `wrapper` is null or a string literal in libavcodec's static
+  // codec list, valid for the process.
+  let wrapper = unsafe { crate::ffi::table_text(wrapper, IMPLEMENTATION_NAME_MAX_BYTES) };
   #[cfg(test)]
-  let implementation = sw_implementation::named().unwrap_or(implementation);
-  let native_h264 = implementation == NATIVE_H264;
+  let (native, wrapper) = match sw_implementation::wrapped() {
+    Some(name) => (false, Some(name)),
+    None => (native, wrapper),
+  };
   let opened = ctx.decoder().open_as(codec).map_err(Error::Ffmpeg)?;
   // Checked in every build, after the open, which is what FFmpeg reads: a
   // decoder that would output unrecovered pictures is closed and refused by
@@ -3629,56 +3730,48 @@ fn open_sw_decoder(
   crate::decoder::ensure_video_codec_type(&opened)?;
   Ok(SwDecoder {
     decoder: ffmpeg_next::decoder::Video(opened),
-    native_h264,
+    native,
+    wrapper,
     _callback_state: callback_state,
     #[cfg(test)]
     _live: live_sw::Guard::new(),
   })
 }
 
-/// FFmpeg's own H.264 decoder, by name.
-const NATIVE_H264: &str = "h264";
-
-/// The software decoder for `parameters`' codec: for H.264, FFmpeg's own
-/// [`NATIVE_H264`], by name — the implementation whose output gate the
-/// withheld resync proof stands on — and otherwise, or where it is not built
-/// in, the one `avcodec_find_decoder` answers (`crate::decoder::find_decoder`),
-/// which may be any implementation of the codec. The session reads which it
-/// opened ([`SwDecoder::native_h264`]).
-fn sw_codec(parameters: &Parameters) -> Result<ffmpeg_next::Codec, Error> {
-  // SAFETY: the parameters' pointer, only read; `codec_id` is read as the
-  // 32-bit integer the field holds, never formed into a bindgen enum.
-  let codec_id = unsafe {
-    let raw = parameters.as_ptr();
-    (!raw.is_null()).then(|| core::ptr::read(core::ptr::addr_of!((*raw).codec_id) as *const i32))
-  };
-  if codec_id == Some(crate::CodecId::H264.raw())
-    && let Some(native) = ffmpeg_next::decoder::find_by_name(NATIVE_H264)
-  {
-    return Ok(native);
-  }
-  crate::decoder::find_decoder(parameters)
+/// What `codec` wraps, `AVCodec.wrapper_name`: null exactly for one of
+/// libavcodec's own decoders ("If this field is NULL, this is a builtin,
+/// libavcodec native codec", FFmpeg's `codec.h`), and otherwise the
+/// wrapper's name — `cuvid`, `qsv`, `v4l2m2m`, `mediacodec`, `libdav1d`. Read
+/// raw off the codec pointer: the null decides, and the text only names the
+/// wrapper in a refusal.
+fn wrapper_name(codec: ffmpeg_next::Codec) -> *const core::ffi::c_char {
+  // SAFETY: `codec` wraps a non-null pointer into libavcodec's static codec
+  // list (`crate::decoder::find_decoder`); one pointer field is read through
+  // `addr_of!`, never forming a reference to the entry, whose `type` and
+  // `id` are bindgen enums.
+  unsafe { core::ptr::addr_of!((*codec.as_ptr()).wrapper_name).read() }
 }
 
-/// Test-only: the name the next software video decoder opened is taken to
-/// have, in place of its own — how a session opened on another
-/// implementation of a codec reads.
+/// Test-only: the next software video decoder opened reads as an
+/// implementation that wraps another, by the wrapper `name`, whatever it
+/// opened — how a session reads where its build answers a wrapper for the
+/// codec.
 #[cfg(test)]
 pub(crate) mod sw_implementation {
   use core::cell::Cell;
 
   std::thread_local! {
-    static NAMED: Cell<Option<&'static str>> = const { Cell::new(None) };
+    static WRAPPED: Cell<Option<&'static str>> = const { Cell::new(None) };
   }
 
-  /// The next open is taken to be of the implementation `name`.
-  pub(crate) fn name_next(name: &'static str) {
-    NAMED.with(|named| named.set(Some(name)));
+  /// The next open reads as wrapped by `name`.
+  pub(crate) fn wrapped_next(name: &'static str) {
+    WRAPPED.with(|wrapped| wrapped.set(Some(name)));
   }
 
-  /// The name armed for this open, once.
-  pub(super) fn named() -> Option<&'static str> {
-    NAMED.with(Cell::take)
+  /// The wrapper armed for this open, once.
+  pub(super) fn wrapped() -> Option<&'static str> {
+    WRAPPED.with(Cell::take)
   }
 }
 

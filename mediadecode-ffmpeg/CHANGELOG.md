@@ -80,6 +80,19 @@ The backend-agnostic core it adapts has its own log at
   has not recovered, and the post-commit resync of an H.264 stream is
   proved by FFmpeg withholding them (below).
 
+- **`Error::ResyncUnprovable`** (`ResyncUnprovable { codec, implementation,
+  wrapper }`, exported): a post-commit fallback whose software decoder is
+  not one of libavcodec's own — `avcodec_find_decoder` answered an
+  implementation that wraps another, `AVCodec.wrapper_name` set — is
+  refused by this name at the open it would commit, naming the codec, the
+  implementation and its wrapper; the decoder is closed and nothing is
+  committed. Every proof of the resync that fallback owes (below) is an
+  invariant of libavcodec's own decoders: a wrapper publishes no reorder
+  bound (`h264_cuvid` keeps a display delay of several pictures and leaves
+  `has_b_frames` at zero) and withholds nothing, so a picture from before
+  the gap could close it. On a build whose AV1 decoder is `libdav1d`, a
+  post-commit fallback on AV1 is refused this way.
+
 - **`active_threads()` on the video stream decoder**: the threads the
   decoder serving now decodes with, read off what is active
   (`active_thread_type`), never off what was asked — the count libavcodec
@@ -208,13 +221,15 @@ The backend-agnostic core it adapts has its own log at
   nothing. It is fed only once the decoder holds
   no picture the caller has not taken (the send answers `MustDrain` until
   then; a packet the decoder reports failed, which FFmpeg may have decoded
-  in part, wants a drain behind it too). On H.264, decoded by FFmpeg's own
-  `h264` — which the software road opens by name, falling back to what
-  `avcodec_find_decoder` answers where it is not built in — the first
-  picture out after the anchor closes the gap; another implementation of
-  the codec (a hardware wrapper such as `h264_cuvid` or `h264_qsv`, a V4L2
-  memory-to-memory or a MediaCodec one) keeps no such gate, and its anchors
-  take the reorder bound. The software decoders are opened with
+  in part, wants a drain behind it too). Both proofs are invariants of
+  libavcodec's own decoders, so a post-commit fallback whose software
+  decoder wraps another implementation (`AVCodec.wrapper_name` set:
+  `h264_cuvid`, `h264_qsv`, `libdav1d`, …), which publishes no reorder
+  bound and withholds nothing, is refused by name
+  (`Error::ResyncUnprovable`, above); a session opened on software, and a
+  probe-era fallback, owe no proof and decode on one as on any other. On
+  H.264, decoded by FFmpeg's own `h264`, the first picture out after the
+  anchor closes the gap. The software decoders are opened with
   neither `AV_CODEC_FLAG_OUTPUT_CORRUPT` nor `AV_CODEC_FLAG2_SHOW_ALL` —
   checked after the open in every build, an open that finds either set
   refused by name (`Error::UnrecoveredOutput`, below) — so FFmpeg's H.264

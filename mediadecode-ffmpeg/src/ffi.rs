@@ -105,12 +105,13 @@ const PIX_FMT_NAME_MAX_BYTES: usize = 64;
 /// within `max_bytes`, or bytes that are not UTF-8.
 ///
 /// **The one bounded C-string reader for FFmpeg's static tables**, and
-/// the three roads onto it are the pixel-format namer below, the codec
-/// descriptor behind [`crate::CodecId::name`] and the container word
-/// behind [`crate::ContainerFormat`]. A bounded search rather than
-/// `CStr::from_ptr`: a missing terminator violates that function's
-/// precondition outright, and this crate does not hand FFmpeg's word on
-/// string lengths to a function that cannot survive being wrong.
+/// the four roads onto it are the pixel-format namer below, the codec
+/// descriptor behind [`crate::CodecId::name`], the container word
+/// behind [`crate::ContainerFormat`] and the software video decoder's
+/// implementation names behind [`crate::ResyncUnprovable`]. A bounded
+/// search rather than `CStr::from_ptr`: a missing terminator violates that
+/// function's precondition outright, and this crate does not hand FFmpeg's
+/// word on string lengths to a function that cannot survive being wrong.
 ///
 /// **Copied, not borrowed.** Every one of these pointers really does
 /// name a `static const` table entry that outlives any session, so a
@@ -138,7 +139,9 @@ const PIX_FMT_NAME_MAX_BYTES: usize = 64;
 /// and it is the one every caller already satisfied: libavformat's
 /// `AVInputFormat` entries and libavcodec's `codec_descriptors[]` are
 /// `static const` tables compiled into those libraries, and the two
-/// `name`/`long_name` fields of each are string literals inside them.
+/// `name`/`long_name` fields of each are string literals inside them;
+/// so are the `name` and `wrapper_name` of the `AVCodec` entries
+/// libavcodec's codec list holds.
 /// Nothing in this crate calls it with a pointer of any other kind.
 ///
 /// # Why the return type changed

@@ -127,7 +127,7 @@ pub use demuxer::{
 };
 pub use error::{
   Error, FrameBudgetExceeded, FrameMedium, HwSurfaceTooLarge, HwTransferTooLarge, ReplayQueueFull,
-  Result, UnpricedFrame, UnpricedHolding, UnrecoveredOutput,
+  Result, ResyncUnprovable, UnpricedFrame, UnpricedHolding, UnrecoveredOutput,
 };
 pub use frame::Frame;
 pub use image::{CarrierImageDecoder, Corrupt, CorruptSource, ImageDecodeError, InputTooLarge};
