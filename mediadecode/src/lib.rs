@@ -37,5 +37,7 @@ pub use pixel_format::PixelFormat;
 pub use rhythm::{Received, Sent};
 
 // Re-export the time primitives so consumers don't have to add a
-// separate `mediatime` dependency.
-pub use mediatime::{TimeRange, Timebase, Timestamp};
+// separate `mediatime` dependency. `InvertedRange` is among them because
+// a `TimeRange`'s ends move only by its checked methods, which refuse an
+// end before the start by that name.
+pub use mediatime::{InvertedRange, TimeRange, Timebase, Timestamp};

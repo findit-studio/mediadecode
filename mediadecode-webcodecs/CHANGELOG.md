@@ -11,6 +11,16 @@ The backend-agnostic core it adapts has its own log at
 
 ## [Unreleased]
 
+### Changed
+
+- **(BREAKING) `mediatime` 0.4 → 0.5, through `mediadecode`.** The
+  `Timebase` and `Timestamp` this adapter's API carries (`pts`,
+  `duration`, `time_base`, the caller's own pts) are `mediadecode`'s
+  re-exports, so a consumer holding a `mediatime 0.4` value no longer
+  type-checks against this release; see
+  [`mediadecode`'s note](../mediadecode/CHANGELOG.md#unreleased). No
+  adapter source line moved.
+
 ## [0.15.1] - 2026-10-05
 
 ### Changed

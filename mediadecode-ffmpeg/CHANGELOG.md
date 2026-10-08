@@ -150,6 +150,15 @@ The backend-agnostic core it adapts has its own log at
   the resync never proved" ("N packets before a keyframe, and no keyframe
   after them" when none came).
 
+- **(BREAKING) `mediatime` 0.4 → 0.5, through `mediadecode`.** Every
+  `Timebase`, `Timestamp` and `TimeRange` in this crate's API is
+  `mediadecode`'s re-export, so a consumer holding a `mediatime 0.4` value
+  no longer type-checks against this release; see
+  [`mediadecode`'s note](../mediadecode/CHANGELOG.md#unreleased). No source
+  line here moved: every timebase this crate builds from a container's
+  rational still goes through `Timebase::try_new`, whose contract is
+  unchanged.
+
 ### Fixed
 
 - **A post-commit resync is proved by the decoder's reorder bound.** Any
