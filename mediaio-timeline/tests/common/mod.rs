@@ -1,0 +1,74 @@
+//! The law timeline, shared by the integration laws.
+#![allow(dead_code)]
+
+use core::num::NonZeroI32;
+
+use mediaio_timeline::{
+  Clip, Duration, Fade, FadeShape, Fades, Gain, MediaRef, Metadata, Rate, TimeRange, Timebase,
+  Timeline, Timestamp, Track, TrackKind, Transition,
+};
+
+pub fn tb(num: i32, den: i32) -> Timebase {
+  Timebase::new(num, NonZeroI32::new(den).unwrap())
+}
+
+/// Two tracks, three clips, a dissolve and two fades, at 23.976 fps from
+/// 01:00:00:00.
+///
+/// - V1: `a` at [0, 96) plays frames 24–120 of a 240-frame movie (reel
+///   A001); a 12 + 12-frame dissolve at 96 into `b` at [96, 144), frames
+///   48–96 of a 480-frame movie, which fades out over its last 24 frames
+///   at the track's end.
+/// - A1: a 24-frame gap, then `a-sound` at [24, 120): 1.001–5.005 s of a
+///   48 kHz recording, at -6 dB, fading in over 12 frames, equal power.
+pub fn law() -> Timeline {
+  let edit = tb(1001, 24_000);
+  let movie = tb(1, 24_000);
+  let sound = tb(1, 48_000);
+  let frames = |n: u64| Duration::new(n, edit);
+  Timeline::new("law", Rate::FPS_23_976)
+    .with_start(Timestamp::new(86_400, edit))
+    .with_metadata(Metadata::new().with("project", "law"))
+    .with_track(
+      Track::new(TrackKind::Video, "V1")
+        .with_clip(Clip::new(
+          "a",
+          MediaRef::new("file:///media/a.mov")
+            .with_available_range(Some(TimeRange::new(0, 240_240, movie)))
+            .with_rate(Some(Rate::FPS_23_976))
+            .with_reel(Some("A001".into())),
+          TimeRange::new(24_024, 120_120, movie),
+          TimeRange::new(0, 96, edit),
+        ))
+        .with_clip(
+          Clip::new(
+            "b",
+            MediaRef::new("file:///media/b.mov")
+              .with_available_range(Some(TimeRange::new(0, 480_480, movie)))
+              .with_rate(Some(Rate::FPS_23_976)),
+            TimeRange::new(48_048, 96_096, movie),
+            TimeRange::new(96, 144, edit),
+          )
+          .with_fades(Fades::new().with_out(Some(Fade::new(frames(24), FadeShape::Linear)))),
+        )
+        .with_transition(Transition::dissolve(
+          Timestamp::new(96, edit),
+          frames(12),
+          frames(12),
+        )),
+    )
+    .with_track(
+      Track::new(TrackKind::Audio, "A1").with_clip(
+        Clip::new(
+          "a-sound",
+          MediaRef::new("file:///media/a.wav")
+            .with_available_range(Some(TimeRange::new(0, 480_480, sound)))
+            .with_rate(Some(Rate::hz(48_000))),
+          TimeRange::new(48_048, 240_240, sound),
+          TimeRange::new(24, 120, edit),
+        )
+        .with_gain(Gain::from_db(-6.0))
+        .with_fades(Fades::new().with_in(Some(Fade::new(frames(12), FadeShape::EqualPower)))),
+      ),
+    )
+}

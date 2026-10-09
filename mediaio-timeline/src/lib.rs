@@ -11,6 +11,7 @@ mod clip;
 mod diff;
 mod layout;
 mod metadata;
+pub mod otio;
 mod schema;
 mod time;
 mod timeline;
