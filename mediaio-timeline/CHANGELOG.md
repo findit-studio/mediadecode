@@ -70,16 +70,19 @@ The crate's first release, as 0.1.0.
   in the timeline; each item's visible range with its neighbouring
   transitions' handles; each track's duration and the stack's, the longest
   as OpenTimelineIO picks it; the global start added to each place and each
-  track's end — is computed in OpenTimelineIO's own arithmetic beside its
-  exact value, and held within ±2^53 in the ruler OpenTimelineIO carries it
-  in, its double less than half a tick from the exact count; a track whose
-  clips' rulers carry its sums past that is written with each clip in the
-  coarsest whole ruler its source range allows. Every range ends where it
-  is stored, and the exported items, laid end to end, put every clip on its
+  track's end; the last tick of every one of those ranges,
+  `end_time_inclusive`, branch for branch — is computed in OpenTimelineIO's
+  own arithmetic beside its exact value, and held within ±2^53 in the ruler
+  OpenTimelineIO carries it in, its double less than half a tick from the
+  exact count. Where a derived value would round, a bounded search writes
+  the clips it is formed from in coarser whole rulers that hold their
+  source ranges — one clip one ruler at a time, the finest first, at most 64
+  rulers a clip, the all-coarsest plan last. Every range ends where it is
+  stored, and the exported items, laid end to end, put every clip on its
   record. Refuses with `otio::Refused`: `Validation` with `validate`'s
   refusals, or `NotRepresentable` — an `otio::Spot` (`otio::ChildAt` for a
   child of an exported track), the count and the rate it is counted at —
-  where nothing holds a count.
+  where no plan the search tries holds a count, naming the last plan's.
 
 - **`otio::validate_json`**: the structural self-check — a strict JSON
   reader and OpenTimelineIO's schema shape, requiring exactly the keys each

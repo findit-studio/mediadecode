@@ -149,25 +149,37 @@ export holds both:
   second that holds its start and its length, whole seconds or
   milliseconds, when its counts there are within 2^53.
 - **what OpenTimelineIO derives from it**, computed operation for operation
-  as OpenTimelineIO computes it, beside its exact value: each child's place
-  on its track — from zero in that child's own rate, every item before it
-  added, as `range_of_child_at_index` sums it, and as one walk over the
-  whole track carries it — and in the timeline; each item's visible range,
-  its source range widened by the handles of the transitions beside it;
-  each track's duration, and the stack's, the longest of them as
-  OpenTimelineIO picks it; and the global start added to each place and to
-  each track's end, as OpenTimelineIO's own tools add it. Each must lie
-  within ±2^53 in the ruler OpenTimelineIO carries it in, and
+  and branch for branch as OpenTimelineIO computes it, beside its exact
+  value: each child's place on its track — from zero in that child's own
+  rate, every item before it added, as `range_of_child_at_index` sums it,
+  and as one walk over the whole track carries it — and in the timeline;
+  each item's visible range, its source range widened by the handles of the
+  transitions beside it; each track's duration, and the stack's, the
+  longest of them as OpenTimelineIO picks it; the global start added to
+  each place and to each track's end, as OpenTimelineIO's own tools add it;
+  and the last tick of every one of those ranges — `end_time_inclusive`,
+  which floors a range's end where the duration's double has a fraction and
+  takes a tick off it where it has none, so a duration whose double rounds
+  onto a whole number, or off one, can move the last tick by up to a tick.
+  Each must lie within ±2^53 in the ruler OpenTimelineIO carries it in, and
   OpenTimelineIO's double less than half a tick from the exact count — read
   to the nearest tick, it is the exact count. On one ruler nothing is
-  rescaled, and the double is the count itself.
+  rescaled, and the double is the count itself: a range the export writes
+  in one ruler ends inclusively where it exactly does.
 
-A track whose clips' rulers carry its sums past that is written again with
-each clip in the coarsest ruler of a whole number of ticks a second its
-source range allows, when the walk holds that. What nothing holds is
-refused, `Refused::NotRepresentable`, naming where (`otio::Spot`; a child of
-an exported track is an `otio::ChildAt`), the count and the ruler it is
-counted in — never written to be read rounded.
+Where OpenTimelineIO would round a value, the export searches the rulers
+the clips the value is formed from may be written in: each whole number of
+ticks a second that holds a clip's source range exactly, from the ruler
+above down to the coarsest such — at most 64 a clip, past that its own and
+the 63 coarsest. It moves one clip one ruler coarser at a time — of the
+clips the refused value is formed from, the one with the finest ruler — and
+walks again, so clips can meet on a ruler they share, or one move while its
+neighbour keeps its own. A clip never moves back, so the search ends within
+`1 + n · 63` walks for `n` clips, the all-coarsest plan last. What no plan it
+tries holds is refused, `Refused::NotRepresentable`, naming where
+(`otio::Spot`; a child of an exported track is an `otio::ChildAt`), the
+count the last plan could not hold and the ruler it is counted in — never
+written to be read rounded.
 
 OpenTimelineIO has no word for a clip's id, its gain or a reel: all three
 ride in `metadata` — the id so a reader can tell each clip again — and an
