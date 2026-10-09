@@ -115,10 +115,26 @@ The backend-agnostic core it adapts has its own log at
   reject — an `avcC` record under seven bytes, a parameter set running past
   it, a set too large for the escaping retry — or apply only in part, a
   parameter set it cannot parse skipped (or a picture parameter set
-  referring to a sequence parameter set the record does not carry, whose
-  fate depends on what the decoder holds), is refused by this name before
-  any decoder sees it, naming the reason; the packet stays the caller's and
-  nothing of the session changes (below).
+  referring to a sequence parameter set neither the record carries nor the
+  decoder holds, read against the sets the decoder holds as FFmpeg reads it
+  against its own), is refused by this name before any decoder sees it,
+  naming the reason; the packet stays the caller's and nothing of the
+  session changes (below). A packet body FFmpeg reads as an `avcC` record
+  is judged the same way.
+
+- **`Error::SetsUnrecordable`** (`SetsUnrecordable { codec, reason }`, with
+  `Unrecordable`, both exported; `Unrecordable` is `#[non_exhaustive]`): a
+  decoder the session would open fresh — a post-commit fallback's cold
+  decoder, a reopen from no decoder — that no record can open holding the
+  parameter sets the decoder serving holds is refused by this name, naming
+  why: a set held in doubt, an H.264 picture parameter set bound to a
+  sequence parameter set its id no longer holds, start codes under a
+  four-byte NAL length size left from an `avcC` record, a set whose reading
+  ran past its payload, more sets than an `avcC` record counts, a set longer
+  than a record's entry, a record that does not read back as what is held,
+  or a decoder that wraps another implementation. A switch to the session's
+  threads is declined instead, the one-thread decoder serving on (below).
+  `ParameterSet` gains `Video`, an HEVC video parameter set.
 
 - **`FrameBudgetExceeded::pts`** (and `with_pts`): the refused frame's
   presentation timestamp as FFmpeg set it before the allocation — the
@@ -436,7 +452,47 @@ The backend-agnostic core it adapts has its own log at
   and a second refusal of a call is reported after the first, not folded
   into it. A seek clears them with the pictures it abandons. A concealed
   refusal used to wait for whatever answer the decoder gave next, which
-  named it: a later packet's error, renamed, or the end of the drain.
+  named it: a later packet's error, renamed, or the end of the drain. A
+  refusal a worker made while FFmpeg handed out a later picture comes before
+  that picture, which waits for the next receive: delivered first, the
+  picture went out and a seek before the next receive erased the refusal.
+
+- **A decoder opened fresh holds the parameter sets the decoder serving
+  held.** FFmpeg's H.264 and HEVC decoders keep every parameter set they
+  store, by id — from the extradata they were opened on, from every packet's
+  `AV_PKT_DATA_NEW_EXTRADATA`, and from every set a packet carries in band,
+  whatever its key flag — and a record replaces only the ids it carries. A
+  decoder the session opened fresh — a switch to its threads, a reopen, a
+  post-commit fallback's cold decoder — opened on the codec parameters'
+  record alone: on a stream whose sets came in band, an IDR carrying none
+  failed on it and every picture to the next set was lost. The session now
+  keeps what the decoder serving holds, as FFmpeg 9 reads every set — an
+  H.264 picture parameter set bound to the sequence parameter set it was
+  read under, an HEVC set that replaces another dropping the sets that refer
+  to it, a set from a packet the decoder may not have read held in doubt —
+  and opens a fresh decoder on the record that gives it exactly that: the
+  codec parameters' or the packet's own where either does, otherwise a
+  record carrying every set held, in the framing the decoder serving reads
+  packets in, read back as FFmpeg reads it (an HEVC sequence or picture
+  parameter set vouched for by FFmpeg's own decoder opened on the record
+  strictly). Where none can, the open is refused by name
+  (`Error::SetsUnrecordable`, above), a switch declined. A probe-era
+  fallback's replay starts from what the hardware held when its history
+  began. The HEVC alpha reading judges a video parameter set against the
+  sets held across packets, as FFmpeg does: a set read past its end under
+  an id an earlier packet filled is refused, not taken as alpha video for
+  good. A set longer than a record's entry is held by a fingerprint.
+
+- **An H.264 packet is framed as FFmpeg's decoder frames it.** A packet
+  whose body FFmpeg reads as an `avcC` record — where the decoder's framing
+  is `avcC` — is applied as one, its sets and NAL length size the decoder's
+  from then on, and holds no picture, so it neither anchors nor is a clean
+  point; and under a NAL length size of four FFmpeg re-guesses every
+  packet's framing — start codes for one opening on a four-byte start code
+  whose next bits read past it, `avcC` for one whose first four bytes read
+  as a length that fits — keeping the guess for the packets after. Read by
+  the record's framing alone, a start-coded IDR on a four-byte `avcC`
+  stream never anchored and no switch fired at it.
 
 ## [0.15.1] - 2026-10-05
 

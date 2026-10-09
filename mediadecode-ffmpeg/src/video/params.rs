@@ -1091,7 +1091,7 @@ pub(super) trait H264Sets {
   /// FFmpeg stores `sps` under `id`, read off `unit` the `reading`-th of the
   /// three ways it reads one: 1, the unit; 2, its raw bytes after its
   /// header; 3, the unit, truncation let stand (h264_parse.c:383-397,
-  /// h264dec.c:698-712).
+  /// h264dec.c:699-715).
   fn store_sps(&mut self, id: usize, sps: Sps, unit: &Unit<'_>, reading: u8);
   /// FFmpeg stores the picture parameter set `unit` under `id`, read against
   /// the sequence parameter set held under `sps`; `past_end` where its
@@ -1121,7 +1121,7 @@ enum Unstored {
 /// **The three readings FFmpeg gives a sequence parameter set** — the unit,
 /// its raw bytes after its header, the unit with truncation let stand
 /// (`decode_extradata_ps`, h264_parse.c:383-397; `decode_nal_units`,
-/// h264dec.c:698-712) — `unit` read over `memory` ([`Walk::memory`]) and its
+/// h264dec.c:699-715) — `unit` read over `memory` ([`Walk::memory`]) and its
 /// raw bytes over `mem`, the buffer it was cut from: the set's id, what it
 /// says and which reading stored it; `None` where none does.
 fn h264_sps_readings(unit: &Unit<'_>, memory: &[u8], mem: &[u8]) -> Option<(usize, Sps, u8)> {
@@ -1420,15 +1420,15 @@ pub(super) fn h264_reguess(data: &[u8]) -> Option<bool> {
 
 /// **The parameter sets FFmpeg's H.264 decoder reads off a packet's
 /// units**, stored in `sets` as it stores them — `decode_nal_units`
-/// (h264dec.c:584-760) over a packet split as the decoder's framing says,
+/// (h264dec.c:583-824) over a packet split as the decoder's framing says,
 /// length-prefixed by `nal_length_size` bytes where `is_avc`, start-coded
 /// otherwise, every unit copied (`ff_h2645_packet_split` without
 /// `H2645_FLAG_SMALL_PADDING`, h264dec.c:609-610): each sequence parameter
-/// set read the three ways FFmpeg reads one (h264dec.c:698-712) and each
-/// picture parameter set once (716-727), a set none of them stores passed
-/// over; nothing where the split fails (611-615); and the reading ending at
+/// set read the three ways FFmpeg reads one (h264dec.c:699-715) and each
+/// picture parameter set once (717-728), a set none of them stores passed
+/// over; nothing where the split fails (609-615); and the reading ending at
 /// an IDR slice whose header reads as a P slice's, "Invalid inter IDR frame"
-/// (634-640). A hardware accelerator's `decode_params` (701-706, 718-723) is
+/// (637-641). A hardware accelerator's `decode_params` (701-706, 718-723) is
 /// taken to pass: VideoToolbox's copies the unit (videotoolbox.c:434-450).
 pub(super) fn h264_packet<S: H264Sets>(
   data: &[u8],

@@ -8,7 +8,7 @@
 //! hevc/hevcdec.c:4167-4172), those of a packet's
 //! `AV_PKT_DATA_NEW_EXTRADATA` (h264dec.c:1038-1044;
 //! hevc/hevcdec.c:3855-3860), and those a packet carries in band, whatever
-//! its key flag (`decode_nal_units`, h264dec.c:698-727; `decode_nal_unit`,
+//! its key flag (`decode_nal_units`, h264dec.c:699-728; `decode_nal_unit`,
 //! hevc/hevcdec.c:3609-3625). A set replaces the one held under its id. A
 //! record replaces exactly the ids it carries and no other: FFmpeg clears
 //! nothing before it applies one (`ff_h264_decode_extradata`,
@@ -543,7 +543,7 @@ impl H264 {
           return Err(Unrecordable::TooMany(ParameterSet::Picture));
         }
         // The profile, its constraints and the level, which FFmpeg does not
-        // read (h264_parse.c:477-488): the record's, or the first set's.
+        // read (h264_parse.c:475-488): the record's, or the first set's.
         let profile = if base.first() == Some(&1) && base.len() >= 4 {
           [base[1], base[2], base[3]]
         } else {
@@ -1055,7 +1055,7 @@ impl Hevc {
     let mut bytes = Vec::new();
     if self.is_nalff {
       // What FFmpeg reads of the header is its version, the NAL length size
-      // and the count of arrays (hevc/parse.c:93-102): the rest is the
+      // and the count of arrays (hevc/parse.c:93-101): the rest is the
       // record's own where it is an `hvcC` record.
       let mut header = [0u8; 23];
       if hvcc(base) {
@@ -1217,7 +1217,7 @@ impl<'a> HevcWrite<'a> {
   /// `nal_length` bytes or start-coded: an extradata buffer's, where any
   /// refusal ends the reading (`hevc_decode_nal_units`, hevc/parse.c:24-77),
   /// or a packet's, where only one other than invalid data does
-  /// (hevc/hevcdec.c:3665-3672, 3766-3772); nothing where the split fails.
+  /// (hevc/hevcdec.c:3664-3672, 3770-3775); nothing where the split fails.
   ///
   /// A unit whose parser this crate does not run — an SEI message, in a
   /// packet a slice — may end the reading: the sets after one are taken in

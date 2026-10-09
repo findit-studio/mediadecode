@@ -5489,7 +5489,7 @@ struct Opening {
 /// again. FFmpeg's HEVC decoder then fails the open at the first set it
 /// refuses, where it would otherwise skip it and go on: `hevc_decode_nal_units`
 /// answers the set's error under `AV_EF_EXPLODE` (hevc/parse.c:72-73),
-/// `ff_hevc_decode_extradata` hands it on (120-125, 132-134), and
+/// `ff_hevc_decode_extradata` hands it on (124-128, 141-142), and
 /// `hevc_decode_init` fails the open (hevc/hevcdec.c:4167-4172). The strict
 /// open refuses, besides, three sets the decoder serving stores with a
 /// warning — a video or sequence parameter set whose reordered pictures
