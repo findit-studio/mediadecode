@@ -14,13 +14,22 @@
 //! | a media-side range its own rulers count past 2^53, recounted in the coarsest whole-rate ruler that holds it | `checked_rescale_with(_, Rounding::Exact)`, which answers only where the ruler holds it |
 //! | a rate as OpenTimelineIO's `f64`; a rate of zero refused | `Rate::as_f64`, `Rate::checked_to_timebase`, `Rate::checked_from_timebase` |
 //! | a range's length, or none past `i64::MAX` ticks | `Timestamp::checked_signed_duration_since` |
+//! | what OpenTimelineIO derives from an exported document, exactly: its sums, and the longest track | `ExactSeconds` (`from_timestamp`, `checked_add`, `checked_sub`, `Ord`) |
 //!
-//! Two roads are missing, and are filed as `mediatime` rows rather than built
-//! here: a range's exact length as a [`Duration`] — [`span`] — and the
+//! Three roads are missing, and are filed as `mediatime` rows rather than
+//! built here: a range's exact length as a [`Duration`] — [`span`]; the
 //! coarsest timebase of a whole number of ticks a second in which a range's
 //! ends both land on a tick, which the OpenTimelineIO export picks meanwhile
 //! from the greatest common divisor of the range's counts, handing the
-//! recount itself to `mediatime`.
+//! recount itself to `mediatime`; and an exact number of seconds counted at
+//! a rate, as an exact fraction of a tick — `ExactSeconds` recounts only to
+//! a whole tick — which the export forms meanwhile as one product of the two
+//! fractions, reduced.
+//!
+//! The export also computes OpenTimelineIO's own `f64` arithmetic, operation
+//! for operation, to find a count OpenTimelineIO would round. That is
+//! OpenTimelineIO's arithmetic, mirrored, not the model's: `mediatime` is
+//! exact by design and has no road for it.
 
 use mediatime::{Duration, TimeRange};
 

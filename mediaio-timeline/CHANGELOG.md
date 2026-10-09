@@ -62,15 +62,24 @@ The crate's first release, as 0.1.0.
   always written, gaps from the layout, a clip's source range whole in its
   medium's one ruler, a dissolve as `SMPTE_Dissolve`, a fade as a dissolve
   against a gap, a clip's id, gain and reel in `metadata` (DaVinci Resolve
-  applies neither gain nor reel). Every count written, every range's end
-  and every place a record starts or ends lies within ±2^53, where
-  OpenTimelineIO's `f64` holds every whole number; a media-side range its
-  own rulers count past that is written in the coarsest whole-rate ruler
-  that holds it. Every range ends where it is stored, and the exported
-  items, laid end to end, put every clip on its record. Refuses with
-  `otio::Refused`: `Validation` with `validate`'s refusals, or
-  `NotRepresentable` (an `otio::Spot` and the count) where no ruler holds a
-  count.
+  applies neither gain nor reel). Every count written lies within ±2^53,
+  where OpenTimelineIO's `f64` holds every whole number; a media-side range
+  its own rulers count past that is written in the coarsest whole-rate
+  ruler that holds it. Every count OpenTimelineIO derives from the document
+  — each child's place on its track, from zero in the child's own rate, and
+  in the timeline; each item's visible range with its neighbouring
+  transitions' handles; each track's duration and the stack's, the longest
+  as OpenTimelineIO picks it; the global start added to each place and each
+  track's end — is computed in OpenTimelineIO's own arithmetic beside its
+  exact value, and held within ±2^53 in the ruler OpenTimelineIO carries it
+  in, its double less than half a tick from the exact count; a track whose
+  clips' rulers carry its sums past that is written with each clip in the
+  coarsest whole ruler its source range allows. Every range ends where it
+  is stored, and the exported items, laid end to end, put every clip on its
+  record. Refuses with `otio::Refused`: `Validation` with `validate`'s
+  refusals, or `NotRepresentable` — an `otio::Spot` (`otio::ChildAt` for a
+  child of an exported track), the count and the rate it is counted at —
+  where nothing holds a count.
 
 - **`otio::validate_json`**: the structural self-check — a strict JSON
   reader and OpenTimelineIO's schema shape, requiring exactly the keys each
