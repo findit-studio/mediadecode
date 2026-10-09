@@ -150,14 +150,19 @@ export holds both:
   second that holds its start and its length, whole seconds or
   milliseconds, when its counts there are within 2^53. Of those rulers a
   range is written in the first whose counts end it within ±2^53 too; where
-  none does, an available range is refused, and a source range is written
-  in the first that writes its start and its length, its end left to the
-  walk and to the search below. A source range none of those rulers writes
-  is written in the first ruler the timeline's operands are counted in that
-  does, finest first — a ruler at a fractional rate, such as the edit rate
-  at one frame every two seconds, as every whole rate that lands on a range
-  is a multiple of the coarsest, which counts it in the smallest counts —
-  and refused only where none of those writes it either.
+  none does, a source range is written in the first that writes its start
+  and its length, its end left to the walk and to the search below. Past
+  its own rulers, a range is written in the first ruler the timeline's
+  operands are counted in, finest first, that does what its own could not:
+  a source range none of them writes, in the first that writes its start
+  and its length, its end left to the walk likewise; an available range
+  none of them ends within ±2^53, in the first whose counts end it there
+  too — no walk reads an available range, so its end is held as it is
+  planned. Such a ruler is at a fractional rate, such as the edit rate at
+  one frame every two seconds, as every whole rate that lands on a range is
+  a multiple of the coarsest, which counts it in the smallest counts; a
+  range none of those rulers writes — or, an available range, ends — is
+  refused.
 - **what OpenTimelineIO derives from it**, computed operation for operation
   and branch for branch as OpenTimelineIO computes it, beside its exact
   value: the end of each clip's source range; each child's place on its
@@ -223,13 +228,14 @@ refusal says the search was bounded. A source range no ruler of the bands
 writes — its start or its length past 2^53 in each of its own rulers and
 in each ruler the timeline's operands are counted in, the only rulers of
 the bands that can write a range its own cannot — leaves the search no
-plan to walk: it is refused before any walk, and says so, naming the bands
-and no walk (`RulerSearch::walks` 0). Refused before any walk, naming no
-search: a count written at the edit rate, which no ruler of the search
-changes; an available range none of its own rulers holds whole, which
-keeps its plan's ruler. A timeline that only a ruler outside the bands,
-or a plan of rulers the moves do not reach, would hold is refused by this
-contract, never written to be read rounded: a complete search would try every
+plan to walk, and so does an available range none of them holds whole,
+its end with its start and its length, as the search never moves it: each
+is refused before any walk, and says so, naming the bands and no walk
+(`RulerSearch::walks` 0). Refused before any walk, naming no search: a
+count written at the edit rate, which no ruler of the search changes. A
+timeline that only a ruler outside the bands, or a plan of rulers the
+moves do not reach, would hold is refused by this contract, never written
+to be read rounded: a complete search would try every
 holding ruler of every clip together, a product space with no closed form
 for OpenTimelineIO's double rounding. Where the bound has been met, counts
 lie near 2^53 ticks of a clip's ruler — at the rates media run at,

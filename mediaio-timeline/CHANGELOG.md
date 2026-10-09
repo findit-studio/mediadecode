@@ -68,10 +68,12 @@ The crate's first release, as 0.1.0.
   ruler that holds it, and of its own rulers in the first that ends it
   within ±2^53 too — a source range none ends is written in one that
   writes its start and its length, its end left to the walk and the
-  search, and a source range none of them writes in the first ruler the
-  timeline's operands are counted in that does, finest first (one at a
-  fractional rate: every whole rate that lands on a range is a multiple of
-  the coarsest). Every count OpenTimelineIO derives from the document —
+  search; a source range none of them writes, in the first ruler the
+  timeline's operands are counted in that does, finest first; and an
+  available range none of them ends, in the first of those rulers that
+  ends it too, its end held as it is planned (each one at a fractional
+  rate: every whole rate that lands on a range is a multiple of the
+  coarsest). Every count OpenTimelineIO derives from the document —
   the end of each clip's source range; each child's place on its track, from zero
   in the child's own rate, and in the timeline; each item's visible range
   with its neighbouring transitions' handles; each track's duration and the
@@ -100,12 +102,12 @@ The crate's first release, as 0.1.0.
   source range's end among them, what the search tried,
   `otio::RulerSearch`: its bands (`otio::RulerBand`) and its walks — where
   no plan the search tries holds a count, naming the last plan's. A count
-  written at the edit rate and an available range none of its own rulers
-  holds whole are refused before any walk, naming no search; a source
-  range no ruler of the bands writes — none of its own, none the
-  timeline's operands are counted in — is refused before any walk too,
-  naming the bands and no walk. A timeline only a ruler outside the bands
-  would hold is refused by that contract, not misread.
+  written at the edit rate is refused before any walk, naming no search; a
+  source range no ruler of the bands writes, and an available range none
+  of them holds whole — none of its own, none the timeline's operands are
+  counted in — are refused before any walk too, naming the bands and no
+  walk. A timeline only a ruler outside the bands would hold is refused by
+  that contract, not misread.
 
 - **`otio::validate_json`**: the structural self-check — a strict JSON
   reader and OpenTimelineIO's schema shape, requiring exactly the keys each
