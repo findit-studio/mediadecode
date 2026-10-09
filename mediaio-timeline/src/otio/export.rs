@@ -3,6 +3,9 @@
 //! Every object is written with its keys in the order OpenTimelineIO's own
 //! writer uses: `OTIO_SCHEMA` first, then each base class's fields before
 //! the derived class's.
+//!
+//! Every count is held within ±2^53 — the whole numbers an `f64` holds
+//! exactly — or refused, by where it sits: the first the walk meets.
 
 use alloc::{
   format,
@@ -10,13 +13,14 @@ use alloc::{
   vec,
   vec::Vec,
 };
+use core::num::NonZeroI32;
 
 use mediatime::{Duration, Rate, Rounding, TimeRange, Timebase};
 
-use super::{OtioTarget, json::Value};
+use super::{NotRepresentable, OtioTarget, Spot, json::Value};
 use crate::{
-  Clip, Fade, FadeShape, Item, Layout, MediaRef, Metadata, Timeline, Track, TrackKind, TrackLayout,
-  Transition, time::span,
+  Clip, ClipAt, Edge, EdgeAt, Fade, FadeShape, Item, Layout, MediaRef, Metadata, Timeline, Track,
+  TrackKind, TrackLayout, Transition, TransitionAt, time::span,
 };
 
 /// The key under which this crate's own words ride in an object's
@@ -26,28 +30,35 @@ const OURS: &str = "mediaio";
 /// The key a `Clip.2` keeps its one media reference under.
 const DEFAULT_MEDIA: &str = "DEFAULT_MEDIA";
 
+/// 2^53: an `f64` holds every whole number of no greater magnitude, and past
+/// it only some — a count there is read rounded.
+const EXACT: u128 = 1 << 53;
+
 struct Ruler {
   /// The edit rate, as the `f64` OpenTimelineIO counts in.
   rate: f64,
 }
 
-pub(crate) fn timeline(timeline: &Timeline, laid: &Layout<'_>, target: OtioTarget) -> Value {
+pub(crate) fn timeline(
+  timeline: &Timeline,
+  laid: &Layout<'_>,
+  target: OtioTarget,
+) -> Result<Value, NotRepresentable> {
   let ruler = Ruler {
     rate: timeline.rate().as_f64(),
   };
+  let start = count(i128::from(timeline.start().pts()), Spot::Start)?;
   let tracks = laid
     .tracks()
     .iter()
-    .map(|track| self::track(track, &ruler, target))
-    .collect();
-  object(vec![
+    .enumerate()
+    .map(|(index, track)| self::track(index, track, &ruler, target))
+    .collect::<Result<_, _>>()?;
+  Ok(object(vec![
     ("OTIO_SCHEMA", text("Timeline.1")),
     ("metadata", metadata(Vec::new(), timeline.metadata())),
     ("name", text(timeline.name())),
-    (
-      "global_start_time",
-      rational_time(ruler.rate, count(timeline.start().pts())),
-    ),
+    ("global_start_time", rational_time(ruler.rate, start)),
     (
       "tracks",
       object(vec![
@@ -61,12 +72,18 @@ pub(crate) fn timeline(timeline: &Timeline, laid: &Layout<'_>, target: OtioTarge
         ("children", Value::Array(tracks)),
       ]),
     ),
-  ])
+  ]))
 }
 
-fn track(laid: &TrackLayout<'_>, ruler: &Ruler, target: OtioTarget) -> Value {
+fn track(
+  index: usize,
+  laid: &TrackLayout<'_>,
+  ruler: &Ruler,
+  target: OtioTarget,
+) -> Result<Value, NotRepresentable> {
   let track = laid.track();
-  object(vec![
+  let children = children(index, laid, ruler, target)?;
+  Ok(object(vec![
     ("OTIO_SCHEMA", text("Track.1")),
     ("metadata", Value::Object(Vec::new())),
     ("name", text(track.name())),
@@ -74,7 +91,7 @@ fn track(laid: &TrackLayout<'_>, ruler: &Ruler, target: OtioTarget) -> Value {
     ("effects", Value::Array(Vec::new())),
     ("markers", Value::Array(Vec::new())),
     ("enabled", Value::Bool(track.enabled())),
-    ("children", Value::Array(children(laid, ruler, target))),
+    ("children", Value::Array(children)),
     (
       "kind",
       text(match track.kind() {
@@ -82,7 +99,7 @@ fn track(laid: &TrackLayout<'_>, ruler: &Ruler, target: OtioTarget) -> Value {
         TrackKind::Audio => "Audio",
       }),
     ),
-  ])
+  ]))
 }
 
 /// A track's children in OpenTimelineIO's order: items end to end, each
@@ -92,52 +109,71 @@ fn track(laid: &TrackLayout<'_>, ruler: &Ruler, target: OtioTarget) -> Value {
 /// clip, a fade-out before the gap after it. Where the clip abuts another
 /// clip or a track end, a gap of no length stands in, so the fade always has
 /// black (or silence) on its other side and takes no time from a neighbour.
-fn children(laid: &TrackLayout<'_>, ruler: &Ruler, target: OtioTarget) -> Vec<Value> {
+///
+/// Each clip's record is held within 2^53 where it starts and ends: those
+/// are the sums of the lengths before it, which OpenTimelineIO adds up at
+/// the edit rate.
+fn children(
+  track_index: usize,
+  laid: &TrackLayout<'_>,
+  ruler: &Ruler,
+  target: OtioTarget,
+) -> Result<Vec<Value>, NotRepresentable> {
   let track = laid.track();
   let items = laid.items();
   let mut out = Vec::with_capacity(items.len() * 2);
   let mut after_gap = false;
+  // The clip the walk reaches next. The layout derives a gap only before a
+  // clip, and a gap is named by the clip it leads to.
+  let mut next = 0;
   for (index, item) in items.iter().enumerate() {
+    let at = ClipAt::new(track_index, next);
     match item {
       Item::Gap(range) => {
-        out.push(gap(length_of(*range), ruler));
+        out.push(gap(length_of(*range), ruler, at)?);
         after_gap = true;
       }
       Item::Clip(clip) => {
+        next += 1;
+        let record = clip.record();
+        hold(i128::from(record.start_pts()), Spot::Record(at))?;
+        hold(i128::from(record.end_pts()), Spot::Record(at))?;
         let fades = clip.fades();
         if let Some(fade) = fades.in_() {
           if !after_gap {
-            out.push(gap(Duration::new(0, Timebase::default()), ruler));
+            out.push(gap(Duration::new(0, Timebase::default()), ruler, at)?);
           }
-          out.push(fade_transition(fade, FadeEdge::In, ruler));
+          out.push(fade_transition(fade, EdgeAt::new(at, Edge::In), ruler)?);
         }
-        out.push(self::clip(clip, target));
+        out.push(self::clip(clip, at, target)?);
         after_gap = false;
         if let Some(fade) = fades.out() {
-          out.push(fade_transition(fade, FadeEdge::Out, ruler));
+          out.push(fade_transition(fade, EdgeAt::new(at, Edge::Out), ruler)?);
           if !matches!(items.get(index + 1), Some(Item::Gap(_))) {
-            out.push(gap(Duration::new(0, Timebase::default()), ruler));
+            out.push(gap(Duration::new(0, Timebase::default()), ruler, at)?);
             after_gap = true;
           }
-        } else if let Some(transition) = leaving(track, clip) {
-          out.push(dissolve(transition, ruler));
+        } else if let Some((which, transition)) = leaving(track, clip) {
+          let at = TransitionAt::new(track_index, which);
+          out.push(dissolve(transition, at, ruler)?);
         }
       }
     }
   }
-  out
+  Ok(out)
 }
 
-/// The transition at the cut where `clip`'s record ends.
-fn leaving<'a>(track: &'a Track, clip: &Clip) -> Option<&'a Transition> {
+/// The transition at the cut where `clip`'s record ends, and its index.
+fn leaving<'a>(track: &'a Track, clip: &Clip) -> Option<(usize, &'a Transition)> {
   let end = clip.record().end();
   track
     .transitions()
     .iter()
-    .find(|transition| transition.at() == end)
+    .enumerate()
+    .find(|(_, transition)| transition.at() == end)
 }
 
-fn clip(clip: &Clip, target: OtioTarget) -> Value {
+fn clip(clip: &Clip, at: ClipAt, target: OtioTarget) -> Result<Value, NotRepresentable> {
   let mut words = Vec::new();
   if let Some(gain) = clip.gain() {
     words.push(("gain_db", Value::Number(format!("{:?}", gain.db()))));
@@ -148,7 +184,7 @@ fn clip(clip: &Clip, target: OtioTarget) -> Value {
   // duration's rate, plus the duration — is the stored end. Validation holds
   // the source's length to a whole number of edit-rate ticks, so the same
   // duration is the record's length: the clip fills exactly its record.
-  let source_range = media_range(clip.source_range(), media.rate());
+  let source_range = media_range(clip.source_range(), media.rate(), Spot::Source(at))?;
   let mut members = vec![
     (
       "OTIO_SCHEMA",
@@ -164,7 +200,7 @@ fn clip(clip: &Clip, target: OtioTarget) -> Value {
     ("markers", Value::Array(Vec::new())),
     ("enabled", Value::Bool(clip.enabled())),
   ];
-  let reference = external_reference(media, target);
+  let reference = external_reference(media, at, target)?;
   match target {
     OtioTarget::V0_15Plus => {
       members.push(("media_references", object(vec![(DEFAULT_MEDIA, reference)])));
@@ -172,10 +208,14 @@ fn clip(clip: &Clip, target: OtioTarget) -> Value {
     }
     OtioTarget::Legacy => members.push(("media_reference", reference)),
   }
-  object(members)
+  Ok(object(members))
 }
 
-fn external_reference(media: &MediaRef, target: OtioTarget) -> Value {
+fn external_reference(
+  media: &MediaRef,
+  at: ClipAt,
+  target: OtioTarget,
+) -> Result<Value, NotRepresentable> {
   let mut words = Vec::new();
   if let Some(rate) = media.rate() {
     words.push(("rate", text(&rate.to_string())));
@@ -184,7 +224,7 @@ fn external_reference(media: &MediaRef, target: OtioTarget) -> Value {
     words.push(("reel", text(reel)));
   }
   let available = match media.available_range() {
-    Some(range) => media_range(range, media.rate()),
+    Some(range) => media_range(range, media.rate(), Spot::Available(at))?,
     None => Value::Null,
   };
   let mut members = vec![
@@ -197,63 +237,71 @@ fn external_reference(media: &MediaRef, target: OtioTarget) -> Value {
     members.push(("available_image_bounds", Value::Null));
   }
   members.push(("target_url", text(media.locator())));
-  object(members)
+  Ok(object(members))
 }
 
-fn gap(length: Duration, ruler: &Ruler) -> Value {
-  object(vec![
+/// A gap of `length` at the edit rate, before the clip `at`.
+fn gap(length: Duration, ruler: &Ruler, at: ClipAt) -> Result<Value, NotRepresentable> {
+  let spot = Spot::Record(at);
+  Ok(object(vec![
     ("OTIO_SCHEMA", text("Gap.1")),
     ("metadata", Value::Object(Vec::new())),
     ("name", text("")),
     (
       "source_range",
       time_range(
-        rational_time(ruler.rate, count_unsigned(length.ticks())),
-        rational_time(ruler.rate, count(0)),
+        rational_time(ruler.rate, count(i128::from(length.ticks()), spot)?),
+        rational_time(ruler.rate, count(0, spot)?),
       ),
     ),
     ("effects", Value::Array(Vec::new())),
     ("markers", Value::Array(Vec::new())),
     ("enabled", Value::Bool(true)),
-  ])
-}
-
-#[derive(Clone, Copy)]
-enum FadeEdge {
-  In,
-  Out,
+  ]))
 }
 
 /// A fade as a dissolve: a fade-in runs `duration` after the cut from its
 /// gap, a fade-out `duration` before the cut to its gap — inside the clip
 /// either way, so it plays no handle.
-fn fade_transition(fade: Fade, edge: FadeEdge, ruler: &Ruler) -> Value {
-  let length = count_unsigned(fade.duration().ticks());
-  let none = count(0);
-  let (word, in_offset, out_offset) = match edge {
-    FadeEdge::In => ("in", none, length),
-    FadeEdge::Out => ("out", length, none),
+fn fade_transition(fade: Fade, at: EdgeAt, ruler: &Ruler) -> Result<Value, NotRepresentable> {
+  let spot = Spot::Fade(at);
+  let length = count(i128::from(fade.duration().ticks()), spot)?;
+  let none = count(0, spot)?;
+  let (word, in_offset, out_offset) = match at.edge() {
+    Edge::In => ("in", none, length),
+    Edge::Out => ("out", length, none),
   };
   let shape = match fade.shape() {
     FadeShape::Linear => "linear",
     FadeShape::EqualPower => "equal_power",
   };
-  transition(
+  Ok(transition(
     metadata(
       vec![("fade", text(word)), ("shape", text(shape))],
       &Metadata::new(),
     ),
     rational_time(ruler.rate, in_offset),
     rational_time(ruler.rate, out_offset),
-  )
+  ))
 }
 
-fn dissolve(transition: &Transition, ruler: &Ruler) -> Value {
-  self::transition(
+fn dissolve(
+  transition: &Transition,
+  at: TransitionAt,
+  ruler: &Ruler,
+) -> Result<Value, NotRepresentable> {
+  let spot = Spot::Transition(at);
+  Ok(self::transition(
     Value::Object(Vec::new()),
-    rational_time(ruler.rate, count_unsigned(transition.in_offset().ticks())),
-    rational_time(ruler.rate, count_unsigned(transition.out_offset().ticks())),
-  )
+    rational_time(
+      ruler.rate,
+      count(i128::from(transition.in_offset().ticks()), spot)?,
+    ),
+    rational_time(
+      ruler.rate,
+      count(i128::from(transition.out_offset().ticks()), spot)?,
+    ),
+  ))
 }
 
 fn transition(metadata: Value, in_offset: Value, out_offset: Value) -> Value {
@@ -268,25 +316,112 @@ fn transition(metadata: Value, in_offset: Value, out_offset: Value) -> Value {
 }
 
 /// A media-side range — a source range or an available range — start and
-/// length in one ruler, never two: frames of the medium's stated rate when
-/// both land on whole frames, else ticks of the range's own timebase. Exact
-/// either way.
-fn media_range(range: TimeRange, rate: Option<Rate>) -> Value {
+/// length in one ruler, never two, exact, and held: the start, the length and
+/// the end they make each within ±2^53. The first ruler that holds it:
+///
+/// 1. frames of the medium's stated rate, when both land on whole frames;
+/// 2. ticks of the range's own timebase;
+/// 3. the coarsest ruler of a whole number of ticks a second in which both
+///    land on a tick ([`coarsest`]).
+///
+/// A range none holds is refused with its own count past 2^53.
+fn media_range(range: TimeRange, rate: Option<Rate>, at: Spot) -> Result<Value, NotRepresentable> {
   let length = length_of(range);
-  if let Some((per_second, ruler)) = media_ruler(rate)
-    && let Some(start) = range.start().checked_rescale_with(ruler, Rounding::Exact)
-    && let Some(frames) = length.checked_rescale_with(ruler, Rounding::Exact)
-  {
-    return time_range(
-      rational_time(per_second, count_unsigned(frames.ticks())),
-      rational_time(per_second, count(start.pts())),
-    );
+  let frames = media_ruler(rate).and_then(|(per_second, ruler)| {
+    let start = range.start().checked_rescale_with(ruler, Rounding::Exact)?;
+    let frames = length.checked_rescale_with(ruler, Rounding::Exact)?;
+    Some(Counted::new(per_second, start.pts(), frames.ticks()))
+  });
+  if let Some(frames) = frames.filter(Counted::held) {
+    return Ok(frames.time_range());
   }
-  let per_second = ticks_per_second(range.timebase());
-  time_range(
-    rational_time(per_second, count_unsigned(length.ticks())),
-    rational_time(per_second, count(range.start_pts())),
-  )
+  let ticks = Counted::new(
+    ticks_per_second(range.timebase()),
+    range.start_pts(),
+    length.ticks(),
+  );
+  let Some(value) = ticks.past_exact() else {
+    return Ok(ticks.time_range());
+  };
+  match coarsest(range, length).filter(Counted::held) {
+    Some(counted) => Ok(counted.time_range()),
+    None => Err(NotRepresentable { at, value }),
+  }
+}
+
+/// A range counted in one ruler: the ruler's rate, as OpenTimelineIO's
+/// `f64`, and the range's start and length in it.
+#[derive(Clone, Copy)]
+struct Counted {
+  per_second: f64,
+  start: i128,
+  length: i128,
+}
+
+impl Counted {
+  fn new(per_second: f64, start: i64, length: u64) -> Self {
+    Self {
+      per_second,
+      start: i128::from(start),
+      length: i128::from(length),
+    }
+  }
+
+  /// The first of the start, the length and the end OpenTimelineIO derives
+  /// from them (the two added, in this one ruler) past ±2^53.
+  fn past_exact(self) -> Option<i128> {
+    [self.start, self.length, self.start + self.length]
+      .into_iter()
+      .find(|&count| !exact(count))
+  }
+
+  fn held(&self) -> bool {
+    self.past_exact().is_none()
+  }
+
+  fn time_range(self) -> Value {
+    time_range(
+      rational_time(self.per_second, number(self.length)),
+      rational_time(self.per_second, number(self.start)),
+    )
+  }
+}
+
+/// The coarsest ruler of a whole number of ticks a second in which `range`
+/// starts and runs `length` on whole ticks, both recounted there by
+/// `mediatime`'s exact rescale; `None` for a range in a degenerate timebase,
+/// which a valid timeline never counts one in.
+///
+/// `n` ticks of `num/den` seconds are a whole number of ticks of `1/r`
+/// seconds exactly when `den` divides `n·num·r`. For the start and the
+/// length together that is when `den` divides `g·num·r`, `g` their greatest
+/// common divisor, so the least `r` — the coarsest ruler — is
+/// `den / gcd(den, g·num)`. A whole rate is an exact `f64`. Choosing the
+/// ruler is the one sum here; the recount is `mediatime`'s, which answers
+/// only where the ruler holds the range exactly.
+fn coarsest(range: TimeRange, length: Duration) -> Option<Counted> {
+  let timebase = range.timebase();
+  let num = u128::try_from(timebase.num())
+    .ok()
+    .filter(|&num| num != 0)?;
+  let den = u128::try_from(timebase.den().get()).ok()?;
+  let common = gcd(
+    u128::from(range.start_pts().unsigned_abs()),
+    u128::from(length.ticks()),
+  );
+  let per_second = den / gcd(den, common * num);
+  let ruler = Timebase::new(1, NonZeroI32::new(i32::try_from(per_second).ok()?)?);
+  let start = range.start().checked_rescale_with(ruler, Rounding::Exact)?;
+  let ticks = length.checked_rescale_with(ruler, Rounding::Exact)?;
+  Some(Counted::new(per_second as f64, start.pts(), ticks.ticks()))
+}
+
+/// Euclid's greatest common divisor; `gcd(n, 0)` is `n`.
+fn gcd(mut a: u128, mut b: u128) -> u128 {
+  while b != 0 {
+    (a, b) = (b, a % b);
+  }
+  a
 }
 
 /// A range's length. Only a valid timeline is exported, and validation
@@ -343,13 +478,30 @@ fn time_range(duration: Value, start_time: Value) -> Value {
   ])
 }
 
-/// A whole count as OpenTimelineIO's `f64` writes one: `86400.0`. Written
-/// from the integer's own digits, so a count past 2^53 keeps every digit.
-fn count(value: i64) -> Value {
-  Value::Number(format!("{value}.0"))
+/// Whether an `f64` holds `count` exactly: whether it lies within ±2^53.
+fn exact(count: i128) -> bool {
+  count.unsigned_abs() <= EXACT
 }
 
-fn count_unsigned(value: u64) -> Value {
+/// Refuses `value`, as sitting at `at`, where an `f64` would hold it only
+/// rounded.
+fn hold(value: i128, at: Spot) -> Result<(), NotRepresentable> {
+  if exact(value) {
+    Ok(())
+  } else {
+    Err(NotRepresentable { at, value })
+  }
+}
+
+/// A whole count as OpenTimelineIO's `f64` writes one, `86400.0` — refused
+/// where an `f64` would hold it only rounded.
+fn count(value: i128, at: Spot) -> Result<Value, NotRepresentable> {
+  hold(value, at)?;
+  Ok(number(value))
+}
+
+/// A whole count written as `86400.0`, from the integer's own digits.
+fn number(value: i128) -> Value {
   Value::Number(format!("{value}.0"))
 }
 

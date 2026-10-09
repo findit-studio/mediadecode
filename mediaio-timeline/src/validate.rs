@@ -569,7 +569,7 @@ pub enum Edge {
 }
 
 impl Edge {
-  const fn side(self) -> &'static str {
+  pub(crate) const fn side(self) -> &'static str {
     match self {
       Self::In => "start",
       Self::Out => "end",

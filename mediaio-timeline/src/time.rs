@@ -11,12 +11,16 @@
 //! | a source's length at the edit rate, exactly, or refused | `Duration::checked_rescale_with(_, Rounding::Exact)`, and `checked_rescale_to` to tell a length between ticks from one too long to count |
 //! | handles and blends summed across timebases | `ExactSeconds` |
 //! | a media-side range in frames only where its start and length both land on one | `checked_rescale_with(_, Rounding::Exact)` |
+//! | a media-side range its own rulers count past 2^53, recounted in the coarsest whole-rate ruler that holds it | `checked_rescale_with(_, Rounding::Exact)`, which answers only where the ruler holds it |
 //! | a rate as OpenTimelineIO's `f64`; a rate of zero refused | `Rate::as_f64`, `Rate::checked_to_timebase`, `Rate::checked_from_timebase` |
-//!
 //! | a range's length, or none past `i64::MAX` ticks | `Timestamp::checked_signed_duration_since` |
 //!
-//! One road is missing, and is filed as a `mediatime` row rather than built
-//! here: a range's exact length as a [`Duration`] — [`span`].
+//! Two roads are missing, and are filed as `mediatime` rows rather than built
+//! here: a range's exact length as a [`Duration`] — [`span`] — and the
+//! coarsest timebase of a whole number of ticks a second in which a range's
+//! ends both land on a tick, which the OpenTimelineIO export picks meanwhile
+//! from the greatest common divisor of the range's counts, handing the
+//! recount itself to `mediatime`.
 
 use mediatime::{Duration, TimeRange};
 

@@ -3,8 +3,8 @@ use core::num::NonZeroI32;
 
 use super::{json::Value, *};
 use crate::{
-  Clip, Duration, Fade, FadeShape, Fades, MediaRef, Rate, TimeRange, Timebase, Track, TrackKind,
-  Transition,
+  Clip, Duration, Fade, FadeShape, Fades, MediaRef, Rate, TimeRange, Timebase, Timestamp, Track,
+  TrackKind, Transition,
 };
 
 fn tb(num: i32, den: i32) -> Timebase {
@@ -136,10 +136,9 @@ fn a_dissolve_sits_between_the_two_clips_it_joins() {
   );
   assert_eq!(
     to_otio(&timeline, OtioTarget::V0_15Plus),
-    Err(alloc::vec![Refusal::HandleMissing(crate::EdgeAt::new(
-      crate::ClipAt::new(0, 1),
-      crate::Edge::In
-    ))])
+    Err(Refused::Validation(alloc::vec![Refusal::HandleMissing(
+      crate::EdgeAt::new(crate::ClipAt::new(0, 1), crate::Edge::In)
+    )]))
   );
   timeline.tracks_mut()[0].clips_mut()[1].set_source_range(TimeRange::new(10, 34, edit()));
   assert_eq!(children(&timeline), ["a", "Dissolve(4, 2)", "b", "c"]);
@@ -154,39 +153,59 @@ fn a_timeline_that_does_not_validate_is_refused_with_its_refusals() {
   );
   assert_eq!(
     to_otio(&timeline, OtioTarget::Legacy),
-    Err(alloc::vec![Refusal::Overlap(crate::ClipPair::new(0, 0, 1))])
+    Err(Refused::Validation(alloc::vec![Refusal::Overlap(
+      crate::ClipPair::new(0, 0, 1)
+    )]))
   );
+}
+
+fn member(value: &Value, key: &str) -> Value {
+  value
+    .as_object()
+    .unwrap()
+    .iter()
+    .find(|(k, _)| k == key)
+    .unwrap()
+    .1
+    .clone()
 }
 
 /// The first clip's `source_range` as written: `(rate, start, duration)`,
 /// after checking that its start and its duration share that rate.
 fn source_range(timeline: &Timeline) -> (f64, f64, f64) {
+  rate_start_duration(&member(&first_clip(timeline), "source_range"))
+}
+
+/// The first clip's medium's `available_range` as written, as
+/// [`source_range`] reads one.
+fn available_range(timeline: &Timeline) -> (f64, f64, f64) {
+  let reference = member(&first_clip(timeline), "media_reference");
+  rate_start_duration(&member(&reference, "available_range"))
+}
+
+/// The first track's first clip, written for `Legacy` readers.
+fn first_clip(timeline: &Timeline) -> Value {
   let text = to_otio(timeline, OtioTarget::Legacy).unwrap();
   let root = json::parse(&text).unwrap();
-  let get = |value: &Value, key: &str| -> Value {
-    value
-      .as_object()
-      .unwrap()
-      .iter()
-      .find(|(k, _)| k == key)
-      .unwrap()
-      .1
-      .clone()
-  };
-  let track = get(&get(&root, "tracks"), "children").as_array().unwrap()[0].clone();
-  let clip = get(&track, "children").as_array().unwrap()[0].clone();
-  let range = get(&clip, "source_range");
-  let (start, duration) = (get(&range, "start_time"), get(&range, "duration"));
-  let rate = get(&duration, "rate").as_f64().unwrap();
+  let track = member(&member(&root, "tracks"), "children")
+    .as_array()
+    .unwrap()[0]
+    .clone();
+  member(&track, "children").as_array().unwrap()[0].clone()
+}
+
+fn rate_start_duration(range: &Value) -> (f64, f64, f64) {
+  let (start, duration) = (member(range, "start_time"), member(range, "duration"));
+  let rate = member(&duration, "rate").as_f64().unwrap();
   assert_eq!(
-    get(&start, "rate").as_f64(),
+    member(&start, "rate").as_f64(),
     Some(rate),
     "a range written in two rates"
   );
   (
     rate,
-    get(&start, "value").as_f64().unwrap(),
-    get(&duration, "value").as_f64().unwrap(),
+    member(&start, "value").as_f64().unwrap(),
+    member(&duration, "value").as_f64().unwrap(),
   )
 }
 
@@ -262,9 +281,274 @@ fn a_source_off_the_edit_rate_is_not_exported() {
   let half = one_source(Rate::FPS_24, 1, TimeRange::new(0, 1, tb(1, 48)), None);
   assert_eq!(
     to_otio(&half, OtioTarget::V0_15Plus),
-    Err(alloc::vec![Refusal::SourceOffEditRate(crate::ClipAt::new(
-      0, 0
-    ))])
+    Err(Refused::Validation(alloc::vec![
+      Refusal::SourceOffEditRate(crate::ClipAt::new(0, 0))
+    ]))
+  );
+}
+
+const TWO_53: i64 = 1 << 53;
+
+/// Where `to_otio` refuses `timeline` as not representable, and the count.
+fn not_representable(timeline: &Timeline) -> (Spot, i128) {
+  match to_otio(timeline, OtioTarget::V0_15Plus) {
+    Err(Refused::NotRepresentable(count)) => (count.at(), count.value()),
+    other => panic!("{other:?}"),
+  }
+}
+
+/// One clip `a` at the record [`start`, `end`) of a timeline at one frame a
+/// second, playing as long a stretch of a medium counted in whole seconds.
+fn at_one_fps(start: i64, end: i64) -> Timeline {
+  let second = tb(1, 1);
+  one_track_at(
+    Rate::hz(1),
+    Clip::new(
+      "a",
+      MediaRef::new("file:///a.mov"),
+      TimeRange::new(0, end - start, second),
+      TimeRange::new(start, end, second),
+    ),
+  )
+}
+
+fn one_track_at(rate: Rate, clip: Clip) -> Timeline {
+  Timeline::new("t", rate).with_track(Track::new(TrackKind::Video, "V").with_clip(clip))
+}
+
+#[test]
+fn a_count_past_2_53_is_refused_rather_than_read_rounded() {
+  // An f64 holds every whole number up to 2^53 and only some past it:
+  // OpenTimelineIO reads 2^53 + 1 as 2^53.
+  assert_eq!(
+    "9007199254740993.0".parse::<f64>(),
+    Ok(9_007_199_254_740_992.0)
+  );
+  let a = Spot::Record(ClipAt::new(0, 0));
+  let past = i128::from(TWO_53) + 1;
+  // Codex's case: a clip at [2^53 + 1, 2^53 + 2) on a timeline at one frame
+  // a second. Its leading gap of 2^53 + 1 frames would read as 2^53, placing
+  // the clip a second early.
+  assert_eq!(
+    not_representable(&at_one_fps(TWO_53 + 1, TWO_53 + 2)),
+    (a, past)
+  );
+  // A gap of 2^53 and a clip of one: each count is held, but the record ends
+  // at their sum, 2^53 + 1, where OpenTimelineIO adds them up.
+  assert_eq!(
+    not_representable(&at_one_fps(TWO_53, TWO_53 + 1)),
+    (a, past)
+  );
+  // The start, at the edit rate.
+  let early = at_one_fps(0, 1).with_start(Timestamp::new(-TWO_53 - 1, tb(1, 1)));
+  assert_eq!(not_representable(&early), (Spot::Start, -past));
+  // Up to 2^53 itself is written, and reads back whole.
+  assert_eq!(
+    children(&at_one_fps(TWO_53 - 1, TWO_53)),
+    ["Gap(9007199254740991)", "a"]
+  );
+}
+
+#[test]
+fn a_media_range_whose_end_is_past_2_53_is_refused() {
+  // The source range [2^53 - 1, 2^53 + 1): its start and its length are
+  // held, the end OpenTimelineIO adds up from them is not, and in whole
+  // seconds no coarser whole ruler holds it.
+  let second = tb(1, 1);
+  let mut timeline = at_one_fps(0, 2);
+  timeline.tracks_mut()[0].clips_mut()[0].set_source_range(TimeRange::new(
+    TWO_53 - 1,
+    TWO_53 + 1,
+    second,
+  ));
+  assert_eq!(
+    not_representable(&timeline),
+    (Spot::Source(ClipAt::new(0, 0)), i128::from(TWO_53) + 1)
+  );
+  // An available range 2^53 + 1 seconds long.
+  let mut timeline = at_one_fps(0, 2);
+  timeline.tracks_mut()[0].clips_mut()[0]
+    .media_mut()
+    .set_available_range(Some(TimeRange::new(0, TWO_53 + 1, second)));
+  assert_eq!(
+    not_representable(&timeline),
+    (Spot::Available(ClipAt::new(0, 0)), i128::from(TWO_53) + 1)
+  );
+}
+
+#[test]
+fn a_media_range_its_ticks_cannot_hold_is_written_in_the_coarsest_whole_ruler_that_can() {
+  // A medium stamped in nanoseconds since 1970: one second of it from
+  // 1 700 000 000 s starts at tick 1.7e18, past 2^53, and has no stated rate
+  // to count frames in. Whole seconds hold it.
+  let nanos = Timebase::NANOS;
+  let second = 1_000_000_000;
+  let epoch = 1_700_000_000 * second;
+  let mut timeline = one_source(
+    Rate::FPS_25,
+    25,
+    TimeRange::new(epoch, epoch + second, nanos),
+    None,
+  );
+  timeline.tracks_mut()[0].clips_mut()[0]
+    .media_mut()
+    .set_available_range(Some(TimeRange::new(epoch, epoch + 10 * second, nanos)));
+  assert_eq!(source_range(&timeline), (1.0, 1_700_000_000.0, 1.0));
+  assert_eq!(available_range(&timeline), (1.0, 1_700_000_000.0, 10.0));
+  // Starting between seconds, on a millisecond: milliseconds.
+  let off = epoch + 123_000_000;
+  let mut timeline = one_source(
+    Rate::FPS_25,
+    25,
+    TimeRange::new(off, off + second, nanos),
+    None,
+  );
+  assert_eq!(
+    source_range(&timeline),
+    (1000.0, 1_700_000_000_123.0, 1000.0)
+  );
+  // Read back, the counts land on the stored ends, exactly.
+  let stored = timeline.tracks()[0].clips()[0].source_range();
+  let (rate, start, duration) = source_range(&timeline);
+  let nanoseconds = |count: f64| count as i128 * i128::from(second) / rate as i128;
+  assert_eq!(nanoseconds(start), i128::from(stored.start_pts()));
+  assert_eq!(nanoseconds(start + duration), i128::from(stored.end_pts()));
+  // A stated rate whose frames it does not land on changes nothing.
+  timeline.tracks_mut()[0].clips_mut()[0]
+    .media_mut()
+    .set_rate(Some(Rate::FPS_29_97));
+  assert_eq!(
+    source_range(&timeline),
+    (1000.0, 1_700_000_000_123.0, 1000.0)
+  );
+}
+
+#[test]
+fn a_media_range_no_ruler_holds_is_refused() {
+  // One nanosecond off a whole microsecond: no whole ruler coarser than its
+  // own holds the start, and its own counts it past 2^53.
+  let start = 1_700_000_000_123_456_789;
+  let timeline = one_source(
+    Rate::FPS_25,
+    25,
+    TimeRange::new(start, start + 1_000_000_000, Timebase::NANOS),
+    None,
+  );
+  assert_eq!(
+    not_representable(&timeline),
+    (Spot::Source(ClipAt::new(0, 0)), i128::from(start))
+  );
+}
+
+/// Every object inside `value` naming `schema`.
+fn named<'a>(value: &'a Value, schema: &str, out: &mut Vec<&'a [(String, Value)]>) {
+  match value {
+    Value::Object(members) => {
+      if members
+        .iter()
+        .any(|(key, name)| key == "OTIO_SCHEMA" && name.as_str() == Some(schema))
+      {
+        out.push(members);
+      }
+      for (_, member) in members {
+        named(member, schema, out);
+      }
+    }
+    Value::Array(items) => items.iter().for_each(|item| named(item, schema, out)),
+    _ => {}
+  }
+}
+
+/// The text a JSON number was written as.
+fn spelled<'a>(members: &'a [(String, Value)], key: &str) -> &'a str {
+  match members.iter().find(|(k, _)| k == key) {
+    Some((_, Value::Number(text))) => text,
+    other => panic!("{key}: {other:?}"),
+  }
+}
+
+#[test]
+fn every_count_in_the_goldens_is_one_an_f64_holds_exactly() {
+  for golden in [
+    include_str!("../../tests/golden/law.v0_15.otio"),
+    include_str!("../../tests/golden/law.legacy.otio"),
+  ] {
+    let root = json::parse(golden).unwrap();
+    let mut times = Vec::new();
+    named(&root, "RationalTime.1", &mut times);
+    // The start; per clip its source and available ranges; per gap its range;
+    // per transition its two offsets.
+    assert_eq!(times.len(), 1 + 3 * 4 + 2 * 2 + 3 * 2);
+    for time in &times {
+      // A whole count within ±2^53, written as `<digits>.0`, which an f64
+      // reads back as exactly that count.
+      let value = spelled(time, "value");
+      let digits = value.strip_suffix(".0").unwrap();
+      let count: i128 = digits.parse().unwrap();
+      assert!(count.unsigned_abs() <= 1 << 53, "{value}");
+      assert_eq!(value.parse::<f64>().unwrap() as i128, count, "{value}");
+      // The rate spelled as the shortest text of one f64, which reads back as
+      // that very f64.
+      let rate = spelled(time, "rate");
+      let read = rate.parse::<f64>().unwrap();
+      assert!(read.is_finite() && read > 0.0, "{rate}");
+      assert_eq!(format!("{read:?}"), rate);
+    }
+    let mut ranges = Vec::new();
+    named(&root, "TimeRange.1", &mut ranges);
+    assert_eq!(ranges.len(), 3 * 2 + 2);
+    for range in ranges {
+      let time = |key: &str| match range.iter().find(|(k, _)| k == key) {
+        Some((_, Value::Object(members))) => members.as_slice(),
+        other => panic!("{key}: {other:?}"),
+      };
+      let (start, duration) = (time("start_time"), time("duration"));
+      // One ruler, so the end is the two counts added, within 2^53 too.
+      assert_eq!(spelled(start, "rate"), spelled(duration, "rate"));
+      let count = |members| -> i128 {
+        spelled(members, "value")
+          .strip_suffix(".0")
+          .unwrap()
+          .parse()
+          .unwrap()
+      };
+      assert!((count(start) + count(duration)).unsigned_abs() <= 1 << 53);
+    }
+  }
+}
+
+#[test]
+fn a_refusal_to_export_says_why() {
+  let shown = |refused: Refused| alloc::string::ToString::to_string(&refused);
+  assert_eq!(
+    shown(Refused::NotRepresentable(NotRepresentable {
+      at: Spot::Record(ClipAt::new(0, 0)),
+      value: 9_007_199_254_740_993,
+    })),
+    "the record of track 0, clip 0 counts 9007199254740993 ticks: past 2^53, where \
+     OpenTimelineIO's f64 no longer holds every whole number"
+  );
+  assert_eq!(
+    shown(Refused::Validation(alloc::vec![
+      Refusal::RateUnstated,
+      Refusal::EmptyRecord(ClipAt::new(0, 1)),
+    ])),
+    "the timeline does not validate: the edit rate is zero; track 0, clip 1: the record covers \
+     no time"
+  );
+  let spot = |at: Spot| alloc::string::ToString::to_string(&at);
+  assert_eq!(spot(Spot::Start), "the start");
+  assert_eq!(
+    spot(Spot::Available(ClipAt::new(1, 2))),
+    "the available range of track 1, clip 2"
+  );
+  assert_eq!(
+    spot(Spot::Fade(EdgeAt::new(ClipAt::new(0, 3), crate::Edge::Out))),
+    "the fade at the end of track 0, clip 3"
+  );
+  assert_eq!(
+    spot(Spot::Transition(TransitionAt::new(0, 1))),
+    "track 0, transition 1"
   );
 }
 
