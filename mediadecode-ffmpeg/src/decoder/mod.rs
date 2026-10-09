@@ -3064,7 +3064,11 @@ pub(crate) fn try_clone_parameters(
 /// pointing into it (packet.c:452-460), and `avcodec_send_packet` refuses a
 /// body of size 0 that is not null (decode.c:742-743): the replay would
 /// refuse a packet the decoder took. Its properties and side data are
-/// copied alone (`av_packet_copy_props`, packet.c:397-432).
+/// copied alone (`av_packet_copy_props`, packet.c:397-432). A session hands
+/// no decoder such a packet — its side data rides the next packet with a
+/// body (`boundary::Deferred`), which the history records carrying it — so
+/// this keeps faithful the history of a caller driving [`VideoDecoder`]
+/// directly.
 pub(crate) fn try_clone_packet(src: &Packet) -> std::result::Result<Packet, ffmpeg_next::Error> {
   let mut dst = Packet::empty();
   // SAFETY: dst is a freshly zero-initialized Packet (av_init_packet inside

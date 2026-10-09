@@ -842,6 +842,272 @@ pub(crate) fn share_or_copy(
   Ok(out)
 }
 
+/// **What every packet the boundary rebuilds is judged by before a byte of
+/// it is allocated** — the packet's own flags, side data and body, each a
+/// refusal by name.
+fn preflight(
+  flags: MdPacketFlags,
+  body: &[u8],
+  side_data: &[SideDataEntry],
+  limits: PacketLimits,
+) -> Result<(), PacketBuildError> {
+  // Before the budget and before the allocation: an uncarriable
+  // payload is not made carriable by fitting.
+  refuse_trusted(flags, body.len())?;
+  // And the annotations, judged whole before the body is allocated —
+  // a list that cannot be carried should not cost a packet first.
+  check_side_data_budget(side_data)?;
+  // **The into-FFmpeg budget, before the allocation.** `try_packet_copy`
+  // duplicates these bytes into a fresh `AVPacket` and checks only that
+  // they fit `c_int`. Without this the configured ceiling was dead on
+  // the road a caller feeds a decoder directly: bytes the demux
+  // boundary would have refused went straight into libavcodec.
+  if body.len() > limits.max_packet_bytes() {
+    return Err(PacketBuildError::SendPayloadTooLarge(
+      SendPayloadTooLarge::new(body.len(), limits.max_packet_bytes()),
+    ));
+  }
+  Ok(())
+}
+
+/// **Side data a packet with no body carried, deferred onto the next packet
+/// of the stream that has one.** Every session keeps one, and its scoped
+/// submission is the one place a packet with no body is kept from a decoder
+/// ([`with_ffmpeg_video_packet`], [`with_ffmpeg_audio_packet`],
+/// [`with_ffmpeg_subtitle_packet`]).
+///
+/// **No decoder reads a packet with no body as a packet.** libavcodec refuses
+/// one whose empty body is not null, the shape libavformat delivers, before
+/// it reads the side data (`avcodec_send_packet`, decode.c:742-743). One
+/// whose body is null it queues for its side data (745-748), as a copy whose
+/// body is a buffer of its own of size 0 (`av_packet_ref`, packet.c:452-460),
+/// and the decoder decodes it as a packet of no bytes: FFmpeg's H.264 decoder
+/// hands out a picture it holds back and returns before it reads the record
+/// (`h264_decode_frame`, h264dec.c:1034-1036 against 1038-1044); its WMA
+/// decoder takes it for its last packet (`wma_decode_superframe`,
+/// wmadec.c:845-862); its AAC decoder applies the record and fails the empty
+/// body (`aac_decode_frame`, aac/aacdec.c:2572-2589); its HEVC decoder
+/// applies the record and decodes an empty access unit, which moves an end
+/// of sequence the packet before it left into its own and clears it
+/// (`decode_nal_units`, hevc/hevcdec.c:3688-3692), so the CRA after it is
+/// decoded as no new sequence — the prior sequence's pictures still waiting
+/// output rather than discarded (`no_output_of_prior_pics_flag`, 786-787;
+/// 3204-3205, 3311-3316), its leading pictures decoded across the boundary
+/// (3284-3285, 3542-3548). A subtitle decoder with a delay takes one for its
+/// flush (`avcodec_decode_subtitle2`, decode.c:954). ffmpeg's own decode
+/// loop never sends one (fftools/ffmpeg_dec.c:701-705).
+///
+/// **So its side data rides the next packet with a body**, in front of that
+/// packet's own: where FFmpeg applies a packet's side data anyway —
+/// libavcodec takes it with the packet the decoder pulls
+/// (`decode_get_packet`, decode.c:229-252), and the H.264, HEVC and AAC
+/// decoders read the record at the head of the packet they decode. A packet
+/// carries one entry of a type — `av_packet_add_side_data` replaces one of
+/// the same type in place (packet.c:203-211) — so of two of a type the later
+/// rides: the later of two deferred, the packet's own over a deferred one. A
+/// packet with no body that carries no side data is dropped, as ffmpeg's
+/// loop drops it. What is deferred and what the packet carries are each
+/// judged by the caps every packet is ([`check_side_data_budget`]); together
+/// they are at most twice them.
+///
+/// **It goes where the packet it rides goes**: taken with it, refused with
+/// it — the refusal the packet's, and the side data's — except under back
+/// pressure, when the same packet is offered again and carries it again. A
+/// rebuild that fails before the decoder's road is reached leaves it for the
+/// next. The end of the stream, past which no packet comes, and a flush,
+/// which abandons the position, drop it and say so ([`Self::abandon`]):
+/// libavcodec's own flush drops a packet it took and had not decoded, its
+/// side data with it (`avcodec_flush_buffers`, avcodec.c:411-412;
+/// `ff_decode_flush_buffers`, decode.c:2370-2371).
+#[derive(Debug, Default)]
+pub(crate) struct Deferred {
+  entries: Vec<SideDataEntry>,
+}
+
+impl Deferred {
+  /// Defers a packet with no body's `side_data`: each entry in place of a
+  /// deferred one of its type, as `av_packet_add_side_data` replaces one, the
+  /// rest after. Refused, nothing deferred, where an entry names a type this
+  /// build does not, or what would be deferred passes the caps: it could
+  /// never be attached.
+  fn defer(&mut self, side_data: &[SideDataEntry]) -> Result<(), PacketBuildError> {
+    if side_data.is_empty() {
+      return Ok(());
+    }
+    let limit = crate::ffi::side_data_type_count();
+    if let Some(entry) = side_data
+      .iter()
+      .find(|entry| entry.kind() < 0 || entry.kind() >= limit)
+    {
+      return Err(PacketBuildError::UnknownSideData(UnknownSideData::new(
+        entry.kind(),
+        limit,
+      )));
+    }
+    let mut next: Vec<SideDataEntry> = Vec::new();
+    next
+      .try_reserve_exact(self.entries.len() + side_data.len())
+      .map_err(|_| {
+        PacketBuildError::Ffmpeg(ffmpeg_next::Error::Other {
+          errno: libc::ENOMEM,
+        })
+      })?;
+    next.extend(self.entries.iter().cloned());
+    for entry in side_data {
+      match next.iter_mut().find(|held| held.kind() == entry.kind()) {
+        Some(held) => *held = entry.clone(),
+        None => next.push(entry.clone()),
+      }
+    }
+    check_side_data_budget(&next)?;
+    self.entries = next;
+    Ok(())
+  }
+
+  /// The side data a packet with a body carries: what is deferred, of every
+  /// type the packet does not carry itself, in front of the packet's own,
+  /// `own`.
+  fn onto<'a>(
+    &self,
+    own: &'a [SideDataEntry],
+  ) -> Result<std::borrow::Cow<'a, [SideDataEntry]>, PacketBuildError> {
+    if self.entries.is_empty() {
+      return Ok(std::borrow::Cow::Borrowed(own));
+    }
+    let mut carried: Vec<SideDataEntry> = Vec::new();
+    carried
+      .try_reserve_exact(self.entries.len() + own.len())
+      .map_err(|_| {
+        PacketBuildError::Ffmpeg(ffmpeg_next::Error::Other {
+          errno: libc::ENOMEM,
+        })
+      })?;
+    carried.extend(
+      self
+        .entries
+        .iter()
+        .filter(|deferred| !own.iter().any(|entry| entry.kind() == deferred.kind()))
+        .cloned(),
+    );
+    carried.extend(own.iter().cloned());
+    Ok(std::borrow::Cow::Owned(carried))
+  }
+
+  /// **Drops what is deferred where no packet will carry it** — `at`, the
+  /// end of the stream or a flush — and says so, naming the side data's
+  /// types (`AV_PKT_DATA_*`, as FFmpeg numbers them). No decoder saw it, so
+  /// nothing the session knows of the stream changes: it is not in doubt.
+  pub(crate) fn abandon(&mut self, at: Abandoned) {
+    if self.entries.is_empty() {
+      return;
+    }
+    let kinds: Vec<i32> = self.entries.iter().map(SideDataEntry::kind).collect();
+    tracing::warn!(
+      ?kinds,
+      "mediadecode-ffmpeg: side data a packet with no body carried waited for the next packet \
+       with a body, and {at} came first: no decoder applied it",
+    );
+    #[cfg(test)]
+    abandoned::note(at, kinds);
+    self.entries.clear();
+  }
+
+  /// The types deferred, in the order they will ride.
+  #[cfg(test)]
+  pub(crate) fn kinds(&self) -> Vec<i32> {
+    self.entries.iter().map(SideDataEntry::kind).collect()
+  }
+}
+
+/// Where side data deferred from a packet with no body was dropped, no
+/// packet left to carry it ([`Deferred::abandon`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Abandoned {
+  /// The end of the stream, taken: no packet comes after it.
+  End,
+  /// A flush: the caller abandons the position, and the packet the side
+  /// data waited for with it.
+  Flush,
+}
+
+impl core::fmt::Display for Abandoned {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.write_str(match self {
+      Self::End => "the end of the stream",
+      Self::Flush => "a flush",
+    })
+  }
+}
+
+/// Test-only: the side data this thread's sessions dropped with no packet to
+/// carry it, and where ([`Deferred::abandon`]).
+#[cfg(test)]
+pub(crate) mod abandoned {
+  use std::cell::RefCell;
+
+  std::thread_local! {
+    static LOG: RefCell<Vec<(super::Abandoned, Vec<i32>)>> = const { RefCell::new(Vec::new()) };
+  }
+
+  pub(super) fn note(at: super::Abandoned, kinds: Vec<i32>) {
+    LOG.with(|log| log.borrow_mut().push((at, kinds)));
+  }
+
+  /// What was dropped since the last call, in order.
+  pub(crate) fn take() -> Vec<(super::Abandoned, Vec<i32>)> {
+    LOG.with(|log| core::mem::take(&mut *log.borrow_mut()))
+  }
+}
+
+/// What a scoped submission did with a packet ([`with_ffmpeg_video_packet`]
+/// and its siblings).
+#[derive(Debug)]
+pub(crate) enum Submission<T> {
+  /// The packet had no body: nothing was submitted, and its side data waits
+  /// for the next packet with one ([`Deferred`]).
+  NoBody,
+  /// The packet was submitted, carrying what was deferred onto it, and this
+  /// is what the decoder's road answered.
+  Answered(T),
+}
+
+/// **The scoped submission every session's packet takes**, and the one place
+/// a packet with no body is kept from a decoder ([`Deferred`]).
+///
+/// The packet is judged as every rebuilt packet is ([`preflight`]), what is
+/// deferred left as it was where it is refused. With no body it is not
+/// submitted: its side data is deferred and nothing else of it kept. With
+/// one, it is rebuilt by `assemble` carrying what is deferred in front of
+/// its own side data, lent to `submit`, and dropped before this returns;
+/// what rode it goes with it unless `again` reads `submit`'s answer as back
+/// pressure, under which the caller offers the same packet again.
+#[allow(clippy::too_many_arguments)]
+fn submission<T>(
+  flags: MdPacketFlags,
+  body: &[u8],
+  side_data: &[SideDataEntry],
+  limits: PacketLimits,
+  deferred: &mut Deferred,
+  assemble: impl FnOnce(&[SideDataEntry]) -> Result<Packet, PacketBuildError>,
+  submit: impl FnOnce(&Packet) -> T,
+  again: impl FnOnce(&T) -> bool,
+) -> Result<Submission<T>, PacketBuildError> {
+  preflight(flags, body, side_data, limits)?;
+  if body.is_empty() {
+    deferred.defer(side_data)?;
+    return Ok(Submission::NoBody);
+  }
+  let av_packet = deferred
+    .onto(side_data)
+    .and_then(|carried| assemble(&carried))?;
+  let answer = submit(&av_packet);
+  drop(av_packet);
+  if !again(&answer) {
+    deferred.entries.clear();
+  }
+  Ok(Submission::Answered(answer))
+}
+
 /// Builds an `ffmpeg::Packet` from a [`mediadecode::VideoPacket`]
 /// parameterized by [`crate::extras::VideoPacketExtra`] and
 /// `FfmpegBytes`.
@@ -856,8 +1122,9 @@ pub(crate) fn share_or_copy(
 /// [`attach_side_data`] for why that is not optional.
 ///
 /// A packet with no body is rebuilt as libavformat delivers one, a body of
-/// size 0 over a padding allocation (demux.c:681): forwarded to a decoder,
-/// it gets libavcodec's own answer to libavformat's own packet.
+/// size 0 over a padding allocation (demux.c:681), and libavcodec refuses
+/// it so (decode.c:742-743). A session hands no decoder one: it defers its
+/// side data onto the next packet with a body.
 ///
 /// Returns [`PacketBuildError`] on:
 /// * payload larger than `c_int::MAX` (would overflow `AVPacket.size`);
@@ -868,7 +1135,7 @@ pub fn ffmpeg_packet_from_video_packet(
   packet: &mediadecode::packet::VideoPacket<VideoPacketExtra, crate::FfmpegBuffer>,
   limits: PacketLimits,
 ) -> std::result::Result<Packet, PacketBuildError> {
-  build_video_packet::<crate::View>(packet, limits, BodyRoute::Copy, Bodiless::AsDemuxed)
+  build_video_packet::<crate::View>(packet, limits)
 }
 
 /// [`ffmpeg_packet_from_video_packet`] on the owned lane.
@@ -876,33 +1143,7 @@ pub fn ffmpeg_packet_from_owned_video_packet(
   packet: &mediadecode::packet::VideoPacket<VideoPacketExtra, FfmpegBytes>,
   limits: PacketLimits,
 ) -> std::result::Result<Packet, PacketBuildError> {
-  build_video_packet::<crate::Owned>(packet, limits, BodyRoute::Copy, Bodiless::AsDemuxed)
-}
-
-/// **How a video packet with no body that carries side data is rebuilt.**
-///
-/// libavcodec takes such a packet in one shape only: `avcodec_send_packet`
-/// refuses a `size` of 0 over a `data` that is not null with
-/// `AVERROR(EINVAL)` before it reads the side data (decode.c:742-743), and
-/// queues one whose `data` is null for its side data (745-748). What a
-/// decoder then makes of it is the codec's: FFmpeg's HEVC decoder applies
-/// its `AV_PKT_DATA_NEW_EXTRADATA` and reads no unit
-/// (`hevc_receive_frame`, hevc/hevcdec.c:3855-3872), while its H.264 and
-/// MPEG decoders read an empty packet as the end of the stream, handing out
-/// a picture they were holding back (h264dec.c:1034-1036, 978-1017;
-/// mpeg12dec.c:2556-2568; h263dec.c:452-472; vc1dec.c:843-854) — so the
-/// session decides which decoder is handed one
-/// (`CarrierVideoStreamDecoder::refuse_bodiless`). A packet that carries no
-/// side data either is rebuilt as libavformat delivers it whatever this
-/// says: null, it would be the end of the stream (decode.c:745-752).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Bodiless {
-  /// A body of size 0 over a padding allocation, as libavformat delivers a
-  /// packet with no payload (`av_packet_make_refcounted`, demux.c:681;
-  /// packet.c:83-110).
-  AsDemuxed,
-  /// No data at all: `data` null, `size` 0.
-  Null,
+  build_video_packet::<crate::Owned>(packet, limits)
 }
 
 /// [`ffmpeg_packet_from_video_packet`] built for **submission**, and
@@ -930,50 +1171,49 @@ enum Bodiless {
 /// nobody else reads. Callers with no history — every software road,
 /// and the hardware road after commit — pass
 /// [`BodyRoute::Submission`] and keep the zero-copy send.
+///
+/// **A packet with no body is not submitted** ([`submission`]): its side
+/// data waits in `deferred` and rides the next packet with a body, which
+/// `submit` is lent carrying it — and so does a probe's rescue history,
+/// which records that packet. `again` reads `submit`'s answer for back
+/// pressure.
 pub(crate) fn with_ffmpeg_video_packet<C: crate::FfmpegCarrier + crate::CarrierOps, T>(
   packet: &mediadecode::packet::VideoPacket<VideoPacketExtra, C::Buffer>,
   limits: PacketLimits,
   route: BodyRoute,
+  deferred: &mut Deferred,
   submit: impl FnOnce(&Packet) -> T,
-) -> std::result::Result<T, PacketBuildError> {
-  // A packet with no body that carries side data is handed over in the one
-  // shape libavcodec takes it in; the session refuses it before any decoder
-  // that would read it as the end of the stream sees it.
-  let av_packet = build_video_packet::<C>(packet, limits, route, Bodiless::Null)?;
-  let out = submit(&av_packet);
-  drop(av_packet);
-  Ok(out)
+  again: impl FnOnce(&T) -> bool,
+) -> std::result::Result<Submission<T>, PacketBuildError> {
+  submission(
+    packet.flags(),
+    packet.data().as_ref(),
+    packet.extra().side_data(),
+    limits,
+    deferred,
+    |carried| assemble_video_packet::<C>(packet, route, carried),
+    submit,
+    again,
+  )
 }
 
 fn build_video_packet<C: crate::FfmpegCarrier + crate::CarrierOps>(
   packet: &mediadecode::packet::VideoPacket<VideoPacketExtra, C::Buffer>,
   limits: PacketLimits,
-  route: BodyRoute,
-  bodiless: Bodiless,
 ) -> std::result::Result<Packet, PacketBuildError> {
-  let body = packet.data().as_ref();
-  // Before the budget and before the allocation: an uncarriable
-  // payload is not made carriable by fitting.
-  refuse_trusted(packet.flags(), body.len())?;
-  // And the annotations, judged whole before the body is allocated —
-  // a list that cannot be carried should not cost a packet first.
-  check_side_data_budget(packet.extra().side_data())?;
-  // **The into-FFmpeg budget, before the allocation.** `try_packet_copy`
-  // duplicates these bytes into a fresh `AVPacket` and checks only that
-  // they fit `c_int`. Without this the configured ceiling was dead on
-  // the road a caller feeds a decoder directly: bytes the demux
-  // boundary would have refused went straight into libavcodec.
-  if body.len() > limits.max_packet_bytes() {
-    return Err(PacketBuildError::SendPayloadTooLarge(
-      SendPayloadTooLarge::new(body.len(), limits.max_packet_bytes()),
-    ));
-  }
   let side_data = packet.extra().side_data();
-  let mut out = if bodiless == Bodiless::Null && body.is_empty() && !side_data.is_empty() {
-    Packet::empty()
-  } else {
-    C::packet_body(packet.data(), route)?
-  };
+  preflight(packet.flags(), packet.data().as_ref(), side_data, limits)?;
+  assemble_video_packet::<C>(packet, BodyRoute::Copy, side_data)
+}
+
+/// `packet` rebuilt around its body, carrying `side_data`: its own, or on a
+/// submission what was deferred onto it as well ([`Deferred`]).
+fn assemble_video_packet<C: crate::FfmpegCarrier + crate::CarrierOps>(
+  packet: &mediadecode::packet::VideoPacket<VideoPacketExtra, C::Buffer>,
+  route: BodyRoute,
+  side_data: &[SideDataEntry],
+) -> std::result::Result<Packet, PacketBuildError> {
+  let mut out = C::packet_body(packet.data(), route)?;
   attach_side_data(&mut out, side_data)?;
   if let Some(ts) = packet.pts() {
     out.set_pts(Some(ts.pts()));
@@ -998,7 +1238,7 @@ pub fn ffmpeg_packet_from_audio_packet(
   packet: &mediadecode::packet::AudioPacket<AudioPacketExtra, crate::FfmpegBuffer>,
   limits: PacketLimits,
 ) -> std::result::Result<Packet, PacketBuildError> {
-  build_audio_packet::<crate::View>(packet, limits, BodyRoute::Copy)
+  build_audio_packet::<crate::View>(packet, limits)
 }
 
 /// [`ffmpeg_packet_from_audio_packet`] on the owned lane.
@@ -1006,7 +1246,7 @@ pub fn ffmpeg_packet_from_owned_audio_packet(
   packet: &mediadecode::packet::AudioPacket<AudioPacketExtra, FfmpegBytes>,
   limits: PacketLimits,
 ) -> std::result::Result<Packet, PacketBuildError> {
-  build_audio_packet::<crate::Owned>(packet, limits, BodyRoute::Copy)
+  build_audio_packet::<crate::Owned>(packet, limits)
 }
 
 /// [`ffmpeg_packet_from_audio_packet`] built for **submission**, and
@@ -1022,42 +1262,48 @@ pub fn ffmpeg_packet_from_owned_audio_packet(
 /// packet is built, lent to `submit` as `&Packet`, and dropped before
 /// this function returns: no value that can produce a `&mut` into the
 /// shared bytes ever exists.
+///
+/// A packet with no body is not submitted, its side data deferred onto
+/// the next packet with one, as on the video road
+/// ([`with_ffmpeg_video_packet`]).
 pub(crate) fn with_ffmpeg_audio_packet<C: crate::FfmpegCarrier + crate::CarrierOps, T>(
   packet: &mediadecode::packet::AudioPacket<AudioPacketExtra, C::Buffer>,
   limits: PacketLimits,
   route: BodyRoute,
+  deferred: &mut Deferred,
   submit: impl FnOnce(&Packet) -> T,
-) -> std::result::Result<T, PacketBuildError> {
-  let av_packet = build_audio_packet::<C>(packet, limits, route)?;
-  let out = submit(&av_packet);
-  drop(av_packet);
-  Ok(out)
+  again: impl FnOnce(&T) -> bool,
+) -> std::result::Result<Submission<T>, PacketBuildError> {
+  submission(
+    packet.flags(),
+    packet.data().as_ref(),
+    packet.extra().side_data(),
+    limits,
+    deferred,
+    |carried| assemble_audio_packet::<C>(packet, route, carried),
+    submit,
+    again,
+  )
 }
 
 fn build_audio_packet<C: crate::FfmpegCarrier + crate::CarrierOps>(
   packet: &mediadecode::packet::AudioPacket<AudioPacketExtra, C::Buffer>,
   limits: PacketLimits,
-  route: BodyRoute,
 ) -> std::result::Result<Packet, PacketBuildError> {
-  let body = packet.data().as_ref();
-  // Before the budget and before the allocation: an uncarriable
-  // payload is not made carriable by fitting.
-  refuse_trusted(packet.flags(), body.len())?;
-  // And the annotations, judged whole before the body is allocated —
-  // a list that cannot be carried should not cost a packet first.
-  check_side_data_budget(packet.extra().side_data())?;
-  // **The into-FFmpeg budget, before the allocation.** `try_packet_copy`
-  // duplicates these bytes into a fresh `AVPacket` and checks only that
-  // they fit `c_int`. Without this the configured ceiling was dead on
-  // the road a caller feeds a decoder directly: bytes the demux
-  // boundary would have refused went straight into libavcodec.
-  if body.len() > limits.max_packet_bytes() {
-    return Err(PacketBuildError::SendPayloadTooLarge(
-      SendPayloadTooLarge::new(body.len(), limits.max_packet_bytes()),
-    ));
-  }
+  let side_data = packet.extra().side_data();
+  preflight(packet.flags(), packet.data().as_ref(), side_data, limits)?;
+  assemble_audio_packet::<C>(packet, BodyRoute::Copy, side_data)
+}
+
+/// `packet` rebuilt around its body, carrying `side_data`
+/// ([`assemble_video_packet`]).
+fn assemble_audio_packet<C: crate::FfmpegCarrier + crate::CarrierOps>(
+  packet: &mediadecode::packet::AudioPacket<AudioPacketExtra, C::Buffer>,
+  route: BodyRoute,
+  side_data: &[SideDataEntry],
+) -> std::result::Result<Packet, PacketBuildError> {
   let mut out = C::packet_body(packet.data(), route)?;
-  attach_side_data(&mut out, packet.extra().side_data())?;
+  attach_side_data(&mut out, side_data)?;
   if let Some(ts) = packet.pts() {
     out.set_pts(Some(ts.pts()));
   }
@@ -1067,7 +1313,7 @@ fn build_audio_packet<C: crate::FfmpegCarrier + crate::CarrierOps>(
   if let Some(d) = packet.duration() {
     out.set_duration(d.pts());
   }
-  // SAFETY: `out` owns the `AVPacket` `try_packet_copy` just built.
+  // SAFETY: `out` owns the `AVPacket` just built.
   unsafe { write_md_flags(&mut out, packet.flags()) };
   out.set_stream(packet.extra().stream_index() as usize);
   Ok(out)
@@ -1081,7 +1327,7 @@ pub fn ffmpeg_packet_from_subtitle_packet(
   packet: &mediadecode::packet::SubtitlePacket<SubtitlePacketExtra, crate::FfmpegBuffer>,
   limits: PacketLimits,
 ) -> std::result::Result<Packet, PacketBuildError> {
-  build_subtitle_packet::<crate::View>(packet, limits, BodyRoute::Copy)
+  build_subtitle_packet::<crate::View>(packet, limits)
 }
 
 /// [`ffmpeg_packet_from_subtitle_packet`] on the owned lane.
@@ -1089,7 +1335,7 @@ pub fn ffmpeg_packet_from_owned_subtitle_packet(
   packet: &mediadecode::packet::SubtitlePacket<SubtitlePacketExtra, FfmpegBytes>,
   limits: PacketLimits,
 ) -> std::result::Result<Packet, PacketBuildError> {
-  build_subtitle_packet::<crate::Owned>(packet, limits, BodyRoute::Copy)
+  build_subtitle_packet::<crate::Owned>(packet, limits)
 }
 
 /// [`ffmpeg_packet_from_subtitle_packet`] built for **submission**, and
@@ -1105,49 +1351,55 @@ pub fn ffmpeg_packet_from_owned_subtitle_packet(
 /// packet is built, lent to `submit` as `&Packet`, and dropped before
 /// this function returns: no value that can produce a `&mut` into the
 /// shared bytes ever exists.
+///
+/// A packet with no body is not submitted, its side data deferred onto
+/// the next packet with one, as on the video road
+/// ([`with_ffmpeg_video_packet`]).
 pub(crate) fn with_ffmpeg_subtitle_packet<C: crate::FfmpegCarrier + crate::CarrierOps, T>(
   packet: &mediadecode::packet::SubtitlePacket<SubtitlePacketExtra, C::Buffer>,
   limits: PacketLimits,
   route: BodyRoute,
+  deferred: &mut Deferred,
   submit: impl FnOnce(&Packet) -> T,
-) -> std::result::Result<T, PacketBuildError> {
-  let av_packet = build_subtitle_packet::<C>(packet, limits, route)?;
-  let out = submit(&av_packet);
-  drop(av_packet);
-  Ok(out)
+  again: impl FnOnce(&T) -> bool,
+) -> std::result::Result<Submission<T>, PacketBuildError> {
+  submission(
+    packet.flags(),
+    packet.data().as_ref(),
+    packet.extra().side_data(),
+    limits,
+    deferred,
+    |carried| assemble_subtitle_packet::<C>(packet, route, carried),
+    submit,
+    again,
+  )
 }
 
 fn build_subtitle_packet<C: crate::FfmpegCarrier + crate::CarrierOps>(
   packet: &mediadecode::packet::SubtitlePacket<SubtitlePacketExtra, C::Buffer>,
   limits: PacketLimits,
-  route: BodyRoute,
 ) -> std::result::Result<Packet, PacketBuildError> {
-  let body = packet.data().as_ref();
-  // Before the budget and before the allocation: an uncarriable
-  // payload is not made carriable by fitting.
-  refuse_trusted(packet.flags(), body.len())?;
-  // And the annotations, judged whole before the body is allocated —
-  // a list that cannot be carried should not cost a packet first.
-  check_side_data_budget(packet.extra().side_data())?;
-  // **The into-FFmpeg budget, before the allocation.** `try_packet_copy`
-  // duplicates these bytes into a fresh `AVPacket` and checks only that
-  // they fit `c_int`. Without this the configured ceiling was dead on
-  // the road a caller feeds a decoder directly: bytes the demux
-  // boundary would have refused went straight into libavcodec.
-  if body.len() > limits.max_packet_bytes() {
-    return Err(PacketBuildError::SendPayloadTooLarge(
-      SendPayloadTooLarge::new(body.len(), limits.max_packet_bytes()),
-    ));
-  }
+  let side_data = packet.extra().side_data();
+  preflight(packet.flags(), packet.data().as_ref(), side_data, limits)?;
+  assemble_subtitle_packet::<C>(packet, BodyRoute::Copy, side_data)
+}
+
+/// `packet` rebuilt around its body, carrying `side_data`
+/// ([`assemble_video_packet`]). Subtitle packets have no `dts`.
+fn assemble_subtitle_packet<C: crate::FfmpegCarrier + crate::CarrierOps>(
+  packet: &mediadecode::packet::SubtitlePacket<SubtitlePacketExtra, C::Buffer>,
+  route: BodyRoute,
+  side_data: &[SideDataEntry],
+) -> std::result::Result<Packet, PacketBuildError> {
   let mut out = C::packet_body(packet.data(), route)?;
-  attach_side_data(&mut out, packet.extra().side_data())?;
+  attach_side_data(&mut out, side_data)?;
   if let Some(ts) = packet.pts() {
     out.set_pts(Some(ts.pts()));
   }
   if let Some(d) = packet.duration() {
     out.set_duration(d.pts());
   }
-  // SAFETY: `out` owns the `AVPacket` `try_packet_copy` just built.
+  // SAFETY: `out` owns the `AVPacket` just built.
   unsafe { write_md_flags(&mut out, packet.flags()) };
   out.set_stream(packet.extra().stream_index() as usize);
   Ok(out)
@@ -3094,8 +3346,9 @@ mod tests {
   #[test]
   fn a_side_data_only_packet_round_trips_on_every_view_decoder_family() {
     // Every family, both roads: the public builder a caller can call,
-    // and the scoped submission a decoder goes through. Neither may
-    // touch the empty carrier's absent buffer.
+    // and the scoped submission a decoder goes through, which builds no
+    // packet for it and defers its side data. Neither may touch the empty
+    // carrier's absent buffer.
     let tb = mediadecode::Timebase::default();
     let source = side_data_only_packet();
     let limits = PacketLimits::default();
@@ -3115,10 +3368,18 @@ mod tests {
         .size(),
       0,
     );
-    with_ffmpeg_video_packet::<crate::View, _>(&video, limits, BodyRoute::Submission, |av| {
-      assert_eq!(av.size(), 0);
-    })
-    .expect("submitted");
+    let mut deferred = Deferred::default();
+    let submitted = with_ffmpeg_video_packet::<crate::View, _>(
+      &video,
+      limits,
+      BodyRoute::Submission,
+      &mut deferred,
+      |_| unreachable!("a packet with no body is not submitted"),
+      |(): &()| false,
+    )
+    .expect("taken");
+    assert!(matches!(submitted, Submission::NoBody));
+    assert_eq!(deferred.kinds(), vec![NEW_EXTRADATA]);
 
     let audio = audio_packet_from_ffmpeg_as::<crate::View>(
       source.clone(),
@@ -3135,10 +3396,18 @@ mod tests {
         .size(),
       0,
     );
-    with_ffmpeg_audio_packet::<crate::View, _>(&audio, limits, BodyRoute::Submission, |av| {
-      assert_eq!(av.size(), 0);
-    })
-    .expect("submitted");
+    let mut deferred = Deferred::default();
+    let submitted = with_ffmpeg_audio_packet::<crate::View, _>(
+      &audio,
+      limits,
+      BodyRoute::Submission,
+      &mut deferred,
+      |_| unreachable!("a packet with no body is not submitted"),
+      |(): &()| false,
+    )
+    .expect("taken");
+    assert!(matches!(submitted, Submission::NoBody));
+    assert_eq!(deferred.kinds(), vec![NEW_EXTRADATA]);
 
     let subtitle = subtitle_packet_from_ffmpeg_as::<crate::View>(
       source.clone(),
@@ -3155,55 +3424,222 @@ mod tests {
         .size(),
       0,
     );
-    with_ffmpeg_subtitle_packet::<crate::View, _>(&subtitle, limits, BodyRoute::Submission, |av| {
-      assert_eq!(av.size(), 0);
-    })
-    .expect("submitted");
+    let mut deferred = Deferred::default();
+    let submitted = with_ffmpeg_subtitle_packet::<crate::View, _>(
+      &subtitle,
+      limits,
+      BodyRoute::Submission,
+      &mut deferred,
+      |_| unreachable!("a packet with no body is not submitted"),
+      |(): &()| false,
+    )
+    .expect("taken");
+    assert!(matches!(submitted, Submission::NoBody));
+    assert_eq!(deferred.kinds(), vec![NEW_EXTRADATA]);
   }
 
+  /// One side data entry of `kind` carrying `data`.
+  fn entry(kind: i32, data: &[u8]) -> SideDataEntry {
+    SideDataEntry::new(kind, FfmpegBytes::copy_from_slice(data))
+  }
+
+  /// The side data a rebuilt packet carries, by type and bytes.
+  fn carried(av: &Packet) -> Vec<(i32, Vec<u8>)> {
+    packet_side_data(av)
+      .expect("readable")
+      .iter()
+      .map(|entry| (entry.kind(), entry.data().to_vec()))
+      .collect()
+  }
+
+  /// LAW (R20 row 1; Codex R19 [high]): **a packet with no body is never
+  /// submitted; its side data rides the next packet with one, on every
+  /// family's road.** No decoder reads a packet with no body as a packet
+  /// (`Deferred`). A packet with no body carrying a record and a display
+  /// matrix, then one carrying a second record, then one carrying nothing:
+  /// none submitted, the second record in the first's place, the matrix
+  /// kept, nothing for the third. The next packet with a body, carrying its
+  /// own matrix, is lent to the decoder's road carrying the second record in
+  /// front of its own matrix; answered back pressure, it carries both again
+  /// when offered again; taken, nothing waits. A packet refused before the
+  /// merge — its body over the budget — leaves what waits for the next. The
+  /// audio and subtitle roads defer the same way. What waits at the end is
+  /// dropped and said so. Kept first, the first record rode the packet.
   #[test]
-  fn a_video_submission_with_no_body_carries_no_data() {
-    // libavcodec takes a packet with no body in one shape: `data` null, its
-    // side data read (decode.c:745-748). A body of size 0 that is not null is
-    // refused before the side data is read (742-743) — the shape libavformat
-    // delivers, which the public builder keeps — and one carrying nothing at
-    // all, null, would be the end of the stream (745-752).
-    let video = video_packet_from_borrowed::<crate::Owned>(
-      &side_data_only_packet(),
-      mediadecode::Timebase::default(),
-      PacketLimits::default(),
-      crate::buffer::PayloadProvenance::CallerSupplied,
-    )
-    .expect("wrappable")
-    .expect("a side-data-only packet is a packet");
+  fn a_packet_with_no_body_is_never_submitted_and_its_side_data_rides_the_next() {
+    const MATRIX: i32 = AVPacketSideDataType::AV_PKT_DATA_DISPLAYMATRIX as i32;
     let limits = PacketLimits::default();
-    let public = ffmpeg_packet_from_owned_video_packet(&video, limits).expect("built");
-    assert_eq!(public.size(), 0);
+    let video = |body: &[u8], side_data: Vec<SideDataEntry>| {
+      VideoPacket::new(
+        FfmpegBytes::copy_from_slice(body),
+        VideoPacketExtra::new(0).with_side_data(side_data),
+      )
+    };
+    // The public builder keeps the shape libavformat delivers one in.
+    let public = ffmpeg_packet_from_owned_video_packet(
+      &video(&[], vec![entry(NEW_EXTRADATA, &[1, 2, 3, 4])]),
+      limits,
+    )
+    .expect("built");
     assert!(
-      public.data().is_some(),
+      public.size() == 0 && public.data().is_some(),
       "the public builder: as libavformat delivers it"
     );
-    for route in [BodyRoute::Copy, BodyRoute::Submission] {
-      with_ffmpeg_video_packet::<crate::Owned, _>(&video, limits, route, |av| {
-        assert_eq!(av.size(), 0);
-        assert!(av.data().is_none(), "{route:?}: submitted with no data");
-        let carried = packet_side_data(av).expect("readable");
-        assert_eq!(carried.len(), 1, "{route:?}: its side data attached");
-        assert_eq!(carried[0].kind(), NEW_EXTRADATA);
-        assert_eq!(carried[0].data(), &[1, 2, 3, 4]);
-      })
-      .expect("submitted");
-    }
-    let nothing =
-      mediadecode::packet::VideoPacket::new(FfmpegBytes::empty(), VideoPacketExtra::new(0));
-    with_ffmpeg_video_packet::<crate::Owned, _>(&nothing, limits, BodyRoute::Submission, |av| {
-      assert_eq!(av.size(), 0);
-      assert!(
-        av.data().is_some(),
-        "a packet carrying nothing is not the end of the stream"
+
+    let mut deferred = Deferred::default();
+    let offer = |deferred: &mut Deferred, packet, again: bool| {
+      let mut lent = None;
+      let answer = with_ffmpeg_video_packet::<crate::Owned, _>(
+        &packet,
+        limits,
+        BodyRoute::Submission,
+        deferred,
+        |av| {
+          lent = Some(carried(av));
+          again
+        },
+        |again| *again,
       );
-    })
+      (
+        answer.map(|submitted| matches!(submitted, Submission::NoBody)),
+        lent,
+      )
+    };
+    for packet in [
+      video(
+        &[],
+        vec![entry(NEW_EXTRADATA, &[1, 2, 3, 4]), entry(MATRIX, &[7])],
+      ),
+      video(&[], vec![entry(NEW_EXTRADATA, &[5, 6])]),
+      video(&[], Vec::new()),
+    ] {
+      let (answer, lent) = offer(&mut deferred, packet, false);
+      assert!(
+        matches!(answer, Ok(true)) && lent.is_none(),
+        "a packet with no body is not submitted"
+      );
+    }
+    assert_eq!(
+      deferred
+        .entries
+        .iter()
+        .map(|e| (e.kind(), e.data().to_vec()))
+        .collect::<Vec<_>>(),
+      vec![(NEW_EXTRADATA, vec![5, 6]), (MATRIX, vec![7])],
+      "the later record in the earlier's place, the matrix kept"
+    );
+    let with_body = || video(&[9, 9, 9], vec![entry(MATRIX, &[8])]);
+    let expected = vec![(NEW_EXTRADATA, vec![5, 6]), (MATRIX, vec![8])];
+    let (answer, lent) = offer(&mut deferred, with_body(), true);
+    assert!(matches!(answer, Ok(false)));
+    assert_eq!(
+      lent.as_ref(),
+      Some(&expected),
+      "the record rides the next packet, the packet's own matrix the later"
+    );
+    assert_eq!(
+      deferred.kinds(),
+      vec![NEW_EXTRADATA, MATRIX],
+      "back pressure: kept"
+    );
+    let (_, lent) = offer(&mut deferred, with_body(), false);
+    assert_eq!(
+      lent.as_ref(),
+      Some(&expected),
+      "offered again, carried again"
+    );
+    assert!(deferred.kinds().is_empty(), "taken: nothing waits");
+
+    // Refused before the merge, the packet leaves what waits.
+    let (answer, _) = offer(
+      &mut deferred,
+      video(&[], vec![entry(NEW_EXTRADATA, &[1])]),
+      false,
+    );
+    assert!(matches!(answer, Ok(true)));
+    let small = PacketLimits::default().with_max_packet_bytes(2);
+    let refused = with_ffmpeg_video_packet::<crate::Owned, _>(
+      &with_body(),
+      small,
+      BodyRoute::Submission,
+      &mut deferred,
+      |_| unreachable!("refused before the decoder's road"),
+      |(): &()| false,
+    );
+    assert!(matches!(
+      refused,
+      Err(PacketBuildError::SendPayloadTooLarge(_))
+    ));
+    assert_eq!(deferred.kinds(), vec![NEW_EXTRADATA], "still waiting");
+
+    // The end drops it, and says so.
+    let _ = abandoned::take();
+    deferred.abandon(Abandoned::End);
+    assert_eq!(
+      abandoned::take(),
+      vec![(Abandoned::End, vec![NEW_EXTRADATA])]
+    );
+    assert!(deferred.kinds().is_empty());
+
+    // The audio and subtitle roads.
+    let audio = |body: &[u8], side_data: Vec<SideDataEntry>| {
+      AudioPacket::new(
+        FfmpegBytes::copy_from_slice(body),
+        AudioPacketExtra::new(0).with_side_data(side_data),
+      )
+    };
+    let mut deferred = Deferred::default();
+    let first = with_ffmpeg_audio_packet::<crate::Owned, _>(
+      &audio(&[], vec![entry(NEW_EXTRADATA, &[3])]),
+      limits,
+      BodyRoute::Submission,
+      &mut deferred,
+      |_| unreachable!("a packet with no body is not submitted"),
+      |(): &()| false,
+    )
+    .expect("taken");
+    assert!(matches!(first, Submission::NoBody));
+    let mut lent = None;
+    with_ffmpeg_audio_packet::<crate::Owned, _>(
+      &audio(&[1], Vec::new()),
+      limits,
+      BodyRoute::Submission,
+      &mut deferred,
+      |av| lent = Some(carried(av)),
+      |(): &()| false,
+    )
     .expect("submitted");
+    assert_eq!(lent, Some(vec![(NEW_EXTRADATA, vec![3])]), "audio");
+    assert!(deferred.kinds().is_empty());
+
+    let subtitle = |body: &[u8], side_data: Vec<SideDataEntry>| {
+      SubtitlePacket::new(
+        FfmpegBytes::copy_from_slice(body),
+        SubtitlePacketExtra::new(0).with_side_data(side_data),
+      )
+    };
+    let first = with_ffmpeg_subtitle_packet::<crate::Owned, _>(
+      &subtitle(&[], vec![entry(NEW_EXTRADATA, &[4])]),
+      limits,
+      BodyRoute::Submission,
+      &mut deferred,
+      |_| unreachable!("a packet with no body is not submitted"),
+      |(): &()| false,
+    )
+    .expect("taken");
+    assert!(matches!(first, Submission::NoBody));
+    let mut lent = None;
+    with_ffmpeg_subtitle_packet::<crate::Owned, _>(
+      &subtitle(&[1], Vec::new()),
+      limits,
+      BodyRoute::Submission,
+      &mut deferred,
+      |av| lent = Some(carried(av)),
+      |(): &()| false,
+    )
+    .expect("submitted");
+    assert_eq!(lent, Some(vec![(NEW_EXTRADATA, vec![4])]), "subtitle");
+    assert!(deferred.kinds().is_empty());
   }
 
   #[test]

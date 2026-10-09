@@ -254,6 +254,17 @@ pub struct CarrierVideoStreamDecoder<C: crate::FfmpegCarrier> {
   /// post-commit fallback and at a flush, which clears the history — and
   /// dropped by a probe-era fallback, which re-applies it.
   probe_extradata: Option<NewExtradata>,
+  /// **Side data a packet with no body carried**, waiting for the next packet
+  /// with a body, which carries it in front of its own
+  /// ([`boundary::Deferred`]): no decoder is handed a packet with no body.
+  /// FFmpeg's HEVC decoder would decode its empty body as an access unit,
+  /// taking an end of sequence off the CRA after it, and its H.264 decoder
+  /// would hand out a picture it holds back and never read the record. A
+  /// new extradata among it is judged when it is deferred, as it will be on
+  /// that packet ([`Self::judge_deferred`]), and is read with that packet —
+  /// its keyframe rule, its sets, the extradata a decoder takes with it — as
+  /// that packet's own, which is where FFmpeg applies it.
+  deferred: boundary::Deferred,
   /// Set, with what left it so, when whether the decoder serving applied a
   /// packet's `AV_PKT_DATA_NEW_EXTRADATA` cannot be told
   /// ([`crate::ExtradataDoubt`]): a decoder refused the packet with an error
@@ -1394,6 +1405,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       path,
       parameters: owned_parameters,
       probe_extradata: None,
+      deferred: boundary::Deferred::default(),
       extradata_unknown: None,
       extradata_provisional: false,
       held,
@@ -2565,62 +2577,29 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     Sets { aso, alpha, held }
   }
 
-  /// **A packet with no body is handed to a decoder only where FFmpeg's
-  /// decoder applies its side data and reads no end of the stream in it**:
-  /// FFmpeg's own HEVC decoder, which applies a packet's
-  /// `AV_PKT_DATA_NEW_EXTRADATA` and `AV_PKT_DATA_DOVI_CONF` and finds no
-  /// unit in an empty body (`hevc_receive_frame`, hevc/hevcdec.c:3855-3872).
-  /// The packet comes over with no data at all, the one shape libavcodec
-  /// takes it in (decode.c:742-748), and its record is read as any packet's
-  /// is.
-  ///
-  /// Every other packet with no body is refused before any decoder sees it,
-  /// and nothing of the session changes. FFmpeg's H.264 decoder reads an
-  /// empty body as the end of the stream, handing out a picture it was
-  /// holding back, and returns before it reads the packet's new extradata
-  /// (`h264_decode_frame`, h264dec.c:1034-1036, 978-1017): a record riding
-  /// one is refused by name ([`crate::ExtradataRejection::Bodiless`]). Its
-  /// MPEG decoders read an empty packet as the end of their pictures too
-  /// (mpeg12dec.c:2556-2568, h263dec.c:452-472, vc1dec.c:843-854), and what an
-  /// implementation that wraps another makes of one is not this crate's to
-  /// read; one carrying nothing at all would be the end of the stream itself
-  /// (decode.c:745-752). Those are answered `AVERROR(EINVAL)`, what
-  /// libavcodec answers such a packet in the shape libavformat delivers it
-  /// (demux.c:681; decode.c:742-743) — answered here, so no road reads the
-  /// refusal as a decoder's that may have taken the packet.
-  fn refuse_bodiless(&self, pkt: &Packet) -> Result<(), Error> {
-    if pkt.size() > 0 {
+  /// **A new extradata a packet with no body carries is judged as it will be
+  /// judged on the packet with a body it rides** ([`Self::deferred`];
+  /// [`NewExtradata::of`]): refused by name, nothing deferred and the packet
+  /// still the caller's, where the parameters with it would pass their
+  /// ceiling, or the stream is H.264 and FFmpeg's decoder would not apply it
+  /// whole — read against what the decoder holds, which no packet changes
+  /// before that one. The later of two deferred replaces the earlier, so
+  /// each is read against what is held alone.
+  fn judge_deferred(&self, side_data: &[crate::extras::SideDataEntry]) -> Result<(), Error> {
+    let Some(record) = deferred_record(side_data) else {
       return Ok(());
+    };
+    fits(
+      record,
+      &self.parameters,
+      self.limits.max_codec_parameter_bytes(),
+    )?;
+    if codec_id_of(&self.parameters) == crate::CodecId::H264.raw() {
+      self.held.h264_verdict(record).map_err(|reason| {
+        Error::ExtradataRejected(crate::ExtradataRejected::new(crate::CodecId::H264, reason))
+      })?;
     }
-    let codec = self.codec_id();
-    if codec == crate::CodecId::HEVC.raw()
-      && crate::decoder::packet_side_data_count(pkt) > 0
-      && self.decodes_natively()
-    {
-      return Ok(());
-    }
-    if codec == crate::CodecId::H264.raw() && new_extradata(pkt).is_some() {
-      return Err(Error::ExtradataRejected(crate::ExtradataRejected::new(
-        crate::CodecId::H264,
-        crate::ExtradataRejection::Bodiless,
-      )));
-    }
-    Err(Error::Ffmpeg(ffmpeg_next::Error::Other {
-      errno: libc::EINVAL,
-    }))
-  }
-
-  /// Whether the decoder that takes the session's next packet is one of
-  /// libavcodec's own: the software decoder serving's implementation
-  /// ([`SwDecoder::native`]); otherwise the one the codec parameters name
-  /// ([`crate::decoder::find_decoder`]), which the hardware road opens under
-  /// its accelerator and a software open opens.
-  fn decodes_natively(&self) -> bool {
-    match &self.state {
-      DecodeState::Sw(sw) => sw.native,
-      DecodeState::Hw(_) | DecodeState::SwClosed => crate::decoder::find_decoder(&self.parameters)
-        .is_ok_and(|codec| wrapper_name(codec).is_null()),
-    }
+    Ok(())
   }
 
   /// **A packet's body FFmpeg's H.264 decoder reads as an `avcC` record**
@@ -3587,6 +3566,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       path,
       parameters: owned_parameters,
       probe_extradata: None,
+      deferred: boundary::Deferred::default(),
       extradata_unknown: None,
       extradata_provisional: false,
       held,
@@ -3657,6 +3637,12 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// What left the session's extradata unknown, while it is.
   pub(crate) const fn extradata_unknown_for_test(&self) -> Option<crate::ExtradataDoubt> {
     self.extradata_unknown
+  }
+
+  /// The side data types a packet with no body left waiting for the next
+  /// packet with one ([`Self::deferred`]).
+  pub(crate) fn deferred_kinds_for_test(&self) -> Vec<i32> {
+    self.deferred.kinds()
   }
 
   /// Whether the active extradata came with a packet the decoder serving
@@ -3848,6 +3834,14 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       return Ok(Sent::MustDrain);
     }
     let phase = self.phase();
+    // A packet with no body is handed to no decoder: its side data waits for
+    // the next packet with one ([`Self::deferred`]), a new extradata among it
+    // judged now as it will be judged there.
+    if packet.data().as_ref().is_empty() {
+      self
+        .judge_deferred(packet.extra().side_data())
+        .map_err(VideoDecodeError::Decode)?;
+    }
     // Scoped submission: the rebuilt `AVPacket` never leaves this call,
     // which is what lets the view lane share its buffer with libavcodec
     // rather than copy into it. See `boundary::with_ffmpeg_video_packet`.
@@ -3873,11 +3867,11 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       self.install_probe_extradata();
       self.held_base = None;
     }
-    boundary::with_ffmpeg_video_packet::<C, _>(packet, limits, route, |av_pkt| {
-      // A packet with no body reaches only a decoder that reads it as one.
-      self
-        .refuse_bodiless(av_pkt)
-        .map_err(VideoDecodeError::Decode)?;
+    // Out of `self` while the decoder's road, which borrows all of it, runs.
+    let mut deferred = core::mem::take(&mut self.deferred);
+    // The packet as the decoder's road gets it, carrying what a packet with
+    // no body deferred onto it ([`Self::deferred`]).
+    let send = |av_pkt: &Packet| {
       self.note_output_alpha();
       // The software road reads the packet once what a fallback's replay owes
       // the decoder is fed ([`Self::send_on_software`]).
@@ -4037,8 +4031,20 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
           self.send_on_software(av_pkt, phase)
         }
       }
-    })
-    .map_err(|e| VideoDecodeError::Decode(Error::PacketBuild(e)))?
+    };
+    let submitted = boundary::with_ffmpeg_video_packet::<C, _>(
+      packet,
+      limits,
+      route,
+      &mut deferred,
+      send,
+      |answer| matches!(answer, Ok(Sent::MustDrain)),
+    );
+    self.deferred = deferred;
+    match submitted.map_err(|e| VideoDecodeError::Decode(Error::PacketBuild(e)))? {
+      boundary::Submission::NoBody => Ok(Sent::Accepted),
+      boundary::Submission::Answered(answer) => answer,
+    }
   }
 
   pub(crate) fn receive_frame_impl(
@@ -4315,6 +4321,16 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   }
 
   pub(crate) fn send_eof_impl(&mut self) -> Result<Sent, VideoDecodeError> {
+    let answer = self.send_eof_inner();
+    // Taken, the end leaves no packet to carry what a packet with no body
+    // deferred ([`Self::deferred`]).
+    if matches!(answer, Ok(Sent::Accepted)) {
+      self.deferred.abandon(boundary::Abandoned::End);
+    }
+    answer
+  }
+
+  fn send_eof_inner(&mut self) -> Result<Sent, VideoDecodeError> {
     // The same two gates in the same order, for the same reason: a
     // repeated end-of-stream past a committed one is refused however
     // much is drained, so answering back pressure would be a promise
@@ -4463,6 +4479,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   }
 
   pub(crate) fn flush_impl(&mut self) -> Result<(), VideoDecodeError> {
+    // Side data a packet with no body left for the next packet belongs to the
+    // position the caller abandons ([`Self::deferred`]): dropped, and said so.
+    self.deferred.abandon(boundary::Abandoned::Flush);
     // Drop any frames buffered during SW fallback replay before
     // flushing the inner decoder — otherwise a seek/reset would
     // surface stale pre-flush frames on the next `receive_frame`.
@@ -5317,6 +5336,22 @@ fn new_extradata(pkt: &Packet) -> Option<&[u8]> {
     );
     (!data.is_null() && size > 0).then(|| core::slice::from_raw_parts(data, size))
   }
+}
+
+/// The extradata a packet's portable side data carries as
+/// `AV_PKT_DATA_NEW_EXTRADATA`: its last entry of the type, the one a packet
+/// rebuilt from it keeps (`av_packet_add_side_data` replaces an earlier one,
+/// packet.c:203-211) — none where that is empty, as [`new_extradata`] reads
+/// it.
+fn deferred_record(side_data: &[crate::extras::SideDataEntry]) -> Option<&[u8]> {
+  const NEW_EXTRADATA: i32 =
+    ffmpeg_next::ffi::AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA as i32;
+  side_data
+    .iter()
+    .rev()
+    .find(|entry| entry.kind() == NEW_EXTRADATA)
+    .map(crate::extras::SideDataEntry::data)
+    .filter(|record| !record.is_empty())
 }
 
 /// The extradata `parameters` carry: `extradata_size` bytes, empty where

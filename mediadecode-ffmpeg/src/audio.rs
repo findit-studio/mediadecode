@@ -71,8 +71,21 @@ pub struct CarrierAudioStreamDecoder<C: crate::FfmpegCarrier> {
   /// moment a caller signals the end. A phase that can be wrong is the
   /// thing [`SessionPhase`](crate::decoder::SessionPhase) exists to
   /// abolish, so the latch is here to make the answer true rather than
-  /// to add a gate. The substrate is still the one that refuses.
+  /// to add a gate. The substrate is still the one that refuses — but for
+  /// a packet with no body, which never reaches it ([`Self::deferred`]):
+  /// the latch refuses that one as the substrate would.
   eof: bool,
+  /// **Side data a packet with no body carried**, waiting for the next packet
+  /// with a body, which carries it in front of its own
+  /// ([`boundary::Deferred`]). libavcodec refuses a packet with no body in
+  /// the shape libavformat delivers it before it reads the side data
+  /// (decode.c:742-743), so FFmpeg's AAC decoder never applied a new
+  /// `AudioSpecificConfig` riding one, which it reads at the head of the
+  /// packet it decodes (`aac_decode_frame`, aac/aacdec.c:2572-2589); one
+  /// with no data at all reaches the decoder as a packet of no bytes, which
+  /// the AAC decoder fails and the WMA decoder takes for its last
+  /// (wmadec.c:845-862).
+  deferred: boundary::Deferred,
   _carrier: core::marker::PhantomData<C>,
 }
 
@@ -112,6 +125,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierAudioStreamDecoder<C> {
       _callback_state: callback_state,
       scratch_pending: false,
       eof: false,
+      deferred: boundary::Deferred::default(),
       _carrier: core::marker::PhantomData,
     })
   }
@@ -168,19 +182,30 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierAudioStreamDecoder<C> {
     &mut self,
     packet: &AudioPacket<AudioPacketExtra, C::Buffer>,
   ) -> Result<Sent, AudioDecodeError> {
+    // A packet with no body never reaches libavcodec, which refuses every
+    // packet after the end (decode.c:739-740): the end refuses it here, as
+    // libavcodec would.
+    if self.eof && packet.data().as_ref().is_empty() {
+      return Err(AudioDecodeError::Decode(Error::Ffmpeg(
+        ffmpeg_next::Error::Eof,
+      )));
+    }
     // Scoped submission: the rebuilt `AVPacket` lives only inside this
     // call, which is what lets the view lane hand libavcodec its own
     // buffer instead of a copy. See `boundary::with_ffmpeg_audio_packet`.
     let state: *const crate::ffi::CallbackState = &*self._callback_state;
     let phase = self.phase();
     let decoder = &mut self.decoder;
-    boundary::with_ffmpeg_audio_packet::<C, _>(
+    let submitted = boundary::with_ffmpeg_audio_packet::<C, _>(
       packet,
       self.limits.packet_limits(),
       // Nothing on this road records what it is sent, so the
       // packet really does die inside the call and its body may
       // be shared.
       crate::carrier::BodyRoute::Submission,
+      // A packet with no body is not submitted: its side data rides the
+      // next packet with one ([`Self::deferred`]).
+      &mut self.deferred,
       |av_pkt| {
         // Funnel, then gate — the same two steps the receive road
         // takes. A frame the allocator judge refused surfaces named,
@@ -193,8 +218,13 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierAudioStreamDecoder<C> {
           }
         }
       },
+      |answer| matches!(answer, Ok(Sent::MustDrain)),
     )
-    .map_err(|e| AudioDecodeError::Decode(Error::PacketBuild(e)))?
+    .map_err(|e| AudioDecodeError::Decode(Error::PacketBuild(e)))?;
+    match submitted {
+      boundary::Submission::NoBody => Ok(Sent::Accepted),
+      boundary::Submission::Answered(answer) => answer,
+    }
   }
 
   pub(crate) fn receive_frame_impl(
@@ -248,6 +278,8 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierAudioStreamDecoder<C> {
     match self.decoder.send_eof() {
       Ok(()) => {
         self.eof = true;
+        // No packet comes to carry what a packet with no body deferred.
+        self.deferred.abandon(boundary::Abandoned::End);
         Ok(Sent::Accepted)
       }
       Err(e) => crate::decoder::software_send(state, e, phase).map_err(AudioDecodeError::Decode),
@@ -259,6 +291,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierAudioStreamDecoder<C> {
     self.scratch_pending = false;
     // And so does the end it was told about.
     self.eof = false;
+    // And so does side data a packet with no body left for the next packet
+    // ([`Self::deferred`]): dropped, and said so.
+    self.deferred.abandon(boundary::Abandoned::Flush);
     self.decoder.flush();
     Ok(())
   }
@@ -360,3 +395,15 @@ pub enum AudioDecodeError {
   #[error(transparent)]
   Convert(#[from] ConvertError),
 }
+
+#[cfg(test)]
+impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierAudioStreamDecoder<C> {
+  /// The side data types a packet with no body left waiting for the next
+  /// packet with one ([`Self::deferred`]).
+  pub(crate) fn deferred_kinds_for_test(&self) -> Vec<i32> {
+    self.deferred.kinds()
+  }
+}
+
+#[cfg(test)]
+mod tests;
