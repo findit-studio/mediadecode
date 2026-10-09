@@ -218,8 +218,8 @@ impl HwDeviceInitFailed {
 
 /// Where in a session's life a hardware failure was reported.
 ///
-/// The two hardware errors carry it — [`AllBackendsFailed`] always
-/// [`Probe`](Self::Probe), [`HardwareRoadLost`] always
+/// The two hardware errors carry it — [`Error::AllBackendsFailed`] always
+/// [`Probe`](Self::Probe), [`Error::HardwareRoadLost`] always
 /// [`PostCommit`](Self::PostCommit) — so a caller routes on one explicit
 /// signal. It is never inferred from whether `unconsumed_packets` is
 /// empty: a probe-era failure on the *first* packet (a side-data / byte /
@@ -229,17 +229,17 @@ impl HwDeviceInitFailed {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, IsVariant)]
 pub enum FallbackOrigin {
   /// Before the first picture, while backends are on trial. Every failure
-  /// advances the probe, and when none is left [`AllBackendsFailed`]
-  /// hands back the probe's buffered history — possibly empty, when the
-  /// failure landed on the first packet.
+  /// advances the probe, and when none is left
+  /// [`Error::AllBackendsFailed`] hands back the probe's buffered history
+  /// — possibly empty, when the failure landed on the first packet.
   /// [`DecodePath::Auto`](crate::DecodePath::Auto) replays that history
   /// into a software decoder and routes the still-unconsumed current
   /// packet to it; the other paths report it.
   Probe,
   /// After the backend committed — at its first picture, or at open when
   /// the caller named it. Only a loss of the road is reported from here,
-  /// as [`HardwareRoadLost`]: no packets ride with it, and nothing opens
-  /// software behind the caller.
+  /// as [`Error::HardwareRoadLost`]: no packets ride with it, and nothing
+  /// opens software behind the caller.
   PostCommit,
 }
 
@@ -485,8 +485,7 @@ pub struct HardwareRoadLost {
 impl HardwareRoadLost {
   /// Constructs a [`HardwareRoadLost`] payload.
   ///
-  /// Not `const fn`, for the same reason as [`FallbackFailed::new`]:
-  /// the boxed source carries a destructor.
+  /// Not `const fn`: the boxed source carries a destructor.
   #[inline]
   pub fn new(backend: Backend, origin: FallbackOrigin, source: Box<Error>) -> Self {
     Self {
@@ -503,7 +502,7 @@ impl HardwareRoadLost {
   /// Where in the session's life the road was lost:
   /// [`FallbackOrigin::PostCommit`]. Before commit a failure advances
   /// the probe instead, and the probe's exhaustion is
-  /// [`AllBackendsFailed`].
+  /// [`Error::AllBackendsFailed`].
   #[inline]
   pub const fn origin(&self) -> FallbackOrigin {
     self.origin

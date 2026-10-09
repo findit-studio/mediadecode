@@ -13,6 +13,11 @@
 //!   replayed into the software decoder — then the packet the probe
 //!   refused — before anything else, so a non-seekable input loses
 //!   nothing. A probe that exhausts at `open` opens software at once.
+//! * **`AnyHardware`** is the same probe with software taken away: when no
+//!   backend takes the stream before its first picture, the session
+//!   reports [`AllBackendsFailed`](crate::Error::AllBackendsFailed) with
+//!   the packets the probe took (none, when no backend opens at all), and
+//!   the caller decides what to replay them into.
 //! * **`Hardware(b)`** is that one backend or nothing, committed at open.
 //! * **`Software`** is libavcodec's own decoder, with no probe.
 //!
@@ -85,30 +90,47 @@ use crate::{
 /// Which decode path a video session takes — the choice
 /// [`CarrierVideoStreamDecoder::open_as`] is given.
 ///
-/// # The arms differ in what they PERMIT, not only in where they start
+/// # Three words and a pin, and what each permits
 ///
-/// [`Auto`](Self::Auto) is a preference at open: it starts on hardware
-/// and is free to end on software before its first picture. The other
-/// two are **pins**: a session opened on either of them stays on the
-/// path it was opened on for its whole life, and a probe's exhaustion
-/// that `Auto` would answer by opening software is reported instead.
-/// After the first picture no path changes its decoder: a hardware
-/// failure is that picture's own error, or the road is lost by name
-/// ([`Error::HardwareRoadLost`]).
+/// - [`Auto`](Self::Auto): before the first picture, the platform's
+///   hardware backends in probe order, the packets taken so far replayed
+///   across them; when none takes the stream, software, the same packets
+///   replayed into it. After it, the decoder that produced it.
+/// - [`AnyHardware`](Self::AnyHardware): the same probe, and never
+///   software — when no backend takes the stream,
+///   [`Error::AllBackendsFailed`] hands back the packets the probe took.
+///   After the first picture, the backend that produced it.
+/// - [`Software`](Self::Software): libavcodec's own decoder, with no
+///   probe, before and after.
+/// - [`Hardware(b)`](Self::Hardware), the pin: backend `b`, committed at
+///   open; nothing else is tried, before or after.
 ///
-/// That is the difference the two consumers of this door need. A
-/// determinism comparison decodes *one stream* both ways and compares
-/// the pixels; a run that silently swapped paths halfway would compare
-/// nothing and say it had. An operator turning hardware off for a lane
-/// over a driver that produces wrong pixels needs it to stay off.
+/// **After the first picture nothing changes the road, on any path.** A
+/// hardware failure there is that picture's own error, returned as the
+/// software road returns a corrupt packet's, and the session decodes on;
+/// a loss of the road itself is [`Error::HardwareRoadLost`], by name, and
+/// the session takes nothing more. What to do then is on
+/// [`HardwareRoadLost`](crate::HardwareRoadLost): open a session on
+/// [`Software`](Self::Software) from the same parameters and feed it
+/// forward.
 ///
-/// # Observability is unchanged
+/// The words differ in what they **permit**, not only where they start.
+/// That is the difference the consumers of this door need. A determinism
+/// comparison decodes *one stream* both ways and compares the pixels; a
+/// run that silently swapped paths halfway would compare nothing and say
+/// it had. An operator turning hardware off for a lane over a driver that
+/// produces wrong pixels needs it to stay off. And a node that sends
+/// hardware and software sessions to separate pools needs a hardware
+/// session that never quietly becomes a software one — which is what
+/// [`AnyHardware`](Self::AnyHardware) is for.
+///
+/// # Observability
 ///
 /// [`is_hardware`](CarrierVideoStreamDecoder::is_hardware) and
 /// [`is_software`](CarrierVideoStreamDecoder::is_software) read where a
 /// session **is**, which stays a live reading — under
 /// [`Auto`](Self::Auto) it can change once, during the probe, and under
-/// the pins it answers what was pinned because nothing can move it.
+/// the others it answers what was chosen because nothing can move it.
 ///
 /// This type deliberately grows **no** `is_*` predicates of its own,
 /// where most vocabularies in this crate do. They would spell the
@@ -128,6 +150,23 @@ pub enum DecodePath {
   ///
   /// What [`CarrierVideoStreamDecoder::open`] does.
   Auto,
+  /// **Any of the platform's hardware backends, and never software.**
+  ///
+  /// The same probe as [`Auto`](Self::Auto): the backends in the
+  /// platform's probe order, the packets taken before the first picture
+  /// replayed across them as each one is tried. Where `Auto` would then
+  /// open software, this arm refuses — at
+  /// [`open_as`](CarrierVideoStreamDecoder::open_as) when no backend
+  /// opens (on a platform with no hardware backend at all, at once), and
+  /// on the road that met it when the probe exhausts later — with
+  /// [`Error::AllBackendsFailed`] carrying every backend's attempt and the
+  /// packets the probe took, so the caller can replay them into a
+  /// software session of its own. After the first picture it is the
+  /// backend that produced it, as on every path.
+  ///
+  /// [`is_hardware`](CarrierVideoStreamDecoder::is_hardware) answers
+  /// `true` for the session's whole life.
+  AnyHardware,
   /// **This hardware backend, or nothing.** No other backend is probed
   /// and software is never opened.
   ///
@@ -398,6 +437,25 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     limits: DecoderLimits,
     path: DecodePath,
   ) -> Result<Self, Error> {
+    Self::open_as_in(
+      parameters,
+      time_base,
+      limits,
+      path,
+      crate::backend::probe_order(),
+    )
+  }
+
+  /// [`Self::open_as_impl`] with the probe order named — the platform's
+  /// own for every public constructor, and an empty one for the lane
+  /// that stands on a platform with no hardware backend at all.
+  pub(crate) fn open_as_in(
+    parameters: Parameters,
+    time_base: Timebase,
+    limits: DecoderLimits,
+    path: DecodePath,
+    order: &[Backend],
+  ) -> Result<Self, Error> {
     // ffmpeg-next's `Parameters` carries an optional `owner: Rc<dyn Any>`
     // (when constructed from `stream.parameters()` it points back at
     // the demuxer's `AVStream`). Upstream marks the type `Send`
@@ -419,10 +477,11 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     let hw_scratch = Frame::empty()?;
     let sw_scratch = alloc_av_video_frame()?;
     let state = match path {
-      DecodePath::Auto => match VideoDecoder::open_with_frame_limits_timed(
+      DecodePath::Auto => match VideoDecoder::open_probing(
         try_clone_parameters(&owned_parameters, limits.max_codec_parameter_bytes())?,
         limits,
-        time_base,
+        Some(time_base),
+        order,
       ) {
         Ok(hw) => DecodeState::Hw(Box::new(hw)),
         Err(Error::AllBackendsFailed(_)) => {
@@ -433,6 +492,16 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
         }
         Err(other) => return Err(other),
       },
+      // **The same probe, and no software behind it.** An exhaustion at
+      // open is the answer — `AllBackendsFailed` with every backend's
+      // attempt and no packet, since none was sent — where `Auto` would
+      // have read it as its cue to open software.
+      DecodePath::AnyHardware => DecodeState::Hw(Box::new(VideoDecoder::open_probing(
+        try_clone_parameters(&owned_parameters, limits.max_codec_parameter_bytes())?,
+        limits,
+        Some(time_base),
+        order,
+      )?)),
       // **The named backend, and no probe order at all.** Nothing is
       // tried before it and nothing after it, which is what makes the
       // arm a pin: an open that fails is the answer, where `Auto` would
@@ -666,10 +735,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// consulted by all three roads that can meet a probe-era
   /// [`Error::AllBackendsFailed`] — the two send arms and the receive
   /// arm. It is one predicate rather than three conditions because the
-  /// promise is one: a session opened on [`DecodePath::Hardware`] ends
-  /// on hardware or ends in an error, and a road that forgot to ask
-  /// would break that promise silently, which is the failure mode a
-  /// caller cannot see.
+  /// promise is one: a session opened on [`DecodePath::AnyHardware`] or
+  /// [`DecodePath::Hardware`] ends on hardware or ends in an error, and
+  /// a road that forgot to ask would break that promise silently, which
+  /// is the failure mode a caller cannot see.
   ///
   /// It is a question for the probe era only. After the first picture no
   /// path opens software: a lost road is reported by name
@@ -681,7 +750,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// path would make the predicate say something it does not mean.
   #[cfg_attr(not(tarpaulin), inline(always))]
   const fn may_open_software(&self) -> bool {
-    !matches!(self.path, DecodePath::Hardware(_))
+    matches!(self.path, DecodePath::Auto | DecodePath::Software)
   }
 
   /// Internal: **probe-era** transition from HW to SW. Replays the rescued
@@ -1354,8 +1423,7 @@ macro_rules! video_lane_face {
       /// Opens a video decoder for `parameters`, probing hardware
       /// backends in order and falling back to software.
       ///
-      /// [`open_as`](Self::open_as)`(.., DecodePath::Auto)`, which is
-      /// what this has always done.
+      /// [`open_as`](Self::open_as)`(.., DecodePath::Auto)`.
       pub fn open(
         parameters: Parameters,
         time_base: Timebase,
@@ -1366,10 +1434,11 @@ macro_rules! video_lane_face {
 
       /// Opens a video decoder on a **named decode path**.
       ///
-      /// [`DecodePath::Auto`] is [`open`](Self::open) exactly; the
-      /// other two arms pin the session to hardware or to software for
-      /// its whole life. See [`DecodePath`] for what a pin promises and
-      /// what it costs.
+      /// [`DecodePath::Auto`] is [`open`](Self::open) exactly;
+      /// [`DecodePath::AnyHardware`] keeps the session to the platform's
+      /// hardware backends and the other two arms pin it to one backend or
+      /// to software, each for its whole life. See [`DecodePath`] for what
+      /// each permits and what it costs.
       ///
       /// Everything else about the session is unchanged — the same
       /// [`VideoStreamDecoder`] face, the same frames, the same
@@ -1380,9 +1449,13 @@ macro_rules! video_lane_face {
       ///
       /// # Errors
       ///
+      /// [`DecodePath::AnyHardware`] fails here with
+      /// [`Error::AllBackendsFailed`] when no hardware backend opens for
+      /// the stream — at once on a platform with none — carrying every
+      /// backend's attempt and no packet, since none was sent.
       /// [`DecodePath::Hardware`] fails here when the named backend
-      /// cannot be opened for the stream — where [`DecodePath::Auto`]
-      /// would have gone on to software. [`DecodePath::Software`] fails
+      /// cannot be opened for the stream. [`DecodePath::Auto`] would have
+      /// gone on to software in both cases. [`DecodePath::Software`] fails
       /// only where libavcodec has no decoder for the stream, or the
       /// context cannot be built.
       ///

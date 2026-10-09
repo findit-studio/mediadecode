@@ -140,6 +140,9 @@ struct FakeHw {
   /// hardware seam that fails at frame time, which nothing else here
   /// does.
   fail_at_receive: bool,
+  /// When set, raise the probe's exhaustion from `send_eof` rather than
+  /// taking the end — the EOF road, carrying the history recorded so far.
+  fail_at_eof: bool,
 }
 
 impl FakeHw {
@@ -153,6 +156,7 @@ impl FakeHw {
       queued: VecDeque::new(),
       history: Vec::new(),
       fail_at_receive: false,
+      fail_at_eof: false,
     }
   }
 
@@ -166,6 +170,7 @@ impl FakeHw {
       queued: VecDeque::new(),
       history: Vec::new(),
       fail_at_receive: false,
+      fail_at_eof: false,
     }
   }
 
@@ -174,6 +179,14 @@ impl FakeHw {
   fn failing_at_receive(width: u32, height: u32) -> Self {
     let mut hw = Self::failing(width, height, 0, usize::MAX);
     hw.fail_at_receive = true;
+    hw
+  }
+
+  /// Accepts every packet, then raises the probe's exhaustion when the
+  /// end of the stream is offered — the EOF road.
+  fn failing_at_eof(width: u32, height: u32) -> Self {
+    let mut hw = Self::failing(width, height, 0, usize::MAX);
+    hw.fail_at_eof = true;
     hw
   }
 
@@ -235,6 +248,13 @@ impl HwInner for FakeHw {
   }
 
   fn send_eof(&mut self) -> Result<Sent, Error> {
+    if self.fail_at_eof {
+      // Once: the probe is spent with this answer.
+      self.fail_at_eof = false;
+      return Err(Error::AllBackendsFailed(
+        crate::error::AllBackendsFailed::new(Vec::new(), std::mem::take(&mut self.history)),
+      ));
+    }
     Ok(Sent::Accepted)
   }
 
@@ -2314,6 +2334,7 @@ fn a_pictures_own_error_keeps_the_road_on_every_hardware_path() {
 
   for path in [
     DecodePath::Auto,
+    DecodePath::AnyHardware,
     DecodePath::Hardware(Backend::VideoToolbox),
   ] {
     let seam = script
@@ -2392,6 +2413,7 @@ fn ffmpegs_own_signal_loses_the_road_by_name_on_every_hardware_path() {
 
   for path in [
     DecodePath::Auto,
+    DecodePath::AnyHardware,
     DecodePath::Hardware(Backend::VideoToolbox),
   ] {
     for signal in [
@@ -2597,6 +2619,229 @@ fn after_the_first_picture_nothing_changes_the_road_under_auto() {
     assert!(
       dec.is_hardware() && !dec.is_software(),
       "{road:?}: nothing changes the road after the first picture",
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+//  AnyHardware: the probe, and never software
+// ---------------------------------------------------------------------------
+
+/// LAW (row 3): **`AnyHardware` refuses at open on a platform with no
+/// hardware backend, with no packet consumed — where `Auto` opens
+/// software.**
+///
+/// No machine that runs this suite is such a platform, so the probe is
+/// handed the order one has: none. `AnyHardware` answers
+/// [`Error::AllBackendsFailed`] at once — no attempt, since there is no
+/// backend to try, and no packet, since none was sent — and the control
+/// beside it, `Auto` over the same order, opens libavcodec's own decoder.
+///
+/// PLANT: an `AnyHardware` arm that falls back as `Auto` does turns this
+/// red at "refuses at open".
+#[test]
+fn any_hardware_refuses_at_open_on_a_platform_with_no_hardware_backend() {
+  let (w, h) = (64u32, 48u32);
+  let clip = encode_synthetic_clip(w, h, 8, 4);
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+
+  match FfmpegVideoStreamDecoder::open_as_in(
+    clip.parameters.clone(),
+    tb,
+    DecoderLimits::default(),
+    DecodePath::AnyHardware,
+    &[],
+  ) {
+    Ok(dec) => panic!(
+      "AnyHardware refuses at open where no hardware backend exists — it opened a {} session",
+      if dec.is_software() {
+        "software"
+      } else {
+        "hardware"
+      },
+    ),
+    Err(Error::AllBackendsFailed(p)) => {
+      assert!(p.origin().is_probe(), "the probe's own exhaustion");
+      assert!(
+        p.attempts().is_empty(),
+        "no backend to try, so no attempt: {:?}",
+        p.attempts()
+      );
+      assert!(
+        p.unconsumed_packets().is_empty(),
+        "no packet was consumed: none had been sent"
+      );
+    }
+    Err(other) => panic!("expected the probe's exhaustion, got {other:?}"),
+  }
+
+  let auto = FfmpegVideoStreamDecoder::open_as_in(
+    clip.parameters.clone(),
+    tb,
+    DecoderLimits::default(),
+    DecodePath::Auto,
+    &[],
+  )
+  .expect("Auto opens software where no hardware backend exists");
+  assert!(
+    auto.is_software(),
+    "the control: Auto over the same order is a software session"
+  );
+}
+
+/// The probe's exhaustion under `AnyHardware`, checked on whichever road
+/// met it: the probe's origin, the packets it took — the first `taken`
+/// of the clip, in the order they were sent — and a session that is
+/// still, and only, a hardware one.
+#[track_caller]
+fn assert_the_probes_packets_come_back(
+  dec: &FfmpegVideoStreamDecoder,
+  refusal: VideoDecodeError,
+  clip: &SyntheticClip,
+  taken: usize,
+  road: &str,
+) {
+  let VideoDecodeError::Decode(Error::AllBackendsFailed(p)) = &refusal else {
+    panic!("{road}: expected the probe's exhaustion, got {refusal:?}");
+  };
+  assert!(p.origin().is_probe(), "{road}: the probe's own exhaustion");
+  let body = |packet: &Packet| packet.data().unwrap_or_default().to_vec();
+  let rescued: Vec<Vec<u8>> = p.unconsumed_packets().iter().map(body).collect();
+  let sent: Vec<Vec<u8>> = clip.packets[..taken].iter().map(body).collect();
+  assert!(
+    rescued == sent,
+    "{road}: the packets the probe took come back, in order ({} rescued, {} sent)",
+    rescued.len(),
+    sent.len(),
+  );
+  assert!(
+    dec.sw_replay_frames_is_empty_for_test(),
+    "{road}: nothing was replayed into anything"
+  );
+}
+
+/// LAW (row 3): **a probe-era exhaustion under `AnyHardware` hands back
+/// the packets the probe took, on every road, and never opens software.**
+///
+/// The seam takes every packet into its history and delivers nothing
+/// until its probe exhausts — on a send, on the first picture asked for,
+/// or at the end of the stream. Each road must answer
+/// [`Error::AllBackendsFailed`] with the probe's origin and the packets in
+/// the order they were sent, so the caller can replay them into a
+/// software session of its own; and the session must stay a hardware
+/// one, with nothing replayed behind the caller.
+///
+/// PLANT: letting `AnyHardware` open software on its probe's exhaustion
+/// turns this red at "never opens software".
+#[test]
+fn any_hardware_hands_back_the_probes_packets_and_never_opens_software() {
+  let (w, h) = (64u32, 48u32);
+  let clip = encode_synthetic_clip(w, h, 12, 6);
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let taken = 3;
+  let any_hardware = |seam: FakeHw| {
+    FfmpegVideoStreamDecoder::from_hw_inner_for_test_as(
+      Box::new(seam),
+      clip.parameters.clone(),
+      tb,
+      DecodePath::AnyHardware,
+    )
+    .expect("build an AnyHardware test decoder")
+  };
+
+  // On a send: the probe exhausts on the packet after the ones it took.
+  let mut dec = any_hardware(FakeHw::failing(w, h, 0, taken));
+  for index in 0..taken {
+    crate::accepted(dec.send_packet(&pushed(&clip, index)), "send_packet");
+  }
+  let answer = dec.send_packet(&pushed(&clip, taken));
+  assert!(
+    dec.is_hardware() && !dec.is_software(),
+    "on a send: AnyHardware never opens software"
+  );
+  let refusal = answer.expect_err("on a send: the probe's exhaustion is reported");
+  assert_the_probes_packets_come_back(&dec, refusal, &clip, taken, "on a send");
+
+  // On the first picture asked for.
+  let mut dec = any_hardware(FakeHw::failing_at_receive(w, h));
+  for index in 0..taken {
+    crate::accepted(dec.send_packet(&pushed(&clip, index)), "send_packet");
+  }
+  let mut dst = crate::empty_owned_video_frame();
+  let answer = dec.receive_frame(&mut dst);
+  assert!(
+    dec.is_hardware() && !dec.is_software(),
+    "on a picture: AnyHardware never opens software"
+  );
+  let refusal = answer.expect_err("on a picture: the probe's exhaustion is reported");
+  assert_the_probes_packets_come_back(&dec, refusal, &clip, taken, "on a picture");
+
+  // At the end of the stream.
+  let mut dec = any_hardware(FakeHw::failing_at_eof(w, h));
+  for index in 0..taken {
+    crate::accepted(dec.send_packet(&pushed(&clip, index)), "send_packet");
+  }
+  let answer = dec.send_eof();
+  assert!(
+    dec.is_hardware() && !dec.is_software(),
+    "at the end: AnyHardware never opens software"
+  );
+  let refusal = answer.expect_err("at the end: the probe's exhaustion is reported");
+  assert_the_probes_packets_come_back(&dec, refusal, &clip, taken, "at the end");
+  assert!(
+    !dec.eof_sent_for_test(),
+    "a refused end is not a committed one"
+  );
+}
+
+/// LAW (row 3): **on this platform's own backends too, `AnyHardware` is
+/// never a software session** — whatever its hardware makes of the
+/// stream. The probe opens on a backend or refuses at open with no packet
+/// consumed; after that the session decodes on hardware, reports its
+/// probe's exhaustion, or reports a picture's error or a lost road — and
+/// at no point has it opened software.
+#[test]
+fn any_hardware_never_becomes_software_on_this_platform() {
+  let (w, h) = (64u32, 48u32);
+  let clip = encode_synthetic_clip(w, h, 8, 4);
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+
+  let mut dec = match FfmpegVideoStreamDecoder::open_as(
+    clip.parameters.clone(),
+    tb,
+    DecoderLimits::default(),
+    DecodePath::AnyHardware,
+  ) {
+    Ok(dec) => dec,
+    Err(Error::AllBackendsFailed(p)) => {
+      assert!(
+        p.origin().is_probe() && p.unconsumed_packets().is_empty(),
+        "refused at open, with no packet consumed"
+      );
+      return;
+    }
+    Err(other) => panic!("AnyHardware opens or refuses with the probe's exhaustion, got {other:?}"),
+  };
+  assert!(
+    dec.is_hardware() && !dec.is_software(),
+    "opened on hardware"
+  );
+
+  let mut dst = crate::empty_owned_video_frame();
+  for index in 0..clip.packets.len() {
+    let sent = dec.send_packet(&pushed(&clip, index));
+    assert!(
+      !dec.is_software(),
+      "packet {index}: AnyHardware never becomes software"
+    );
+    if let Err(VideoDecodeError::Decode(Error::AllBackendsFailed(p))) = &sent {
+      assert!(p.origin().is_probe(), "an exhaustion here is the probe's");
+      return;
+    }
+    while let Ok(Received::Frame) = dec.receive_frame(&mut dst) {}
+    assert!(
+      !dec.is_software(),
+      "packet {index}: AnyHardware never becomes software"
     );
   }
 }

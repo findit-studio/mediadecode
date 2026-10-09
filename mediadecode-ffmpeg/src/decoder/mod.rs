@@ -682,8 +682,23 @@ impl VideoDecoder {
     limits: crate::limits::DecoderLimits,
     pkt_timebase: Option<mediadecode::Timebase>,
   ) -> Result<Self> {
+    Self::open_probing(parameters, limits, pkt_timebase, backend::probe_order())
+  }
+
+  /// The probe itself, across `order` — [`backend::probe_order`] for every
+  /// public constructor.
+  ///
+  /// Taken as an argument so a lane can stand on a platform with no
+  /// hardware backend at all, which no machine that runs the suite is: an
+  /// empty `order` is exactly that platform's probe, and it answers
+  /// [`Error::AllBackendsFailed`] with no attempt and no packet.
+  pub(crate) fn open_probing(
+    parameters: codec::Parameters,
+    limits: crate::limits::DecoderLimits,
+    pkt_timebase: Option<mediadecode::Timebase>,
+    order: &[Backend],
+  ) -> Result<Self> {
     let codec = find_decoder(&parameters)?;
-    let order = backend::probe_order();
 
     let mut attempts: Vec<(Backend, Box<Error>)> = Vec::new();
     for (i, &backend) in order.iter().enumerate() {
