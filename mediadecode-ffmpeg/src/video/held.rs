@@ -53,10 +53,11 @@ pub(super) struct Record {
   /// The record's bytes.
   pub(super) bytes: Vec<u8>,
   /// Whether FFmpeg's own decoder, opened on it strictly, witnesses what it
-  /// carries before a decoder opens on it: an HEVC record carrying a
-  /// sequence or picture parameter set, which this crate reads as FFmpeg
-  /// reads it ([`params::hevc_sps`], [`params::hevc_pps`]), the strict open a
-  /// second witness.
+  /// carries before a decoder opens on it — a second witness of an HEVC
+  /// record, whose sets this crate reads as FFmpeg reads them
+  /// ([`params::hevc_vps`], [`params::hevc_sps`], [`params::hevc_pps`]): where
+  /// no set it carries is one FFmpeg stores with a warning that the strict
+  /// open turns into its refusal.
   pub(super) strict: bool,
 }
 
@@ -1123,9 +1124,20 @@ impl Hevc {
     if !read.same(self) {
       return Err(Unrecordable::Unverified);
     }
+    // FFmpeg's own decoder opened strictly answers as the decoder serving
+    // does only where no set the record carries is one FFmpeg stores with a
+    // warning `AV_EF_EXPLODE` turns into its refusal (hevc/ps.c:858-862,
+    // 1416-1424): there it is a second witness; elsewhere this reading is the
+    // only one, and it holds such a set as FFmpeg stores it.
+    let warned = self.vps.iter().flatten().any(|vps| vps.read.warned)
+      || self
+        .sps
+        .iter()
+        .flatten()
+        .any(|sps| sps.facts.is_some_and(|facts| facts.warned));
     Ok(Some(Record {
       bytes,
-      strict: self.sps.iter().any(Option::is_some) || self.pps.iter().any(Option::is_some),
+      strict: !warned,
     }))
   }
 }

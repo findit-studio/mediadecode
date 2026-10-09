@@ -11514,3 +11514,267 @@ fn a_sequence_parameter_set_repeated_with_a_trailing_zero_fewer_is_the_same_set(
     "every picture, as the straight decode"
   );
 }
+
+// ---------------------------------------------------------------------------
+//  R18 row 5: a set FFmpeg stores with a warning is held and recorded
+// ---------------------------------------------------------------------------
+
+/// A NAL unit's payload as `0`s and `1`s, read field by field, each field's
+/// place kept, to rewrite it.
+struct Fields {
+  bits: String,
+  at: usize,
+}
+
+impl Fields {
+  fn of(unit: &[u8], header: usize) -> Self {
+    Self {
+      bits: rbsp_payload_bits(unit, header),
+      at: 0,
+    }
+  }
+
+  /// `u(n)`.
+  fn u(&mut self, n: usize) -> u64 {
+    let value = u64::from_str_radix(&self.bits[self.at..self.at + n], 2).expect("bits");
+    self.at += n;
+    value
+  }
+
+  /// `n` bits passed over.
+  fn skip(&mut self, n: usize) {
+    self.at += n;
+  }
+
+  /// `ue(v)`, and where it stands.
+  fn ue(&mut self) -> (u64, core::ops::Range<usize>) {
+    let start = self.at;
+    let zeros = self.bits[start..].find('1').expect("a code");
+    self.at += zeros;
+    let value = self.u(zeros + 1) - 1;
+    (value, start..self.at)
+  }
+
+  /// The payload with each `(place, bits)` written in, the last first.
+  fn rewritten(&self, mut edits: Vec<(core::ops::Range<usize>, String)>) -> String {
+    edits.sort_by_key(|(place, _)| core::cmp::Reverse(place.start));
+    let mut bits = self.bits.clone();
+    for (place, with) in edits {
+      bits.replace_range(place, &with);
+    }
+    bits
+  }
+}
+
+/// The places of the sub-layer ordering fields of an HEVC video or sequence
+/// parameter set of one sub-layer, read from the unit's first field —
+/// `(buffering_minus1, reorder's place)` each — and the place of a sequence
+/// parameter set's id, bit depths and
+/// `log2_max_pic_order_cnt_lsb_minus4`.
+fn hevc_ordering(
+  unit: &[u8],
+  sps: bool,
+) -> (
+  Fields,
+  Vec<(u64, core::ops::Range<usize>)>,
+  Vec<core::ops::Range<usize>>,
+) {
+  let mut fields = Fields::of(unit, 2);
+  let mut places = Vec::new();
+  let sub_layers;
+  if sps {
+    fields.u(4);
+    sub_layers = fields.u(3) + 1;
+    fields.u(1);
+  } else {
+    fields.skip(4 + 2 + 6);
+    sub_layers = fields.u(3) + 1;
+    fields.skip(1 + 16);
+  }
+  assert_eq!(sub_layers, 1, "one sub-layer");
+  fields.skip(88 + 8); // the general profile, tier and level
+  if sps {
+    places.push(fields.ue().1); // sps_seq_parameter_set_id
+    let (format, _) = fields.ue();
+    if format == 3 {
+      fields.u(1);
+    }
+    fields.ue();
+    fields.ue(); // the picture's size
+    if fields.u(1) == 1 {
+      for _ in 0..4 {
+        fields.ue();
+      }
+    }
+    places.push(fields.ue().1); // bit_depth_luma_minus8
+    places.push(fields.ue().1); // bit_depth_chroma_minus8
+    fields.ue(); // log2_max_pic_order_cnt_lsb_minus4
+  }
+  fields.u(1); // sub_layer_ordering_info_present_flag
+  let (buffering, _) = fields.ue();
+  let (_, reorder) = fields.ue();
+  fields.ue(); // max_latency_increase_plus1
+  (fields, vec![(buffering, reorder)], places)
+}
+
+/// LAW (R18 row 5; Codex R17 [medium]): **a parameter set FFmpeg stores with
+/// a warning is held and recorded, a decoder opened fresh on the record; the
+/// strict open witnesses only a record carrying none, and still refuses one
+/// carrying a set FFmpeg rejects.** `AV_EF_EXPLODE` turns two warnings into
+/// refusals: a video or sequence parameter set whose
+/// `max_num_reorder_pics` passes its buffering (hevc/ps.c:858-862,
+/// 1416-1424). Two `x265` streams, 128x96 then 160x96, the second's VPS, SPS
+/// and PPS carried by a packet of their own between them — its VPS's
+/// reordering, or its SPS's, set past the buffering: FFmpeg stores the set,
+/// and so does the session. On a probe-era fallback at 10 on three threads
+/// the switch at the second stream's IDR 17 opens on a record synthesized
+/// from what is held, not opened strictly, and every picture comes out as a
+/// straight decode gives it; the hardware failing post-commit at 17, the
+/// cold decoder holds them too. A sequence parameter set FFmpeg rejects — the
+/// first stream's own, as id 9 at 11 bits, which `map_pixel_format` refuses
+/// (ps.c:1190-1237) — carried in band by its packet 5 is held by nothing, as
+/// FFmpeg holds it, so no record carries it: on a probe-era fallback at 3
+/// the switch at its IDR 8 needs none. The strict open, on a record carrying
+/// it, refuses. Opened strictly on every record, the
+/// fresh decoders for the warned sets were refused, `Unverified`, the switch
+/// declined and the fallback refused by name.
+#[test]
+fn a_parameter_set_ffmpeg_stores_with_a_warning_is_held_and_recorded() {
+  use super::held::Held;
+  let hevc = crate::CodecId::HEVC.raw();
+  let params = "keyint=8:min-keyint=8:scenecut=0:bframes=0:open-gop=0:log-level=error";
+  let a = encode_hevc_global(128, 96, 16, params);
+  let three = core::num::NonZeroU32::new(3).expect("nonzero");
+  for (name, kind) in [("video", 32u8), ("sequence", 33)] {
+    let mut b = encode_hevc_global(160, 96, 16, params);
+    let sets = extradata_of(&b.parameters);
+    let mut units: Vec<Vec<u8>> = annexb_units(&sets)
+      .into_iter()
+      .map(<[u8]>::to_vec)
+      .collect();
+    let unit = units
+      .iter_mut()
+      .find(|unit| (unit[0] >> 1) & 0x3f == kind)
+      .expect("the set");
+    let (fields, ordering, _) = hevc_ordering(unit, kind == 33);
+    let edits = ordering
+      .into_iter()
+      .map(|(buffering, reorder)| {
+        assert!(buffering < 15, "{name}: room to reorder past the buffering");
+        (reorder, ue_bits(buffering as u32 + 1))
+      })
+      .collect();
+    *unit = nal_unit_of_bits(&unit[..2], &fields.rewritten(edits));
+    let warned: Vec<u8> = units
+      .iter()
+      .flat_map(|unit| [0u8, 0, 0, 1].into_iter().chain(unit.iter().copied()))
+      .collect();
+    set_extradata(&mut b.parameters, &warned);
+    let clip = with_the_next_sets_in_band(&a, &b, Carried::Alone);
+    assert!(clip.packets[17].is_key(), "{name}: 17 is the second IDR");
+
+    // Held as FFmpeg stores it, and recorded, the strict open not asked.
+    let held = Held::opened_on(hevc, &extradata_of(&a.parameters))
+      .after_packet(None, Some(&warned))
+      .expect("the second stream's sets stored");
+    let record = held
+      .record(hevc, &extradata_of(&a.parameters), None)
+      .expect("a record carries them")
+      .expect("a record of its own");
+    assert!(!record.strict, "{name}: no strict open for a warned set");
+
+    let reference = straight(&clip);
+    assert_eq!(reference.len(), 32, "{name}: the straight decode is whole");
+    let session = session_of(
+      behind_a_probe(&clip, 10, crate::Threads::Count(three)),
+      &clip,
+      |_, _| {},
+    );
+    assert_eq!(
+      (session.threads[16], session.threads[17]),
+      (Some(core::num::NonZeroU32::MIN), Some(three)),
+      "{name}: the switch at 17"
+    );
+    assert!(
+      session.errors.is_empty(),
+      "{name}: no error: {:?}",
+      session.errors
+    );
+    assert!(
+      session.pictures == reference,
+      "{name}: every picture, as the straight decode"
+    );
+    let failed = session_of(behind_a_failure_at(&clip, 17), &clip, |_, _| {});
+    assert!(
+      failed.errors.is_empty(),
+      "{name}: no error, the end clean: {:?}",
+      failed.errors
+    );
+    assert!(
+      from_pts(&failed.pictures, 16) == from_pts(&reference, 16),
+      "{name}: every picture from 17 on, as the straight decode"
+    );
+  }
+
+  // A set FFmpeg rejects: held by nothing, and refused by the strict open.
+  let sets = extradata_of(&a.parameters);
+  let sps = annexb_units(&sets)
+    .into_iter()
+    .find(|unit| (unit[0] >> 1) & 0x3f == 33)
+    .expect("the SPS")
+    .to_vec();
+  let (fields, _, places) = hevc_ordering(&sps, true);
+  let rejected = nal_unit_of_bits(
+    &sps[..2],
+    &fields.rewritten(vec![
+      (places[0].clone(), ue_bits(9)),
+      (places[1].clone(), ue_bits(3)),
+      (places[2].clone(), ue_bits(3)),
+    ]),
+  );
+  let carrying = [&[0, 0, 0, 1][..], &rejected].concat();
+  let held = Held::opened_on(hevc, &sets);
+  assert!(
+    held.after_packet(None, Some(&carrying)).is_none(),
+    "the rejected set is held by nothing"
+  );
+  let mut parameters = a.parameters.clone();
+  set_extradata(&mut parameters, &[&sets[..], &carrying[..]].concat());
+  assert!(
+    !super::opens_strictly(
+      &parameters,
+      DecoderLimits::default().with_threads(crate::Threads::Single)
+    )
+    .expect("the strict open runs"),
+    "the strict open refuses a record carrying it"
+  );
+  let mut packets = a.packets.clone();
+  packets[5] = repacked(
+    &a.packets[5],
+    &[a.packets[5].data().expect("a payload"), &carrying[..]].concat(),
+  );
+  let clip = SyntheticClip {
+    parameters: a.parameters.clone(),
+    packets,
+  };
+  assert!(
+    clip.packets[8].is_key() && !clip.packets[5].is_key(),
+    "an IDR at 8"
+  );
+  let reference = straight(&clip);
+  let session = session_of(
+    behind_a_probe(&clip, 3, crate::Threads::Count(three)),
+    &clip,
+    |_, _| {},
+  );
+  assert_eq!(
+    session.threads[8],
+    Some(three),
+    "the switch at the IDR 8 needs no record"
+  );
+  assert!(session.errors.is_empty(), "no error: {:?}", session.errors);
+  assert!(
+    session.pictures == reference,
+    "every picture, as the straight decode"
+  );
+}

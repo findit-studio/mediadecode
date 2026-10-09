@@ -5633,12 +5633,19 @@ struct Opening {
 /// refuses, where it would otherwise skip it and go on: `hevc_decode_nal_units`
 /// answers the set's error under `AV_EF_EXPLODE` (hevc/parse.c:72-73),
 /// `ff_hevc_decode_extradata` hands it on (124-128, 141-142), and
-/// `hevc_decode_init` fails the open (hevc/hevcdec.c:4167-4172). The strict
-/// open refuses, besides, three sets the decoder serving stores with a
+/// `hevc_decode_init` fails the open (hevc/hevcdec.c:4167-4172).
+///
+/// The strict open also refuses two sets the decoder serving stores with a
 /// warning — a video or sequence parameter set whose reordered pictures
-/// overrun its buffering, a sequence parameter set whose cropping leaves no
-/// picture (hevc/ps.c:858-862, 1416-1421, 1640-1648) — so where it answers
-/// yes, the decoder opened on the same parameters stores the same sets.
+/// overrun its buffering (hevc/ps.c:858-862, 1416-1424) — so it witnesses
+/// only a record carrying neither ([`held::Record::strict`]); a third,
+/// cropping that leaves no picture (1640-1650), never meets a set the
+/// decoder serving stores: `read_window` refuses a conformance window that
+/// leaves none (66-87), and the output window is that window alone, the
+/// default display window applied only under `apply_defdispwin`
+/// (1389, 1633-1638), which this crate leaves at its default, 0
+/// (hevc/hevcdec.c:4204-4205). Where it witnesses, the decoder opened on the
+/// same parameters stores the same sets.
 fn opens_strictly(parameters: &Parameters, limits: DecoderLimits) -> Result<bool, Error> {
   let one_thread = limits.with_threads(crate::Threads::Single);
   let (mut ctx, _callback_state) = build_codec_context(parameters, one_thread, None)?;

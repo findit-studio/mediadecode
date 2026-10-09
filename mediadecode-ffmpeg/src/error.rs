@@ -278,7 +278,8 @@ pub enum Unrecordable {
   Oversized(ParameterSet),
   /// The record, read back as FFmpeg reads it, would not give the decoder
   /// what the decoder serving holds — for HEVC, FFmpeg's decoder opened on
-  /// it strictly (`AV_EF_EXPLODE`) refuses a set it carries.
+  /// it strictly (`AV_EF_EXPLODE`), the second witness of a record carrying
+  /// no set FFmpeg stores with a warning, refuses a set it carries.
   Unverified,
   /// The decoder is an implementation that wraps another, whose parameter
   /// sets this crate does not read.
