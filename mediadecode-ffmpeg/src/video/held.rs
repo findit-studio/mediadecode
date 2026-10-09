@@ -98,7 +98,7 @@ impl Held {
           let _ = write.record(record);
         }
         if let Some(data) = data {
-          write.units(data);
+          write.body(data);
         }
         write.next.map(|next| Self::H264(Box::new(next)))
       }
@@ -148,6 +148,32 @@ impl Held {
       (Self::Hevc(held), Self::Hevc(fresh)) => held.record(&fresh, base),
       _ => Ok(None),
     }
+  }
+
+  /// **How FFmpeg's H.264 decoder reads the packet** `data` carrying
+  /// `record` as `AV_PKT_DATA_NEW_EXTRADATA`, under the framing it holds once
+  /// it applied the record: as an `avcC` record it applies, decoding no
+  /// slice (h264dec.c:1045-1050), or as NAL units so framed; `None` where
+  /// the framing cannot be told, or the stream is not H.264.
+  pub(super) fn h264_reading(&self, record: Option<&[u8]>, data: &[u8]) -> Option<H264Reading> {
+    let Self::H264(held) = self else {
+      return None;
+    };
+    let (mut is_avc, mut size) = (held.is_avc, held.nal_length_size);
+    if let Some(record) = record.filter(|record| !record.is_empty()) {
+      let read = params::h264_extradata(record, &mut [None; 32]);
+      is_avc = Some(read.is_avc);
+      if let Some(read) = read.nal_length_size {
+        size = Some(read);
+      }
+    }
+    if !is_avc? {
+      return Some(H264Reading::Units(None));
+    }
+    if params::avcc_body(data) {
+      return Some(H264Reading::Record);
+    }
+    Some(H264Reading::Units(Some(usize::from(size?))))
   }
 
   /// Whether this holds the same sets as `other`, in the same framing, each
@@ -220,6 +246,15 @@ impl PictureHeld {
       && self.past_end == other.past_end
       && self.doubt == other.doubt
   }
+}
+
+/// How FFmpeg's H.264 decoder reads a packet's body ([`Held::h264_reading`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum H264Reading {
+  /// As an `avcC` record it applies as extradata, decoding no slice of it.
+  Record,
+  /// As NAL units, length-prefixed by so many bytes, or start-coded.
+  Units(Option<usize>),
 }
 
 /// How an H.264 decoder frames the packets it reads.
@@ -471,13 +506,13 @@ impl<'a> H264Write<'a> {
     read.verdict
   }
 
-  /// The sets FFmpeg stores off a packet's units, framed as the decoder
-  /// frames them ([`params::h264_packet`]). Where its framing cannot be
+  /// **What FFmpeg's H.264 decoder reads off a packet's body**, under the
+  /// framing it holds ([`Self::read_body`]). Where its framing cannot be
   /// told, every set any framing it may have would store is in doubt.
-  fn units(&mut self, data: &[u8]) {
+  fn body(&mut self, data: &[u8]) {
     let now = self.now();
     if let (Some(is_avc), Some(size)) = (now.is_avc, now.nal_length_size) {
-      params::h264_packet(data, is_avc, usize::from(size), self);
+      self.read_body(data, is_avc, size);
       return;
     }
     let avc = now.is_avc.map_or(&[false, true][..], |is_avc| {
@@ -490,7 +525,7 @@ impl<'a> H264Write<'a> {
     for &is_avc in avc {
       for &size in &sizes {
         let mut probe = H264Write::new(&before);
-        params::h264_packet(data, is_avc, usize::from(size), &mut probe);
+        probe.read_body(data, is_avc, size);
         if let Some(mut next) = probe.next {
           next.doubt_since(&before);
           // What this framing would change, in doubt over what is held.
@@ -516,6 +551,21 @@ impl<'a> H264Write<'a> {
         }
       }
     }
+  }
+}
+
+impl H264Write<'_> {
+  /// `h264_decode_frame`'s reading of a packet's body, under the framing
+  /// `is_avc` and `size`: a body that reads as an `avcC` record where the
+  /// framing is `avcC` applied as extradata, its sets and its framing, and
+  /// no unit read as a slice (h264dec.c:1045-1050; [`params::avcc_body`]);
+  /// otherwise its units ([`params::h264_packet`]).
+  fn read_body(&mut self, data: &[u8], is_avc: bool, size: u8) {
+    if is_avc && params::avcc_body(data) {
+      let _ = self.record(data);
+      return;
+    }
+    params::h264_packet(data, is_avc, usize::from(size), self);
   }
 }
 

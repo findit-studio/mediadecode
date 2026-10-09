@@ -2392,16 +2392,32 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// the session's is unknown ([`Self::extradata_unknown`]): the decoder may
   /// frame the packet's units either way.
   fn rule_for(&self, pkt: &Packet) -> Option<access::KeyframeRule> {
-    match new_extradata(pkt) {
-      Some(extradata) => Some(
-        access::KeyframeRule::of(self.codec_id(), extradata)
-          .permitting_aso(self.h264_aso)
-          .declaring_alpha(self.hevc_alpha),
-      ),
+    let record = new_extradata(pkt);
+    let rule = match record {
+      Some(extradata) => access::KeyframeRule::of(self.codec_id(), extradata)
+        .permitting_aso(self.h264_aso)
+        .declaring_alpha(self.hevc_alpha),
       None => {
         let rule = self.keyframe_rule();
-        (self.extradata_unknown.is_none() || !rule.reads_extradata()).then_some(rule)
+        if self.extradata_unknown.is_some() && rule.reads_extradata() {
+          return None;
+        }
+        rule
       }
+    };
+    if self.codec_id() != crate::CodecId::H264.raw() {
+      return Some(rule);
+    }
+    // FFmpeg's H.264 decoder frames the packet by the framing it holds once
+    // it applied the packet's record ([`held::Held::h264_reading`]); a body
+    // it reads as a record holds no picture, so it neither anchors nor is a
+    // clean point.
+    match self
+      .held
+      .h264_reading(record, pkt.data().unwrap_or_default())?
+    {
+      held::H264Reading::Record => None,
+      held::H264Reading::Units(nal_length) => Some(rule.framed(nal_length)),
     }
   }
 
@@ -2455,11 +2471,55 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       }
       rule.declares_alpha() || units.is_some_and(|data| rule.units_declare_alpha(data, &mut held))
     };
-    Sets {
-      aso: h264 && (rule.permits_aso() || units.is_some_and(|data| rule.units_permit_aso(data))),
-      alpha,
-      held,
+    // An H.264 packet's own sequence parameter sets, read as the decoder
+    // reads its body: a record's entries where it reads the body as a record
+    // (h264dec.c:1045-1050), the units it frames otherwise — under every
+    // framing it may have, where that cannot be told.
+    let aso = h264
+      && (rule.permits_aso()
+        || units.is_some_and(|data| {
+          let record_aso = || access::KeyframeRule::of(codec, data).permits_aso();
+          match self.held.h264_reading(record, data) {
+            Some(held::H264Reading::Record) => record_aso(),
+            Some(held::H264Reading::Units(nal_length)) => {
+              rule.framed(nal_length).units_permit_aso(data)
+            }
+            None => {
+              (params::avcc_body(data) && record_aso())
+                || [None, Some(1), Some(2), Some(3), Some(4)]
+                  .into_iter()
+                  .any(|nal_length| rule.framed(nal_length).units_permit_aso(data))
+            }
+          }
+        }));
+    Sets { aso, alpha, held }
+  }
+
+  /// **A packet's body FFmpeg's H.264 decoder reads as an `avcC` record**
+  /// (h264dec.c:1045-1050; [`held::Held::h264_reading`]), or may, is applied
+  /// as extradata — `ff_h264_decode_extradata`, as a new extradata is, but
+  /// with its answer the packet's own — and one it would not apply whole is
+  /// refused by name before any decoder sees the packet, as a new extradata
+  /// is ([`NewExtradata::of`], [`Error::ExtradataRejected`]): the packet
+  /// stays the caller's, and nothing of the session changes.
+  fn refuse_record_body(&self, pkt: &Packet) -> Result<(), Error> {
+    if self.codec_id() != crate::CodecId::H264.raw() {
+      return Ok(());
     }
+    let Some(data) = pkt.data() else {
+      return Ok(());
+    };
+    let record = match self.held.h264_reading(new_extradata(pkt), data) {
+      Some(held::H264Reading::Record) => true,
+      Some(held::H264Reading::Units(_)) => false,
+      None => params::avcc_body(data),
+    };
+    if record {
+      params::h264_record(data).map_err(|reason| {
+        Error::ExtradataRejected(crate::ExtradataRejected::new(crate::CodecId::H264, reason))
+      })?;
+    }
+    Ok(())
   }
 
   /// **The video parameter sets the HEVC decoder serving certainly holds**,
@@ -3691,6 +3751,11 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     }
     boundary::with_ffmpeg_video_packet::<C, _>(packet, limits, route, |av_pkt| {
       self.note_output_alpha();
+      // A body the decoder would read as a record it would not apply whole is
+      // refused before any road takes the packet.
+      self
+        .refuse_record_body(av_pkt)
+        .map_err(VideoDecodeError::Decode)?;
       // What the packet's parameter sets say of the stream, read before any
       // road takes it and the session's only once a decoder may have taken
       // it ([`Self::commit_sets`]).

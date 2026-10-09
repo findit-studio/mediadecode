@@ -10404,3 +10404,138 @@ fn an_hevc_set_that_replaces_another_drops_what_referred_to_it() {
     "read back as FFmpeg reads it"
   );
 }
+
+// ---------------------------------------------------------------------------
+//  R17 row 2: a packet whose body is an avcC record is read as one
+// ---------------------------------------------------------------------------
+
+/// A four-byte `avcC` stream of 16 frames (128x96), then a packet — flagged
+/// key — whose body is the `avcC` record of a second stream (160x96, two-byte
+/// NAL length fields, SPS and PPS 0), then that stream's 16 frames framed by
+/// it, none carrying a set; answers the clip and the record packet's index.
+fn h264_with_a_record_for_a_body() -> (SyntheticClip, usize) {
+  let (a, _, _) = encode_h264_avcc(128, 96, 16);
+  let b = encode_h264_with_extradata(160, 96, 16);
+  let (sps, pps) = sps_and_pps(&b);
+  let mut record = Packet::copy(&avcc(&sps, &pps, 2));
+  record.set_flags(ffmpeg_next::packet::Flags::KEY);
+  let mut packets = a.packets.clone();
+  let at = packets.len();
+  packets.push(record);
+  for packet in &b.packets {
+    let units = annexb_units(packet.data().expect("a payload"));
+    let mut moved = repacked(packet, &length_prefixed(&units, 2));
+    moved.set_pts(packet.pts().map(|pts| pts + 16));
+    moved.set_dts(packet.dts().map(|dts| dts + 16));
+    packets.push(moved);
+  }
+  (
+    SyntheticClip {
+      parameters: a.parameters.clone(),
+      packets,
+    },
+    at,
+  )
+}
+
+/// LAW (R17 row 2, the author's own; Codex R16 [high]): **a packet whose
+/// body FFmpeg's H.264 decoder reads as an `avcC` record is read as one: its
+/// sets and framing are the decoder's from then on, and it anchors nothing.**
+/// `h264_decode_frame` applies such a body as extradata and decodes no slice
+/// of it where the decoder's framing is `avcC` (h264dec.c:1045-1050;
+/// `is_avcc_extradata`, 899-921). A four-byte `avcC` stream, then a packet
+/// flagged key whose body is a second stream's two-byte `avcC` record, then
+/// that stream, its IDR 17 carrying no set. The hardware failing post-commit
+/// at the record's packet: the cold decoder takes it, it anchors nothing, the
+/// IDR 17 — read with two-byte fields — anchors, and every picture from 17 on
+/// comes out as a straight decode gives it, the end clean. On a probe-era
+/// fallback at 10 on three threads the session switches at 17, the decoder
+/// opened there holding the record's sets, every picture as the straight
+/// decode. Read as units, the record's packet left the framing four-byte: 17
+/// anchored nothing, the end escalated, and no switch fired.
+#[test]
+fn a_packet_whose_body_is_an_avcc_record_is_read_as_one() {
+  let (clip, at) = h264_with_a_record_for_a_body();
+  assert_eq!(at, 16, "the record's packet");
+  assert!(
+    clip.packets[at + 1].is_key(),
+    "17 is the second stream's IDR"
+  );
+  let reference = straight(&clip);
+  assert_eq!(reference.len(), 32, "the straight decode is whole");
+
+  // The post-commit fallback at the record's packet.
+  let mut anchored_at_the_record = None;
+  let session = session_of(behind_a_failure_at(&clip, at), &clip, |index, dec| {
+    if index == at + 1 {
+      anchored_at_the_record = Some(dec.degraded_anchored_for_test());
+    }
+  });
+  assert_eq!(
+    anchored_at_the_record,
+    Some(false),
+    "the record's packet anchors nothing"
+  );
+  assert!(
+    session.errors.is_empty(),
+    "no error, the end clean: {:?}",
+    session.errors
+  );
+  assert!(
+    from_pts(&session.pictures, 16) == from_pts(&reference, 16),
+    "every picture from 17 on, as the straight decode gives it"
+  );
+
+  // The switch.
+  let three = core::num::NonZeroU32::new(3).expect("nonzero");
+  let session = session_of(
+    behind_a_probe(&clip, 10, crate::Threads::Count(three)),
+    &clip,
+    |_, _| {},
+  );
+  assert_eq!(
+    (session.threads[at], session.threads[at + 1]),
+    (Some(core::num::NonZeroU32::MIN), Some(three)),
+    "one thread to the record's packet, three from the switch at 17"
+  );
+  assert!(session.errors.is_empty(), "no error: {:?}", session.errors);
+  assert!(
+    session.pictures == reference,
+    "every picture, as the straight decode"
+  );
+
+  // A body FFmpeg would read as a record it applies only in part — an SPS it
+  // skips, its id read as 32 — is refused by name before any decoder sees
+  // it, as a new extradata is; the stream's own record as a body is taken.
+  let (clip, sps, pps) = encode_h264_avcc(128, 96, 16);
+  let mut bad_sps = sps.clone();
+  bad_sps[4] = 0x04;
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let mut dec = FfmpegVideoStreamDecoder::open_as(
+    clip.parameters.clone(),
+    tb,
+    DecoderLimits::default().with_threads(crate::Threads::Single),
+    DecodePath::Software,
+  )
+  .expect("the software road opens");
+  let mut dst = crate::empty_owned_video_frame();
+  for av_pkt in &clip.packets[..5] {
+    sent_through(&mut dec, &mut dst, av_pkt);
+    drained(&mut dec, &mut dst);
+  }
+  let taken = super::live_sw::sent();
+  match dec.send_packet(&pushed(&Packet::copy(&avcc(&bad_sps, &pps, 4)))) {
+    Err(VideoDecodeError::Decode(Error::ExtradataRejected(rejected))) => assert_eq!(
+      rejected.reason(),
+      crate::ExtradataRejection::Unparsed(crate::ParameterSet::Sequence),
+      "the reason"
+    ),
+    other => panic!("the record's body refused by name: {other:?}"),
+  }
+  assert_eq!(super::live_sw::sent(), taken, "no decoder took it");
+  sent_through(&mut dec, &mut dst, &Packet::copy(&avcc(&sps, &pps, 4)));
+  for av_pkt in &clip.packets[5..] {
+    sent_through(&mut dec, &mut dst, av_pkt);
+    drained(&mut dec, &mut dst);
+  }
+}

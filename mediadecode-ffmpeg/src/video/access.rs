@@ -210,6 +210,17 @@ impl KeyframeRule {
     }
   }
 
+  /// This rule, for an H.264 stream, its NAL units framed as `nal_length`
+  /// says — length-prefixed by so many bytes, or start-coded where `None` —
+  /// as FFmpeg's decoder frames the packet it reads, by the framing it holds;
+  /// any other rule as it is.
+  pub(crate) const fn framed(self, nal_length: Option<usize>) -> Self {
+    match self {
+      Self::H264 { aso, .. } => Self::H264 { nal_length, aso },
+      other => other,
+    }
+  }
+
   /// Whether this HEVC rule's stream declares an auxiliary layer (`alpha`).
   pub(crate) const fn declares_alpha(self) -> bool {
     matches!(self, Self::Hevc { alpha: true, .. })

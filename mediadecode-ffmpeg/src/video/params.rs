@@ -1362,6 +1362,37 @@ pub(crate) fn h264_record(record: &[u8]) -> Result<(), crate::ExtradataRejection
   h264_extradata(record, &mut [None; 32]).verdict
 }
 
+/// **Whether FFmpeg's H.264 decoder reads a packet's body as an `avcC`
+/// record** where its framing is `avcC` (`is_avc`) — `h264_decode_frame`
+/// (h264dec.c:1045-1050), which then applies the body as extradata
+/// (`ff_h264_decode_extradata`) and decodes no slice of it: nine bytes or
+/// more, the version byte 1, a zero third byte and the reserved bits of the
+/// NAL length size byte set, and `is_avcc_extradata` (899-921) — at least one
+/// sequence and one picture parameter set entry, each within the buffer, whose
+/// header byte, the forbidden bit and type read under `0x9F`, says SPS (7) and
+/// PPS (8). A byte past the buffer reads as the zero of its padding, as there.
+pub(super) fn avcc_body(buf: &[u8]) -> bool {
+  let byte = |at: usize| buf.get(at).copied().unwrap_or(0);
+  if buf.len() < 9 || buf[0] != 1 || buf[2] != 0 || buf[4] & 0xfc != 0xfc {
+    return false;
+  }
+  let entries = |at: &mut usize, count: usize, kind: u8| {
+    count > 0
+      && (0..count).all(|_| {
+        let nalsize = ((usize::from(byte(*at)) << 8) | usize::from(byte(*at + 1))) + 2;
+        let fits = nalsize <= buf.len() - *at && byte(*at + 2) & 0x9f == kind;
+        *at += nalsize;
+        fits
+      })
+  };
+  let mut at = 6usize;
+  entries(&mut at, usize::from(byte(5) & 0x1f), 7) && {
+    let pictures = usize::from(byte(at));
+    at += 1;
+    entries(&mut at, pictures, 8)
+  }
+}
+
 /// **The parameter sets FFmpeg's H.264 decoder reads off a packet's
 /// units**, stored in `sets` as it stores them — `decode_nal_units`
 /// (h264dec.c:584-760) over a packet split as the decoder's framing says,
