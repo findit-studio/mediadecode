@@ -58,6 +58,52 @@ pub(super) struct Record {
   pub(super) strict: bool,
 }
 
+/// The most bytes of a parameter set the table keeps: what an `avcC` or
+/// `hvcC` entry, its length 16 bits, can carry. A packet may run to a
+/// gigabyte; a set longer than this is held by a fingerprint of its bytes
+/// alone, and no record carries it ([`Unrecordable::Oversized`]), so what the
+/// table holds stays within what records could.
+const MAX_HELD_UNIT: usize = u16::MAX as usize;
+
+/// A parameter set's bytes as the table holds them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Bytes {
+  /// The bytes themselves.
+  Kept(Box<[u8]>),
+  /// A set too long for a record's entry: its length and a 64-bit
+  /// fingerprint (FNV-1a) of its bytes, which tell one such set from
+  /// another.
+  Fingerprint(usize, u64),
+}
+
+impl Bytes {
+  fn of(bytes: &[u8]) -> Self {
+    if bytes.len() <= MAX_HELD_UNIT {
+      return Self::Kept(bytes.into());
+    }
+    let fingerprint = bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, &byte| {
+      (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+    });
+    Self::Fingerprint(bytes.len(), fingerprint)
+  }
+
+  /// Whether these are `bytes`'s, as [`Self::of`] would hold them.
+  fn is(&self, bytes: &[u8]) -> bool {
+    match self {
+      Self::Kept(kept) => **kept == *bytes,
+      Self::Fingerprint(..) => *self == Self::of(bytes),
+    }
+  }
+
+  /// The bytes, where they are kept: a record can carry them.
+  fn kept(&self) -> Option<&[u8]> {
+    match self {
+      Self::Kept(bytes) => Some(bytes),
+      Self::Fingerprint(..) => None,
+    }
+  }
+}
+
 impl Held {
   /// What a decoder of `codec_id` holds once opened on `extradata` — none
   /// where it is empty.
@@ -261,7 +307,7 @@ impl Held {
 #[derive(Debug, PartialEq, Eq)]
 struct Sequence {
   /// The unit as the splitter took it (`nal->raw_data`).
-  unit: Box<[u8]>,
+  unit: Bytes,
   /// Its payload bits (`nal->size_bits`).
   size_bits: u64,
   /// Which of FFmpeg's three readings stored it ([`params::H264Sets`]).
@@ -289,7 +335,7 @@ struct SequenceHeld {
 #[derive(Clone, Debug)]
 struct PictureHeld {
   /// The unit as the splitter took it.
-  unit: Arc<[u8]>,
+  unit: Arc<Bytes>,
   /// The id of the sequence parameter set it refers to.
   sps_id: u8,
   /// The sequence parameter set it was read under (`pps->sps`), which a
@@ -501,7 +547,10 @@ impl H264 {
         let profile = if base.first() == Some(&1) && base.len() >= 4 {
           [base[1], base[2], base[3]]
         } else {
-          let unit: &[u8] = sequences.first().map_or(&[], |sps| &sps.set.unit);
+          let unit: &[u8] = sequences
+            .first()
+            .and_then(|sps| sps.set.unit.kept())
+            .unwrap_or_default();
           core::array::from_fn(|at| unit.get(at + 1).copied().unwrap_or(0))
         };
         bytes.extend_from_slice(&[
@@ -521,13 +570,17 @@ impl H264 {
         }
       }
       H264Framing::AnnexB { reguess: false } => {
-        for unit in sequences
+        for (unit, set) in sequences
           .iter()
-          .map(|sps| &sps.set.unit[..])
-          .chain(pictures.iter().map(|pps| &pps.unit[..]))
+          .map(|sps| (&sps.set.unit, ParameterSet::Sequence))
+          .chain(
+            pictures
+              .iter()
+              .map(|pps| (&*pps.unit, ParameterSet::Picture)),
+          )
         {
           bytes.extend_from_slice(&[0, 0, 1]);
-          bytes.extend_from_slice(unit);
+          bytes.extend_from_slice(unit.kept().ok_or(Unrecordable::Oversized(set))?);
         }
       }
       H264Framing::Avc(_) | H264Framing::AnnexB { reguess: true } => {
@@ -552,7 +605,8 @@ impl H264 {
 
 /// `unit` as an `avcC` or `hvcC` entry: its length in two bytes, then the
 /// unit — refused where it does not fit them.
-fn entry(bytes: &mut Vec<u8>, unit: &[u8], set: ParameterSet) -> Result<(), Unrecordable> {
+fn entry(bytes: &mut Vec<u8>, unit: &Bytes, set: ParameterSet) -> Result<(), Unrecordable> {
+  let unit = unit.kept().ok_or(Unrecordable::Oversized(set))?;
   let length = u16::try_from(unit.len()).map_err(|_| Unrecordable::Oversized(set))?;
   bytes.extend_from_slice(&length.to_be_bytes());
   bytes.extend_from_slice(unit);
@@ -749,7 +803,7 @@ impl H264Sets for H264Write<'_> {
 
   fn store_sps(&mut self, id: usize, facts: params::Sps, unit: &Unit<'_>, reading: u8) {
     let set = Sequence {
-      unit: unit.raw().into(),
+      unit: Bytes::of(unit.raw()),
       size_bits: unit.size_bits,
       reading,
       facts,
@@ -779,7 +833,7 @@ impl H264Sets for H264Write<'_> {
       return;
     };
     let pps = PictureHeld {
-      unit: unit.raw().into(),
+      unit: Arc::new(Bytes::of(unit.raw())),
       sps_id: sps as u8,
       bound: held.set,
       past_end,
@@ -807,8 +861,8 @@ impl H264Sets for H264Write<'_> {
 /// 1729-1733, 2219-2223).
 #[derive(Debug, PartialEq, Eq)]
 struct HevcSet {
-  unit: Box<[u8]>,
-  identity: Box<[u8]>,
+  unit: Bytes,
+  identity: Bytes,
 }
 
 /// A video parameter set held.
@@ -1026,10 +1080,10 @@ impl Hevc {
         }
       }
     } else {
-      for (_, _, units) in &arrays {
+      for (_, set, units) in &arrays {
         for unit in units {
           bytes.extend_from_slice(&[0, 0, 1]);
-          bytes.extend_from_slice(&unit.unit);
+          bytes.extend_from_slice(unit.unit.kept().ok_or(Unrecordable::Oversized(*set))?);
         }
       }
     }
@@ -1238,7 +1292,7 @@ impl<'a> HevcWrite<'a> {
     let held = self.now().vps[id].clone();
     if held
       .as_ref()
-      .is_some_and(|held| !held.doubt && *held.set.identity == *identity)
+      .is_some_and(|held| !held.doubt && held.set.identity.is(identity))
     {
       return Read::Taken;
     }
@@ -1256,8 +1310,8 @@ impl<'a> HevcWrite<'a> {
     let doubt = !certain || (past_end && held.is_some());
     self.alpha |= read.alpha;
     let set = Arc::new(HevcSet {
-      unit: unit.raw().into(),
-      identity: identity.into(),
+      unit: Bytes::of(unit.raw()),
+      identity: Bytes::of(identity),
     });
     let replaces = held.as_ref().is_some_and(|held| !held.doubt) && !doubt;
     let edit = self.edit();
@@ -1327,13 +1381,13 @@ impl<'a> HevcWrite<'a> {
     let held = self.now().sps[id].clone();
     let identical = held
       .as_ref()
-      .is_some_and(|held| *held.set.identity == *identity);
+      .is_some_and(|held| held.set.identity.is(identity));
     if identical && held.as_ref().is_some_and(|held| !held.doubt || doubt) {
       return Read::Taken;
     }
     let set = Arc::new(HevcSet {
-      unit: unit.raw().into(),
-      identity: identity.into(),
+      unit: Bytes::of(unit.raw()),
+      identity: Bytes::of(identity),
     });
     let replaces = held.as_ref().is_none_or(|held| !held.doubt) && !doubt && !identical;
     let edit = self.edit();
@@ -1372,7 +1426,7 @@ impl<'a> HevcWrite<'a> {
     let held = self.now().pps[id].clone();
     let identical = held
       .as_ref()
-      .is_some_and(|held| *held.set.identity == *identity);
+      .is_some_and(|held| held.set.identity.is(identity));
     if identical && held.as_ref().is_some_and(|held| !held.doubt || !certain) {
       return Read::Taken;
     }
@@ -1384,8 +1438,8 @@ impl<'a> HevcWrite<'a> {
       return Read::Refused { aborts: false };
     };
     let set = Arc::new(HevcSet {
-      unit: unit.raw().into(),
-      identity: identity.into(),
+      unit: Bytes::of(unit.raw()),
+      identity: Bytes::of(identity),
     });
     self.edit().pps[id] = Some(HevcPictureHeld {
       set,

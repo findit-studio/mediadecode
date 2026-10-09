@@ -10242,9 +10242,10 @@ fn h264_units_of_kind(data: &[u8], kind: u8) -> Vec<u8> {
 /// the switch at 16 is declined and the one-thread decoder serves on; the
 /// hardware failing post-commit at 16, the fallback is refused by name; a
 /// decoder closed before 16 is reopened by none, by name. A set held in
-/// doubt has no record either (`Unknown`); nor a start-coded record taking
-/// over from a four-byte `avcC` one, under which FFmpeg re-guesses every
-/// packet's framing (`Framing`).
+/// doubt has no record either (`Unknown`); nor a set longer than a record's
+/// entry, which the session holds by a fingerprint alone (`Oversized`); nor a
+/// start-coded record taking over from a four-byte `avcC` one, under which
+/// FFmpeg re-guesses every packet's framing (`Framing`).
 #[test]
 fn where_no_record_carries_what_is_held_a_fresh_decoder_is_refused_by_name() {
   use super::held::Held;
@@ -10288,6 +10289,22 @@ fn where_no_record_carries_what_is_held_a_fresh_decoder_is_refused_by_name() {
     "a set in doubt"
   );
   let (sps, pps) = sps_and_pps(&a);
+  // A set longer than a record's entry is held by a fingerprint, its bytes
+  // not kept: no record carries it.
+  let long_sps = [&sps[..], &[0x55; 70_000][..]].concat();
+  let long = held
+    .after_packet(
+      None,
+      Some(&[&[0, 0, 0, 1][..], &long_sps, &[0, 0, 0, 1], &pps].concat()),
+    )
+    .expect("the long SPS replaces id 0, the PPS read again");
+  assert_eq!(
+    long.record(h264, &record, None),
+    Err(crate::Unrecordable::Oversized(
+      crate::ParameterSet::Sequence
+    )),
+    "a set past a record's entry"
+  );
   let four = Held::opened_on(h264, &avcc(&sps, &pps, 4));
   let start_coded = four.with_record(&b_sets);
   assert_eq!(
