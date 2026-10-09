@@ -121,10 +121,10 @@ The backend-agnostic core it adapts has its own log at
   naming the reason; the packet stays the caller's and nothing of the
   session changes (below). A packet body FFmpeg reads as an `avcC` record
   is judged the same way, against the sets the decoder holds once it
-  applied the packet's own new extradata, which FFmpeg applies first. So is
-  an H.264 record riding a packet with no body, which FFmpeg's decoder reads
-  as the end of the stream before it reads the record
-  (`ExtradataRejection::Bodiless`).
+  applied the packet's own new extradata, which FFmpeg applies first. A
+  record riding a packet with no body is judged as soon as that packet is
+  handed over, as it will be judged on the packet with a body it rides
+  (below).
 
 - **`Error::SetsUnrecordable`** (`SetsUnrecordable { codec, reason }`, with
   `Unrecordable`, both exported; `Unrecordable` is `#[non_exhaustive]`): a
@@ -435,19 +435,26 @@ The backend-agnostic core it adapts has its own log at
   parameters as opened, an `avcC` stream
   whose length fields changed never anchored, ended in a false
   `PostCommitNeverResynced`, and never returned to the session's threads.
-  A packet with no body that carries side data — what libavformat hands over
-  for a sample of no bytes at a change of sample description — reaches
-  FFmpeg's own HEVC decoder, which applies its record and reads no unit, in
-  the one shape libavcodec takes it in, no data at all, and its record is
-  followed as any packet's; a probe's rescue history records it so too.
-  Rebuilt with a body of size 0 that was not null, it was refused
-  `AVERROR(EINVAL)` before the decoder read its side data, and the record
-  and the parameter sets held were left unknown. Every other packet with no
-  body is refused before any decoder sees it, nothing of the session moved:
-  an H.264 record riding one by name (`Bodiless`, above); another codec's,
-  whose FFmpeg decoders read an empty packet as the end of the stream, one
-  for a decoder that wraps another, and one carrying nothing at all
-  `AVERROR(EINVAL)`, the answer libavcodec gives it in libavformat's shape.
+  A packet with no body is handed to no decoder, on the video, audio and
+  subtitle roads alike. Its side data — a new extradata, a Dolby Vision
+  configuration, any other — rides the next packet of the stream with a
+  body, ahead of that packet's own: where FFmpeg applies a packet's side
+  data anyway. Of two entries of a type the later rides, as a packet
+  carries one. A packet with no body that carries nothing is dropped.
+  What still waits at the end of the stream, or at a flush, is dropped
+  and said so; no decoder saw it, so nothing is left in doubt. What
+  waits goes where the packet it rides goes — taken, failed or refused
+  with it — and is offered again with it under back pressure. A probe's
+  rescue history records it on that packet. Rebuilt as libavformat
+  delivers it, a body of size 0 that is not null, the packet was refused
+  `AVERROR(EINVAL)` before its side data was read, so an AAC
+  configuration change riding one was never applied. With no data at
+  all, FFmpeg's decoders decode a packet of no bytes. Its HEVC decoder
+  decodes an empty access unit, which takes an end of sequence off the
+  CRA after it: the prior sequence's waiting pictures are output rather
+  than discarded, and its leading pictures are decoded across the
+  boundary. Its H.264 decoder ends its pictures without reading the
+  record, and its WMA decoder takes the packet for its last.
 
 - **A picture the allocator judge refused is named even where FFmpeg
   conceals it.** FFmpeg's H.264 decoder drops a slice whose picture it
@@ -514,7 +521,11 @@ The backend-agnostic core it adapts has its own log at
   across packets, as FFmpeg does — a keyframe's own sets too, for whether it
   is clean or anchors: a set read past its end under an id an earlier packet
   filled is refused, not taken as alpha video for good. A set longer than a
-  record's entry is held by a fingerprint.
+  record's entry, whose bytes are not kept, is alike to no set that
+  arrives, whatever a hash of it says. Every arrival replaces what its id
+  held, drops what referred to it, and is read off its own bytes, so a
+  set crafted to take another's 64-bit fingerprint hides no replacement
+  and no alpha layer.
 
 - **An H.264 packet is framed as FFmpeg's decoder frames it.** A packet
   whose body FFmpeg reads as an `avcC` record — where the decoder's framing
