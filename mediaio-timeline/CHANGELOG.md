@@ -7,6 +7,24 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Its versions are its own: they do not move with `mediadecode`'s.
 
+## [0.1.1] - 2026-10-10
+
+### Changed
+
+- **Time is measured and counted by `mediatime` 0.5.1**, which this version
+  requires. A range's length is `TimeRange::span`, and a range longer than
+  `i64::MAX` ticks is refused by name as before; the coarsest whole-rate
+  ruler a media-side range lands on is `TimeRange::coarsest_whole_rate`;
+  and the exact count of a time in a ruler, which the export's walk holds
+  every derived value by, is `Rate::checked_count`. The crate's own copies
+  of the three, and its greatest-common-divisor routines, are gone.
+
+  Every document, refusal and export is the one 0.1.0 gives, but at one
+  edge: a count is formed in lowest terms whatever the spelling of its
+  ruler's rate, so over a rate written in other than lowest terms
+  (`60000/2002`) a count whose halves 0.1.0 formed past `i128`, and so
+  refused, can be formed and held.
+
 ## [0.1.0] - 2026-10-10
 
 The crate's first release, as 0.1.0.
