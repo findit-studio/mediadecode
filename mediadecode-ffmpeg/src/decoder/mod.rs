@@ -1143,18 +1143,6 @@ impl VideoDecoder {
     HwRoute::Report(reason)
   }
 
-  /// Whether the probe rescue history is still being recorded.
-  ///
-  /// While this is true, [`Self::send_packet`] copies every accepted
-  /// packet into `buffered_packets` (see [`try_clone_packet`]), and a
-  /// later [`Error::AllBackendsFailed`] hands those copies to the caller
-  /// as owned, mutable `Packet`s. The window closes at commit, when the
-  /// first frame arrives and `probe` is taken.
-  #[inline]
-  pub(crate) const fn is_probing(&self) -> bool {
-    self.probe.is_some()
-  }
-
   /// **Where this session is, derived here and nowhere else.**
   ///
   /// The two latches this reads — whether a backend is still on trial,

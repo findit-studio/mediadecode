@@ -316,18 +316,6 @@ pub(crate) trait HwInner: Send {
   /// exposing it. Returns `None` for a test fake.
   fn as_video_decoder(&self) -> Option<&VideoDecoder>;
 
-  /// Whether a packet submitted **now** would be recorded for replay.
-  ///
-  /// The probe keeps a rescue history so that a decoder which exhausts
-  /// every backend can hand the caller everything FFmpeg consumed since
-  /// open, and [`AllBackendsFailed::into_unconsumed_packets`] hands those
-  /// recordings out as owned, **mutable** `Packet`s. [`VideoDecoder`]
-  /// records copies of its own. The view lane copies a submission that
-  /// could be recorded as well, so a recording never addresses a
-  /// carrier's storage, whichever way a seam records. See
-  /// [`CarrierVideoStreamDecoder::send_packet_impl`].
-  fn records_submissions(&self) -> bool;
-
   /// See [`VideoDecoder::scaled_output_capability`].
   ///
   /// Defaulted to the refusal so a test fake — which has no
@@ -350,11 +338,6 @@ pub(crate) trait HwInner: Send {
 }
 
 impl HwInner for VideoDecoder {
-  #[inline]
-  fn records_submissions(&self) -> bool {
-    self.is_probing()
-  }
-
   #[inline]
   fn send_packet(&mut self, packet: &Packet) -> Result<Sent, Error> {
     VideoDecoder::send_packet(self, packet)
@@ -1152,20 +1135,18 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     // which is what lets the view lane share its buffer with libavcodec
     // rather than copy into it. See `boundary::with_ffmpeg_video_packet`.
     let limits = self.limits.packet_limits();
-    // **The route depends on what this decoder does with what it is
-    // sent.** While the hardware probe is open it records every
-    // accepted packet into a rescue history, and
-    // `AllBackendsFailed::into_unconsumed_packets` hands those out as
-    // owned, mutable `Packet`s. `VideoDecoder` records copies of its
-    // own (`decoder::try_clone_packet`); inside that window the body is
-    // copied here as well, so a recording never addresses a carrier the
-    // caller may still be reading, whichever way the seam records. Once
-    // the probe has committed, nothing is recorded and the send is
-    // zero-copy again. The software road never records.
-    let route = match &self.state {
-      DecodeState::Hw(hw) if hw.records_submissions() => crate::carrier::BodyRoute::Copy,
-      _ => crate::carrier::BodyRoute::Submission,
-    };
+    // **One route, on every road.** The submission may share its
+    // carrier's buffer — wherever `boundary::share_or_copy` can prove
+    // the padding — in the probe window as after it, hardware or
+    // software. libavcodec may keep a reference past the call and does
+    // not write through it (`libavcodec/avcodec.h` 2333–2335 in FFmpeg
+    // 9.0.1). The one thing that keeps what it is sent *and hands it
+    // back* is the hardware probe, whose rescue history goes to the
+    // caller as owned, mutable `Packet`s
+    // (`AllBackendsFailed::into_unconsumed_packets`); it records copies
+    // of its own (`decoder::try_clone_packet`), so nothing it hands back
+    // addresses a carrier.
+    let route = crate::carrier::BodyRoute::Submission;
     boundary::with_ffmpeg_video_packet::<C, _>(packet, limits, route, |av_pkt| {
       match &mut self.state {
         DecodeState::Hw(hw) => match hw.send_packet(av_pkt) {

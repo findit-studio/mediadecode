@@ -2,6 +2,7 @@ use super::*;
 
 use mediadecode::decoder::VideoStreamDecoder;
 use std::num::NonZeroI32;
+use std::sync::{Arc, Mutex};
 
 // The hardware-fallback suite runs on the **owned** lane, because it
 // replays one `Vec<Packet>` through several decoders: a borrowed source
@@ -97,6 +98,49 @@ fn encode_synthetic_clip(width: u32, height: u32, frames: usize, gop: u32) -> Sy
   }
 }
 
+/// Where a packet or a view carrier keeps its payload: the address its
+/// bytes start at, and the `AVBuffer` that holds them.
+///
+/// The `AVBuffer`, not the `AVBufferRef`: `av_buffer_ref` mints a new
+/// reference around the same buffer, so two holders of one allocation
+/// differ in the reference and agree here (see `FfmpegBuffer::ptr_eq`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Storage {
+  /// Where the payload starts.
+  data: usize,
+  /// The `AVBuffer` behind the holder's reference, or 0 for none.
+  buffer: usize,
+}
+
+impl Storage {
+  /// Read while `packet` is live.
+  fn of_packet(packet: &Packet) -> Self {
+    use ffmpeg_next::packet::Ref;
+    // SAFETY: `packet` is live; `data` and `buf` are public fields, and
+    // a non-null `buf` is the live `AVBufferRef` the packet holds, whose
+    // `buffer` field is read as an address and never dereferenced.
+    unsafe {
+      let raw = packet.as_ptr();
+      Self {
+        data: (*raw).data as usize,
+        buffer: (*raw).buf.as_ref().map_or(0, |held| held.buffer as usize),
+      }
+    }
+  }
+
+  /// The same two facts for a view carrier.
+  fn of_carrier(carrier: &crate::FfmpegBuffer) -> Self {
+    // SAFETY: a non-null reference is the live `AVBufferRef` the carrier
+    // holds; its `buffer` field is read as an address and never
+    // dereferenced.
+    let held = unsafe { carrier.as_av_buffer_ref().as_ref() };
+    Self {
+      data: carrier.as_ref().as_ptr() as usize,
+      buffer: held.map_or(0, |held| held.buffer as usize),
+    }
+  }
+}
+
 /// A test HW seam modelling a probe that exhausts.
 ///
 /// * `inert()` — never driven (a placeholder seam).
@@ -128,9 +172,14 @@ struct FakeHw {
   /// thing an allocator ceiling hit, which is not the thing under test
   /// when a lane caps the ceiling to refuse a *carrier*.
   queued: VecDeque<frame::Video>,
-  /// Copies of every packet accepted so far — the probe's
+  /// Copies of every packet accepted so far, made as the probe makes
+  /// them (`decoder::try_clone_packet`) — the probe's
   /// `unconsumed_packets` history, surfaced when it exhausts.
   history: Vec<Packet>,
+  /// Where each `send_packet`'s packet kept its payload, read while it
+  /// was live. Shared, so a lane can read it after the seam has moved
+  /// into a decoder: see [`FakeHw::submitted`].
+  submitted: Arc<Mutex<Vec<Storage>>>,
   /// When set, raise a **probe-era** exhaustion from `receive_frame`
   /// rather than from `send_packet`.
   ///
@@ -155,6 +204,7 @@ impl FakeHw {
       sends: 0,
       queued: VecDeque::new(),
       history: Vec::new(),
+      submitted: Arc::default(),
       fail_at_receive: false,
       fail_at_eof: false,
     }
@@ -169,6 +219,7 @@ impl FakeHw {
       sends: 0,
       queued: VecDeque::new(),
       history: Vec::new(),
+      submitted: Arc::default(),
       fail_at_receive: false,
       fail_at_eof: false,
     }
@@ -194,20 +245,20 @@ impl FakeHw {
   fn never_failing(width: u32, height: u32) -> Self {
     Self::failing(width, height, usize::MAX, usize::MAX)
   }
+
+  /// A handle on where each send's packet kept its payload.
+  fn submitted(&self) -> Arc<Mutex<Vec<Storage>>> {
+    Arc::clone(&self.submitted)
+  }
 }
 
 impl HwInner for FakeHw {
-  fn records_submissions(&self) -> bool {
-    // **This fake records exactly like the real probe does** — see
-    // `send_packet` below, which `try_clone_packet`s (a copy of its
-    // own) every accepted packet into `history` and hands that history
-    // out through `AllBackendsFailed`. Saying so is what makes the view
-    // lane copy into it, and what
-    // `a_rescued_packet_never_aliases_a_view_carrier` checks.
-    true
-  }
-
   fn send_packet(&mut self, packet: &Packet) -> Result<Sent, Error> {
+    self
+      .submitted
+      .lock()
+      .expect("no lane panics while holding the record")
+      .push(Storage::of_packet(packet));
     let idx = self.sends;
     self.sends += 1;
     if idx == self.fail_at_send {
@@ -291,12 +342,6 @@ impl FakeHwEofFails {
 }
 
 impl HwInner for FakeHwEofFails {
-  fn records_submissions(&self) -> bool {
-    // This one keeps no history: its exhaustion at `send_eof` hands back
-    // an empty rescue set.
-    false
-  }
-
   fn send_packet(&mut self, packet: &Packet) -> Result<Sent, Error> {
     self.queued.push_back(packet.pts().unwrap_or(0));
     Ok(Sent::Accepted)
@@ -336,9 +381,6 @@ impl HwInner for FakeHwEofFails {
 struct FakeHwEofBackpressures;
 
 impl HwInner for FakeHwEofBackpressures {
-  fn records_submissions(&self) -> bool {
-    false
-  }
   fn send_packet(&mut self, _: &Packet) -> Result<Sent, Error> {
     Ok(Sent::Accepted)
   }
@@ -1109,24 +1151,29 @@ impl Fx3Observation {
   }
 }
 
+/// LAW: **a rescued packet never aliases a view carrier**, on `Auto`'s
+/// road, where the probe's history comes back through a failed fallback.
+///
+/// PLANT: `av_packet_make_writable` skipped in `decoder::try_clone_packet`
+/// turns this red at "addresses a retained view carrier's storage".
 #[test]
 fn a_rescued_packet_never_aliases_a_view_carrier() {
   use crate::{CarrierVideoStreamDecoder, View, boundary::video_packet_from_ffmpeg_in};
   use ffmpeg_next::packet::Ref;
   use mediadecode::decoder::VideoStreamDecoder;
 
-  // **The scoped submission's proof has a hole on one road.** "Built,
+  // **The scoped submission's proof leans on the recorder.** "Built,
   // lent, dropped inside this call" is true of the function — and would
   // be false of a probe that recorded by reference, because
   // `FallbackFailed::unconsumed_packets` hands its rescue history back
-  // to the caller as owned, **mutable** `Packet`s. A shared body would
-  // leave that call as a live mutable alias of bytes a view carrier is
-  // still lending.
+  // to the caller as owned, **mutable** `Packet`s. The view lane's
+  // submission shares its carrier's buffer in the probe window too, so
+  // a recording by reference would leave that call as a live mutable
+  // alias of bytes a view carrier is still lending.
   //
-  // So the probe records copies of its own, and while the history is
-  // being recorded the body is copied as well. This pins the outcome
-  // from the outside, on the one road where the history is observable:
-  // a probe-era failure whose SW replay also fails.
+  // So the probe records copies of its own, and that copy is the only
+  // one: this law stands on it alone. That the submission does share is
+  // `a_view_send_in_the_probe_window_is_zero_copy`'s.
   let (w, h) = (128u32, 96u32);
   let mut clip = encode_synthetic_clip(w, h, 12, 100);
   let p1 = clip
@@ -1215,6 +1262,132 @@ fn a_rescued_packet_never_aliases_a_view_carrier() {
       packet.data().as_ref(),
       expected.as_slice(),
       "writing a rescued packet reached a retained view carrier",
+    );
+  }
+}
+
+/// LAW: **a view send in the probe window is zero-copy, and the probe's
+/// copy is the one copy.**
+///
+/// The probe window is the one stretch of a session with a recorder in
+/// it: the probe keeps every packet it takes, and its exhaustion hands
+/// them to the caller as owned, mutable `Packet`s. It records copies of
+/// its own (`decoder::try_clone_packet`), so the view lane's submission
+/// shares its carrier's buffer there as it does after the first picture.
+/// On a pinned session, whose exhaustion reports the history as the seam
+/// recorded it: each send hands the seam the retained carrier's own
+/// storage, held by a reference to its buffer; no rescued packet is that
+/// storage, each is referenced once and holds the bytes it was sent
+/// with; and after its call each carrier is its buffer's only holder.
+///
+/// PLANT: the route forced to `BodyRoute::Copy` in `send_packet_impl`
+/// turns this red at "the submission must be the carrier's own storage";
+/// `av_packet_make_writable` skipped in `decoder::try_clone_packet` turns
+/// it red at "shares a retained carrier's storage".
+#[test]
+fn a_view_send_in_the_probe_window_is_zero_copy() {
+  use crate::{CarrierVideoStreamDecoder, View, boundary::video_packet_from_ffmpeg_in};
+  use ffmpeg_next::{ffi::av_buffer_get_ref_count, packet::Ref};
+
+  const PADDING: usize = ffmpeg_next::ffi::AV_INPUT_BUFFER_PADDING_SIZE as usize;
+
+  let (w, h) = (64u32, 48u32);
+  let clip = encode_synthetic_clip(w, h, 8, 100);
+  let fail_at = 4;
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  // Takes every packet into its history and delivers nothing, then
+  // exhausts on the send at `fail_at`.
+  let seam = FakeHw::failing(w, h, 0, fail_at);
+  let submitted = seam.submitted();
+  let mut dec = CarrierVideoStreamDecoder::<View>::from_hw_inner_for_test_as(
+    Box::new(seam),
+    clip.parameters.clone(),
+    tb,
+    DecodePath::AnyHardware,
+  )
+  .expect("build a pinned test decoder");
+
+  // Every carrier is retained, so its storage stays its own for the
+  // whole lane: an address can match only by being that storage.
+  let mut retained: Vec<crate::VideoPacket> = Vec::new();
+  let mut rescued: Vec<ffmpeg_next::Packet> = Vec::new();
+  for av_pkt in &clip.packets[..=fail_at] {
+    let vpkt = video_packet_from_ffmpeg_in(av_pkt.clone(), tb, crate::PacketLimits::default())
+      .expect("a wrappable payload")
+      .expect("packet has a buffer");
+    // The premise: a packet payload with FFmpeg's padding behind it,
+    // the one shape `boundary::share_or_copy` shares.
+    let body = vpkt.data();
+    assert_eq!(body.origin(), crate::view::Origin::PacketPayload);
+    // SAFETY: the carrier holds this live, non-null reference; `size`
+    // is a public field.
+    let capacity = unsafe { (*body.as_av_buffer_ref()).size };
+    assert!(
+      capacity
+        .checked_sub(body.offset() + body.len())
+        .is_some_and(|slack| slack >= PADDING),
+      "the premise: the padding behind the payload",
+    );
+    let answer = dec.send_packet(&vpkt);
+    retained.push(vpkt);
+    match answer {
+      Ok(Sent::Accepted) => {}
+      Err(VideoDecodeError::Decode(Error::AllBackendsFailed(p))) => {
+        rescued = p.into_unconsumed_packets();
+        break;
+      }
+      other => panic!("send_packet: {other:?}"),
+    }
+  }
+  assert_eq!(
+    retained.len(),
+    fail_at + 1,
+    "the exhaustion arrives on its send"
+  );
+  assert_eq!(rescued.len(), fail_at, "the history comes back as recorded");
+
+  let carriers: Vec<Storage> = retained
+    .iter()
+    .map(|p| Storage::of_carrier(p.data()))
+    .collect();
+  let sends = submitted.lock().expect("the seam is done").clone();
+  assert_eq!(sends.len(), carriers.len(), "one record per send");
+  for (send, (sent, carrier)) in sends.iter().zip(&carriers).enumerate() {
+    assert_eq!(
+      sent, carrier,
+      "send {send}: the submission must be the carrier's own storage, held \
+       by a reference to its buffer — a copy here is a second copy",
+    );
+  }
+  for (index, packet) in rescued.iter().enumerate() {
+    let kept = Storage::of_packet(packet);
+    assert!(
+      carriers
+        .iter()
+        .all(|carrier| carrier.data != kept.data && carrier.buffer != kept.buffer),
+      "rescued packet {index} shares a retained carrier's storage — the \
+       probe must record a copy",
+    );
+    // SAFETY: the packet is live and holds the buffer just read.
+    let references = unsafe { av_buffer_get_ref_count((*packet.as_ptr()).buf) };
+    assert_eq!(
+      references, 1,
+      "rescued packet {index}: a payload of its own"
+    );
+    assert_eq!(
+      packet.data(),
+      Some(retained[index].data().as_ref()),
+      "rescued packet {index}: the bytes it was sent with",
+    );
+  }
+  // And the shared reference died with its call: each carrier is its
+  // buffer's only holder again.
+  for (index, carrier) in retained.iter().enumerate() {
+    // SAFETY: the carrier holds this live, non-null reference.
+    let references = unsafe { av_buffer_get_ref_count(carrier.data().as_av_buffer_ref()) };
+    assert_eq!(
+      references, 1,
+      "carrier {index}: nothing kept the submission"
     );
   }
 }
@@ -2191,11 +2364,6 @@ impl ScriptedHw {
 }
 
 impl HwInner for ScriptedHw {
-  fn records_submissions(&self) -> bool {
-    // Committed from the start: there is no rescue history to record.
-    false
-  }
-
   fn send_packet(&mut self, packet: &Packet) -> Result<Sent, Error> {
     let index = self.sent;
     if let Some(&(_, raw)) = self.failing_sends.iter().find(|(at, _)| *at == index) {
