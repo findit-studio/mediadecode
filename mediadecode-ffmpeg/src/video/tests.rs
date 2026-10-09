@@ -11433,3 +11433,84 @@ fn an_hevc_picture_parameter_set_read_past_its_end_has_no_record() {
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+//  R18 row 4: a parameter set is told from another as FFmpeg tells it
+// ---------------------------------------------------------------------------
+
+/// LAW (R18 row 4; Codex R17 [high]): **an H.264 sequence parameter set is
+/// told from another as FFmpeg tells it — by its parsed form and the bytes it
+/// keeps of it, not by its raw bytes: the same set repeated with one trailing
+/// zero fewer replaces nothing.** `libx264`'s record (start codes) carries SPS
+/// 0 before a four-byte start code, its raw bytes one zero longer than its
+/// payload, which the splitter drops (`get_bit_length`, h2645_parse.c:348-376);
+/// FFmpeg compares the parsed `SPS`, its `data` the payload's bytes
+/// (h264_ps.c:296-305, 578-587). The stream's packet 15 — no keyframe —
+/// carrying the record's SPS 0 again at its end, nothing after it: the same
+/// set, held as it was, PPS 0 still bound to it, no record to synthesize; on
+/// a probe-era fallback at 10 on three threads the switch at 16 fires and
+/// every picture is the straight decode's. A second stream's SPS 0 (160x96)
+/// there replaces it, PPS 0 bound to the set it replaced — `Superseded`, as
+/// before. Compared by its raw bytes, the repeated set read as a replacement,
+/// the record `Superseded` and the switch declined.
+#[test]
+fn a_sequence_parameter_set_repeated_with_a_trailing_zero_fewer_is_the_same_set() {
+  use super::held::Held;
+  let h264 = crate::CodecId::H264.raw();
+  let params = "keyint=8:min-keyint=8:scenecut=0:bframes=2:b-adapt=0:open-gop=0:log-level=error";
+  let a = encode_h264_global(128, 96, 32, params);
+  let record = extradata_of(&a.parameters);
+  let (sps, _) = sps_and_pps(&a);
+  assert!(
+    record
+      .windows(sps.len() + 4)
+      .any(|window| window[..sps.len()] == sps[..] && window[sps.len()..] == [0, 0, 0, 1]),
+    "the record's SPS stands before a four-byte start code"
+  );
+  let repeated = [&[0, 0, 1][..], &sps].concat();
+  let held = Held::opened_on(h264, &record);
+  assert!(
+    held.after_packet(None, Some(&repeated)).is_none(),
+    "the same set: nothing held changes"
+  );
+  let b = encode_h264_global(160, 96, 8, params);
+  let (other, _) = sps_and_pps(&b);
+  let replaced = held
+    .after_packet(None, Some(&[&[0, 0, 1][..], &other].concat()))
+    .expect("a set that differs replaces SPS 0");
+  assert_eq!(
+    replaced.record(h264, &record, None),
+    Err(crate::Unrecordable::Superseded),
+    "PPS 0 bound to the set replaced"
+  );
+
+  let mut packets = a.packets.clone();
+  let data = packets[15].data().expect("a payload").to_vec();
+  packets[15] = repacked(&a.packets[15], &[&data[..], &repeated[..]].concat());
+  let clip = SyntheticClip {
+    parameters: a.parameters.clone(),
+    packets,
+  };
+  assert!(
+    clip.packets[16].is_key() && !clip.packets[15].is_key(),
+    "16 is an IDR"
+  );
+  let reference = straight(&clip);
+  assert_eq!(reference.len(), 32, "the straight decode is whole");
+  let three = core::num::NonZeroU32::new(3).expect("nonzero");
+  let session = session_of(
+    behind_a_probe(&clip, 10, crate::Threads::Count(three)),
+    &clip,
+    |_, _| {},
+  );
+  assert_eq!(
+    (session.threads[15], session.threads[16]),
+    (Some(core::num::NonZeroU32::MIN), Some(three)),
+    "the switch at 16"
+  );
+  assert!(session.errors.is_empty(), "no error: {:?}", session.errors);
+  assert!(
+    session.pictures == reference,
+    "every picture, as the straight decode"
+  );
+}

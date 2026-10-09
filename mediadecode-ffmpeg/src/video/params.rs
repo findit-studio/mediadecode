@@ -1111,12 +1111,13 @@ pub(super) trait H264Sets {
   /// FFmpeg stores `sps` under `id`, read off `unit` the `reading`-th of the
   /// three ways it reads one: 1, the unit; 2, its raw bytes after its
   /// header; 3, the unit, truncation let stand (h264_parse.c:383-397,
-  /// h264dec.c:699-715).
-  fn store_sps(&mut self, id: usize, sps: Sps, unit: &Unit<'_>, reading: u8);
+  /// h264dec.c:699-715). `memory` is the unit as handed over
+  /// ([`Walk::memory`]).
+  fn store_sps(&mut self, id: usize, sps: Sps, unit: &Unit<'_>, memory: &[u8], reading: u8);
   /// FFmpeg stores the picture parameter set `unit` under `id`, read against
   /// the sequence parameter set held under `sps`; `past_end` where its
   /// reading ran past its payload.
-  fn store_pps(&mut self, id: usize, sps: usize, unit: &Unit<'_>, past_end: bool);
+  fn store_pps(&mut self, id: usize, sps: usize, unit: &Unit<'_>, memory: &[u8], past_end: bool);
 }
 
 impl H264Sets for [Option<Sps>; 32] {
@@ -1124,11 +1125,35 @@ impl H264Sets for [Option<Sps>; 32] {
     self.get(id).copied().flatten()
   }
 
-  fn store_sps(&mut self, id: usize, sps: Sps, _: &Unit<'_>, _: u8) {
+  fn store_sps(&mut self, id: usize, sps: Sps, _: &Unit<'_>, _: &[u8], _: u8) {
     self[id] = Some(sps);
   }
 
-  fn store_pps(&mut self, _: usize, _: usize, _: &Unit<'_>, _: bool) {}
+  fn store_pps(&mut self, _: usize, _: usize, _: &Unit<'_>, _: &[u8], _: bool) {}
+}
+
+/// **What FFmpeg's H.264 decoder keeps of a parameter set it stores, and
+/// compares** — `data` (`ff_h264_decode_seq_parameter_set`,
+/// h264_ps.c:296-305; `ff_h264_decode_picture_parameter_set`, 716-727): the
+/// bytes its reader starts at, through the last its payload bits reach, the
+/// stop bit put back where it filled a byte of its own. For the first and
+/// third readings of a sequence parameter set and for a picture parameter
+/// set, the unit as handed over (`memory`) from its header, to its payload's
+/// end (`nal->size_bits`): its trailing zeros, which the splitter drops, not
+/// among them. For the second, the unit's raw bytes after its header, all of
+/// them, the stop bit put back after them. FFmpeg keeps 4096 bytes; every
+/// byte is kept here, so two sets alike here are alike there.
+pub(super) fn h264_identity(unit: &Unit<'_>, memory: &[u8], reading: u8) -> Vec<u8> {
+  let mut data = if reading == 2 {
+    unit.raw().get(1..).unwrap_or_default().to_vec()
+  } else {
+    let size = usize::try_from(unit.size_bits.div_ceil(8)).unwrap_or(usize::MAX);
+    memory.get(..size).unwrap_or(memory).to_vec()
+  };
+  if reading == 2 || unit.size_bits.is_multiple_of(8) {
+    data.push(0x80);
+  }
+  data
 }
 
 /// A parameter set FFmpeg did not store, and why.
@@ -1176,12 +1201,12 @@ fn h264_sets<S: H264Sets>(
         let Some((id, sps, reading)) = h264_sps_readings(&unit, memory, mem) else {
           return Err(Unstored::Failed(crate::ParameterSet::Sequence));
         };
-        sets.store_sps(id, sps, &unit, reading);
+        sets.store_sps(id, sps, &unit, memory, reading);
       }
       8 => {
         let memory = units.memory(&unit, &mut scratch);
         match h264_pps(&mut unit.reader(memory), unit.size_bits, sets) {
-          Pps::Stored { id, sps, past_end } => sets.store_pps(id, sps, &unit, past_end),
+          Pps::Stored { id, sps, past_end } => sets.store_pps(id, sps, &unit, memory, past_end),
           Pps::Failed => return Err(Unstored::Failed(crate::ParameterSet::Picture)),
           Pps::Unresolved => return Err(Unstored::Unresolved),
         }
@@ -1474,7 +1499,7 @@ pub(super) fn h264_packet<S: H264Sets>(
       7 => {
         let memory = units.memory(&unit, &mut scratch);
         if let Some((id, sps, reading)) = h264_sps_readings(&unit, memory, data) {
-          sets.store_sps(id, sps, &unit, reading);
+          sets.store_sps(id, sps, &unit, memory, reading);
         }
       }
       8 => {
@@ -1482,7 +1507,7 @@ pub(super) fn h264_packet<S: H264Sets>(
         if let Pps::Stored { id, sps, past_end } =
           h264_pps(&mut unit.reader(memory), unit.size_bits, sets)
         {
-          sets.store_pps(id, sps, &unit, past_end);
+          sets.store_pps(id, sps, &unit, memory, past_end);
         }
       }
       _ => {}

@@ -303,20 +303,39 @@ impl Held {
 //  H.264
 // ---------------------------------------------------------------------------
 
-/// A sequence parameter set an H.264 decoder stored: the unit it read and
-/// how — together what FFmpeg compares to keep an identical set in place
-/// (the whole `SPS`, h264_ps.c:578-587) — and what it says.
-#[derive(Debug, PartialEq, Eq)]
+/// A sequence parameter set an H.264 decoder stored: the unit it read,
+/// which a record carries; what FFmpeg compares to keep an identical set in
+/// place; and what it says.
+///
+/// FFmpeg compares the whole parsed `SPS` (h264_ps.c:578-587): its fields
+/// and `data`, the bytes its reader starts at through those its payload bits
+/// reach ([`params::h264_identity`], h264_ps.c:296-305). A set's fields are
+/// what its reading makes of those bytes — the first two readings never read
+/// past them, or they fail the set — so two sets are alike in FFmpeg exactly
+/// where their bytes so taken and their reading are: `unit`, the raw bytes,
+/// is not compared. The same set before a four-byte start code rather than a
+/// three-byte one carries one zero more in its raw bytes, which the splitter
+/// drops from its payload (`get_bit_length`, h2645_parse.c:348-376), and is
+/// the same set.
+#[derive(Debug)]
 struct Sequence {
   /// The unit as the splitter took it (`nal->raw_data`).
   unit: Bytes,
-  /// Its payload bits (`nal->size_bits`).
-  size_bits: u64,
+  /// `data` as FFmpeg keeps it ([`params::h264_identity`]).
+  identity: Bytes,
   /// Which of FFmpeg's three readings stored it ([`params::H264Sets`]).
   reading: u8,
   /// What it says to a picture parameter set read after it.
   facts: params::Sps,
 }
+
+impl PartialEq for Sequence {
+  fn eq(&self, other: &Self) -> bool {
+    self.identity == other.identity && self.reading == other.reading && self.facts == other.facts
+  }
+}
+
+impl Eq for Sequence {}
 
 impl Sequence {
   /// Whether its reading ran past its payload: the third reading, which
@@ -338,6 +357,10 @@ struct SequenceHeld {
 struct PictureHeld {
   /// The unit as the splitter took it.
   unit: Arc<Bytes>,
+  /// `data` as FFmpeg keeps it ([`params::h264_identity`],
+  /// h264_ps.c:716-727): what tells it from another, whose raw bytes may
+  /// differ by a trailing zero.
+  identity: Arc<Bytes>,
   /// The id of the sequence parameter set it refers to.
   sps_id: u8,
   /// The sequence parameter set it was read under (`pps->sps`), which a
@@ -350,7 +373,7 @@ struct PictureHeld {
 
 impl PictureHeld {
   fn same(&self, other: &Self) -> bool {
-    self.unit == other.unit
+    self.identity == other.identity
       && self.sps_id == other.sps_id
       && *self.bound == *other.bound
       && self.past_end == other.past_end
@@ -803,10 +826,17 @@ impl H264Sets for H264Write<'_> {
     self.now().sps.get(id)?.as_ref().map(|sps| sps.set.facts)
   }
 
-  fn store_sps(&mut self, id: usize, facts: params::Sps, unit: &Unit<'_>, reading: u8) {
+  fn store_sps(
+    &mut self,
+    id: usize,
+    facts: params::Sps,
+    unit: &Unit<'_>,
+    memory: &[u8],
+    reading: u8,
+  ) {
     let set = Sequence {
       unit: Bytes::of(unit.raw()),
-      size_bits: unit.size_bits,
+      identity: Bytes::of(&params::h264_identity(unit, memory, reading)),
       reading,
       facts,
     };
@@ -829,13 +859,14 @@ impl H264Sets for H264Write<'_> {
     });
   }
 
-  fn store_pps(&mut self, id: usize, sps: usize, unit: &Unit<'_>, past_end: bool) {
+  fn store_pps(&mut self, id: usize, sps: usize, unit: &Unit<'_>, memory: &[u8], past_end: bool) {
     // `h264_pps` found it held.
     let Some(held) = self.now().sps[sps].clone() else {
       return;
     };
     let pps = PictureHeld {
       unit: Arc::new(Bytes::of(unit.raw())),
+      identity: Arc::new(Bytes::of(&params::h264_identity(unit, memory, 1))),
       sps_id: sps as u8,
       bound: held.set,
       past_end,
@@ -857,15 +888,24 @@ impl H264Sets for H264Write<'_> {
 //  HEVC
 // ---------------------------------------------------------------------------
 
-/// An HEVC parameter set a decoder stored: the unit it read, and the bytes
-/// FFmpeg compares to keep an identical set in place — the unit as handed
-/// over, to its last payload byte (`get_bits_bytesize`, hevc/ps.c:797-802,
-/// 1729-1733, 2219-2223).
-#[derive(Debug, PartialEq, Eq)]
+/// An HEVC parameter set a decoder stored: the unit it read, which a record
+/// carries, and the bytes FFmpeg compares to keep an identical set in place
+/// — the unit as handed over, to its last payload byte (`get_bits_bytesize`,
+/// hevc/ps.c:797-802, 1729-1733, 2219-2223), which alone tell one set from
+/// another: the raw bytes are not compared.
+#[derive(Debug)]
 struct HevcSet {
   unit: Bytes,
   identity: Bytes,
 }
+
+impl PartialEq for HevcSet {
+  fn eq(&self, other: &Self) -> bool {
+    self.identity == other.identity
+  }
+}
+
+impl Eq for HevcSet {}
 
 /// A video parameter set held.
 #[derive(Clone, Debug, PartialEq, Eq)]
