@@ -11778,3 +11778,84 @@ fn a_parameter_set_ffmpeg_stores_with_a_warning_is_held_and_recorded() {
     "every picture, as the straight decode"
   );
 }
+
+// ---------------------------------------------------------------------------
+//  R18 row 6: a keyframe's own video parameter sets, read against the sets held
+// ---------------------------------------------------------------------------
+
+/// LAW (R18 row 6; the author's own, found in R17): **a keyframe's own HEVC
+/// video parameter sets are read against the sets the decoder holds, as
+/// FFmpeg reads them, when the keyframe is judged clean or an anchor.** A
+/// keyframe carrying, ahead of its own units, a VPS 0 of two layers cut
+/// before `direct_dependency_flag` — alpha video where FFmpeg stores it —
+/// while the decoder holds a VPS 0: FFmpeg refuses the set read past its end
+/// (hevc/ps.c:944-949), and the keyframe is its own. The R6 `x265` CRA
+/// stream, its sets in band, the hardware failing post-commit at a CRA that
+/// carries one: the CRA anchors, and the end is clean. An `x265` stream whose
+/// sets are in its codec parameters, its IDR 16 carrying one: on a
+/// probe-era fallback at 10 on three threads the switch fires at 16, every
+/// picture the straight decode's. Read against a table holding nothing, the
+/// cut set read as alpha for its own keyframe: the CRA anchored nothing and
+/// the switch waited for the IDR 24.
+#[test]
+fn a_keyframe_s_own_video_parameter_set_is_read_against_the_sets_held() {
+  const AUXILIARY: u16 = 1 << (15 - 3);
+  let cut = hevc_vps_cut(0, 1, Some(AUXILIARY), 1, VpsCut::BeforeDirectDependency);
+  let ahead = |packet: &Packet| {
+    repacked(
+      packet,
+      &[&[0, 0, 0, 1][..], &cut, packet.data().expect("a payload")].concat(),
+    )
+  };
+
+  // The anchor.
+  let clip = encode_hevc_cra_with_headers(128, 96, 40);
+  let at = keyframe_after(&clip, 3);
+  let mut packets = clip.packets.clone();
+  packets[at] = ahead(&clip.packets[at]);
+  let with = SyntheticClip {
+    parameters: clip.parameters.clone(),
+    packets,
+  };
+  let mut anchored = None;
+  let session = session_of(behind_a_failure_at(&with, at), &with, |index, dec| {
+    if index == at + 1 {
+      anchored = Some(dec.degraded_anchored_for_test());
+    }
+  });
+  assert_eq!(anchored, Some(true), "the CRA anchors");
+  assert!(
+    session.errors.is_empty(),
+    "no error, the end clean: {:?}",
+    session.errors
+  );
+
+  // The clean point.
+  let params = "keyint=8:min-keyint=8:scenecut=0:bframes=0:open-gop=0:log-level=error";
+  let clip = encode_hevc_global(128, 96, 32, params);
+  let mut packets = clip.packets.clone();
+  packets[16] = ahead(&clip.packets[16]);
+  let with = SyntheticClip {
+    parameters: clip.parameters.clone(),
+    packets,
+  };
+  assert!(with.packets[16].is_key(), "16 is an IDR");
+  let reference = straight(&with);
+  assert_eq!(reference.len(), 32, "the straight decode is whole");
+  let three = core::num::NonZeroU32::new(3).expect("nonzero");
+  let session = session_of(
+    behind_a_probe(&with, 10, crate::Threads::Count(three)),
+    &with,
+    |_, _| {},
+  );
+  assert_eq!(
+    (session.threads[15], session.threads[16]),
+    (Some(core::num::NonZeroU32::MIN), Some(three)),
+    "the switch at 16"
+  );
+  assert!(session.errors.is_empty(), "no error: {:?}", session.errors);
+  assert!(
+    session.pictures == reference,
+    "every picture, as the straight decode"
+  );
+}

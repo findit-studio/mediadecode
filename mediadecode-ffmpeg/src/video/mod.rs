@@ -2393,10 +2393,25 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   fn anchor(&self, pkt: &Packet) -> Option<access::Anchor> {
     let rule = self.rule_for(pkt)?;
     if pkt.is_key() || rule.every_packet() {
-      pkt.data().and_then(|data| rule.anchor(data))
+      pkt
+        .data()
+        .and_then(|data| rule.anchor_given(data, self.packet_alpha(pkt)))
     } else {
       None
     }
+  }
+
+  /// Whether `pkt`, an HEVC packet, carries a video parameter set FFmpeg
+  /// stores as alpha video — its record, then its units — read against the
+  /// sets the decoder holds as it reads the packet
+  /// ([`held::Held::after_packet_reading_alpha`]): the keyframe rule's reading
+  /// of the packet's own sets (`access::KeyframeRule::is_clean_given`).
+  fn packet_alpha(&self, pkt: &Packet) -> bool {
+    self.codec_id() == crate::CodecId::HEVC.raw()
+      && self
+        .held
+        .after_packet_reading_alpha(new_extradata(pkt), pkt.data())
+        .1
   }
 
   /// Whether `pkt` is a point to switch the software decoder at: a keyframe
@@ -2874,9 +2889,11 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// FFmpeg raises only when it meets reordering — which an open GOP can
   /// introduce at this very keyframe.
   fn clean_keyframe(&self, pkt: &Packet) -> bool {
-    pkt
-      .data()
-      .is_some_and(|data| self.rule_for(pkt).is_some_and(|rule| rule.is_clean(data)))
+    pkt.data().is_some_and(|data| {
+      self
+        .rule_for(pkt)
+        .is_some_and(|rule| rule.is_clean_given(data, self.packet_alpha(pkt)))
+    })
   }
 
   /// **A fallback that outlives a minute on one thread says so, once.** A

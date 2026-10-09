@@ -156,7 +156,22 @@ impl KeyframeRule {
   /// so the memory a packet costs here does not grow with how many units it
   /// packs: a hostile keyframe of one-byte units costs a walk, not a slice
   /// entry per unit.
+  ///
+  /// A packet's own HEVC video parameter sets are read here against a table
+  /// that holds nothing; a session reads them against the sets the decoder
+  /// holds ([`Self::is_clean_given`]).
+  #[cfg(test)]
   pub(crate) fn is_clean(self, data: &[u8]) -> bool {
+    self.is_clean_given(data, self.units_alpha_from_nothing(data))
+  }
+
+  /// [`Self::is_clean`], `units_alpha` saying whether the packet's own units
+  /// carry an HEVC video parameter set FFmpeg stores as alpha video — read
+  /// against the sets the decoder holds as it reads the packet, which decide
+  /// whether FFmpeg stores a set at all (an identical set changes nothing, a
+  /// set read past its end is refused under an id held, hevc/ps.c:797-802,
+  /// 944-949).
+  pub(crate) fn is_clean_given(self, data: &[u8], units_alpha: bool) -> bool {
     match self {
       Self::H264 { nal_length, aso } => {
         !aso
@@ -166,7 +181,7 @@ impl KeyframeRule {
       }
       Self::Hevc { nal_length, alpha } => {
         !alpha
-          && !hevc_units_declare_auxiliary(data, nal_length, &mut Default::default())
+          && !units_alpha
           && first_hevc_picture(data, nal_length).is_some_and(|(kind, unit)| {
             (16..=20).contains(&kind) && hevc_segment_starts_picture(unit)
           })
@@ -174,6 +189,19 @@ impl KeyframeRule {
       Self::Mpeg12 => closed_gop(data),
       Self::Resets | Self::IntraOnly => true,
       Self::Reordering => false,
+    }
+  }
+
+  /// Whether the HEVC packet `data` carries a video parameter set FFmpeg
+  /// stores as alpha video, read against a table holding nothing; `false`
+  /// under any other rule.
+  #[cfg(test)]
+  fn units_alpha_from_nothing(self, data: &[u8]) -> bool {
+    match self {
+      Self::Hevc { nal_length, .. } => {
+        hevc_units_declare_auxiliary(data, nal_length, &mut Default::default())
+      }
+      _ => false,
     }
   }
 
@@ -292,9 +320,15 @@ impl KeyframeRule {
   /// Every NAL unit is read whole, as for [`Self::is_clean`], and every SEI
   /// message before the first picture walked by its size over the raw byte
   /// sequence payload; bytes that do not parse anchor nothing.
+  #[cfg(test)]
   pub(crate) fn anchor(self, data: &[u8]) -> Option<Anchor> {
+    self.anchor_given(data, self.units_alpha_from_nothing(data))
+  }
+
+  /// [`Self::anchor`], `units_alpha` read as for [`Self::is_clean_given`].
+  pub(crate) fn anchor_given(self, data: &[u8], units_alpha: bool) -> Option<Anchor> {
     let anchor = |recovery| Anchor {
-      definitive: self.is_clean(data),
+      definitive: self.is_clean_given(data, units_alpha),
       recovery,
     };
     match self {
@@ -313,7 +347,7 @@ impl KeyframeRule {
         }
       }
       Self::Hevc { nal_length, alpha } => (!alpha
-        && !hevc_units_declare_auxiliary(data, nal_length, &mut Default::default())
+        && !units_alpha
         && first_hevc_picture(data, nal_length).is_some_and(|(kind, unit)| {
           (16..=23).contains(&kind) && hevc_segment_starts_picture(unit)
         }))
@@ -610,6 +644,7 @@ fn hevc_segment_starts_picture(unit: &[u8]) -> bool {
 /// says it holds ([`super::params::VpsTable::read_packet`]: the units found as
 /// FFmpeg's splitter cuts them, each set read by FFmpeg 9's own reading,
 /// past its unit's end too).
+#[cfg(test)]
 fn hevc_units_declare_auxiliary(
   data: &[u8],
   nal_length: Option<usize>,

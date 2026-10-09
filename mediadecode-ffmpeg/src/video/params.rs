@@ -1671,6 +1671,7 @@ impl VpsTable {
   /// packet; a set refused for invalid data passed over, one refused for
   /// another reason ending the packet's reading. Answers whether a set
   /// stored is alpha video, this table updated.
+  #[cfg(test)]
   pub(super) fn read_packet(&mut self, data: &[u8], nal_length: Option<usize>) -> bool {
     self.read_units(data, data.len(), nal_length, false)
   }
