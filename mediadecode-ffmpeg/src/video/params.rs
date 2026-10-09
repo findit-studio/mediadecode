@@ -1354,10 +1354,12 @@ fn h264_entries<S: H264Sets>(
 ///   426-463): the decoder keeps the set it had of that id. An entry too
 ///   large for the escaping retry rejects the record (h264_parse.c:436-437).
 /// - **A picture parameter set referring to a sequence parameter set the
-///   record does not carry** stands or falls on what the decoder holds
-///   already, which this crate does not read.
+///   record does not carry** is read against the sets the decoder holds
+///   already (`h264_ps.c:731-738`): here, none — the session reads it against
+///   what it holds ([`super::held::Held::h264_verdict`]).
 ///
 /// Any of them leaves the decoder on parameters other than the record's.
+#[cfg(test)]
 pub(crate) fn h264_record(record: &[u8]) -> Result<(), crate::ExtradataRejection> {
   h264_extradata(record, &mut [None; 32]).verdict
 }

@@ -2139,6 +2139,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       pkt,
       &self.parameters,
       self.limits.max_codec_parameter_bytes(),
+      Some(&self.held),
     )
     .map_err(VideoDecodeError::Decode)?;
     if self.restart.is_none()
@@ -2527,7 +2528,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       None => params::avcc_body(data),
     };
     if record {
-      params::h264_record(data).map_err(|reason| {
+      self.held.h264_verdict(data).map_err(|reason| {
         Error::ExtradataRejected(crate::ExtradataRejected::new(crate::CodecId::H264, reason))
       })?;
     }
@@ -3029,6 +3030,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
         pkt,
         &self.parameters,
         self.limits.max_codec_parameter_bytes(),
+        Some(&self.held),
       )?,
       PostCommitInput::FrameTime | PostCommitInput::Eof => None,
     };
@@ -3796,6 +3798,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
           av_pkt,
           &self.parameters,
           self.limits.max_codec_parameter_bytes(),
+          Some(&self.held),
         )
         .map_err(VideoDecodeError::Decode)?
       } else {
@@ -4668,7 +4671,9 @@ fn replay_history(
       return Ok(Drained::Full);
     }
     // Copied before the decoder sees the packet; kept once it takes it.
-    let extradata = NewExtradata::of(pkt, parameters, limits.max_codec_parameter_bytes())?;
+    // Judged against what the decoder held when the hardware took it, as the
+    // replay's decoder holds it again: it is not judged twice.
+    let extradata = NewExtradata::of(pkt, parameters, limits.max_codec_parameter_bytes(), None)?;
     let mut attempts: u32 = 0;
     loop {
       match sw.submit(pkt, refusals) {
@@ -5357,20 +5362,26 @@ impl NewExtradata {
   /// switch's, a post-commit fallback's, after the decoder serving is closed;
   /// and by name ([`Error::ExtradataRejected`]) where the stream is H.264 and
   /// FFmpeg's decoder would not apply the record whole
-  /// ([`params::h264_record`]) — it drops what its own reading answers, so
-  /// the session, and every decoder it opens later, would otherwise stand on
-  /// a record the decoder serving never adopted.
+  /// ([`held::Held::h264_verdict`]) — it drops what its own reading answers,
+  /// so the session, and every decoder it opens later, would otherwise stand
+  /// on a record the decoder serving never adopted. The verdict is read
+  /// against `held`, what the decoder holds as it applies the record; a
+  /// replay's packet, judged as the hardware took it, passes `None` and is
+  /// not judged again.
   fn of(
     pkt: &Packet,
     parameters: &Parameters,
     max_parameter_bytes: usize,
+    held: Option<&held::Held>,
   ) -> Result<Option<Self>, Error> {
     let Some(extradata) = new_extradata(pkt) else {
       return Ok(None);
     };
     fits(extradata, parameters, max_parameter_bytes)?;
-    if codec_id_of(parameters) == crate::CodecId::H264.raw() {
-      params::h264_record(extradata).map_err(|reason| {
+    if let Some(held) = held
+      && codec_id_of(parameters) == crate::CodecId::H264.raw()
+    {
+      held.h264_verdict(extradata).map_err(|reason| {
         Error::ExtradataRejected(crate::ExtradataRejected::new(crate::CodecId::H264, reason))
       })?;
     }

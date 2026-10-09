@@ -160,6 +160,35 @@ impl Held {
     }
   }
 
+  /// **FFmpeg's H.264 decoder's verdict on `record`**, applied now — as a
+  /// packet's new extradata, or as a body it reads as one
+  /// ([`params::h264_record`]): read against the sequence parameter sets the
+  /// decoder holds, which a picture parameter set the record carries may
+  /// refer to — FFmpeg parses it against `ps->sps_list` (h264_ps.c:731-738) —
+  /// a set held in doubt read as held by nothing.
+  pub(super) fn h264_verdict(&self, record: &[u8]) -> Result<(), crate::ExtradataRejection> {
+    let mut facts = [None; 32];
+    if let Self::H264(held) = self {
+      for (fact, sps) in facts.iter_mut().zip(held.sps.iter()) {
+        *fact = sps
+          .as_ref()
+          .filter(|sps| !sps.doubt)
+          .map(|sps| sps.set.facts);
+      }
+    }
+    params::h264_extradata(record, &mut facts).verdict
+  }
+
+  /// Whether this holds a picture parameter set under `id`, for certain.
+  #[cfg(test)]
+  pub(super) fn holds_pps(&self, id: usize) -> bool {
+    match self {
+      Self::H264(held) => held.pps[id].as_ref().is_some_and(|pps| !pps.doubt),
+      Self::Hevc(held) => held.pps[id].as_ref().is_some_and(|pps| !pps.doubt),
+      Self::Other => false,
+    }
+  }
+
   /// **How FFmpeg's H.264 decoder reads the packet** `data` carrying
   /// `record` as `AV_PKT_DATA_NEW_EXTRADATA`, under the framing it holds once
   /// it applied the record: as an `avcC` record it applies, decoding no

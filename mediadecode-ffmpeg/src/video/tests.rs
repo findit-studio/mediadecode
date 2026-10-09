@@ -10670,3 +10670,113 @@ fn under_four_byte_lengths_a_packet_is_framed_as_ffmpeg_reguesses_it() {
     "four-byte fields read with two under a two-byte record"
   );
 }
+
+// ---------------------------------------------------------------------------
+//  R17 row 6: a record's picture parameter set is read against the sets held
+// ---------------------------------------------------------------------------
+
+/// An H.264 picture parameter set unit of id `pps_id` referring to the
+/// sequence parameter set `sps_id`: CAVLC, one slice group, one reference
+/// each way, no weighting, QP 26, the deblocking filter's control present,
+/// nothing past `redundant_pic_cnt_present_flag`.
+fn h264_pps_unit(pps_id: u32, sps_id: u32) -> Vec<u8> {
+  let ue = |value: u32| -> String {
+    let coded = value + 1;
+    let width = 32 - coded.leading_zeros();
+    format!("{}{coded:b}", "0".repeat(width as usize - 1))
+  };
+  let mut bits = ue(pps_id) + &ue(sps_id);
+  bits += "00"; // entropy_coding_mode_flag, bottom_field_pic_order_in_frame_present_flag
+  bits += &ue(0); // num_slice_groups_minus1
+  bits += &ue(0); // num_ref_idx_l0_default_active_minus1
+  bits += &ue(0); // num_ref_idx_l1_default_active_minus1
+  bits += "000"; // weighted_pred_flag, weighted_bipred_idc
+  bits += "111"; // pic_init_qp_minus26, pic_init_qs_minus26, chroma_qp_index_offset: se(0)
+  bits += "100"; // deblocking control, constrained intra, redundant_pic_cnt
+  bits += "1"; // rbsp_stop_one_bit
+  while bits.len() % 8 != 0 {
+    bits.push('0');
+  }
+  let mut unit = vec![0x68];
+  for chunk in bits.as_bytes().chunks(8) {
+    let byte = u8::from_str_radix(core::str::from_utf8(chunk).expect("ascii"), 2).expect("bits");
+    // Emulation prevention, as a NAL unit carries it.
+    if unit.len() >= 2 && unit[unit.len() - 2..] == [0, 0] && byte <= 3 {
+      unit.push(3);
+    }
+    unit.push(byte);
+  }
+  unit
+}
+
+/// LAW (R17 row 6; Codex R16 [medium]): **a new extradata's picture parameter
+/// set is read against the sequence parameter sets the decoder holds.**
+/// FFmpeg parses a record's PPS against its own `ps->sps_list`
+/// (`ff_h264_decode_picture_parameter_set`, h264_ps.c:731-738), which keeps
+/// every SPS it stored. A four-byte `avcC` stream (its record SPS and PPS 0);
+/// its packet 5 carrying, as `AV_PKT_DATA_NEW_EXTRADATA`, an `avcC` record of
+/// one PPS — id 1, referring to the held SPS 0 — is taken, on the software
+/// road and on the hardware, and the decoder holds PPS 1; its packet 6
+/// carrying one of PPS 2 referring to SPS 5, held by nothing, is refused by
+/// name, `Unresolved`, before any decoder sees it. Read against an empty
+/// table, the first was refused too.
+#[test]
+fn a_record_s_picture_parameter_set_is_read_against_the_sets_the_decoder_holds() {
+  let (clip, sps, _) = encode_h264_avcc(128, 96, 16);
+  let pps_only = |pps: &[u8]| {
+    let mut record = vec![1, sps[1], sps[2], sps[3], 0xff, 0xe0, 1];
+    record.extend_from_slice(&u16::try_from(pps.len()).expect("a short PPS").to_be_bytes());
+    record.extend_from_slice(pps);
+    record
+  };
+  let (held, nobody) = (
+    pps_only(&h264_pps_unit(1, 0)),
+    pps_only(&h264_pps_unit(2, 5)),
+  );
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  for road in ["software", "hardware"] {
+    let mut dec = if road == "software" {
+      FfmpegVideoStreamDecoder::open_as(
+        clip.parameters.clone(),
+        tb,
+        DecoderLimits::default().with_threads(crate::Threads::Single),
+        DecodePath::Software,
+      )
+      .expect("the software road opens")
+    } else {
+      FfmpegVideoStreamDecoder::from_hw_inner_for_test(
+        Box::new(FakeHw::never_failing(128, 96)),
+        clip.parameters.clone(),
+        tb,
+      )
+      .expect("build test decoder")
+    };
+    let mut dst = crate::empty_owned_video_frame();
+    for av_pkt in &clip.packets[..5] {
+      sent_through(&mut dec, &mut dst, av_pkt);
+      drained(&mut dec, &mut dst);
+    }
+    match dec.send_packet(&pushed(&with_new_extradata(clip.packets[5].clone(), &held))) {
+      Ok(Sent::Accepted) => {}
+      other => panic!("{road}: a PPS referring to the held SPS is taken: {other:?}"),
+    }
+    drained(&mut dec, &mut dst);
+    assert!(dec.held.holds_pps(1), "{road}: and applied");
+    match dec.send_packet(&pushed(&with_new_extradata(
+      clip.packets[6].clone(),
+      &nobody,
+    ))) {
+      Err(VideoDecodeError::Decode(Error::ExtradataRejected(rejected))) => assert_eq!(
+        rejected.reason(),
+        crate::ExtradataRejection::Unresolved,
+        "{road}: the reason"
+      ),
+      other => panic!("{road}: a PPS referring to an SPS held by nothing is refused: {other:?}"),
+    }
+    assert!(!dec.held.holds_pps(2), "{road}: nothing of it applied");
+    for av_pkt in &clip.packets[6..] {
+      sent_through(&mut dec, &mut dst, av_pkt);
+      drained(&mut dec, &mut dst);
+    }
+  }
+}

@@ -323,10 +323,10 @@ impl core::fmt::Display for Unrecordable {
 /// again without the record, or to drop.
 ///
 /// The record is read as FFmpeg 9 reads it, its bit reader and parameter
-/// set parsers mirrored; a record whose verdict depends on what the decoder
-/// holds already — a picture parameter set referring to a sequence
-/// parameter set the record does not carry — is refused too, since this
-/// crate does not read that.
+/// set parsers mirrored, against the sequence parameter sets the decoder
+/// holds already — a picture parameter set the record carries may refer to
+/// one of them — as the session keeps them; a set it holds in doubt reads as
+/// held by nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error(
   "a packet's new extradata for {codec:?} was refused before any decoder saw it: {reason}; the \
@@ -377,9 +377,9 @@ pub enum ExtradataRejection {
   /// A parameter set FFmpeg fails to parse that is too large for the
   /// escaping retry it gives an `avcC` entry: the record rejected there.
   Oversized(ParameterSet),
-  /// A picture parameter set referring to a sequence parameter set the
-  /// record does not carry: whether FFmpeg stores it depends on what the
-  /// decoder holds already.
+  /// A picture parameter set referring to a sequence parameter set neither
+  /// the record carries nor the decoder holds — or holds for certain:
+  /// FFmpeg fails it, and the rest of the record applies.
   Unresolved,
 }
 
@@ -397,7 +397,8 @@ impl core::fmt::Display for ExtradataRejection {
         "a {set} FFmpeg fails to parse, too large for its escaping retry"
       ),
       Self::Unresolved => f.write_str(
-        "a picture parameter set referring to a sequence parameter set the record does not carry",
+        "a picture parameter set referring to a sequence parameter set neither the record nor \
+         the decoder holds",
       ),
     }
   }
