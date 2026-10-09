@@ -167,27 +167,51 @@ export holds both:
   rescaled, and the double is the count itself: a range the export writes
   in one ruler ends inclusively where it exactly does.
 
-Where OpenTimelineIO would round a value, the export searches the rulers
-the clips the value is formed from may be written in. A clip's rulers are
-its own; every ruler the timeline's operands are counted in — the edit
-rate, at which the global start, the gaps and the transitions are written,
-the rate 1 OpenTimelineIO sums a track's duration from, and every clip's
-planned ruler — that holds its source range exactly, finer or coarser than
-its own, all of them; and the coarsest whole numbers of ticks a second
-below its own that hold the range, at most 64. So where OpenTimelineIO
-would rescale a clip into the edit rate or into a neighbour's ruler, the
-search can write the clip in that ruler itself. It moves one clip to its
-next ruler at a time — of the clips the refused value is formed from, the
-one with the finest ruler; a clip's rulers run from its own through the
-others, finest first, to its coarsest, its own again last where every
-other is finer — and walks again, so clips can meet on a ruler they
-share, or one move while its neighbour keeps its own. A clip never moves
-back, so for `n` clips and `d` distinct operand rulers the search ends
-within `1 + n · (d + 63)` walks, the all-coarsest plan last. What no plan
-it tries holds is refused, `Refused::NotRepresentable`, naming where
-(`otio::Spot`; a child of an exported track is an `otio::ChildAt`), the
-count the last plan could not hold and the ruler it is counted in — never
-written to be read rounded.
+**Exact, or refused.** The export's guarantee is soundness: what it writes,
+OpenTimelineIO reads back exactly, and a timeline it cannot so write is
+refused by name. Where OpenTimelineIO would round a value, the export
+writes the clips the value is formed from in other rulers that hold their
+source ranges exactly and walks the timeline again — a search, bounded by
+contract. A clip's rulers, in the order the search tries them:
+
+1. its own: frames of its medium's stated rate, ticks of its source's
+   timebase, or the coarsest whole rate that holds the range;
+2. every ruler the timeline's operands are counted in that holds the range
+   — the edit rate, at which the global start, the gaps and the transitions
+   are written, the rate 1 OpenTimelineIO sums a track's duration from, and
+   every clip's planned ruler — finer or coarser than its own, all of them,
+   finest first;
+3. the 64 finest whole numbers of ticks a second below its own that hold
+   the range and that no operand is counted in, finest first;
+4. the 64 coarsest of those, finest first, less any already listed;
+5. its own again, where every other is finer.
+
+So where OpenTimelineIO would rescale a clip into the edit rate or into a
+neighbour's ruler, the search can write the clip in that ruler itself. It
+moves one clip to the next ruler of its list at a time — of the clips the
+refused value is formed from, the one with the finest ruler — and walks
+again, so clips can meet on a ruler they share, or one move while its
+neighbour keeps its own. A clip never moves back, so for `n` clips and `d`
+distinct operand rulers the search ends within `1 + n · (d + 127)` walks.
+
+What no plan the search walks holds is refused,
+`Refused::NotRepresentable`, naming where (`otio::Spot`; a child of an
+exported track is an `otio::ChildAt`), the count the last plan could not
+hold and the ruler it is counted in — and, for a count OpenTimelineIO
+derives, what the search tried: `otio::RulerSearch`, its bands
+(`otio::RulerBand`) and its walks. So a refusal says the search was
+bounded. A timeline that only a ruler outside the bands, or a plan of
+rulers the moves do not reach, would hold is refused by this contract,
+never written to be read rounded: a complete search would try every
+holding ruler of every clip together, a product space with no closed form
+for OpenTimelineIO's double rounding. Where the bound has been met, counts
+lie near 2^53 ticks of a clip's ruler — at the rates media run at,
+positions thousands of years in: 2^53 ticks are some 1 500 years even at
+192 kHz. The rounding a real timeline meets is a rate or a rescale no `f64`
+holds exactly — NTSC's 30000/1001, or frames of one rate counted in
+another — and the half-tick hold settles it: written where
+OpenTimelineIO's double lands within half a tick of the exact count,
+refused by name where it does not.
 
 OpenTimelineIO has no word for a clip's id, its gain or a reel: all three
 ride in `metadata` — the id so a reader can tell each clip again — and an

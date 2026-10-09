@@ -74,17 +74,22 @@ The crate's first release, as 0.1.0.
   `end_time_inclusive`, branch for branch — is computed in OpenTimelineIO's
   own arithmetic beside its exact value, and held within ±2^53 in the ruler
   OpenTimelineIO carries it in, its double less than half a tick from the
-  exact count. Where a derived value would round, a bounded search writes
-  the clips it is formed from in other rulers that hold their source ranges
-  — every ruler the timeline's operands are counted in (the edit rate, every
-  clip's planned ruler), never capped, and at most 64 of the coarsest whole
-  rates below a clip's own — one clip one ruler at a time, the finest first,
-  the all-coarsest plan last. Every range ends where it is
-  stored, and the exported items, laid end to end, put every clip on its
-  record. Refuses with `otio::Refused`: `Validation` with `validate`'s
-  refusals, or `NotRepresentable` — an `otio::Spot` (`otio::ChildAt` for a
-  child of an exported track), the count and the rate it is counted at —
-  where no plan the search tries holds a count, naming the last plan's.
+  exact count. Exact, or refused: where a derived value would round, a
+  search bounded by contract writes the clips it is formed from in other
+  rulers that hold their source ranges — a clip's own, then every ruler the
+  timeline's operands are counted in (the edit rate, 1, every clip's
+  planned ruler), never capped, then the 64 finest and the 64 coarsest
+  whole rates below its own — one clip one ruler at a time, the finest
+  first, within `1 + n · (d + 127)` walks for `n` clips and `d` operand
+  rulers. Every range ends where it is stored, and the exported items, laid
+  end to end, put every clip on its record. Refuses with `otio::Refused`:
+  `Validation` with `validate`'s refusals, or `NotRepresentable` — an
+  `otio::Spot` (`otio::ChildAt` for a child of an exported track), the
+  count and the rate it is counted at, and for a count OpenTimelineIO
+  derives what the search tried, `otio::RulerSearch`: its bands
+  (`otio::RulerBand`) and its walks — where no plan the search tries holds
+  a count, naming the last plan's. A timeline only a ruler outside the
+  bands would hold is refused by that contract, not misread.
 
 - **`otio::validate_json`**: the structural self-check — a strict JSON
   reader and OpenTimelineIO's schema shape, requiring exactly the keys each
