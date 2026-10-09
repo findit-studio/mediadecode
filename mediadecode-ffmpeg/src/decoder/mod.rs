@@ -16,7 +16,8 @@ use ffmpeg_next::{
   ffi::{
     AVBufferRef, AVCodec, AVFrame, AVHWFramesContext, AVMediaType, av_buffer_ref, av_buffer_unref,
     av_frame_move_ref, av_frame_unref, av_hwdevice_ctx_create, av_hwframe_transfer_data,
-    av_packet_ref, avcodec_alloc_context3, avcodec_free_context, avcodec_parameters_to_context,
+    av_packet_make_writable, av_packet_ref, avcodec_alloc_context3, avcodec_free_context,
+    avcodec_parameters_to_context,
   },
   frame,
 };
@@ -271,10 +272,10 @@ struct DecoderState {
 const MAX_PROBE_PACKETS: usize = 256;
 
 /// Maximum total compressed-byte size of buffered probe packets. Each
-/// `Packet` clone holds a refcounted reference to the demuxer's bitstream
-/// data — even though the clone itself is shallow, the underlying buffers
-/// stay alive until we drop them. 64 MiB is generous for normal video and
-/// gives untrusted media a hard ceiling.
+/// buffered packet holds its own copy of the payload (see
+/// [`try_clone_packet`]), so this bounds bytes the probe itself holds.
+/// 64 MiB is generous for normal video and gives untrusted media a hard
+/// ceiling.
 const MAX_PROBE_PACKET_BYTES: usize = 64 * 1024 * 1024;
 
 /// Hard cap on the number of side-data entries we tolerate per buffered
@@ -447,6 +448,17 @@ enum HwRoute {
   Advance(Error),
 }
 
+/// How [`VideoDecoder::advance_probe_with`] builds a candidate: the
+/// signature of [`VideoDecoder::build_state`], which every production
+/// road passes.
+type BuildCandidate = fn(
+  codec::Parameters,
+  Codec,
+  Backend,
+  crate::limits::DecoderLimits,
+  Option<mediadecode::Timebase>,
+) -> Result<DecoderState>;
+
 /// State carried only during the probe window (before the first successful
 /// frame). Holds enough information to tear down the current decoder and
 /// retry with the next backend.
@@ -543,7 +555,7 @@ impl VideoDecoder {
   /// In both cases, `attempts` carries the per-backend error log. When
   /// the runtime path fires, `unconsumed_packets` also contains the
   /// packets the decoder consumed from the caller before the probe
-  /// exhausted (refcounted shallow clones); for non-seekable inputs
+  /// exhausted (the probe's own copies of them); for non-seekable inputs
   /// (live streams, pipes) the caller can replay these directly into
   /// a software decoder of their choice without re-demuxing. From the
   /// open-time path the vec is empty since no packets have been sent.
@@ -839,18 +851,6 @@ impl VideoDecoder {
     auditioning: bool,
   ) -> Result<Self> {
     let codec = find_decoder(&parameters)?;
-    let (ctx, callback_state) = build_codec_context(&parameters, limits, None)?;
-    let opened = ctx.decoder().open_as(codec).map_err(Error::Ffmpeg)?;
-    ensure_video_codec_type(&opened)?;
-    let state = DecoderState {
-      inner: ManuallyDrop::new(ffmpeg_next::decoder::Video(opened)),
-      backend: backend::probe_order()
-        .first()
-        .copied()
-        .unwrap_or(Backend::VideoToolbox),
-      hw_device_ref: ptr::null_mut(),
-      callback_state: Box::into_raw(callback_state),
-    };
     let probe = auditioning.then(|| ProbeState {
       parameters: try_clone_parameters(&parameters, limits.max_codec_parameter_bytes())
         .expect("a clonable parameter set"),
@@ -860,6 +860,11 @@ impl VideoDecoder {
       buffered_bytes: 0,
       attempts: Vec::new(),
     });
+    let backend = backend::probe_order()
+      .first()
+      .copied()
+      .unwrap_or(Backend::VideoToolbox);
+    let state = Self::software_state_for_test(parameters, codec, backend, limits, None)?;
     Ok(Self {
       state,
       hw_frame: alloc_av_frame().map_err(Error::Ffmpeg)?,
@@ -870,6 +875,30 @@ impl VideoDecoder {
       pkt_timebase: None,
       eof_sent: false,
       scaled_output: crate::vtscale::ScaledOutput::new(),
+    })
+  }
+
+  /// A [`BuildCandidate`] that opens the decoder in software: the state
+  /// [`Self::from_software_for_test`] stands on, labelled `backend`.
+  ///
+  /// Passed to [`Self::advance_probe_with`], it is a candidate the probe
+  /// can build, replay into and commit on any machine.
+  #[cfg(test)]
+  fn software_state_for_test(
+    parameters: codec::Parameters,
+    codec: Codec,
+    backend: Backend,
+    limits: crate::limits::DecoderLimits,
+    pkt_timebase: Option<mediadecode::Timebase>,
+  ) -> Result<DecoderState> {
+    let (ctx, callback_state) = build_codec_context(&parameters, limits, pkt_timebase)?;
+    let opened = ctx.decoder().open_as(codec).map_err(Error::Ffmpeg)?;
+    ensure_video_codec_type(&opened)?;
+    Ok(DecoderState {
+      inner: ManuallyDrop::new(ffmpeg_next::decoder::Video(opened)),
+      backend,
+      hw_device_ref: ptr::null_mut(),
+      callback_state: Box::into_raw(callback_state),
     })
   }
 
@@ -1116,14 +1145,11 @@ impl VideoDecoder {
 
   /// Whether the probe rescue history is still being recorded.
   ///
-  /// While this is true, [`Self::send_packet`] `av_packet_ref`s every
-  /// accepted packet into `buffered_packets`, and a later
-  /// [`Error::AllBackendsFailed`] hands those recordings to the caller
-  /// as owned, mutable `Packet`s. A submission built to be dropped
-  /// inside one call therefore does **not** stay inside that call on
-  /// this road — which is what the view lane's send-side sharing
-  /// assumed. The window closes at commit, when the first frame
-  /// arrives and `probe` is taken.
+  /// While this is true, [`Self::send_packet`] copies every accepted
+  /// packet into `buffered_packets` (see [`try_clone_packet`]), and a
+  /// later [`Error::AllBackendsFailed`] hands those copies to the caller
+  /// as owned, mutable `Packet`s. The window closes at commit, when the
+  /// first frame arrives and `probe` is taken.
   #[inline]
   pub(crate) const fn is_probing(&self) -> bool {
     self.probe.is_some()
@@ -1169,7 +1195,8 @@ impl VideoDecoder {
   /// If we cannot prove this packet is buffer-able — its side-data
   /// entry count exceeds [`MAX_PROBE_PACKET_SIDE_DATA_ENTRIES`], its
   /// bytes would push the probe past [`MAX_PROBE_PACKETS`] or
-  /// [`MAX_PROBE_PACKET_BYTES`], or [`av_packet_ref`] fails ENOMEM —
+  /// [`MAX_PROBE_PACKET_BYTES`], or the probe's copy of it cannot be
+  /// made ([`av_packet_ref`] or `av_packet_make_writable` failing) —
   /// `send_packet` returns [`Error::AllBackendsFailed`] **without
   /// invoking** `state.inner.send_packet` on this packet. The caller's
   /// packet stays in their hand and `unconsumed_packets` carries the
@@ -1189,7 +1216,7 @@ impl VideoDecoder {
       let phase = self.phase();
       // Pre-flight while probe is active: prove we can record this
       // packet for replay BEFORE the active decoder consumes it.
-      // `staged_clone` carries the refcounted clone and the new
+      // `staged_clone` carries the probe's copy and the new
       // `buffered_bytes` value through the send below; we only commit
       // them to the probe state if FFmpeg accepts the packet.
       let staged_clone: Option<(Packet, usize)> = if let Some(probe) = self.probe.as_ref() {
@@ -1238,17 +1265,21 @@ impl VideoDecoder {
             probe.buffered_packets,
           )));
         }
-        // Step 3: pre-clone before consuming. `av_packet_ref` is a
-        // refcounted shallow clone (no payload deep-copy) but can still
-        // ENOMEM on heavy side-data; if it does we bail rather than
-        // consuming a packet we can't track.
+        // Step 3: copy before consuming. The history goes to the caller
+        // as owned, mutable `Packet`s, so it keeps a payload of its own:
+        // a reference to this one would carry the caller's later writes
+        // into the history, and `data_mut` on the two would alias. The
+        // copy is the size step 2 charged — payload and side data — so
+        // `new_bytes` stands. If it cannot be made we bail rather than
+        // consuming a packet we can't track; the packet stays the
+        // caller's, unsent.
         match try_clone_packet(packet) {
           Ok(c) => Some((c, new_bytes)),
           Err(e) => {
             let probe = self.probe.take().expect("probe present");
             tracing::warn!(
               error = %e,
-              "hwdecode: packet clone failed before consuming; \
+              "hwdecode: packet copy failed before consuming; \
                returning AllBackendsFailed without invoking decoder"
             );
             return Err(Error::AllBackendsFailed(AllBackendsFailed::new(
@@ -1705,6 +1736,16 @@ impl VideoDecoder {
   /// - `Err(_)` for other fatal conditions surfaced by probe machinery
   ///   itself (e.g. `alloc_av_frame` ENOMEM during replay drain).
   fn advance_probe(&mut self, last_error: Error) -> Result<()> {
+    self.advance_probe_with(last_error, Self::build_state)
+  }
+
+  /// [`Self::advance_probe`], with the candidate builder named.
+  ///
+  /// [`Self::build_state`] on every production road. A lane passes a
+  /// builder that opens the candidate in software, which is how the
+  /// replay and the commit below run on a machine with one hardware
+  /// backend or none.
+  fn advance_probe_with(&mut self, last_error: Error, build: BuildCandidate) -> Result<()> {
     // Record the failure that triggered this advance against the active
     // backend. If the probe was somehow already gone (shouldn't happen —
     // call sites guard with `self.probe.is_some()`), just propagate the
@@ -1783,7 +1824,7 @@ impl VideoDecoder {
         //
         // Hand the buffered packet history back to the caller along
         // with the attempt log: those packets were consumed from the
-        // caller's demuxer (and refcounted-cloned into `buffered_packets`)
+        // caller's demuxer (and copied into `buffered_packets`)
         // before the probe exhausted, and for non-seekable inputs the
         // caller cannot re-demux them. Returning them here lets a
         // caller-side software fallback replay the same byte history
@@ -1809,7 +1850,7 @@ impl VideoDecoder {
 
       // Build candidate. On failure, record into attempts and continue
       // without touching the packet buffer.
-      let mut candidate_state = match Self::build_state(
+      let mut candidate_state = match build(
         parameters,
         codec,
         next_backend,
@@ -1858,9 +1899,23 @@ impl VideoDecoder {
         };
         let mut r: std::result::Result<(), ffmpeg_next::Error> = Ok(());
 
-        'replay: for pkt in &probe.buffered_packets {
+        'replay: for kept in &probe.buffered_packets {
+          // **The candidate is sent a copy, never the history's own
+          // packet.** `avcodec_send_packet` takes a reference to what it
+          // is sent (`libavcodec/decode.c` 748 in FFmpeg 9.0.1) and the
+          // decoder may hold it past the call, while a candidate
+          // committed here stays the session's when the history later
+          // goes to the caller as owned, mutable `Packet`s. A copy that
+          // cannot be made fails this candidate's replay.
+          let pkt = match try_clone_packet(kept) {
+            Ok(pkt) => pkt,
+            Err(e) => {
+              r = Err(e);
+              break 'replay;
+            }
+          };
           loop {
-            match candidate_state.inner.send_packet(pkt) {
+            match candidate_state.inner.send_packet(&pkt) {
               Ok(()) => break,
               Err(e) if is_eagain(&e) => {
                 // Drain candidate output (transferring + queueing each frame)
@@ -2942,20 +2997,45 @@ pub(crate) fn try_clone_parameters(
   })
 }
 
-/// Checked counterpart to `Packet::clone()`. ffmpeg-next's `clone_from`
-/// calls `av_packet_ref` and ignores the int return value; on `ENOMEM`
-/// the destination is left empty while the caller assumes the clone
-/// succeeded — corrupting any later replay history. This helper surfaces
-/// the AVERROR. The result is a refcounted shallow clone — the payload
-/// buffer is shared with `src` rather than deep-copied; the probe replay
-/// only sends packets through `avcodec_send_packet`, which does not
-/// require a writable buffer.
+/// Checked counterpart to `Packet::clone()`: a copy of `src` whose payload
+/// nothing else references.
+///
+/// ffmpeg-next's `clone_from` makes the same two calls, `av_packet_ref`
+/// then `av_packet_make_writable`, and ignores both return codes
+/// (`src/codec/packet/packet.rs` 287–297 in ffmpeg-next 9.0.0). Under
+/// `ENOMEM` its clone is left empty, or still sharing `src`'s buffer,
+/// while the caller assumes a copy. Both are checked here.
+///
+/// **Why both calls.** `av_packet_ref` alone shares `src`'s payload
+/// buffer (`libavcodec/packet.c` 461–468 in FFmpeg 9.0.1), and a `Packet`
+/// lends `&mut [u8]` through `data_mut` without consulting writability.
+/// A shallow clone kept past the call is a second owner of the caller's
+/// bytes: the caller's later writes reach it, and `data_mut` on the two
+/// hands out aliasing `&mut [u8]` from safe code, on two threads once
+/// the packets are sent apart. `av_packet_make_writable` copies a buffer
+/// that is not writable — referenced more than once, or read-only
+/// (`libavutil/buffer.c` 147–153) — into one of the packet's own
+/// (`packet.c` 516–536). Side data is the copy's own already:
+/// `av_packet_copy_props` copies each entry (417–429). `opaque_ref` stays
+/// shared (413), and ffmpeg-next's safe API does not reach it.
+///
+/// The copy's payload and side data are `src`'s sizes, so a budget that
+/// charged `src` charges the copy the same bytes. On failure the partial
+/// clone is dropped, which releases the reference it took.
 pub(crate) fn try_clone_packet(src: &Packet) -> std::result::Result<Packet, ffmpeg_next::Error> {
   let mut dst = Packet::empty();
   // SAFETY: dst is a freshly zero-initialized Packet (av_init_packet inside
   // Packet::empty); av_packet_ref initializes its data fields from src's
-  // refcounted buffer or returns AVERROR(ENOMEM) on failure.
+  // refcounted buffer, or returns AVERROR(ENOMEM) and leaves dst blank
+  // (`packet.h` 861–862).
   let ret = unsafe { av_packet_ref(dst.as_mut_ptr(), src.as_ptr()) };
+  if ret < 0 {
+    return Err(ffmpeg_next::Error::from(ret));
+  }
+  // SAFETY: dst is the live packet av_packet_ref just filled. On failure
+  // av_packet_make_writable leaves it unchanged (`packet.h` 921–922), and
+  // dropping it releases the reference it holds.
+  let ret = unsafe { av_packet_make_writable(dst.as_mut_ptr()) };
   if ret < 0 {
     return Err(ffmpeg_next::Error::from(ret));
   }

@@ -891,15 +891,15 @@ pub fn ffmpeg_packet_from_owned_video_packet(
 ///
 /// **Which is why the route is the caller's to choose.** "Dropped
 /// before this returns" is a claim about this function, and a decoder
-/// that *records* what it is sent makes it false: the video decoder's
-/// hardware probe `av_packet_ref`s every accepted packet into a rescue
-/// history, and `FallbackFailed::unconsumed_packets` hands those
-/// recordings to the caller as owned, **mutable** `Packet`s. A
-/// submission that could be recorded must therefore carry
-/// [`BodyRoute::Copy`], so that what enters the history is storage
-/// nobody else reads. Callers with no history — every software road,
-/// and the hardware road after commit — pass
-/// [`BodyRoute::Submission`] and keep the zero-copy send.
+/// that *records* what it is sent by reference would make it false:
+/// the video decoder's hardware probe keeps every accepted packet in a
+/// rescue history, and `FallbackFailed::unconsumed_packets` hands those
+/// recordings to the caller as owned, **mutable** `Packet`s. The probe
+/// records copies of its own, and a submission that could be recorded
+/// carries [`BodyRoute::Copy`] as well, so that what reaches a recorder
+/// is storage nobody else reads, however it records. Callers with no
+/// history — every software road, and the hardware road after commit —
+/// pass [`BodyRoute::Submission`] and keep the zero-copy send.
 pub(crate) fn with_ffmpeg_video_packet<C: crate::FfmpegCarrier + crate::CarrierOps, T>(
   packet: &mediadecode::packet::VideoPacket<VideoPacketExtra, C::Buffer>,
   limits: PacketLimits,

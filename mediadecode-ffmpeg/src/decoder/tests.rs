@@ -2471,3 +2471,376 @@ fn the_public_decoder_has_a_timed_construction_road() {
     ) -> Result<VideoDecoder> = VideoDecoder::open_with_limits_timed;
   }
 }
+
+/// Side of the rawvideo pictures the rescue lanes send, in pixels. The
+/// format is `GRAY8`, one byte a pixel.
+const RAW_SIDE: i32 = 16;
+
+/// Bytes in one such picture: the payload rawvideo takes as one packet.
+const RAW_PICTURE: usize = (RAW_SIDE * RAW_SIDE) as usize;
+
+/// A decoder on trial with no backend left to advance to, over
+/// libavcodec's rawvideo decoder.
+///
+/// Rawvideo takes any payload of a picture's size, so a lane chooses
+/// every byte it sends. libavcodec decodes the first packet as it is
+/// sent and holds the second until a picture is asked for
+/// (`avcodec_send_packet`, `libavcodec/decode.c` 745–758 in FFmpeg
+/// 9.0.1): two sends taken, and no back pressure.
+fn raw_auditioning_decoder() -> VideoDecoder {
+  ffmpeg_next::init().expect("ffmpeg init");
+  let mut parameters = ffmpeg_next::codec::Parameters::new();
+  // SAFETY: `parameters` owns a live, zeroed `AVCodecParameters`; every
+  // field written is a plain scalar.
+  unsafe {
+    let raw = parameters.as_mut_ptr();
+    (*raw).codec_type = ffmpeg_next::ffi::AVMediaType::AVMEDIA_TYPE_VIDEO;
+    (*raw).codec_id = ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_RAWVIDEO;
+    (*raw).width = RAW_SIDE;
+    (*raw).height = RAW_SIDE;
+    (*raw).format = ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_GRAY8 as i32;
+  }
+  VideoDecoder::from_software_for_test(
+    parameters,
+    crate::limits::DecoderLimits::default(),
+    /*auditioning=*/ true,
+  )
+  .expect("a software-backed rawvideo candidate on trial")
+}
+
+/// One picture's packet, every byte `fill`.
+fn raw_packet(fill: u8) -> Packet {
+  crate::boundary::try_packet_copy(&[fill; RAW_PICTURE]).expect("a submittable packet")
+}
+
+/// Where a packet's payload is, and how many references its buffer has.
+fn payload_of(packet: &Packet) -> (usize, i32) {
+  // SAFETY: the packet is live; `data` and `buf` are plain fields, and
+  // `av_buffer_get_ref_count` only reads the buffer's atomic count.
+  unsafe {
+    let raw = packet.as_ptr();
+    assert!(!(*raw).buf.is_null(), "the lanes send refcounted packets");
+    (
+      (*raw).data as usize,
+      ffmpeg_next::ffi::av_buffer_get_ref_count((*raw).buf),
+    )
+  }
+}
+
+/// Whether every byte of `packet`'s payload is `fill`.
+fn holds(packet: &Packet, fill: u8) -> bool {
+  packet
+    .data()
+    .is_some_and(|bytes| bytes.iter().all(|&byte| byte == fill))
+}
+
+/// LAW: **the probe's copy shares nothing with its source, and costs
+/// what its source was charged.**
+///
+/// [`try_clone_packet`] is how the probe records a packet. Its
+/// `av_packet_ref` leaves the record sharing the source's payload
+/// buffer, so the record is then made writable, which copies the
+/// payload into a buffer of its own; the side data is the copy
+/// `av_packet_copy_props` makes of each entry. The sizes are the
+/// source's, so the charge the pre-flight computes from the source —
+/// `size` and [`packet_side_data_bytes`] — is the copy's.
+///
+/// PLANT: `av_packet_make_writable` skipped in [`try_clone_packet`]
+/// turns this red at "a payload of its own".
+#[test]
+fn the_probes_copy_shares_nothing_with_its_source() {
+  use ffmpeg_next::ffi::{AVPacketSideDataType, av_packet_new_side_data};
+
+  ffmpeg_next::init().expect("ffmpeg init");
+  let mut source = crate::boundary::try_packet_copy(&[0x5A; 1024]).expect("a source packet");
+  // SAFETY: `source` owns a live packet; the entry is FFmpeg's own
+  // allocation of 16 bytes, written only through the pointer it returns.
+  unsafe {
+    let entry = av_packet_new_side_data(
+      source.as_mut_ptr(),
+      AVPacketSideDataType::AV_PKT_DATA_STRINGS_METADATA,
+      16,
+    );
+    assert!(!entry.is_null(), "the entry must exist to be copied");
+    core::ptr::write_bytes(entry, 0xC3, 16);
+  }
+
+  let copy = try_clone_packet(&source).expect("an uncapped copy");
+  let (source_at, source_refs) = payload_of(&source);
+  let (copy_at, copy_refs) = payload_of(&copy);
+  assert_eq!(copy.data(), source.data(), "the same bytes");
+  assert_ne!(copy_at, source_at, "in a payload of its own");
+  assert_eq!(
+    (source_refs, copy_refs),
+    (1, 1),
+    "each buffer referenced by its own packet alone",
+  );
+
+  // Read as raw fields, never through the bindgen enum the entry also
+  // carries.
+  let side = |packet: &Packet| -> (usize, Vec<u8>) {
+    // SAFETY: the packet is live and carries one entry, checked first;
+    // `data` and `size` are plain fields of it.
+    unsafe {
+      let raw = packet.as_ptr();
+      assert_eq!((*raw).side_data_elems, 1, "one entry");
+      let entry = (*raw).side_data;
+      let (data, size) = ((*entry).data, (*entry).size);
+      (
+        data as usize,
+        std::slice::from_raw_parts(data, size).to_vec(),
+      )
+    }
+  };
+  let (source_side_at, source_side) = side(&source);
+  let (copy_side_at, copy_side) = side(&copy);
+  assert_eq!(copy_side, source_side, "the same side data");
+  assert_ne!(copy_side_at, source_side_at, "in an entry of its own");
+
+  let charge = |packet: &Packet| {
+    packet.size() + packet_side_data_bytes(packet, MAX_PROBE_PACKET_SIDE_DATA_ENTRIES)
+  };
+  assert_eq!(
+    charge(&copy),
+    charge(&source),
+    "the copy costs what its source was charged",
+  );
+}
+
+/// LAW: **a rescued packet keeps the bytes it was sent with, whatever
+/// the caller writes to its own packet afterwards, and a write to it
+/// reaches nothing the caller holds.**
+///
+/// `Packet::data_mut` lends `&mut [u8]` without consulting writability,
+/// and [`Error::AllBackendsFailed`] hands the probe's history to the
+/// caller as owned packets. A history that shared the caller's payloads
+/// would carry the caller's writes after the send into what it hands
+/// back, and would give safe code two `&mut [u8]` over one allocation.
+/// So the probe records copies, charged what the packets were.
+///
+/// The probe exhausts on the road a caller meets it on. The first
+/// picture asked for is a CPU frame from a context on trial as hardware,
+/// so its download fails — `av_hwframe_transfer_data` answers `EINVAL`
+/// for a frame with no hardware frames context — and no backend is left
+/// to advance to.
+///
+/// PLANT: `av_packet_make_writable` skipped in [`try_clone_packet`]
+/// turns this red at "the bytes it was sent with".
+#[test]
+fn a_rescued_packet_keeps_the_bytes_it_was_sent_with() {
+  let mut dec = raw_auditioning_decoder();
+  let fills = [0x11u8, 0x22];
+  let mut sent: Vec<Packet> = fills.iter().map(|&fill| raw_packet(fill)).collect();
+  for packet in &sent {
+    assert_eq!(dec.send_packet(packet).expect("taken"), Sent::Accepted);
+  }
+  assert_eq!(
+    dec.probe.as_ref().expect("still on trial").buffered_bytes,
+    fills.len() * RAW_PICTURE,
+    "each copy is charged its payload",
+  );
+
+  // The caller writes to its own packets after the send, through safe
+  // code.
+  for packet in &mut sent {
+    packet.data_mut().expect("a payload").fill(0xEE);
+  }
+
+  let mut frame = crate::Frame::empty().expect("frame slot");
+  let Err(Error::AllBackendsFailed(p)) = dec.receive_frame(&mut frame) else {
+    panic!("a CPU frame on trial fails the only backend, and the probe exhausts");
+  };
+  let mut rescued = p.into_unconsumed_packets();
+  assert_eq!(
+    rescued.len(),
+    fills.len(),
+    "every packet the probe took comes back"
+  );
+  for (packet, &fill) in rescued.iter().zip(&fills) {
+    assert!(
+      holds(packet, fill),
+      "{fill:#04x}: the bytes it was sent with, not the caller's later writes",
+    );
+    assert_eq!(
+      payload_of(packet).1,
+      1,
+      "{fill:#04x}: referenced by the rescued packet alone",
+    );
+  }
+
+  // And the other way: a write to a rescued packet reaches nothing the
+  // caller holds.
+  for packet in &mut rescued {
+    packet.data_mut().expect("a payload").fill(0x55);
+  }
+  for packet in &sent {
+    assert!(
+      holds(packet, 0xEE),
+      "a write to a rescued packet reached the caller's"
+    );
+  }
+}
+
+/// LAW: **a copy the probe cannot make refuses the send by name, before
+/// libavcodec sees the packet, and leaves the packet with the caller.**
+///
+/// The refusal is the probe's own, as at its byte ceiling:
+/// [`Error::AllBackendsFailed`] with the history recorded so far and no
+/// attempt, since no backend failed. The session stays where it was, on
+/// the same backend and no longer on trial.
+///
+/// The allocator fails it, through `av_max_alloc` in a child process of
+/// its own: capped at 512 bytes, `av_packet_ref`'s `AVBufferRef` is
+/// still allocated and the payload `av_packet_make_writable` copies into
+/// (8,192 bytes and the padding) is not.
+///
+/// PLANT: `av_packet_make_writable` skipped in [`try_clone_packet`]
+/// turns this red at "refused by name".
+#[test]
+fn a_copy_the_probe_cannot_make_refuses_the_send_by_name() {
+  use crate::fault_subprocess::{cap_ffmpeg_allocations, in_subprocess, uncap_ffmpeg_allocations};
+
+  in_subprocess(
+    "decoder::tests::a_copy_the_probe_cannot_make_refuses_the_send_by_name",
+    || {
+      let mut dec = raw_auditioning_decoder();
+      let first = raw_packet(0x11);
+      assert_eq!(dec.send_packet(&first).expect("taken"), Sent::Accepted);
+
+      let mut refused = crate::boundary::try_packet_copy(&[0x77; 8192]).expect("a packet");
+      cap_ffmpeg_allocations(512);
+      let answer = dec.send_packet(&refused);
+      uncap_ffmpeg_allocations();
+
+      let Err(Error::AllBackendsFailed(p)) = answer else {
+        panic!("a copy that cannot be made is refused by name, got {answer:?}");
+      };
+      assert!(
+        p.attempts().is_empty(),
+        "the probe's own refusal: no backend failed, got {:?}",
+        p.attempts(),
+      );
+      let history = p.into_unconsumed_packets();
+      assert!(
+        history.len() == 1 && holds(&history[0], 0x11),
+        "the history recorded before the refusal, without the refused packet",
+      );
+
+      // The packet is the caller's again: neither the copy that failed
+      // nor libavcodec holds a reference to it.
+      assert_eq!(
+        payload_of(&refused).1,
+        1,
+        "nothing else references the packet"
+      );
+      assert!(holds(&refused, 0x77), "its bytes untouched");
+      refused.data_mut().expect("a payload").fill(0x78);
+
+      // The same backend, no longer on trial; and libavcodec never saw
+      // the packet. Offered now it is taken, where a decoder already
+      // holding one packet beside a waiting picture answers back
+      // pressure (`decode.c` 746–747).
+      assert_eq!(dec.phase(), SessionPhase::Streaming);
+      assert_eq!(
+        dec.send_packet(&refused).expect("offered again"),
+        Sent::Accepted,
+        "libavcodec never saw the refused packet",
+      );
+    },
+  );
+}
+
+/// LAW: **a candidate is replayed copies, and the history stays the
+/// probe's own.**
+///
+/// `avcodec_send_packet` takes a reference to what it is sent and may
+/// hold it past the call (`libavcodec/decode.c` 748 and 754). A
+/// candidate replayed the history's own packets would share their
+/// buffers for as long as it holds them, and a candidate the probe
+/// commits stays the session's: when it fails in its turn and the
+/// history goes to the caller, the caller's `&mut [u8]` would cover
+/// bytes a live decoder reads.
+///
+/// The candidate is opened in software through
+/// [`VideoDecoder::advance_probe_with`]. Two packets, so the replay
+/// leaves one picture waiting and one packet held, and asks for no
+/// drain.
+///
+/// PLANT: the replay sending the history's own packet turns this red
+/// at "the candidate holds none of the history".
+#[test]
+fn a_candidate_is_replayed_copies_and_the_history_stays_the_probes_own() {
+  let mut dec = raw_auditioning_decoder();
+  dec
+    .probe
+    .as_mut()
+    .expect("on trial")
+    .remaining_backends
+    .push(Backend::Cuda);
+  let fills = [0x11u8, 0x22];
+  let sent: Vec<Packet> = fills.iter().map(|&fill| raw_packet(fill)).collect();
+  for packet in &sent {
+    assert_eq!(dec.send_packet(packet).expect("taken"), Sent::Accepted);
+  }
+
+  dec
+    .advance_probe_with(
+      Error::Ffmpeg(ffmpeg_next::Error::InvalidData),
+      VideoDecoder::software_state_for_test,
+    )
+    .expect("the candidate takes the replay and is committed");
+  assert_eq!(
+    dec.backend(),
+    Backend::Cuda,
+    "the candidate is the session's"
+  );
+  for (packet, &fill) in dec
+    .probe
+    .as_ref()
+    .expect("still on trial: no picture yet")
+    .buffered_packets
+    .iter()
+    .zip(&fills)
+  {
+    assert_eq!(
+      payload_of(packet).1,
+      1,
+      "{fill:#04x}: the candidate holds none of the history",
+    );
+  }
+
+  // The candidate fails in its turn, on the first picture asked for, and
+  // the history goes to the caller while the candidate stays the
+  // session's, holding what it was replayed.
+  let mut frame = crate::Frame::empty().expect("frame slot");
+  let Err(Error::AllBackendsFailed(p)) = dec.receive_frame(&mut frame) else {
+    panic!("the candidate fails on a CPU frame, and the probe exhausts");
+  };
+  assert_eq!(
+    p.attempts().len(),
+    2,
+    "the first backend's failure and the candidate's: {:?}",
+    p.attempts(),
+  );
+  assert_eq!(
+    p.unconsumed_packets().len(),
+    fills.len(),
+    "every packet the probe took comes back"
+  );
+  for (packet, &fill) in p.unconsumed_packets().iter().zip(&fills) {
+    assert!(
+      holds(packet, fill),
+      "{fill:#04x}: the bytes it was sent with"
+    );
+    assert_eq!(
+      payload_of(packet).1,
+      1,
+      "{fill:#04x}: referenced by the rescued packet alone, beside a live candidate",
+    );
+  }
+  assert_eq!(
+    dec.backend(),
+    Backend::Cuda,
+    "and that candidate is still live"
+  );
+}

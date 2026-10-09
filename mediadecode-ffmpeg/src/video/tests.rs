@@ -128,7 +128,7 @@ struct FakeHw {
   /// thing an allocator ceiling hit, which is not the thing under test
   /// when a lane caps the ceiling to refuse a *carrier*.
   queued: VecDeque<frame::Video>,
-  /// Refcounted clones of every packet accepted so far — the probe's
+  /// Copies of every packet accepted so far — the probe's
   /// `unconsumed_packets` history, surfaced when it exhausts.
   history: Vec<Packet>,
   /// When set, raise a **probe-era** exhaustion from `receive_frame`
@@ -199,10 +199,10 @@ impl FakeHw {
 impl HwInner for FakeHw {
   fn records_submissions(&self) -> bool {
     // **This fake records exactly like the real probe does** — see
-    // `send_packet` below, which `try_clone_packet`s (an
-    // `av_packet_ref`) every accepted packet into `history` and hands
-    // that history out through `AllBackendsFailed`. Saying so is what
-    // makes the view lane copy into it, and what
+    // `send_packet` below, which `try_clone_packet`s (a copy of its
+    // own) every accepted packet into `history` and hands that history
+    // out through `AllBackendsFailed`. Saying so is what makes the view
+    // lane copy into it, and what
     // `a_rescued_packet_never_aliases_a_view_carrier` checks.
     true
   }
@@ -1116,16 +1116,17 @@ fn a_rescued_packet_never_aliases_a_view_carrier() {
   use mediadecode::decoder::VideoStreamDecoder;
 
   // **The scoped submission's proof has a hole on one road.** "Built,
-  // lent, dropped inside this call" is true of the function — and false
-  // of the probe, which `av_packet_ref`s every accepted packet into a
-  // rescue history that `FallbackFailed::unconsumed_packets` hands back
+  // lent, dropped inside this call" is true of the function — and would
+  // be false of a probe that recorded by reference, because
+  // `FallbackFailed::unconsumed_packets` hands its rescue history back
   // to the caller as owned, **mutable** `Packet`s. A shared body would
   // leave that call as a live mutable alias of bytes a view carrier is
   // still lending.
   //
-  // So while the history is being recorded, the body is copied. This
-  // pins it from the outside, on the one road where the history is
-  // observable: a probe-era failure whose SW replay also fails.
+  // So the probe records copies of its own, and while the history is
+  // being recorded the body is copied as well. This pins the outcome
+  // from the outside, on the one road where the history is observable:
+  // a probe-era failure whose SW replay also fails.
   let (w, h) = (128u32, 96u32);
   let mut clip = encode_synthetic_clip(w, h, 12, 100);
   let p1 = clip

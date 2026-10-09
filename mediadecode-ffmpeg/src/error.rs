@@ -212,12 +212,13 @@ pub enum FallbackOrigin {
 /// fall back to a software decoder of their choice.
 ///
 /// `unconsumed_packets` holds the packets the decoder accepted from
-/// the caller before the probe exhausted (refcounted shallow clones
-/// of the packets fed via `send_packet`). For non-seekable inputs
-/// (live streams, pipes, network sources) the caller cannot
-/// re-demux from start, so this crate surfaces the buffered history
-/// here so the caller can feed those packets directly into a
-/// software decoder of their choice. When `AllBackendsFailed` comes
+/// the caller before the probe exhausted: copies the probe made of the
+/// packets fed via `send_packet`, each payload referenced by its packet
+/// alone, so the caller's own packets and these never share bytes. For
+/// non-seekable inputs (live streams, pipes, network sources) the
+/// caller cannot re-demux from start, so this crate surfaces the
+/// buffered history here so the caller can feed those packets directly
+/// into a software decoder of their choice. When `AllBackendsFailed` comes
 /// from [`crate::VideoDecoder::open`] (no packets were ever sent),
 /// this vec is empty.
 ///

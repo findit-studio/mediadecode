@@ -320,11 +320,11 @@ pub(crate) trait HwInner: Send {
   ///
   /// The probe keeps a rescue history so that a decoder which exhausts
   /// every backend can hand the caller everything FFmpeg consumed since
-  /// open. It records by `av_packet_ref`, and
-  /// [`AllBackendsFailed::into_unconsumed_packets`] hands those
-  /// recordings out as owned, **mutable** `Packet`s — which is why the
-  /// view lane must not share its carrier's storage into a submission
-  /// that could be recorded. See
+  /// open, and [`AllBackendsFailed::into_unconsumed_packets`] hands those
+  /// recordings out as owned, **mutable** `Packet`s. [`VideoDecoder`]
+  /// records copies of its own. The view lane copies a submission that
+  /// could be recorded as well, so a recording never addresses a
+  /// carrier's storage, whichever way a seam records. See
   /// [`CarrierVideoStreamDecoder::send_packet_impl`].
   fn records_submissions(&self) -> bool;
 
@@ -1153,14 +1153,15 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     // rather than copy into it. See `boundary::with_ffmpeg_video_packet`.
     let limits = self.limits.packet_limits();
     // **The route depends on what this decoder does with what it is
-    // sent.** While the hardware probe is open it `av_packet_ref`s
-    // every accepted packet into a rescue history, and
+    // sent.** While the hardware probe is open it records every
+    // accepted packet into a rescue history, and
     // `AllBackendsFailed::into_unconsumed_packets` hands those out as
-    // owned, mutable `Packet`s — so a shared body would escape this
-    // call as a live mutable alias of a carrier the caller may still be
-    // reading. Inside that window the body is copied; once the probe
-    // has committed, nothing is recorded and the send is zero-copy
-    // again. The software road never records.
+    // owned, mutable `Packet`s. `VideoDecoder` records copies of its
+    // own (`decoder::try_clone_packet`); inside that window the body is
+    // copied here as well, so a recording never addresses a carrier the
+    // caller may still be reading, whichever way the seam records. Once
+    // the probe has committed, nothing is recorded and the send is
+    // zero-copy again. The software road never records.
     let route = match &self.state {
       DecodeState::Hw(hw) if hw.records_submissions() => crate::carrier::BodyRoute::Copy,
       _ => crate::carrier::BodyRoute::Submission,
