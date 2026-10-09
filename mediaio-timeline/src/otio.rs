@@ -82,8 +82,9 @@ pub fn to_otio(timeline: &Timeline, target: OtioTarget) -> Result<String, Vec<Re
 
 /// Checks that `json` is an OpenTimelineIO timeline `target`'s readers
 /// read: well-formed JSON, every object of a schema OpenTimelineIO defines,
-/// with the keys its reader requires and the types it reads, and every
-/// transition between two items.
+/// with exactly the keys those readers require — audited against each
+/// schema's `read_from`, per target — the types they read for the keys the
+/// export writes, and every transition between two items.
 ///
 /// This is the structural self-check the export is held to — the shape, not
 /// the meaning: it does not recompute positions.

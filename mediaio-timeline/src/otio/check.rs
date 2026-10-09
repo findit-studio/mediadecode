@@ -1,10 +1,46 @@
 //! OpenTimelineIO's schema shape, checked over a value the crate's own
 //! reader produced.
 //!
-//! Each schema's required keys are the ones OpenTimelineIO's reader cannot
-//! do without; its other keys may be absent, but where present must have
-//! their type. A key OpenTimelineIO does not define is left alone, as its
-//! reader keeps one.
+//! # Which keys are required
+//!
+//! Each schema's `read_from` in OpenTimelineIO's C++ core decides which keys
+//! a document must carry: `reader.read` fails on a missing key, and
+//! `reader.read_if_present` does not. The check requires exactly the keys
+//! the `reader.read` calls take, for every reader of its target — releases
+//! 0.15 to 0.18.1 and `main` (`00c22fa`) for [`OtioTarget::V0_15Plus`]; for
+//! [`OtioTarget::Legacy`], the C++ readers of 0.12 to 0.14.1 (the Python
+//! ones before them require less). Lines are `main`'s under
+//! `src/opentimelineio/` unless a release is named:
+//!
+//! | schema | required | where |
+//! |---|---|---|
+//! | `Timeline.1` | `tracks` | `timeline.cpp:30` |
+//! | `Stack.1` | `children` | `composition.cpp:199` |
+//! | `Track.1` | `kind`, `children` | `track.cpp:41` (0.14.1: `:31`), `composition.cpp:199` |
+//! | `Clip.2` | `media_references`, `active_media_reference_key` | `clip.cpp:145–148` |
+//! | `Clip.1` | `media_reference` under `Legacy`; nothing under `V0_15Plus` | 0.14.1 `clip.cpp:34`, 0.12 `clip.cpp:28`; a later reader upgrades a `Clip.1`, reading a reference left out as missing (`typeRegistry.cpp:159–177`) |
+//! | `Gap.1` | — | an item's keys only |
+//! | `Transition.1` | `in_offset`, `out_offset`, `transition_type` | `transition.cpp:35–37` |
+//! | `ExternalReference.1` | `target_url` | `externalReference.cpp:23` |
+//! | `RationalTime.1` | `rate`, `value` | `deserialization.cpp:578–583` |
+//! | `TimeRange.1` | `start_time`, `duration` | `deserialization.cpp:585–591` |
+//!
+//! Everything else these schemas read is read only if present: `metadata`
+//! and `name` on each (`serializableObjectWithMetadata.cpp:21–22`), an
+//! item's `source_range`, `effects`, `markers` and `enabled`
+//! (`item.cpp:185–188`), a timeline's `global_start_time`
+//! (`timeline.cpp:31`), a media reference's `available_range` and
+//! `available_image_bounds` (`mediaReference.cpp:30–33`).
+//!
+//! # What a value is held to
+//!
+//! A value present is held to the type the reader takes, and in places to
+//! more — a string where a reader would take `null` as empty, a positive,
+//! finite rate, a length of zero or more, an active media key among the
+//! references, every transition between two items. Keys this crate never
+//! writes are not checked: a newer reader's `color` on an item or `enabled`
+//! on a transition, an effect's or a marker's own fields, an image bound's
+//! corners.
 
 use alloc::{format, string::String};
 
@@ -36,7 +72,8 @@ fn stack(value: &Value, path: &str, target: OtioTarget) -> Result<(), Shape> {
 fn track(value: &Value, path: &str, target: OtioTarget) -> Result<(), Shape> {
   let members = schema(value, path, &["Track.1"], "the schema Track.1")?;
   item(members, path)?;
-  optional(members, path, "kind", string)?;
+  let (kind, at) = required(members, path, "kind")?;
+  string(kind, &at)?;
   let (children, at) = required(members, path, "children")?;
   let children = array(children, &at)?;
   let is_transition = |index: usize| {
@@ -71,9 +108,15 @@ fn composable(value: &Value, path: &str, target: OtioTarget, in_track: bool) -> 
     "Gap.1" => item(members, path),
     "Clip.1" => {
       item(members, path)?;
-      optional(members, path, "media_reference", |value, at| {
-        nullable(value, at, media_reference)
-      })
+      match target {
+        OtioTarget::V0_15Plus => optional(members, path, "media_reference", |value, at| {
+          nullable(value, at, media_reference)
+        }),
+        OtioTarget::Legacy => {
+          let (reference, at) = required(members, path, "media_reference")?;
+          nullable(reference, &at, media_reference)
+        }
+      }
     }
     "Clip.2" if target == OtioTarget::V0_15Plus => clip2(members, path),
     "Clip.2" => Err(shape(

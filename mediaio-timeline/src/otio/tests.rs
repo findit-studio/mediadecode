@@ -377,6 +377,180 @@ fn the_self_check_refuses_by_path() {
 }
 
 #[test]
+fn a_track_without_kind_is_refused_for_both_targets() {
+  // Every reader takes `kind` with `reader.read`, which fails on a key left
+  // out (track.cpp).
+  let kindless = document(&gap()).replace(r#""kind": "Video", "#, "");
+  assert!(!kindless.contains("kind"));
+  for target in [OtioTarget::V0_15Plus, OtioTarget::Legacy] {
+    assert_eq!(
+      shape_refusal(&kindless, target),
+      (String::from("$.tracks.children[0].kind"), "a required key")
+    );
+  }
+}
+
+#[test]
+fn a_clip_1_without_its_media_reference_is_refused_for_legacy_readers_only() {
+  // Readers before 0.15 read `media_reference` with `reader.read`; later
+  // ones upgrade a `Clip.1` and take a reference left out as missing.
+  let bare = document(r#"{"OTIO_SCHEMA": "Clip.1"}"#);
+  assert_eq!(
+    shape_refusal(&bare, OtioTarget::Legacy),
+    (
+      String::from("$.tracks.children[0].children[0].media_reference"),
+      "a required key"
+    )
+  );
+  assert_eq!(validate_json(&bare, OtioTarget::V0_15Plus), Ok(()));
+  // A null reference is read, as an empty one.
+  let null = document(r#"{"OTIO_SCHEMA": "Clip.1", "media_reference": null}"#);
+  assert_eq!(validate_json(&null, OtioTarget::Legacy), Ok(()));
+}
+
+/// The keys each schema's reader requires, per target: the audit in
+/// `check`'s docs, transcribed.
+fn required_by_readers(schema: &str, target: OtioTarget) -> &'static [&'static str] {
+  match (schema, target) {
+    ("Timeline.1", _) => &["tracks"],
+    ("Stack.1", _) => &["children"],
+    ("Track.1", _) => &["kind", "children"],
+    ("Clip.2", _) => &["media_references", "active_media_reference_key"],
+    ("Clip.1", OtioTarget::Legacy) => &["media_reference"],
+    ("Clip.1" | "Gap.1", _) => &[],
+    ("Transition.1", _) => &["in_offset", "out_offset", "transition_type"],
+    ("ExternalReference.1", _) => &["target_url"],
+    ("RationalTime.1", _) => &["rate", "value"],
+    ("TimeRange.1", _) => &["start_time", "duration"],
+    _ => panic!("no audit for {schema}"),
+  }
+}
+
+/// One step from a value to one inside it.
+#[derive(Clone)]
+enum Step {
+  Key(String),
+  At(usize),
+}
+
+/// Every object naming a schema inside `value`: its path as the check
+/// writes one, the steps to it, its schema, and its keys.
+fn schema_objects(
+  value: &Value,
+  path: &str,
+  steps: &[Step],
+  out: &mut Vec<(String, Vec<Step>, String, Vec<String>)>,
+) {
+  match value {
+    Value::Object(members) => {
+      if let Some(schema) = members
+        .iter()
+        .find(|(key, _)| key == "OTIO_SCHEMA")
+        .and_then(|(_, schema)| schema.as_str())
+      {
+        let keys = members
+          .iter()
+          .map(|(key, _)| key.clone())
+          .filter(|key| key != "OTIO_SCHEMA")
+          .collect();
+        out.push((
+          String::from(path),
+          steps.to_vec(),
+          String::from(schema),
+          keys,
+        ));
+      }
+      for (key, member) in members {
+        let mut deeper = steps.to_vec();
+        deeper.push(Step::Key(key.clone()));
+        schema_objects(member, &format!("{path}.{key}"), &deeper, out);
+      }
+    }
+    Value::Array(items) => {
+      for (index, item) in items.iter().enumerate() {
+        let mut deeper = steps.to_vec();
+        deeper.push(Step::At(index));
+        schema_objects(item, &format!("{path}[{index}]"), &deeper, out);
+      }
+    }
+    _ => {}
+  }
+}
+
+/// `root` with `key` taken out of the object `steps` lead to, written out.
+fn without(root: &Value, steps: &[Step], key: &str) -> String {
+  let mut root = root.clone();
+  let mut at = &mut root;
+  for step in steps {
+    at = match (step, at) {
+      (Step::Key(name), Value::Object(members)) => {
+        &mut members
+          .iter_mut()
+          .find(|(member, _)| member == name)
+          .unwrap()
+          .1
+      }
+      (Step::At(index), Value::Array(items)) => &mut items[*index],
+      _ => unreachable!(),
+    };
+  }
+  let Value::Object(members) = at else {
+    unreachable!()
+  };
+  members.retain(|(member, _)| member != key);
+  let mut text = String::new();
+  json::write_pretty(&root, &mut text);
+  text
+}
+
+#[test]
+fn the_self_check_requires_exactly_what_the_targets_readers_require() {
+  // Each key of each object of each golden taken out in turn: refused where
+  // the target's readers require it, read where they do not. Fewer under
+  // Miri, which interprets slowly.
+  let every = if cfg!(miri) { 23 } else { 1 };
+  for (target, golden) in [
+    (
+      OtioTarget::V0_15Plus,
+      include_str!("../../tests/golden/law.v0_15.otio"),
+    ),
+    (
+      OtioTarget::Legacy,
+      include_str!("../../tests/golden/law.legacy.otio"),
+    ),
+  ] {
+    let root = json::parse(golden).unwrap();
+    let mut objects = Vec::new();
+    schema_objects(&root, "$", &[], &mut objects);
+    let cases = objects.iter().flat_map(|(path, steps, schema, keys)| {
+      keys.iter().map(move |key| (path, steps, schema, key))
+    });
+    let mut checked = 0;
+    for (path, steps, schema, key) in cases.step_by(every) {
+      let verdict = validate_json(&without(&root, steps, key), target);
+      if required_by_readers(schema, target).contains(&key.as_str()) {
+        assert_eq!(
+          verdict,
+          Err(Invalid::Shape(Shape {
+            path: format!("{path}.{key}"),
+            expected: "a required key",
+          })),
+          "{target:?}: {schema} at {path} without {key}"
+        );
+      } else {
+        assert_eq!(
+          verdict,
+          Ok(()),
+          "{target:?}: {schema} at {path} without {key}"
+        );
+      }
+      checked += 1;
+    }
+    assert!(checked > 0);
+  }
+}
+
+#[test]
 fn the_self_check_holds_transitions_between_two_items() {
   let target = OtioTarget::Legacy;
   for (children, at) in [
