@@ -9084,6 +9084,39 @@ enum VpsCut {
 
 /// [`hevc_vps`], its payload ended at `cut`.
 fn hevc_vps_cut(id: u8, layers_minus1: u8, mask: Option<u16>, aux_id: u8, cut: VpsCut) -> Vec<u8> {
+  let bits = hevc_vps_bits(id, layers_minus1, mask, aux_id, cut) + "1";
+  let payload: Vec<u8> = bits
+    .as_bytes()
+    .chunks(8)
+    .map(|chunk| {
+      chunk
+        .iter()
+        .enumerate()
+        .filter(|&(_, &bit)| bit == b'1')
+        .fold(0u8, |byte, (index, _)| byte | (0x80 >> index))
+    })
+    .collect();
+  hevc_vps_unit(&payload)
+}
+
+/// An HEVC video parameter set NAL unit around `payload`, its header that of
+/// a base layer's set, with the emulation prevention bytes a unit carries.
+fn hevc_vps_unit(payload: &[u8]) -> Vec<u8> {
+  let mut unit = vec![0x40, 0x01];
+  let mut zeros = 0;
+  for &byte in payload {
+    if zeros >= 2 && byte <= 3 {
+      unit.push(3);
+      zeros = 0;
+    }
+    zeros = if byte == 0 { zeros + 1 } else { 0 };
+    unit.push(byte);
+  }
+  unit
+}
+
+/// [`hevc_vps_cut`]'s payload bits, its stop bit not yet added.
+fn hevc_vps_bits(id: u8, layers_minus1: u8, mask: Option<u16>, aux_id: u8, cut: VpsCut) -> String {
   const AUXILIARY: u16 = 1 << (15 - 3);
   let ue = |value: u32| -> String {
     let coded = value + 1;
@@ -9149,29 +9182,7 @@ fn hevc_vps_cut(id: u8, layers_minus1: u8, mask: Option<u16>, aux_id: u8, cut: V
     }
     None => bits += "0",
   }
-  bits += "1";
-  let payload: Vec<u8> = bits
-    .as_bytes()
-    .chunks(8)
-    .map(|chunk| {
-      chunk
-        .iter()
-        .enumerate()
-        .filter(|&(_, &bit)| bit == b'1')
-        .fold(0u8, |byte, (index, _)| byte | (0x80 >> index))
-    })
-    .collect();
-  let mut unit = vec![0x40, 0x01];
-  let mut zeros = 0;
-  for byte in payload {
-    if zeros >= 2 && byte <= 3 {
-      unit.push(3);
-      zeros = 0;
-    }
-    zeros = if byte == 0 { zeros + 1 } else { 0 };
-    unit.push(byte);
-  }
-  unit
+  bits
 }
 
 /// A spare HEVC video parameter set NAL unit — id 5, which no sequence
@@ -10270,7 +10281,7 @@ fn h264_units_of_kind(data: &[u8], kind: u8) -> Vec<u8> {
 /// hardware failing post-commit at 16, the fallback is refused by name; a
 /// decoder closed before 16 is reopened by none, by name. A set held in
 /// doubt has no record either (`Unknown`); nor a set longer than a record's
-/// entry, which the session holds by a fingerprint alone (`Oversized`); nor a
+/// entry, whose bytes the session does not keep (`Oversized`); nor a
 /// start-coded record taking over from a four-byte `avcC` one, under which
 /// FFmpeg re-guesses every packet's framing (`Framing`).
 #[test]
@@ -10316,8 +10327,8 @@ fn where_no_record_carries_what_is_held_a_fresh_decoder_is_refused_by_name() {
     "a set in doubt"
   );
   let (sps, pps) = sps_and_pps(&a);
-  // A set longer than a record's entry is held by a fingerprint, its bytes
-  // not kept: no record carries it.
+  // A set longer than a record's entry is held with its bytes not kept: no
+  // record carries it.
   let long_sps = [&sps[..], &[0x55; 70_000][..]].concat();
   let long = held
     .after_packet(
@@ -12698,4 +12709,186 @@ fn a_long_sequence_parameter_set_repeated_with_other_bytes_past_those_kept_is_th
     session.pictures == reference,
     "every picture, as the straight decode"
   );
+}
+
+// ---------------------------------------------------------------------------
+//  R20 row 2: a set too long to keep is alike to no set that arrives
+// ---------------------------------------------------------------------------
+
+/// An HEVC video parameter set of `identity` bytes as FFmpeg compares it —
+/// its NAL header and payload to the last payload byte — and the unit
+/// carrying it: [`hevc_vps`]'s fields, then bytes no field reads, filler
+/// and `tail`, then the stop bit in a byte of its own, which is no payload
+/// byte (`get_bit_length`, h2645_parse.c:348-376).
+fn oversized_vps(
+  layers_minus1: u8,
+  mask: Option<u16>,
+  identity: usize,
+  tail: [u8; 8],
+) -> (Vec<u8>, Vec<u8>) {
+  let mut bits = hevc_vps_bits(0, layers_minus1, mask, 1, VpsCut::Whole);
+  while !bits.len().is_multiple_of(8) {
+    bits.push('0');
+  }
+  let mut payload: Vec<u8> = bits
+    .as_bytes()
+    .chunks(8)
+    .map(|chunk| u8::from_str_radix(core::str::from_utf8(chunk).expect("ascii"), 2).expect("bits"))
+    .collect();
+  let filler = identity - 2 - payload.len() - tail.len();
+  payload.extend(core::iter::repeat_n(0xaa, filler));
+  payload.extend_from_slice(&tail);
+  let compared = [&[0x40, 0x01][..], &payload].concat();
+  payload.push(0x80);
+  (hevc_vps_unit(&payload), compared)
+}
+
+/// The 64-bit FNV-1a hash of `bytes`, as R17 to R19 fingerprinted a set too
+/// long to keep.
+fn fnv1a(bytes: &[u8]) -> u64 {
+  bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, &byte| {
+    (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+  })
+}
+
+/// LAW (R20 row 2; Codex R19 [medium]): **an HEVC parameter set too long to
+/// keep is alike to no set that arrives, whatever its fingerprint.** FFmpeg
+/// tells two sets apart by every byte (`memcmp`, hevc/ps.c:797-802),
+/// stores a new one in place of the old and drops what referred to the old
+/// (`remove_vps`, 951, 102-111). Two video parameter sets of 70,000 bytes
+/// whose 64-bit FNV-1a hashes collide, found offline by a search for
+/// colliding eight-byte tails: one-layer sets alike but for their last eight
+/// bytes, past every field FFmpeg reads — it reads no extension flag of a
+/// one-layer set (919). An `x265` record's sets held, the first arrives with
+/// SPS and PPS 0 after it, then the second: it replaces the first, and SPS
+/// and PPS 0 are dropped — as FFmpeg's own decoder drops them, which decodes
+/// the IDR under the first and nothing after the second. Told alike by their
+/// fingerprints, the second changed nothing, and what referred to the first
+/// stayed.
+#[test]
+fn an_hevc_set_too_long_to_keep_is_alike_to_no_set_that_arrives() {
+  a_second_set_too_long_to_keep_replaces_the_first(
+    (0, None, 0x3d9e_5a64_3a67_7dc4),
+    (0, None, 0x9be5_ae8b_cc87_0a61),
+  );
+}
+
+/// LAW (R20 row 2; Codex R19 [medium]): **an HEVC alpha set too long to keep
+/// is read as alpha off its own bytes, whatever its fingerprint.** A
+/// one-layer video parameter set and an alpha one — two layers with the
+/// auxiliary type, which FFmpeg decodes as an alpha plane
+/// (`ff_hevc_is_alpha_video`, hevc/hevcdec.c:440-457) — of 70,000 bytes and
+/// one FNV-1a hash, found offline as above. The alpha set replaces the
+/// one-layer set, SPS and PPS 0 dropped, and is read as alpha, as FFmpeg's
+/// own decoder reads it. Told alike by their fingerprints, the alpha set was
+/// never read, and the keyframes after it judged clean.
+#[test]
+fn an_hevc_alpha_set_too_long_to_keep_is_read_off_its_own_bytes() {
+  const AUXILIARY: u16 = 1 << (15 - 3);
+  a_second_set_too_long_to_keep_replaces_the_first(
+    (0, None, 0x62d6_5b64_0b48_bc9e),
+    (1, Some(AUXILIARY), 0x9adb_6c29_40e5_bff1),
+  );
+}
+
+/// The laws of R20 row 2: `first` and `second`, each `(layers_minus1, mask,
+/// tail)` for [`oversized_vps`], two sets of 70,000 bytes whose FNV-1a
+/// hashes collide; the second is alpha where it has a mask.
+fn a_second_set_too_long_to_keep_replaces_the_first(
+  first: (u8, Option<u16>, u64),
+  second: (u8, Option<u16>, u64),
+) {
+  use super::held::Held;
+  let hevc = crate::CodecId::HEVC.raw();
+  let params = "keyint=8:min-keyint=8:scenecut=0:bframes=0:open-gop=0:log-level=error";
+  let clip = encode_hevc_global(128, 96, 8, params);
+  let record = extradata_of(&clip.parameters);
+  let units = annexb_units(&record);
+  let of_kind = |kind: u8| {
+    units
+      .iter()
+      .find(|unit| (unit[0] >> 1) & 0x3f == kind)
+      .expect("the record's set")
+      .to_vec()
+  };
+  let (sps, pps) = (of_kind(33), of_kind(34));
+  let started = |units: &[&[u8]]| {
+    units
+      .iter()
+      .flat_map(|unit| [0u8, 0, 0, 1].into_iter().chain(unit.iter().copied()))
+      .collect::<Vec<u8>>()
+  };
+  let alpha = second.1.is_some();
+  let (first, first_compared) = oversized_vps(first.0, first.1, 70_000, first.2.to_le_bytes());
+  let (second, second_compared) = oversized_vps(second.0, second.1, 70_000, second.2.to_le_bytes());
+  assert!(
+    first_compared.len() == 70_000
+      && second_compared.len() == 70_000
+      && first_compared != second_compared
+      && fnv1a(&first_compared) == fnv1a(&second_compared),
+    "the premise: two sets of one length whose fingerprints collide"
+  );
+
+  let held = Held::opened_on(hevc, &record);
+  let with_first = held
+    .after_packet(None, Some(&started(&[&first, &sps, &pps])))
+    .expect("the first replaces the record's VPS 0");
+  assert!(
+    with_first.holds_vps(0) && with_first.holds_sps(0) && with_first.holds_pps(0),
+    "the first held, SPS and PPS 0 read against it"
+  );
+  let (with_second, read_alpha) =
+    with_first.after_packet_reading_alpha(None, Some(&started(&[&second])));
+  let with_second = with_second.expect("the second replaces the first, not taken for it");
+  assert!(
+    with_second.holds_vps(0) && !with_second.holds_sps(0) && !with_second.holds_pps(0),
+    "SPS and PPS 0 dropped with the set they referred to"
+  );
+  assert_eq!(
+    (read_alpha, with_second.declares_alpha()),
+    (alpha, alpha),
+    "read off its own bytes"
+  );
+  assert_eq!(
+    with_second.record(hevc, &record, None),
+    Err(crate::Unrecordable::Oversized(crate::ParameterSet::Video)),
+    "a decoder opened fresh refused: no record carries the set"
+  );
+
+  // FFmpeg's own decoder: the IDR decodes under the first set; after the
+  // second, PPS 0 gone with the first, it decodes to nothing.
+  let decoded = |payloads: &[Vec<u8>]| {
+    let mut sw = super::open_sw_decoder(
+      &clip.parameters,
+      DecoderLimits::default().with_threads(crate::Threads::Single),
+      None,
+    )
+    .expect("an HEVC decoder");
+    let mut refusals = super::Refusals::default();
+    let mut picture = alloc_av_video_frame().expect("a frame");
+    let mut counts = Vec::new();
+    for payload in payloads {
+      let _ = sw.submit(&repacked(&clip.packets[0], payload), &mut refusals);
+      let mut count = 0;
+      while sw.receive(&mut picture, &mut refusals).is_ok() {
+        count += 1;
+      }
+      counts.push(count);
+    }
+    (counts, sw.outputs_alpha())
+  };
+  let idr = clip.packets[0].data().expect("a payload");
+  let (counts, _) = decoded(&[
+    [&started(&[&first, &sps, &pps])[..], idr].concat(),
+    [&started(&[&second])[..], idr].concat(),
+  ]);
+  assert_eq!(
+    counts,
+    vec![1, 0],
+    "FFmpeg decodes the IDR under the first, and nothing after the second"
+  );
+  if alpha {
+    let (_, outputs_alpha) = decoded(&[[&started(&[&second, &sps, &pps])[..], idr].concat()]);
+    assert!(outputs_alpha, "FFmpeg reads the set as alpha");
+  }
 }

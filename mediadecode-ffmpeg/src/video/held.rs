@@ -63,9 +63,9 @@ pub(super) struct Record {
 
 /// The most bytes of a parameter set the table keeps: what an `avcC` or
 /// `hvcC` entry, its length 16 bits, can carry. A packet may run to a
-/// gigabyte; a set longer than this is held by a fingerprint of its bytes
-/// alone, and no record carries it ([`Unrecordable::Oversized`]), so what the
-/// table holds stays within what records could.
+/// gigabyte; a set longer than this is not kept, and no record carries it
+/// ([`Unrecordable::Oversized`]), so what the table holds stays within what
+/// records could.
 const MAX_HELD_UNIT: usize = u16::MAX as usize;
 
 /// A parameter set's bytes as the table holds them.
@@ -73,10 +73,16 @@ const MAX_HELD_UNIT: usize = u16::MAX as usize;
 enum Bytes {
   /// The bytes themselves.
   Kept(Box<[u8]>),
-  /// A set too long for a record's entry: its length and a 64-bit
-  /// fingerprint (FNV-1a) of its bytes, which tell one such set from
-  /// another.
-  Fingerprint(usize, u64),
+  /// A set too long for a record's entry, its bytes not kept: **alike to no
+  /// set that arrives** ([`Self::is`]). FFmpeg tells HEVC sets apart by
+  /// every byte they hold (`memcmp`, hevc/ps.c:797-802, 1729-1733,
+  /// 2219-2223); a hash of them, its input the stream's, is no such witness
+  /// — a set crafted past what its fields read can take another's 64-bit
+  /// fingerprint — so each arrival of one is a set of its own, told apart by
+  /// `arrival` alone: it replaces what its id held, and what is read of it is
+  /// read off its own bytes. `len` and `fnv`, an FNV-1a hash of its bytes,
+  /// label it for the debug output and decide nothing.
+  Oversized { arrival: u64, len: usize, fnv: u64 },
 }
 
 impl Bytes {
@@ -84,17 +90,21 @@ impl Bytes {
     if bytes.len() <= MAX_HELD_UNIT {
       return Self::Kept(bytes.into());
     }
-    let fingerprint = bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, &byte| {
-      (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
-    });
-    Self::Fingerprint(bytes.len(), fingerprint)
+    static ARRIVALS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    Self::Oversized {
+      arrival: ARRIVALS.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
+      len: bytes.len(),
+      fnv: bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, &byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+      }),
+    }
   }
 
-  /// Whether these are `bytes`'s, as [`Self::of`] would hold them.
+  /// Whether these are `bytes`'s: never, for a set too long to keep.
   fn is(&self, bytes: &[u8]) -> bool {
     match self {
       Self::Kept(kept) => **kept == *bytes,
-      Self::Fingerprint(..) => *self == Self::of(bytes),
+      Self::Oversized { .. } => false,
     }
   }
 
@@ -102,7 +112,7 @@ impl Bytes {
   fn kept(&self) -> Option<&[u8]> {
     match self {
       Self::Kept(bytes) => Some(bytes),
-      Self::Fingerprint(..) => None,
+      Self::Oversized { .. } => None,
     }
   }
 }
@@ -251,6 +261,25 @@ impl Held {
       }
     }
     params::h264_extradata(record, &mut facts).verdict
+  }
+
+  /// Whether this holds an HEVC video parameter set under `id`, for certain.
+  #[cfg(test)]
+  pub(super) fn holds_vps(&self, id: usize) -> bool {
+    match self {
+      Self::Hevc(held) => held.vps[id].as_ref().is_some_and(|vps| !vps.doubt),
+      Self::H264(_) | Self::Other => false,
+    }
+  }
+
+  /// Whether this holds a sequence parameter set under `id`, for certain.
+  #[cfg(test)]
+  pub(super) fn holds_sps(&self, id: usize) -> bool {
+    match self {
+      Self::H264(held) => held.sps[id].as_ref().is_some_and(|sps| !sps.doubt),
+      Self::Hevc(held) => held.sps[id].as_ref().is_some_and(|sps| !sps.doubt),
+      Self::Other => false,
+    }
   }
 
   /// Whether this holds a picture parameter set under `id`, for certain.
@@ -898,7 +927,12 @@ impl H264Sets for H264Write<'_> {
 /// carries, and the bytes FFmpeg compares to keep an identical set in place
 /// — the unit as handed over, to its last payload byte (`get_bits_bytesize`,
 /// hevc/ps.c:797-802, 1729-1733, 2219-2223), which alone tell one set from
-/// another: the raw bytes are not compared.
+/// another: the raw bytes are not compared. A set too long to keep is alike
+/// to no set that arrives ([`Bytes::Oversized`]): every arrival of one
+/// replaces what its id held, its dependents dropped as FFmpeg drops a
+/// replaced set's (`remove_vps`, `remove_sps`, 89-111). Where FFmpeg finds
+/// the arrival identical and keeps them, this holds less than the decoder
+/// does — and no record carries what is held while such a set is.
 #[derive(Debug)]
 struct HevcSet {
   unit: Bytes,
