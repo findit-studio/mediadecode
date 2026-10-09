@@ -35,6 +35,9 @@ struct Session {
   input: ffmpeg_next::format::context::Input,
   stream_index: usize,
   time_base: Timebase,
+  /// Whether the end of the input has been sent, so the decoder is
+  /// draining what it still holds.
+  draining: bool,
 }
 
 impl Session {
@@ -70,6 +73,7 @@ impl Session {
       input,
       stream_index,
       time_base,
+      draining: false,
     }
   }
 
@@ -95,7 +99,17 @@ impl Session {
         return Some((frame.width(), frame.height()));
       }
     }
-    None
+    // **The end of the input is the drain.** A frame-threaded software
+    // decoder keeps a packet per thread in flight, so a short clip can
+    // run out before its first picture has come back.
+    if !self.draining {
+      self.draining = true;
+      assert_eq!(self.decoder.send_eof().expect("send eof"), Sent::Accepted);
+    }
+    match self.decoder.receive_frame(frame).expect("receive frame") {
+      Received::Frame => Some((frame.width(), frame.height())),
+      _ => None,
+    }
   }
 }
 
@@ -228,10 +242,10 @@ fn a_mid_stream_request_takes_effect_from_the_next_frame() {
   assert_eq!(after, (320, 180), "the very next frame carries the request");
 }
 
-/// The two refusals this seat mints itself, on the road that could
+/// The two refusals this call mints itself, on the road that could
 /// otherwise have honored them: a zero extent and an upscale. Neither
 /// is an error — and each returns the session to full coded size, which
-/// is what the trait says an `Unsupported` answer from this seat means
+/// is what the trait says an `Unsupported` answer from this call means
 /// and the only reading a caller can act on without risking a second
 /// resample of an already-fitted picture.
 #[test]
@@ -273,7 +287,7 @@ fn zero_and_upscale_requests_are_refused_and_return_the_session_to_full_size() {
 
   // **And a refusal after an acceptance returns the session to full
   // size**, which is what the trait says an `Unsupported` answer from
-  // this seat means. A caller acting on it resamples for itself, so a
+  // this call means. A caller acting on it resamples for itself, so a
   // session that went on fitting to the older request would have it
   // resample an already-fitted picture — irreversibly.
   assert_eq!(

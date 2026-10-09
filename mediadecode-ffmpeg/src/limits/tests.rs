@@ -1,7 +1,7 @@
 use super::*;
 
 /// The defaults' own coherence — that they are finite, that 8K passes
-/// and the bomb does not, that no seat is shadowed by a wider one — is
+/// and the bomb does not, that no limit is shadowed by a wider one — is
 /// asserted at **compile time**, in `limits.rs` beside the constants
 /// themselves. Nothing here re-checks it: a `const` block that failed
 /// would have stopped the build before this file was reached.
@@ -75,11 +75,11 @@ fn demux_limits_carry_all_three_tiers() {
   assert_eq!(mutated.max_total_attachment_bytes(), 6);
 }
 
-/// The chapter seats carry their defaults and take their overrides,
+/// The chapter limits carry their defaults and take their overrides,
 /// through both mutators the house shape asks for.
 ///
 /// The defaults themselves are the load-bearing half: both are
-/// **finite**, which is the whole point of the seat — a chapter table
+/// **finite**, which is the whole point of the limit — a chapter table
 /// is file-controlled and libavformat has no ceiling of its own for it.
 #[test]
 fn demux_limits_bound_the_chapter_table() {
@@ -102,4 +102,33 @@ fn demux_limits_bound_the_chapter_table() {
     .set_max_total_chapter_title_bytes(10);
   assert_eq!(mutated.max_chapters(), 9);
   assert_eq!(mutated.max_total_chapter_title_bytes(), 10);
+}
+
+#[test]
+fn decoder_limits_default_to_auto_threads_and_take_overrides() {
+  assert_eq!(DecoderLimits::default().threads(), Threads::Auto);
+  assert_eq!(Threads::default(), Threads::Auto);
+
+  let three = core::num::NonZeroU32::new(3).expect("nonzero");
+  let tuned = DecoderLimits::new().with_threads(Threads::Count(three));
+  assert_eq!(tuned.threads(), Threads::Count(three));
+  // The other limits are untouched by the thread choice.
+  assert_eq!(tuned.frame(), FrameLimits::new());
+  assert_eq!(
+    tuned.max_codec_parameter_bytes(),
+    DEFAULT_MAX_CODEC_PARAMETER_BYTES
+  );
+
+  let mut mutated = DecoderLimits::new();
+  mutated.set_threads(Threads::Single);
+  assert_eq!(mutated.threads(), Threads::Single);
+
+  // What each arm writes to `AVCodecContext.thread_count`.
+  assert_eq!(Threads::Auto.thread_count(), 0);
+  assert_eq!(Threads::Count(three).thread_count(), 3);
+  assert_eq!(
+    Threads::Count(core::num::NonZeroU32::MAX).thread_count(),
+    core::ffi::c_int::MAX
+  );
+  assert_eq!(Threads::Single.thread_count(), 1);
 }

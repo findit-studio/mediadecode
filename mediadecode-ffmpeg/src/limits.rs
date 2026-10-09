@@ -1,9 +1,9 @@
 //! Resource ceilings — the finite budgets every copy across the FFmpeg
 //! boundary is checked against **before** it allocates.
 //!
-//! These seats are tier one and tier two of the [resource governance
+//! These limits are tier one and tier two of the [resource governance
 //! contract][gov]: what this crate allocates itself, and the FFmpeg
-//! knobs it sets on the caller's behalf. The contract also states what
+//! options it sets on the caller's behalf. The contract also states what
 //! they do **not** bound, and what a deployment needing a hard memory
 //! bound puts underneath them — read it before sizing these for a
 //! hostile-input service.
@@ -19,7 +19,7 @@
 //! refcount; from 0.9 it costs memory, and the claim has to be judged
 //! before it is paid.
 //!
-//! Every seat here is a **finite default**, not an `Option`. There is no
+//! Every limit here is a **finite default**, not an `Option`. There is no
 //! "unlimited" spelling on purpose: the shape that lets a caller ask for
 //! no ceiling is the shape a caller reaches for once, in a hurry, and
 //! never revisits. A caller who needs more says how much more.
@@ -37,7 +37,7 @@
 //! # The house shape
 //!
 //! `DEFAULT_*` consts, `Copy` options structs with `new` / getters /
-//! `with_*` / `set_*`, and a `with_*` seat on each session — the same
+//! `with_*` / `set_*`, and a `with_*` setter on each session — the same
 //! shape [`crate::VideoDecoder::with_max_probe_pending_bytes`] and its
 //! [`DEFAULT_MAX_PROBE_PENDING_BYTES`](crate::decoder::DEFAULT_MAX_PROBE_PENDING_BYTES)
 //! already established for the probe-replay budget.
@@ -114,7 +114,7 @@ pub const DEFAULT_MAX_TOTAL_ATTACHMENT_BYTES: usize = 256 * 1024 * 1024;
 
 /// Default ceiling on one stream's codec-parameter heap — 16 MiB.
 ///
-/// **What it bounds.** `AVCodecParameters` has three heap seats and all
+/// **What it bounds.** `AVCodecParameters` has three heap fields and all
 /// three come from the file: `extradata`, every entry of
 /// `coded_side_data`, and a custom `ch_layout` channel map. A track
 /// row's codec ticket mirrors all three, and rebuilding one for a
@@ -156,7 +156,7 @@ pub const DEFAULT_MAX_TOTAL_CODEC_PARAMETER_BYTES: usize = 64 * 1024 * 1024;
 /// - the 100000×100000 header does not;
 /// - a whole-file attachment budget below the per-attachment one, or a
 ///   per-packet ceiling below the per-attachment one, would be
-///   incoherent — the narrower seat could never fire;
+///   incoherent — the narrower limit could never fire;
 /// - a per-packet ceiling above `c_int::MAX` could never fire either,
 ///   since `AVPacket.size` cannot express it.
 const _: () = {
@@ -209,7 +209,7 @@ const _: () = {
 ///
 /// Carried by every session that decodes frames and handed to the
 /// conversion that copies them. See the [module docs](self) for why the
-/// seats are finite and how [`Self::max_pixels`] reaches libavcodec as
+/// limits are finite and how [`Self::max_pixels`] reaches libavcodec as
 /// well as this crate.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct FrameLimits {
@@ -303,7 +303,7 @@ impl FrameLimits {
 /// and analysing a container — 5 MiB, which is FFmpeg's own
 /// `probesize` default.
 ///
-/// **What this seat is for, and what it is not.** Every other budget in
+/// **What this limit is for, and what it is not.** Every other budget in
 /// this crate bounds a copy *this crate* makes. This one bounds work
 /// **libavformat does before this crate is handed anything**:
 /// `avformat_open_input` and `avformat_find_stream_info` build the
@@ -356,7 +356,7 @@ pub const DEFAULT_MAX_CHAPTERS: u32 = 4096;
 /// already exists one layer down: the metadata reader refuses any
 /// single dictionary value past 64 KiB rather than truncating it. On
 /// its own that leaves the table's total at the count times that cap —
-/// 256 MiB at the two defaults. This seat is what turns those two
+/// 256 MiB at the two defaults. This limit is what turns those two
 /// finite numbers into a small one.
 pub const DEFAULT_MAX_TOTAL_CHAPTER_TITLE_BYTES: usize = 1024 * 1024;
 
@@ -403,7 +403,7 @@ pub const DEFAULT_MAX_TOTAL_STREAM_METADATA_BYTES: usize = 4 * 1024 * 1024;
 /// profile ahead of it pushed out. A picture came back silently rotated
 /// wrong.
 ///
-/// So the still road gets a seat sized to what it actually carries, and
+/// So the still road gets a limit sized to what it actually carries, and
 /// over-budget is a **named refusal** rather than a quiet truncation:
 /// side data that cannot be carried whole is a fact about the picture,
 /// not a detail to drop.
@@ -416,7 +416,7 @@ pub const DEFAULT_MAX_IMAGE_SIDE_DATA_BYTES: usize = DEFAULT_MAX_CODEC_PARAMETER
 /// [`crate::FfmpegImageDecoder`] decodes *is* an attachment: a whole
 /// file a container handed over eagerly. When it arrives through the
 /// demuxer it has already been charged against
-/// [`DEFAULT_MAX_ATTACHMENT_BYTES`], and this seat is what keeps the
+/// [`DEFAULT_MAX_ATTACHMENT_BYTES`], and this limit is what keeps the
 /// same ceiling in force when a caller builds the packet itself — the
 /// one road that skips the demux tier entirely. A 1 GiB packet ceiling
 /// here would mean the direct road was a gigabyte more permissive than
@@ -468,6 +468,18 @@ impl PacketLimits {
   }
 }
 
+/// Default for [`DecoderLimits::max_replay_bytes`]: the most bytes the
+/// software video road's queue of decoded pictures waiting for delivery
+/// holds at once.
+///
+/// 512 MiB — about forty 1080p 4:2:0 8-bit pictures, or fifteen 4K 4:2:2
+/// 10-bit ones. The queue takes a fallback replay's pictures and the tail a
+/// one-thread decoder is drained of where the session restarts it at a
+/// clean keyframe; reaching the budget stops the drain, resumable, until
+/// the caller has taken pictures — nothing is dropped. Sixty-four pictures
+/// bound it besides.
+pub const DEFAULT_MAX_REPLAY_BYTES: usize = 512 * 1024 * 1024;
+
 /// What opening and running one **decoder** may spend.
 ///
 /// Composes [`FrameLimits`] — what the frames it produces may cost —
@@ -479,12 +491,21 @@ impl PacketLimits {
 /// Taken at `open` by every decoder session in this crate, for the
 /// reason [`FrameLimits`] gives: half of it is written into an
 /// `AVCodecContext` whose ceilings cannot move after `avcodec_open2`.
+///
+/// The same reason carries [`Threads`], the one setting here that is not a
+/// byte ceiling: how many threads a software video decoder may decode on
+/// is also a context field libavcodec reads once, at open. Beside it sits
+/// the byte budget of the software video road's queue of pictures waiting
+/// for delivery ([`Self::max_replay_bytes`]), which this crate keeps, not
+/// libavcodec.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DecoderLimits {
   frame: FrameLimits,
   max_codec_parameter_bytes: usize,
   max_packet_bytes: usize,
   max_image_input_bytes: usize,
+  threads: Threads,
+  max_replay_bytes: usize,
 }
 
 impl Default for DecoderLimits {
@@ -496,8 +517,9 @@ impl Default for DecoderLimits {
 
 impl DecoderLimits {
   /// The defaults: [`FrameLimits::new`],
-  /// [`DEFAULT_MAX_CODEC_PARAMETER_BYTES`], [`DEFAULT_MAX_PACKET_BYTES`]
-  /// and [`DEFAULT_MAX_IMAGE_INPUT_BYTES`].
+  /// [`DEFAULT_MAX_CODEC_PARAMETER_BYTES`], [`DEFAULT_MAX_PACKET_BYTES`],
+  /// [`DEFAULT_MAX_IMAGE_INPUT_BYTES`], [`Threads::Auto`] and
+  /// [`DEFAULT_MAX_REPLAY_BYTES`].
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn new() -> Self {
     Self {
@@ -505,6 +527,8 @@ impl DecoderLimits {
       max_codec_parameter_bytes: DEFAULT_MAX_CODEC_PARAMETER_BYTES,
       max_packet_bytes: DEFAULT_MAX_PACKET_BYTES,
       max_image_input_bytes: DEFAULT_MAX_IMAGE_INPUT_BYTES,
+      threads: Threads::Auto,
+      max_replay_bytes: DEFAULT_MAX_REPLAY_BYTES,
     }
   }
 
@@ -532,16 +556,37 @@ impl DecoderLimits {
 
   /// [`Self::max_packet_bytes`] as the [`PacketLimits`] the boundary
   /// conversions take, so the send leg and the receive leg are handed
-  /// the same seat rather than two numbers that could drift.
+  /// the same limit rather than two numbers that could drift.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn packet_limits(&self) -> PacketLimits {
     PacketLimits::new().with_max_packet_bytes(self.max_packet_bytes)
   }
   /// Most compressed bytes one **image** decode may be handed. See
-  /// [`DEFAULT_MAX_IMAGE_INPUT_BYTES`] for why this is its own seat.
+  /// [`DEFAULT_MAX_IMAGE_INPUT_BYTES`] for why this is its own limit.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn max_image_input_bytes(&self) -> usize {
     self.max_image_input_bytes
+  }
+  /// How many threads a **software video** decoder opened under these
+  /// limits may decode on. See [`Threads`] for what each arm writes and
+  /// which roads read it.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn threads(&self) -> Threads {
+    self.threads
+  }
+  /// Most bytes the **software video** road's queue of decoded pictures
+  /// waiting for delivery may hold — a fallback replay's pictures, and the
+  /// tail a one-thread decoder is drained of where the session restarts it
+  /// at a clean keyframe ([`DEFAULT_MAX_REPLAY_BYTES`] by default; 64
+  /// pictures bound it besides). A picture's bytes are the buffers it
+  /// references. A drain that reaches it stops and answers
+  /// [`Sent::MustDrain`](mediadecode::Sent::MustDrain), resuming once the
+  /// caller has taken pictures, so nothing is dropped; a picture that alone
+  /// exceeds it is refused by name, as
+  /// [`Error::ReplayQueueFull`](crate::Error::ReplayQueueFull).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn max_replay_bytes(&self) -> usize {
+    self.max_replay_bytes
   }
 
   /// Sets the frame ceilings (consuming builder).
@@ -572,6 +617,21 @@ impl DecoderLimits {
     self.max_image_input_bytes = value;
     self
   }
+  /// Sets the software video decoder's threads (consuming builder).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
+  pub const fn with_threads(mut self, value: Threads) -> Self {
+    self.threads = value;
+    self
+  }
+  /// Sets the software video road's replay-queue budget (consuming
+  /// builder).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  #[must_use]
+  pub const fn with_max_replay_bytes(mut self, value: usize) -> Self {
+    self.max_replay_bytes = value;
+    self
+  }
 
   /// Sets the frame ceilings in place.
   #[cfg_attr(not(tarpaulin), inline(always))]
@@ -596,6 +656,148 @@ impl DecoderLimits {
   pub const fn set_max_image_input_bytes(&mut self, value: usize) -> &mut Self {
     self.max_image_input_bytes = value;
     self
+  }
+  /// Sets the software video decoder's threads in place.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn set_threads(&mut self, value: Threads) -> &mut Self {
+    self.threads = value;
+    self
+  }
+  /// Sets the software video road's replay-queue budget in place.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn set_max_replay_bytes(&mut self, value: usize) -> &mut Self {
+    self.max_replay_bytes = value;
+    self
+  }
+}
+
+/// How many threads a **software video** decoder may decode on.
+///
+/// Written to `AVCodecContext.thread_count` and `thread_type` before
+/// `avcodec_open2`, because libavcodec reads both once, at open, and
+/// neither can move after it — the same reason the rest of
+/// [`DecoderLimits`] is taken at `open`.
+///
+/// # The default is [`Auto`](Self::Auto)
+///
+/// Through 0.15 nothing was written, and libavcodec kept its option
+/// default of **one** thread: a software decode of 4K H.264 High 4:2:2
+/// 10-bit — a stream VideoToolbox does not take — ran on one core, and
+/// that core was the whole video wall of a library scan
+/// ([mediagraph#537](https://github.com/findit-studio/mediagraph/issues/537)).
+/// `Auto` hands the count to libavcodec, which picks one more thread
+/// than the host has cores, at most 16, for a codec that can thread.
+///
+/// # The kind of threading is libavcodec's to pick
+///
+/// [`Auto`](Self::Auto) and [`Count`](Self::Count) write
+/// `thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE`. libavcodec takes
+/// frame threading where the codec supports it (H.264, HEVC, MPEG-4
+/// part 2, VP8, VP9, …), slice threading where it supports only that,
+/// and one thread where it supports neither. What it settled on is
+/// read back after the open as
+/// [`active_threads`](crate::CarrierVideoStreamDecoder::active_threads).
+///
+/// # What frame threading costs, and what it does not
+///
+/// * **Latency.** A frame-threaded decoder keeps up to one frame per
+///   thread in flight, so its first picture comes out up to that many
+///   packets later, and every picture after it lags by as much.
+///   Nothing a caller does changes: the push face already answers
+///   "needs input" for as long as the decoder wants more, and
+///   `send_eof` drains whatever is still in flight.
+/// * **Memory.** Each frame in flight is a picture of its own — a 4K
+///   4:2:2 10-bit picture is about 33 MB — and each thread holds a copy
+///   of the decoder's state. [`FrameLimits`] still prices every one of
+///   those pictures before it is allocated; it does not bound how many
+///   are in flight at once. A deployment that needs that bound says
+///   [`Count`](Self::Count).
+/// * **Not the pictures.** Frame threading changes *when* a picture
+///   comes out, never its bytes: the same stream decodes to the same
+///   planes under `Auto` and under [`Single`](Self::Single).
+///
+/// A keyframe-only read — the shape of `ffmpeg -skip_frame nokey`, or a
+/// caller that sends only keyframe packets — still gains: keyframes do
+/// not reference one another, so each is decoded on a thread of its
+/// own.
+///
+/// # Every software road; a fallback's from the next keyframe
+///
+/// A session pinned to software and one that finds no hardware backend
+/// at open decode on these threads from the first packet. A session that
+/// falls back from hardware mid-stream commits a decoder on **one**
+/// thread: the fallback is a transaction — the packets it hands the
+/// software decoder must decode, or the session stays where it was and
+/// the packets go back to the caller — and a frame-threaded decoder
+/// reports a packet's failure only once it has a packet per thread in
+/// flight. The session returns to these threads at the next **clean**
+/// random access point — a keyframe nothing after it references past: an
+/// H.264 IDR, an HEVC IDR or BLA, a VP8, VP9 or AV1 keyframe, any keyframe
+/// of a stream that reorders nothing — or at the first keyframe after a
+/// seek; after a post-commit degrade, not before its resync. There the
+/// one-thread decoder is drained, every picture it holds delivered in
+/// order, and closed, and a decoder on these threads is opened and fed
+/// from the keyframe on. One software decoder is open at any instant, no
+/// packet is decoded twice, and no picture is lost. Until that keyframe the
+/// session decodes on one thread — on an H.264 file of IDR GOPs whose first
+/// packet the hardware refuses, the first GOP at most — and
+/// [`active_threads`](crate::CarrierVideoStreamDecoder::active_threads)
+/// says so. A fallback at the end of the stream keeps its one thread until
+/// a seek, and the first keyframe after it. The session's threads are
+/// attempted once: if a decoder on them will not open, the session stays on
+/// one thread for good.
+///
+/// An open-GOP keyframe — an HEVC CRA, an H.264 recovery point that is not
+/// an IDR — is never a switch point: its leading pictures reference the
+/// GOP before it, which a decoder opened there never saw, and would be
+/// dropped or concealed. So a stream whose keyframes are all open (x265's
+/// default CRA cadence) stays on the one thread after a fallback until
+/// the caller seeks, and the session warns once when a fallback has run a
+/// minute of stream that way, naming the codec and the reason.
+///
+/// # The roads it does not reach
+///
+/// The **hardware** road opens its contexts with libavcodec's default
+/// of one thread — the device does the decoding, and its sessions
+/// carry their own probe and replay state that frame threading would
+/// reorder. The **audio**, **subtitle** and **image** decoders read
+/// nothing here either and keep that same one thread: the setting answers
+/// a video wall, and a one-shot image decode has one frame to share
+/// out.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Threads {
+  /// libavcodec's own choice: `thread_count = 0`, resolved at open to
+  /// one more thread than the host has cores, at most 16, for a codec
+  /// that can thread at all.
+  #[default]
+  Auto,
+  /// Exactly this many threads, for a codec that can thread at all.
+  ///
+  /// libavcodec builds one decoding context per thread, so the count is
+  /// also a memory figure; FFmpeg warns above 16. A count above
+  /// `c_int::MAX` is written as `c_int::MAX`, the most the field holds.
+  /// `Count(1)` is [`Single`](Self::Single) by another name.
+  Count(core::num::NonZeroU32),
+  /// One thread: `thread_count = 1`, which is what every software
+  /// decode in this crate ran on through 0.15.
+  Single,
+}
+
+impl Threads {
+  /// The value written to `AVCodecContext.thread_count`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub(crate) const fn thread_count(self) -> core::ffi::c_int {
+    match self {
+      Self::Auto => 0,
+      Self::Count(count) => {
+        if count.get() > core::ffi::c_int::MAX as u32 {
+          core::ffi::c_int::MAX
+        } else {
+          count.get() as core::ffi::c_int
+        }
+      }
+      Self::Single => 1,
+    }
   }
 }
 
@@ -665,10 +867,10 @@ impl DemuxLimits {
   /// **Not bounded:** allocation *amplification* inside a parser. A
   /// container can describe, in a handful of bytes, a structure whose
   /// in-memory form is much larger, and nothing outside libavformat can
-  /// see that happen. What this seat guarantees is that the input to
+  /// see that happen. What this limit guarantees is that the input to
   /// that amplification is finite and small; bounding its output is the
   /// substrate's own hardening territory, and FFmpeg has its own
-  /// `max_streams` / `max_index_size` / `max_picture_buffer` seats for
+  /// `max_streams` / `max_index_size` / `max_picture_buffer` options for
   /// exactly that — [`Self::max_streams`] sets the first of them.
   ///
   /// **Not bounded on the path entrypoint:** the byte meter needs an
@@ -681,7 +883,7 @@ impl DemuxLimits {
     self.max_probe_bytes
   }
   /// The ceiling on streams a container may declare. See
-  /// [`Self::max_probe_bytes`] for why a seat inside libavformat is
+  /// [`Self::max_probe_bytes`] for why a limit inside libavformat is
   /// worth setting at all.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn max_streams(&self) -> u32 {
@@ -708,7 +910,7 @@ impl DemuxLimits {
   /// claiming an enormous table is refused rather than mirrored. Unlike
   /// [`Self::max_streams`], which is handed to libavformat and enforced
   /// inside it, this one is this crate's own: libavformat has no
-  /// `max_chapters` knob, and an `AVChapter` is cheap enough there that
+  /// `max_chapters` option, and an `AVChapter` is cheap enough there that
   /// the probe budget does not reach the count either.
   ///
   /// A file over the ceiling **fails to open**, with

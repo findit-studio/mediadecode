@@ -103,6 +103,12 @@ pub struct CarrierSubtitleStreamDecoder<C: crate::FfmpegCarrier> {
   /// draining to the end of a subtitle track had no terminating
   /// condition to look for at all.
   eof: bool,
+  /// **Side data a packet with no body carried**, waiting for the next packet
+  /// with a body, which carries it in front of its own
+  /// ([`boundary::Deferred`]): `avcodec_decode_subtitle2` hands an empty
+  /// packet to a decoder with a delay as its flush (decode.c:954), the one
+  /// ffmpeg's own subtitle road sends at the end.
+  deferred: boundary::Deferred,
   time_base: Timebase,
   /// Retained, not discarded at open: the send path judges
   /// [`DecoderLimits::max_packet_bytes`] against every packet it
@@ -156,6 +162,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierSubtitleStreamDecoder<C
       scratch: ScratchSubtitle::new(),
       scratch_pending: false,
       eof: false,
+      deferred: boundary::Deferred::default(),
       time_base,
       limits,
       _callback_state: callback_state,
@@ -227,20 +234,34 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierSubtitleStreamDecoder<C
     let state: *const crate::ffi::CallbackState = &*self._callback_state;
     let decoder = &mut self.decoder;
     let scratch = &mut self.scratch.inner;
-    let got = boundary::with_ffmpeg_subtitle_packet::<C, _>(
+    let submitted = boundary::with_ffmpeg_subtitle_packet::<C, _>(
       packet,
       self.limits.packet_limits(),
       // Nothing on this road records what it is sent, so the packet
       // really does die inside the call and its body may be shared.
       crate::carrier::BodyRoute::Submission,
-      |av_pkt| {
-        decoder.decode(av_pkt, scratch).map_err(|e| {
+      // A packet with no body is not submitted: its side data rides the
+      // next packet with one ([`Self::deferred`]).
+      &mut self.deferred,
+      // The inline decode answers no back pressure — a held cue was refused
+      // above, before the packet was rebuilt — so what rode the packet is
+      // spent with it, but where its refusal says no decoder saw it
+      // ([`boundary::Disposition`]).
+      |av_pkt| match decoder.decode(av_pkt, scratch) {
+        Ok(got) => (Ok(got), boundary::Disposition::Taken),
+        Err(e) => {
           // SAFETY: the callback state outlives this decoder.
-          SubtitleDecodeError::Decode(crate::decoder::software_exit(unsafe { &*state }, e))
-        })
+          let named = crate::decoder::software_exit(unsafe { &*state }, e);
+          let disposition = crate::video::refused_in_step(e, &named);
+          (Err(SubtitleDecodeError::Decode(named)), disposition)
+        }
       },
     )
-    .map_err(|e| SubtitleDecodeError::Decode(Error::PacketBuild(e)))??;
+    .map_err(|e| SubtitleDecodeError::Decode(Error::PacketBuild(e)))?;
+    let got = match submitted {
+      boundary::Submission::NoBody => false,
+      boundary::Submission::Answered(got) => got?,
+    };
     // The cue stays in the scratch until a carrier exists for it — see
     // [`Self::scratch_pending`]. Nothing is converted here.
     self.scratch_pending = got;
@@ -312,6 +333,8 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierSubtitleStreamDecoder<C
     // libavcodec refuses a second flush packet with `AVERROR_EOF`, and
     // that is the substrate's word, reported rather than papered over.
     self.eof = true;
+    // No packet comes to carry what a packet with no body deferred.
+    self.deferred.abandon(boundary::Abandoned::End);
     Ok(Sent::Accepted)
   }
 
@@ -320,6 +343,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierSubtitleStreamDecoder<C
     // A held cue belongs to the position being abandoned.
     self.scratch_pending = false;
     self.scratch.clear();
+    // So does side data a packet with no body left for the next packet
+    // ([`Self::deferred`]): dropped, and said so.
+    self.deferred.abandon(boundary::Abandoned::Flush);
     // And the session is open again: flush is how a caller reuses this
     // decoder for another stream, so the end it declared is retracted
     // with the rest of the position.
@@ -441,3 +467,15 @@ pub enum SubtitleDecodeError {
   #[error("send_packet after send_eof; flush() first to start another stream")]
   AfterEof,
 }
+
+#[cfg(test)]
+impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierSubtitleStreamDecoder<C> {
+  /// The side data types a packet with no body left waiting for the next
+  /// packet with one ([`Self::deferred`]).
+  pub(crate) fn deferred_kinds_for_test(&self) -> Vec<i32> {
+    self.deferred.kinds()
+  }
+}
+
+#[cfg(test)]
+mod tests;

@@ -126,6 +126,49 @@ fn packet_side_data_counts_against_probe_budget() {
   );
 }
 
+/// **A packet with no data — side data alone — is cloned with none.**
+/// `av_packet_ref` gives a source without a buffer one of its own, `data`
+/// pointing into it (packet.c:452-460), and `avcodec_send_packet` refuses a
+/// body of size 0 that is not null (decode.c:742-743): a probe history
+/// recording the packet so would hand a replay a packet the decoder refuses.
+/// A packet with a body is still shared, by reference.
+#[test]
+fn a_packet_with_no_data_is_cloned_with_none() {
+  use ffmpeg_next::ffi::{AVPacketSideDataType, av_packet_new_side_data};
+
+  let mut bodiless = Packet::empty();
+  // SAFETY: `bodiless` owns a live, zeroed AVPacket; the type is a constant of
+  // this build, and the four bytes written are the ones just allocated.
+  unsafe {
+    let side = av_packet_new_side_data(
+      bodiless.as_mut_ptr(),
+      AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA,
+      4,
+    );
+    assert!(!side.is_null(), "av_packet_new_side_data");
+    core::ptr::copy_nonoverlapping([1u8, 2, 3, 4].as_ptr(), side, 4);
+  }
+  bodiless.set_pts(Some(7));
+  let cloned = try_clone_packet(&bodiless).expect("cloned");
+  assert!(cloned.data().is_none(), "no data, as the source");
+  assert_eq!(cloned.size(), 0);
+  assert_eq!(cloned.pts(), Some(7), "its properties copied");
+  assert_eq!(packet_side_data_count(&cloned), 1, "its side data copied");
+  assert_eq!(
+    packet_side_data_bytes(&cloned, MAX_PROBE_PACKET_SIDE_DATA_ENTRIES),
+    packet_side_data_bytes(&bodiless, MAX_PROBE_PACKET_SIDE_DATA_ENTRIES),
+  );
+
+  let body = Packet::copy(&[9u8, 8, 7]);
+  let shared = try_clone_packet(&body).expect("cloned");
+  assert_eq!(shared.data(), Some(&[9u8, 8, 7][..]));
+  assert_eq!(
+    shared.data().map(<[u8]>::as_ptr),
+    body.data().map(<[u8]>::as_ptr),
+    "a body shared by reference"
+  );
+}
+
 #[test]
 fn packet_side_data_is_zero_when_no_side_data() {
   let packet = Packet::new(64);
@@ -486,9 +529,8 @@ fn partial_build_state_into_owned_disarms_and_returns_originals() {
     declined_pixels: core::sync::atomic::AtomicI64::new(0),
     declined_limit: core::sync::atomic::AtomicI64::new(0),
     max_frame_bytes: u64::MAX,
-    frame_budget_declined: core::sync::atomic::AtomicBool::new(false),
-    declined_frame_bytes: core::sync::atomic::AtomicU64::new(0),
-    declined_frame_audio: core::sync::atomic::AtomicBool::new(false),
+    frame_refusals: crate::ffi::FrameRefusals::new(),
+    declining_pts: core::sync::atomic::AtomicI64::new(i64::MIN),
   }));
 
   let g = PartialBuildState {
@@ -1052,9 +1094,8 @@ fn the_declination_reader_reports_then_clears() {
     declined_pixels: AtomicI64::new(0),
     declined_limit: AtomicI64::new(0),
     max_frame_bytes: u64::MAX,
-    frame_budget_declined: core::sync::atomic::AtomicBool::new(false),
-    declined_frame_bytes: core::sync::atomic::AtomicU64::new(0),
-    declined_frame_audio: core::sync::atomic::AtomicBool::new(false),
+    frame_refusals: crate::ffi::FrameRefusals::new(),
+    declining_pts: core::sync::atomic::AtomicI64::new(i64::MIN),
   };
   assert!(ceiling_declination_of(&quiet).is_none());
 
@@ -1067,9 +1108,8 @@ fn the_declination_reader_reports_then_clears() {
     declined_pixels: AtomicI64::new(1920 * 1088),
     declined_limit: AtomicI64::new(1_048_576),
     max_frame_bytes: u64::MAX,
-    frame_budget_declined: core::sync::atomic::AtomicBool::new(false),
-    declined_frame_bytes: core::sync::atomic::AtomicU64::new(0),
-    declined_frame_audio: core::sync::atomic::AtomicBool::new(false),
+    frame_refusals: crate::ffi::FrameRefusals::new(),
+    declining_pts: core::sync::atomic::AtomicI64::new(i64::MIN),
   };
   match ceiling_declination_of(&declined) {
     Some(Error::HwSurfaceTooLarge(p)) => {
@@ -1187,8 +1227,8 @@ impl JudgeCase {
         "the harness codec must open",
       );
       // Set after the open, so nothing resets them — including the
-      // callback state, which is the seat the judge reads its budget
-      // from. A context this crate did not build has no seat and is
+      // callback state, which is the slot the judge reads its budget
+      // from. A context this crate did not build has no such slot and is
       // refused, so the harness installs one exactly as
       // `build_codec_context` does.
       (*ctx).max_pixels = self.max_pixels;
@@ -1199,9 +1239,8 @@ impl JudgeCase {
         declined_pixels: core::sync::atomic::AtomicI64::new(0),
         declined_limit: core::sync::atomic::AtomicI64::new(0),
         max_frame_bytes: self.max_frame_bytes,
-        frame_budget_declined: core::sync::atomic::AtomicBool::new(false),
-        declined_frame_bytes: core::sync::atomic::AtomicU64::new(0),
-        declined_frame_audio: core::sync::atomic::AtomicBool::new(false),
+        frame_refusals: crate::ffi::FrameRefusals::new(),
+        declining_pts: core::sync::atomic::AtomicI64::new(i64::MIN),
       });
       (*ctx).opaque = (&raw mut *state).cast();
 
@@ -1247,7 +1286,7 @@ fn the_callback_prices_the_frames_layout_not_the_contexts() {
   );
 
   // And the same frame under a ceiling that genuinely covers it is
-  // delegated — the seat refuses cost, not multichannel audio.
+  // delegated — the judge refuses cost, not multichannel audio.
   JudgeCase::audio(DBLP, 130_000, 255)
     .with_max_frame_bytes(u64::MAX)
     .run()
@@ -1294,7 +1333,7 @@ fn the_callback_recovers_each_mediums_ceiling_independently() {
     "a zero byte budget admitted an audio frame",
   );
 
-  // A generous pixel seat does not rescue a starved byte seat.
+  // A generous pixel limit does not rescue a starved byte limit.
   assert!(
     JudgeCase::audio(S16, 65_535, 8)
       .with_max_pixels(i64::MAX)
@@ -1304,8 +1343,8 @@ fn the_callback_recovers_each_mediums_ceiling_independently() {
   );
 
   // **The shape that disproved the old recovery.** A 256x256 frame at
-  // 16 bytes a pixel under a tight *pixel* seat and a generous *byte*
-  // seat satisfies both of the caller's limits — 65,536 pixels, and
+  // 16 bytes a pixel under a tight *pixel* limit and a generous *byte*
+  // limit satisfies both of the caller's limits — 65,536 pixels, and
   // 1,050,624 bytes against 2 MiB — while the recovered ceiling was
   // `max_pixels * 16 = 1,048,576`. It was refused by exactly the 2,048
   // bytes of alignment and slack the recovery could not see, which is
@@ -1317,8 +1356,8 @@ fn the_callback_recovers_each_mediums_ceiling_independently() {
     .run()
     .expect("a frame inside both of the caller's limits must be allocated");
 
-  // And the other direction still refuses: a generous pixel seat buys
-  // nothing past the byte seat.
+  // And the other direction still refuses: a generous pixel limit buys
+  // nothing past the byte limit.
   assert!(
     JudgeCase::video(RGBAF32, 256, 256)
       .with_max_pixels(i64::MAX)
@@ -1346,7 +1385,7 @@ fn the_callback_judges_cost_and_leaves_logical_extent_to_libavcodec() {
   // This is what the removed gate got wrong: it compared the *aligned*
   // dimensions against `max_pixels`, which is
   // `min(pixel limit, byte ceiling / worst)` — so when the pixel limit
-  // was the tighter seat, alignment inflation alone refused a frame
+  // was the tighter bound, alignment inflation alone refused a frame
   // that was inside both requested limits, for arithmetic the caller
   // never asked about.
   JudgeCase::video(GRAY8, 65_536, 1)

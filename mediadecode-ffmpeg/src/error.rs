@@ -49,7 +49,7 @@ pub enum Error {
   /// The decoder tier has no options object of its own for this, so it
   /// applies the default ceiling. A caller that needs a larger one
   /// opens the parameters through the demux tier, where
-  /// [`DemuxLimits`](crate::DemuxLimits) carries the seat.
+  /// [`DemuxLimits`](crate::DemuxLimits) carries the limit.
   #[error(transparent)]
   ParametersTooLarge(#[from] crate::demuxer::ParametersTooLarge),
 
@@ -88,12 +88,12 @@ pub enum Error {
   /// The CPU frame a hardware->CPU transfer would allocate is larger
   /// than [`FrameLimits::max_frame_bytes`](crate::FrameLimits::max_frame_bytes).
   ///
-  /// The hardware road's own seat. `judge_buffer` — the allocator hook
+  /// The hardware road's own check. `judge_buffer` — the allocator hook
   /// that applies the byte ceiling to aligned dimensions — is **not** a
   /// universal choke point: `ff_get_buffer` calls `hwaccel->alloc_frame`
   /// directly for VideoToolbox h264/hevc/vp9 and never reaches
   /// `get_buffer2` at all, and `av_hwframe_transfer_data` allocates its
-  /// CPU destination outside both. This is the seat for that second
+  /// CPU destination outside both. This is the check for that second
   /// road, judged before the transfer rather than after it.
   #[error(transparent)]
   HwTransferTooLarge(#[from] HwTransferTooLarge),
@@ -146,6 +146,607 @@ pub enum Error {
   /// gives a free `impl From<FallbackFailed> for Error`.
   #[error(transparent)]
   FallbackFailed(#[from] FallbackFailed),
+
+  /// A decoded picture alone exceeds the byte budget of the software video
+  /// road's queue of pictures waiting for delivery
+  /// ([`DecoderLimits::max_replay_bytes`](crate::DecoderLimits::max_replay_bytes))
+  /// — a picture a fallback replay decoded, or one of the tail a one-thread
+  /// decoder is drained of where the session restarts it at a keyframe. No
+  /// drain can make room for it, so it is refused by name; see
+  /// [`ReplayQueueFull`].
+  #[error(transparent)]
+  ReplayQueueFull(#[from] ReplayQueueFull),
+
+  /// A software video decoder opened set to output pictures before their
+  /// recovery — `AV_CODEC_FLAG_OUTPUT_CORRUPT` or `AV_CODEC_FLAG2_SHOW_ALL`
+  /// set on its codec context after the open — is refused by name; see
+  /// [`UnrecoveredOutput`].
+  #[error(transparent)]
+  UnrecoveredOutput(#[from] UnrecoveredOutput),
+
+  /// A decoded picture holds an allocation the software video road's queue
+  /// of pictures waiting for delivery cannot price — of no stated size, or
+  /// owned by no buffer reference — so it is refused by name rather than
+  /// queued as costing nothing; see [`UnpricedFrame`].
+  #[error(transparent)]
+  UnpricedFrame(#[from] UnpricedFrame),
+
+  /// A post-commit fallback's software decoder wraps another implementation
+  /// of the codec — a hardware or OS framework, or an external library —
+  /// rather than being one of libavcodec's own, so the resync the fallback
+  /// owes could never be proved; the fallback is refused by name at the
+  /// open it would commit; see [`ResyncUnprovable`].
+  #[error(transparent)]
+  ResyncUnprovable(#[from] ResyncUnprovable),
+
+  /// A software video decoder the session would open on its codec
+  /// parameters while their extradata is unknown — a packet carrying a new
+  /// extradata was refused with an error that does not say whether the
+  /// decoder took it, a decode error among them — is refused by name; see
+  /// [`ExtradataUnknown`].
+  #[error(transparent)]
+  ExtradataUnknown(#[from] ExtradataUnknown),
+
+  /// A packet's `AV_PKT_DATA_NEW_EXTRADATA` is a record FFmpeg's decoder
+  /// would reject, or apply only in part, without saying so — so the packet
+  /// was refused before any decoder saw it, still the caller's; see
+  /// [`ExtradataRejected`].
+  #[error(transparent)]
+  ExtradataRejected(#[from] ExtradataRejected),
+
+  /// A decoder the session would open fresh — a post-commit fallback's, a
+  /// reopen — could not be opened holding the parameter sets the decoder it
+  /// takes over from holds: no record re-creates them, or whether that
+  /// decoder holds one cannot be told; see [`SetsUnrecordable`].
+  #[error(transparent)]
+  SetsUnrecordable(#[from] SetsUnrecordable),
+}
+
+/// Payload for [`Error::SetsUnrecordable`].
+///
+/// FFmpeg's H.264 and HEVC decoders keep every parameter set they store, by
+/// id, for as long as they live — from the extradata they were opened on,
+/// from a packet's `AV_PKT_DATA_NEW_EXTRADATA`, and from every packet that
+/// carries one in band, whatever its key flag — and a record replaces only
+/// the ids it carries. A decoder opened fresh holds only the sets of the
+/// record it is opened on: on a stream whose sets came in band, an IDR
+/// carrying none fails on it, and every picture to the next set is lost. So
+/// the session keeps what the decoder serving holds, as FFmpeg 9 reads it,
+/// and opens a decoder fresh — a switch to the session's threads, a reopen,
+/// a post-commit fallback's cold decoder, a probe-era fallback's replay — on
+/// a record carrying all of it, in the framing that decoder reads packets
+/// in, read back as FFmpeg reads it before it is used.
+///
+/// Where no record can carry what the decoder serving holds, or whether it
+/// holds a set cannot be told ([`Unrecordable`]), the decoder is not opened:
+/// a switch to the session's threads is declined, the decoder serving kept,
+/// and a reopen or a fallback is refused by this name, the packet still the
+/// caller's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+  "no decoder for {codec:?} could be opened holding the parameter sets the decoder serving holds: \
+   {reason}"
+)]
+pub struct SetsUnrecordable {
+  codec: crate::CodecId,
+  reason: Unrecordable,
+}
+
+impl SetsUnrecordable {
+  /// Constructs a [`SetsUnrecordable`] payload.
+  #[inline]
+  pub const fn new(codec: crate::CodecId, reason: Unrecordable) -> Self {
+    Self { codec, reason }
+  }
+  /// The stream's codec.
+  #[inline]
+  pub const fn codec(&self) -> crate::CodecId {
+    self.codec
+  }
+  /// Why no record carries what the decoder serving holds.
+  #[inline]
+  pub const fn reason(&self) -> Unrecordable {
+    self.reason
+  }
+}
+
+/// Why no record carries the parameter sets a decoder holds
+/// ([`SetsUnrecordable`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Unrecordable {
+  /// Whether the decoder holds a set cannot be told: a packet carrying it
+  /// was refused with an error that does not say whether the decoder read
+  /// it, a flush dropped it before the decoder was seen to read it, or it
+  /// was read against a set held so, which decides whether FFmpeg stores it.
+  Unknown,
+  /// An H.264 picture parameter set the decoder holds was read under a
+  /// sequence parameter set its id no longer holds, and is decoded under
+  /// that one: a record reads every sequence parameter set first, and
+  /// binds the picture parameter set to the one held now.
+  Superseded,
+  /// The decoder frames packets as no record sets it to: H.264 start codes
+  /// with a NAL length size of four left from an earlier `avcC` record, under
+  /// which FFmpeg re-guesses the framing of every packet.
+  Framing,
+  /// A set whose reading ran past its payload: its last fields were read off
+  /// the bytes after it, which a record does not reproduce.
+  PastEnd(ParameterSet),
+  /// More sets than an `avcC` record counts: 31 sequence or 255 picture
+  /// parameter sets.
+  TooMany(ParameterSet),
+  /// A set longer than the 16-bit length of a record's entry.
+  Oversized(ParameterSet),
+  /// The record, read back as FFmpeg reads it, would not give the decoder
+  /// what the decoder serving holds — for HEVC, FFmpeg's decoder opened on
+  /// it strictly (`AV_EF_EXPLODE`), the second witness of a record carrying
+  /// no set FFmpeg stores with a warning, refuses a set it carries.
+  Unverified,
+  /// The decoder is an implementation that wraps another, whose parameter
+  /// sets this crate does not read.
+  Wrapped,
+}
+
+impl core::fmt::Display for Unrecordable {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    match self {
+      Self::Unknown => f.write_str("whether the decoder holds a parameter set cannot be told"),
+      Self::Superseded => f.write_str(
+        "a picture parameter set was read under a sequence parameter set its id no longer holds",
+      ),
+      Self::Framing => f.write_str("the decoder frames packets as no record sets it to"),
+      Self::PastEnd(set) => write!(f, "a {set}'s reading ran past its payload"),
+      Self::TooMany(set) => write!(f, "more {set}s than the record counts"),
+      Self::Oversized(set) => write!(f, "a {set} longer than a record's entry"),
+      Self::Unverified => {
+        f.write_str("the record, read back as FFmpeg reads it, does not give what is held")
+      }
+      Self::Wrapped => f.write_str(
+        "the decoder wraps another implementation, whose parameter sets this crate does not read",
+      ),
+    }
+  }
+}
+
+/// Payload for [`Error::ExtradataRejected`].
+///
+/// A packet carrying `AV_PKT_DATA_NEW_EXTRADATA` changes a stream's codec
+/// parameters from that packet on. FFmpeg's H.264 decoder applies the
+/// record as it begins to decode the packet and drops what
+/// `ff_h264_decode_extradata` answers (`h264_decode_frame`, FFmpeg 9's
+/// h264dec.c): a record it rejects — an `avcC` record shorter than seven
+/// bytes, one whose parameter set runs past its end — leaves the decoder on
+/// its old NAL length size and parameter sets, and a parameter set it
+/// cannot parse is skipped while the rest of the record applies. A session
+/// that took such a record as the stream's would read every later packet,
+/// and open every later decoder, on parameters the decoder serving never
+/// adopted. So the packet is refused before any decoder sees it: nothing of
+/// the session changes, and the packet is still the caller's — to send
+/// again without the record, or to drop. A record riding a packet with no
+/// body rides the next packet with one, and is judged as that packet's as
+/// soon as it is handed over: refused so, the packet with no body is the
+/// caller's and nothing waits.
+///
+/// The record is read as FFmpeg 9 reads it, its bit reader and parameter
+/// set parsers mirrored, against the sequence parameter sets the decoder
+/// holds already — a picture parameter set the record carries may refer to
+/// one of them — as the session keeps them; a set it holds in doubt reads as
+/// held by nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+  "a packet's new extradata for {codec:?} was refused before any decoder saw it: {reason}; the \
+   decoder would have kept parameters other than the record's"
+)]
+pub struct ExtradataRejected {
+  codec: crate::CodecId,
+  reason: ExtradataRejection,
+}
+
+impl ExtradataRejected {
+  /// Constructs an [`ExtradataRejected`] payload.
+  #[inline]
+  pub const fn new(codec: crate::CodecId, reason: ExtradataRejection) -> Self {
+    Self { codec, reason }
+  }
+  /// The stream's codec.
+  #[inline]
+  pub const fn codec(&self) -> crate::CodecId {
+    self.codec
+  }
+  /// What FFmpeg would have made of the record.
+  #[inline]
+  pub const fn reason(&self) -> ExtradataRejection {
+    self.reason
+  }
+}
+
+/// Why a packet's new extradata was refused ([`ExtradataRejected`]): what
+/// FFmpeg's decoder would have made of the record instead of applying it
+/// whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ExtradataRejection {
+  /// An `avcC` record shorter than the seven bytes FFmpeg reads before its
+  /// first parameter set: rejected whole.
+  TooShort {
+    /// The record's length.
+    size: usize,
+  },
+  /// A parameter set whose length runs past the record: FFmpeg rejects the
+  /// record there, the sets before it applied and its NAL length size not.
+  Overrun(ParameterSet),
+  /// A parameter set FFmpeg fails to parse, read every way it reads one:
+  /// skipped, the decoder keeping the set it had of that id, while the rest
+  /// of the record applies.
+  Unparsed(ParameterSet),
+  /// A parameter set FFmpeg fails to parse that is too large for the
+  /// escaping retry it gives an `avcC` entry: the record rejected there.
+  Oversized(ParameterSet),
+  /// A picture parameter set referring to a sequence parameter set neither
+  /// the record carries nor the decoder holds — or holds for certain:
+  /// FFmpeg fails it, and the rest of the record applies.
+  Unresolved,
+}
+
+impl core::fmt::Display for ExtradataRejection {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    match self {
+      Self::TooShort { size } => write!(
+        f,
+        "an avcC record of {size} bytes, under the seven FFmpeg reads"
+      ),
+      Self::Overrun(set) => write!(f, "a {set} whose length runs past the record"),
+      Self::Unparsed(set) => write!(f, "a {set} FFmpeg fails to parse, and would skip"),
+      Self::Oversized(set) => write!(
+        f,
+        "a {set} FFmpeg fails to parse, too large for its escaping retry"
+      ),
+      Self::Unresolved => f.write_str(
+        "a picture parameter set referring to a sequence parameter set neither the record nor \
+         the decoder holds",
+      ),
+    }
+  }
+}
+
+/// A kind of parameter set a codec's extradata carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ParameterSet {
+  /// A sequence parameter set.
+  Sequence,
+  /// A picture parameter set.
+  Picture,
+  /// An HEVC video parameter set.
+  Video,
+}
+
+impl core::fmt::Display for ParameterSet {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.write_str(match self {
+      Self::Sequence => "sequence parameter set",
+      Self::Picture => "picture parameter set",
+      Self::Video => "video parameter set",
+    })
+  }
+}
+
+/// Payload for [`Error::ExtradataUnknown`].
+///
+/// A packet carrying `AV_PKT_DATA_NEW_EXTRADATA` changes a stream's codec
+/// parameters from that packet on, and FFmpeg's H.264 and HEVC decoders
+/// apply it as they begin to decode the packet. The session takes the new
+/// extradata for its own once the decoder takes the packet, and holds it
+/// provisionally until the decoder is seen to have read the packet — it
+/// answers "needs input" or the end, or, decoding a packet inside the
+/// submission that hands it over, takes a later one: until then the packet
+/// may still wait in libavcodec's input slot, unread. The extradata is
+/// unknown when that cannot be told any more ([`ExtradataDoubt`]): a
+/// decoder refuses the packet with an error that does not say whether it
+/// got that far — any error libavcodec reports, invalid data among them —
+/// or reports one before it was seen to read it, a flush drops the packet
+/// unread, or the hardware fails and no fallback replaces it. A corrupt
+/// packet at an extradata change leaves it unknown, then, until a packet
+/// carrying a new one is taken: until then the session reads no H.264 or
+/// HEVC resync anchor or switch point under its own, switches to no new
+/// decoder, and refuses by this name to open a decoder on it — a
+/// post-commit fallback's cold decoder, a reopen — rather than decode on
+/// parameters that may be stale. A packet carrying its own new extradata is
+/// read, and opened on, under that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+  "the stream's codec extradata is unknown: {doubt}; no decoder is opened on extradata that may \
+   be stale"
+)]
+pub struct ExtradataUnknown {
+  doubt: ExtradataDoubt,
+}
+
+impl ExtradataUnknown {
+  /// Constructs an [`ExtradataUnknown`] payload.
+  #[inline]
+  pub const fn new(doubt: ExtradataDoubt) -> Self {
+    Self { doubt }
+  }
+  /// What left the extradata unknown.
+  #[inline]
+  pub const fn doubt(&self) -> ExtradataDoubt {
+    self.doubt
+  }
+}
+
+/// What left a stream's codec extradata unknown ([`ExtradataUnknown`]):
+/// each says a decoder may, or may not, have applied a packet's new
+/// extradata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ExtradataDoubt {
+  /// libavcodec reported this error before the decoder was seen to read the
+  /// packet carrying the new extradata — refusing that packet, or later —
+  /// and nothing ties an error to a packet: it can come from before the
+  /// decode, which then drops the packet, or from an earlier packet.
+  Reported(ffmpeg_next::Error),
+  /// A refusal this crate made itself — a frame or a coded surface over its
+  /// ceiling, among others — before the decoder was seen to read the packet
+  /// carrying the new extradata, the error libavcodec reported with it not
+  /// kept.
+  Minted,
+  /// A flush dropped what the decoder had not yet been seen to read, the
+  /// packet carrying the new extradata among it.
+  Flushed,
+  /// The hardware decoder failed post-commit before it was seen to read the
+  /// packet carrying the new extradata — on that packet, or later — and the
+  /// software fallback that would have replaced it did not commit.
+  HardwareFailed,
+}
+
+impl core::fmt::Display for ExtradataDoubt {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    match self {
+      Self::Reported(error) => write!(
+        f,
+        "the decoder reported \"{error}\" before it was seen to read a packet carrying a new \
+         extradata"
+      ),
+      Self::Minted => f.write_str(
+        "this crate refused a picture before the decoder was seen to read a packet carrying a \
+         new extradata",
+      ),
+      Self::Flushed => f.write_str(
+        "a flush dropped a packet carrying a new extradata before the decoder was seen to read it",
+      ),
+      Self::HardwareFailed => f.write_str(
+        "the hardware failed before it was seen to read a packet carrying a new extradata, and \
+         the software fallback did not commit",
+      ),
+    }
+  }
+}
+
+/// Payload for [`Error::ResyncUnprovable`].
+///
+/// A post-commit fallback opens a software decoder cold, mid-stream, and
+/// drops the pictures up to the next random-access point; the session then
+/// owes a proof that the pictures it delivers past that point come from
+/// after it. Both proofs it has are invariants of libavcodec's own decoders:
+/// FFmpeg's `h264` withholds every picture it has not recovered, and
+/// libavcodec's decoders publish how many pictures their reorder buffer can
+/// hold back (`has_b_frames`), holding none past that once they answer
+/// "needs input". A decoder that wraps another implementation —
+/// `h264_cuvid`, `h264_qsv`, `h264_v4l2m2m`, `h264_mediacodec`, `libdav1d`,
+/// `libvpx-vp9`, … (`AVCodec.wrapper_name` set) — publishes no reorder bound
+/// (`h264_cuvid` keeps a display delay of several pictures and leaves
+/// `has_b_frames` at zero) and withholds nothing, and its "needs input" does
+/// not say its pipeline is empty, so a picture from before the gap could
+/// close it. The fallback is refused at the open it would commit: that
+/// decoder is closed, nothing is committed, and the session stays where it
+/// was.
+///
+/// Only this road needs a proof. A session opened on software from the
+/// start, and a probe-era fallback, which replays the whole history, decode
+/// on a wrapped implementation as on any other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+  "a post-commit fallback was refused: the software decoder for {codec:?}, {implementation}, \
+   wraps {wrapper}, which publishes no reorder bound and withholds no unrecovered picture, so \
+   the resync after the gap could not be proved",
+  implementation = name_or_unread(.implementation),
+  wrapper = name_or_unread(.wrapper),
+)]
+pub struct ResyncUnprovable {
+  codec: crate::CodecId,
+  implementation: Option<&'static str>,
+  wrapper: Option<&'static str>,
+}
+
+impl ResyncUnprovable {
+  /// Constructs a [`ResyncUnprovable`] payload.
+  #[inline]
+  pub const fn new(
+    codec: crate::CodecId,
+    implementation: Option<&'static str>,
+    wrapper: Option<&'static str>,
+  ) -> Self {
+    Self {
+      codec,
+      implementation,
+      wrapper,
+    }
+  }
+  /// The stream's codec.
+  #[inline]
+  pub const fn codec(&self) -> crate::CodecId {
+    self.codec
+  }
+  /// The software decoder that was opened and refused, by FFmpeg's name for
+  /// it (`AVCodec.name`: `h264_cuvid`, `libdav1d`), or `None` where that
+  /// name does not read as FFmpeg's ASCII.
+  #[inline]
+  pub const fn implementation(&self) -> Option<&'static str> {
+    self.implementation
+  }
+  /// What it wraps (`AVCodec.wrapper_name`: `cuvid`, `libdav1d`), or `None`
+  /// where that name does not read as FFmpeg's ASCII.
+  #[inline]
+  pub const fn wrapper(&self) -> Option<&'static str> {
+    self.wrapper
+  }
+}
+
+/// A name FFmpeg's tables gave, for a message — or what to say where it did
+/// not read.
+fn name_or_unread(name: &Option<&'static str>) -> &'static str {
+  name.unwrap_or("(a name that does not read)")
+}
+
+/// What a decoded picture holds that the replay queue's budget cannot price
+/// ([`UnpricedFrame`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum UnpricedHolding {
+  /// `AVFrame.private_ref`: a reference libavcodec keeps for itself, of no
+  /// stated size, which it clears before a frame leaves a decoder.
+  PrivateRef,
+  /// A side data entry whose bytes no buffer reference owns, or a side data
+  /// table that does not hold its entries.
+  SideData,
+  /// More side data entries than a picture the queue takes may carry. A
+  /// decoder makes one for each message it reads — FFmpeg's H.264 decoder
+  /// one per unregistered SEI message, with no cap of its own — and the
+  /// queue prices each alone, so it walks no table past the cap.
+  SideDataEntries {
+    /// The entries the picture carries.
+    count: usize,
+    /// The most a picture the queue takes may carry.
+    cap: usize,
+  },
+}
+
+impl core::fmt::Display for UnpricedHolding {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    match self {
+      Self::PrivateRef => f.write_str("a private reference"),
+      Self::SideData => f.write_str("side data no buffer reference owns"),
+      Self::SideDataEntries { count, cap } => write!(
+        f,
+        "{count} side data entries, more than the {cap} a queued picture may carry"
+      ),
+    }
+  }
+}
+
+/// Payload for [`Error::UnpricedFrame`].
+///
+/// The software video road's queue prices a decoded picture by every
+/// allocation it owns — its pixel buffers, the side data table and every
+/// entry in it, each entry's buffer, its metadata and the side data's,
+/// `opaque_ref` and `hw_frames_ctx`, each at its payload rounded to the
+/// allocator's alignment and the allocator's and the buffer's own overhead
+/// — against [`DecoderLimits::max_replay_bytes`](crate::DecoderLimits::max_replay_bytes).
+/// A picture holding an allocation whose size it cannot read, or more side
+/// data entries than the queue prices, is never admitted as costing nothing:
+/// it is refused by this name, naming what it holds, and released.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+  "a decoded picture holds an allocation the software video decoder's replay budget cannot \
+   price: {holding}"
+)]
+pub struct UnpricedFrame {
+  holding: UnpricedHolding,
+}
+
+impl UnpricedFrame {
+  /// Constructs an [`UnpricedFrame`] payload.
+  #[inline]
+  pub const fn new(holding: UnpricedHolding) -> Self {
+    Self { holding }
+  }
+  /// What the picture holds that cannot be priced.
+  #[inline]
+  pub const fn holding(&self) -> UnpricedHolding {
+    self.holding
+  }
+}
+
+/// Payload for [`Error::UnrecoveredOutput`].
+///
+/// The session clears both flags on every software video decoder's codec
+/// context before the open, and checks them after it, in every build. A
+/// decoder found with either set would output pictures it has not
+/// recovered — FFmpeg's H.264 decoder conceals the pictures it decodes from
+/// references it never saw and hands them out — and the proof that a
+/// post-commit resync happened on an H.264 stream is that FFmpeg withholds
+/// every such picture. The decoder is closed and the open refused, with the
+/// flags it found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+  "a software video decoder opened set to output pictures before their recovery \
+   (AV_CODEC_FLAG_OUTPUT_CORRUPT: {output_corrupt}, AV_CODEC_FLAG2_SHOW_ALL: {show_all}); \
+   the post-commit resync of an H.264 stream is proved by FFmpeg withholding them"
+)]
+pub struct UnrecoveredOutput {
+  output_corrupt: bool,
+  show_all: bool,
+}
+
+impl UnrecoveredOutput {
+  /// Constructs an [`UnrecoveredOutput`] payload.
+  #[inline]
+  pub const fn new(output_corrupt: bool, show_all: bool) -> Self {
+    Self {
+      output_corrupt,
+      show_all,
+    }
+  }
+  /// Whether `AV_CODEC_FLAG_OUTPUT_CORRUPT` was set.
+  #[inline]
+  pub const fn output_corrupt(&self) -> bool {
+    self.output_corrupt
+  }
+  /// Whether `AV_CODEC_FLAG2_SHOW_ALL` was set.
+  #[inline]
+  pub const fn show_all(&self) -> bool {
+    self.show_all
+  }
+}
+
+/// Payload for [`Error::ReplayQueueFull`].
+///
+/// One budget spans the whole queue — what a replay left waiting and any
+/// tail drained behind it. A drain that reaches it stops and resumes once
+/// the caller has taken pictures, so pictures are never refused for the
+/// queue being full; only a picture that alone exceeds the budget, which no
+/// draining could make room for, is refused, by this name. The picture is
+/// released with the refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+  "a decoded picture of {frame_bytes} bytes alone exceeds the software video decoder's replay \
+   budget of {budget} bytes"
+)]
+pub struct ReplayQueueFull {
+  frame_bytes: usize,
+  budget: usize,
+}
+
+impl ReplayQueueFull {
+  /// Constructs a [`ReplayQueueFull`] payload.
+  #[inline]
+  pub const fn new(frame_bytes: usize, budget: usize) -> Self {
+    Self {
+      frame_bytes,
+      budget,
+    }
+  }
+  /// The bytes the refused picture holds.
+  #[inline]
+  pub const fn frame_bytes(&self) -> usize {
+    self.frame_bytes
+  }
+  /// The queue's byte budget it exceeds.
+  #[inline]
+  pub const fn budget(&self) -> usize {
+    self.budget
+  }
 }
 
 /// Payload for [`Error::HwDeviceInitFailed`].
@@ -250,6 +851,11 @@ pub struct AllBackendsFailed {
   /// Whether this was raised during the probe or post-commit. The wrapper's
   /// fallback replay routes on this, never on `unconsumed_packets` emptiness.
   origin: FallbackOrigin,
+  /// Whether no decoder was handed the packet whose send raised this: the
+  /// probe's history could not record it — its side data entries, its
+  /// bytes or its clone — and gave up before any decoder took it
+  /// ([`Self::before_any_decoder`]).
+  untaken: bool,
 }
 
 impl AllBackendsFailed {
@@ -267,6 +873,20 @@ impl AllBackendsFailed {
       attempts,
       unconsumed_packets,
       origin: FallbackOrigin::Probe,
+      untaken: false,
+    }
+  }
+  /// [`Self::new`], raised by a send whose packet no decoder was handed: the
+  /// probe's history could not record it, and the probe gave up before the
+  /// decoder took it ([`crate::VideoDecoder::send_packet`]).
+  #[inline]
+  pub(crate) fn before_any_decoder(
+    attempts: Vec<(Backend, Box<Error>)>,
+    unconsumed_packets: Vec<Packet>,
+  ) -> Self {
+    Self {
+      untaken: true,
+      ..Self::new(attempts, unconsumed_packets)
     }
   }
   /// Constructs a post-commit [`AllBackendsFailed`] payload — raised after the
@@ -280,6 +900,7 @@ impl AllBackendsFailed {
       attempts,
       unconsumed_packets: Vec::new(),
       origin: FallbackOrigin::PostCommit,
+      untaken: false,
     }
   }
   /// Per-backend errors collected during probing, in the order tried.
@@ -292,6 +913,13 @@ impl AllBackendsFailed {
   #[inline]
   pub const fn origin(&self) -> FallbackOrigin {
     self.origin
+  }
+  /// Whether no decoder was handed the packet whose send raised this
+  /// ([`Self::before_any_decoder`]). Otherwise a decoder may have read it
+  /// before it failed.
+  #[inline]
+  pub(crate) const fn untaken(&self) -> bool {
+    self.untaken
   }
   /// Packets the decoder consumed from the caller before exhaustion.
   /// Replay them through a software decoder for non-seekable inputs.
@@ -492,23 +1120,59 @@ impl core::fmt::Display for FrameMedium {
 /// input. Without a name, a caller could not tell "this file is broken"
 /// from "your budget refused this frame" — and only one of those is
 /// worth retrying with a larger ceiling.
+///
+/// # Which frame
+///
+/// [`pts`](Self::pts) is the refused frame's presentation timestamp as
+/// FFmpeg set it before the allocation — the timestamp of the packet it was
+/// being decoded from, in the stream's time base. A software video decoder
+/// on frame threads refuses a picture on a worker, for a packet sent
+/// earlier, and FFmpeg's H.264 decoder can conceal it behind a later
+/// picture of the same packet with no error to follow; such a refusal is
+/// reported at the next `receive_frame`, as its own error ahead of the
+/// decoder's next answer, and names no packet but the one its `pts` does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("the {medium} would allocate {bytes} bytes, over a ceiling of {limit}")]
+#[error(
+  "the {medium}{at} would allocate {bytes} bytes, over a ceiling of {limit}",
+  at = at_pts(.pts)
+)]
 pub struct FrameBudgetExceeded {
   bytes: u64,
   limit: u64,
   medium: FrameMedium,
+  pts: Option<i64>,
+}
+
+/// " at pts N" for a known `pts`, for a message; nothing otherwise.
+fn at_pts(pts: &Option<i64>) -> String {
+  pts.map_or_else(String::new, |pts| format!(" at pts {pts}"))
 }
 
 impl FrameBudgetExceeded {
-  /// Constructs a `FrameBudgetExceeded` payload.
+  /// Constructs a `FrameBudgetExceeded` payload, of a frame whose `pts` is
+  /// not known.
   #[inline]
   pub const fn new(bytes: u64, limit: u64, medium: FrameMedium) -> Self {
     Self {
       bytes,
       limit,
       medium,
+      pts: None,
     }
+  }
+  /// This payload, of the frame whose presentation timestamp is `pts`.
+  #[inline]
+  #[must_use]
+  pub const fn with_pts(mut self, pts: Option<i64>) -> Self {
+    self.pts = pts;
+    self
+  }
+  /// The refused frame's presentation timestamp, in the stream's time base,
+  /// as FFmpeg set it before the allocation — the timestamp of the packet it
+  /// was decoded from; `None` where it had none.
+  #[inline]
+  pub const fn pts(&self) -> Option<i64> {
+    self.pts
   }
   /// What the frame would have cost.
   #[inline]

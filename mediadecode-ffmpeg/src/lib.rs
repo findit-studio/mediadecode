@@ -6,7 +6,7 @@
 // is where this crate joined it: a signature here reads
 // `VideoPacket<VideoPacketExtra, FfmpegBytes>` because every one of those
 // three names is load-bearing — the household, the backend's extras,
-// and the owned carrier the D-seat amputation contract requires.
+// and the owned carrier the core's amputation contract requires.
 // `clippy::type_complexity` counts nesting, and the fix it asks for is
 // an alias that hides exactly the word this release exists to make
 // visible. 0.8 had that alias; it was called `FfmpegBuffer`.
@@ -40,6 +40,8 @@ mod reader_guard;
 mod resampler;
 mod sample_format;
 mod subtitle;
+#[cfg(test)]
+mod test_alloc;
 pub mod ticket;
 mod video;
 mod view;
@@ -124,17 +126,20 @@ pub use demuxer::{
   TrackMetadataBudgetExhausted, TrackMetadataTooLong, TrackTableAlloc, TrackTimebaseInvalid,
 };
 pub use error::{
-  Error, FrameBudgetExceeded, FrameMedium, HwSurfaceTooLarge, HwTransferTooLarge, Result,
+  Error, ExtradataDoubt, ExtradataRejected, ExtradataRejection, ExtradataUnknown,
+  FrameBudgetExceeded, FrameMedium, HwSurfaceTooLarge, HwTransferTooLarge, ParameterSet,
+  ReplayQueueFull, Result, ResyncUnprovable, SetsUnrecordable, UnpricedFrame, UnpricedHolding,
+  Unrecordable, UnrecoveredOutput,
 };
 pub use frame::Frame;
 pub use image::{CarrierImageDecoder, Corrupt, CorruptSource, ImageDecodeError, InputTooLarge};
 pub use limits::{
   DEFAULT_MAX_ATTACHMENT_BYTES, DEFAULT_MAX_CHAPTERS, DEFAULT_MAX_CODEC_PARAMETER_BYTES,
   DEFAULT_MAX_FRAME_BYTES, DEFAULT_MAX_IMAGE_INPUT_BYTES, DEFAULT_MAX_IMAGE_SIDE_DATA_BYTES,
-  DEFAULT_MAX_PACKET_BYTES, DEFAULT_MAX_PIXELS, DEFAULT_MAX_PROBE_BYTES, DEFAULT_MAX_STREAMS,
-  DEFAULT_MAX_TOTAL_ATTACHMENT_BYTES, DEFAULT_MAX_TOTAL_CHAPTER_TITLE_BYTES,
+  DEFAULT_MAX_PACKET_BYTES, DEFAULT_MAX_PIXELS, DEFAULT_MAX_PROBE_BYTES, DEFAULT_MAX_REPLAY_BYTES,
+  DEFAULT_MAX_STREAMS, DEFAULT_MAX_TOTAL_ATTACHMENT_BYTES, DEFAULT_MAX_TOTAL_CHAPTER_TITLE_BYTES,
   DEFAULT_MAX_TOTAL_CODEC_PARAMETER_BYTES, DEFAULT_MAX_TOTAL_STREAM_METADATA_BYTES, DecoderLimits,
-  DemuxLimits, FrameLimits, PacketLimits,
+  DemuxLimits, FrameLimits, PacketLimits, Threads,
 };
 #[cfg(feature = "resample")]
 #[cfg_attr(docsrs, doc(cfg(feature = "resample")))]
@@ -165,7 +170,7 @@ pub use subtitle::{CarrierSubtitleStreamDecoder, SubtitleDecodeError};
 pub use ticket::{ChannelLayoutTicket, CodecTicket, CustomChannel, DolbyVisionConfig, Ratio};
 pub use video::{CarrierVideoStreamDecoder, DecodePath, VideoDecodeError};
 
-// Every bare alias below binds [`FfmpegBuffer`] in the `D` seat — the
+// Every bare alias below binds [`FfmpegBuffer`] as the `D` parameter — the
 // view lane, the ordinary road: a decoder's output read where it lands
 // and dropped. The `Owned*` family binds [`FfmpegBytes`] and is what a
 // payload takes when it has to **travel** — outlive the decoder, cross
@@ -174,12 +179,12 @@ pub use video::{CarrierVideoStreamDecoder, DecodePath, VideoDecodeError};
 // Each spells its carrier out rather than hiding it behind a neutral
 // name. That is deliberate, and it is the one lesson 0.8's version of
 // this block failed to teach: 0.8 also called this type `FfmpegBuffer`,
-// but the D seat was *only* ever that type, so a consumer reading
+// but `D` was *only* ever that type, so a consumer reading
 // `VideoFrame` could not tell that holding one held libavcodec's memory
 // open. It did. Naming both carriers in both families is what makes the
 // question answerable at the use site — and [`FfmpegBytes`] answers it
 // by being nothing of ours: owned, `Send + Sync`, no FFmpeg lifetime
-// attached, the core's D-seat amputation contract satisfied by a type
+// attached, the core's amputation contract satisfied by a type
 // out of `alloc`.
 
 /// Compressed video packet pre-parameterized with this crate's extras

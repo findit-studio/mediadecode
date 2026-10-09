@@ -11,6 +11,558 @@ The backend-agnostic core it adapts has its own log at
 
 ## [Unreleased]
 
+### Added
+
+- **`Threads`, how many threads a software video decoder may decode
+  on**, carried by `DecoderLimits` (`threads`, `with_threads`,
+  `set_threads`) because libavcodec reads it once, at `avcodec_open2`,
+  like the rest of the limits. Three arms: `Auto` (libavcodec's own
+  choice, `thread_count = 0`: one more thread than the host has cores,
+  at most 16), `Count(NonZeroU32)` and `Single`. Every arm but `Single`
+  also writes `thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE`, so
+  libavcodec takes frame threading where the codec has it, slice
+  threading where it has only that, and one thread otherwise.
+
+- **A byte budget for the software video road's queue of decoded
+  pictures waiting for delivery**, `DecoderLimits::max_replay_bytes`
+  (`with_` / `set_`, default `DEFAULT_MAX_REPLAY_BYTES`, 512 MiB, exported),
+  beside the threads it serves. The queue takes a fallback replay's pictures
+  and the tail a one-thread decoder is drained of where the session restarts
+  it at a clean keyframe; each picture counts every allocation it owns — the
+  buffers its pixels reference, the side data table, every side data entry
+  and its buffer (SEI payloads, ICC profiles, …), its metadata and the side
+  data's, `opaque_ref` and `hw_frames_ctx` — each at its payload rounded up
+  to 64 bytes and 256 bytes for the allocator's and the buffer's own
+  overhead, so small pictures carrying large side data, or many small
+  entries, cannot fill memory under a small budget, and 64 pictures bound
+  the queue besides. A replay used to abort at 64 pictures
+  whatever their size — up to 32 GiB of 4K pictures at the per-picture
+  ceiling — and a switch's drain that passed the cap dropped the rest of the
+  tail. Now a drain stops at either bound and answers `Sent::MustDrain`
+  with the packet (or the end of the stream) still the caller's: the
+  budget is a hard bound on the queue at each picture's ACTUAL size — a
+  received picture the queue cannot take within it (a resolution or
+  pixel-format change, outgrowing the one before it) is never queued but
+  parked, the one picture held past the queue, and nothing more is
+  received while it waits; the size of the last picture is only the hint
+  that stops a drain before it receives. The drain resumes once the
+  caller has taken pictures: a replay
+  committed at the budget feeds its remaining packets before anything sent
+  next, and with every packet fed it still drains the pictures the decoder
+  holds — a picture its last packet made that waits parked among them —
+  before it takes any input: both sends answer `MustDrain` until a drain
+  finds the decoder with none ready. A restart's decoder stays open,
+  draining, until it has given its last. Nothing is dropped. An error the resumed replay meets is reported
+  after the pictures it queued before it, on a send's drain and past the end
+  alike; and the end of the stream the replay owes is the session's the
+  moment the decoder takes it — the `send_eof` that fed it is accepted even
+  when the drain after it fails, that error waits for the drain, and the
+  end is never sent to the decoder twice. An end counts as taken only when
+  the decoder takes it or answers that it already has (`AVERROR_EOF`): back
+  pressure past the retries, or a refusal, leaves it owed — reported on the
+  drain and sent again — on a replay and on a switch's drain of the decoder
+  it closes alike.
+
+- **`Error::ReplayQueueFull`** (`ReplayQueueFull { frame_bytes, budget }`,
+  exported): a decoded picture that alone exceeds that budget, which no
+  drain can make room for, is refused by this name, where a replay overflow
+  used to surface as a bare `ENOMEM`.
+
+- **`Error::UnpricedFrame`** (`UnpricedFrame { holding }`, with
+  `UnpricedHolding { PrivateRef, SideData, SideDataEntries { count, cap } }`,
+  exported): a decoded picture holding an allocation the budget cannot
+  price — a `private_ref`, of no stated size, or side data no buffer
+  reference owns — or more than 256 side data entries is refused by this
+  name and released, never queued as costing nothing. FFmpeg's H.264
+  decoder makes a side data entry for every unregistered SEI message, with
+  no cap of its own; a legitimate stream carries a handful, and the queue
+  walks no table past the cap.
+
+- **`Error::UnrecoveredOutput`** (`UnrecoveredOutput { output_corrupt,
+  show_all }`, exported): a software video decoder found after its open
+  with `AV_CODEC_FLAG_OUTPUT_CORRUPT` or `AV_CODEC_FLAG2_SHOW_ALL` set —
+  which the session clears before the open — is closed and refused by this
+  name, the flags it found named. Such a decoder would output pictures it
+  has not recovered, and the post-commit resync of an H.264 stream is
+  proved by FFmpeg withholding them (below).
+
+- **`Error::ResyncUnprovable`** (`ResyncUnprovable { codec, implementation,
+  wrapper }`, exported): a post-commit fallback whose software decoder is
+  not one of libavcodec's own — `avcodec_find_decoder` answered an
+  implementation that wraps another, `AVCodec.wrapper_name` set — is
+  refused by this name at the open it would commit, naming the codec, the
+  implementation and its wrapper; the decoder is closed and nothing is
+  committed. Every proof of the resync that fallback owes (below) is an
+  invariant of libavcodec's own decoders: a wrapper publishes no reorder
+  bound (`h264_cuvid` keeps a display delay of several pictures and leaves
+  `has_b_frames` at zero) and withholds nothing, so a picture from before
+  the gap could close it. On a build whose AV1 decoder is `libdav1d`, a
+  post-commit fallback on AV1 is refused this way.
+
+- **`Error::ExtradataUnknown`** (`ExtradataUnknown { doubt }`, with
+  `ExtradataDoubt`, both exported; `ExtradataDoubt` is `#[non_exhaustive]`):
+  a software video decoder the session would open on its codec parameters
+  while their extradata is unknown — whether the decoder applied a packet's
+  `AV_PKT_DATA_NEW_EXTRADATA` cannot be told: the packet was refused with an
+  error that does not say, a decode error among them, or a flush dropped it
+  unread — is refused by this name, naming what left it unknown, rather
+  than opened on extradata that may be stale (below).
+
+- **`Error::ExtradataRejected`** (`ExtradataRejected { codec, reason }`,
+  with `ExtradataRejection` and `ParameterSet`, all exported;
+  `ExtradataRejection` and `ParameterSet` are `#[non_exhaustive]`): a packet
+  whose `AV_PKT_DATA_NEW_EXTRADATA` is an H.264 record FFmpeg's decoder would
+  reject — an `avcC` record under seven bytes, a parameter set running past
+  it, a set too large for the escaping retry — or apply only in part, a
+  parameter set it cannot parse skipped (or a picture parameter set
+  referring to a sequence parameter set neither the record carries nor the
+  decoder holds, read against the sets the decoder holds as FFmpeg reads it
+  against its own), is refused by this name before any decoder sees it,
+  naming the reason; the packet stays the caller's and nothing of the
+  session changes (below). A packet body FFmpeg reads as an `avcC` record
+  is judged the same way, against the sets the decoder holds once it
+  applied the packet's own new extradata, which FFmpeg applies first. A
+  record riding a packet with no body is judged as soon as that packet is
+  handed over — after what a fallback's replay owes the decoder is fed,
+  against what the decoder would hold once it applied the records that
+  wait — as it would be judged on the packet with a body it rides, and is
+  not judged again there (below).
+
+- **`Error::SetsUnrecordable`** (`SetsUnrecordable { codec, reason }`, with
+  `Unrecordable`, both exported; `Unrecordable` is `#[non_exhaustive]`): a
+  decoder the session would open fresh — a post-commit fallback's cold
+  decoder, a reopen from no decoder — that no record can open holding the
+  parameter sets the decoder serving holds is refused by this name, naming
+  why: a set held in doubt, an H.264 picture parameter set bound to a
+  sequence parameter set its id no longer holds, start codes under a
+  four-byte NAL length size left from an `avcC` record, a set whose reading
+  ran past its payload, more sets than an `avcC` record counts, a set longer
+  than a record's entry, a record that does not read back as what is held,
+  or a decoder that wraps another implementation. A switch to the session's
+  threads is declined instead, the one-thread decoder serving on (below).
+  `ParameterSet` gains `Video`, an HEVC video parameter set. Records riding
+  packets with no body that no one record can carry together are refused
+  by this name as the later is handed over, nothing more deferred, and so
+  is a packet with a body whose own record no record can carry after the
+  one that waits (below).
+
+- **`FrameBudgetExceeded::pts`** (and `with_pts`): the refused frame's
+  presentation timestamp as FFmpeg set it before the allocation — the
+  packet's it was decoded from — so a refusal reported apart from the call
+  that ran its decode says which picture was lost; `new` keeps none.
+
+- **`active_threads()` on the video stream decoder**: the threads the
+  decoder serving now decodes with, read off what is active
+  (`active_thread_type`), never off what was asked — the count libavcodec
+  settled on when frame or slice threading is active, the count handed to
+  a codec that runs its own threads (`None` for libdav1d under `Auto`),
+  and one otherwise: a codec that cannot thread, whatever is asked, and
+  the hardware road, which writes no thread fields. A codec that cannot
+  thread schedules no switch to the session's threads after a fallback:
+  the reopen would decode on one thread all the same.
+
+### Changed
+
+- **A software video decode runs on libavcodec's own thread count by
+  default.** Through 0.15 no thread field was written and libavcodec
+  kept its option default of one thread, so a software decode of 4K
+  H.264 High 4:2:2 10-bit — a stream VideoToolbox does not take — ran
+  on one core, and that core was the whole video wall of a library scan
+  ([mediagraph#537](https://github.com/findit-studio/mediagraph/issues/537)).
+  `DecoderLimits::default()` now carries `Threads::Auto`. A
+  frame-threaded decoder keeps up to one packet per thread in flight:
+  its pictures come out up to that many packets later, the push face
+  answers "needs input" until then, and `send_eof` drains the rest. The
+  pictures themselves do not change — pinned byte for byte against
+  `Single` on MPEG-4 part 2 and on H.264 High 4:2:2 10-bit with
+  B-frames. Each frame in flight is a picture of its own, priced by
+  `FrameLimits` like any other; a deployment that needs to bound how
+  many are in flight says `Count`. The hardware road, and the audio,
+  subtitle and image decoders, keep one thread.
+
+- **A software fallback commits the one-thread decoder that proved it,
+  and the session returns to its threads at the next keyframe.** Both
+  fallbacks are transactions — the packets they hand the software
+  decoder must decode, or the session stays where it was and the
+  packets go back to the caller — and a frame-threaded decoder reports a
+  packet's failure only once it has a packet per thread in flight. So
+  the probe-era replay and the post-commit cold forward run on a
+  one-thread decoder, and that decoder is the one committed. At the next
+  clean random access point the session sends — an H.264 IDR, an HEVC IDR
+  or BLA, a VP8, VP9 or AV1 keyframe, an MPEG-1 or MPEG-2 keyframe behind a
+  GOP header that says `closed_gop`, each proved by its bitstream and never
+  inferred from the old decoder's `has_b_frames` (FFmpeg raises it only when
+  it meets reordering, which an open GOP can introduce at that keyframe);
+  every packet of a codec that codes every picture alone (its descriptor's
+  `AV_CODEC_PROP_INTRA_ONLY`: ProRes, DNxHD, MJPEG, Ut Video, …); every other
+  codec has none mid-stream — or at the first keyframe after a
+  seek, and after a
+  post-commit degrade not before its resync, it is drained, every picture
+  it still holds delivered first and in order, and closed, and a decoder
+  on the session's threads is opened and fed from the keyframe on. One
+  software decoder is open at any instant, no packet is decoded twice and
+  no picture is lost, so no budget has to span two decoded histories.
+  Between a fallback and that keyframe the session decodes on one thread:
+  on an H.264 file of IDR GOPs whose first packet the hardware refuses,
+  the first GOP at most. An open-GOP keyframe (an HEVC CRA, an H.264
+  recovery point that is not an IDR) is never a switch point, so a stream
+  whose keyframes are all open stays on one thread after a fallback until
+  a seek, with one warning, naming the codec and the reason, once a
+  minute of stream has gone by that way. A fallback at the end of the
+  stream keeps its one-thread decoder until a seek. An H.264 or HEVC
+  keyframe is clean only when the first picture's NAL unit in its packet is
+  the IDR (or, for HEVC, the BLA; HEVC's first picture is its base layer's,
+  the layer FFmpeg outputs, a unit of layer 63 skipped as FFmpeg's NAL
+  splitter skips it) — a packet with any picture before it is
+  not — and starts that picture: an H.264 slice whose `first_mb_in_slice`
+  is 0, an HEVC slice segment whose `first_slice_segment_in_pic_flag` is set
+  (a packet opening on a later slice of the picture, or on a unit cut inside
+  its slice header, is neither clean nor a resync anchor) — and an H.264
+  stream whose sequence parameter set permits arbitrary slice order
+  (Baseline or Extended without `constraint_set1_flag`, read off the codec
+  parameters — an `avcC` record's header and its SPS entries — a new
+  extradata or any packet's own SPS, a keyframe's or not, each found as
+  FFmpeg's NAL splitter cuts the packet) has no clean point
+  and no anchor at all, its slices' order vouching for no picture start: it
+  returns to the session's threads only at a seek, a post-commit fallback's
+  gap ends escalated, and a warning says so once — as does an HEVC stream
+  whose video parameter set declares an auxiliary layer FFmpeg decodes as
+  alpha (the set read as FFmpeg 9's `ff_hevc_decode_nal_vps` and
+  `decode_vps_ext` read it, on a mirror of its bit reader, past the set's
+  end into the memory after it too: two layers and at most two layer sets,
+  the extension's scalability mask setting the auxiliary type and the second
+  layer's `nuh_layer_id` not 0, read whole or up to the unsupported value
+  that leaves FFmpeg treating the set as alpha video — a set of more layers,
+  whose extension FFmpeg ignores and decodes the base layer alone, and a set
+  it refuses declaring none, as does a set read past its end under an id the
+  decoder is known to hold, which FFmpeg refuses; read off the codec
+  parameters, a new extradata or any packet's own VPS, a keyframe's or not)
+  or whose software decoder
+  negotiated an output format with alpha: FFmpeg decodes that layer beside
+  the base one as every picture's alpha plane, and no base-layer picture
+  proves where it starts. A packet's parameter sets make either reading the
+  session's only once a decoder may have taken the packet: one refused
+  before any decoder saw it — past the codec parameters' ceiling, say — or
+  answered with back pressure leaves the session's readings as they were.
+  And a keyframe is clean only when
+  every NAL unit in it parses whole: a four-byte start
+  code read whole and the zero bytes after a unit (`trailing_zero_8bits`)
+  stripped from it, every header byte present and valid (H.264's and HEVC's
+  forbidden bit, H.264's extended headers and an IDR's non-zero
+  `nal_ref_idc`, HEVC's second header byte, a non-zero temporal id and an
+  IRAP picture's zero one), a picture's unit carrying a slice past its
+  header, and nothing but zeros before the first start code. The units are
+  read one at a time and never collected, so a keyframe packed with
+  millions of one-byte units costs a walk, not memory per unit.
+  The session's threads are attempted once: a decoder on them that will
+  not open leaves the session on one thread for good. A switch drains the
+  old decoder into the session's queue of pictures waiting for delivery,
+  so it begins only while that queue is empty — the send answers
+  `MustDrain` until it is — and the queue has one budget across everything
+  in it.
+
+- **(BREAKING) `PostCommitNeverResynced` reports the gap in two counts.**
+  `new(packets_before_anchor, packets_unproven, anchor_seen)` and the
+  accessors `packets_before_anchor()`, `packets_unproven()` and
+  `anchor_seen()` replace `new(packets_lost)` and `packets_lost()`. The one
+  count stopped at the first keyframe, so a keyframe that decoded to nothing
+  read as nothing after it at all, and the packets taken between an anchor
+  and an un-anchor vanished. The first count is the fallback window; the
+  second, every packet the decoder took after the first keyframe, through
+  an un-anchor, with the resync never proved — decoded, delivered, unproven;
+  the keyframe itself is in neither, and `anchor_seen` says whether there
+  was one. The message reads "N packets before a keyframe, M after it with
+  the resync never proved" ("N packets before a keyframe, and no keyframe
+  after them" when none came).
+
+- **(BREAKING) `mediatime` 0.4 → 0.5, through `mediadecode`.** Every
+  `Timebase`, `Timestamp` and `TimeRange` in this crate's API is
+  `mediadecode`'s re-export, so a consumer holding a `mediatime 0.4` value
+  no longer type-checks against this release; see
+  [`mediadecode`'s note](../mediadecode/CHANGELOG.md#unreleased). No source
+  line here moved: every timebase this crate builds from a container's
+  rational still goes through `Timebase::try_new`, whose contract is
+  unchanged.
+
+- **(BREAKING) `mediaframe` 0.11 → 0.12**: mediaframe 0.12, on mediatime
+  0.5 like this crate — one mediatime in the tree. This crate's API carries
+  `mediaframe` values (the channel layout descriptions, the text fields, the
+  re-exported vocabulary), so a consumer holding a `mediaframe 0.11` value
+  no longer type-checks against this release; 0.12's source is 0.11's but
+  for documentation, and no source line here moved.
+
+### Fixed
+
+- **A post-commit resync is proved: by FFmpeg's withheld output for H.264,
+  by the decoder's reorder bound for every other codec.** Any
+  keyframe the cold software decoder took used to arm the proof, and the
+  next picture delivered — even a concealed one from before the keyframe,
+  delivered late — cleared the guard; a keyframe that decoded to nothing
+  then let the end of the stream pass as clean instead of escalating
+  `PostCommitNeverResynced`. The anchor is a key-flagged packet fed across
+  the gap whose first picture the bitstream proves a random-access one — an
+  H.264 IDR picture, or an access unit whose recovery point SEI message,
+  before its first picture, says so — exact or approximate
+  (`exact_match_flag` 0), its flags read and reported: what a resync proves
+  is the pictures a decoder started at the anchor produces, which FFmpeg
+  does at any recovery point, not a bit-for-bit match with a decode that
+  ran through the gap (every SEI message walked by its size
+  over the payload with its emulation prevention bytes removed; the first
+  slice header parsing and starting its picture, `first_mb_in_slice` 0 and
+  `slice_type` at most 9; an I picture alone anchors nothing, since a slice
+  type describes that slice alone and FFmpeg flags some such pictures key
+  by heuristic), an HEVC base-layer IRAP picture (a CRA among them) whose
+  first slice segment starts it, in a stream declaring no auxiliary layer;
+  for a codec that codes every picture alone,
+  every packet; for the other codecs whose pictures this crate does not
+  read, the key flag FFmpeg's parser set is the proof — since an intra
+  picture resets the references of every picture after it that does not
+  lead it; a stale flag, or a picture before the random-access one, anchors
+  nothing. It is fed only once the decoder holds
+  no picture the caller has not taken (the send answers `MustDrain` until
+  then; a packet the decoder reports failed, which FFmpeg may have decoded
+  in part, wants a drain behind it too). Both proofs are invariants of
+  libavcodec's own decoders, so a post-commit fallback whose software
+  decoder wraps another implementation (`AVCodec.wrapper_name` set:
+  `h264_cuvid`, `h264_qsv`, `libdav1d`, …), which publishes no reorder
+  bound and withholds nothing, is refused by name
+  (`Error::ResyncUnprovable`, above); a session opened on software, and a
+  probe-era fallback, owe no proof and decode on one as on any other. On
+  H.264, decoded by FFmpeg's own `h264`, the first picture out after the
+  anchor closes the gap. The software decoders are opened with
+  neither `AV_CODEC_FLAG_OUTPUT_CORRUPT` nor `AV_CODEC_FLAG2_SHOW_ALL` —
+  checked after the open in every build, an open that finds either set
+  refused by name (`Error::UnrecoveredOutput`, below) — so FFmpeg's H.264
+  decoder outputs only the pictures it has recovered, from an IDR picture
+  on and from a recovery point's recovery on, and a decoder opened cold
+  across the gap starts with nothing recovered; a recovery point's
+  `recovery_frame_cnt` is reported, never counted. After a decode error
+  across the gap — a packet the decoder reported failed, or a picture it
+  could not give — the next anchor is proved by the reorder bound instead,
+  until a proof closes the gap or a seek: FFmpeg's H.264 decoder keeps the
+  recovery state it sets while it parses a picture, a packet it reports
+  failed may have been parsed in part, and pictures from before the next
+  anchor may then come out marked recovered. On every other
+  codec the gap closes at the delivery of the `has_b_frames + 1`-th picture
+  out after the anchor (`has_b_frames` the largest value read from just
+  before the anchoring packet was submitted on — a keyframe can activate
+  parameters that lower it, an HEVC SPS with fewer `num_reorder_pics`,
+  while the pictures from before it still wait; the first picture for VP8,
+  VP9 and AV1): the pictures before it are at most the ones the reorder
+  buffer held from before the anchor. Allowing that depth on H.264 too left
+  a short tail open — at a depth of 2, a one-picture tail after an IDR —
+  and raised `PostCommitNeverResynced` on a resync that happened. A
+  definitive anchor — a clean random access point, an IDR among them —
+  supersedes one across the same gap that is not, the count restarting
+  there, which costs an H.264 stream nothing. Nothing is drained or reset
+  for the resync, and no picture is matched to a packet. The end of the
+  stream proves nothing more: the same proof applies there, so an anchor
+  that decoded to nothing, with none or only the pictures held from before
+  it out since, is not a resync. A decode error before the gap closes
+  leaves the anchor in doubt, and the next key-flagged packet anchors
+  again. `PostCommitNeverResynced` is raised when no key-flagged packet was
+  fed across the gap or the pictures out after one never proved it, still
+  once, as the `Err` of the `receive_frame`
+  that reaches the end, after every picture was delivered, and counts the gap
+  in two parts: the packets fed before a keyframe anchored the resync, and
+  those fed after it with the resync never proved.
+
+- **A new extradata mid-stream is followed.** A packet carrying
+  `AV_PKT_DATA_NEW_EXTRADATA` — a container's sample description switch, a
+  codec-private change — is read under the extradata it carries, the NAL
+  length fields and packing its own units use (FFmpeg's H.264 and HEVC
+  decoders apply it before they decode that packet), for the resync anchor,
+  the switch point and the clean keyframe alike. Once a decoder takes the
+  packet, that extradata replaces the session's codec parameters': later
+  packets are read under it, and every decoder opened later — a post-commit
+  fallback's cold decoder, a switch's — starts on the stream's current
+  parameters. A decoder opened for a packet that carries its own — the
+  post-commit fallback's, a switch's, the reopen from no decoder — opens on
+  a copy of the parameters carrying it, committed once that decoder serves:
+  opened on the retained parameters first, a record no decoder can open on
+  (FFmpeg's HEVC decoder parses it at the open) failed the open for good,
+  and the packet carrying the replacement never reached a decoder. A packet
+  the decoder refuses counts as taken only where the
+  refusal says the decoder decoded it, past the point where FFmpeg applies
+  the extradata: a frame this crate's allocator judge refused over its
+  ceiling while the packet's own picture was allocated, on a software
+  decoder of libavcodec's own on one thread, whose every call reads the
+  refusal its own decode latched (below) — on the software send and the
+  replay alike, a replay applying that proof ahead of its error, as it does
+  a later packet's being taken on that decoder, which says the packet
+  before it was read; on the hardware
+  road, whose funnel keeps no raw error and whose probe may replay a
+  history inside one submission, such a refusal says nothing; a packet
+  refused before it was queued (back pressure, the end) leaves them as they
+  were. Any other refusal does not say whether the decoder got that far and
+  leaves them unknown: an allocation failure, an invalid argument, and
+  invalid data or an unimplemented feature too, which FFmpeg can report
+  from before the decode (a parameter change, a bitstream filter, either of
+  which drops the packet; FFmpeg's HEVC decoder failing to parse the new
+  extradata) or, on a frame-threaded decoder, for an earlier packet while
+  this one still waits — where a flush would drop it. So a corrupt packet
+  at an extradata change leaves them unknown: until a packet carrying
+  extradata is taken, no H.264 or HEVC packet is read as an anchor or a
+  switch point under them, no switch opens a decoder on them, and a decoder
+  the session must open on them is refused by name
+  (`Error::ExtradataUnknown`). A packet a decoder takes may still wait
+  unread in libavcodec's input slot — behind a picture a submission decoded
+  that waits to be received, or a frame thread's results — so its new
+  extradata is provisional until the decoder is seen to read it: it answers
+  the end; or, decoding what a call hands it inside that call (one thread,
+  libavcodec's own; the hardware), it answers "needs input" or takes a
+  later packet; or a decoder opened on the parameters replaces it. A
+  frame-threaded decoder answers "needs input" as soon as a worker has the
+  packet, decoded or not, so there its extradata stays provisional until
+  the end. A picture coming out proves nothing, since it can be the
+  waiting one. A
+  flush while it is provisional drops the packet unread, the decoder kept
+  on the framing it read before, and a decode error reported then may be
+  that packet's own: either leaves the extradata unknown, as does the
+  hardware failing post-commit then, or on the packet carrying it, with no
+  fallback replacing it — the hardware, still serving, may or may not have
+  applied it. One the
+  hardware took while its
+  probe recorded is installed once nothing will replay it. A new extradata
+  that would carry the codec parameters past `max_codec_parameter_bytes` —
+  measured as a decoder's open measures them, the old extradata replaced by
+  the new — is refused by name (`Error::ParametersTooLarge`) before any
+  decoder takes the packet, which stays the caller's, and nothing changes:
+  taken, it was refused instead at the next restart or fallback, after the
+  decoder serving was closed, and at every send after it. A post-commit
+  fallback reports `ParametersTooLarge` by its own name, as it does a frame
+  budget refusal. An H.264 new extradata FFmpeg's decoder would reject or
+  apply only in part — which `h264_decode_frame` does without a word, the
+  decoder keeping its old NAL length size or parameter sets — is refused by
+  name (`Error::ExtradataRejected`) before any decoder takes the packet, the
+  record read as FFmpeg 9 reads it, its bit reader and parameter set parsers
+  mirrored: taken, the session read later packets, and opened later
+  decoders, on a record the decoder serving never adopted. Read under the
+  parameters as opened, an `avcC` stream
+  whose length fields changed never anchored, ended in a false
+  `PostCommitNeverResynced`, and never returned to the session's threads.
+  A packet with no body is handed to no decoder, on the video, audio and
+  subtitle roads alike. Of its side data, the state a decoder keeps from
+  the packet that brings it on — a new extradata, a parameter change, a
+  palette, a Dolby Vision configuration — waits for the next packet of the
+  stream with a body and rides it, ahead of that packet's own: where
+  FFmpeg applies a packet's side data anyway. The rest describes that
+  packet alone, or no decoder reads it from a packet — a skip of its
+  samples, its captions, a cue's settings, how to decrypt it, what
+  libavcodec copies onto the picture decoded from it, a type FFmpeg 9.0.1
+  does not name — and is dropped and said so: carried onto the next
+  packet, a skip of samples trimmed that packet's audio. A packet carries
+  one entry of a type, so what waits of a type is folded into one. H.264
+  and HEVC records fold through the parameter sets the decoder holds, as
+  FFmpeg applies one after another, each changing the sets it carries and
+  keeping every other — an SPS-only record then a PPS-only one both apply
+  — into the one record that gives the decoder all of them, a packet's own
+  record folded after them. Another codec's record folds as the later
+  whole, a parameter change field by field, a palette or a configuration
+  as the later whole. A record of no bytes folds nothing: FFmpeg's H.264,
+  HEVC and ADX decoders apply nothing for one, and its AAC decoder drops
+  its configuration for one and fails the packet. A packet with no body
+  that carries nothing is dropped. What waits goes as the session reads
+  the packet it rides: spent where a decoder took it; spent, and in doubt
+  as that packet's own record would be, where whether a decoder read it
+  cannot be told; still waiting, for the packet offered again or the one
+  after it, where no decoder saw it — back pressure, a refusal by name
+  before any decoder, a hardware probe whose history could not record the
+  packet. What still waits at the end of the stream, or at a flush, is
+  dropped and said so; no decoder saw it, so nothing is left in doubt. A
+  probe's rescue history records the packet carrying it. Rebuilt as
+  libavformat delivers it, a body of size 0 that is not null, the packet
+  was refused `AVERROR(EINVAL)` before its side data was read, so an AAC
+  configuration change riding one was never applied. With no data at
+  all, FFmpeg's decoders decode a packet of no bytes. Its HEVC decoder
+  decodes an empty access unit, which takes an end of sequence off the
+  CRA after it: the prior sequence's waiting pictures are output rather
+  than discarded, and its leading pictures are decoded across the
+  boundary. Its H.264 decoder ends its pictures without reading the
+  record, and its WMA decoder takes the packet for its last.
+
+- **A picture the allocator judge refused is named even where FFmpeg
+  conceals it.** FFmpeg's H.264 decoder drops a slice whose picture it
+  could not allocate and decodes on, so where a later picture of the same
+  packet starts, the decode reports success — or gives that other picture
+  — with the refusal latched. On a software decoder that decodes in step
+  (libavcodec's own, one thread), the call that ran the decode names it:
+  the send answers `FrameBudgetExceeded` for its packet, taken, as for a
+  packet the decoder reports failed; a receive answers it ahead of the
+  picture its decode gave, which the next receive delivers; a replay's or a
+  restart's drain reports it after the pictures it queued. The next
+  packet's result is its own, and no refusal is reported twice. On a
+  frame-threaded decoder a worker refuses a picture for a packet sent
+  before, and nothing ties the decoder's answers to it: each refusal is
+  kept on its own, with the declined picture's `pts`, and reported at the
+  next `receive_frame` — by itself, ahead of whatever the decoder answers
+  next, "needs input" and the end included — so a stream that never drains
+  to its end still hears it; no error of the decoder's is renamed by one,
+  and a second refusal of a call is reported after the first, not folded
+  into it. A seek clears them with the pictures it abandons. A concealed
+  refusal used to wait for whatever answer the decoder gave next, which
+  named it: a later packet's error, renamed, or the end of the drain. A
+  refusal a worker made while FFmpeg handed out a later picture comes before
+  that picture, which waits for the next receive: delivered first, the
+  picture went out and a seek before the next receive erased the refusal.
+
+- **A decoder opened fresh holds the parameter sets the decoder serving
+  held.** FFmpeg's H.264 and HEVC decoders keep every parameter set they
+  store, by id — from the extradata they were opened on, from every packet's
+  `AV_PKT_DATA_NEW_EXTRADATA`, and from every set a packet carries in band,
+  whatever its key flag — and a record replaces only the ids it carries. A
+  decoder the session opened fresh — a switch to its threads, a reopen, a
+  post-commit fallback's cold decoder — opened on the codec parameters'
+  record alone: on a stream whose sets came in band, an IDR carrying none
+  failed on it and every picture to the next set was lost. The session now
+  keeps what the decoder serving holds, as FFmpeg 9 reads every set — an
+  H.264 picture parameter set bound to the sequence parameter set it was
+  read under, an HEVC set that replaces another dropping the sets that refer
+  to it, a set from a packet the decoder may not have read held in doubt —
+  and opens a fresh decoder on the record that gives it exactly that: the
+  codec parameters' or the packet's own where either does, otherwise a
+  record carrying every set held, in the framing the decoder serving reads
+  packets in, read back as FFmpeg reads it. Every HEVC set is read whole as
+  FFmpeg 9 reads it — a set it refuses held by nothing, one it stores with a
+  warning held and recorded, one it reads past its end held so — and
+  FFmpeg's own decoder, opened on the record strictly, is a second witness
+  of a record carrying no set it stores with a warning. Where no record
+  can, the open is refused by name (`Error::SetsUnrecordable`, above), a
+  switch declined: among the reasons a set whose last fields FFmpeg read off
+  the bytes after it, which a record changes — an HEVC picture parameter
+  set it stores so, a video parameter set it stores so under an id holding
+  nothing. An H.264 set is told from another as FFmpeg tells it — by the
+  first 4096 bytes of it FFmpeg keeps and every field its reading stores,
+  not by its raw bytes: the same set repeated before a three-byte start code
+  rather than a four-byte one replaces nothing, nor does a set of more than
+  4096 bytes repeated with other bytes past them that no field reads, nor a
+  set read past its end repeated with the same bytes after it; a field
+  FFmpeg stores from past those 4096 bytes still tells a set apart. A
+  probe-era fallback's replay starts from what the
+  hardware held when its history began, and moves what is held by the
+  packets it feeds alone, each read as the decoder serving reads it: a seek
+  that drops what the budget left unfed leaves none of their sets behind.
+  The HEVC alpha reading judges a video parameter set against the sets held
+  across packets, as FFmpeg does — a keyframe's own sets too, for whether it
+  is clean or anchors: a set read past its end under an id an earlier packet
+  filled is refused, not taken as alpha video for good. A set longer than a
+  record's entry, whose bytes are not kept, is alike to no set that
+  arrives, whatever a hash of it says. Every arrival replaces what its id
+  held, drops what referred to it, and is read off its own bytes, so a
+  set crafted to take another's 64-bit fingerprint hides no replacement
+  and no alpha layer.
+
+- **An H.264 packet is framed as FFmpeg's decoder frames it.** A packet
+  whose body FFmpeg reads as an `avcC` record — where the decoder's framing
+  is `avcC` — is applied as one, its sets and NAL length size the decoder's
+  from then on, and holds no picture, so it neither anchors nor is a clean
+  point; and under a NAL length size of four FFmpeg re-guesses every
+  packet's framing — start codes for one opening on a four-byte start code
+  whose next bits read past it, `avcC` for one whose first four bytes read
+  as a length that fits — keeping the guess for the packets after. Read by
+  the record's framing alone, a start-coded IDR on a four-byte `avcC`
+  stream never anchored and no switch fired at it.
+
 ## [0.15.1] - 2026-10-05
 
 ### Added

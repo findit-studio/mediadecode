@@ -16,7 +16,8 @@ use ffmpeg_next::{
   ffi::{
     AVBufferRef, AVCodec, AVFrame, AVHWFramesContext, AVMediaType, av_buffer_ref, av_buffer_unref,
     av_frame_move_ref, av_frame_unref, av_hwdevice_ctx_create, av_hwframe_transfer_data,
-    av_packet_ref, avcodec_alloc_context3, avcodec_free_context, avcodec_parameters_to_context,
+    av_packet_copy_props, av_packet_ref, avcodec_alloc_context3, avcodec_free_context,
+    avcodec_parameters_to_context,
   },
   frame,
 };
@@ -857,6 +858,14 @@ impl VideoDecoder {
     self.state.backend
   }
 
+  /// The thread count libavcodec settled on for the context serving
+  /// now. The hardware road writes no thread fields, so this reads
+  /// libavcodec's default of one; see [`opened_threads`].
+  pub(crate) fn active_threads(&self) -> Option<core::num::NonZeroU32> {
+    // SAFETY: `inner` is the live opened context of the current state.
+    opened_threads(unsafe { self.state.inner.as_ptr() })
+  }
+
   /// Whether this decoder can emit pictures at a caller-requested size
   /// instead of full coded size.
   ///
@@ -1051,7 +1060,25 @@ impl VideoDecoder {
       | Error::BackendUnsupportedByCodec(_)
       | Error::HwDeviceInitFailed(_)
       | Error::AllBackendsFailed(_)
-      | Error::FallbackFailed(_) => VerdictRouting::Direct,
+      | Error::FallbackFailed(_)
+      // The software road's own queue; no hardware funnel mints it.
+      | Error::ReplayQueueFull(_)
+      // The software road's open; no hardware funnel mints it either.
+      | Error::UnrecoveredOutput(_)
+      // The software road's queue again.
+      | Error::UnpricedFrame(_)
+      // The software road's post-commit fallback; no hardware funnel mints
+      // it.
+      | Error::ResyncUnprovable(_)
+      // The session's open of a software decoder on its parameters; no
+      // hardware funnel mints it either.
+      | Error::ExtradataUnknown(_)
+      // The session's reading of a packet's new extradata, before any
+      // decoder sees the packet.
+      | Error::ExtradataRejected(_)
+      // The session's open of a software decoder on what the decoder
+      // serving holds; no hardware funnel mints it.
+      | Error::SetsUnrecordable(_) => VerdictRouting::Direct,
     }
   }
 
@@ -1171,7 +1198,8 @@ impl VideoDecoder {
   /// bytes would push the probe past [`MAX_PROBE_PACKETS`] or
   /// [`MAX_PROBE_PACKET_BYTES`], or [`av_packet_ref`] fails ENOMEM —
   /// `send_packet` returns [`Error::AllBackendsFailed`] **without
-  /// invoking** `state.inner.send_packet` on this packet. The caller's
+  /// invoking** `state.inner.send_packet` on this packet, and the payload
+  /// says so (`AllBackendsFailed::before_any_decoder`). The caller's
   /// packet stays in their hand and `unconsumed_packets` carries the
   /// pre-existing buffered history, so they can replay
   /// `unconsumed_packets` plus the current packet through their
@@ -1202,10 +1230,9 @@ impl VideoDecoder {
             "hwdecode: probe rescue exhausted before consuming packet; \
              returning AllBackendsFailed without invoking decoder"
           );
-          return Err(Error::AllBackendsFailed(AllBackendsFailed::new(
-            probe.attempts,
-            probe.buffered_packets,
-          )));
+          return Err(Error::AllBackendsFailed(
+            AllBackendsFailed::before_any_decoder(probe.attempts, probe.buffered_packets),
+          ));
         }
         // Step 2: byte / packet count cap. `packet_side_data_bytes`
         // clamps its walk to MAX_PROBE_PACKET_SIDE_DATA_ENTRIES as
@@ -1229,10 +1256,9 @@ impl VideoDecoder {
             "hwdecode: probe rescue exhausted before consuming packet; \
              returning AllBackendsFailed without invoking decoder"
           );
-          return Err(Error::AllBackendsFailed(AllBackendsFailed::new(
-            probe.attempts,
-            probe.buffered_packets,
-          )));
+          return Err(Error::AllBackendsFailed(
+            AllBackendsFailed::before_any_decoder(probe.attempts, probe.buffered_packets),
+          ));
         }
         // Step 3: pre-clone before consuming. `av_packet_ref` is a
         // refcounted shallow clone (no payload deep-copy) but can still
@@ -1247,10 +1273,9 @@ impl VideoDecoder {
               "hwdecode: packet clone failed before consuming; \
                returning AllBackendsFailed without invoking decoder"
             );
-            return Err(Error::AllBackendsFailed(AllBackendsFailed::new(
-              probe.attempts,
-              probe.buffered_packets,
-            )));
+            return Err(Error::AllBackendsFailed(
+              AllBackendsFailed::before_any_decoder(probe.attempts, probe.buffered_packets),
+            ));
           }
         }
       } else {
@@ -1477,7 +1502,7 @@ impl VideoDecoder {
           // hook reaches this allocation — `hwaccel->alloc_frame`
           // bypasses `get_buffer2` entirely, and the CPU destination is
           // allocated by `av_hwframe_transfer_data` outside both — so
-          // this is the seat that bounds what the hardware road hands
+          // this is the check that bounds what the hardware road hands
           // back.
           //
           // Judged out here rather than inside `transfer_hw_frame`
@@ -2000,7 +2025,7 @@ impl VideoDecoder {
     }
 
     // The state `build_codec_context` already installed in `opaque`,
-    // told which format this backend wants. One allocation, one seat:
+    // told which format this backend wants. One allocation, one place:
     // the budget the judge reads and the declination the funnel reads
     // are the same object, and `Box::into_raw` hands its ownership to
     // the guard below without moving it — so the pointer the context
@@ -2807,7 +2832,7 @@ pub(crate) fn build_codec_context(
   //
   // The translation is gone because it is no longer needed: the byte
   // ceiling is enforced by [`judge_buffer`], which is *also* a
-  // pre-allocation seat — `get_buffer2` is the allocator, so it runs
+  // pre-allocation check — `get_buffer2` is the allocator, so it runs
   // before the allocation and prices the frame's real format at its
   // real aligned dimensions. Nothing is lost on the software road by
   // stating the pixel limit as what it is.
@@ -2818,7 +2843,7 @@ pub(crate) fn build_codec_context(
     (*ctx_ptr).max_pixels = i64::try_from(limits.frame().max_pixels()).unwrap_or(i64::MAX);
   }
 
-  // **The byte ceiling's own seat, in the allocator itself.**
+  // **The byte ceiling's own check, in the allocator itself.**
   // `max_pixels` bounds an extent; what an extent costs depends on its
   // format and on how the allocator aligns it — a `gray8` frame of
   // 65536x1 is 64 KiB by `w * h` and 2 MiB once its single row is
@@ -2880,7 +2905,7 @@ pub(crate) fn build_codec_context(
   // allocator's own ruler. An exact judge at the allocation beats an
   // approximate one before it.
 
-  // **The judge's budget seat.** `judge_buffer` runs as a C callback
+  // **The judge's budget slot.** `judge_buffer` runs as a C callback
   // with nothing but the context to read, and the byte ceiling is not
   // recoverable from any field on it — see
   // [`CallbackState::max_frame_bytes`]. So the state that already
@@ -2898,9 +2923,9 @@ pub(crate) fn build_codec_context(
     declined_pixels: core::sync::atomic::AtomicI64::new(0),
     declined_limit: core::sync::atomic::AtomicI64::new(0),
     max_frame_bytes: limits.frame().max_frame_bytes() as u64,
-    frame_budget_declined: core::sync::atomic::AtomicBool::new(false),
-    declined_frame_bytes: core::sync::atomic::AtomicU64::new(0),
-    declined_frame_audio: core::sync::atomic::AtomicBool::new(false),
+    frame_refusals: crate::ffi::FrameRefusals::new(),
+    #[cfg(test)]
+    declining_pts: core::sync::atomic::AtomicI64::new(i64::MIN),
   });
   // SAFETY: `ctx_ptr` is the non-null context; `opaque` is a public
   // field FFmpeg never reads or frees.
@@ -2911,6 +2936,72 @@ pub(crate) fn build_codec_context(
   // SAFETY: ctx_ptr is valid; passing `owner: None` means our wrapper owns
   // the allocation and `Context::drop` will run `avcodec_free_context`.
   Ok((unsafe { Context::wrap(ctx_ptr, None) }, state))
+}
+
+/// Writes `threads` into a context that has not been opened yet.
+///
+/// `thread_count` carries the arm's count; `thread_type` names both
+/// kinds, so libavcodec takes frame threading where the codec has it,
+/// slice threading where it has only that, and one thread otherwise.
+/// Both are read once, by `avcodec_open2`, which is why this runs
+/// before it and why [`DecoderLimits`](crate::DecoderLimits) carries
+/// the choice.
+///
+/// **What frame threading asks of this crate's callbacks.** libavcodec
+/// calls `get_buffer2` from its worker threads, one at a time, with the
+/// worker's copy of the context — whose `opaque` is copied from this
+/// one. [`judge_buffer`] reads nothing there but that pointer and the
+/// immutable `max_frame_bytes` behind it, prices the frame through
+/// libavutil's pure size functions, and leaves a refusal in atomics the
+/// caller's thread collects with acquire ordering; the `CallbackState`
+/// outlives the context, whose free joins the workers. The `get_format`
+/// callback is the hardware road's and is never installed here.
+pub(crate) fn request_threads(ctx: &mut Context, threads: crate::limits::Threads) {
+  // SAFETY: `ctx` is a live, unopened context this crate built;
+  // `thread_count` and `thread_type` are plain `c_int` fields.
+  unsafe {
+    let raw = ctx.as_mut_ptr();
+    (*raw).thread_count = threads.thread_count();
+    (*raw).thread_type = ffmpeg_next::ffi::FF_THREAD_FRAME | ffmpeg_next::ffi::FF_THREAD_SLICE;
+  }
+}
+
+/// The threads the decoder `ctx` was opened on decodes with — read off what
+/// is active, never off what was asked.
+///
+/// - **Frame or slice threading active** (`active_thread_type`): the count
+///   libavcodec settled on, `thread_count`.
+/// - **A codec that runs its own threads** (`AV_CODEC_CAP_OTHER_THREADS`,
+///   an external decoder such as libdav1d): the count it was handed, `None`
+///   where that was zero — under [`Threads::Auto`](crate::Threads::Auto)
+///   the library chooses, and records no count.
+/// - **Anything else** decodes on one thread, whatever was asked: a codec
+///   that cannot thread, or a context opened on one.
+pub(crate) fn opened_threads(
+  ctx: *const ffmpeg_next::ffi::AVCodecContext,
+) -> Option<core::num::NonZeroU32> {
+  if ctx.is_null() {
+    return None;
+  }
+  // SAFETY: non-null per the check above, and the caller hands a live
+  // opened context: `thread_count` and `active_thread_type` are plain
+  // `c_int`s, and `codec` points at the codec's static description, whose
+  // `capabilities` is a plain `c_int`.
+  let (count, active, external) = unsafe {
+    let codec = (*ctx).codec;
+    let external = !codec.is_null()
+      && ((*codec).capabilities as u32) & ffmpeg_next::ffi::AV_CODEC_CAP_OTHER_THREADS != 0;
+    ((*ctx).thread_count, (*ctx).active_thread_type, external)
+  };
+  let threaded =
+    active & (ffmpeg_next::ffi::FF_THREAD_FRAME | ffmpeg_next::ffi::FF_THREAD_SLICE) != 0;
+  if threaded || external {
+    u32::try_from(count)
+      .ok()
+      .and_then(core::num::NonZeroU32::new)
+  } else {
+    Some(core::num::NonZeroU32::MIN)
+  }
 }
 
 /// Checked deep-clone of `codec::Parameters`. ffmpeg-next's
@@ -2965,12 +3056,31 @@ pub(crate) fn try_clone_parameters(
 /// buffer is shared with `src` rather than deep-copied; the probe replay
 /// only sends packets through `avcodec_send_packet`, which does not
 /// require a writable buffer.
+///
+/// **A packet with no data — side data alone — is cloned with none.**
+/// `av_packet_ref` gives a source without a buffer one of its own, `data`
+/// pointing into it (packet.c:452-460), and `avcodec_send_packet` refuses a
+/// body of size 0 that is not null (decode.c:742-743): the replay would
+/// refuse a packet the decoder took. Its properties and side data are
+/// copied alone (`av_packet_copy_props`, packet.c:397-432). A session hands
+/// no decoder such a packet — its side data rides the next packet with a
+/// body (`boundary::Deferred`), which the history records carrying it — so
+/// this keeps faithful the history of a caller driving [`VideoDecoder`]
+/// directly.
 pub(crate) fn try_clone_packet(src: &Packet) -> std::result::Result<Packet, ffmpeg_next::Error> {
   let mut dst = Packet::empty();
   // SAFETY: dst is a freshly zero-initialized Packet (av_init_packet inside
   // Packet::empty); av_packet_ref initializes its data fields from src's
-  // refcounted buffer or returns AVERROR(ENOMEM) on failure.
-  let ret = unsafe { av_packet_ref(dst.as_mut_ptr(), src.as_ptr()) };
+  // refcounted buffer, and av_packet_copy_props its properties and side
+  // data alone, leaving its data null; either returns AVERROR(ENOMEM) on
+  // failure, dst left holding nothing.
+  let ret = unsafe {
+    if (*src.as_ptr()).data.is_null() {
+      av_packet_copy_props(dst.as_mut_ptr(), src.as_ptr())
+    } else {
+      av_packet_ref(dst.as_mut_ptr(), src.as_ptr())
+    }
+  };
   if ret < 0 {
     return Err(ffmpeg_next::Error::from(ret));
   }
@@ -3083,7 +3193,7 @@ pub(crate) const PROBE_PIXELS: usize = 256 * 256;
 /// really does cost 506 MiB — but a 16K `yuv420p` frame, which would
 /// only have cost 199 MB, is refused too. That is the honest shape of a
 /// bound that has to hold before the format is known: the deployment
-/// answer is to raise `max_frame_bytes`, which is exactly the knob that
+/// answer is to raise `max_frame_bytes`, which is exactly the limit that
 /// says how much memory one frame may cost.
 ///
 /// # The residual, stated
@@ -3208,7 +3318,7 @@ unsafe extern "C" fn judge_buffer(
   // plain integers.
   let (width, height) = unsafe { ((*frame).width, (*frame).height) };
 
-  // **This seat judges cost, and only cost.**
+  // **This check judges cost, and only cost.**
   //
   // `max_pixels` is a *logical* limit on a picture's extent, and
   // libavcodec already enforces it — against the **raw** dimensions, in
@@ -3228,7 +3338,7 @@ unsafe extern "C" fn judge_buffer(
   //   degenerate shape is refused on its actual cost; and
   // * wrong, because `max_pixels` is `min(the caller's pixel limit,
   //   byte ceiling / worst-bytes-per-pixel)` — so when the caller's
-  //   pixel limit was the tighter seat, alignment inflation alone
+  //   pixel limit was the tighter bound, alignment inflation alone
   //   refused frames satisfying *both* requested limits. A 65536x1
   //   `gray8` frame under `max_pixels = 65536` and a generous byte
   //   budget fits the pixel limit exactly and costs 2 MiB, and was
@@ -3249,17 +3359,17 @@ unsafe extern "C" fn judge_buffer(
   // SAFETY: `frame` is live; the field is a plain pointer.
   let hw_frames = unsafe { (*frame).hw_frames_ctx };
 
-  // A hardware frame carries no CPU bytes for this seat to price — its
+  // A hardware frame carries no CPU bytes for this check to price — its
   // pool is judged where it is declared, in the `get_format` callback —
   // so it is delegated rather than failed closed on an unpriceable
   // format.
   if hw_frames.is_null() {
-    // **The caller's own number, read from the seat that carries it.**
+    // **The caller's own number, read from the slot that carries it.**
     // This used to recover a byte ceiling from `AVCodecContext.max_pixels`,
     // and the recovery was wrong in both directions:
     //
     // * `max_pixels` is `min(pixel ceiling, byte ceiling / worst)`, so
-    //   when the *pixel* seat was the tighter of the two it stopped
+    //   when the *pixel* limit was the tighter of the two it stopped
     //   encoding the byte ceiling at all — and the recovery invented a
     //   smaller one. A 256x256 frame at 16 bytes a pixel under
     //   `max_pixels = 65536` with a 2 MiB byte budget satisfies both of
@@ -3273,7 +3383,7 @@ unsafe extern "C" fn judge_buffer(
     //
     // The audio road briefly recovered from `max_samples` instead,
     // which *is* exact — but two sources of truth for one number is how
-    // the first one went wrong. Both media read the seat now.
+    // the first one went wrong. Both media read the slot now.
     //
     // SAFETY: `opaque` holds the `CallbackState` that
     // `build_codec_context` installed and whose owner outlives the
@@ -3312,7 +3422,7 @@ unsafe extern "C" fn judge_buffer(
       crate::footprint::audio_frame_bytes(format_raw, nb_samples as usize, channels as usize)
     } else {
       // Neither geometry nor samples: nothing is being allocated that
-      // this seat can price, and nothing is claimed.
+      // this check can price, and nothing is claimed.
       Some(0)
     };
 
@@ -3322,23 +3432,28 @@ unsafe extern "C" fn judge_buffer(
     // input — so a bare refusal here was indistinguishable from a
     // broken file, and only one of those is worth retrying with a
     // larger ceiling. The decoder funnels collect this the same way
-    // they collect the `get_format` declination.
+    // they collect the `get_format` declination. Each refusal is kept on
+    // its own, with the frame's `pts`, which FFmpeg set before calling
+    // here: a frame thread's worker can refuse while another refusal
+    // waits to be collected.
+    // SAFETY: `frame` is live; `pts` is a plain integer field.
+    let pts = unsafe { (*frame).pts };
     let record = |bytes: u64| {
-      use core::sync::atomic::Ordering;
       // SAFETY: `state` was proved non-null above.
       unsafe {
-        (*state)
-          .declined_frame_bytes
-          .store(bytes, Ordering::Relaxed);
-        (*state)
-          .declined_frame_audio
-          .store(width <= 0 && height <= 0, Ordering::Relaxed);
-        (*state)
-          .frame_budget_declined
-          .store(true, Ordering::Release);
+        (*state).frame_refusals.push(crate::ffi::FrameRefusal {
+          bytes,
+          audio: width <= 0 && height <= 0,
+          pts: (pts != ffmpeg_next::ffi::AV_NOPTS_VALUE).then_some(pts),
+        });
       }
       -(libc::EINVAL)
     };
+    // Test-only: the picture a law armed to be refused, priced or not.
+    #[cfg(test)]
+    if crate::ffi::declines_picture_for_test(state, pts) {
+      return record(priced.map_or(u64::MAX, |bytes| bytes as u64));
+    }
     match priced {
       // Fail closed. An allocation whose size cannot be established is
       // not a small one — the same stance every other judge here takes.
@@ -3362,7 +3477,7 @@ unsafe extern "C" fn judge_buffer(
 /// Prices the CPU frame `av_hwframe_transfer_data` would allocate, and
 /// refuses it if it is over the ceiling — **before** the transfer runs.
 ///
-/// # Why the hardware road needs its own seat
+/// # Why the hardware road needs its own check
 ///
 /// [`judge_buffer`] is not a universal choke point, and the census says
 /// so on this machine. `ff_get_buffer` calls `hwaccel->alloc_frame`
@@ -3381,7 +3496,7 @@ unsafe extern "C" fn judge_buffer(
 /// `av_image_check_size2`, zero `get_buffer2` calls and no frame. The
 /// check lives in `ff_set_dimensions`, which every decoder runs when it
 /// learns its dimensions and before any surface pool exists — so the
-/// seat `max_pixels` already occupies covers the hardware surface too.
+/// bound `max_pixels` already sets covers the hardware surface too.
 ///
 /// The residual on that road is the aligned-dimensions gap
 /// [`judge_buffer`] closes for software frames, and it applies to
@@ -3643,17 +3758,33 @@ pub(crate) fn software_send(
 /// can only answer libavcodec with an errno, so the reason lives in the
 /// callback state and every decoder funnel collects it.
 pub(crate) fn frame_budget_declination_of(state: *const CallbackState) -> Option<Error> {
-  crate::ffi::take_frame_budget_declination(state).map(|(bytes, limit, audio)| {
-    Error::FrameBudgetExceeded(crate::error::FrameBudgetExceeded::new(
-      bytes,
-      limit,
-      if audio {
-        crate::error::FrameMedium::Audio
-      } else {
-        crate::error::FrameMedium::Video
-      },
-    ))
-  })
+  crate::ffi::take_frame_budget_declination(state)
+    .map(|refusal| Error::FrameBudgetExceeded(frame_budget_exceeded(state, refusal)))
+}
+
+/// The name a refusal `judge_buffer` recorded in `state` goes by: its cost,
+/// the ceiling `state` carries, the frame's medium and `pts`.
+pub(crate) fn frame_budget_exceeded(
+  state: *const CallbackState,
+  refusal: crate::ffi::FrameRefusal,
+) -> crate::error::FrameBudgetExceeded {
+  // SAFETY: `state` is null or the live `CallbackState` the caller owns;
+  // `max_frame_bytes` is a plain integer, written once at its build.
+  let limit = if state.is_null() {
+    0
+  } else {
+    unsafe { (*state).max_frame_bytes }
+  };
+  crate::error::FrameBudgetExceeded::new(
+    refusal.bytes,
+    limit,
+    if refusal.audio {
+      crate::error::FrameMedium::Audio
+    } else {
+      crate::error::FrameMedium::Video
+    },
+  )
+  .with_pts(refusal.pts)
 }
 
 /// Proves an opened codec context is a **video** one without going

@@ -122,6 +122,22 @@ impl CodecId {
       .map(Utf8Bytes::from_static)
   }
 
+  /// Whether this codec codes every picture alone: its descriptor carries
+  /// `AV_CODEC_PROP_INTRA_ONLY` (ProRes, DNxHD, MJPEG, Ut Video, …). `false`
+  /// for an id this build has no descriptor for.
+  pub(crate) fn intra_only(self) -> bool {
+    let descriptor = self.descriptor();
+    if descriptor.is_null() {
+      return false;
+    }
+    // SAFETY: `descriptor` is non-null and points into libavcodec's
+    // `static const codec_descriptors[]`; `addr_of!` reaches the plain
+    // `c_int` `props` without forming a reference — see
+    // [`Self::descriptor`].
+    let props = unsafe { core::ptr::addr_of!((*descriptor).props).read() };
+    props & ffmpeg_next::ffi::AV_CODEC_PROP_INTRA_ONLY != 0
+  }
+
   /// libavcodec's descriptor for this id, or null where this build
   /// names no codec for it.
   ///

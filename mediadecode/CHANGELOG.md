@@ -11,6 +11,61 @@ The sibling FFmpeg adapter has its own log at
 
 ## [Unreleased]
 
+### Added
+
+- **`InvertedRange`, re-exported beside `Timebase`, `Timestamp` and
+  `TimeRange`.** In `mediatime` 0.5 (below) a range's ends move only by
+  its checked methods, which refuse an end before the start by this name.
+  A consumer that moved a range's ends through this crate's re-exports
+  alone can name the refusal their replacements answer with, still
+  without a `mediatime` dependency of its own.
+
+### Changed (BREAKING)
+
+- **`mediatime` 0.4 → 0.5**, at the same pin as before
+  (`default-features = false`). `Timebase`, `Timestamp` and `TimeRange`
+  are this crate's own public surface, so a consumer holding a
+  `mediatime 0.4` value no longer type-checks against this release — the
+  reasoning of the 0.11.0 crossing. The upstream
+  [0.5.0 notes](https://github.com/findit-studio/mediatime/blob/main/CHANGELOG.md)
+  are the authority; what reaches a consumer through the re-exports:
+
+  - `TimeRange::{with_start, with_end, set_start, set_end}` are removed:
+    they assigned without checking, so a safe call could build a range
+    whose end precedes its start. `try_with_start` / `try_with_end` /
+    `try_set_start` / `try_set_end` answer `Err(InvertedRange)` and leave
+    the range as it was; `with_bounds` / `set_bounds` move both ends at
+    once and panic on an inverted pair, as `TimeRange::new` does.
+  - The three types no longer implement buffa's `Message`. This crate
+    never enables `mediatime/buffa`; a consumer that does, for protobuf
+    code of its own, maps `.mediatime.v1` onto `mediatime::wire` and
+    converts at the edge (`TryFrom<wire::X>` refuses a malformed value by
+    name, `From<X>` is total).
+  - Everything else upstream changed is additive here: `TimeRange`'s
+    comparison algebra, `Timestamp::parse_seconds`, the directed and
+    exact rescales. The types those take (`Rounding`,
+    `ParseSecondsError`) are not re-exported, as `SignedDuration` and
+    `Duration` never were. The serde shapes, and the message an inverted
+    range is refused with, are unchanged.
+
+  `mediaframe` crosses with it (below), so one `mediatime` is in the
+  graph.
+
+  No other source line changed. Verified: `cargo hack test` and
+  `cargo hack clippy` over `-p mediadecode --each-feature
+  --exclude-no-default-features`; the FFmpeg adapter's tests, doc tests,
+  clippy and rustdoc; and the WebCodecs adapter's `wasm32` clippy lane —
+  all pass unchanged.
+
+- **`mediaframe` 0.11 → 0.12**: mediaframe 0.12, on mediatime 0.5 like this
+  crate — one mediatime in the tree. The color, pixel format and frame
+  geometry vocabulary this crate re-exports is `mediaframe`'s, so a
+  consumer holding a `mediaframe 0.11` value no longer type-checks against
+  this release. Nothing else in 0.12 reaches a consumer here: its source
+  is 0.11's but for documentation. A consumer that puts this crate's
+  `Timestamp` into `mediaframe::frame::TimestampedFrame` no longer needs a
+  second `mediatime`. No source line here moved.
+
 ## [0.15.1] - 2026-10-05
 
 ### Added

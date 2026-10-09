@@ -60,9 +60,9 @@
 //! descriptor of the frame's own format.
 
 use ffmpeg_next::ffi::{
-  AV_PIX_FMT_FLAG_BAYER, AV_PIX_FMT_FLAG_BITSTREAM, AV_PIX_FMT_FLAG_HWACCEL, AV_PIX_FMT_FLAG_PAL,
-  AVPixelFormat, av_image_fill_linesizes, av_image_fill_plane_sizes, av_pix_fmt_count_planes,
-  av_pix_fmt_desc_get,
+  AV_PIX_FMT_FLAG_ALPHA, AV_PIX_FMT_FLAG_BAYER, AV_PIX_FMT_FLAG_BITSTREAM, AV_PIX_FMT_FLAG_HWACCEL,
+  AV_PIX_FMT_FLAG_PAL, AVPixelFormat, av_image_fill_linesizes, av_image_fill_plane_sizes,
+  av_pix_fmt_count_planes, av_pix_fmt_desc_get,
 };
 use mediadecode::PixelFormat;
 
@@ -150,6 +150,22 @@ fn geometry_descriptor(pix_fmt: &PixelFormat) -> Option<AVPixelFormat> {
 /// `ceil(width / 8)`, and libavutil computes both.
 fn still_descriptor(pix_fmt: &PixelFormat) -> Option<AVPixelFormat> {
   descriptor_for(pix_fmt, AV_PIX_FMT_FLAG_HWACCEL | AV_PIX_FMT_FLAG_BAYER)
+}
+
+/// Whether `pix_fmt` carries an alpha component: its descriptor sets
+/// `AV_PIX_FMT_FLAG_ALPHA`. A format this crate maps to no constant, or one
+/// with no descriptor, carries none it can name.
+pub(crate) fn carries_alpha(pix_fmt: &PixelFormat) -> bool {
+  let Some(av) = to_av_pixel_format(pix_fmt) else {
+    return false;
+  };
+  // SAFETY: `av` is a known `AV_PIX_FMT_*` constant (never an integer cast
+  // into the enum). `av_pix_fmt_desc_get` returns a pointer to a static
+  // descriptor or null; it is only read through the returned pointer.
+  let desc = unsafe { av_pix_fmt_desc_get(av) };
+  // SAFETY: non-null per the check; `flags` is a plain integer field of a
+  // `'static` libavutil table entry.
+  !desc.is_null() && unsafe { (*desc).flags } & (AV_PIX_FMT_FLAG_ALPHA as u64) != 0
 }
 
 fn descriptor_for(pix_fmt: &PixelFormat, rejected: i32) -> Option<AVPixelFormat> {
@@ -308,7 +324,7 @@ fn geometry_from(
   if paletted {
     // The palette rides `data[1]` as a flat `AVPALETTE_SIZE` run: 256
     // entries of `AV_PIX_FMT_RGB32`, one row, never any other size.
-    // A format bound, not a budget seat — there is no number here a
+    // A format bound, not a budget — there is no number here a
     // file gets to choose.
     if count >= MAX_PLANES {
       return None;
