@@ -205,7 +205,7 @@ fn visible(kids: &[Kid], index: usize) -> (Read, Read) {
 
 /// A clip `id` playing `source` at `record`, of a medium with no stated
 /// rate: its source range is written in its own timebase's ticks, or a
-/// coarser whole ruler.
+/// ruler the export's search moves it to.
 fn placed(id: &str, source: TimeRange, record: TimeRange) -> Clip {
   Clip::new(
     ClipId::new(id),
@@ -394,12 +394,16 @@ fn the_goldens_read_back_put_every_clip_on_its_record() {
 
 #[test]
 fn a_count_opentimelineio_rescales_a_tick_off_is_refused_though_within_2_53() {
-  // At 3 fps, `a` plays v thirds of a second, then `b`, whose medium counts
-  // ninths. OpenTimelineIO places `b` at zero in ninths and adds `a` there:
-  // v · 9 / 3, its product past 2^54, where an f64 steps by four — 9v
-  // rounds by two, and `b` lands a ninth of a second early. Every count,
-  // the product's quotient among them, is within 2^53.
-  let v: i64 = 2_001_599_834_386_890;
+  // At 3 fps, `a` plays v = 3w thirds of a second, then `b`, whose medium
+  // counts sevenths. OpenTimelineIO places `b` at zero in sevenths and adds
+  // `a` there: v · 7 / 3, its product past 2^54, where an f64 steps by four
+  // — 7v rounds by two, and `b` lands a seventh of a second early. Every
+  // count, the product's quotient 7w among them, is within 2^53, and no
+  // ruler the timeline counts in holds both clips: `a` from a third of a
+  // second is no whole number of sevenths, `b` from a seventh none of
+  // thirds — and in 21sts `a` runs 7v, past 2^53.
+  let w: i64 = 1_000_000_000_000_002;
+  let v = 3 * w;
   let timeline = Timeline::new("t", Rate::hz(3)).with_track(video([
     placed(
       "a",
@@ -408,7 +412,7 @@ fn a_count_opentimelineio_rescales_a_tick_off_is_refused_though_within_2_53() {
     ),
     placed(
       "b",
-      TimeRange::new(1, 10, tb(1, 9)),
+      TimeRange::new(1, 8, tb(1, 7)),
       TimeRange::new(v, v + 3, tb(1, 3)),
     ),
   ]));
@@ -416,19 +420,19 @@ fn a_count_opentimelineio_rescales_a_tick_off_is_refused_though_within_2_53() {
     refused(&timeline),
     (
       Spot::TrackPosition(ChildAt::new(0, 1)),
-      3 * i128::from(v),
-      Rate::hz(9)
+      7 * i128::from(w),
+      Rate::hz(7)
     )
   );
   let reads = Read {
     value: 0.0,
-    rate: 9.0,
+    rate: 7.0,
   }
   .plus(Read {
     value: v as f64,
     rate: 3.0,
   });
-  assert_eq!(reads.value as i128, 3 * i128::from(v) - 1);
+  assert_eq!(reads.value as i128, 7 * i128::from(w) - 1);
 }
 
 /// A clip `a` one second long in thirds of a second, from a third past a
@@ -889,4 +893,219 @@ fn a_track_no_ruler_holds_is_refused_with_the_last_plan_the_search_walked() {
       Rate::hz(1)
     )
   );
+}
+
+#[test]
+fn a_clip_is_written_in_the_finer_ruler_its_neighbour_is_counted_in() {
+  // `a` in thirds, then `b` in ninths: OpenTimelineIO places `b` at zero in
+  // ninths and adds `a` there, v · 9 / 3, a product past 2^54 that rounds —
+  // and `a`'s own thirds are its coarsest whole ruler. But `b`'s ninths,
+  // finer than `a`'s own, hold `a` too, from three of them for 3v: written
+  // in its neighbour's ruler, `a` is counted as `b` is, and nothing is
+  // rescaled.
+  in_ninths(&shared(3, 9));
+}
+
+/// Codex round 5's `N`: ticks of 1/127 s, of which 65 · N lie within 2^53.
+const N: i64 = 138_572_296_126_847;
+
+/// One clip `a`, `ticks` ticks of 1/127 s from zero, its medium stated at
+/// (k + 1) · 127 fps, so planned in those frames, on a timeline at k · 127
+/// fps from `start`.
+fn a_frame_rate_above(k: i32, ticks: i64, start: i64) -> Timeline {
+  let edit = tb(1, 127 * k);
+  let mut a = placed(
+    "a",
+    TimeRange::new(0, ticks, tb(1, 127)),
+    TimeRange::new(0, i64::from(k) * ticks, edit),
+  );
+  a.media_mut().set_rate(Some(Rate::hz(127 * (k + 1))));
+  Timeline::new("t", Rate::hz(127 * k))
+    .with_start(Timestamp::new(start, edit))
+    .with_track(video([a]))
+}
+
+/// `a_frame_rate_above(k, ticks, start)` exported and read back: `a`
+/// written in the edit rate's ticks, k · `ticks` of them, and its end from
+/// the global start — by `operator+`, and as the end of a range of the
+/// track's duration from it — at `start + k · ticks`, its last tick one
+/// before, exactly. Answers the global start, read back.
+fn in_the_edit_rate(k: i32, ticks: i64, start: i64) -> Read {
+  let text = to_otio(&a_frame_rate_above(k, ticks, start), OtioTarget::V0_15Plus).unwrap();
+  assert_eq!(validate_json(&text, OtioTarget::V0_15Plus), Ok(()));
+  let rate = f64::from(127 * k);
+  let edit = |value: i64| Read {
+    value: value as f64,
+    rate,
+  };
+  let root = json::parse(&text).unwrap();
+  let global = read(&member(&root, "global_start_time"));
+  assert_eq!(global, edit(start));
+  let kids = kids(&text, 0);
+  let length = i64::from(k) * ticks;
+  let Kid::Item {
+    start: from,
+    duration,
+  } = kids[0]
+  else {
+    panic!("{kids:?}");
+  };
+  assert_eq!((from, duration), (edit(0), edit(length)));
+  let end = edit(start + length);
+  assert_eq!(global.plus(place(&kids, 0).1), end);
+  let track = track_duration(&kids);
+  assert_eq!(Read::end(global, track), end);
+  assert_eq!(Read::end_inclusive(global, track), edit(start + length - 1));
+  global
+}
+
+#[test]
+fn a_clip_only_the_edit_rate_holds_is_written_in_it() {
+  // Codex round 5's case: at 8128 = 64 · 127 fps from 7 000 000, `a` runs N
+  // ticks of 1/127 s, its medium stated at 8255 = 65 · 127 fps. In its
+  // plan's 8255ths its end from the global start lies past 2^53. Below the
+  // plan's lie 64 whole rulers, 127 · m: the 63 coarsest each rescale its
+  // end into the edit rate a tick short, and the 64th is the edit rate's
+  // own — the one ruler that holds it, a cap of the 63 coarsest would drop
+  // it. Written in the edit rate, nothing is rescaled: read back exactly.
+  let global = in_the_edit_rate(64, N, 7_000_000);
+  // In OpenTimelineIO's arithmetic: in the plan's frames, the global start
+  // rescaled to 7 109 375 of them, the end lies past 2^53; carried in the
+  // edit rate from each of the 63 coarsest, a tick short of the exact
+  // 64N + 7 000 000.
+  let plan = Read {
+    value: (65 * N) as f64,
+    rate: 8255.0,
+  };
+  assert_eq!(global.plus(plan).value, 9_007_199_255_354_430.0);
+  for m in 1..=63 {
+    let ruler = Read {
+      value: (N * m) as f64,
+      rate: (127 * m) as f64,
+    };
+    assert_eq!(
+      global.plus(ruler).value,
+      8_868_626_959_118_207.0,
+      "127 · {m}"
+    );
+  }
+  assert_eq!(64 * N + 7_000_000, 8_868_626_959_118_208);
+}
+
+/// Codex round 5's construction at k = 100: ticks of 1/127 s, of which
+/// 101 · M lie within 2^53, and whose 100 · M, rescaled from any of the 64
+/// coarsest whole rulers below 12 827 fps into 12 700 fps, is read a tick
+/// short.
+const M: i64 = 88_628_115_813_744;
+
+#[test]
+fn the_edit_rate_is_tried_however_many_whole_rulers_lie_below_the_plans() {
+  // At 12 700 = 100 · 127 fps from 10^14, `a` runs M ticks of 1/127 s, its
+  // medium stated at 12 827 = 101 · 127 fps. A hundred whole rulers lie
+  // below the plan's, 127 · m: the finest is the edit rate's, and of the
+  // 99 others, free, the search keeps the 64 coarsest — each of which
+  // rescales `a`'s end from the global start into the edit rate a tick
+  // short. The edit rate is an operand's ruler, never capped: written in
+  // it, `a` reads back exactly.
+  let global = in_the_edit_rate(100, M, 100_000_000_000_000);
+  let plan = Read {
+    value: (101 * M) as f64,
+    rate: 12_827.0,
+  };
+  assert_eq!(global.plus(plan).value, 9_052_439_697_188_144.0);
+  for m in 1..=64 {
+    let ruler = Read {
+      value: (M * m) as f64,
+      rate: (127 * m) as f64,
+    };
+    assert_eq!(
+      global.plus(ruler).value,
+      8_962_811_581_374_399.0,
+      "127 · {m}"
+    );
+  }
+  assert_eq!(100 * M + 100_000_000_000_000, 8_962_811_581_374_400);
+}
+
+/// How long `b` runs in [`beside_a_neighbour`]: 600 000 000 000 frames of
+/// 127 fps.
+const LONG: i64 = 600_000_000_000;
+
+/// At 127 fps: `a`, M ticks of 1/127 s from zero, its medium stated at
+/// 12 827 = 101 · 127 fps; then `b`, [`LONG`] frames, counted in its own
+/// 1/12 700 s from one of them — so `b` has no other ruler.
+fn beside_a_neighbour() -> Timeline {
+  let edit = tb(1, 127);
+  let mut a = placed("a", TimeRange::new(0, M, edit), TimeRange::new(0, M, edit));
+  a.media_mut().set_rate(Some(Rate::hz(12_827)));
+  let b = placed(
+    "b",
+    TimeRange::new(1, 1 + 100 * LONG, tb(1, 12_700)),
+    TimeRange::new(M, M + LONG, edit),
+  );
+  Timeline::new("t", Rate::hz(127)).with_track(video([a, b]))
+}
+
+#[test]
+fn a_clip_only_its_neighbours_ruler_holds_is_written_in_it() {
+  // `a` again, a neighbour after it in place of the global start: in its
+  // plan's 12 827ths the track's duration sums past 2^53, and OpenTimelineIO
+  // places `b` at zero in 12 700ths and adds `a` there — from each of the 64
+  // coarsest whole rulers below `a`'s plan's, a tick short. `b`'s 12 700ths,
+  // another clip's ruler and not the edit rate's, hold `a`: written in them,
+  // both clips are counted alike and the track reads back exactly.
+  let text = to_otio(&beside_a_neighbour(), OtioTarget::V0_15Plus).unwrap();
+  assert_eq!(validate_json(&text, OtioTarget::V0_15Plus), Ok(()));
+  let kids = kids(&text, 0);
+  let ticks = |value: i64| Read {
+    value: value as f64,
+    rate: 12_700.0,
+  };
+  let written: Vec<(Read, Read)> = kids
+    .iter()
+    .map(|kid| match *kid {
+      Kid::Item { start, duration } => (start, duration),
+      Kid::Transition { .. } => panic!("{kids:?}"),
+    })
+    .collect();
+  assert_eq!(
+    written,
+    [(ticks(0), ticks(100 * M)), (ticks(1), ticks(100 * LONG))]
+  );
+  assert_eq!(place(&kids, 1), (ticks(100 * M), ticks(100 * (M + LONG))));
+  assert_eq!(track_duration(&kids), ticks(100 * (M + LONG)));
+  // In OpenTimelineIO's arithmetic: planned, the track's duration lies past
+  // 2^53; from each of the 64 coarsest rulers, `b`'s place a tick short.
+  let planned = [
+    Read {
+      value: (101 * M) as f64,
+      rate: 12_827.0,
+    },
+    ticks(100 * LONG),
+  ];
+  let sum = planned.into_iter().fold(
+    Read {
+      value: 0.0,
+      rate: 1.0,
+    },
+    Read::plus,
+  );
+  assert_eq!(
+    sum,
+    Read {
+      value: 9_012_039_697_188_144.0,
+      rate: 12_827.0
+    }
+  );
+  for m in 1..=64 {
+    let ruler = Read {
+      value: (M * m) as f64,
+      rate: (127 * m) as f64,
+    };
+    assert_eq!(
+      ticks(0).plus(ruler).value,
+      (100 * M - 1) as f64,
+      "127 · {m}"
+    );
+  }
 }

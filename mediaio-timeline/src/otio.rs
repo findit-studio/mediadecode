@@ -52,14 +52,16 @@
 //!   OpenTimelineIO's arithmetic on them is exact.
 //!
 //! Where OpenTimelineIO's arithmetic would round a value, the export
-//! searches the rulers the clips it is formed from may be written in: each
-//! whole number of ticks a second that holds a clip's source range exactly,
-//! from the ruler above down to the coarsest such, at most 64 a clip —
-//! moving one clip one ruler coarser at a time, the one with the finest
-//! ruler first, the coarsest plan last. What no plan it tries holds,
-//! [`to_otio`] refuses ([`Refused::NotRepresentable`], naming the value the
-//! last plan could not hold): it never writes a document OpenTimelineIO
-//! would read rounded.
+//! searches the rulers the clips it is formed from may be written in: every
+//! ruler the timeline's own operands are counted in — the edit rate, at
+//! which the global start, the gaps and the transitions are written, and
+//! every clip's planned ruler — that holds a clip's source range exactly,
+//! however many, and the coarsest whole numbers of ticks a second below the
+//! ruler above that hold it, at most 64 of those a clip — moving one clip
+//! one ruler at a time, the one with the finest ruler first, the
+//! all-coarsest plan last. What no plan it tries holds, [`to_otio`] refuses
+//! ([`Refused::NotRepresentable`], naming the value the last plan could not
+//! hold): it never writes a document OpenTimelineIO would read rounded.
 //!
 //! A source range's length is a whole number of edit-rate ticks (validation
 //! refuses one that is not), so laying a track's items end to end puts every
