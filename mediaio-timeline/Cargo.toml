@@ -12,7 +12,7 @@ keywords   = ["timeline", "otio", "editing", "media", "no-std"]
 categories = ["multimedia", "multimedia::video", "multimedia::audio", "no-std"]
 
 [dependencies]
-mediatime = { version = "0.5", default-features = false, features = ["serde"] }
+mediatime = { version = "0.5.1", default-features = false, features = ["serde"] }
 serde     = { workspace = true, features = ["alloc"] }
 
 [dev-dependencies]
