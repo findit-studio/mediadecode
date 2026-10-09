@@ -35,7 +35,8 @@ see. That type is gone.
 
 `FfmpegVideoStreamDecoder` mirrors the `send_packet` / `receive_frame`
 shape of `ffmpeg::decoder::Video`, auto-probes the host's HW backends,
-and falls through to a software decoder when none open. Audio and
+and falls through to a software decoder when none takes the stream
+before its first picture. Audio and
 subtitles use parallel `FfmpegAudioStreamDecoder` /
 `FfmpegSubtitleStreamDecoder` types.
 
@@ -57,13 +58,25 @@ Output frames are CPU-side, downloaded with `av_hwframe_transfer_data`
 — downstream
 [`colconv`](https://github.com/findit-studio/colconv) handles it.
 
-If every HW backend opens but later fails at decode time and the
-software backend is also unavailable, the error surfaces as
-`VideoDecodeError::Decode(Error::AllBackendsFailed(p))` carrying any
-packets the decoder had already accepted from the demuxer (accessible
-via `p.unconsumed_packets()` / `p.into_unconsumed_packets()`) — so
-non-seekable callers (live streams, pipes, network sources) can replay
-them through their own software decoder without re-demuxing.
+The probe keeps every packet it consumes until the first picture comes
+out. When no backend takes the stream by then, `open` (that is,
+`DecodePath::Auto`) replays those packets into the software decoder, so
+nothing is lost; `DecodePath::AnyHardware` and a `DecodePath::Hardware`
+pin report `VideoDecodeError::Decode(Error::AllBackendsFailed(p))`
+instead, carrying them (`p.unconsumed_packets()` /
+`p.into_unconsumed_packets()`) — so non-seekable callers (live streams,
+pipes, network sources) can replay them through a software decoder of
+their own without re-demuxing.
+
+After the first picture nothing changes the road, on any path. A picture
+the hardware fails to decode is that picture's error, as a corrupt packet
+is on the software road, and the session decodes on — FFmpeg's own model
+of a hardware failure. Only FFmpeg's own signals that no session can
+continue lose the road: `Error::HardwareRoadLost`, by name, after which the
+session refuses every call with it. To go on, open a session on
+`DecodePath::Software` from the same parameters and feed it forward from
+the packet the loss was reported on; libavcodec decodes from the next
+keyframe.
 
 ## Usage
 
@@ -88,19 +101,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::num::NonZeroI32::new(stream.time_base().denominator()).unwrap(),
   );
 
-  // Probes HW backends in order, falls back to software.
+  // Probes HW backends in order and falls back to software when none
+  // takes the stream — so an error here means software could not open it
+  // either.
   let mut decoder =
-    match FfmpegVideoStreamDecoder::open(stream.parameters(), time_base, DecoderLimits::default())
-    {
-    Ok(d) => d,
-    Err(FfmpegError::AllBackendsFailed(p)) => {
-      // No backend at all could open this stream — including software.
-      // `unconsumed_packets` is empty at open-time. Caller decides.
-      let _unconsumed_packets = p.into_unconsumed_packets();
-      return Ok(());
-    }
-    Err(e) => return Err(e.into()),
-  };
+    FfmpegVideoStreamDecoder::open(stream.parameters(), time_base, DecoderLimits::default())?;
 
   let mut frame = empty_video_frame();
   for (s, av_packet) in input.packets() {
@@ -127,12 +132,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         while decoder.receive_frame(&mut frame)? == Received::Frame {}
         // (re-offer `pkt`; elided here for brevity)
       }
-      Err(VideoDecodeError::Decode(FfmpegError::AllBackendsFailed(p))) => {
-        // Runtime exhaustion: rescued packets are the bytes the decoder
-        // already consumed from `input`. Replay them through your own
-        // software decoder before the current packet so non-seekable
-        // sources recover cleanly.
-        let _unconsumed_packets = p.into_unconsumed_packets();
+      Err(VideoDecodeError::Decode(FfmpegError::HardwareRoadLost(lost))) => {
+        // The committed hardware decoder can no longer decode this
+        // stream, and the session takes nothing more. Open one on
+        // `DecodePath::Software` from the same parameters and feed it
+        // this packet and the ones after it.
+        let _backend = lost.backend();
         return Ok(());
       }
       // `VideoDecodeError` is `#[non_exhaustive]`: a fault this code
@@ -173,12 +178,13 @@ for end-to-end demuxer-driven runs that cover all three streams.
   their error types: `VideoDecodeError`, `AudioDecodeError`,
   `SubtitleDecodeError`.
 - **Decode path**: `DecodePath` and `FfmpegVideoStreamDecoder::open_as`
-  — `Auto` (what `open` does: probe hardware, fall back to software),
-  `Hardware(Backend)` or `Software`. The two named arms are **pins**:
-  a session opened on one stays on it, so a backend that fails at open
-  fails the call and one that fails mid-stream reports rather than
-  degrading behind the caller. `is_hardware()` / `is_software()` stay
-  the live reading of where a session is.
+  — `Auto` (what `open` does: probe hardware, fall back to software
+  before the first picture), `AnyHardware` (the same probe, never
+  software), `Software`, or the pin `Hardware(Backend)`. After the first
+  picture no path changes its decoder: a hardware failure is the
+  picture's own error, and a lost road is `Error::HardwareRoadLost`.
+  `is_hardware()` / `is_software()` stay the live reading of where a
+  session is.
 - **Demuxer**: `FfmpegDemuxer` — `mediadecode`'s `Demuxer` over
   `libavformat`, opened from a path (`open`) or from any
   `Read + Seek` byte source through a custom `AVIOContext`
@@ -245,7 +251,7 @@ is what opts into them.
 | `MEDIADECODE_SAMPLE_VIDEO` | `tests/decode_via_trait.rs` |
 | `MEDIADECODE_SAMPLE_AUDIO` | the audio-through-trait case (any container with an audio track) |
 | `MEDIADECODE_SAMPLE_SUBTITLE` | the subtitle-through-trait case (needs a container that really carries a subtitle track) |
-| `MEDIADECODE_FX3_SAMPLE` | the Sony FX3 H.264 High 4:2:2 10-bit mid-stream HW→SW fallback case |
+| `MEDIADECODE_FX3_SAMPLE` | the Sony FX3 H.264 High 4:2:2 10-bit probe-era HW→SW fallback case |
 
 ```sh
 HWDECODE_SAMPLE_VIDEO=/path/to/clip.mp4 cargo test --test hw_smoke -- --ignored

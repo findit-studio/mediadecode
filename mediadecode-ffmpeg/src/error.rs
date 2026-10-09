@@ -224,8 +224,8 @@ impl HwDeviceInitFailed {
 /// signal. It is never inferred from whether `unconsumed_packets` is
 /// empty: a probe-era failure on the *first* packet (a side-data / byte /
 /// packet cap trip, or an `av_packet_ref` ENOMEM) has no history to
-/// surface either, and reading that emptiness as "after commit" once made
-/// the wrapper skip the current packet on exactly that road.
+/// surface either, so emptiness cannot say which side of the first
+/// picture a failure came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, IsVariant)]
 pub enum FallbackOrigin {
   /// Before the first picture, while backends are on trial. Every failure
