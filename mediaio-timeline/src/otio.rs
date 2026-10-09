@@ -156,9 +156,10 @@ impl NotRepresentable {
     self.at
   }
 
-  /// The count as the timeline holds it — ticks of the edit rate on the
-  /// record side, ticks of the range's own timebase on the media side — past
-  /// 2^53 either way, and past it in every ruler the export may use.
+  /// The count past 2^53, as the timeline holds it: on the record side,
+  /// ticks of the edit rate; on the media side, ticks of the range's own
+  /// timebase — its start, its length or its end, the first past 2^53 — for
+  /// a range no ruler the export may write it in holds.
   pub const fn value(&self) -> i128 {
     self.value
   }

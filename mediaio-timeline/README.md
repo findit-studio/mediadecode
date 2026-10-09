@@ -22,7 +22,8 @@ OpenTimelineIO export. Pure Rust, `no_std` + `alloc`, no FFmpeg.
 |---|---|
 | `Timeline` | an edit: `name`, the edit `rate`, the timecode `start` its zero carries, `metadata`, and `tracks` stacked bottom first — a `schema 1` document |
 | `Track` | one layer: `kind` (`Video` or `Audio`), `name`, `enabled`, `clips` in record order, and the `transitions` between them |
-| `Clip` | a stretch of one medium at an explicit position: `name`, `media`, `source_range` (in the medium's timebase), `record` (at the edit rate), `enabled`, `gain`, `fades`, `metadata` |
+| `Clip` | a stretch of one medium at an explicit position: its `id`, `name`, `media`, `source_range` (in the medium's timebase), `record` (at the edit rate), `enabled`, `gain`, `fades`, `metadata` |
+| `ClipId` | a clip's identity: a string its creator mints, once per placement, unique in the timeline |
 | `MediaRef` | the medium: its `locator`, and when known its `available_range`, `rate` and `reel` |
 | `Transition` | a `Dissolve` across the cut `at`, reaching `in_offset` before it and `out_offset` after it — OpenTimelineIO's offsets |
 | `Fades`, `Fade` | a fade at a clip's start (`in`) and end (`out`): a `duration` at the edit rate and a `shape`, `Linear` or `EqualPower` |
@@ -47,6 +48,15 @@ the edit rate.
 Gaps are never stored. `layout` derives them — from the zero to the first
 record, and between records — for formats that place items end to end.
 
+### A clip is its id
+
+A clip is identified by its `id`, which its creator mints — findit's edit
+plan mints one per placement — and which no other clip of the timeline
+carries. Its name and its medium may repeat: a cut back to a shot, or a
+loop of it, places one medium twice, under two ids, and a medium on a video
+and an audio track is two clips with two ids. `diff` matches clips by the
+id, so a clip renamed or pointed at another medium is still the same clip.
+
 ## Validation
 
 `validate(&Timeline) -> Result<(), Vec<Refusal>>` answers every defect at
@@ -63,7 +73,8 @@ transition it is about:
 | `EmptyRecord` | a record covering no time |
 | `OutOfOrder` | a track's clips out of record order |
 | `Overlap` | two records of one track overlapping — a transition blends with media outside the records, so it is never one |
-| `DuplicateClip` | a clip with the name and locator of an earlier clip of its track — the identity `diff` matches by |
+| `EmptyClipId` | a clip whose id is empty |
+| `DuplicateClipId` | a clip carrying the id of an earlier clip of the timeline, on its track or another — the identity `diff` matches by |
 | `SourceOffEditRate` | a source range whose length is no whole number of edit-rate ticks |
 | `DurationMismatch` | a record not exactly its source's length at the edit rate |
 | `OutsideAvailable` | a source range outside its medium's available range, when that is known |
@@ -80,21 +91,24 @@ is where it is judged.
 
 `diff(&before, &after) -> Result<Delta, Ambiguous>` reports, per track in
 record order, each clip `Added`, `Removed`, `Moved` (its record changed),
-`Retimed` (its source range changed), `Regained` (its gain or fades changed)
-or `EnabledFlipped`. Tracks match by index; a clip is identified by its
-`name` together with its medium's `locator`, an identity unique in its track
-(a stable `id` word is reserved for a later schema). A track of either side
-naming one identity twice is refused as `Ambiguous` — the side, the track and
-the two clips — rather than matched by occurrence. Ranges compare by the
-time they cover. The order is fixed, so `diff(a, a)` is empty for every `a`
-it answers. Only clips are compared: the timeline's and a track's own words,
-transitions, and a clip's notes are not.
+`Retimed` (its source range changed), `Regained` (its gain or fades
+changed), `EnabledFlipped`, `Renamed` or `Relinked` (its medium's locator
+changed). Tracks match by index, and a clip by its `id` alone: a clip that
+changes track is removed from one and added to the other. A side carrying
+one id on two clips — a timeline `validate` would refuse — is refused as
+`Ambiguous`, naming the side and the two clips, rather than matched by
+occurrence. Ranges compare by the time they cover. The order is fixed, so
+`diff(a, a)` is empty for every `a` it answers. Only clips are compared: the
+timeline's and a track's own words, transitions, and a clip's notes are
+not.
 
 ## OpenTimelineIO
 
-`otio::to_otio(&Timeline, OtioTarget)` writes a valid timeline as
-OpenTimelineIO JSON, keys in OpenTimelineIO's own writer order. A timeline
-that does not validate is refused with its refusals.
+`otio::to_otio(&Timeline, OtioTarget) -> Result<String, otio::Refused>`
+writes a valid timeline as OpenTimelineIO JSON, keys in OpenTimelineIO's own
+writer order. A timeline that does not validate is refused with its
+refusals (`Refused::Validation`); a count OpenTimelineIO cannot hold exactly
+is refused by name (`Refused::NotRepresentable`, below).
 
 | model | OpenTimelineIO |
 |---|---|
@@ -107,23 +121,37 @@ that does not validate is refused with its refusals.
 | a gap between records | `Gap.1`, derived by `layout` |
 | `Transition` | `Transition.1`, `SMPTE_Dissolve`, offsets at the edit rate |
 | a fade | `Transition.1`, `SMPTE_Dissolve` against a gap — of no length where the clip abuts a clip or the track's end |
-| gain, reel, the medium's rate, a fade's curve, `Metadata` | `metadata.mediaio`: `gain_db`, `reel`, `rate`, `fade` and `shape`, `metadata` |
+| a clip's `id`, gain, reel, the medium's rate, a fade's curve, `Metadata` | `metadata.mediaio`: `id`, `gain_db`, `reel`, `rate`, `fade` and `shape`, `metadata` |
 
 Record-side times are whole counts at the edit rate. A media-side range — a
 source range, an available range — is written whole in one ruler: frames of
 the medium's stated rate where its start and length both land on one, else
-ticks of its own timebase. Every number written is exact, and the end
-OpenTimelineIO derives from a range (its start rescaled to its duration's
-rate, plus the duration) is the range's own end. Because a source range runs
-a whole number of edit-rate ticks, walking the exported items end to end
-lands every clip on its record. Where a medium's ruler is not the edit rate,
-one track's items are counted in more than one rate, and OpenTimelineIO sums
-those in floating point: a position derived that way is read to the nearest
-frame, not truncated.
+ticks of its own timebase. The end OpenTimelineIO derives from a range (its
+start rescaled to its duration's rate, plus the duration) is the range's own
+end. Because a source range runs a whole number of edit-rate ticks, walking
+the exported items end to end lands every clip on its record. Where a
+medium's ruler is not the edit rate, one track's items are counted in more
+than one rate, and OpenTimelineIO sums those in floating point: a position
+derived that way is read to the nearest frame, not truncated.
 
-OpenTimelineIO has no word for gain or a reel: both ride in `metadata`, and
-an application that does not read it — DaVinci Resolve among them — applies
-neither. Available ranges and the start are written as the timeline holds
+**Every count is one OpenTimelineIO holds exactly.** A `RationalTime` keeps
+its value in an `f64`, which holds every whole number up to 2^53 and only
+some past it. Every value written lies within ±2^53, and so does every end
+OpenTimelineIO derives from a range and every place a record starts or ends
+on its track; a rate is the `f64` nearest it, spelled so it reads back as
+that very `f64`. A media-side range its own rulers count past 2^53 — a
+medium stamped in nanoseconds since 1970 — is written in the coarsest ruler
+of a whole number of ticks a second that holds its start and its length
+exactly, whole seconds or milliseconds, when its counts there are within
+2^53. The record side has no other ruler: OpenTimelineIO adds a track's
+items up at the edit rate. What no ruler holds is refused,
+`Refused::NotRepresentable`, naming where (`otio::Spot`) and the count —
+never written rounded.
+
+OpenTimelineIO has no word for a clip's id, its gain or a reel: all three
+ride in `metadata` — the id so a reader can tell each clip again — and an
+application that does not read it — DaVinci Resolve among them — applies
+neither gain nor reel. Available ranges and the start are written as the timeline holds
 them: a medium read through `mediadecode` starts at zero until the read side
 exposes the container's timecode, so its available range does not yet carry
 the camera's.
@@ -141,9 +169,9 @@ runs it on the goldens.
 
 With `serde`, a timeline is a document whose first field is `schema` (`1`).
 A reader refuses by name an unknown schema, a field it does not know — inside
-a time value too, a record's or a rate's — a required field left out, a
-metadata key named twice, a gain that is not finite and a range longer than
-`i64::MAX` ticks. Time values are written under `mediatime`'s own field names
+a time value too, a record's or a rate's — a required field left out (a
+clip's `id` among them), a metadata key named twice, a gain that is not
+finite and a range longer than `i64::MAX` ticks. Time values are written under `mediatime`'s own field names
 and read through the crate's strict shapes of them. An optional word left
 out reads as absent.
 
@@ -151,10 +179,12 @@ out reads as absent.
 
 The crate does no time arithmetic of its own: every comparison, sum and
 recount is `mediatime`'s, exact across timebases unless it names a
-rounding. The one road `mediatime` 0.5 lacks — a range's exact length as a
-`Duration` — is a `mediatime` row; meanwhile a range is measured by the
-checked difference of its ends, and one longer than `i64::MAX` ticks is
-refused.
+rounding. Two roads `mediatime` 0.5 lacks are `mediatime` rows: a range's
+exact length as a `Duration` — meanwhile a range is measured by the checked
+difference of its ends, and one longer than `i64::MAX` ticks is refused —
+and the coarsest whole-rate timebase holding a range, which the
+OpenTimelineIO export picks meanwhile from the greatest common divisor of
+the range's counts, the recount itself `mediatime`'s.
 
 ## Not here
 
@@ -164,8 +194,6 @@ refused.
   module is its home.
 - **Rendering.** The compositor and the contact sheet are `mediaio-render`'s,
   the mixer `mediaencode`'s.
-- **A clip `id`** — reserved; clips are identified by name and locator,
-  unique within a track.
 - **The container's timecode** in available ranges — a `mediadecode` row.
 
 ## Example
