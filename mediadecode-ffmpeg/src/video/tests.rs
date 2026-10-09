@@ -2365,7 +2365,7 @@ fn feed_through_failures(
 
 /// LAW (row 1): **after the first picture every failure is its picture's
 /// own, on every path that can hold hardware — reported as it was minted,
-/// the session kept, the next packet decoded.**
+/// the session kept, the next packet reaching libavcodec.**
 ///
 /// FFmpeg has no reliable signal that a hardware session is gone, so
 /// nothing after the first picture is classified: in FFmpeg 9.0.1
@@ -2375,11 +2375,12 @@ fn feed_through_failures(
 /// pictures asked for, `AVERROR_EXTERNAL` and `ENOSYS` among them. Each
 /// must reach the caller as itself on the road that met it, the session
 /// must stay on hardware throughout, and every other picture must come
-/// out — the shape of the software road reporting a corrupt packet's
-/// `AVERROR_INVALIDDATA` and decoding on.
+/// out. The decoder behind the seam is FFmpeg's own and was never broken,
+/// so what the law sees is this wrapper passing every call through — not
+/// a hardware session recovering, which is FFmpeg's.
 ///
 /// PLANT: a wrapper that remembers a failure and refuses what follows
-/// turns this red at "the next packet decodes".
+/// turns this red at "each next packet reaching libavcodec".
 #[test]
 fn every_failure_after_the_first_picture_is_its_pictures_own_on_every_hardware_path() {
   let (w, h) = (64u32, 48u32);
@@ -2434,7 +2435,7 @@ fn every_failure_after_the_first_picture_is_its_pictures_own_on_every_hardware_p
     assert_eq!(
       answers.pictures,
       [0, 1, 3, 4, 7, 8, 11],
-      "{path:?}: every other picture came out — the next packet decodes after each failure",
+      "{path:?}: every other picture came out, each next packet reaching libavcodec",
     );
     assert_eq!(
       answers.failures,
@@ -2473,12 +2474,13 @@ enum FailureRoad {
 /// send, on a picture asked for, or at the end of the stream is that
 /// call's own error: it is reported as itself on that road, the session
 /// stays on hardware, nothing reaches the probe-era replay queue, and the
-/// next call decodes — every other picture comes out, and the end drains.
-/// A failed VideoToolbox restart answers `AVERROR_EXTERNAL`
-/// (`libavcodec/videotoolbox.c` 1066–1067 in FFmpeg 9.0.1), and FFmpeg
-/// tries the restart again once a parameter set marks the session
-/// (446–450 and 1062–1068); the session is left to FFmpeg's own recovery
-/// and to the caller's policy.
+/// next call reaches libavcodec behind the seam — every other picture
+/// comes out, and the end drains. A failed VideoToolbox restart answers
+/// `AVERROR_EXTERNAL` (`libavcodec/videotoolbox.c` 1066–1067 in FFmpeg
+/// 9.0.1), and every picture after it fails the same way until a new
+/// parameter set re-arms the restart (1071–1072, 446–450). Whether the
+/// session recovers is FFmpeg's, and when to rebuild on software is the
+/// caller's; what this law pins is that nothing here changes the road.
 ///
 /// PLANT: an `Auto` that opens software on a committed session's failure
 /// turns this red at "nothing changes the road".
@@ -2528,7 +2530,7 @@ fn after_the_first_picture_nothing_changes_the_road_on_any_path() {
         .collect();
       assert_eq!(
         answers.pictures, expected_pictures,
-        "{path:?} {road:?}: every other picture came out — the next call decodes",
+        "{path:?} {road:?}: every other picture came out — the next call reaches libavcodec",
       );
       assert_eq!(
         answers.failures,
@@ -2547,13 +2549,18 @@ fn after_the_first_picture_nothing_changes_the_road_on_any_path() {
   }
 }
 
-/// LAW (row 1): **`flush` after a failure leaves the session serving, on
-/// every path that can hold hardware.** An `AVERROR_EXTERNAL` on a send,
-/// then a seek's flush: the packets from the next keyframe on decode as on
-/// any session, every picture from that keyframe comes out, and the
-/// session is still on hardware.
+/// LAW (row 1): **after a failure and a `flush`, the packets reach
+/// libavcodec, on every path that can hold hardware.** An
+/// `AVERROR_EXTERNAL` on a send, then a seek's flush: the packets from the
+/// next keyframe on reach the decoder behind the seam, every picture from
+/// that keyframe comes out, and the session is still on hardware.
+///
+/// The decoder behind the seam is FFmpeg's own and was never broken, so
+/// the law pins what this wrapper's `flush` keeps of a failure — nothing —
+/// and not that a hardware session recovers: `flush` rebuilds none (see
+/// `VideoDecoder::flush`).
 #[test]
-fn flush_after_a_failure_leaves_the_session_serving_on_every_hardware_path() {
+fn after_a_failure_and_a_flush_the_packets_reach_libavcodec_on_every_hardware_path() {
   let (w, h) = (64u32, 48u32);
   let clip = encode_synthetic_clip(w, h, 12, 4);
   let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
@@ -2600,11 +2607,11 @@ fn flush_after_a_failure_leaves_the_session_serving_on_every_hardware_path() {
     for index in resume_at..clip.packets.len() {
       crate::accepted(
         dec.send_packet(&pushed(&clip, index)),
-        "after a flush the session serves",
+        "after a flush the packet reaches libavcodec",
       );
       drain_pictures(&mut dec, &mut after);
     }
-    crate::accepted(dec.send_eof(), "after a flush the session serves the end");
+    crate::accepted(dec.send_eof(), "after a flush the end reaches libavcodec");
     drain_pictures(&mut dec, &mut after);
 
     assert_eq!(
@@ -2615,7 +2622,7 @@ fn flush_after_a_failure_leaves_the_session_serving_on_every_hardware_path() {
     assert_eq!(
       after,
       (resume_at as i64..clip.packets.len() as i64).collect::<Vec<_>>(),
-      "{path:?}: after a flush the session serves — every picture from the keyframe on",
+      "{path:?}: after a flush the packets reach libavcodec — every picture from the keyframe on",
     );
     assert!(
       dec.is_hardware() && !dec.is_software(),

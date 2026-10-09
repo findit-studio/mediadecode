@@ -150,9 +150,9 @@ use crate::{
 /// A committed backend reports per picture, and nothing is classified or
 /// remembered. Every failure is that picture's own error, reported as it
 /// was minted — a refusal this crate made by its name, anything else as
-/// libavcodec's errno — and the next call reaches libavcodec, as the
-/// software decoder returns a corrupt packet's `AVERROR_INVALIDDATA` and
-/// decodes on. `flush` leaves the session serving.
+/// libavcodec's errno — and the next call reaches libavcodec. That is all
+/// this decoder promises about the next call: whether the hardware
+/// session behind it recovers is FFmpeg's.
 ///
 /// FFmpeg has no reliable signal that a hardware session is gone, so this
 /// decoder never decides that one is. In FFmpeg 9.0.1 `AVERROR_EXTERNAL`
@@ -163,17 +163,25 @@ use crate::{
 /// NVDEC's answer to one HEVC picture its tables cannot describe
 /// (`nvdec_hevc.c` 200–227). A hardware format `ff_get_format` withdraws
 /// says only that the hwaccel's setup failed, not why (`decode.c`
-/// 1341–1343 and 1348–1357). And FFmpeg restarts a VideoToolbox session
-/// itself: a malfunction or an invalidated session marks it for a restart
+/// 1341–1343 and 1348–1357).
+///
+/// Nor does FFmpeg always recover a session. A malfunction or an
+/// invalidated session marks a VideoToolbox session for a restart
 /// (`videotoolbox.c` 1076–1077), as does an H.264 SPS whose profile/level
 /// bytes differ (446–450), and the next picture stops the session and
 /// starts a new one (1062–1068). A restart that fails answers
-/// `AVERROR_EXTERNAL` (1066–1067), and a later parameter set that marks
-/// the session again has the next picture try once more.
+/// `AVERROR_EXTERNAL` (1066–1067) and leaves no session behind, because
+/// the stop released it (518–522): VideoToolbox answers every picture
+/// after it with `AVERROR_INVALIDDATA` (1071–1072) until a new parameter
+/// set re-arms the restart (446–450). [`Self::flush`] does not rebuild
+/// one: `avcodec_flush_buffers` reaches only the codec's own flush
+/// (`libavcodec/avcodec.c` 417–418).
 ///
-/// When to stop trusting a hardware session is the caller's policy — the
-/// caller sees the errors, the packets' key flags and what it has
-/// delivered. [`DecodePath`](crate::DecodePath) carries one recipe.
+/// So a caller that sees failures persist rebuilds: it opens a software
+/// decoder from the same parameters and feeds it forward. When to do so
+/// is the caller's policy — the caller sees the errors, the packets' key
+/// flags and what it has delivered — and [`DecodePath`](crate::DecodePath)
+/// describes one.
 pub struct VideoDecoder {
   /// Live FFmpeg state for the currently active backend.
   state: DecoderState,
@@ -1391,8 +1399,8 @@ impl VideoDecoder {
   /// decoder of their choice.
   ///
   /// After commit a failure is that picture's own error, reported as it
-  /// was minted, and the next call decodes on. See the type's
-  /// documentation.
+  /// was minted, and nothing is remembered: the next call reaches
+  /// libavcodec. See the type's documentation.
   ///
   /// Answers the same three states `ffmpeg::decoder::Video` does, in
   /// the shape the trait tier publishes: [`Received::NeedsInput`] where
@@ -1603,6 +1611,11 @@ impl VideoDecoder {
   /// cleared since post-seek packets do not align with the previously
   /// captured history. After a flush, the next `receive_frame` waits for new
   /// post-seek input.
+  ///
+  /// It rebuilds no hardware session. `avcodec_flush_buffers` reaches only
+  /// the codec's own flush (`libavcodec/avcodec.c` 417–418 in FFmpeg
+  /// 9.0.1), which drops the pictures and references the codec holds. See
+  /// the type's documentation for a session FFmpeg leaves without one.
   pub fn flush(&mut self) {
     self.state.inner.flush();
     // SAFETY: hw_frame is a valid AVFrame we own; av_frame_unref is a no-op

@@ -2159,10 +2159,12 @@ const COMMITTED_FAILURES: [ffmpeg_next::Error; 9] = [
 /// FFmpeg 9.0.1 `AVERROR_EXTERNAL` also answers one picture
 /// (`libavcodec/videotoolbox.c` 126–129 and 556–559), `ENOSYS` is NVDEC's
 /// answer to one HEVC picture (`nvdec_hevc.c` 200–227), and a failed
-/// VideoToolbox restart (`videotoolbox.c` 1066–1067) is tried again by
-/// FFmpeg itself once a parameter set marks the session (446–450 and
-/// 1062–1068). So no errno is read as more than its picture's: each comes
-/// back as itself, and the call after it reaches libavcodec.
+/// VideoToolbox restart (`videotoolbox.c` 1066–1067) is FFmpeg's to try
+/// again, once a new parameter set re-arms it (446–450 and 1062–1068) —
+/// until then every picture fails the same way (1071–1072). So no errno
+/// is read as more than its picture's: each comes back as itself, and the
+/// call after it reaches libavcodec. That is all this law pins; whether
+/// the session behind the call recovers is FFmpeg's.
 ///
 /// How "reaches libavcodec" is seen: libavcodec is handed the end first,
 /// behind the session's back, so its own answer to any packet is
@@ -2204,16 +2206,20 @@ fn a_committed_failure_is_its_pictures_own_and_the_next_packet_reaches_libavcode
   }
 }
 
-/// LAW (row 1): **`flush` after a committed failure leaves the session
-/// serving.** Nothing about the failure outlives a seek: after the flush
-/// the end is taken, libavcodec holds it — a second flush packet sent
-/// straight to it is refused, which only a libavcodec that took the first
-/// one does — and the drain answers the end.
+/// LAW (row 1): **after a committed failure and a `flush`, the end
+/// reaches libavcodec.** Nothing about the failure outlives a seek in
+/// this decoder: after the flush the end is taken, libavcodec holds it —
+/// a second end sent straight to it is refused, which only a libavcodec
+/// that took the first one does — and the drain answers the end.
 ///
-/// The plant above turns this red at "after a flush the session serves"
-/// when the restored latch survives `flush`.
+/// That is all it pins. `flush` rebuilds no hardware session: it reaches
+/// only the codec's own flush (`libavcodec/avcodec.c` 417–418 in FFmpeg
+/// 9.0.1), so a session FFmpeg left without a decoder stays without one.
+///
+/// The plant above turns this red at "after a flush the end reaches
+/// libavcodec" when the restored latch survives `flush`.
 #[test]
-fn flush_after_a_committed_failure_leaves_the_session_serving() {
+fn after_a_committed_failure_and_a_flush_the_end_reaches_libavcodec() {
   for raw in COMMITTED_FAILURES {
     let mut dec = committed_decoder();
     let out = reported(dec.hw_failure(raw, BareVerdict::CandidateFailure));
@@ -2226,7 +2232,7 @@ fn flush_after_a_committed_failure_leaves_the_session_serving() {
     let eof = dec.send_eof();
     assert!(
       matches!(eof, Ok(Sent::Accepted)),
-      "{raw:?}: after a flush the session serves — the end is taken, got {eof:?}",
+      "{raw:?}: after a flush the end reaches libavcodec — it is taken, got {eof:?}",
     );
     assert!(
       matches!(dec.state.inner.send_eof(), Err(ffmpeg_next::Error::Eof)),

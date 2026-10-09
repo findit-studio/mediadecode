@@ -26,19 +26,20 @@
 //! Once a backend has committed — at its first picture, or at open when
 //! it was named — the session stays on it, and nothing is classified.
 //! Every failure is that picture's own error, reported as it was minted,
-//! and the next packet decodes, as the software road returns a corrupt
-//! packet's `AVERROR_INVALIDDATA` and goes on. Nothing is remembered from
-//! one call to the next, and `flush` leaves the session serving. FFmpeg
-//! may restart a hardware session on its own at a later parameter set
-//! (see [`crate::VideoDecoder`] for the lines); this wrapper neither
-//! waits for that nor rules it out.
+//! and nothing is remembered from one call to the next, so every call
+//! reaches libavcodec. Whether a hardware session recovers is FFmpeg's:
+//! after a VideoToolbox restart that fails, every picture fails the same
+//! way until a new parameter set re-arms the restart, and `flush` rebuilds
+//! no hardware session (see [`crate::VideoDecoder`] for the lines). This
+//! wrapper neither waits for a recovery nor rules one out.
 //!
 //! **`Auto` does not go on in software at that point.** A software
-//! decoder that starts mid-stream holds no reference pictures, so no
-//! session can switch without a gap, and the caller — which sees the
-//! errors, the packets' key flags and what it has delivered — is the one
-//! placed to decide when to switch and how to close the gap. The recipe
-//! is on [`DecodePath`].
+//! decoder that starts mid-stream holds no reference pictures, and after
+//! the first picture this session keeps no packets to give it, so it
+//! cannot switch without a gap. The caller can: it sees the failures, the
+//! packets' key flags and what it has delivered, and it can keep the
+//! packets since the last keyframe. When to rebuild on software is the
+//! caller's policy; [`DecodePath`] describes one.
 //!
 //! Frames produced by either decoder are converted via
 //! [`crate::convert::av_frame_to_video_frame`] so the consumer sees the
@@ -94,22 +95,38 @@ use crate::{
 ///   open; nothing else is tried, before or after.
 ///
 /// **After the first picture nothing changes the road, on any path, and
-/// nothing is classified.** A failure there is that picture's own error,
-/// reported as it was minted — on hardware as the software road reports
-/// a corrupt packet's — and the session decodes on. FFmpeg may restart a
-/// hardware session on its own at a later parameter set; see
+/// nothing is classified.** Every call reaches libavcodec, and a failure
+/// is that picture's own error, reported as it was minted. Whether a
+/// hardware session recovers is FFmpeg's: after a VideoToolbox restart
+/// that fails, every picture fails the same way until a new parameter set
+/// re-arms the restart, and `flush` rebuilds no hardware session. See
 /// [`VideoDecoder`](crate::VideoDecoder) for the lines.
 ///
 /// # When to stop trusting a hardware session
 ///
-/// That is the caller's policy, not this crate's: the caller sees the
-/// errors, the packets' key flags and what it has delivered. One recipe:
-/// after `N` consecutive failures, or one failure on a packet flagged
-/// key, open a session on [`Software`](Self::Software) from the same
-/// parameters and feed it forward — the packet the error answered when
-/// it came from `send_packet`, otherwise the next one. libavcodec
-/// conceals or drops what comes before the next keyframe and decodes
-/// normally from there.
+/// A caller that sees failures persist rebuilds: it opens a session on
+/// [`Software`](Self::Software) from the same parameters and feeds it
+/// forward. When to do so is the caller's policy, not this crate's,
+/// because it is the caller that sees the failures on all three roads
+/// (`send_packet`, `receive_frame` and `send_eof`), the packets' key flags
+/// and what it has delivered. The example in the
+/// [crate documentation](crate) is one such policy:
+///
+/// - It counts a failure from any of the three roads, and only a
+///   delivered picture ends the count.
+/// - At a threshold of its own it opens [`Software`](Self::Software) from
+///   the same parameters and replays into it the packets since the last
+///   packet flagged key, which it kept because its input is read once (a
+///   seekable input could seek back instead). Pictures the hardware
+///   session already delivered come out again, and it skips them by PTS.
+///   Then the stream goes on, and when the input is already over the new
+///   session is given the end.
+/// - On software its failures are reported and the stream goes on:
+///   software is where the policy ends.
+///
+/// A caller that keeps nothing feeds software forward from the failing
+/// packet instead, and libavcodec conceals or drops what comes before the
+/// next keyframe: that gap is the price of keeping nothing.
 ///
 /// The words differ in what they **permit**, not only where they start.
 /// That is the difference the consumers of this door need. A determinism
