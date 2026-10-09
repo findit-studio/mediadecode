@@ -1803,3 +1803,203 @@ fn a_whole_rate_that_cannot_end_a_source_range_is_never_tried() {
   assert!(twentieths(a) <= i128::from(TWO_53) && twentieths(b) <= i128::from(TWO_53));
   assert_eq!(twentieths(a) + twentieths(b) - i128::from(TWO_53), 2698);
 }
+
+/// Track 0's items as `to_otio` writes `timeline`: each clip's source range,
+/// its start and its duration read.
+fn written_items(timeline: &Timeline) -> Vec<(Read, Read)> {
+  let text = to_otio(timeline, OtioTarget::V0_15Plus).unwrap();
+  assert_eq!(validate_json(&text, OtioTarget::V0_15Plus), Ok(()));
+  kids(&text, 0)
+    .iter()
+    .map(|kid| match *kid {
+      Kid::Item { start, duration } => (start, duration),
+      Kid::Transition { .. } => panic!("{kid:?}"),
+    })
+    .collect()
+}
+
+/// Why `to_otio` refuses `timeline`, whole.
+fn refusal(timeline: &Timeline) -> NotRepresentable {
+  match to_otio(timeline, OtioTarget::V0_15Plus) {
+    Err(Refused::NotRepresentable(refusal)) => refusal,
+    other => panic!("{other:?}"),
+  }
+}
+
+#[test]
+fn a_source_range_none_of_its_own_rulers_writes_is_written_in_the_edit_rate() {
+  // At one frame every two seconds, `a` plays [2^53 + 2, 2^53 + 4) seconds.
+  // Its own rulers — seconds, its timebase's and its coarsest whole one —
+  // count its start past 2^53, but the edit rate, a ruler the timeline's
+  // operands are counted in, writes it: from 2^52 + 1, one long, ending at
+  // 2^52 + 2. Planned there, it reads back as [2^53 + 2, 2^53 + 4) seconds
+  // exactly.
+  let frames = |value: i64| Read {
+    value: value as f64,
+    rate: 0.5,
+  };
+  let [(start, duration)] = written_items(&seconds_from(TWO_53 + 2, 2))[..] else {
+    panic!("one item");
+  };
+  assert_eq!((start, duration), (frames(TWO_53 / 2 + 1), frames(1)));
+  let end = Read::end(start, duration);
+  assert_eq!(end, frames(TWO_53 / 2 + 2));
+  assert_eq!(Read::end_inclusive(start, duration), start);
+  assert_eq!(
+    (start.at(1.0), end.at(1.0)),
+    ((TWO_53 + 2) as f64, (TWO_53 + 4) as f64)
+  );
+}
+
+#[test]
+fn a_source_range_from_before_minus_2_53_none_of_its_own_rulers_writes_is_written_in_the_edit_rate()
+{
+  // `a` plays [-2^53 - 2, -2^53 + 2) seconds of a medium whose clock starts
+  // before zero, at one frame every two seconds. Its own rulers count its
+  // start past -2^53; the edit rate writes it, from -2^52 - 1, two long. The
+  // walk derives only the end from a start, here within ±2^53 in seconds
+  // too, so it is the plan that keeps the start written within ±2^53.
+  let frames = |value: i64| Read {
+    value: value as f64,
+    rate: 0.5,
+  };
+  let [(start, duration)] = written_items(&seconds_from(-TWO_53 - 2, 4))[..] else {
+    panic!("one item");
+  };
+  assert_eq!((start, duration), (frames(-TWO_53 / 2 - 1), frames(2)));
+  let end = Read::end(start, duration);
+  assert_eq!(end, frames(-TWO_53 / 2 + 1));
+  assert_eq!(Read::end_inclusive(start, duration), frames(-TWO_53 / 2));
+  assert_eq!(
+    (start.at(1.0), end.at(1.0)),
+    ((-TWO_53 - 2) as f64, (-TWO_53 + 2) as f64)
+  );
+}
+
+#[test]
+fn a_source_range_no_ruler_of_the_bands_writes_is_refused_before_any_walk() {
+  // At one frame a second, [2^53 + 2, 2^53 + 4) seconds: its own rulers
+  // count its start past 2^53, and so does the one ruler the timeline's
+  // operands are counted in, seconds. Every whole rate that lands on it is
+  // a multiple of a second, so no free ruler writes it either: no ruler of
+  // the bands does, and there is no plan to walk. Refused as the timeline
+  // holds it, with the bands the search tried and no walk.
+  let at_one_fps = Timeline::new("t", Rate::hz(1)).with_track(video([placed(
+    "a",
+    TimeRange::new(TWO_53 + 2, TWO_53 + 4, second()),
+    TimeRange::new(0, 2, second()),
+  )]));
+  let refused = refusal(&at_one_fps);
+  assert_eq!(
+    (refused.at(), refused.value(), refused.rate()),
+    (
+      Spot::Source(ClipAt::new(0, 0)),
+      i128::from(TWO_53) + 2,
+      Rate::hz(1)
+    )
+  );
+  let searched = refused.searched().unwrap();
+  assert_eq!(searched.walks(), 0);
+  assert_eq!(
+    searched.bands(),
+    [
+      RulerBand::Operands,
+      RulerBand::Finest(64),
+      RulerBand::Coarsest(64)
+    ]
+  );
+  assert!(
+    refused.to_string().ends_with(
+      ", in any of the clip's own rulers or of the bounded search's bands, so the search walked \
+       no plan"
+    ),
+    "{refused}"
+  );
+  // At one frame every two seconds, [2^53 + 3, 2^53 + 5) seconds: the edit
+  // rate's frames do not land on its odd start. Refused the same way.
+  let refused = refusal(&seconds_from(TWO_53 + 3, 2));
+  assert_eq!(
+    (refused.at(), refused.value(), refused.rate()),
+    (
+      Spot::Source(ClipAt::new(0, 0)),
+      i128::from(TWO_53) + 3,
+      Rate::hz(1)
+    )
+  );
+  assert_eq!(refused.searched().map(|searched| searched.walks()), Some(0));
+}
+
+#[test]
+fn a_source_range_an_operand_ruler_writes_but_cannot_end_moves_its_own_clip_on() {
+  // At one frame every two seconds: `m`, two seconds counted in
+  // milliseconds; `q`, one tick of four seconds; then `a`, [2^54 - 4,
+  // 2^54 + 4) seconds. None of `a`'s own rulers writes it. Of the
+  // timeline's operands, finest first — 1 000, 1, the edit rate's 1/2,
+  // `q`'s 1/4 — the first that writes it is the edit rate: from 2^53 - 2,
+  // four long, ending at 2^53 + 2, past the bound. The walk refuses that end,
+  // and the search moves `a` alone — `m`, finer, plays no part in it — to
+  // the next ruler of its list, `q`'s, which ends it at 2^52 + 1.
+  let edit = tb(2, 1);
+  let timeline = Timeline::new("t", every_two_seconds()).with_track(video([
+    placed(
+      "m",
+      TimeRange::new(0, 2000, Timebase::MILLIS),
+      TimeRange::new(0, 1, edit),
+    ),
+    placed(
+      "q",
+      TimeRange::new(0, 1, tb(4, 1)),
+      TimeRange::new(1, 3, edit),
+    ),
+    placed(
+      "a",
+      TimeRange::new(2 * TWO_53 - 4, 2 * TWO_53 + 4, second()),
+      TimeRange::new(3, 7, edit),
+    ),
+  ]));
+  let at = |value: i64, rate: f64| Read {
+    value: value as f64,
+    rate,
+  };
+  let written = written_items(&timeline);
+  assert_eq!(
+    written,
+    [
+      (at(0, 1000.0), at(2000, 1000.0)),
+      (at(0, 0.25), at(1, 0.25)),
+      (at(TWO_53 / 2 - 1, 0.25), at(2, 0.25)),
+    ]
+  );
+  let (start, duration) = written[2];
+  let end = Read::end(start, duration);
+  assert_eq!(end, at(TWO_53 / 2 + 1, 0.25));
+  assert_eq!(
+    (start.at(1.0), end.at(1.0)),
+    ((2 * TWO_53 - 4) as f64, (2 * TWO_53 + 4) as f64)
+  );
+}
+
+#[test]
+fn a_source_range_an_operand_ruler_writes_but_none_ends_is_refused_after_the_walk() {
+  // `a` alone at one frame every two seconds, [2^54 - 4, 2^54 + 4) seconds:
+  // planned in the edit rate's frames, from 2^53 - 2, four long, whose end,
+  // 2^53 + 2, the walk refuses. No other ruler of its list holds it —
+  // seconds count its start past 2^53 — so the search refuses it there,
+  // after that one walk.
+  let refused = refusal(&seconds_from(2 * TWO_53 - 4, 8));
+  assert_eq!(
+    (refused.at(), refused.value(), refused.rate()),
+    (
+      Spot::Source(ClipAt::new(0, 0)),
+      i128::from(TWO_53) + 2,
+      every_two_seconds()
+    )
+  );
+  assert_eq!(refused.searched().map(|searched| searched.walks()), Some(1));
+  assert!(
+    refused.to_string().contains(
+      ", in the one plan the bounded search walked, trying each clip in its plan's ruler, "
+    ),
+    "{refused}"
+  );
+}

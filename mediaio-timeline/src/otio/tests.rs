@@ -514,6 +514,13 @@ fn a_media_range_no_ruler_holds_is_refused() {
     not_representable(&timeline),
     (Spot::Source(ClipAt::new(0, 0)), i128::from(start))
   );
+  // Nor does a ruler the timeline's operands are counted in — 25 fps or
+  // seconds: no ruler of the search's bands writes it, so there is no plan
+  // to walk, and the refusal says so.
+  let Err(Refused::NotRepresentable(refusal)) = to_otio(&timeline, OtioTarget::V0_15Plus) else {
+    panic!("exported");
+  };
+  assert_eq!(refusal.searched().map(|search| search.walks()), Some(0));
 }
 
 /// Every object inside `value` naming `schema`.
@@ -619,15 +626,28 @@ fn a_refusal_to_export_says_why() {
     })),
     "the place of track 0, child 1 counts 27021597764222973 ticks of 1/3 s, which \
      OpenTimelineIO's f64 does not hold exactly, in the last of 3 plans the bounded search \
-     walked, trying each clip in its own ruler, every ruler the timeline's operands are counted \
-     in that holds it, the 64 finest whole rates below its own that hold it, and the 64 \
-     coarsest whole rates below its own that hold it"
+     walked, trying each clip in its plan's ruler, every ruler the timeline's operands are \
+     counted in that holds it, the 64 finest whole rates below its plan's that hold it, and the \
+     64 coarsest whole rates below its plan's that hold it"
   );
   assert_eq!(
     alloc::string::ToString::to_string(&RulerSearch { walks: 1 }),
-    "the one plan the bounded search walked, trying each clip in its own ruler, every ruler the \
-     timeline's operands are counted in that holds it, the 64 finest whole rates below its own \
-     that hold it, and the 64 coarsest whole rates below its own that hold it"
+    "the one plan the bounded search walked, trying each clip in its plan's ruler, every ruler \
+     the timeline's operands are counted in that holds it, the 64 finest whole rates below its \
+     plan's that hold it, and the 64 coarsest whole rates below its plan's that hold it"
+  );
+  // A source range no ruler of the search's bands writes: refused as the
+  // timeline holds it, the bands tried and no plan walked.
+  assert_eq!(
+    shown(Refused::NotRepresentable(NotRepresentable {
+      at: Spot::Source(ClipAt::new(0, 0)),
+      value: 9_007_199_254_740_994,
+      rate: Rate::hz(1),
+      searched: Some(RulerSearch { walks: 0 }),
+    })),
+    "the source range of track 0, clip 0 counts 9007199254740994 ticks of 1/1 s, which \
+     OpenTimelineIO's f64 does not hold exactly, in any of the clip's own rulers or of the \
+     bounded search's bands, so the search walked no plan"
   );
   assert_eq!(
     shown(Refused::Validation(alloc::vec![
