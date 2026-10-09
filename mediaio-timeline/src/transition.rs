@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 /// - the incoming clip starts `in_offset` before its source range's start.
 ///
 /// These are OpenTimelineIO's `in_offset` and `out_offset`, with the same
-/// meaning. [`validate`](crate::validate) holds each handle inside its
+/// meaning. [`validate`](fn@crate::validate) holds each handle inside its
 /// clip's available media when that is known.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

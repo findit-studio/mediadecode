@@ -20,11 +20,11 @@ use crate::Metadata;
 /// The record is **explicit**: it is stored, not derived from the clips
 /// before it, so trimming one clip moves no other. With no time-warp in
 /// schema 1 the two ranges are one stretch of time, and
-/// [`validate`](crate::validate) holds the record's length to the source's,
+/// [`validate`](fn@crate::validate) holds the record's length to the source's,
 /// rescaled to the edit rate to the nearest tick.
 ///
 /// A clip is identified by its [`name`](Self::name) together with its
-/// medium's [`locator`](MediaRef::locator); [`diff`](crate::diff) matches
+/// medium's [`locator`](MediaRef::locator); [`diff`](fn@crate::diff) matches
 /// clips that way. An `id` word is reserved for a later schema, as is
 /// `speed`: neither is part of schema 1.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -190,7 +190,7 @@ impl Clip {
 /// what is known about the medium, each `None` until someone knows it:
 ///
 /// - [`available_range`](Self::available_range) — the stretch the medium
-///   holds, in its own timebase. [`validate`](crate::validate) holds a source
+///   holds, in its own timebase. [`validate`](fn@crate::validate) holds a source
 ///   range and a transition's handles inside it when it is known. It starts
 ///   where the medium's own clock starts: a medium read through `mediadecode`
 ///   starts at zero until the read side exposes the container's timecode;

@@ -11,7 +11,7 @@
 //! | [`Clip`](crate::Clip) | `Clip.2` under [`OtioTarget::V0_15Plus`], `Clip.1` under [`OtioTarget::Legacy`]; `enabled` |
 //! | its trim | `source_range`: `duration` is the record's length at the edit rate, `start_time` the source range's start |
 //! | [`MediaRef`](crate::MediaRef) | `ExternalReference.1` (under `DEFAULT_MEDIA` in `Clip.2`): `target_url` is the locator, `available_range` the available range |
-//! | a gap between records | `Gap.1` — derived by [`layout`](crate::layout), never stored |
+//! | a gap between records | `Gap.1` — derived by [`layout`](fn@crate::layout), never stored |
 //! | [`Transition`](crate::Transition) | `Transition.1`, `SMPTE_Dissolve`, its offsets at the edit rate |
 //! | a [`Fade`](crate::Fade) | `Transition.1`, `SMPTE_Dissolve` against a gap — a gap of no length where the clip abuts a clip or a track's end |
 //! | gain, reel, the medium's rate, a fade's curve, [`Metadata`](crate::Metadata) | `metadata.mediaio`: `gain_db`, `reel`, `rate`, `fade` and `shape`, `metadata` |
@@ -60,7 +60,7 @@ pub enum OtioTarget {
 /// spaces a level as OpenTimelineIO's own writer indents, ending in a
 /// newline.
 ///
-/// A timeline that does not [`validate`] is refused with its refusals: its
+/// A timeline that does not [`validate`](fn@validate) is refused with its refusals: its
 /// records could not be laid end to end, which is how OpenTimelineIO places
 /// items.
 pub fn to_otio(timeline: &Timeline, target: OtioTarget) -> Result<String, Vec<Refusal>> {

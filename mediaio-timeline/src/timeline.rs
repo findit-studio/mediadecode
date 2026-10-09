@@ -16,7 +16,7 @@ use crate::{Clip, Metadata, Schema, Transition};
 /// moves nothing on it.
 ///
 /// The value is plain data: building one checks nothing, and
-/// [`validate`](crate::validate) is where a timeline is judged. Tracks stack
+/// [`validate`](fn@crate::validate) is where a timeline is judged. Tracks stack
 /// in order, the first at the bottom.
 ///
 /// On the wire the document's first field is [`schema`](Self::schema), and
@@ -37,7 +37,7 @@ impl Timeline {
   /// timecode zero.
   ///
   /// The start is counted at `rate`; for a rate of zero, which
-  /// [`validate`](crate::validate) refuses, it is counted in `1/1`.
+  /// [`validate`](fn@crate::validate) refuses, it is counted in `1/1`.
   pub fn new(name: impl Into<String>, rate: Rate) -> Self {
     let ruler = rate.checked_to_timebase().unwrap_or_default();
     Self {
@@ -103,7 +103,7 @@ impl Timeline {
   }
 
   /// Sets the edit rate in place. Nothing is recounted: positions keep their
-  /// counts, and [`validate`](crate::validate) refuses those not counted at
+  /// counts, and [`validate`](fn@crate::validate) refuses those not counted at
   /// the new rate.
   pub const fn set_rate(&mut self, rate: Rate) -> &mut Self {
     self.rate = rate;
