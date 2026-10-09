@@ -24,7 +24,7 @@ use crate::Metadata;
 /// rescaled to the edit rate to the nearest tick.
 ///
 /// A clip is identified by its [`name`](Self::name) together with its
-/// medium's [`locator`](MediaRef::locator); `diff` matches
+/// medium's [`locator`](MediaRef::locator); [`diff`](crate::diff) matches
 /// clips that way. An `id` word is reserved for a later schema, as is
 /// `speed`: neither is part of schema 1.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

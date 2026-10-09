@@ -8,6 +8,7 @@
 extern crate alloc;
 
 mod clip;
+mod diff;
 mod layout;
 mod metadata;
 mod schema;
@@ -17,6 +18,7 @@ mod transition;
 mod validate;
 
 pub use clip::{Clip, Fade, FadeShape, Fades, Gain, MediaRef};
+pub use diff::{Change, ChangeKind, Delta, diff};
 pub use layout::{Item, Layout, TrackLayout, layout};
 pub use metadata::Metadata;
 pub use schema::Schema;
