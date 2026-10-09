@@ -478,3 +478,284 @@ fn an_entry_too_large_to_retry_rejects_the_record() {
     );
   }
 }
+
+/// The `data` FFmpeg keeps of `unit` read the `reading`-th way
+/// ([`h264_identity`]): the unit cut out of a start-coded buffer as a
+/// record's units are.
+fn kept_of(unit: &[u8], reading: u8) -> Vec<u8> {
+  let buffer = annexb(&[unit]);
+  let mut walk = Walk::new(&buffer, buffer.len(), 0, Codec::H264, false, true);
+  let first = walk.next().expect("a unit").expect("cut");
+  let mut scratch = Vec::new();
+  let memory = walk.memory(&first, &mut scratch);
+  h264_identity(&first, memory, reading)
+}
+
+/// A unit of header byte `0x67`: `payload` bytes, then `extra` more payload
+/// bits, the last of them 1, and the stop bit after them — in a byte of its
+/// own where there are none.
+fn unit_of(payload: &[u8], extra: Option<u8>) -> Vec<u8> {
+  let mut bits = Bits::default();
+  for &byte in payload {
+    bits.put(u64::from(byte), 8);
+  }
+  if let Some(n) = extra {
+    bits.put(1, u32::from(n));
+  }
+  bits.unit(0x67)
+}
+
+/// LAW (R19 row 2; Codex R18 [medium]): **the `data` FFmpeg's H.264 decoder
+/// keeps of a parameter set is its first 4096 bytes, the stop bit put back
+/// only where they leave it room** — `get_bits_bytesize` cut at
+/// `sizeof(sps->data)`, then the stop bit re-added where the payload filled
+/// its last byte and `data_size` is still under 4096 (h264_ps.c:297-306; the
+/// picture parameter set's, 717-728). From its header (the first reading):
+/// 4,094 payload bytes and a stop bit of its own keep 4096, the stop bit
+/// last; 4,095 keep 4096, no stop bit; 4,095 bytes and three bits keep the
+/// first 4096 bytes; units of 6,000 bytes alike in those and unlike after
+/// keep the same. From its raw bytes after its header (the second): 4,094
+/// payload bytes and the stop byte keep those and a stop bit; 4,095 and the
+/// stop byte keep those alone. Every byte kept, the second, third and last
+/// cases kept 4,097 bytes, and the fourth told two sets FFmpeg keeps alike
+/// apart.
+#[test]
+fn h264_data_is_kept_as_ffmpeg_keeps_it() {
+  let payload = |n: usize| vec![0xaa_u8; n];
+  let kept = kept_of(&unit_of(&payload(4094), None), 1);
+  assert_eq!(kept.len(), H264_DATA);
+  assert_eq!(kept.last(), Some(&0x80), "the stop bit put back");
+  let kept = kept_of(&unit_of(&payload(4095), None), 1);
+  assert_eq!(kept.len(), H264_DATA, "no room for the stop bit");
+  assert_eq!(kept.last(), Some(&0xaa));
+  let kept = kept_of(&unit_of(&payload(4095), Some(3)), 1);
+  assert_eq!(kept.len(), H264_DATA, "cut at 4096");
+  assert!(
+    kept[..] == unit_of(&payload(4095), Some(3))[..H264_DATA],
+    "the unit's first 4096 bytes"
+  );
+  let mut other = payload(6000);
+  other[4500..].fill(0x55);
+  assert!(
+    kept_of(&unit_of(&payload(6000), None), 1) == kept_of(&unit_of(&other, None), 1),
+    "alike in the first 4096 bytes: the same data"
+  );
+  let raw = kept_of(&unit_of(&payload(4094), None), 2);
+  assert_eq!(raw.len(), H264_DATA);
+  assert_eq!(
+    raw[H264_DATA - 2..],
+    [0x80, 0x80],
+    "the stop byte, then the stop bit"
+  );
+  let raw = kept_of(&unit_of(&payload(4095), None), 2);
+  assert_eq!(raw.len(), H264_DATA);
+  assert_eq!(
+    raw[H264_DATA - 2..],
+    [0xaa, 0x80],
+    "the stop byte, no room for the stop bit"
+  );
+}
+
+/// What a long sequence parameter set of [`long_sps`] carries past the 4096
+/// bytes FFmpeg keeps of its `data`.
+#[derive(Clone, Copy, Default)]
+struct PastData {
+  /// The VCL HRD's last `cbr_flag`, which FFmpeg stores in `cpr_flag`.
+  last_cbr: bool,
+  /// `low_delay_hrd_flag`, which it reads and drops.
+  low_delay: bool,
+  /// `pic_struct_present_flag`, which it stores.
+  pic_struct: bool,
+  /// `max_bytes_per_pic_denom`, 3 or 4, which it reads and drops.
+  max_bytes_per_pic_denom: u32,
+  /// `max_num_reorder_frames`, 3 or 4, which it stores.
+  reorder: u32,
+  /// Bytes after the last field, which it never reads.
+  tail: &'static [u8],
+}
+
+/// A sequence parameter set of id 0 FFmpeg reads past the 4096 bytes it keeps
+/// of its `data`: High 4:4:4 Predictive, every scaling list sent, picture
+/// order type 1 with 255 offsets in a cycle, cropping, a VUI with every
+/// optional part and both HRDs of 32 entries, each value at the longest code
+/// FFmpeg stores — the end of the VCL HRD and the bitstream restriction past
+/// them, as `past` says.
+fn long_sps(past: PastData) -> Vec<u8> {
+  let mut bits = Bits::default();
+  bits.put(244, 8).put(0, 8).put(30, 8).ue(0);
+  // 4:4:4, no separate colour planes, 8 bits, no bypass; every scaling list,
+  // each of its deltas -128.
+  bits.ue(3).put(0, 1).ue(0).ue(0).put(0, 1).put(1, 1);
+  for size in [16; 6].into_iter().chain([64; 6]) {
+    bits.put(1, 1);
+    for _ in 0..size {
+      bits.se(-128);
+    }
+  }
+  // Picture order type 1: each offset a 63-bit code.
+  let far = 1 << 30;
+  bits.ue(0).ue(1).put(0, 1).se(far).se(far).ue(255);
+  for _ in 0..255 {
+    bits.se(far);
+  }
+  // One reference frame, 128x96 in frames, cropped.
+  bits.ue(1).put(0, 1).ue(7).ue(5).put(1, 1).put(1, 1);
+  bits.put(1, 1).ue(60).ue(60).ue(40).ue(40);
+  // The VUI: an extended aspect ratio, overscan, the video signal and colour
+  // description, the chroma location, timing.
+  bits.put(1, 1).put(1, 1).put(255, 8).put(4, 16).put(3, 16);
+  bits.put(1, 1).put(1, 1);
+  bits
+    .put(1, 1)
+    .put(5, 3)
+    .put(1, 1)
+    .put(1, 1)
+    .put(1, 8)
+    .put(1, 8)
+    .put(1, 8);
+  bits.put(1, 1).ue(5).ue(5);
+  bits.put(1, 1).put(1, 32).put(50, 32).put(1, 1);
+  for vcl in [false, true] {
+    bits.put(1, 1).ue(31).put(0, 4).put(0, 4);
+    for entry in 0..32 {
+      bits.ue(u32::MAX - 1).ue(u32::MAX - 1);
+      if vcl && entry == 31 {
+        assert!(
+          8 + bits.used as usize >= 8 * H264_DATA,
+          "the premise: the VCL HRD's last cbr_flag past the 4096 bytes kept"
+        );
+      }
+      bits.put(u64::from(vcl && entry == 31 && past.last_cbr), 1);
+    }
+    bits.put(23, 5).put(23, 5).put(23, 5).put(24, 5);
+  }
+  bits.put(u64::from(past.low_delay), 1);
+  bits.put(u64::from(past.pic_struct), 1);
+  bits.put(1, 1).put(1, 1);
+  bits.ue(past.max_bytes_per_pic_denom).ue(1).ue(16).ue(16);
+  bits.ue(past.reorder).ue(16);
+  for &byte in past.tail {
+    bits.put(u64::from(byte), 8);
+  }
+  bits.unit(0x67)
+}
+
+/// LAW (R19 row 2; Codex R18 [medium]): **an H.264 sequence parameter set is
+/// told from another as FFmpeg tells it — its first 4096 bytes and every
+/// field its reading stores — so what FFmpeg reads past those bytes and drops
+/// makes no new set, and what it reads past them and stores does.** FFmpeg
+/// compares the whole `SPS`, `data` cut at 4096 bytes and every field
+/// (`memcmp`, h264_ps.c:578-587): a set it reads past the 4096 bytes is one
+/// whose stored fields run past them. A record of such a set — FFmpeg's own
+/// decoder, opened on it strictly, stores it — and a picture parameter set
+/// bound to it: the same set again with bytes after its last field, with
+/// another `low_delay_hrd_flag` or `max_bytes_per_pic_denom`, changes nothing
+/// held; with another last `cbr_flag`, `pic_struct_present_flag` or
+/// `max_num_reorder_frames` it replaces the set, the picture parameter set
+/// bound to the one it replaced — `Superseded`, as FFmpeg holds it. A set
+/// whose bitstream restriction runs past its end, which FFmpeg's third
+/// reading stores with the fields it read off the bytes after it, again with
+/// the same bytes after it: the same set. Compared whole, the first three
+/// replaced the set; compared by `data` alone, the next three did not; a set
+/// read past its end taken as new whatever it read, the last replaced itself.
+#[test]
+fn an_h264_sequence_parameter_set_is_told_from_another_as_ffmpeg_tells_it() {
+  use super::super::held::Held;
+  let h264 = crate::CodecId::H264.raw();
+  let base = PastData {
+    max_bytes_per_pic_denom: 3,
+    reorder: 3,
+    ..PastData::default()
+  };
+  let record = annexb(&[&long_sps(base), &pps(0, 0)]);
+  assert!(
+    ffmpeg_opens_strictly_on(&record),
+    "the premise: FFmpeg stores the long set and the picture parameter set"
+  );
+  let held = Held::opened_on(h264, &record);
+  assert!(held.holds_pps(0), "the premise: both sets held");
+  for (name, past) in [
+    (
+      "bytes after the last field",
+      PastData {
+        tail: &[0x55; 64],
+        ..base
+      },
+    ),
+    (
+      "low_delay_hrd_flag",
+      PastData {
+        low_delay: true,
+        ..base
+      },
+    ),
+    (
+      "max_bytes_per_pic_denom",
+      PastData {
+        max_bytes_per_pic_denom: 4,
+        ..base
+      },
+    ),
+  ] {
+    let again = long_sps(past);
+    assert!(
+      held.after_packet(None, Some(&annexb(&[&again]))).is_none(),
+      "{name}: the same set, nothing held changes"
+    );
+  }
+  for (name, past) in [
+    (
+      "the last cbr_flag",
+      PastData {
+        last_cbr: true,
+        ..base
+      },
+    ),
+    (
+      "pic_struct_present_flag",
+      PastData {
+        pic_struct: true,
+        ..base
+      },
+    ),
+    ("max_num_reorder_frames", PastData { reorder: 4, ..base }),
+  ] {
+    let other = long_sps(past);
+    assert!(
+      ffmpeg_opens_strictly_on(&annexb(&[&other, &pps(0, 0)])),
+      "{name}: the premise, FFmpeg stores it"
+    );
+    let replaced = held
+      .after_packet(None, Some(&annexb(&[&other])))
+      .expect("a set that differs replaces SPS 0");
+    assert_eq!(
+      replaced.record(h264, &record, None),
+      Err(crate::Unrecordable::Superseded),
+      "{name}: PPS 0 bound to the set replaced"
+    );
+  }
+
+  // A set read past its end: no timing, no HRD, the bitstream restriction's
+  // flags and nothing after them.
+  let cut = baseline_sps(
+    0,
+    Some(&|bits: &mut Bits| {
+      bits.put(0, 8).put(1, 1).put(1, 1);
+    }),
+  );
+  let record = annexb(&[&cut, &pps(0, 0)]);
+  let reading = {
+    let mut walk = Walk::new(&record, record.len(), 0, Codec::H264, false, true);
+    let unit = walk.next().expect("a unit").expect("cut");
+    let mut scratch = Vec::new();
+    let memory = walk.memory(&unit, &mut scratch);
+    h264_sps_readings(&unit, memory, &record).map(|(.., reading)| reading)
+  };
+  assert_eq!(reading, Some(3), "the premise: read past its end");
+  let held = Held::opened_on(h264, &record);
+  assert!(held.holds_pps(0), "the premise: both sets held");
+  assert!(
+    held.after_packet(Some(&record), None).is_none(),
+    "a set read past its end, the same bytes after it: the same set"
+  );
+}

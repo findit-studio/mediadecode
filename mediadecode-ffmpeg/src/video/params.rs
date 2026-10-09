@@ -721,64 +721,169 @@ pub(super) struct Sps {
   bit_depth_luma: i32,
 }
 
+/// **What FFmpeg's `SPS` holds of a set once
+/// `ff_h264_decode_seq_parameter_set` stores it, `data` aside**
+/// (h264_ps.h:44-105): every field its reading sets — the set's own
+/// (h264_ps.c:284-594), its VUI's (`ff_h2645_decode_common_vui_params`,
+/// h2645_vui.c:37-100; `decode_vui_parameters`, h264_ps.c:133-199) and its
+/// HRD's (`decode_hrd_parameters`, 106-131) — which FFmpeg compares with
+/// `data` to keep an identical set in place, `memcmp` of the whole structure
+/// (578-587). A field a value read past the 4096 bytes `data` keeps can set
+/// — the end of the VUI's HRD, its bitstream restriction — is held as FFmpeg
+/// stores it, and the fields FFmpeg does not store are not held. Where
+/// FFmpeg stores a value it maps from the one it reads through a table or a
+/// rule of its decoder's — the scaling matrices from their deltas (201-268),
+/// the aspect ratio, colour description and chroma location
+/// (h2645_vui.c:41-99), the reference frame count under the `SMV2` codec tag
+/// (h264_ps.c:440-441), the reorder depth from the level where the bitstream
+/// restriction is absent (543-555) — the value read is held: alike values
+/// store alike fields. Every one of those is read within the first 3,200
+/// bytes of any set FFmpeg stores, the longest codes it takes for each field
+/// before the timing information's end summed, so two sets whose values read
+/// there differ differ in `data` as well.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct SpsFields {
+  sps_id: u32,
+  profile_idc: i32,
+  level_idc: i32,
+  constraint_set_flags: i32,
+  chroma_format_idc: i32,
+  residual_color_transform_flag: bool,
+  bit_depth_luma: i32,
+  bit_depth_chroma: i32,
+  transform_bypass: bool,
+  /// `decode_scaling_matrices`' reading: its present flag, then each list's
+  /// flag and every delta read for it.
+  scaling: Vec<i32>,
+  log2_max_frame_num: i32,
+  poc_type: i32,
+  log2_max_poc_lsb: i32,
+  delta_pic_order_always_zero_flag: bool,
+  offset_for_non_ref_pic: i32,
+  offset_for_top_to_bottom_field: i32,
+  /// One for each of `poc_cycle_length`.
+  offset_for_ref_frame: Vec<i32>,
+  ref_frame_count: i32,
+  gaps_in_frame_num_allowed_flag: bool,
+  mb_width: i32,
+  mb_height: i32,
+  frame_mbs_only_flag: bool,
+  mb_aff: bool,
+  direct_8x8_inference_flag: bool,
+  crop: bool,
+  /// Left, right, top and bottom, in luma samples.
+  crop_offsets: [u32; 4],
+  vui_parameters_present_flag: bool,
+  vui: CommonVui,
+  timing_info_present_flag: bool,
+  num_units_in_tick: u32,
+  time_scale: u32,
+  fixed_frame_rate_flag: bool,
+  nal_hrd_parameters_present_flag: bool,
+  vcl_hrd_parameters_present_flag: bool,
+  cpb_cnt: i32,
+  bit_rate_scale: u32,
+  bit_rate_value: [u32; 32],
+  cpb_size_value: [u32; 32],
+  cpr_flag: u32,
+  initial_cpb_removal_delay_length: u32,
+  cpb_removal_delay_length: u32,
+  dpb_output_delay_length: u32,
+  time_offset_length: u32,
+  pic_struct_present_flag: bool,
+  bitstream_restriction_flag: bool,
+  num_reorder_frames: i32,
+  max_dec_frame_buffering: i32,
+}
+
+/// What `ff_h2645_decode_common_vui_params` (h2645_vui.c:37-100) reads: each
+/// flag, and the values behind it as read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct CommonVui {
+  /// `aspect_ratio_idc`, and an extended aspect ratio's width and height.
+  aspect_ratio: Option<(u32, Option<(u32, u32)>)>,
+  /// `overscan_appropriate_flag`.
+  overscan: Option<bool>,
+  /// `video_format`, `video_full_range_flag`, and the colour description's
+  /// primaries, transfer characteristics and matrix coefficients.
+  video_signal: Option<(u32, bool, Option<[u32; 3]>)>,
+  /// The chroma sample location types of the top and bottom fields.
+  chroma_loc: Option<(i32, i32)>,
+}
+
 /// **`ff_h264_decode_seq_parameter_set`** (h264_ps.c:284-594) read from
-/// `r`, past the unit's header: the set's id and what it says, where FFmpeg
-/// stores it; `None` where it fails it. `ignore_truncation` lets a reading
-/// that ran past the unit stand (h264_ps.c:535-541). The decoder's context
-/// is the one this crate opens: no `AV_CODEC_FLAG2_IGNORE_CROP`.
-fn h264_sps(r: &mut Reader<'_>, ignore_truncation: bool) -> Option<(usize, Sps)> {
-  let profile_idc = r.bits(8) as i32;
-  let mut constraint_set_flags = 0i32;
+/// `r`, past the unit's header: the set's id, what it says to a picture
+/// parameter set and what FFmpeg's `SPS` holds of it ([`SpsFields`]), where
+/// FFmpeg stores it; `None` where it fails it. `ignore_truncation` lets a
+/// reading that ran past the unit stand (h264_ps.c:535-541). The decoder's
+/// context is the one this crate opens: no `AV_CODEC_FLAG2_IGNORE_CROP`.
+fn h264_sps(r: &mut Reader<'_>, ignore_truncation: bool) -> Option<(usize, Sps, SpsFields)> {
+  let mut f = SpsFields {
+    time_offset_length: 24,
+    ..SpsFields::default()
+  };
+  f.profile_idc = r.bits(8) as i32;
   for flag in 0..6 {
-    constraint_set_flags |= i32::from(r.bit()) << flag;
+    f.constraint_set_flags |= i32::from(r.bit()) << flag;
   }
   r.skip(2); // reserved_zero_2bits
-  r.bits(8); // level_idc
-  let sps_id = r.ue_31() as u32;
-  if sps_id >= 32 {
+  f.level_idc = r.bits(8) as i32;
+  f.sps_id = r.ue_31() as u32;
+  if f.sps_id >= 32 {
     return None;
   }
-  let (chroma_format_idc, bit_depth_luma) = if matches!(
-    profile_idc,
+  if matches!(
+    f.profile_idc,
     100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 144
   ) {
-    let chroma_format_idc = r.ue_31();
-    if chroma_format_idc as u32 > 3 {
+    f.chroma_format_idc = r.ue_31();
+    if f.chroma_format_idc as u32 > 3 {
       return None;
     }
     // residual_color_transform_flag: separate colour planes, unsupported.
-    if chroma_format_idc == 3 && r.bit() {
+    if f.chroma_format_idc == 3 && r.bit() {
       return None;
     }
-    let luma = r.ue_31() + 8;
-    let chroma = r.ue_31() + 8;
-    if chroma != luma || !(8..=14).contains(&luma) || !(8..=14).contains(&chroma) {
+    f.bit_depth_luma = r.ue_31() + 8;
+    f.bit_depth_chroma = r.ue_31() + 8;
+    if f.bit_depth_chroma != f.bit_depth_luma
+      || !(8..=14).contains(&f.bit_depth_luma)
+      || !(8..=14).contains(&f.bit_depth_chroma)
+    {
       return None;
     }
-    r.bit(); // transform_bypass
+    f.transform_bypass = r.bit();
     let present = r.bit();
-    if !scaling_matrices(r, true, present, false, chroma_format_idc) {
+    f.scaling.push(i32::from(present));
+    if !scaling_matrices(r, true, present, false, f.chroma_format_idc, &mut f.scaling) {
       return None;
     }
-    (chroma_format_idc, luma)
   } else {
-    (1, 8)
-  };
+    f.chroma_format_idc = 1;
+    f.bit_depth_luma = 8;
+    f.bit_depth_chroma = 8;
+  }
   // log2_max_frame_num_minus4, from 0 to 12.
-  if !(0..=12).contains(&r.ue_31()) {
+  let log2_max_frame_num_minus4 = r.ue_31();
+  if !(0..=12).contains(&log2_max_frame_num_minus4) {
     return None;
   }
-  match r.ue_31() {
-    // pic_order_cnt_type
+  f.log2_max_frame_num = log2_max_frame_num_minus4 + 4;
+  f.poc_type = r.ue_31();
+  match f.poc_type {
     0 => {
       // log2_max_pic_order_cnt_lsb_minus4, at most 12.
-      if r.ue_31() as u32 > 12 {
+      let minus4 = r.ue_31();
+      if minus4 as u32 > 12 {
         return None;
       }
+      f.log2_max_poc_lsb = minus4 + 4;
     }
     1 => {
-      r.bit(); // delta_pic_order_always_zero_flag
-      if r.se_long() == i32::MIN || r.se_long() == i32::MIN {
+      f.delta_pic_order_always_zero_flag = r.bit();
+      f.offset_for_non_ref_pic = r.se_long();
+      f.offset_for_top_to_bottom_field = r.se_long();
+      if f.offset_for_non_ref_pic == i32::MIN || f.offset_for_top_to_bottom_field == i32::MIN {
         return None;
       }
       let cycle = r.ue();
@@ -786,72 +891,73 @@ fn h264_sps(r: &mut Reader<'_>, ignore_truncation: bool) -> Option<(usize, Sps)>
         return None;
       }
       for _ in 0..cycle {
-        if r.se_long() == i32::MIN {
+        let offset = r.se_long();
+        if offset == i32::MIN {
           return None;
         }
+        f.offset_for_ref_frame.push(offset);
       }
     }
     2 => {}
     _ => return None,
   }
   // max_num_ref_frames, at most H264_MAX_DPB_FRAMES.
-  if r.ue_31() > 16 {
+  f.ref_frame_count = r.ue_31();
+  if f.ref_frame_count > 16 {
     return None;
   }
-  r.bit(); // gaps_in_frame_num_allowed_flag
-  let mb_width = r.ue().wrapping_add(1);
+  f.gaps_in_frame_num_allowed_flag = r.bit();
+  f.mb_width = r.ue().wrapping_add(1);
   let mut mb_height = r.ue().wrapping_add(1);
-  let frame_mbs_only = r.bit();
+  f.frame_mbs_only_flag = r.bit();
   if mb_height as u32 >= (i32::MAX as u32) / 2 {
     return None;
   }
-  mb_height *= 2 - i32::from(frame_mbs_only);
-  if !frame_mbs_only {
-    r.bit(); // mb_adaptive_frame_field_flag
-  }
+  mb_height *= 2 - i32::from(f.frame_mbs_only_flag);
+  f.mb_height = mb_height;
+  f.mb_aff = !f.frame_mbs_only_flag && r.bit();
   let limit = (i32::MAX / 16) as u32;
-  if mb_width as u32 >= limit
-    || mb_height as u32 >= limit
-    || !image_size_valid((16 * mb_width) as u32, (16 * mb_height) as u32)
+  if f.mb_width as u32 >= limit
+    || f.mb_height as u32 >= limit
+    || !image_size_valid((16 * f.mb_width) as u32, (16 * f.mb_height) as u32)
   {
     return None;
   }
-  r.bit(); // direct_8x8_inference_flag
-  if r.bit() {
-    // frame_cropping_flag: offsets in chroma units that must leave a
-    // picture.
+  f.direct_8x8_inference_flag = r.bit();
+  f.crop = r.bit();
+  if f.crop {
+    // Offsets in chroma units that must leave a picture.
     let (left, right, top, bottom) = (r.ue() as u32, r.ue() as u32, r.ue() as u32, r.ue() as u32);
-    let vsub = u32::from(chroma_format_idc == 1);
-    let hsub = u32::from(chroma_format_idc == 1 || chroma_format_idc == 2);
+    let vsub = u32::from(f.chroma_format_idc == 1);
+    let hsub = u32::from(f.chroma_format_idc == 1 || f.chroma_format_idc == 2);
     let step_x = 1u32 << hsub;
-    let step_y = (2 - u32::from(frame_mbs_only)) << vsub;
+    let step_y = (2 - u32::from(f.frame_mbs_only_flag)) << vsub;
     let bound = |step: u32| (i32::MAX as u32) / 4 / step;
     if left > bound(step_x)
       || right > bound(step_x)
       || top > bound(step_y)
       || bottom > bound(step_y)
-      || left.wrapping_add(right).wrapping_mul(step_x) >= (16 * mb_width) as u32
-      || top.wrapping_add(bottom).wrapping_mul(step_y) >= (16 * mb_height) as u32
+      || left.wrapping_add(right).wrapping_mul(step_x) >= (16 * f.mb_width) as u32
+      || top.wrapping_add(bottom).wrapping_mul(step_y) >= (16 * f.mb_height) as u32
     {
       return None;
     }
+    f.crop_offsets = [left * step_x, right * step_x, top * step_y, bottom * step_y];
   }
-  if r.bit() && !h264_vui(r) {
-    // vui_parameters_present_flag
+  f.vui_parameters_present_flag = r.bit();
+  if f.vui_parameters_present_flag && !h264_vui(r, &mut f) {
     return None;
   }
   if r.left() < 0 && !ignore_truncation {
     return None;
   }
-  Some((
-    sps_id as usize,
-    Sps {
-      profile_idc,
-      constraint_set_flags,
-      chroma_format_idc,
-      bit_depth_luma,
-    },
-  ))
+  let sps = Sps {
+    profile_idc: f.profile_idc,
+    constraint_set_flags: f.constraint_set_flags,
+    chroma_format_idc: f.chroma_format_idc,
+    bit_depth_luma: f.bit_depth_luma,
+  };
+  Some((f.sps_id as usize, sps, f))
 }
 
 /// `av_image_check_size(w, h)`: `av_image_check_size2` with no pixel
@@ -870,47 +976,54 @@ fn image_size_valid(width: u32, height: u32) -> bool {
 
 /// The VUI of an H.264 sequence parameter set: `ff_h2645_decode_common_vui_params`
 /// (h2645_vui.c:37-100), which reads past its fields and fails nothing,
-/// then `decode_vui_parameters` (h264_ps.c:133-199). `false` where it fails
-/// the set.
-fn h264_vui(r: &mut Reader<'_>) -> bool {
-  common_vui(r);
+/// then `decode_vui_parameters` (h264_ps.c:133-199), each field FFmpeg
+/// stores set in `f`. `false` where it fails the set.
+fn h264_vui(r: &mut Reader<'_>, f: &mut SpsFields) -> bool {
+  f.vui = common_vui(r);
   // A VUI cut short is taken as it stands.
   if r.show_bit() && r.left() < 10 {
     return true;
   }
   if r.bit() {
-    // timing_info_present_flag
-    r.bits(32);
-    r.bits(32);
-    r.bit();
+    // timing_info_present_flag, cleared where either value is 0.
+    let (num_units_in_tick, time_scale) = (r.bits(32), r.bits(32));
+    if num_units_in_tick != 0 && time_scale != 0 {
+      f.timing_info_present_flag = true;
+      f.num_units_in_tick = num_units_in_tick;
+      f.time_scale = time_scale;
+    }
+    f.fixed_frame_rate_flag = r.bit();
   }
-  let nal = r.bit();
-  if nal && !h264_hrd(r) {
+  f.nal_hrd_parameters_present_flag = r.bit();
+  if f.nal_hrd_parameters_present_flag && !h264_hrd(r, f) {
     return false;
   }
-  let vcl = r.bit();
-  if vcl && !h264_hrd(r) {
+  f.vcl_hrd_parameters_present_flag = r.bit();
+  if f.vcl_hrd_parameters_present_flag && !h264_hrd(r, f) {
     return false;
   }
-  if nal || vcl {
+  if f.nal_hrd_parameters_present_flag || f.vcl_hrd_parameters_present_flag {
     r.bit(); // low_delay_hrd_flag
   }
-  r.bit(); // pic_struct_present_flag
+  f.pic_struct_present_flag = r.bit();
   if r.left() == 0 {
     return true;
   }
-  if r.bit() {
-    // bitstream_restriction_flag
-    r.bit();
+  f.bitstream_restriction_flag = r.bit();
+  if f.bitstream_restriction_flag {
+    r.bit(); // motion_vectors_over_pic_boundaries_flag
     for _ in 0..4 {
+      // max_bytes_per_pic_denom, max_bits_per_mb_denom and the largest
+      // motion vectors' lengths.
       r.ue_31();
     }
-    let mut num_reorder_frames = r.ue_31();
-    r.ue_31(); // max_dec_frame_buffering
+    f.num_reorder_frames = r.ue_31();
+    f.max_dec_frame_buffering = r.ue_31();
     if r.left() < 0 {
-      num_reorder_frames = 0;
+      f.num_reorder_frames = 0;
+      f.bitstream_restriction_flag = false;
     }
-    if num_reorder_frames as u32 > 16 {
+    if f.num_reorder_frames as u32 > 16 {
       return false;
     }
   }
@@ -918,90 +1031,97 @@ fn h264_vui(r: &mut Reader<'_>) -> bool {
 }
 
 /// `ff_h2645_decode_common_vui_params` (h2645_vui.c:37-100), the start of
-/// both codecs' VUI, which fails nothing.
-fn common_vui(r: &mut Reader<'_>) {
+/// both codecs' VUI, which fails nothing: what it reads.
+fn common_vui(r: &mut Reader<'_>) -> CommonVui {
+  let mut vui = CommonVui::default();
   if r.bit() {
     // aspect_ratio_idc, and the SAR it extends to.
-    if r.bits(8) == 255 {
-      r.bits(16);
-      r.bits(16);
-    }
+    let idc = r.bits(8);
+    let extended = (idc == 255).then(|| (r.bits(16), r.bits(16)));
+    vui.aspect_ratio = Some((idc, extended));
   }
   if r.bit() {
-    r.bit(); // overscan_appropriate_flag
+    vui.overscan = Some(r.bit());
   }
   if r.bit() {
     // video_signal_type_present_flag
-    r.bits(3);
-    r.bit();
-    if r.bit() {
-      r.bits(8);
-      r.bits(8);
-      r.bits(8);
-    }
+    let video_format = r.bits(3);
+    let full_range = r.bit();
+    let colour = r.bit().then(|| [r.bits(8), r.bits(8), r.bits(8)]);
+    vui.video_signal = Some((video_format, full_range, colour));
   }
   if r.bit() {
     // chroma_loc_info_present_flag
-    r.ue_31();
-    r.ue_31();
+    vui.chroma_loc = Some((r.ue_31(), r.ue_31()));
   }
+  vui
 }
 
-/// `decode_hrd_parameters` (h264_ps.c:106-131): `false` where it fails.
-fn h264_hrd(r: &mut Reader<'_>) -> bool {
+/// `decode_hrd_parameters` (h264_ps.c:106-131), each field FFmpeg stores set
+/// in `f` — a second HRD over the first, its entries past the second's count
+/// the first's: `false` where it fails.
+fn h264_hrd(r: &mut Reader<'_>, f: &mut SpsFields) -> bool {
   let cpb_count = r.ue_31() + 1;
   if cpb_count as u32 > 32 {
     return false;
   }
-  r.bits(4);
-  r.bits(4);
-  for _ in 0..cpb_count {
-    r.ue_long();
-    r.ue_long();
-    r.bit();
+  f.cpr_flag = 0;
+  f.bit_rate_scale = r.bits(4);
+  r.bits(4); // cpb_size_scale
+  for index in 0..cpb_count as usize {
+    f.bit_rate_value[index] = r.ue_long().wrapping_add(1);
+    f.cpb_size_value[index] = r.ue_long().wrapping_add(1);
+    f.cpr_flag |= u32::from(r.bit()) << index;
   }
-  for _ in 0..4 {
-    r.bits(5);
-  }
+  f.initial_cpb_removal_delay_length = r.bits(5) + 1;
+  f.cpb_removal_delay_length = r.bits(5) + 1;
+  f.dpb_output_delay_length = r.bits(5) + 1;
+  f.time_offset_length = r.bits(5);
+  f.cpb_cnt = cpb_count;
   true
 }
 
 /// `decode_scaling_matrices` (h264_ps.c:231-268), as far as its verdict
 /// goes: `false` where a list fails. Every list is read, as there, a failed
-/// one's among them.
+/// one's among them, and each list's flag and the deltas read for it pushed
+/// to `read`.
 fn scaling_matrices(
   r: &mut Reader<'_>,
   sps: bool,
   present: bool,
   transform_8x8: bool,
   chroma_format_idc: i32,
+  read: &mut Vec<i32>,
 ) -> bool {
   if !present {
     return true;
   }
   let mut valid = true;
   for _ in 0..6 {
-    valid &= scaling_list(r, 16);
+    valid &= scaling_list(r, 16, read);
   }
   if sps || transform_8x8 {
     let lists = if chroma_format_idc == 3 { 6 } else { 2 };
     for _ in 0..lists {
-      valid &= scaling_list(r, 64);
+      valid &= scaling_list(r, 64, read);
     }
   }
   valid
 }
 
 /// `decode_scaling_list` (h264_ps.c:201-228): `false` where a delta falls
-/// outside -128 to 127.
-fn scaling_list(r: &mut Reader<'_>, size: usize) -> bool {
-  if !r.bit() {
+/// outside -128 to 127. Its flag and each delta read are pushed to `read`.
+fn scaling_list(r: &mut Reader<'_>, size: usize, read: &mut Vec<i32>) -> bool {
+  let present = r.bit();
+  read.push(i32::from(present));
+  if !present {
     return true;
   }
   let (mut last, mut next) = (8i32, 8i32);
   for index in 0..size {
     if next != 0 {
       let delta = r.se();
+      read.push(delta);
       if !(-128..=127).contains(&delta) {
         return false;
       }
@@ -1083,7 +1203,14 @@ fn h264_pps(r: &mut Reader<'_>, bit_length: u64, sets: &impl H264Sets) -> Pps {
   if bits_left > 0 && more {
     let transform_8x8 = r.bit();
     let present = r.bit();
-    if !scaling_matrices(r, false, present, transform_8x8, sps.chroma_format_idc) {
+    if !scaling_matrices(
+      r,
+      false,
+      present,
+      transform_8x8,
+      sps.chroma_format_idc,
+      &mut Vec::new(),
+    ) {
       return Pps::Failed;
     }
     if !(-12..=12).contains(&r.se()) {
@@ -1108,12 +1235,20 @@ pub(super) trait H264Sets {
   /// What the sequence parameter set held under `id` says to a picture
   /// parameter set read now; `None` where none is held.
   fn sps(&self, id: usize) -> Option<Sps>;
-  /// FFmpeg stores `sps` under `id`, read off `unit` the `reading`-th of the
-  /// three ways it reads one: 1, the unit; 2, its raw bytes after its
-  /// header; 3, the unit, truncation let stand (h264_parse.c:383-397,
-  /// h264dec.c:699-715). `memory` is the unit as handed over
-  /// ([`Walk::memory`]).
-  fn store_sps(&mut self, id: usize, sps: Sps, unit: &Unit<'_>, memory: &[u8], reading: u8);
+  /// FFmpeg stores `sps` under `id`, its `SPS` holding `fields`, read off
+  /// `unit` the `reading`-th of the three ways it reads one: 1, the unit; 2,
+  /// its raw bytes after its header; 3, the unit, truncation let stand
+  /// (h264_parse.c:383-397, h264dec.c:699-715). `memory` is the unit as
+  /// handed over ([`Walk::memory`]).
+  fn store_sps(
+    &mut self,
+    id: usize,
+    sps: Sps,
+    fields: SpsFields,
+    unit: &Unit<'_>,
+    memory: &[u8],
+    reading: u8,
+  );
   /// FFmpeg stores the picture parameter set `unit` under `id`, read against
   /// the sequence parameter set held under `sps`; `past_end` where its
   /// reading ran past its payload.
@@ -1125,32 +1260,40 @@ impl H264Sets for [Option<Sps>; 32] {
     self.get(id).copied().flatten()
   }
 
-  fn store_sps(&mut self, id: usize, sps: Sps, _: &Unit<'_>, _: &[u8], _: u8) {
+  fn store_sps(&mut self, id: usize, sps: Sps, _: SpsFields, _: &Unit<'_>, _: &[u8], _: u8) {
     self[id] = Some(sps);
   }
 
   fn store_pps(&mut self, _: usize, _: usize, _: &Unit<'_>, _: &[u8], _: bool) {}
 }
 
+/// The bytes of a set's `data` FFmpeg's `SPS` and `PPS` keep (h264_ps.h:103,
+/// 133).
+pub(super) const H264_DATA: usize = 4096;
+
 /// **What FFmpeg's H.264 decoder keeps of a parameter set it stores, and
 /// compares** — `data` (`ff_h264_decode_seq_parameter_set`,
-/// h264_ps.c:296-305; `ff_h264_decode_picture_parameter_set`, 717-728): the
-/// bytes its reader starts at, through the last its payload bits reach, the
-/// stop bit put back where it filled a byte of its own. For the first and
-/// third readings of a sequence parameter set and for a picture parameter
-/// set, the unit as handed over (`memory`) from its header, to its payload's
-/// end (`nal->size_bits`): its trailing zeros, which the splitter drops, not
+/// h264_ps.c:297-306; `ff_h264_decode_picture_parameter_set`, 717-728): the
+/// bytes its reader starts at, through the last its payload bits reach, cut
+/// at [`H264_DATA`], then the stop bit put back where it filled a byte of its
+/// own and the cut left room for it. For the first and third readings of a
+/// sequence parameter set and for a picture parameter set, the unit as
+/// handed over (`memory`) from its header, to its payload's end
+/// (`nal->size_bits`): its trailing zeros, which the splitter drops, not
 /// among them. For the second, the unit's raw bytes after its header, all of
-/// them, the stop bit put back after them. FFmpeg keeps 4096 bytes; every
-/// byte is kept here, so two sets alike here are alike there.
+/// them, a whole number of bytes whose stop bit is put back after them.
 pub(super) fn h264_identity(unit: &Unit<'_>, memory: &[u8], reading: u8) -> Vec<u8> {
-  let mut data = if reading == 2 {
-    unit.raw().get(1..).unwrap_or_default().to_vec()
+  let (bytes, stop_bit_alone) = if reading == 2 {
+    (unit.raw().get(1..).unwrap_or_default(), true)
   } else {
     let size = usize::try_from(unit.size_bits.div_ceil(8)).unwrap_or(usize::MAX);
-    memory.get(..size).unwrap_or(memory).to_vec()
+    (
+      memory.get(..size).unwrap_or(memory),
+      unit.size_bits.is_multiple_of(8),
+    )
   };
-  if reading == 2 || unit.size_bits.is_multiple_of(8) {
+  let mut data = bytes[..bytes.len().min(H264_DATA)].to_vec();
+  if stop_bit_alone && data.len() < H264_DATA {
     data.push(0x80);
   }
   data
@@ -1168,12 +1311,21 @@ enum Unstored {
 /// (`decode_extradata_ps`, h264_parse.c:383-397; `decode_nal_units`,
 /// h264dec.c:699-715) — `unit` read over `memory` ([`Walk::memory`]) and its
 /// raw bytes over `mem`, the buffer it was cut from: the set's id, what it
-/// says and which reading stored it; `None` where none does.
-fn h264_sps_readings(unit: &Unit<'_>, memory: &[u8], mem: &[u8]) -> Option<(usize, Sps, u8)> {
+/// says, what FFmpeg's `SPS` holds of it and which reading stored it; `None`
+/// where none does.
+fn h264_sps_readings(
+  unit: &Unit<'_>,
+  memory: &[u8],
+  mem: &[u8],
+) -> Option<(usize, Sps, SpsFields, u8)> {
   h264_sps(&mut unit.reader(memory), false)
-    .map(|(id, sps)| (id, sps, 1))
-    .or_else(|| h264_sps(&mut unit.raw_reader(mem), false).map(|(id, sps)| (id, sps, 2)))
-    .or_else(|| h264_sps(&mut unit.reader(memory), true).map(|(id, sps)| (id, sps, 3)))
+    .map(|(id, sps, fields)| (id, sps, fields, 1))
+    .or_else(|| {
+      h264_sps(&mut unit.raw_reader(mem), false).map(|(id, sps, fields)| (id, sps, fields, 2))
+    })
+    .or_else(|| {
+      h264_sps(&mut unit.reader(memory), true).map(|(id, sps, fields)| (id, sps, fields, 3))
+    })
 }
 
 /// **`decode_extradata_ps`** (h264_parse.c:367-415) over the first `length`
@@ -1198,10 +1350,10 @@ fn h264_sets<S: H264Sets>(
     match unit.kind {
       7 => {
         let memory = units.memory(&unit, &mut scratch);
-        let Some((id, sps, reading)) = h264_sps_readings(&unit, memory, mem) else {
+        let Some((id, sps, fields, reading)) = h264_sps_readings(&unit, memory, mem) else {
           return Err(Unstored::Failed(crate::ParameterSet::Sequence));
         };
-        sets.store_sps(id, sps, &unit, memory, reading);
+        sets.store_sps(id, sps, fields, &unit, memory, reading);
       }
       8 => {
         let memory = units.memory(&unit, &mut scratch);
@@ -1498,8 +1650,8 @@ pub(super) fn h264_packet<S: H264Sets>(
       5 if unit.head::<2>()[1] & 0xfc == 0x98 => return,
       7 => {
         let memory = units.memory(&unit, &mut scratch);
-        if let Some((id, sps, reading)) = h264_sps_readings(&unit, memory, data) {
-          sets.store_sps(id, sps, &unit, memory, reading);
+        if let Some((id, sps, fields, reading)) = h264_sps_readings(&unit, memory, data) {
+          sets.store_sps(id, sps, fields, &unit, memory, reading);
         }
       }
       8 => {

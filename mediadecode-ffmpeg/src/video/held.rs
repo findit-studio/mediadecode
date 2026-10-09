@@ -308,16 +308,18 @@ impl Held {
 /// which a record carries; what FFmpeg compares to keep an identical set in
 /// place; and what it says.
 ///
-/// FFmpeg compares the whole parsed `SPS` (h264_ps.c:578-587): its fields
-/// and `data`, the bytes its reader starts at through those its payload bits
-/// reach ([`params::h264_identity`], h264_ps.c:296-305). A set's fields are
-/// what its reading makes of those bytes — the first two readings never read
-/// past them, or they fail the set — so two sets are alike in FFmpeg exactly
-/// where their bytes so taken and their reading are: `unit`, the raw bytes,
-/// is not compared. The same set before a four-byte start code rather than a
-/// three-byte one carries one zero more in its raw bytes, which the splitter
-/// drops from its payload (`get_bit_length`, h2645_parse.c:348-376), and is
-/// the same set.
+/// FFmpeg compares the whole parsed `SPS` (h264_ps.c:578-587): `data`, the
+/// bytes its reader starts at through those its payload bits reach, the
+/// first 4096 of them ([`params::h264_identity`], h264_ps.c:297-306), and
+/// every field its reading stores ([`params::SpsFields`]) — not the reading
+/// that stored it, nor a byte past those 4096 that no stored field reads.
+/// Two sets are alike here exactly where they are alike there: `unit`, the
+/// raw bytes, is not compared. The same set before a four-byte start code
+/// rather than a three-byte one carries one zero more in its raw bytes,
+/// which the splitter drops from its payload (`get_bit_length`,
+/// h2645_parse.c:348-376), and is the same set; so is a set of more than
+/// 4096 bytes repeated with other bytes past them that no stored field
+/// reads.
 #[derive(Debug)]
 struct Sequence {
   /// The unit as the splitter took it (`nal->raw_data`).
@@ -328,11 +330,13 @@ struct Sequence {
   reading: u8,
   /// What it says to a picture parameter set read after it.
   facts: params::Sps,
+  /// What FFmpeg's `SPS` holds of it besides `data`.
+  fields: params::SpsFields,
 }
 
 impl PartialEq for Sequence {
   fn eq(&self, other: &Self) -> bool {
-    self.identity == other.identity && self.reading == other.reading && self.facts == other.facts
+    self.identity == other.identity && self.fields == other.fields
   }
 }
 
@@ -831,6 +835,7 @@ impl H264Sets for H264Write<'_> {
     &mut self,
     id: usize,
     facts: params::Sps,
+    fields: params::SpsFields,
     unit: &Unit<'_>,
     memory: &[u8],
     reading: u8,
@@ -840,12 +845,12 @@ impl H264Sets for H264Write<'_> {
       identity: Bytes::of(&params::h264_identity(unit, memory, reading)),
       reading,
       facts,
+      fields,
     };
     // A set identical to the one held leaves that one in place, and what
-    // was read under it (h264_ps.c:578-587). One read past its payload is
-    // taken as new: what it read past it may differ.
+    // was read under it (h264_ps.c:578-587) — one read past its payload too,
+    // its fields read off the bytes after it compared with the rest.
     if let Some(held) = &self.now().sps[id]
-      && !set.past_end()
       && *held.set == set
     {
       if held.doubt {

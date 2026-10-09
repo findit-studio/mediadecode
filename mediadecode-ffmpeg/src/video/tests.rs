@@ -12195,3 +12195,81 @@ fn a_packet_carrying_nothing_is_refused_before_any_decoder_sees_it() {
     "every picture, as the straight decode"
   );
 }
+
+// ---------------------------------------------------------------------------
+//  R19 row 2: a parameter set is told from another by what FFmpeg compares
+// ---------------------------------------------------------------------------
+
+/// LAW (R19 row 2; Codex R18 [medium]): **an H.264 sequence parameter set
+/// longer than the 4096 bytes FFmpeg keeps of it, repeated with other bytes
+/// past them, is the same set, and the switch fires.** `libx264`'s record,
+/// its SPS 0 run to 6,000 bytes by bytes after its last field: FFmpeg keeps
+/// the first 4096 of its `data` and never reads the rest
+/// (h264_ps.c:297-306), and compares those with every field it stores
+/// (578-587). The stream's packet 15 — no keyframe — carrying the same set
+/// with other bytes past those: FFmpeg keeps the set it holds, PPS 0 bound to
+/// it; on a probe-era fallback at 10 on three threads the switch at the IDR
+/// 16 fires, every picture the straight decode's. Compared whole, the set
+/// read as a replacement, the record `Superseded` and the switch declined.
+#[test]
+fn a_long_sequence_parameter_set_repeated_with_other_bytes_past_those_kept_is_the_same_set() {
+  use super::held::Held;
+  let h264 = crate::CodecId::H264.raw();
+  let params = "keyint=8:min-keyint=8:scenecut=0:bframes=2:b-adapt=0:open-gop=0:log-level=error";
+  let a = encode_h264_global(128, 96, 32, params);
+  let (sps, pps) = sps_and_pps(&a);
+  let fields = rbsp_payload_bits(&sps, 1);
+  let long = |tail: u8| {
+    let mut bits = fields.clone();
+    for at in 0..6000 {
+      let byte = if at < 5000 { 0xaa_u8 } else { tail };
+      bits += &format!("{byte:08b}");
+    }
+    nal_unit_of_bits(&sps[..1], &bits)
+  };
+  let (first, again) = (long(0xaa), long(0x55));
+  assert!(
+    first.len() > 6000 && first[..4096] == again[..4096] && first != again,
+    "the premise: alike in their first 4096 bytes, unlike past them"
+  );
+  let record = [&[0, 0, 0, 1][..], &first, &[0, 0, 0, 1], &pps].concat();
+  let held = Held::opened_on(h264, &record);
+  assert!(held.holds_pps(0), "the premise: both sets held");
+  let repeated = [&[0, 0, 1][..], &again].concat();
+  assert!(
+    held.after_packet(None, Some(&repeated)).is_none(),
+    "the same set: nothing held changes"
+  );
+
+  let mut parameters = a.parameters.clone();
+  set_extradata(&mut parameters, &record);
+  let mut packets = a.packets.clone();
+  let data = packets[15].data().expect("a payload").to_vec();
+  packets[15] = repacked(&a.packets[15], &[&data[..], &repeated[..]].concat());
+  let clip = SyntheticClip {
+    parameters,
+    packets,
+  };
+  assert!(
+    clip.packets[16].is_key() && !clip.packets[15].is_key(),
+    "16 is an IDR"
+  );
+  let reference = straight(&clip);
+  assert_eq!(reference.len(), 32, "the straight decode is whole");
+  let three = core::num::NonZeroU32::new(3).expect("nonzero");
+  let session = session_of(
+    behind_a_probe(&clip, 10, crate::Threads::Count(three)),
+    &clip,
+    |_, _| {},
+  );
+  assert_eq!(
+    (session.threads[15], session.threads[16]),
+    (Some(core::num::NonZeroU32::MIN), Some(three)),
+    "the switch at 16"
+  );
+  assert!(session.errors.is_empty(), "no error: {:?}", session.errors);
+  assert!(
+    session.pictures == reference,
+    "every picture, as the straight decode"
+  );
+}
