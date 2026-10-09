@@ -11,10 +11,10 @@ The backend-agnostic core it adapts has its own log at
 
 ## [0.16.0] — unreleased
 
-A committed hardware session reports every failure as that picture's
-own and changes nothing after its first picture; when to stop trusting
-it is the caller's policy. `DecodePath::AnyHardware` is a session that
-is hardware or nothing.
+A committed hardware session reports every decoder failure as that
+picture's own and changes nothing after its first picture; when to stop
+trusting it is the caller's policy. `DecodePath::AnyHardware` is a
+session that is hardware or nothing.
 
 ### Changed (BREAKING)
 
@@ -26,14 +26,14 @@ is hardware or nothing.
   mid-stream, its one-GOP gap, and the keyframe-anchored resync guard
   that watched over it.
 
-- **After the first picture every failure is that picture's own error,
-  on every path, and nothing is classified or remembered.** A committed
-  hardware session reports each failure as it was minted — a refusal
-  this crate made by its name (`HwSurfaceTooLarge`,
-  `HwTransferTooLarge`, `FrameBudgetExceeded`), anything else as
-  `Error::Ffmpeg` with libavcodec's errno — and nothing of it is
-  remembered, so every call reaches libavcodec. Whether a hardware
-  session recovers is FFmpeg's, not this crate's. Until now
+- **After the first picture every decoder failure is that picture's own
+  error, on every path, and nothing is classified or remembered.** A
+  committed hardware session reports each `VideoDecodeError::Decode` as
+  it was minted — a refusal this crate made by its name
+  (`HwSurfaceTooLarge`, `HwTransferTooLarge`, `FrameBudgetExceeded`),
+  anything else as `Error::Ffmpeg` with libavcodec's errno — and nothing
+  of it is remembered, so the next call reaches libavcodec. Whether a
+  hardware session recovers is FFmpeg's, not this crate's. Until now
   `AVERROR_EXTERNAL`, `AVERROR_BUG`, `AVERROR_BUG2`, `AVERROR_UNKNOWN`,
   `AVERROR_INVALIDDATA` and `EINVAL` from a committed backend, and a
   coded surface the `get_format` callback declined over the caller's
@@ -64,17 +64,38 @@ is hardware or nothing.
   references the codec holds.
 
   **When to stop trusting a hardware session is the caller's policy.**
-  A caller that sees failures persist rebuilds: it opens a session on
-  `DecodePath::Software` from the same parameters and feeds it forward.
-  The caller sees the failures on all three roads (`send_packet`,
-  `receive_frame` and `send_eof`), the packets' key flags and what it
-  has delivered. The README's usage example is one policy: it counts a
-  failure from any road, and only a delivered picture ends the count; at
-  a threshold of its own it opens `Software`, replays the packets it kept
-  since the last packet flagged key, skips by PTS the pictures the
-  hardware session already delivered, and goes on. A caller that keeps
-  nothing feeds software forward from the failing packet, and libavcodec
-  conceals or drops what comes before the next keyframe.
+  A caller that sees a hardware session's decoder failures persist
+  rebuilds: it opens a session on `DecodePath::Software` from the same
+  parameters and feeds it forward. The caller sees the failures on all
+  three roads, the packets' key flags and what it has delivered, and
+  what it can feed the new session depends on the road:
+
+  - a `send_packet` failure names the packet in hand, and the new
+    session is given that packet;
+  - a `receive_frame` failure may concern a packet accepted earlier,
+    because FFmpeg decouples input from output and may hold several
+    pictures (`libavcodec/avcodec.h` 90–139), so the new session is
+    given the next packet and the caller accepts the gap;
+  - `send_eof` has no packet: what the hardware session still held at
+    the end is recoverable only from packets kept from before, or by a
+    seek.
+
+  The policy counts `VideoDecodeError::Decode`. A
+  `VideoDecodeError::Convert` is the wrapper's own failure to convert a
+  decoded picture into a frame, and it is reported, not counted. One
+  that failed on an allocation parks the picture: until a
+  `receive_frame` delivers it, `send_packet` and `send_eof` answer
+  `Sent::MustDrain` without reaching libavcodec, which is the wrapper's
+  back pressure and not a failure.
+
+  The README's usage example is the simplest policy. It counts the
+  hardware session's decoder failures from all three roads, and only a
+  delivered picture ends the count; at a threshold of its own it opens
+  `Software` from the same parameters and feeds it forward, and every
+  picture the new session delivers is delivered as it is. It keeps no
+  packets, so the pictures from the failure to the next keyframe are
+  lost: libavcodec drops or conceals what comes before one. A lossless
+  replay is the caller's own design and is not shown.
 
 - **`AllBackendsFailed` is the probe's alone.** Its `origin()` is always
   `FallbackOrigin::Probe`.
