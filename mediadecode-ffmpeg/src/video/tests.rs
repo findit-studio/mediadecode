@@ -10265,7 +10265,7 @@ fn where_no_record_carries_what_is_held_a_fresh_decoder_is_refused_by_name() {
     .after_packet(None, Some(&b_sps))
     .expect("the SPS replaces id 0");
   assert_eq!(
-    superseded.record(h264, &record),
+    superseded.record(h264, &record, None),
     Err(crate::Unrecordable::Superseded),
     "PPS 0 bound to the SPS it was read under"
   );
@@ -10273,7 +10273,7 @@ fn where_no_record_carries_what_is_held_a_fresh_decoder_is_refused_by_name() {
     .after_packet(None, Some(&b_pps))
     .expect("the PPS is read again");
   let synthesized = rebound
-    .record(h264, &record)
+    .record(h264, &record, None)
     .expect("a record re-creates it")
     .expect("not the record's own");
   assert!(
@@ -10283,7 +10283,7 @@ fn where_no_record_carries_what_is_held_a_fresh_decoder_is_refused_by_name() {
   let mut doubtful = rebound.clone();
   doubtful.doubt_since(&held);
   assert_eq!(
-    doubtful.record(h264, &record),
+    doubtful.record(h264, &record, None),
     Err(crate::Unrecordable::Unknown),
     "a set in doubt"
   );
@@ -10291,7 +10291,7 @@ fn where_no_record_carries_what_is_held_a_fresh_decoder_is_refused_by_name() {
   let four = Held::opened_on(h264, &avcc(&sps, &pps, 4));
   let start_coded = four.with_record(&b_sets);
   assert_eq!(
-    start_coded.record(h264, &b_sets),
+    start_coded.record(h264, &b_sets, None),
     Err(crate::Unrecordable::Framing),
     "start codes under a four-byte NAL length size"
   );
@@ -10391,7 +10391,7 @@ fn an_hevc_set_that_replaces_another_drops_what_referred_to_it() {
     )
     .expect("a new VPS 0");
   let synthesized = replaced
-    .record(hevc, &record)
+    .record(hevc, &record, None)
     .expect("a record re-creates it")
     .expect("not the record's own");
   assert_eq!(
@@ -10538,4 +10538,135 @@ fn a_packet_whose_body_is_an_avcc_record_is_read_as_one() {
     sent_through(&mut dec, &mut dst, av_pkt);
     drained(&mut dec, &mut dst);
   }
+}
+
+// ---------------------------------------------------------------------------
+//  R17 row 3: the per-packet re-guess of the framing under four-byte lengths
+// ---------------------------------------------------------------------------
+
+/// A `libx264` stream of 32 frames under a four-byte `avcC` record, its
+/// packets 0 to 15 and 24 to 31 framed by four-byte length fields and 16 to
+/// 23 — the IDR 16 first — start-coded, as a stream spliced from two sources
+/// arrives where nothing re-describes it; answers the clip and the record's
+/// SPS and PPS.
+fn h264_avcc_with_start_codes_from_16() -> (SyntheticClip, Vec<u8>, Vec<u8>) {
+  let annexb = encode_h264_with_extradata(128, 96, 32);
+  let (sps, pps) = sps_and_pps(&annexb);
+  let packets = annexb
+    .packets
+    .iter()
+    .enumerate()
+    .map(|(index, packet)| {
+      let units = annexb_units(packet.data().expect("a payload"));
+      let body = if (16..24).contains(&index) {
+        units
+          .iter()
+          .flat_map(|unit| [0u8, 0, 0, 1].into_iter().chain(unit.iter().copied()))
+          .collect()
+      } else {
+        length_prefixed(&units, 4)
+      };
+      repacked(packet, &body)
+    })
+    .collect();
+  let mut parameters = annexb.parameters.clone();
+  set_extradata(&mut parameters, &avcc(&sps, &pps, 4));
+  (
+    SyntheticClip {
+      parameters,
+      packets,
+    },
+    sps,
+    pps,
+  )
+}
+
+/// LAW (R17 row 3, the author's own; Codex R16 [high]): **under a NAL length
+/// size of four, a packet's framing is read as FFmpeg's H.264 decoder
+/// re-guesses it, and the guess holds for the packets after it.**
+/// `decode_nal_units` takes start codes for a packet opening on a four-byte
+/// start code whose next 32 bits after the header byte read past it, and
+/// `avcC` for one whose first four bytes read as a length that fits it
+/// (h264dec.c:602-607). A four-byte `avcC` stream whose packets 16 to 23 — the
+/// IDR 16 first — are start-coded and 24 on four-byte again: FFmpeg decodes it
+/// whole. The hardware failing post-commit at 16, the IDR 16, read with start
+/// codes, anchors and every picture from 16 on comes out as the straight
+/// decode gives it, the end clean; on a probe-era fallback at 10 on three
+/// threads the session switches at 16. The session holds start codes after
+/// 16 and four-byte fields again at 24. Under a two-byte record FFmpeg
+/// re-guesses nothing: a packet of four-byte fields is read with two, as
+/// there. Read by the record's framing alone, 16 anchored nothing and the
+/// switch waited for 24.
+#[test]
+fn under_four_byte_lengths_a_packet_is_framed_as_ffmpeg_reguesses_it() {
+  use super::held::{H264Reading, Held};
+  let (clip, sps, pps) = h264_avcc_with_start_codes_from_16();
+  assert!(
+    clip.packets[16].is_key() && clip.packets[24].is_key(),
+    "IDRs at 16 and 24"
+  );
+  let reference = straight(&clip);
+  assert_eq!(reference.len(), 32, "FFmpeg decodes it whole");
+
+  // The post-commit fallback at 16.
+  let mut readings = Vec::new();
+  let mut anchored_at_16 = None;
+  let session = session_of(behind_a_failure_at(&clip, 16), &clip, |index, dec| {
+    if index == 17 {
+      anchored_at_16 = Some(dec.degraded_anchored_for_test());
+    }
+    if matches!(index, 16 | 17 | 24 | 25) {
+      readings.push(
+        dec
+          .held
+          .h264_reading(None, clip.packets[index].data().expect("a payload")),
+      );
+    }
+  });
+  assert_eq!(anchored_at_16, Some(true), "the IDR 16 anchors");
+  assert_eq!(
+    readings,
+    [
+      Some(H264Reading::Units(None)),
+      Some(H264Reading::Units(None)),
+      Some(H264Reading::Units(Some(4))),
+      Some(H264Reading::Units(Some(4))),
+    ],
+    "start codes from 16, four-byte fields again from 24"
+  );
+  assert!(
+    session.errors.is_empty(),
+    "no error, the end clean: {:?}",
+    session.errors
+  );
+  assert!(
+    from_pts(&session.pictures, 16) == from_pts(&reference, 16),
+    "every picture from 16 on, as the straight decode gives it"
+  );
+
+  // The switch.
+  let three = core::num::NonZeroU32::new(3).expect("nonzero");
+  let session = session_of(
+    behind_a_probe(&clip, 10, crate::Threads::Count(three)),
+    &clip,
+    |_, _| {},
+  );
+  assert_eq!(
+    (session.threads[15], session.threads[16]),
+    (Some(core::num::NonZeroU32::MIN), Some(three)),
+    "one thread to 15, three from the switch at 16"
+  );
+  assert!(session.errors.is_empty(), "no error: {:?}", session.errors);
+  assert!(
+    session.pictures == reference,
+    "every picture, as the straight decode"
+  );
+
+  // Under a two-byte record, nothing is re-guessed.
+  let two = Held::opened_on(crate::CodecId::H264.raw(), &avcc(&sps, &pps, 2));
+  assert_eq!(
+    two.h264_reading(None, clip.packets[24].data().expect("a payload")),
+    Some(H264Reading::Units(Some(2))),
+    "four-byte fields read with two under a two-byte record"
+  );
 }

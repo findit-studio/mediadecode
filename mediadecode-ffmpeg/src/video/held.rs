@@ -142,9 +142,19 @@ impl Held {
   /// is; a record carrying every set held, in the framing the decoder
   /// serving reads packets in, otherwise, read back as FFmpeg reads it and
   /// found to give exactly that; the reason none can, where none can.
-  pub(super) fn record(&self, codec_id: i32, base: &[u8]) -> Result<Option<Record>, Unrecordable> {
+  ///
+  /// `next`, the body of the packet the decoder opened reads first, if any:
+  /// where it is H.264 and FFmpeg re-guesses its framing (h264dec.c:602-607)
+  /// — under a NAL length size of four, which the record must then give —
+  /// the framing either held before it does not matter.
+  pub(super) fn record(
+    &self,
+    codec_id: i32,
+    base: &[u8],
+    next: Option<&[u8]>,
+  ) -> Result<Option<Record>, Unrecordable> {
     match (self, Self::opened_on(codec_id, base)) {
-      (Self::H264(held), Self::H264(fresh)) => held.record(&fresh, base),
+      (Self::H264(held), Self::H264(fresh)) => held.record(&fresh, base, next),
       (Self::Hevc(held), Self::Hevc(fresh)) => held.record(&fresh, base),
       _ => Ok(None),
     }
@@ -167,13 +177,11 @@ impl Held {
         size = Some(read);
       }
     }
-    if !is_avc? {
-      return Some(H264Reading::Units(None));
-    }
-    if params::avcc_body(data) {
-      return Some(H264Reading::Record);
-    }
-    Some(H264Reading::Units(Some(usize::from(size?))))
+    Some(match reading(is_avc, size, data)? {
+      BodyReading::Record => H264Reading::Record,
+      BodyReading::Units { is_avc: false, .. } => H264Reading::Units(None),
+      BodyReading::Units { is_avc: true, size } => H264Reading::Units(Some(usize::from(size))),
+    })
   }
 
   /// Whether this holds the same sets as `other`, in the same framing, each
@@ -365,15 +373,40 @@ impl H264 {
     }
   }
 
+  /// This, as it is once the packet `next` re-guessed its framing, where it
+  /// does: FFmpeg's decoder takes start codes or `avcC` for that packet
+  /// whatever it held, where its NAL length size is four and the packet is
+  /// not read as a record (h264dec.c:602-607, 1045-1050) — `None` otherwise.
+  fn decided_by(&self, next: Option<&[u8]>) -> Option<Self> {
+    let data = next?;
+    if self.nal_length_size != Some(4) || params::avcc_body(data) {
+      return None;
+    }
+    let guess = params::h264_reguess(data)?;
+    let mut decided = self.clone();
+    decided.is_avc = Some(guess);
+    Some(decided)
+  }
+
   /// The record a decoder opened fresh opens on to hold this, against
-  /// `fresh`, what one opened on `base` holds ([`Held::record`]).
-  fn record(&self, fresh: &Self, base: &[u8]) -> Result<Option<Record>, Unrecordable> {
-    if self.same(fresh) {
+  /// `fresh`, what one opened on `base` holds ([`Held::record`]): `next`, the
+  /// packet it reads first, deciding the framing either holds where it
+  /// re-guesses it ([`Self::decided_by`]).
+  fn record(
+    &self,
+    fresh: &Self,
+    base: &[u8],
+    next: Option<&[u8]>,
+  ) -> Result<Option<Record>, Unrecordable> {
+    let decided = self.decided_by(next);
+    let this = decided.as_ref().unwrap_or(self);
+    let fresh_decided = fresh.decided_by(next);
+    if this.same(fresh_decided.as_ref().unwrap_or(fresh)) {
       return Ok(None);
     }
-    let framing = self.framing().ok_or(Unrecordable::Unknown)?;
-    let sequences: Vec<&SequenceHeld> = self.sps.iter().flatten().collect();
-    let pictures: Vec<&PictureHeld> = self.pps.iter().flatten().collect();
+    let framing = this.framing().ok_or(Unrecordable::Unknown)?;
+    let sequences: Vec<&SequenceHeld> = this.sps.iter().flatten().collect();
+    let pictures: Vec<&PictureHeld> = this.pps.iter().flatten().collect();
     if sequences.iter().any(|sps| sps.doubt) || pictures.iter().any(|pps| pps.doubt) {
       return Err(Unrecordable::Unknown);
     }
@@ -387,12 +420,19 @@ impl H264 {
     // longer holds: a record reads every sequence parameter set first, and
     // binds it to the one held now.
     if pictures.iter().any(|pps| {
-      self.sps[usize::from(pps.sps_id)]
+      this.sps[usize::from(pps.sps_id)]
         .as_ref()
         .is_none_or(|sps| *sps.set != *pps.bound)
     }) {
       return Err(Unrecordable::Superseded);
     }
+    // Start codes under a NAL length size of four, which the next packet
+    // re-guesses: an `avcC` record of four-byte fields, whose framing that
+    // packet re-guesses alike.
+    let framing = match framing {
+      H264Framing::AnnexB { reguess: true } if decided.is_some() => H264Framing::Avc(4),
+      framing => framing,
+    };
     let mut bytes = Vec::new();
     match framing {
       H264Framing::Avc(size @ 1..=4) => {
@@ -446,7 +486,7 @@ impl H264 {
     if let Some(next) = write.next {
       read = next;
     }
-    if !read.same(self) {
+    if !read.decided_by(next).as_ref().unwrap_or(&read).same(this) {
       return Err(Unrecordable::Unverified);
     }
     Ok(Some(Record {
@@ -507,65 +547,144 @@ impl<'a> H264Write<'a> {
   }
 
   /// **What FFmpeg's H.264 decoder reads off a packet's body**, under the
-  /// framing it holds ([`Self::read_body`]). Where its framing cannot be
-  /// told, every set any framing it may have would store is in doubt.
+  /// framing it holds ([`reading`], [`Self::read_body`]). Where that cannot
+  /// be told, every set any framing it may hold would store is in doubt, and
+  /// so is the framing it holds after it.
   fn body(&mut self, data: &[u8]) {
     let now = self.now();
-    if let (Some(is_avc), Some(size)) = (now.is_avc, now.nal_length_size) {
-      self.read_body(data, is_avc, size);
-      return;
+    match reading(now.is_avc, now.nal_length_size, data) {
+      Some(reading) => self.read_body(data, reading),
+      None => self.body_in_doubt(data),
     }
-    let avc = now.is_avc.map_or(&[false, true][..], |is_avc| {
-      if is_avc { &[true][..] } else { &[false][..] }
-    });
-    let sizes = now
+  }
+
+  /// `h264_decode_frame`'s reading of a packet's body as `reading` says: an
+  /// `avcC` record applied as extradata, its sets and its framing, no unit
+  /// read as a slice (h264dec.c:1045-1050); or its units, split as the
+  /// framing re-guessed for it says, that framing the decoder's from then
+  /// on (602-610; [`params::h264_packet`]).
+  fn read_body(&mut self, data: &[u8], reading: BodyReading) {
+    match reading {
+      BodyReading::Record => {
+        let _ = self.record(data);
+      }
+      BodyReading::Units { is_avc, size } => {
+        if self.now().is_avc != Some(is_avc) {
+          self.edit().is_avc = Some(is_avc);
+        }
+        params::h264_packet(data, is_avc, usize::from(size), self);
+      }
+    }
+  }
+
+  /// [`Self::body`] where the framing cannot be told: the body read under
+  /// every framing the decoder may hold, what any reading changes in doubt
+  /// over what is held, and the framing after it known only where every
+  /// reading leaves the same.
+  fn body_in_doubt(&mut self, data: &[u8]) {
+    let before = self.now().clone();
+    let avc: &[bool] = match before.is_avc {
+      Some(true) => &[true],
+      Some(false) => &[false],
+      None => &[false, true],
+    };
+    let sizes = before
       .nal_length_size
       .map_or(vec![1u8, 2, 3, 4], |size| vec![size]);
-    let before = now.clone();
+    let mut framings = Vec::new();
     for &is_avc in avc {
       for &size in &sizes {
+        let Some(reading) = reading(Some(is_avc), Some(size), data) else {
+          continue;
+        };
         let mut probe = H264Write::new(&before);
-        probe.read_body(data, is_avc, size);
-        if let Some(mut next) = probe.next {
-          next.doubt_since(&before);
-          // What this framing would change, in doubt over what is held.
-          let edit = self.edit();
-          for id in 0..edit.sps.len() {
-            if next.sps[id].as_ref().is_some_and(|sps| sps.doubt) {
-              let entry = edit.sps[id].clone().or_else(|| next.sps[id].clone());
-              edit.sps[id] = entry.map(|entry| SequenceHeld {
-                doubt: true,
-                ..entry
-              });
-            }
+        probe.read_body(data, reading);
+        let mut next = probe.next.unwrap_or_else(|| before.clone());
+        framings.push((next.is_avc, next.nal_length_size));
+        next.doubt_since(&before);
+        // What this framing would change, in doubt over what is held.
+        let edit = self.edit();
+        for id in 0..edit.sps.len() {
+          if next.sps[id].as_ref().is_some_and(|sps| sps.doubt) {
+            let entry = edit.sps[id].clone().or_else(|| next.sps[id].clone());
+            edit.sps[id] = entry.map(|entry| SequenceHeld {
+              doubt: true,
+              ..entry
+            });
           }
-          for id in 0..edit.pps.len() {
-            if next.pps[id].as_ref().is_some_and(|pps| pps.doubt) {
-              let entry = edit.pps[id].clone().or_else(|| next.pps[id].clone());
-              edit.pps[id] = entry.map(|entry| PictureHeld {
-                doubt: true,
-                ..entry
-              });
-            }
+        }
+        for id in 0..edit.pps.len() {
+          if next.pps[id].as_ref().is_some_and(|pps| pps.doubt) {
+            let entry = edit.pps[id].clone().or_else(|| next.pps[id].clone());
+            edit.pps[id] = entry.map(|entry| PictureHeld {
+              doubt: true,
+              ..entry
+            });
           }
         }
       }
     }
+    let first = framings.first().copied();
+    let edit = self.edit();
+    edit.is_avc = first
+      .and_then(|(is_avc, _)| is_avc)
+      .filter(|&is_avc| framings.iter().all(|framing| framing.0 == Some(is_avc)));
+    edit.nal_length_size = first
+      .and_then(|(_, size)| size)
+      .filter(|&size| framings.iter().all(|framing| framing.1 == Some(size)));
   }
 }
 
-impl H264Write<'_> {
-  /// `h264_decode_frame`'s reading of a packet's body, under the framing
-  /// `is_avc` and `size`: a body that reads as an `avcC` record where the
-  /// framing is `avcC` applied as extradata, its sets and its framing, and
-  /// no unit read as a slice (h264dec.c:1045-1050; [`params::avcc_body`]);
-  /// otherwise its units ([`params::h264_packet`]).
-  fn read_body(&mut self, data: &[u8], is_avc: bool, size: u8) {
-    if is_avc && params::avcc_body(data) {
-      let _ = self.record(data);
-      return;
+/// How FFmpeg's H.264 decoder reads a packet's body, its framing told.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BodyReading {
+  /// As an `avcC` record it applies as extradata.
+  Record,
+  /// As NAL units, length-prefixed by `size` bytes where `is_avc`, or
+  /// start-coded: the framing it holds once it re-guessed it.
+  Units { is_avc: bool, size: u8 },
+}
+
+/// **How FFmpeg's H.264 decoder reads the packet `data`** under the framing
+/// `is_avc` and `size` it holds (`None` where that cannot be told): as an
+/// `avcC` record where its framing is `avcC` and the body reads as one
+/// (h264dec.c:1045-1050), tested before the units are; otherwise as units
+/// split under the framing it re-guesses for the packet where its NAL length
+/// size is four ([`reguessed`]). `None` where that cannot be told.
+fn reading(is_avc: Option<bool>, size: Option<u8>, data: &[u8]) -> Option<BodyReading> {
+  if params::avcc_body(data) {
+    match is_avc {
+      Some(true) => return Some(BodyReading::Record),
+      None => return None,
+      Some(false) => {}
     }
-    params::h264_packet(data, is_avc, usize::from(size), self);
+  }
+  match (reguessed(is_avc, size, data)?, size) {
+    // Start codes split alike whatever the length size.
+    (false, size) => Some(BodyReading::Units {
+      is_avc: false,
+      size: size.unwrap_or(0),
+    }),
+    (true, Some(size)) => Some(BodyReading::Units { is_avc: true, size }),
+    (true, None) => None,
+  }
+}
+
+/// The `is_avc` FFmpeg's H.264 decoder holds once it re-guessed the framing
+/// of the packet `data` (h264dec.c:602-607; [`params::h264_reguess`]) — which
+/// it does where its NAL length size is four — from `is_avc` under the NAL
+/// length size `size`; `None` where that cannot be told.
+fn reguessed(is_avc: Option<bool>, size: Option<u8>, data: &[u8]) -> Option<bool> {
+  let guess = params::h264_reguess(data);
+  match size {
+    Some(4) => guess.or(is_avc),
+    Some(_) => is_avc,
+    // It may re-guess, or not.
+    None => match (guess, is_avc) {
+      (None, is_avc) => is_avc,
+      (Some(guess), Some(is_avc)) if guess == is_avc => Some(is_avc),
+      _ => None,
+    },
   }
 }
 

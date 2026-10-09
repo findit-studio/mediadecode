@@ -1393,6 +1393,29 @@ pub(super) fn avcc_body(buf: &[u8]) -> bool {
   }
 }
 
+/// **The framing FFmpeg's H.264 decoder re-guesses for a packet** where its
+/// NAL length size is four (`decode_nal_units`, h264dec.c:602-607): start
+/// codes (`false`) where the packet, over eight bytes, opens on a four-byte
+/// start code and the 32 bits after the byte that follows it read as more
+/// than its size; `avcC` (`true`) where its first four bytes, over three,
+/// read as more than 1 and no more than its size; `None` where neither, the
+/// framing it held kept. Both compare as unsigned 32-bit numbers, as there.
+pub(super) fn h264_reguess(data: &[u8]) -> Option<bool> {
+  let size = u32::try_from(data.len()).unwrap_or(u32::MAX);
+  let word = |at: usize| {
+    data
+      .get(at..at + 4)
+      .map(|bytes| u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+  };
+  if data.len() > 8 && word(0) == Some(1) && word(5).is_some_and(|after| after > size) {
+    Some(false)
+  } else if data.len() > 3 && word(0).is_some_and(|first| first > 1 && first <= size) {
+    Some(true)
+  } else {
+    None
+  }
+}
+
 /// **The parameter sets FFmpeg's H.264 decoder reads off a packet's
 /// units**, stored in `sets` as it stores them — `decode_nal_units`
 /// (h264dec.c:584-760) over a packet split as the decoder's framing says,

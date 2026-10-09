@@ -1747,7 +1747,11 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       Some(base) => (**base).clone(),
       None => held_of(&self.parameters),
     };
-    let opening = self.opening_from(&base, None)?;
+    let opening = self.opening_from(
+      &base,
+      None,
+      unconsumed_packets.first().and_then(Packet::data),
+    )?;
     let one_thread = self.limits.with_threads(crate::Threads::Single);
     let mut sw = open_sw_decoder(
       opening.parameters.as_ref().unwrap_or(&self.parameters),
@@ -1941,12 +1945,16 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// decoder cannot open on. The opening is committed once the decoder serves
   /// ([`Self::commit_opened`]); where no record carries what is held, the
   /// open is refused by name ([`Error::SetsUnrecordable`]).
-  fn open_after_drain(&mut self, replacement: Option<NewExtradata>) -> Result<(), Error> {
+  fn open_after_drain(
+    &mut self,
+    replacement: Option<NewExtradata>,
+    next: Option<&[u8]>,
+  ) -> Result<(), Error> {
     if let DecodeState::Sw(sw) = &self.state {
       sw.give_up_refusals(&mut self.refusals);
     }
     self.state = DecodeState::SwClosed;
-    let opening = self.opening(replacement.as_ref().map(NewExtradata::bytes))?;
+    let opening = self.opening(replacement.as_ref().map(NewExtradata::bytes), next)?;
     drop(replacement);
     let parameters = opening.parameters.as_ref().unwrap_or(&self.parameters);
     let one_thread = self.limits.with_threads(crate::Threads::Single);
@@ -2040,11 +2048,15 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// **A drained switch, completed**: the drained decoder is closed and one
   /// on the session's threads opened ([`Self::open_after_drain`]), on the
   /// new extradata the keyframe carries, if it carries one.
-  fn finish_restart(&mut self, replacement: Option<NewExtradata>) -> Result<(), Error> {
+  fn finish_restart(
+    &mut self,
+    replacement: Option<NewExtradata>,
+    next: Option<&[u8]>,
+  ) -> Result<(), Error> {
     if self.restart.take().is_none() {
       return Ok(());
     }
-    self.open_after_drain(replacement)
+    self.open_after_drain(replacement, next)
   }
 
   /// The software road's send: what a fallback's replay left fed first,
@@ -2144,7 +2156,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       // A decoder on the session's threads opens holding what this one
       // holds, or the switch is declined and this one serves on: nothing is
       // drained or closed before that is known.
-      match self.opening(new_extradata(pkt)) {
+      match self.opening(new_extradata(pkt), pkt.data()) {
         Ok(_) => self.restart = Some(Restart { eof_sent: false }),
         Err(error) => self.decline_switch(&error),
       }
@@ -2159,7 +2171,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
         }
       }
       self
-        .finish_restart(extradata.take())
+        .finish_restart(extradata.take(), pkt.data())
         .map_err(VideoDecodeError::Decode)?;
     }
     if matches!(self.state, DecodeState::SwClosed) {
@@ -2175,7 +2187,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
         )));
       }
       self
-        .open_after_drain(extradata.take())
+        .open_after_drain(extradata.take(), pkt.data())
         .map_err(VideoDecodeError::Decode)?;
     }
     // A key-flagged packet across an open gap whose first picture is proved
@@ -2656,12 +2668,21 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// the packet's record replaced them failed for good on an unreadable
   /// retained record, while the packet carrying the stream's replacement
   /// never reached a decoder.
-  fn opening(&self, replacement: Option<&[u8]>) -> Result<Opening, Error> {
-    self.opening_from(&self.held, replacement)
+  fn opening(&self, replacement: Option<&[u8]>, next: Option<&[u8]>) -> Result<Opening, Error> {
+    self.opening_from(&self.held, replacement, next)
   }
 
   /// [`Self::opening`], for a decoder that must hold `held`.
-  fn opening_from(&self, held: &held::Held, replacement: Option<&[u8]>) -> Result<Opening, Error> {
+  ///
+  /// `next` is the body of the packet the decoder reads first, if any: where
+  /// its framing is re-guessed, the framing held before it does not matter
+  /// ([`held::Held::record`]).
+  fn opening_from(
+    &self,
+    held: &held::Held,
+    replacement: Option<&[u8]>,
+    next: Option<&[u8]>,
+  ) -> Result<Opening, Error> {
     let held = match replacement {
       Some(record) => held.with_record(record),
       None => held.clone(),
@@ -2674,7 +2695,11 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       ))
     };
     let record = held
-      .record(codec, replacement.unwrap_or(record_of(&self.parameters)))
+      .record(
+        codec,
+        replacement.unwrap_or(record_of(&self.parameters)),
+        next,
+      )
       .map_err(refused)?;
     let Some(bytes) = record
       .as_ref()
@@ -3007,7 +3032,11 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       )?,
       PostCommitInput::FrameTime | PostCommitInput::Eof => None,
     };
-    let opening = self.opening(extradata.as_ref().map(NewExtradata::bytes))?;
+    let next = match input {
+      PostCommitInput::Packet(pkt) => pkt.data(),
+      PostCommitInput::FrameTime | PostCommitInput::Eof => None,
+    };
+    let opening = self.opening(extradata.as_ref().map(NewExtradata::bytes), next)?;
     drop(extradata);
     let one_thread = self.limits.with_threads(crate::Threads::Single);
     let mut sw = open_sw_decoder(
