@@ -49,7 +49,7 @@ pub enum Error {
   /// The decoder tier has no options object of its own for this, so it
   /// applies the default ceiling. A caller that needs a larger one
   /// opens the parameters through the demux tier, where
-  /// [`DemuxLimits`](crate::DemuxLimits) carries the seat.
+  /// [`DemuxLimits`](crate::DemuxLimits) carries the limit.
   #[error(transparent)]
   ParametersTooLarge(#[from] crate::demuxer::ParametersTooLarge),
 
@@ -88,12 +88,12 @@ pub enum Error {
   /// The CPU frame a hardware->CPU transfer would allocate is larger
   /// than [`FrameLimits::max_frame_bytes`](crate::FrameLimits::max_frame_bytes).
   ///
-  /// The hardware road's own seat. `judge_buffer` — the allocator hook
+  /// The hardware road's own check. `judge_buffer` — the allocator hook
   /// that applies the byte ceiling to aligned dimensions — is **not** a
   /// universal choke point: `ff_get_buffer` calls `hwaccel->alloc_frame`
   /// directly for VideoToolbox h264/hevc/vp9 and never reaches
   /// `get_buffer2` at all, and `av_hwframe_transfer_data` allocates its
-  /// CPU destination outside both. This is the seat for that second
+  /// CPU destination outside both. This is the check for that second
   /// road, judged before the transfer rather than after it.
   #[error(transparent)]
   HwTransferTooLarge(#[from] HwTransferTooLarge),

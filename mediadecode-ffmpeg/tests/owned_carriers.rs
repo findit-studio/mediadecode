@@ -1,7 +1,7 @@
 //! The 0.9 amputation, pinned from outside the crate.
 //!
 //! Everything here reads only the public API, which is the point: the
-//! [D-seat amputation contract][law] is a promise made to a *consumer*,
+//! [amputation contract][law] is a promise made to a *consumer*,
 //! and a consumer cannot see `pub(crate)` helpers or unit-test
 //! internals. If a future release reintroduces a carrier that borrows
 //! from libavcodec, these lanes stop compiling.
@@ -77,7 +77,7 @@ fn every_emitted_form_is_a_message() {
 
 #[test]
 fn the_carrier_is_opaque_and_a_consumer_can_still_build_one() {
-  // The seat is `FfmpegBytes`, and the aliases bind it. Written as a
+  // The carrier is `FfmpegBytes`, and the aliases bind it. Written as a
   // coercion rather than a comment so that changing the carrier fails
   // here rather than in a consumer's build.
   fn takes_the_carrier(_: &FfmpegBytes) {}
@@ -307,7 +307,7 @@ fn a_still_s_exif_orientation_reaches_the_image_extras() {
   };
   // Every tag EXIF names, through the real mjpeg decoder, end to end.
   // The mapping is not asserted from a table this test also owns: the
-  // fixture writes tag N into the file's EXIF IFD, and the seat has to
+  // fixture writes tag N into the file's EXIF IFD, and the field has to
   // answer the orientation whose `to_exif_code()` is N.
   for tag in 1..=8u16 {
     let image = decode_still(&corpus.exif_oriented_jpeg(tag));
@@ -325,7 +325,7 @@ fn a_still_s_exif_orientation_reaches_the_image_extras() {
       orientation.rotation().is_some(),
       "tag {tag} is a quarter turn"
     );
-    // The picture itself decoded too — the seat is not a consolation
+    // The picture itself decoded too — the field is not a consolation
     // prize for a frame that failed.
     assert_eq!((image.width(), image.height()), (32, 24));
   }
@@ -354,7 +354,7 @@ fn a_still_with_no_orientation_tag_says_so_rather_than_guessing() {
   );
 
   // And an out-of-range tag: libavcodec emits no display matrix for
-  // one, so the seat is empty — measured, not assumed.
+  // one, so the field is empty — measured, not assumed.
   let out_of_range = decode_still(&corpus.exif_oriented_jpeg(9));
   assert_eq!(
     out_of_range.extra().orientation(),
@@ -648,7 +648,7 @@ fn decode_still_with(
 /// The ceiling is on the *session*, and it reaches libavcodec too —
 /// `AVCodecContext.max_pixels` is written from the same number, so an
 /// oversized picture is refused before FFmpeg allocates its own frame.
-/// Asserted through the public seat rather than by reading the context.
+/// Asserted through the public limit rather than by reading the context.
 #[test]
 fn the_frame_ceilings_ride_the_session() {
   use mediadecode_ffmpeg::FrameLimits;
@@ -1163,7 +1163,7 @@ fn an_oversized_image_input_is_refused_before_the_packet_copy() {
     Err(other) => panic!("expected InputTooLarge, got {other:?}"),
     Ok(_) => panic!("an 8-byte input ceiling passed a real JPEG"),
   }
-  // The default seat is the attachment family, so the same bytes that
+  // The default limit is the attachment family's, so the same bytes that
   // would have been admitted through the demuxer are admitted here.
   assert!(mediadecode_ffmpeg::DEFAULT_MAX_IMAGE_INPUT_BYTES >= bytes.len());
 }
@@ -1229,7 +1229,7 @@ fn indexed_and_one_bit_stills_decode_as_what_ffmpeg_produced() {
   assert_eq!(
     indexed.planes()[1].data_ref().len(),
     1024,
-    "AVPALETTE_SIZE — a format bound, not a budget seat",
+    "AVPALETTE_SIZE — a format bound, not a budget",
   );
 
   // monob: rows of ceil(32/8) = 4 bytes.
@@ -1406,7 +1406,7 @@ fn the_send_leg_judges_the_packet_budget_on_all_three_families() {
 }
 
 /// The subtitle session retains its limits rather than discarding them
-/// at open, so its send path judges the same seat the other two do.
+/// at open, so its send path judges the same limit the other two do.
 #[test]
 fn the_subtitle_session_keeps_its_limits() {
   use mediadecode_ffmpeg::{
@@ -1786,7 +1786,7 @@ fn a_packed_frame_at_255_channels_still_converts() {
   support::init_ffmpeg();
 
   // The other side of the boundary: 255 is the last count the frame's
-  // channel seat can state, and it is carried, not refused. A ceiling
+  // channel field can state, and it is carried, not refused. A ceiling
   // that also rejects the values below it is not a ceiling.
   let mut frame = ffmpeg_next::frame::Audio::empty();
   // SAFETY: `frame` owns a live, zeroed `AVFrame`; the fields written
@@ -1807,7 +1807,7 @@ fn a_packed_frame_at_255_channels_still_converts() {
     mediadecode::Timebase::default(),
     FrameLimits::default(),
   )
-  .expect("255 channels is inside the seat");
+  .expect("255 channels is inside the field");
 
   assert_eq!(out.channel_count(), 255);
   assert_eq!(out.nb_samples(), 1);
@@ -2007,7 +2007,7 @@ fn the_image_seam_honours_the_packet_flags_it_used_to_drop() {
   // build: the flag reaches libavcodec and libavcodec does nothing with
   // it — mjpeg returns a full picture with `AV_FRAME_FLAG_CORRUPT`
   // clear. Forwarding it would only move where the fact is dropped, and
-  // `ImageFrame` has no flag seat to land it in, so the seam refuses by
+  // `ImageFrame` has no flag field to land it in, so the seam refuses by
   // name instead of handing back a picture with its warning deleted.
   let corrupt = payload
     .clone()
@@ -2188,7 +2188,7 @@ fn a_still_refuses_oversized_side_data_rather_than_dropping_the_orientation() {
   // real device-link ICC — is carried whole, and the entry behind it
   // survives.
   let ok = with_side_data(4 * 1024 * 1024);
-  let image = convert::image_frame_from(&ok, FrameLimits::default()).expect("inside the seat");
+  let image = convert::image_frame_from(&ok, FrameLimits::default()).expect("inside the limit");
   let kinds: Vec<i32> = image.extra().side_data().iter().map(|e| e.kind()).collect();
   assert!(kinds.contains(&(ICC as i32)), "the profile was dropped");
   assert!(
@@ -2196,7 +2196,7 @@ fn a_still_refuses_oversized_side_data_rather_than_dropping_the_orientation() {
     "the orientation was pushed off the end by the profile — the exact loss",
   );
 
-  // Over the seat: a named refusal, never a truncated list.
+  // Over the limit: a named refusal, never a truncated list.
   let over = with_side_data(DEFAULT_MAX_IMAGE_SIDE_DATA_BYTES + 1);
   match convert::image_frame_from(&over, FrameLimits::default()) {
     Err(ConvertError::ImageSideDataTooLarge(p)) => {
@@ -2207,7 +2207,7 @@ fn a_still_refuses_oversized_side_data_rather_than_dropping_the_orientation() {
     Ok(_) => panic!("over-budget side data was silently truncated"),
   }
 
-  // And the seat is configurable, so a caller with a tighter budget
+  // And the limit is configurable, so a caller with a tighter budget
   // gets the same named answer rather than a quiet loss.
   assert!(matches!(
     convert::image_frame_from(&ok, FrameLimits::new().with_max_image_side_data_bytes(1024)),
@@ -2518,7 +2518,7 @@ fn decode_first_audio(
 }
 
 #[test]
-fn the_hardware_road_still_delivers_frames_through_its_new_seat() {
+fn the_hardware_road_still_delivers_frames_through_its_new_check() {
   use mediadecode_ffmpeg::{Frame, VideoDecoder};
   let Some(corpus) = Corpus::new() else {
     return;
@@ -2526,13 +2526,13 @@ fn the_hardware_road_still_delivers_frames_through_its_new_seat() {
   support::init_ffmpeg();
 
   // **The accepting path of the pre-transfer judge.** The hardware road
-  // has its own seat now, because neither ceiling hook reaches it:
+  // has its own check now, because neither ceiling hook reaches it:
   // censused on this machine, a VideoToolbox h264 decode records *zero*
   // `get_buffer2` calls (`ff_get_buffer` goes to `hwaccel->alloc_frame`
   // instead), and the CPU destination is allocated by
   // `av_hwframe_transfer_data` outside both hooks.
   //
-  // What that seat must not do is refuse ordinary video, which is what
+  // What that check must not do is refuse ordinary video, which is what
   // this lane pins. Whichever backend the probe settles on — hardware
   // here, software elsewhere — a frame has to come back.
   let path = corpus.multi_track_mkv();
@@ -2583,7 +2583,7 @@ fn a_cropped_stream_is_judged_on_what_it_allocates_not_what_it_displays() {
   // **Two dimension vocabularies.** This clip displays 32x32 — 1024
   // pixels — out of a 1920x1088 coded surface, a 2040x divergence
   // written into the SPS as real cropping. `max_pixels` is applied by
-  // `ff_set_dimensions` to the *display* dims, so the seat sees 1024
+  // `ff_set_dimensions` to the *display* dims, so the check sees 1024
   // and waves it through however tight it is set: measured on this
   // build, `max_pixels = 5000` opens this stream without complaint.
   //
@@ -2690,8 +2690,8 @@ fn a_cropped_stream_is_judged_on_what_it_allocates_not_what_it_displays() {
   assert_eq!(named.limit(), CEILING as i64);
 
   // And under the defaults, where the coded surface genuinely fits, the
-  // same stream decodes. A seat that also refuses what fits is not a
-  // seat.
+  // same stream decodes. A check that also refuses what fits is not a
+  // check.
   decode_under(mediadecode_ffmpeg::DEFAULT_MAX_FRAME_BYTES)
     .expect("an ordinary cropped stream must still decode");
 }
@@ -2832,7 +2832,7 @@ fn every_hardware_exit_names_the_coded_surface_refusal() {
 }
 
 // ---------------------------------------------------------------------------
-//  R19: the seats say what they mean, and cheap formats are not charged
+//  R19: the limits say what they mean, and cheap formats are not charged
 //  the price of expensive ones.
 // ---------------------------------------------------------------------------
 
@@ -2852,9 +2852,9 @@ fn a_cheap_format_is_not_charged_the_worst_formats_price() {
   // 3,135,488 bytes; the translation priced it at 16 bytes a pixel and
   // refused it under any budget below 32 MiB.
   //
-  // Under 4 MiB it fits, comfortably, and now decodes. The seat that
+  // Under 4 MiB it fits, comfortably, and now decodes. The check that
   // enforces the byte ceiling is `judge_buffer`, which is itself a
-  // pre-allocation seat — `get_buffer2` *is* the allocation — so
+  // pre-allocation check — `get_buffer2` *is* the allocation — so
   // nothing was traded away to stop over-refusing.
   let path = corpus.cropped_h264();
   let decode_under = |bytes: usize| -> Result<(), mediadecode_ffmpeg::Error> {
@@ -2920,7 +2920,7 @@ fn the_still_road_still_refuses_what_it_cannot_afford() {
   support::init_ffmpeg();
   let path = corpus.exif_oriented_jpeg(1); // a 32x24 JPEG
 
-  // The still road's byte ceiling is the same seat, and it still bites
+  // The still road's byte ceiling is the same check, and it still bites
   // — at the **decode** now rather than at the open. That is the whole
   // shape of this round's change: the open no longer carries a
   // byte-derived pixel translation, so a budget is spent where the

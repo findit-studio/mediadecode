@@ -1184,8 +1184,8 @@ impl JudgeCase {
         "the harness codec must open",
       );
       // Set after the open, so nothing resets them — including the
-      // callback state, which is the seat the judge reads its budget
-      // from. A context this crate did not build has no seat and is
+      // callback state, which is the slot the judge reads its budget
+      // from. A context this crate did not build has no such slot and is
       // refused, so the harness installs one exactly as
       // `build_codec_context` does.
       (*ctx).max_pixels = self.max_pixels;
@@ -1243,7 +1243,7 @@ fn the_callback_prices_the_frames_layout_not_the_contexts() {
   );
 
   // And the same frame under a ceiling that genuinely covers it is
-  // delegated — the seat refuses cost, not multichannel audio.
+  // delegated — the judge refuses cost, not multichannel audio.
   JudgeCase::audio(DBLP, 130_000, 255)
     .with_max_frame_bytes(u64::MAX)
     .run()
@@ -1290,7 +1290,7 @@ fn the_callback_recovers_each_mediums_ceiling_independently() {
     "a zero byte budget admitted an audio frame",
   );
 
-  // A generous pixel seat does not rescue a starved byte seat.
+  // A generous pixel limit does not rescue a starved byte limit.
   assert!(
     JudgeCase::audio(S16, 65_535, 8)
       .with_max_pixels(i64::MAX)
@@ -1300,8 +1300,8 @@ fn the_callback_recovers_each_mediums_ceiling_independently() {
   );
 
   // **The shape that disproved the old recovery.** A 256x256 frame at
-  // 16 bytes a pixel under a tight *pixel* seat and a generous *byte*
-  // seat satisfies both of the caller's limits — 65,536 pixels, and
+  // 16 bytes a pixel under a tight *pixel* limit and a generous *byte*
+  // limit satisfies both of the caller's limits — 65,536 pixels, and
   // 1,050,624 bytes against 2 MiB — while the recovered ceiling was
   // `max_pixels * 16 = 1,048,576`. It was refused by exactly the 2,048
   // bytes of alignment and slack the recovery could not see, which is
@@ -1313,8 +1313,8 @@ fn the_callback_recovers_each_mediums_ceiling_independently() {
     .run()
     .expect("a frame inside both of the caller's limits must be allocated");
 
-  // And the other direction still refuses: a generous pixel seat buys
-  // nothing past the byte seat.
+  // And the other direction still refuses: a generous pixel limit buys
+  // nothing past the byte limit.
   assert!(
     JudgeCase::video(RGBAF32, 256, 256)
       .with_max_pixels(i64::MAX)
@@ -1342,7 +1342,7 @@ fn the_callback_judges_cost_and_leaves_logical_extent_to_libavcodec() {
   // This is what the removed gate got wrong: it compared the *aligned*
   // dimensions against `max_pixels`, which is
   // `min(pixel limit, byte ceiling / worst)` — so when the pixel limit
-  // was the tighter seat, alignment inflation alone refused a frame
+  // was the tighter bound, alignment inflation alone refused a frame
   // that was inside both requested limits, for arithmetic the caller
   // never asked about.
   JudgeCase::video(GRAY8, 65_536, 1)

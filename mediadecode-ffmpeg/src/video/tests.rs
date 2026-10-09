@@ -2154,7 +2154,7 @@ fn the_cold_fallback_forwards_keep_the_allocator_refusal() {
     assert_eq!(payload.limit(), 64 * 1024);
   }
 
-  // And under a budget that fits, the same forward succeeds — the seat
+  // And under a budget that fits, the same forward succeeds — the ceiling
   // refuses cost, not fallbacks.
   let generous = DecoderLimits::new()
     .with_frame(FrameLimits::new().with_max_frame_bytes(crate::DEFAULT_MAX_FRAME_BYTES))
@@ -2405,11 +2405,11 @@ fn the_receive_time_fallback_queue_survives_a_failed_carrier() {
 }
 
 // ---------------------------------------------------------------------------
-//  R2: the end of the stream outranks the parked seat, on both send gates
+//  R2: the end of the stream outranks the parked frame, on both send gates
 // ---------------------------------------------------------------------------
 
 /// The cross product this lane needs: a session that has **accepted**
-/// end-of-stream *and* has a frame parked in its seat.
+/// end-of-stream *and* has a frame parked in its holding.
 ///
 /// Reaching it takes both halves at once — `send_eof` committed, then a
 /// delayed tail frame drained out of the decoder whose carrier
@@ -2430,7 +2430,7 @@ fn eof_with_a_parked_frame(
   // A seam that never fails keeps us on the hardware scratch; one that
   // raises probe-era exhaustion drops us onto the real software decoder
   // with the history replayed losslessly, so both scratches — the two
-  // the parked-seat gate exists for — are proved.
+  // the parked-frame gate exists for — are proved.
   let seam: Box<dyn HwInner> = if hw {
     Box::new(FakeHw::failing(
       w,
@@ -2493,7 +2493,7 @@ fn eof_with_a_parked_frame(
   assert!(
     dec.sw_replay_frames_is_empty_for_test(),
     "the replay queue must be empty, or the park below lands in it \
-     instead of the scratch seat this lane is about",
+     instead of the scratch holding this lane is about",
   );
 
   // The end, accepted — this is what sets `eof_sent`.
@@ -2504,7 +2504,7 @@ fn eof_with_a_parked_frame(
   );
 
   // Now park a tail frame: the ceiling refuses the carrier, and the
-  // refusal is one another attempt could survive, so the seat keeps it.
+  // refusal is one another attempt could survive, so the holding keeps it.
   crate::fault_subprocess::cap_ffmpeg_allocations(16);
   let refused = dec.receive_frame(&mut frame);
   crate::fault_subprocess::uncap_ffmpeg_allocations();
@@ -2524,7 +2524,7 @@ fn eof_with_a_parked_frame(
 ///
 /// The arm's whole contract is *drain the output and this same offer
 /// becomes acceptable*. With `eof_sent` committed it never becomes
-/// acceptable — draining empties the seat and the retry faults anyway,
+/// acceptable — draining empties the holding and the retry faults anyway,
 /// until `flush`. So a caller that obeys the contract loops, drains,
 /// re-offers, and is refused: the same fault-under-back-pressure
 /// inversion the subtitle seam carried, one surface over.
@@ -2555,11 +2555,11 @@ fn a_post_eof_send_is_a_fault_not_backpressure(hw: bool) {
     )
   };
 
-  // --- with the seat still parked -----------------------------------
+  // --- with the frame still parked ----------------------------------
   let sent = dec.send_packet(&packet(4));
   assert!(
     is_after_eof(&sent),
-    "a packet after a committed EOF must be the fault even with the seat \
+    "a packet after a committed EOF must be the fault even with the frame \
      parked — `MustDrain` here promises a retry that can never succeed; got {sent:?}",
   );
   let eof_again = dec.send_eof();
@@ -2583,7 +2583,7 @@ fn a_post_eof_send_is_a_fault_not_backpressure(hw: bool) {
   }
   assert!(drained > 0, "the parked frame was never recovered");
 
-  // --- with the seat free -------------------------------------------
+  // --- with the holding free ----------------------------------------
   let sent_after = dec.send_packet(&packet(5));
   assert!(
     is_after_eof(&sent_after),
@@ -2614,7 +2614,7 @@ fn a_post_eof_send_is_a_fault_not_backpressure_on_the_hardware_road() {
 }
 
 /// And the software scratch, after a post-commit fallback put us there —
-/// the two scratches are the reason the parked-seat gate exists at all,
+/// the two scratches are the reason the parked-frame gate exists at all,
 /// so the ordering is proved against both.
 #[test]
 fn a_post_eof_send_is_a_fault_not_backpressure_on_the_software_road() {
@@ -2745,7 +2745,7 @@ fn a_post_eof_frame_time_fallback_never_strands_the_caller_in_needs_input() {
   // did the work. A decoder that was handed the end answers
   // `AVERROR_EOF`; one still cold answers `EAGAIN`.
   let DecodeState::Sw(sw) = &mut dec.state else {
-    panic!("the software decoder must be the one in the seat");
+    panic!("the software decoder must be the one serving");
   };
   let mut scratch = alloc_av_video_frame().expect("frame slot");
   let raw = sw
@@ -2795,7 +2795,7 @@ fn the_post_eof_fault_is_the_one_the_substrate_gives() {
   let (w, h) = (64u32, 48u32);
   let clip = encode_synthetic_clip(w, h, 8, 100);
   let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
-  // Probe-era exhaustion puts the real software decoder in the seat —
+  // Probe-era exhaustion puts the real software decoder in place —
   // the fake seam has no EOF state machine to interrogate.
   let mut dec = CarrierVideoStreamDecoder::<View>::from_hw_inner_for_test(
     Box::new(FakeHw::failing(w, h, 0, 2, FailShape::ProbeEra)),
@@ -2823,7 +2823,7 @@ fn the_post_eof_fault_is_the_one_the_substrate_gives() {
   // private state is reachable; the point is that nothing below asks
   // the wrapper anything.
   let DecodeState::Sw(sw) = &mut dec.state else {
-    panic!("the software decoder must be the one in the seat");
+    panic!("the software decoder must be the one serving");
   };
   sw.send_eof(&mut super::Refusals::default())
     .expect("the substrate takes the end");
@@ -2872,7 +2872,7 @@ fn a_parked_hardware_frame_is_delivered_before_any_fallback() {
   // parked would send the retry to the software scratch — delivering a
   // stale frame, or refusing permanently and stranding a decoded one.
   // Both send roads can commit that fallback, so both refuse while the
-  // seat is taken.
+  // holding is taken.
   crate::fault_subprocess::in_subprocess(
     "video::tests::a_parked_hardware_frame_is_delivered_before_any_fallback",
     || {
@@ -2943,7 +2943,7 @@ fn a_parked_hardware_frame_is_delivered_before_any_fallback() {
         "the delivered frame must carry the decoded planes",
       );
 
-      // And once the seat is free the send reaches the seam — this is
+      // And once the holding is free the send reaches the seam — this is
       // the one that would have committed the fallback underneath the
       // parked frame. Whether the cold software decoder then accepts a
       // lone P-frame is not this lane's business; that it is no longer
@@ -2951,7 +2951,7 @@ fn a_parked_hardware_frame_is_delivered_before_any_fallback() {
       let after = dec.send_packet(&packet(1));
       assert!(
         !matches!(after, Ok(Sent::MustDrain)),
-        "with the seat free the send must reach the seam, got {after:?}",
+        "with the holding free the send must reach the seam, got {after:?}",
       );
     },
   );

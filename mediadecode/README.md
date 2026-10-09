@@ -52,7 +52,7 @@ bytes. Adapter implementations live in sibling crates such as
   `ImageFrame` is the still-image household: no `pts`, no `duration`,
   because a still is not on the timeline — the same fact
   `AttachmentPacket` states on the packet side.
-- **The D-seat amputation contract** — the one law a backend's buffer
+- **The amputation contract** — the one law a backend's buffer
   type `B` must obey: owned, `Send + Sync`, cheap to clone (a refcount
   bump), with no backend-internal lifetime crossing the seam. This
   crate names no carrier and pins no bound past `AsRef<[u8]>`; the

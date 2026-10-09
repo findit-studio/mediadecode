@@ -257,7 +257,7 @@ pub(crate) struct CallbackState {
   /// **The single source of truth for the allocator judge.** It used to
   /// be recovered from `AVCodecContext.max_pixels`, which is set to
   /// `min(pixel ceiling, byte ceiling / worst-bytes-per-pixel)` — so
-  /// when the *pixel* seat was the tighter of the two, `max_pixels`
+  /// when the *pixel* limit was the tighter of the two, `max_pixels`
   /// stopped encoding the byte ceiling at all and the recovery invented
   /// a smaller one. A 256x256 frame at 16 bytes a pixel under
   /// `max_pixels = 65536` and a 2 MiB byte budget satisfies both of the
@@ -547,7 +547,7 @@ pub(crate) unsafe extern "C" fn get_hw_format(
       return AVPixelFormat::AV_PIX_FMT_NONE;
     }
     if v == wanted_int {
-      // **The coded-dimension seat.** This is the last moment before
+      // **The coded-dimension check.** This is the last moment before
       // the hardware frames pool is built, and the first at which the
       // *coded* extent is known — which is the extent that gets
       // allocated, and not the one `max_pixels` was checked against.
@@ -641,7 +641,7 @@ unsafe fn coded_extent_over_ceiling(
   // *smaller* than the pool. A conservative fallback that can
   // under-state is not conservative; it is a hole with a comment on it.
   //
-  // So this seat takes the rule the transfer judge already keeps: **a
+  // So this check takes the rule the transfer judge already keeps: **a
   // pool that will not declare itself is a pool that cannot be judged,
   // and an unprovable extent is not a small one.** Refusing here
   // declines the hardware format, which falls the decode back to
@@ -654,7 +654,7 @@ unsafe fn coded_extent_over_ceiling(
   let device_ref = unsafe { (*ctx).hw_device_ctx };
   if device_ref.is_null() {
     // No device means no hardware frames pool will be built at all, so
-    // there is nothing for this seat to guard. That is a different
+    // there is nothing for this check to guard. That is a different
     // thing from a pool declining to describe itself, which is refused
     // below — this crate's hardware road always attaches a device
     // before opening, so reaching here means the caller is not on it.

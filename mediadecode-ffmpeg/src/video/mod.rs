@@ -523,7 +523,7 @@ pub struct CarrierVideoStreamDecoder<C: crate::FfmpegCarrier> {
   /// for the reasoning, which is the same on both roads.
   ///
   /// **This decoder has two scratches and can change which one is
-  /// current, so the seat is enforced rather than merely recorded.**
+  /// current, so the holding is enforced rather than merely recorded.**
   /// While it is set, `send_packet` and `send_eof` answer
   /// [`Sent::MustDrain`]: both are the roads that commit a
   /// hardware-to-software fallback, and a fallback under a parked frame
@@ -539,7 +539,7 @@ pub struct CarrierVideoStreamDecoder<C: crate::FfmpegCarrier> {
   /// which is to say it was back pressure wearing an error's clothes.
   /// Now it says so, and a caller can act on it without inspecting a
   /// backend-specific error type. The subtitle decoder keeps the same
-  /// seat one road over, spelled the same way.
+  /// holding one road over, spelled the same way.
   scratch_pending: bool,
   _carrier: core::marker::PhantomData<C>,
 }
@@ -592,7 +592,7 @@ pub(crate) trait HwInner: Send {
   }
 
   /// See [`VideoDecoder::cancel_scaled_output`]. Defaulted to nothing,
-  /// because a seat that never accepts a request has none to withdraw.
+  /// because a road that never accepts a request has none to withdraw.
   fn cancel_scaled_output(&mut self) {}
 
   /// The thread count libavcodec settled on for this decoder's context.
@@ -1501,7 +1501,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// decided — the retry delivers it from the scratch without
   /// consulting the stage — so accepting a new size would promise an
   /// extent the very next frame cannot have. Drain it and ask again;
-  /// the same escape every other seat guarded by that flag offers.
+  /// the same escape every other call guarded by that flag offers.
   ///
   /// The refusal carries the same meaning as every other: the session
   /// returns to full coded size, so any request already standing is
@@ -1515,7 +1515,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// reaches back to a picture already decoded and never waits longer
   /// than the one being decoded now.
   ///
-  /// # The two refusals this seat mints itself
+  /// # The two refusals this call mints itself
   ///
   /// Neither is an error, and each **returns the session to full coded
   /// size**, dropping any request already standing — what the trait
@@ -1570,7 +1570,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     // silent mismatch [`Self::scaled_output_capability_impl`]'s promise
     // exists to rule out. Refusing changes nothing, which is the
     // contract for a refusal, and the caller's escape is the one this
-    // seat already documents everywhere else: drain the frame, then ask
+    // holding already documents everywhere else: drain the frame, then ask
     // again.
     if self.scratch_pending {
       tracing::debug!(
@@ -3347,7 +3347,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     decoded: bool,
     dst: &mut VideoFrame<mediadecode::PixelFormat, VideoFrameExtra, C::Buffer>,
   ) {
-    // The seat is free once a carrier exists for what it held.
+    // The holding is free once a carrier exists for what it held.
     self.scratch_pending = false;
     // A picture the decoder output is what the resync's proof counts toward
     // closing the gap. A no-op on every road that never entered degraded
@@ -3702,12 +3702,12 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
 impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// The fault a submission after end-of-stream earns on this face.
   ///
-  /// **Censused from the empty-seat road rather than invented.** With
-  /// the seat free, a post-EOF `send_packet` or a repeated `send_eof`
+  /// **Censused from the empty-holding road rather than invented.** With
+  /// the holding free, a post-EOF `send_packet` or a repeated `send_eof`
   /// reaches libavcodec, which answers `AVERROR_EOF`, and all four
   /// roads through this wrapper — hardware and software, packet and
   /// EOF — surface it as exactly this value. The gates below short
-  /// out to the same one so a parked seat cannot change *which* answer
+  /// out to the same one so a parked frame cannot change *which* answer
   /// a caller gets, only how quickly. `the_post_eof_fault_is_the_one_the_substrate_gives`
   /// pins the two against each other.
   ///
@@ -3724,13 +3724,13 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     &mut self,
     packet: &VideoPacket<VideoPacketExtra, C::Buffer>,
   ) -> Result<Sent, VideoDecodeError> {
-    // **The end of the stream outranks the parked seat, and the order
+    // **The end of the stream outranks the parked frame, and the order
     // is the whole point.**
     //
     // `Sent::MustDrain` is a promise: drain the output and this same
     // offer becomes acceptable. Past end-of-stream that promise is
-    // false — draining empties the seat and the retry still faults,
-    // until `flush`. Checking the seat first made the wrapper answer
+    // false — draining empties the holding and the retry still faults,
+    // until `flush`. Checking the holding first made the wrapper answer
     // `MustDrain` for a submission nothing could ever accept, which is
     // the same fault-under-back-pressure inversion the subtitle seam
     // carried: a caller obeying the contract loops, drains, re-offers,
@@ -3738,7 +3738,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     //
     // It is reachable: `send_eof` is accepted and sets `eof_sent`, a
     // delayed tail frame comes out of the decoder, its carrier
-    // allocation fails parkably, and the seat is taken on a session
+    // allocation fails parkably, and the holding is taken on a session
     // that is already over.
     if !self.phase().accepts_input() {
       return Err(Self::after_eof());
@@ -3981,7 +3981,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
         Ok(new_frame) => new_frame,
         Err(e) if e.parks_in_decode() => return Err(VideoDecodeError::Convert(e)),
         // A frame nothing can carry is dropped rather than re-offered
-        // forever — the same rule the scratch seat follows.
+        // forever — the same rule the scratch holding follows.
         Err(e) => {
           self.sw_replay_frames.pop_front();
           return Err(VideoDecodeError::Convert(e));
@@ -4032,7 +4032,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
         DecodeState::Hw(hw) => match hw.receive_frame(&mut self.hw_scratch) {
           Ok(Received::Frame) => {
             // The frame is out of the decoder's queue from here; the
-            // seat is what keeps it if the conversion cannot commit.
+            // holding is what keeps it if the conversion cannot commit.
             self.scratch_pending = true;
             return self.deliver_frame(dst);
           }
@@ -4104,7 +4104,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
           match sw.receive(&mut self.sw_scratch, &mut self.refusals) {
             Ok(()) => {
               // The frame is out of the decoder's queue from here; the
-              // seat is what keeps it if the conversion cannot commit.
+              // holding is what keeps it if the conversion cannot commit.
               self.scratch_pending = true;
               // A picture this call's decode refused, concealed while it gave
               // this one: the call's own decode error, reported first, as
@@ -4536,7 +4536,7 @@ macro_rules! video_lane_face {
       /// contract (never an error) and
       /// [`Self::scaled_output_capability`]'s documentation for which
       /// road can honor one, what a mid-stream request means, and the
-      /// zero / upscale refusals this seat mints itself.
+      /// zero / upscale refusals this call mints itself.
       pub fn request_scaled_output(&mut self, size: (u32, u32)) -> ScaledOutputCapability {
         self.request_scaled_output_impl(size)
       }

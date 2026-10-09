@@ -296,7 +296,7 @@ impl Corpus {
   /// The same declaration in an **MP4**, where the untagged track says
   /// `und` instead of saying nothing.
   ///
-  /// This is the fourth shape, and the one that makes the seat's
+  /// This is the fourth shape, and the one that makes the field's
   /// `Option` mean something: an ISOBMFF `mdhd` has a language field it
   /// must fill, so a track nobody tagged is written `und` —
   /// *undetermined*, which the file really does say. Matroska simply
@@ -714,7 +714,7 @@ impl Corpus {
   /// **no** mastering-display or content-light-level side data — the
   /// paired "absent metadata answers absent" fixture to
   /// [`Self::hdr10_hevc`]: a different, real transfer characteristic,
-  /// decoded through the same path, with the HDR10-only seats reading
+  /// decoded through the same path, with the HDR10-only fields reading
   /// `None` rather than a leftover default.
   #[rustfmt::skip]
   pub fn hlg_hevc(&self) -> PathBuf {

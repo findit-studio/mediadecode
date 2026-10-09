@@ -1503,7 +1503,7 @@ impl VideoDecoder {
           // hook reaches this allocation — `hwaccel->alloc_frame`
           // bypasses `get_buffer2` entirely, and the CPU destination is
           // allocated by `av_hwframe_transfer_data` outside both — so
-          // this is the seat that bounds what the hardware road hands
+          // this is the check that bounds what the hardware road hands
           // back.
           //
           // Judged out here rather than inside `transfer_hw_frame`
@@ -2026,7 +2026,7 @@ impl VideoDecoder {
     }
 
     // The state `build_codec_context` already installed in `opaque`,
-    // told which format this backend wants. One allocation, one seat:
+    // told which format this backend wants. One allocation, one place:
     // the budget the judge reads and the declination the funnel reads
     // are the same object, and `Box::into_raw` hands its ownership to
     // the guard below without moving it — so the pointer the context
@@ -2833,7 +2833,7 @@ pub(crate) fn build_codec_context(
   //
   // The translation is gone because it is no longer needed: the byte
   // ceiling is enforced by [`judge_buffer`], which is *also* a
-  // pre-allocation seat — `get_buffer2` is the allocator, so it runs
+  // pre-allocation check — `get_buffer2` is the allocator, so it runs
   // before the allocation and prices the frame's real format at its
   // real aligned dimensions. Nothing is lost on the software road by
   // stating the pixel limit as what it is.
@@ -2844,7 +2844,7 @@ pub(crate) fn build_codec_context(
     (*ctx_ptr).max_pixels = i64::try_from(limits.frame().max_pixels()).unwrap_or(i64::MAX);
   }
 
-  // **The byte ceiling's own seat, in the allocator itself.**
+  // **The byte ceiling's own check, in the allocator itself.**
   // `max_pixels` bounds an extent; what an extent costs depends on its
   // format and on how the allocator aligns it — a `gray8` frame of
   // 65536x1 is 64 KiB by `w * h` and 2 MiB once its single row is
@@ -2906,7 +2906,7 @@ pub(crate) fn build_codec_context(
   // allocator's own ruler. An exact judge at the allocation beats an
   // approximate one before it.
 
-  // **The judge's budget seat.** `judge_buffer` runs as a C callback
+  // **The judge's budget slot.** `judge_buffer` runs as a C callback
   // with nothing but the context to read, and the byte ceiling is not
   // recoverable from any field on it — see
   // [`CallbackState::max_frame_bytes`]. So the state that already
@@ -3175,7 +3175,7 @@ pub(crate) const PROBE_PIXELS: usize = 256 * 256;
 /// really does cost 506 MiB — but a 16K `yuv420p` frame, which would
 /// only have cost 199 MB, is refused too. That is the honest shape of a
 /// bound that has to hold before the format is known: the deployment
-/// answer is to raise `max_frame_bytes`, which is exactly the knob that
+/// answer is to raise `max_frame_bytes`, which is exactly the limit that
 /// says how much memory one frame may cost.
 ///
 /// # The residual, stated
@@ -3300,7 +3300,7 @@ unsafe extern "C" fn judge_buffer(
   // plain integers.
   let (width, height) = unsafe { ((*frame).width, (*frame).height) };
 
-  // **This seat judges cost, and only cost.**
+  // **This check judges cost, and only cost.**
   //
   // `max_pixels` is a *logical* limit on a picture's extent, and
   // libavcodec already enforces it — against the **raw** dimensions, in
@@ -3320,7 +3320,7 @@ unsafe extern "C" fn judge_buffer(
   //   degenerate shape is refused on its actual cost; and
   // * wrong, because `max_pixels` is `min(the caller's pixel limit,
   //   byte ceiling / worst-bytes-per-pixel)` — so when the caller's
-  //   pixel limit was the tighter seat, alignment inflation alone
+  //   pixel limit was the tighter bound, alignment inflation alone
   //   refused frames satisfying *both* requested limits. A 65536x1
   //   `gray8` frame under `max_pixels = 65536` and a generous byte
   //   budget fits the pixel limit exactly and costs 2 MiB, and was
@@ -3341,17 +3341,17 @@ unsafe extern "C" fn judge_buffer(
   // SAFETY: `frame` is live; the field is a plain pointer.
   let hw_frames = unsafe { (*frame).hw_frames_ctx };
 
-  // A hardware frame carries no CPU bytes for this seat to price — its
+  // A hardware frame carries no CPU bytes for this check to price — its
   // pool is judged where it is declared, in the `get_format` callback —
   // so it is delegated rather than failed closed on an unpriceable
   // format.
   if hw_frames.is_null() {
-    // **The caller's own number, read from the seat that carries it.**
+    // **The caller's own number, read from the slot that carries it.**
     // This used to recover a byte ceiling from `AVCodecContext.max_pixels`,
     // and the recovery was wrong in both directions:
     //
     // * `max_pixels` is `min(pixel ceiling, byte ceiling / worst)`, so
-    //   when the *pixel* seat was the tighter of the two it stopped
+    //   when the *pixel* limit was the tighter of the two it stopped
     //   encoding the byte ceiling at all — and the recovery invented a
     //   smaller one. A 256x256 frame at 16 bytes a pixel under
     //   `max_pixels = 65536` with a 2 MiB byte budget satisfies both of
@@ -3365,7 +3365,7 @@ unsafe extern "C" fn judge_buffer(
     //
     // The audio road briefly recovered from `max_samples` instead,
     // which *is* exact — but two sources of truth for one number is how
-    // the first one went wrong. Both media read the seat now.
+    // the first one went wrong. Both media read the slot now.
     //
     // SAFETY: `opaque` holds the `CallbackState` that
     // `build_codec_context` installed and whose owner outlives the
@@ -3404,7 +3404,7 @@ unsafe extern "C" fn judge_buffer(
       crate::footprint::audio_frame_bytes(format_raw, nb_samples as usize, channels as usize)
     } else {
       // Neither geometry nor samples: nothing is being allocated that
-      // this seat can price, and nothing is claimed.
+      // this check can price, and nothing is claimed.
       Some(0)
     };
 
@@ -3459,7 +3459,7 @@ unsafe extern "C" fn judge_buffer(
 /// Prices the CPU frame `av_hwframe_transfer_data` would allocate, and
 /// refuses it if it is over the ceiling — **before** the transfer runs.
 ///
-/// # Why the hardware road needs its own seat
+/// # Why the hardware road needs its own check
 ///
 /// [`judge_buffer`] is not a universal choke point, and the census says
 /// so on this machine. `ff_get_buffer` calls `hwaccel->alloc_frame`
@@ -3478,7 +3478,7 @@ unsafe extern "C" fn judge_buffer(
 /// `av_image_check_size2`, zero `get_buffer2` calls and no frame. The
 /// check lives in `ff_set_dimensions`, which every decoder runs when it
 /// learns its dimensions and before any surface pool exists — so the
-/// seat `max_pixels` already occupies covers the hardware surface too.
+/// bound `max_pixels` already sets covers the hardware surface too.
 ///
 /// The residual on that road is the aligned-dimensions gap
 /// [`judge_buffer`] closes for software frames, and it applies to
