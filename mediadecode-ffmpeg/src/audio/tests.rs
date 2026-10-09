@@ -377,3 +377,75 @@ fn of_aac_records_deferred_the_later_whole_one_rides_and_one_of_no_bytes_folds_n
     heard.last().map(|heard| (heard.0, heard.1))
   );
 }
+
+/// `packet` carrying `data` as side data of `kind`.
+fn with_side_data(mut packet: ffmpeg_next::Packet, kind: i32, data: &[u8]) -> ffmpeg_next::Packet {
+  use ffmpeg_next::packet::Mut;
+  // SAFETY: `packet` is a live packet this function owns; FFmpeg allocates
+  // the side data, padded, and frees it with the packet; `data` is copied
+  // into exactly the bytes it allocated.
+  unsafe {
+    let slot = crate::ffi::packet_new_side_data(packet.as_mut_ptr(), kind, data.len())
+      .expect("side data attached");
+    core::ptr::copy_nonoverlapping(data.as_ptr(), slot, data.len());
+  }
+  packet
+}
+
+/// LAW (R21 row 4; Codex R20 [medium]): **a skip of samples a packet with no
+/// body carries is dropped and said so, never carried onto the next packet.**
+/// `AV_PKT_DATA_SKIP_SAMPLES` is the trim of the samples decoded from the
+/// packet it rides: libavcodec copies it onto that packet's frame
+/// (`ff_decode_frame_props_from_pkt`, decode.c:1553-1565) and trims that
+/// frame by it (`discard_samples`, decode.c:322-420), and no frame comes of
+/// a packet with no body (`boundary::carry_of`). An AAC stream of FFmpeg's
+/// own encoder with a packet with no body in its middle carrying a skip of
+/// 512 samples from its start: the session hears every frame as the
+/// straight decode of the stream without it, and the notice names the skip.
+/// Carried onto the next packet, as R20 carried every type, the 512 samples
+/// were cut from that packet's frame.
+#[test]
+fn a_skip_of_samples_a_packet_with_no_body_carries_is_dropped_not_carried() {
+  use ffmpeg_next::{ChannelLayout, codec::Id};
+  const SKIP_SAMPLES: i32 = ffmpeg_next::ffi::AVPacketSideDataType::AV_PKT_DATA_SKIP_SAMPLES as i32;
+  let whole = encode(Id::AAC, 44_100, ChannelLayout::MONO, 12);
+  let (reference, errors) = session_hears(&whole, |_, _| {});
+  assert!(errors.is_empty(), "the straight decode: {errors:?}");
+  let mut skip = 512u32.to_le_bytes().to_vec();
+  skip.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+  let mut packets = whole.packets.clone();
+  let middle = packets.len() / 2;
+  packets.insert(
+    middle,
+    with_side_data(ffmpeg_next::Packet::empty(), SKIP_SAMPLES, &skip),
+  );
+  let clip = Clip {
+    parameters: whole.parameters.clone(),
+    packets,
+  };
+  let _ = crate::boundary::abandoned::take();
+  let mut deferred = None;
+  let (heard, errors) = session_hears(&clip, |index, dec| {
+    if index == middle + 1 {
+      deferred = Some(dec.deferred_kinds_for_test());
+    }
+  });
+  assert!(errors.is_empty(), "nothing refused: {errors:?}");
+  assert!(
+    heard == reference,
+    "every frame, as the straight decode of the stream without it: the fewest samples a frame \
+     held, {}, where the straight decode's held {}",
+    heard.iter().map(|frame| frame.2).min().unwrap_or_default(),
+    reference
+      .iter()
+      .map(|frame| frame.2)
+      .min()
+      .unwrap_or_default(),
+  );
+  assert_eq!(deferred, Some(Vec::new()), "nothing waits");
+  assert_eq!(
+    crate::boundary::abandoned::take(),
+    vec![(crate::boundary::Abandoned::Alone, vec![SKIP_SAMPLES])],
+    "the skip dropped, and said so"
+  );
+}

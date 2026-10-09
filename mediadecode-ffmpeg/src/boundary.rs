@@ -911,12 +911,20 @@ fn preflight(
 /// is no configuration. FFmpeg's H.264, HEVC and ADX decoders apply nothing
 /// for one (h264_parse.c:472-473; hevc/hevcdec.c:3855-3856;
 /// adxdec.c:173-175), and its AAC decoder drops its configuration for one
-/// and fails the packet (aac/aacdec.c:2580-2589, 1177-1182). Of every other
-/// type, the later in place of the earlier, the packet's own over what
-/// waits. A packet with no body that carries no side data is dropped, as
-/// ffmpeg's loop drops it. What is deferred and what the packet carries are
-/// each judged by the caps every packet is ([`check_side_data_budget`]);
-/// together they are at most twice them.
+/// and fails the packet (aac/aacdec.c:2580-2589, 1177-1182).
+///
+/// **Only what a decoder keeps as state is deferred** ([`carry_of`]): a new
+/// extradata, a parameter change, a palette, a Dolby Vision configuration —
+/// each folded as its type folds ([`Fold`]). Side data that describes the
+/// packet it rides alone — a skip of its samples, its captions, a cue's
+/// settings, how to decrypt it, what libavcodec copies onto the picture
+/// decoded from it — or that no decoder reads from a packet, and a type
+/// this table does not know, is dropped, and said so: no picture or sample
+/// comes of a packet with no body, and riding another packet it would
+/// describe that one. A packet with no body that carries no side data is
+/// dropped silently, as ffmpeg's loop drops it. What is deferred and what
+/// the packet carries are each judged by the caps every packet is
+/// ([`check_side_data_budget`]); together they are at most twice them.
 ///
 /// **What becomes of it is what the session reads of the packet it rides**
 /// ([`Disposition`]), where it forms its answer. Spent where a decoder took
@@ -969,7 +977,7 @@ pub(crate) enum Record<'a> {
   /// Of whole records, the later that has bytes: the audio and subtitle
   /// roads. FFmpeg's AAC and ADX decoders read a record as the whole of
   /// their configuration (`aac_decode_frame`, aac/aacdec.c:2580-2589;
-  /// `adx_decode_frame`, adxdec.c:173-189); no subtitle decoder of FFmpeg's
+  /// `adx_decode_frame`, adxdec.c:173-190); no subtitle decoder of FFmpeg's
   /// reads one.
   Whole,
   /// The session's own fold: for a packet with no body, the record that
@@ -978,27 +986,219 @@ pub(crate) enum Record<'a> {
   Folded(Option<&'a [u8]>),
 }
 
+/// **What becomes of an entry of side data a packet with no body carries**,
+/// by its type ([`carry_of`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Carry {
+  /// State a decoder keeps from the packet that brings it on: deferred onto
+  /// the next packet with a body, which brings it on there, folded into what
+  /// waits of its type as the [`Fold`] says.
+  Deferred(Fold),
+  /// The packet's own — what describes it alone — or what no decoder reads
+  /// from a packet: dropped, and said so. No picture or sample comes of a
+  /// packet with no body, and riding another packet it would describe that
+  /// one.
+  Dropped,
+}
+
+/// How what waits of a deferred type folds with an entry of it that comes
+/// later ([`Carry::Deferred`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Fold {
+  /// `AV_PKT_DATA_NEW_EXTRADATA`: as the road folds it ([`Record`]).
+  Record,
+  /// `AV_PKT_DATA_PARAM_CHANGE`: field by field, as `apply_param_change`
+  /// applies them, the later's fields over the earlier's ([`ParamChange`]).
+  Fields,
+  /// The later whole entry, where it has bytes: the state it brings is the
+  /// whole of what its type holds.
+  Whole,
+}
+
+/// **The carry table: what becomes of a type of side data a packet with no
+/// body carries**, by FFmpeg 9.0.1's numbering (libavcodec/packet.h:41-395).
+///
+/// **Deferred** — state a decoder keeps from the packet that brings it on:
+/// - 0 `PALETTE`, the later whole: the palette the palettized decoders keep
+///   for every picture after it — `ff_copy_palette` (decode.c:2321-2333)
+///   into their own (8bps.c:117, msrle.c:99, cinepak.c:478-480 and twelve
+///   more), mscc.c:182-194, bethsoftvideo.c:91-98.
+/// - 1 `NEW_EXTRADATA`, as the road folds it ([`Record`]): h264dec.c:1038-1044,
+///   hevc/hevcdec.c:3855-3860, aac/aacdec.c:2580-2589, adxdec.c:173-190,
+///   audiotoolboxdec.c:497-511.
+/// - 2 `PARAM_CHANGE`, field by field: `apply_param_change` sets the
+///   context's sample rate and dimensions at every packet a decoder pulls
+///   (decode.c:117-176, 244); Interplay video drops its reference pictures
+///   at one (interplayvideo.c:1201-1206).
+/// - 29 `DOVI_CONF`, the later whole: FFmpeg's HEVC decoder keeps it as its
+///   Dolby Vision configuration (hevc/hevcdec.c:3862-3870).
+///
+/// **Dropped** — the packet's own, or read by no decoder:
+/// - copied onto the frame decoded from the packet, and no frame comes of
+///   one with no body (`ff_decode_frame_props_from_pkt`,
+///   decode.c:1550-1596; `side_data_map`, 1492-1535): 4 `REPLAYGAIN`, 5
+///   `DISPLAYMATRIX`, 6 `STEREO3D`, 7 `AUDIO_SERVICE_TYPE`, 20
+///   `MASTERING_DISPLAY_METADATA`, 21 `SPHERICAL`, 22 `CONTENT_LIGHT_LEVEL`,
+///   28 `ICC_PROFILE`, 35 `AMBIENT_VIEWING_ENVIRONMENT`, 38
+///   `3D_REFERENCE_DISPLAYS`, 40 `EXIF` (`ff_sd_global_map`,
+///   avcodec.c:57-70); 11 `SKIP_SAMPLES` — the trim of that packet's
+///   samples (`discard_samples`, decode.c:322-420) — 23 `A53_CC`, 26 `AFD`,
+///   30 `S12M_TIMECODE`, 31 `DYNAMIC_HDR10_PLUS`, 32
+///   `IAMF_MIX_GAIN_PARAM`, 33 `IAMF_DEMIXING_INFO_PARAM`, 34
+///   `IAMF_RECON_GAIN_INFO_PARAM`, 37 `LCEVC`, 41
+///   `DYNAMIC_HDR_SMPTE_2094_APP5` (decode.c:1553-1565); 13
+///   `STRINGS_METADATA`, the frame's metadata (decode.c:1538-1547);
+/// - read by a decoder as its packet's alone: 12 `JP_DUALMONO`, reset at
+///   every packet (aac/aacdec.c:2591-2595); 14 `SUBTITLE_POSITION`, that
+///   event's (srtdec.c:65-73); 15 `MATROSKA_BLOCKADDITIONAL`, that picture's
+///   alpha (libvpxdec.c:248-255);
+/// - read by no decoder of FFmpeg's from a packet: 3 `H263_MB_INFO`, 8
+///   `QUALITY_STATS`, 9 `FALLBACK_TRACK`, 10 `CPB_PROPERTIES`, 16
+///   `WEBVTT_IDENTIFIER` and 17 `WEBVTT_SETTINGS` (a cue's own), 18
+///   `METADATA_UPDATE`, 19 `MPEGTS_STREAM_ID`, 24 `ENCRYPTION_INIT_INFO` and
+///   25 `ENCRYPTION_INFO` (how to decrypt that sample), 27 `PRFT`, 36
+///   `FRAME_CROPPING`, 39 `RTCP_SR`, 42 `HEVC_CONF`;
+/// - a type FFmpeg 9.0.1 does not name — past this table, or past this
+///   build's own numbering — whatever it is.
+///
+/// Only the four deferred types are named here, all of them older than this
+/// crate's FFmpeg floor; every other number falls to the drop.
+pub(crate) const fn carry_of(kind: i32) -> Carry {
+  use ffmpeg_next::ffi::AVPacketSideDataType as Type;
+  const PALETTE: i32 = Type::AV_PKT_DATA_PALETTE as i32;
+  const PARAM_CHANGE: i32 = Type::AV_PKT_DATA_PARAM_CHANGE as i32;
+  const DOVI_CONF: i32 = Type::AV_PKT_DATA_DOVI_CONF as i32;
+  match kind {
+    NEW_EXTRADATA => Carry::Deferred(Fold::Record),
+    PARAM_CHANGE => Carry::Deferred(Fold::Fields),
+    PALETTE | DOVI_CONF => Carry::Deferred(Fold::Whole),
+    _ => Carry::Dropped,
+  }
+}
+
+/// **What `apply_param_change` applies of an `AV_PKT_DATA_PARAM_CHANGE`
+/// entry** (decode.c:117-176) — the sample rate, then the dimensions, as far
+/// as its reading goes: nothing where the entry is under four bytes; no
+/// field once one is short, and none after a sample rate out of range
+/// (decode.c:142-153); the dimensions as read, which `ff_set_dimensions`
+/// judges where the decoder applies them (utils.c:91-104). FFmpeg 9 reads no
+/// other field (packet.h:59-69, 672-673), and only a decoder with
+/// `AV_CODEC_CAP_PARAM_CHANGE` applies any (decode.c:129-134), which a folded
+/// entry leaves as it was: still present, Interplay video still resets at it
+/// (interplayvideo.c:1201-1206).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ParamChange {
+  sample_rate: Option<u32>,
+  dimensions: Option<(u32, u32)>,
+}
+
+impl ParamChange {
+  /// `AV_SIDE_DATA_PARAM_CHANGE_SAMPLE_RATE` (packet.h:672).
+  const SAMPLE_RATE: u32 = 0x0004;
+  /// `AV_SIDE_DATA_PARAM_CHANGE_DIMENSIONS` (packet.h:673).
+  const DIMENSIONS: u32 = 0x0008;
+
+  /// The fields `entry` applies.
+  fn read(entry: &[u8]) -> Self {
+    let le32 = |at: usize| {
+      entry
+        .get(at..at + 4)
+        .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    };
+    let mut read = Self::default();
+    let Some(flags) = le32(0) else {
+      return read;
+    };
+    let mut at = 4;
+    if flags & Self::SAMPLE_RATE != 0 {
+      match le32(at) {
+        Some(rate) if rate > 0 && rate <= i32::MAX as u32 => read.sample_rate = Some(rate),
+        _ => return read,
+      }
+      at += 4;
+    }
+    if flags & Self::DIMENSIONS != 0
+      && let (Some(width), Some(height)) = (le32(at), le32(at + 4))
+    {
+      read.dimensions = Some((width, height));
+    }
+    read
+  }
+
+  /// These fields, then `later`'s over them.
+  fn then(self, later: Self) -> Self {
+    Self {
+      sample_rate: later.sample_rate.or(self.sample_rate),
+      dimensions: later.dimensions.or(self.dimensions),
+    }
+  }
+
+  /// An entry `apply_param_change` reads as these fields.
+  fn bytes(self) -> Vec<u8> {
+    let mut flags = 0u32;
+    let mut fields = Vec::new();
+    if let Some(rate) = self.sample_rate {
+      flags |= Self::SAMPLE_RATE;
+      fields.extend_from_slice(&rate.to_le_bytes());
+    }
+    if let Some((width, height)) = self.dimensions {
+      flags |= Self::DIMENSIONS;
+      fields.extend_from_slice(&width.to_le_bytes());
+      fields.extend_from_slice(&height.to_le_bytes());
+    }
+    [&flags.to_le_bytes()[..], &fields[..]].concat()
+  }
+}
+
+/// The `AV_PKT_DATA_PARAM_CHANGE` entry that applies what `earlier` then
+/// `later` apply ([`ParamChange`]).
+fn fold_fields(
+  earlier: &SideDataEntry,
+  later: &SideDataEntry,
+) -> Result<SideDataEntry, PacketBuildError> {
+  let fields = ParamChange::read(earlier.data()).then(ParamChange::read(later.data()));
+  Ok(SideDataEntry::new(
+    later.kind(),
+    FfmpegBytes::try_copy_from_slice(&fields.bytes()).ok_or_else(out_of_memory)?,
+  ))
+}
+
+/// The `AV_PKT_DATA_PARAM_CHANGE` entry that applies what `entry` applies,
+/// and no more ([`ParamChange`]).
+fn fold_fields_alone(entry: &SideDataEntry) -> Result<SideDataEntry, PacketBuildError> {
+  Ok(SideDataEntry::new(
+    entry.kind(),
+    FfmpegBytes::try_copy_from_slice(&ParamChange::read(entry.data()).bytes())
+      .ok_or_else(out_of_memory)?,
+  ))
+}
+
+/// **Says that side data a packet with no body carried was dropped**,
+/// naming its types ([`Carry::Dropped`]): it describes that packet alone, or
+/// no decoder reads it from a packet.
+fn dropped_alone(kinds: Vec<i32>) {
+  let at = Abandoned::Alone;
+  tracing::warn!(
+    ?kinds,
+    "mediadecode-ffmpeg: side data a packet with no body carried was dropped at {at}: it \
+     describes that packet alone, or no decoder reads it from a packet, and no picture or \
+     sample comes of a packet with no body; it is not carried onto the next packet",
+  );
+  #[cfg(test)]
+  abandoned::note(at, kinds);
+}
+
 impl Deferred {
   /// Defers a packet with no body's `side_data`: its new extradata as
-  /// `record` folds it, every other entry in place of a deferred one of its
-  /// type, the rest after. Refused, nothing deferred, where an entry names a
-  /// type this build does not, or what would be deferred passes the caps: it
-  /// could never be attached.
+  /// `record` folds it, every other type the table defers ([`carry_of`])
+  /// folded into what waits of it, and the rest dropped, and said so
+  /// ([`Carry::Dropped`]). Refused, nothing deferred, where what would be
+  /// deferred passes the caps: it could never be attached.
   fn defer(
     &mut self,
     side_data: &[SideDataEntry],
     record: Record<'_>,
   ) -> Result<(), PacketBuildError> {
-    let limit = crate::ffi::side_data_type_count();
-    if let Some(entry) = side_data
-      .iter()
-      .find(|entry| entry.kind() < 0 || entry.kind() >= limit)
-    {
-      return Err(PacketBuildError::UnknownSideData(UnknownSideData::new(
-        entry.kind(),
-        limit,
-      )));
-    }
     let record = match record {
       Record::Whole => record_of(side_data).or(self.record.as_ref()).cloned(),
       Record::Folded(Some(bytes)) => Some(SideDataEntry::new(
@@ -1012,13 +1212,26 @@ impl Deferred {
       .try_reserve_exact(self.entries.len() + side_data.len() + 1)
       .map_err(|_| out_of_memory())?;
     next.extend(self.entries.iter().cloned());
-    for entry in side_data
-      .iter()
-      .filter(|entry| entry.kind() != NEW_EXTRADATA)
-    {
-      match next.iter_mut().find(|held| held.kind() == entry.kind()) {
-        Some(held) => *held = entry.clone(),
-        None => next.push(entry.clone()),
+    let mut dropped: Vec<i32> = Vec::new();
+    for entry in side_data {
+      let fold = match carry_of(entry.kind()) {
+        Carry::Deferred(Fold::Record) => continue,
+        Carry::Deferred(fold) => fold,
+        Carry::Dropped => {
+          dropped.push(entry.kind());
+          continue;
+        }
+      };
+      let at = next.iter().position(|held| held.kind() == entry.kind());
+      match (fold, at) {
+        (Fold::Fields, Some(at)) => {
+          next[at] = fold_fields(&next[at], entry)?;
+        }
+        (Fold::Fields, None) => next.push(fold_fields_alone(entry)?),
+        // An entry of no bytes folds nothing.
+        (_, _) if entry.data().is_empty() => {}
+        (_, Some(at)) => next[at] = entry.clone(),
+        (_, None) => next.push(entry.clone()),
       }
     }
     // Judged with the record that would wait, then kept apart from it.
@@ -1029,13 +1242,17 @@ impl Deferred {
     }
     self.record = record;
     self.entries = next;
+    if !dropped.is_empty() {
+      dropped_alone(dropped);
+    }
     Ok(())
   }
 
   /// The side data a packet with a body carries: the new extradata `record`
   /// says it carries — what waits, where the packet carries none of its own
   /// with bytes, on [`Record::Whole`] — then what is deferred of every other
-  /// type the packet does not carry itself, then the packet's own, `own`.
+  /// type, folded with the packet's own of the type after it ([`Fold`]), then
+  /// the rest of the packet's own, `own`.
   fn onto<'a>(
     &self,
     own: &'a [SideDataEntry],
@@ -1056,19 +1273,33 @@ impl Deferred {
     carried
       .try_reserve_exact(self.entries.len() + own.len() + 1)
       .map_err(|_| out_of_memory())?;
-    let replaced = record.is_some();
-    carried.extend(record);
-    carried.extend(
-      self
-        .entries
-        .iter()
-        .filter(|deferred| !own.iter().any(|entry| entry.kind() == deferred.kind()))
-        .cloned(),
-    );
+    // The types of the packet's own entries that what is carried replaces.
+    let mut replaced: Vec<i32> = Vec::new();
+    if let Some(record) = record {
+      carried.push(record);
+      replaced.push(NEW_EXTRADATA);
+    }
+    for deferred in &self.entries {
+      let kind = deferred.kind();
+      let theirs = own.iter().rev().find(|entry| entry.kind() == kind);
+      match (carry_of(kind), theirs) {
+        (Carry::Deferred(Fold::Fields), Some(theirs)) => {
+          carried.push(fold_fields(deferred, theirs)?);
+          replaced.push(kind);
+        }
+        // The packet's own, the later, where it has bytes.
+        (_, Some(theirs)) if !theirs.data().is_empty() => {}
+        (_, Some(_)) => {
+          carried.push(deferred.clone());
+          replaced.push(kind);
+        }
+        (_, None) => carried.push(deferred.clone()),
+      }
+    }
     carried.extend(
       own
         .iter()
-        .filter(|entry| !replaced || entry.kind() != NEW_EXTRADATA)
+        .filter(|entry| !replaced.contains(&entry.kind()))
         .cloned(),
     );
     Ok(std::borrow::Cow::Owned(carried))
@@ -1116,8 +1347,9 @@ impl Deferred {
   }
 }
 
-/// Where side data deferred from a packet with no body was dropped, no
-/// packet left to carry it ([`Deferred::abandon`]).
+/// Where side data a packet with no body carried was dropped, no packet left
+/// to carry it ([`Deferred::abandon`]), or none to carry it to
+/// ([`Carry::Dropped`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Abandoned {
   /// The end of the stream, taken: no packet comes after it.
@@ -1125,6 +1357,9 @@ pub(crate) enum Abandoned {
   /// A flush: the caller abandons the position, and the packet the side
   /// data waited for with it.
   Flush,
+  /// The packet with no body itself: what it carried describes it alone, or
+  /// no decoder reads it from a packet.
+  Alone,
 }
 
 impl core::fmt::Display for Abandoned {
@@ -1132,6 +1367,7 @@ impl core::fmt::Display for Abandoned {
     f.write_str(match self {
       Self::End => "the end of the stream",
       Self::Flush => "a flush",
+      Self::Alone => "the packet with no body it describes",
     })
   }
 }
@@ -3572,13 +3808,15 @@ mod tests {
   /// LAW (R20 row 1; Codex R19 [high]): **a packet with no body is never
   /// submitted; its side data rides the next packet with one, on every
   /// family's road.** No decoder reads a packet with no body as a packet
-  /// (`Deferred`). A packet with no body carrying a record and a display
-  /// matrix, then one carrying a second record, then one carrying nothing:
-  /// none submitted, the second record in the first's place, the matrix
-  /// kept, nothing for the third. The next packet with a body, carrying its
-  /// own matrix, is lent to the decoder's road carrying the second record in
-  /// front of its own matrix; answered back pressure, it carries both again
-  /// when offered again; taken, nothing waits. A packet refused before the
+  /// (`Deferred`). A packet with no body carrying a record, a Dolby Vision
+  /// configuration and a display matrix, then one carrying a second record,
+  /// then one carrying nothing: none submitted, the second record in the
+  /// first's place, the configuration kept, the matrix dropped and said so
+  /// (R21 row 4, `carry_of`), nothing for the third. The next packet with a
+  /// body, carrying its own configuration, is lent to the decoder's road
+  /// carrying the second record in front of its own configuration; answered
+  /// back pressure, it carries both again when offered again; taken, nothing
+  /// waits. A packet refused before the
   /// merge — its body over the budget — leaves what waits for the next, and
   /// so does one the decoder's road refused before any decoder saw it
   /// (`Disposition::Untaken`); one whose read cannot be told spends it
@@ -3588,6 +3826,7 @@ mod tests {
   #[test]
   fn a_packet_with_no_body_is_never_submitted_and_its_side_data_rides_the_next() {
     const MATRIX: i32 = AVPacketSideDataType::AV_PKT_DATA_DISPLAYMATRIX as i32;
+    const DOVI: i32 = AVPacketSideDataType::AV_PKT_DATA_DOVI_CONF as i32;
     let limits = PacketLimits::default();
     let video = |body: &[u8], side_data: Vec<SideDataEntry>| {
       VideoPacket::new(
@@ -3607,6 +3846,7 @@ mod tests {
     );
 
     let mut deferred = Deferred::default();
+    let _ = abandoned::take();
     let offer = |deferred: &mut Deferred, packet, disposition: Disposition| {
       let mut lent = None;
       let answer = with_ffmpeg_video_packet::<crate::Owned, _>(
@@ -3628,7 +3868,11 @@ mod tests {
     for packet in [
       video(
         &[],
-        vec![entry(NEW_EXTRADATA, &[1, 2, 3, 4]), entry(MATRIX, &[7])],
+        vec![
+          entry(NEW_EXTRADATA, &[1, 2, 3, 4]),
+          entry(DOVI, &[7]),
+          entry(MATRIX, &[9]),
+        ],
       ),
       video(&[], vec![entry(NEW_EXTRADATA, &[5, 6])]),
       video(&[], Vec::new()),
@@ -3646,21 +3890,26 @@ mod tests {
         .chain(&deferred.entries)
         .map(|e| (e.kind(), e.data().to_vec()))
         .collect::<Vec<_>>(),
-      vec![(NEW_EXTRADATA, vec![5, 6]), (MATRIX, vec![7])],
-      "the later record in the earlier's place, the matrix kept"
+      vec![(NEW_EXTRADATA, vec![5, 6]), (DOVI, vec![7])],
+      "the later record in the earlier's place, the configuration kept"
     );
-    let with_body = || video(&[9, 9, 9], vec![entry(MATRIX, &[8])]);
-    let expected = vec![(NEW_EXTRADATA, vec![5, 6]), (MATRIX, vec![8])];
+    assert_eq!(
+      abandoned::take(),
+      vec![(Abandoned::Alone, vec![MATRIX])],
+      "the matrix dropped, and said so"
+    );
+    let with_body = || video(&[9, 9, 9], vec![entry(DOVI, &[8])]);
+    let expected = vec![(NEW_EXTRADATA, vec![5, 6]), (DOVI, vec![8])];
     let (answer, lent) = offer(&mut deferred, with_body(), Disposition::Untaken);
     assert!(matches!(answer, Ok(false)));
     assert_eq!(
       lent.as_ref(),
       Some(&expected),
-      "the record rides the next packet, the packet's own matrix the later"
+      "the record rides the next packet, the packet's own configuration the later"
     );
     assert_eq!(
       deferred.kinds(),
-      vec![NEW_EXTRADATA, MATRIX],
+      vec![NEW_EXTRADATA, DOVI],
       "back pressure: kept"
     );
     let (_, lent) = offer(&mut deferred, with_body(), Disposition::Taken);
@@ -3697,7 +3946,7 @@ mod tests {
     let (_, lent) = offer(&mut deferred, with_body(), Disposition::Untaken);
     assert_eq!(
       lent,
-      Some(vec![(NEW_EXTRADATA, vec![1]), (MATRIX, vec![8])]),
+      Some(vec![(NEW_EXTRADATA, vec![1]), (DOVI, vec![8])]),
       "carried by the refused packet"
     );
     assert_eq!(
@@ -3709,14 +3958,14 @@ mod tests {
     let (_, lent) = offer(&mut deferred, with_body(), Disposition::Unknown);
     assert_eq!(
       lent,
-      Some(vec![(NEW_EXTRADATA, vec![1]), (MATRIX, vec![8])]),
+      Some(vec![(NEW_EXTRADATA, vec![1]), (DOVI, vec![8])]),
       "carried by the packet whose read is unknown"
     );
     assert!(deferred.kinds().is_empty(), "unknown: spent");
     let (_, lent) = offer(&mut deferred, with_body(), Disposition::Taken);
     assert_eq!(
       lent,
-      Some(vec![(MATRIX, vec![8])]),
+      Some(vec![(DOVI, vec![8])]),
       "the packet after it carries its own alone"
     );
     let (answer, _) = offer(
@@ -3905,6 +4154,181 @@ mod tests {
       ),
       Some(vec![(NEW_EXTRADATA, vec![6])]),
       "the packet's own, as it is"
+    );
+  }
+
+  /// LAW (R21 row 4; Codex R20 [medium]): **of the side data a packet with no
+  /// body carries, the state a decoder keeps is deferred, folded by its
+  /// type, and the rest dropped and said so** (`carry_of`). Every type this
+  /// build numbers, and one past it, read by the table: deferred exactly
+  /// `PALETTE` and `DOVI_CONF` (the later whole), `NEW_EXTRADATA` (as the
+  /// road folds it) and `PARAM_CHANGE` (field by field). A palette, a
+  /// parameter change setting a sample rate and a configuration, then a
+  /// second palette, a parameter change setting dimensions and a
+  /// configuration of no bytes: the later palette waits, one parameter
+  /// change applying both fields, the first configuration; the packet with a
+  /// body whose own parameter change sets another sample rate carries one
+  /// applying it and the dimensions. A skip of samples, captions, an active
+  /// format, a cue's identifier and settings, how to decrypt, a display
+  /// matrix and a type no FFmpeg names: nothing waits, and the notice names
+  /// every one. `apply_param_change`'s reading, mirrored: nothing past a
+  /// short field or a sample rate out of range, no other flag read.
+  #[test]
+  fn the_carry_table_defers_state_and_drops_what_describes_a_packet_alone() {
+    use AVPacketSideDataType as Type;
+    let limits = PacketLimits::default();
+    let count = crate::ffi::side_data_type_count();
+    let deferred_types: Vec<(i32, Fold)> = (-1..count + 2)
+      .filter_map(|kind| match carry_of(kind) {
+        Carry::Deferred(fold) => Some((kind, fold)),
+        Carry::Dropped => None,
+      })
+      .collect();
+    assert_eq!(
+      deferred_types,
+      vec![
+        (Type::AV_PKT_DATA_PALETTE as i32, Fold::Whole),
+        (NEW_EXTRADATA, Fold::Record),
+        (Type::AV_PKT_DATA_PARAM_CHANGE as i32, Fold::Fields),
+        (Type::AV_PKT_DATA_DOVI_CONF as i32, Fold::Whole),
+      ],
+      "the four types FFmpeg 9.0.1 keeps as state, and no other"
+    );
+
+    let video = |body: &[u8], side_data: Vec<SideDataEntry>| {
+      VideoPacket::new(
+        FfmpegBytes::copy_from_slice(body),
+        VideoPacketExtra::new(0).with_side_data(side_data),
+      )
+    };
+    let offer = |deferred: &mut Deferred, packet| {
+      let mut lent = None;
+      with_ffmpeg_video_packet::<crate::Owned, _>(
+        &packet,
+        limits,
+        BodyRoute::Submission,
+        deferred,
+        Record::Whole,
+        |av| {
+          lent = Some(carried(av));
+          ((), Disposition::Taken)
+        },
+      )
+      .expect("taken");
+      lent
+    };
+    let param_change = |flags: u32, fields: &[u32]| {
+      let mut bytes = flags.to_le_bytes().to_vec();
+      for field in fields {
+        bytes.extend_from_slice(&field.to_le_bytes());
+      }
+      bytes
+    };
+    let (palette, param, dovi) = (
+      Type::AV_PKT_DATA_PALETTE as i32,
+      Type::AV_PKT_DATA_PARAM_CHANGE as i32,
+      Type::AV_PKT_DATA_DOVI_CONF as i32,
+    );
+    let (rate, dimensions) = (ParamChange::SAMPLE_RATE, ParamChange::DIMENSIONS);
+
+    // State: deferred, folded by its type.
+    let mut deferred = Deferred::default();
+    let _ = abandoned::take();
+    offer(
+      &mut deferred,
+      video(
+        &[],
+        vec![
+          entry(palette, &[1; 1024]),
+          entry(param, &param_change(rate, &[44_100])),
+          entry(dovi, &[5; 24]),
+        ],
+      ),
+    );
+    offer(
+      &mut deferred,
+      video(
+        &[],
+        vec![
+          entry(palette, &[2; 1024]),
+          entry(param, &param_change(dimensions, &[640, 480])),
+          entry(dovi, &[]),
+        ],
+      ),
+    );
+    assert!(abandoned::take().is_empty(), "nothing dropped");
+    let carried_by = offer(
+      &mut deferred,
+      video(&[9], vec![entry(param, &param_change(rate, &[48_000]))]),
+    )
+    .expect("a packet with a body is lent");
+    assert_eq!(
+      carried_by,
+      vec![
+        (palette, vec![2; 1024]),
+        (param, param_change(rate | dimensions, &[48_000, 640, 480])),
+        (dovi, vec![5; 24]),
+      ],
+      "the later palette, one parameter change applying every field, the first configuration"
+    );
+
+    // What describes a packet alone, and a type no FFmpeg names: dropped,
+    // and said so.
+    let alone: Vec<i32> = [
+      Type::AV_PKT_DATA_SKIP_SAMPLES,
+      Type::AV_PKT_DATA_A53_CC,
+      Type::AV_PKT_DATA_AFD,
+      Type::AV_PKT_DATA_WEBVTT_IDENTIFIER,
+      Type::AV_PKT_DATA_WEBVTT_SETTINGS,
+      Type::AV_PKT_DATA_ENCRYPTION_INIT_INFO,
+      Type::AV_PKT_DATA_ENCRYPTION_INFO,
+      Type::AV_PKT_DATA_DISPLAYMATRIX,
+    ]
+    .into_iter()
+    .map(|kind| kind as i32)
+    .chain([count + 1])
+    .collect();
+    let mut deferred = Deferred::default();
+    let answer = offer(
+      &mut deferred,
+      video(&[], alone.iter().map(|&kind| entry(kind, &[3])).collect()),
+    );
+    assert!(answer.is_none(), "not submitted");
+    assert!(deferred.kinds().is_empty(), "nothing waits");
+    assert_eq!(
+      abandoned::take(),
+      vec![(Abandoned::Alone, alone.clone())],
+      "every one named"
+    );
+    assert_eq!(
+      offer(&mut deferred, video(&[9], Vec::new())),
+      Some(Vec::new()),
+      "the packet after it carries none of it"
+    );
+
+    // `apply_param_change`'s reading.
+    let read = |bytes: &[u8]| ParamChange::read(bytes);
+    assert_eq!(read(&[4, 0, 0]), ParamChange::default(), "under four bytes");
+    assert_eq!(
+      read(&param_change(rate | dimensions, &[0, 640, 480])),
+      ParamChange::default(),
+      "a sample rate out of range, and nothing after it"
+    );
+    assert_eq!(
+      read(&param_change(rate | dimensions, &[44_100, 640])),
+      ParamChange {
+        sample_rate: Some(44_100),
+        dimensions: None
+      },
+      "dimensions cut short"
+    );
+    assert_eq!(
+      read(&param_change(0x3 | dimensions, &[640, 480])),
+      ParamChange {
+        sample_rate: None,
+        dimensions: Some((640, 480))
+      },
+      "no other flag read"
     );
   }
 
