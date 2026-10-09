@@ -301,8 +301,10 @@ pub struct CarrierVideoStreamDecoder<C: crate::FfmpegCarrier> {
   /// them ([`held::Held`]): every set of every record it applied and every
   /// set a packet it took carried in band, by id, and its framing — what a
   /// decoder opened fresh must hold too ([`Self::opening`]). Updated where a
-  /// decoder may have taken a packet ([`Self::commit_sets`]); a set whose
-  /// reading cannot be told is held in doubt.
+  /// decoder may have taken a packet ([`Self::commit_sets`]), and by a
+  /// fallback's replay as it feeds each packet, never by a packet it has not
+  /// fed ([`replay_history`]); a set whose reading cannot be told is held in
+  /// doubt.
   held: held::Held,
   /// What the decoder serving held when it was last seen to read every
   /// packet it took — `None` while it is seen to have — kept while sets
@@ -1796,7 +1798,8 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     )?;
     let mut local_replay = ReplayQueue::default();
     let mut local_refusals = Refusals::default();
-    let mut progress = Replay::default();
+    // The decoder opened holds what the opening gives it, read at the open.
+    let mut progress = Replay::holding(opening.held, None);
     let drained = replay_history(
       &mut sw,
       unconsumed_packets,
@@ -1823,20 +1826,13 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     if let Some(parameters) = opening.parameters {
       self.parameters = parameters;
     }
-    // The replay's decoder holds what it started from with the history read
-    // again — what the hardware refused, and left in doubt, is not in it;
-    // until it is seen to have read all of it, what it started from is what
-    // it is known to hold.
-    let mut replayed = opening.held.clone();
-    for pkt in unconsumed_packets {
-      if let Some(next) = replayed.after_packet(new_extradata(pkt), pkt.data()) {
-        replayed = next;
-      }
-    }
-    self.held = replayed;
+    // The replay's decoder holds what it started from with the packets it
+    // fed read again, each as the live road reads it — what the hardware
+    // refused, and left in doubt, is not in it, nor is what the packets the
+    // budget left unfed carry, until a later round feeds them.
+    self.held = core::mem::take(&mut progress.held);
+    self.held_proven = progress.held_proven.take();
     self.held_base = None;
-    let read_all = progress.fed == unconsumed_packets.len() && drained == Drained::Empty && in_step;
-    self.held_proven = (!read_all).then(|| Box::new(opening.held));
     let installed = match progress.extradata.take() {
       Some(extradata) => {
         extradata.install(&mut self.parameters);
@@ -1892,7 +1888,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       return Ok(true);
     };
     let in_step = sw.decodes_in_step();
-    let mut progress = Replay::default();
+    // The round moves what the decoder holds packet by packet, as far as it
+    // feeds.
+    let mut progress = Replay::holding(core::mem::take(&mut self.held), self.held_proven.take());
     let replayed = replay_history(
       sw,
       self.pending_history.make_contiguous(),
@@ -1903,6 +1901,8 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       &mut progress,
       &mut self.refusals,
     );
+    self.held = core::mem::take(&mut progress.held);
+    self.held_proven = progress.held_proven.take();
     self.pending_history.drain(..progress.fed);
     // A packet the decoder took, the failing one among them where its
     // refusal says the decoder decoded it: its new extradata, if it carried
@@ -1914,11 +1914,14 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     // it is no longer the unread packet's. A failing one whose refusal does
     // not say — a decode error among them — leaves it unknown, as does an
     // error the round met while one was provisional.
+    // The proof is the extradata's alone: the sets the round's packets carry
+    // were followed packet by packet, and a packet the round took last may
+    // still be unread.
     let read = progress.read || (matches!(replayed, Ok(Drained::Empty)) && in_step);
     if let Some(extradata) = progress.extradata.take() {
       self.took_extradata(extradata, false, read);
     } else if read {
-      self.extradata_read();
+      self.extradata_provisional = false;
     }
     if let Some(doubt) = progress.unknown {
       self.extradata_in_doubt(doubt);
@@ -2133,15 +2136,17 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// drain ([`Self::deferred_error`]), and this send answers `MustDrain`
   /// with the packet still the caller's.
   ///
-  /// `sets`, what the packet's parameter sets say ([`Self::sets_of`]), are
-  /// the session's once the decoder may have taken the packet — it took it,
-  /// or refused it with an error that does not say it refused it before its
-  /// queue — and never where the packet went back to the caller untaken.
+  /// The packet is read once what the replay owed is fed, against what the
+  /// decoder holds then: a body it would read as a record it would not apply
+  /// whole is refused by name ([`Self::refuse_record_body`]), and what its
+  /// parameter sets say ([`Self::sets_of`]) is the session's once the
+  /// decoder may have taken it — it took it, or refused it with an error
+  /// that does not say it refused it before its queue — and never where the
+  /// packet went back to the caller untaken.
   fn send_on_software(
     &mut self,
     pkt: &Packet,
     phase: crate::decoder::SessionPhase,
-    sets: Sets,
   ) -> Result<Sent, VideoDecodeError> {
     // An error the drain has not reported yet comes before anything more.
     if self.deferred_error.is_some() {
@@ -2166,6 +2171,12 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
         return Ok(Sent::MustDrain);
       }
     }
+    // The packet comes after every packet the replay fed: it is read against
+    // what the decoder holds once it has read them.
+    self
+      .refuse_record_body(pkt)
+      .map_err(VideoDecodeError::Decode)?;
+    let sets = self.sets_of(pkt);
     // The extradata this packet carries, copied before anything of the
     // session moves: it becomes the active extradata once the decoder takes
     // the packet — or once a decoder opened on it for the packet serves
@@ -2581,19 +2592,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// ([`Self::held_proven`]); read, as they are; whether it read it unknown,
   /// every set the packet changed in doubt.
   fn commit_sets(&mut self, sets: Sets, commit: Commit) {
-    if let Some(next) = sets.held {
-      let mut next = *next;
-      match commit {
-        Commit::Taken => {
-          if self.held_proven.is_none() {
-            self.held_proven = Some(Box::new(self.held.clone()));
-          }
-        }
-        Commit::Read => {}
-        Commit::Doubt => next.doubt_since(&self.held),
-      }
-      self.held = next;
-    }
+    follow(&mut self.held, &mut self.held_proven, sets.held, commit);
     if sets.aso && !self.h264_aso {
       self.h264_aso = true;
       tracing::warn!(
@@ -2833,9 +2832,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// what it had not read: every set that differs from what it held when it
   /// was last seen to read every packet ([`Self::held_proven`]) is in doubt.
   fn held_doubt(&mut self) {
-    if let Some(proven) = self.held_proven.take() {
-      self.held.doubt_since(&proven);
-    }
+    doubt_unread(&mut self.held, &mut self.held_proven);
   }
 
   /// **A decode error the software decoder serving answered a receive with**,
@@ -3784,28 +3781,29 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     }
     boundary::with_ffmpeg_video_packet::<C, _>(packet, limits, route, |av_pkt| {
       self.note_output_alpha();
+      // The software road reads the packet once what a fallback's replay owes
+      // the decoder is fed ([`Self::send_on_software`]).
+      if !matches!(self.state, DecodeState::Hw(_)) {
+        return self.send_on_software(av_pkt, phase);
+      }
       // A body the decoder would read as a record it would not apply whole is
-      // refused before any road takes the packet.
+      // refused before the hardware takes the packet.
       self
         .refuse_record_body(av_pkt)
         .map_err(VideoDecodeError::Decode)?;
-      // What the packet's parameter sets say of the stream, read before any
-      // road takes it and the session's only once a decoder may have taken
-      // it ([`Self::commit_sets`]).
+      // What the packet's parameter sets say of the stream, read before the
+      // hardware takes it and the session's only once a decoder may have
+      // taken it ([`Self::commit_sets`]).
       let sets = self.sets_of(av_pkt);
-      // The extradata a packet for the hardware carries, copied before it
-      // sees the packet: the stream's once it takes it.
-      let extradata = if matches!(self.state, DecodeState::Hw(_)) {
-        NewExtradata::of(
-          av_pkt,
-          &self.parameters,
-          self.limits.max_codec_parameter_bytes(),
-          Some(&self.held),
-        )
-        .map_err(VideoDecodeError::Decode)?
-      } else {
-        None
-      };
+      // The extradata the packet carries, copied before the hardware sees
+      // it: the stream's once it takes it.
+      let extradata = NewExtradata::of(
+        av_pkt,
+        &self.parameters,
+        self.limits.max_codec_parameter_bytes(),
+        Some(&self.held),
+      )
+      .map_err(VideoDecodeError::Decode)?;
       match &mut self.state {
         DecodeState::Hw(hw) => match hw.send_packet(av_pkt) {
           // The seam already classified libavcodec's back pressure, so
@@ -3907,11 +3905,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
             // keyframe here is where the session's threads come back. A
             // failure surfaces (it is not silently dropped), and back pressure
             // is reported as such rather than mistaken for one: the fallback
-            // committed either way, and the caller re-offers the packet. Its
-            // sets are read against what the replay's decoder holds.
+            // committed either way, and the caller re-offers the packet. The
+            // software road reads it against what the replay's decoder holds.
             drop(sets);
-            let sets = self.sets_of(av_pkt);
-            self.send_on_software(av_pkt, phase, sets)
+            self.send_on_software(av_pkt, phase)
           }
           Err(other) => {
             // No refusal of the hardware's says it decoded this packet
@@ -3937,7 +3934,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
             Err(VideoDecodeError::Decode(other))
           }
         },
-        DecodeState::Sw(_) | DecodeState::SwClosed => self.send_on_software(av_pkt, phase, sets),
+        DecodeState::Sw(_) | DecodeState::SwClosed => {
+          drop((sets, extradata));
+          self.send_on_software(av_pkt, phase)
+        }
       }
     })
     .map_err(|e| VideoDecodeError::Decode(Error::PacketBuild(e)))?
@@ -4632,6 +4632,33 @@ struct Replay {
   /// packet, which carried a new extradata, where it does not say whether
   /// the decoder took the packet ([`Taken::Unknown`]).
   unknown: Option<crate::ExtradataDoubt>,
+  /// **What the decoder the replay feeds holds**, moved by each packet the
+  /// replay feeds as the live road moves it ([`follow`]): taken, read, or
+  /// refused with an error that does not say. A packet the budget left
+  /// unfed moves nothing: its sets are the decoder's only once a later round
+  /// feeds it, and a flush that drops it leaves none behind.
+  held: held::Held,
+  /// What that decoder held when it was last seen to read every packet the
+  /// replay fed it — `None` while it is seen to have: a later packet it
+  /// took in step, or a drain that found it with nothing left to decode.
+  held_proven: Option<Box<held::Held>>,
+}
+
+impl Replay {
+  /// A replay's progress, the decoder it feeds holding `held`, `proven`
+  /// what it was last seen to have read.
+  fn holding(held: held::Held, proven: Option<Box<held::Held>>) -> Self {
+    Self {
+      held,
+      held_proven: proven,
+      ..Self::default()
+    }
+  }
+
+  /// The decoder was seen to read every packet it took.
+  fn all_read(&mut self) {
+    self.held_proven = None;
+  }
 }
 
 /// How a drain into the queue stopped.
@@ -4686,15 +4713,30 @@ fn replay_history(
     // Judged against what the decoder held when the hardware took it, as the
     // replay's decoder holds it again: it is not judged twice.
     let extradata = NewExtradata::of(pkt, parameters, limits.max_codec_parameter_bytes(), None)?;
+    // What the decoder holds once it has read the packet, its own record
+    // first: the decoder's where it may have taken the packet, as the live
+    // road has it ([`follow`]).
+    let mut next = progress
+      .held
+      .after_packet(new_extradata(pkt), pkt.data())
+      .map(Box::new);
     let mut attempts: u32 = 0;
     loop {
       match sw.submit(pkt, refusals) {
         Ok(()) => {
           // Taken in step: every packet before it was read. Its own record,
-          // if it carries one, is read only once something says so.
+          // if it carries one, is read only once something says so; so are
+          // its sets.
           if in_step {
             progress.read = true;
+            progress.all_read();
           }
+          follow(
+            &mut progress.held,
+            &mut progress.held_proven,
+            next.take(),
+            Commit::Taken,
+          );
           if extradata.is_some() {
             progress.extradata = extradata;
             progress.read = false;
@@ -4702,8 +4744,13 @@ fn replay_history(
           break;
         }
         Err(ffmpeg_next::Error::Other { errno }) if errno == ffmpeg_next::error::EAGAIN => {
-          if drain_into(sw, queue, budget, refusals)? == Drained::Full {
+          let drained = drain_into(sw, queue, budget, refusals)?;
+          if drained == Drained::Full {
             return Ok(Drained::Full);
+          }
+          // Nothing left to decode, in step: every packet it took is read.
+          if in_step {
+            progress.all_read();
           }
           attempts += 1;
           if attempts > 16 {
@@ -4722,7 +4769,8 @@ fn replay_history(
           // decoder decoded it, the decoder read it and every packet before
           // it, and its new extradata is the replay's, read; where it does
           // not say — a decode error does not — the extradata is unknown.
-          match taken_despite(other, &error, in_step) {
+          let taken = taken_despite(other, &error, in_step);
+          match taken {
             Taken::Yes => {
               if extradata.is_some() {
                 progress.extradata = extradata;
@@ -4731,6 +4779,31 @@ fn replay_history(
             }
             Taken::Unknown(cause) if extradata.is_some() => progress.unknown = Some(cause),
             Taken::Unknown(_) | Taken::No => {}
+          }
+          // Its sets, as the live road reads a refused packet's: read where
+          // the refusal says the decoder decoded it, every set it changed in
+          // doubt where the refusal does not say — after every set an
+          // unread packet before it changed.
+          match taken {
+            Taken::Yes => {
+              progress.all_read();
+              follow(
+                &mut progress.held,
+                &mut progress.held_proven,
+                next.take(),
+                Commit::Read,
+              );
+            }
+            Taken::Unknown(_) => {
+              doubt_unread(&mut progress.held, &mut progress.held_proven);
+              follow(
+                &mut progress.held,
+                &mut progress.held_proven,
+                next.take(),
+                Commit::Doubt,
+              );
+            }
+            Taken::No => {}
           }
           return Err(error);
         }
@@ -4741,6 +4814,10 @@ fn replay_history(
     // picture parked here, after the last packet, is the answer too.
     if drain_into(sw, queue, budget, refusals)? == Drained::Full {
       return Ok(Drained::Full);
+    }
+    // Nothing left to decode, in step: the packet is read.
+    if in_step {
+      progress.all_read();
     }
   }
   // Re-forward EOF if the HW path already saw it. SW EOF can also
@@ -4768,6 +4845,9 @@ fn replay_history(
         Err(ffmpeg_next::Error::Other { errno }) if errno == ffmpeg_next::error::EAGAIN => {
           if drain_into(sw, queue, budget, refusals)? == Drained::Full {
             return Ok(Drained::Full);
+          }
+          if in_step {
+            progress.all_read();
           }
           attempts += 1;
           if attempts > 16 {
@@ -4798,7 +4878,11 @@ fn replay_history(
   // thread — see `fall_back_to_sw_inner`. A queue at its budget stops it, and
   // the answer says so: the pictures still in the decoder are owed to the
   // queue before the caller's next input is taken.
-  drain_into(sw, queue, budget, refusals)
+  let drained = drain_into(sw, queue, budget, refusals)?;
+  if drained == Drained::Empty && in_step {
+    progress.all_read();
+  }
+  Ok(drained)
 }
 
 /// Pulls the decoder's pictures into `queue` until it has none ready or the
@@ -5197,6 +5281,46 @@ enum Commit {
   Read,
   /// Whether it read the packet cannot be told: a refusal that does not say.
   Doubt,
+}
+
+/// **The sets a decoder holds, moved by a packet it may have taken**: `held`
+/// becomes `next`, what it holds once it has read the packet, where that
+/// changes anything, as `commit` says it read it — taken, `held` kept as
+/// `proven` until the decoder is seen to read it, where nothing unread came
+/// before it; read, as it is; whether it read it unknown, every set the
+/// packet changed in doubt. The one reading of a packet's sets, the live
+/// road's (`CarrierVideoStreamDecoder::commit_sets`) and a replay round's,
+/// packet by packet ([`replay_history`]).
+fn follow(
+  held: &mut held::Held,
+  proven: &mut Option<Box<held::Held>>,
+  next: Option<Box<held::Held>>,
+  commit: Commit,
+) {
+  let Some(next) = next else {
+    return;
+  };
+  let mut next = *next;
+  match commit {
+    Commit::Taken => {
+      if proven.is_none() {
+        *proven = Some(Box::new(held.clone()));
+      }
+    }
+    Commit::Read => {}
+    Commit::Doubt => next.doubt_since(held),
+  }
+  *held = next;
+}
+
+/// **Whether a decoder read the packets it took cannot be told any more** —
+/// an error that may be such a packet's, a flush that drops what it had not
+/// read: every set in `held` that differs from `proven`, what it held when
+/// it was last seen to read every packet, is in doubt.
+fn doubt_unread(held: &mut held::Held, proven: &mut Option<Box<held::Held>>) {
+  if let Some(proven) = proven.take() {
+    held.doubt_since(&proven);
+  }
 }
 
 /// Whether a decoder took a packet whose submission it refused, as far as

@@ -10960,3 +10960,112 @@ fn a_video_parameter_set_read_past_its_end_is_judged_against_the_sets_held_in_ba
     "a picture closes the gap: {delivered:?}"
   );
 }
+
+// ---------------------------------------------------------------------------
+//  R18 row 1: a replay holds the sets of the packets it fed, and no other
+// ---------------------------------------------------------------------------
+
+/// LAW (R18 row 1; Codex R17 [high]): **a replay round moves what the decoder
+/// holds by the packets it feeds, and no other: a flush that drops the
+/// packets the budget left unfed leaves none of their sets behind.** An H.264
+/// stream (128x96, an IDR every 8, its SPS and PPS 0 in its codec parameters
+/// alone) whose packets 8 and 9 carry, after their own units, a second
+/// stream's SPS 0 and PPS 0 (160x96). A probe-era fallback at 10 on a session
+/// of three threads, its replay budget two and a half pictures: the
+/// fallback's transaction feeds the history as far as the budget goes, and
+/// the round the caller's next send runs feeds more, in step, 8 and 9 still
+/// unfed; then the caller seeks. The session holds the record's sets — no
+/// record is synthesized — and, sent the stream from the IDR 16, it switches
+/// to its threads there and every picture comes out as a straight decode
+/// from 16 gives it. Advanced through the whole history at the fallback, the
+/// session held 8 and 9's sets, the round's proof that its packets were
+/// read cleared their doubt, and the decoder opened at 16 opened on a record
+/// of them.
+#[test]
+fn a_replay_holds_the_sets_of_the_packets_it_fed_and_no_other() {
+  use super::held::Held;
+  let h264 = crate::CodecId::H264.raw();
+  let params = "keyint=8:min-keyint=8:scenecut=0:bframes=0:open-gop=0:log-level=error";
+  let a = encode_h264_global(128, 96, 32, params);
+  let b = encode_h264_global(160, 96, 8, params);
+  let record = extradata_of(&a.parameters);
+  let b_sets = extradata_of(&b.parameters);
+  let mut packets = a.packets.clone();
+  for (at, kind) in [(8, 7), (9, 8)] {
+    let data = packets[at].data().expect("a payload").to_vec();
+    let set = h264_units_of_kind(&b_sets, kind);
+    assert!(!set.is_empty(), "the second stream's set of kind {kind}");
+    packets[at] = repacked(&a.packets[at], &[&data[..], &set[..]].concat());
+  }
+  let clip = SyntheticClip {
+    parameters: a.parameters.clone(),
+    packets,
+  };
+  assert!(clip.packets[16].is_key(), "16 is an IDR");
+  let fail_at = 10;
+  let three = core::num::NonZeroU32::new(3).expect("nonzero");
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test(
+    Box::new(FakeHw::failing(128, 96, 0, fail_at, FailShape::ProbeEra)),
+    clip.parameters.clone(),
+    tb,
+  )
+  .expect("build test decoder")
+  .with_threads_for_test(crate::Threads::Count(three))
+  .with_max_replay_bytes_for_test(picture_bytes(&clip) * 5 / 2);
+  let mut dst = crate::empty_owned_video_frame();
+  for av_pkt in &clip.packets[..fail_at] {
+    crate::accepted(dec.send_packet(&pushed(av_pkt)), "the hardware takes it");
+  }
+  // The fallback, its transaction stopped at the budget.
+  assert!(
+    matches!(
+      dec.send_packet(&pushed(&clip.packets[fail_at])),
+      Ok(Sent::MustDrain)
+    ),
+    "the fallback's replay stops at the budget"
+  );
+  let unfed = dec.pending_history.len();
+  let mut answers = Vec::new();
+  answered(&mut dec, &mut dst, &mut answers);
+  // A round of the caller's next send feeds more of the history, in step.
+  assert!(
+    matches!(
+      dec.send_packet(&pushed(&clip.packets[fail_at])),
+      Ok(Sent::MustDrain)
+    ),
+    "the round stops at the budget"
+  );
+  let left = dec.pending_history.len();
+  assert!(
+    left < unfed && left >= 2,
+    "the round fed packets, 8 and 9 still unfed: {unfed} then {left} left"
+  );
+  dec.flush().expect("a seek");
+  assert_eq!(
+    dec.held.record(h264, &record, None),
+    Ok(None),
+    "the record's own sets, none of 8 and 9's"
+  );
+  assert!(
+    dec.held.same(&Held::opened_on(h264, &record)),
+    "held as the record gives them"
+  );
+  let after = SyntheticClip {
+    parameters: clip.parameters.clone(),
+    packets: clip.packets[16..].to_vec(),
+  };
+  let session = session_of(dec, &after, |_, _| {});
+  assert_eq!(
+    session.threads.first().copied().flatten(),
+    Some(three),
+    "the switch at 16"
+  );
+  assert!(session.errors.is_empty(), "no error: {:?}", session.errors);
+  let reference = straight(&after);
+  assert_eq!(reference.len(), 16, "the straight decode from 16 is whole");
+  assert!(
+    session.pictures == reference,
+    "every picture from 16 on, as a straight decode from 16 gives it"
+  );
+}
