@@ -193,6 +193,20 @@ impl<'a> Reader<'a> {
     self.advance(n);
   }
 
+  /// `get_bits(n)` where `n` may be 0, which advances nothing; its value
+  /// unread. FFmpeg reads a field this wide only where it reads a value
+  /// nothing after it looks at.
+  fn skip_field(&mut self, n: u32) {
+    if n > 0 {
+      self.bits(n);
+    }
+  }
+
+  /// `show_bits(n)`, `n` from 1 to 25: the next `n` bits, the index kept.
+  fn peek(&self, n: u32) -> u32 {
+    self.show(n)
+  }
+
   /// `align_get_bits`: to the next byte boundary.
   pub(super) fn align(&mut self) {
     let n = self.index.wrapping_neg() & 7;
@@ -859,31 +873,7 @@ fn image_size_valid(width: u32, height: u32) -> bool {
 /// then `decode_vui_parameters` (h264_ps.c:133-199). `false` where it fails
 /// the set.
 fn h264_vui(r: &mut Reader<'_>) -> bool {
-  if r.bit() {
-    // aspect_ratio_idc, and the SAR it extends to.
-    if r.bits(8) == 255 {
-      r.bits(16);
-      r.bits(16);
-    }
-  }
-  if r.bit() {
-    r.bit(); // overscan_appropriate_flag
-  }
-  if r.bit() {
-    // video_signal_type_present_flag
-    r.bits(3);
-    r.bit();
-    if r.bit() {
-      r.bits(8);
-      r.bits(8);
-      r.bits(8);
-    }
-  }
-  if r.bit() {
-    // chroma_loc_info_present_flag
-    r.ue_31();
-    r.ue_31();
-  }
+  common_vui(r);
   // A VUI cut short is taken as it stands.
   if r.show_bit() && r.left() < 10 {
     return true;
@@ -925,6 +915,36 @@ fn h264_vui(r: &mut Reader<'_>) -> bool {
     }
   }
   true
+}
+
+/// `ff_h2645_decode_common_vui_params` (h2645_vui.c:37-100), the start of
+/// both codecs' VUI, which fails nothing.
+fn common_vui(r: &mut Reader<'_>) {
+  if r.bit() {
+    // aspect_ratio_idc, and the SAR it extends to.
+    if r.bits(8) == 255 {
+      r.bits(16);
+      r.bits(16);
+    }
+  }
+  if r.bit() {
+    r.bit(); // overscan_appropriate_flag
+  }
+  if r.bit() {
+    // video_signal_type_present_flag
+    r.bits(3);
+    r.bit();
+    if r.bit() {
+      r.bits(8);
+      r.bits(8);
+      r.bits(8);
+    }
+  }
+  if r.bit() {
+    // chroma_loc_info_present_flag
+    r.ue_31();
+    r.ue_31();
+  }
 }
 
 /// `decode_hrd_parameters` (h264_ps.c:106-131): `false` where it fails.
@@ -1689,6 +1709,69 @@ pub(super) struct VpsRead {
   /// `vps_max_sub_layers`, which bounds a sequence parameter set's own
   /// (hevc/ps.c:1262-1278).
   pub(super) max_sub_layers: u8,
+  /// `vps_max_layers`, which bounds a picture parameter set's reference
+  /// layer offsets (hevc/ps.c:1888-1890).
+  max_layers: u8,
+  /// `nb_layers`: two where `decode_vps_ext` read the second layer, or the
+  /// broken extension is kept as alpha video, one otherwise
+  /// (hevc/ps.c:507, 919-939); a sequence parameter set of the second layer
+  /// referring to a set of one is refused (1299-1303).
+  nb_layers: u8,
+  /// `rep_format` as `decode_vps_ext` left it (hevc/ps.c:705-734), what a
+  /// sequence parameter set of the second layer takes for its own
+  /// (1311-1325).
+  rep: RepFormat,
+  /// Whether FFmpeg stored it with a warning that `AV_EF_EXPLODE` turns into
+  /// its refusal: reordered pictures past the decoded picture buffer
+  /// (`vps_max_num_reorder_pics`, hevc/ps.c:858-862).
+  pub(super) warned: bool,
+}
+
+impl VpsRead {
+  /// `vps_max_layers`.
+  pub(super) const fn max_layers(&self) -> u8 {
+    self.max_layers
+  }
+}
+
+/// `rep_format` (`RepFormat`, hevc/ps.h): the first representation format of
+/// a video parameter set's extension, each field as `decode_vps_ext` set it
+/// before it returned — zeros past where it stopped.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct RepFormat {
+  width: u16,
+  height: u16,
+  chroma_format_idc: u8,
+  separate_colour_plane: bool,
+  bit_depth_luma: u8,
+  /// The conformance window, in luma samples.
+  window: Window,
+}
+
+/// A conformance window's offsets in luma samples — left, right, top,
+/// bottom (`HEVCWindow`, its fields `unsigned int`).
+type Window = [u32; 4];
+
+/// **`read_window`** (hevc/ps.c:66-87): four offsets in chroma units, scaled
+/// to luma samples by the chroma format, which must leave a picture of
+/// `width` by `height`; `None` where they do not, FFmpeg's
+/// `AVERROR_INVALIDDATA`.
+fn read_window(
+  r: &mut Reader<'_>,
+  chroma_format_idc: usize,
+  width: i64,
+  height: i64,
+) -> Option<Window> {
+  const SUB_WIDTH: [i64; 4] = [1, 2, 2, 1];
+  const SUB_HEIGHT: [i64; 4] = [1, 2, 1, 1];
+  let left = i64::from(r.ue_long()) * SUB_WIDTH[chroma_format_idc];
+  let right = i64::from(r.ue_long()) * SUB_WIDTH[chroma_format_idc];
+  let top = i64::from(r.ue_long()) * SUB_HEIGHT[chroma_format_idc];
+  let bottom = i64::from(r.ue_long()) * SUB_HEIGHT[chroma_format_idc];
+  if width <= left + right || height <= top + bottom {
+    return None;
+  }
+  Some([left as u32, right as u32, top as u32, bottom as u32])
 }
 
 /// **`ff_hevc_decode_nal_vps`** (hevc/ps.c:786-959) from the reader past the
@@ -1710,15 +1793,18 @@ pub(super) fn hevc_vps(r: &mut Reader<'_>) -> Result<VpsRead, bool> {
     return INVALID;
   }
   let ordering = r.bit();
+  let mut warned = false;
   for _ in (if ordering { 0 } else { max_sub_layers - 1 })..max_sub_layers {
     // vps_max_dec_pic_buffering, an unsigned of minus1 + 1, from 1 to 16;
-    // vps_max_num_reorder_pics over its bound is a warning only.
+    // vps_max_num_reorder_pics past it a warning, refused only under
+    // AV_EF_EXPLODE (ps.c:858-862).
     let buffering = r.ue_long().wrapping_add(1);
-    r.ue_long();
+    let reorder = r.ue_long();
     r.ue_long();
     if buffering > 16 || buffering == 0 {
       return INVALID;
     }
+    warned |= reorder > buffering - 1;
   }
   let max_layer_id = i64::from(r.bits(6));
   let layer_sets = r.ue_long().wrapping_add(1) as i32;
@@ -1749,20 +1835,18 @@ pub(super) fn hevc_vps(r: &mut Reader<'_>) -> Result<VpsRead, bool> {
     for index in 0..hrd_sets {
       r.ue_long(); // hrd_layer_set_idx
       let common = index == 0 || r.bit();
-      hevc_hrd(r, common, max_sub_layers);
+      // Each set's HRD parameters zeroed (`av_calloc`).
+      hevc_hrd(r, common, max_sub_layers, &mut [0; 7]);
     }
   }
+  let mut ext = Extension {
+    layers: 1,
+    mask: 0,
+    layer_id: 0,
+    rep: RepFormat::default(),
+  };
   if max_layers > 1 && r.bit() {
     // vps_extension_flag
-    let mut ext = Extension {
-      layers: 1,
-      mask: 0,
-      layer_id: 0,
-    };
-    let read = |alpha| VpsRead {
-      alpha,
-      max_sub_layers: max_sub_layers as u8,
-    };
     match vps_extension(
       r,
       &mut ext,
@@ -1771,26 +1855,35 @@ pub(super) fn hevc_vps(r: &mut Reader<'_>) -> Result<VpsRead, bool> {
       layer_sets,
       layer1_included,
     ) {
-      Ok(()) => return Ok(read(ext.alpha())),
+      Ok(()) => {}
       // "Broken VPS extension, treating as alpha video" where two layers,
       // the second's id and the auxiliary type were read; one layer
-      // otherwise (ps.c:921-939).
-      Err(Unsupported::PatchWelcome) => return Ok(read(ext.alpha())),
+      // otherwise, "Ignoring unsupported VPS extension" (ps.c:921-939).
+      Err(Unsupported::PatchWelcome) => {
+        if !ext.alpha() {
+          ext.layers = 1;
+        }
+      }
       Err(Unsupported::Invalid) => return INVALID,
     }
   }
   Ok(VpsRead {
-    alpha: false,
+    alpha: ext.alpha(),
     max_sub_layers: max_sub_layers as u8,
+    max_layers: max_layers as u8,
+    nb_layers: ext.layers as u8,
+    rep: ext.rep,
+    warned,
   })
 }
 
-/// What `decode_vps_ext` set before it returned: the layers, the mask and
-/// the second layer's `nuh_layer_id`.
+/// What `decode_vps_ext` set before it returned: the layers, the mask, the
+/// second layer's `nuh_layer_id` and the representation format.
 struct Extension {
   layers: i32,
   mask: u32,
   layer_id: u32,
+  rep: RepFormat,
 }
 
 impl Extension {
@@ -1937,33 +2030,34 @@ fn vps_extension(
     // vps_num_rep_formats_minus1
     return Err(PatchWelcome);
   }
-  let width = i64::from(r.bits(16));
-  let height = i64::from(r.bits(16));
+  // The representation format, each field kept as it is set (ps.c:709-734).
+  ext.rep.width = r.bits(16) as u16;
+  ext.rep.height = r.bits(16) as u16;
   if !r.bit() {
     // chroma_and_bit_depth_vps_present_flag
     return Err(Invalid);
   }
   let chroma_format_idc = r.bits(2) as usize;
+  ext.rep.chroma_format_idc = chroma_format_idc as u8;
   if chroma_format_idc == 3 {
-    r.bit(); // separate_colour_plane_flag
+    ext.rep.separate_colour_plane = r.bit();
   }
   let luma = r.bits(4) + 8;
   let chroma = r.bits(4) + 8;
+  ext.rep.bit_depth_luma = luma as u8;
   if luma > 16 || chroma > 16 || luma != chroma {
     return Err(PatchWelcome);
   }
   if r.bit() {
-    // conformance_window_vps_flag: `read_window` (ps.c:66-87), offsets in
-    // chroma units that must leave a picture.
-    const SUB_WIDTH: [i64; 4] = [1, 2, 2, 1];
-    const SUB_HEIGHT: [i64; 4] = [1, 2, 1, 1];
-    let left = i64::from(r.ue_long()) * SUB_WIDTH[chroma_format_idc];
-    let right = i64::from(r.ue_long()) * SUB_WIDTH[chroma_format_idc];
-    let top = i64::from(r.ue_long()) * SUB_HEIGHT[chroma_format_idc];
-    let bottom = i64::from(r.ue_long()) * SUB_HEIGHT[chroma_format_idc];
-    if width <= left + right || height <= top + bottom {
-      return Err(Invalid);
-    }
+    // conformance_window_vps_flag: offsets in chroma units that must leave a
+    // picture.
+    ext.rep.window = read_window(
+      r,
+      chroma_format_idc,
+      i64::from(ext.rep.width),
+      i64::from(ext.rep.height),
+    )
+    .ok_or(Invalid)?;
   }
   r.bit(); // max_one_active_ref_layer_flag
   r.bit(); // vps_poc_lsb_aligned_flag
@@ -2002,6 +2096,14 @@ fn vps_extension(
 /// whichever profile it names) each refused where fewer bits are left than
 /// it reads: `false` where it fails.
 pub(super) fn parse_ptl(r: &mut Reader<'_>, profile_present: bool, max_sub_layers: i32) -> bool {
+  parse_ptl_profile(r, profile_present, max_sub_layers).is_some()
+}
+
+/// [`parse_ptl`], answering the general `profile_idc` it stores — 0 where
+/// the profile is not present, `memset` (ps.c:343-345) — or `None` where it
+/// fails. A `profile_idc` of 0 takes the first compatibility flag set after
+/// the first (`decode_profile_tier_level`, ps.c:288-293).
+fn parse_ptl_profile(r: &mut Reader<'_>, profile_present: bool, max_sub_layers: i32) -> Option<u8> {
   let common = |r: &mut Reader<'_>| {
     if r.left() < 88 {
       return false;
@@ -2009,12 +2111,25 @@ pub(super) fn parse_ptl(r: &mut Reader<'_>, profile_present: bool, max_sub_layer
     r.skip(88);
     true
   };
-  if profile_present && !common(r) {
-    return false;
+  let mut profile_idc = 0u8;
+  if profile_present {
+    if r.left() < 88 {
+      return None;
+    }
+    r.bits(2); // general_profile_space
+    r.bit(); // general_tier_flag
+    profile_idc = r.bits(5) as u8;
+    for flag in 0..32u8 {
+      if r.bit() && profile_idc == 0 && flag > 0 {
+        profile_idc = flag;
+      }
+    }
+    // The source and constraint flags, 48 bits whichever profile it names.
+    r.skip(48);
   }
   let sub_layers = (max_sub_layers - 1).max(0) as usize;
   if r.left() < 8 + if sub_layers > 0 { 16 } else { 0 } {
-    return false;
+    return None;
   }
   r.bits(8); // general_level_idc
   let mut present = [(false, false); 6];
@@ -2026,22 +2141,26 @@ pub(super) fn parse_ptl(r: &mut Reader<'_>, profile_present: bool, max_sub_layer
   }
   for (profile, level) in present.into_iter().take(sub_layers) {
     if profile && !common(r) {
-      return false;
+      return None;
     }
     if level {
       if r.left() < 8 {
-        return false;
+        return None;
       }
       r.bits(8);
     }
   }
-  true
+  Some(profile_idc)
 }
 
-/// **`decode_hrd`** (hevc/ps.c:401-467), whose answer the video parameter
-/// set's reading does not look at (ps.c:909-910): a sub-layer counting more
-/// than 32 CPBs stops it there.
-fn hevc_hrd(r: &mut Reader<'_>, common: bool, max_sub_layers: i32) {
+/// **`decode_hrd`** (hevc/ps.c:401-467), whose answer neither the video
+/// parameter set's reading nor the VUI's looks at (ps.c:909-910, 1047-1048):
+/// a sub-layer counting more than 32 CPBs stops it there. `cpb_cnt` is the
+/// parameters' `cpb_cnt_minus1`, which a low-delay sub-layer reads none of
+/// and keeps — zeroed with the parameters, and kept across a VUI read again
+/// from its timing information, whose `sps->hdr` the retry does not restore
+/// (ps.c:1032-1033).
+fn hevc_hrd(r: &mut Reader<'_>, common: bool, max_sub_layers: i32, cpb_cnt: &mut [u8; 7]) {
   let (mut nal, mut vcl, mut sub_picture) = (false, false, false);
   if common {
     nal = r.bit();
@@ -2064,7 +2183,7 @@ fn hevc_hrd(r: &mut Reader<'_>, common: bool, max_sub_layers: i32) {
       r.bits(5);
     }
   }
-  for _ in 0..max_sub_layers {
+  for count in cpb_cnt.iter_mut().take(max_sub_layers.max(0) as usize) {
     let fixed_general = r.bit();
     let fixed_within = !fixed_general && r.bit();
     let mut low_delay = false;
@@ -2073,16 +2192,14 @@ fn hevc_hrd(r: &mut Reader<'_>, common: bool, max_sub_layers: i32) {
     } else {
       low_delay = r.bit();
     }
-    // `cpb_cnt_minus1`, zeroed with the set's HRD parameters, is kept where
-    // a low-delay sub-layer reads none.
-    let mut cpbs = 1u32;
     if !low_delay {
       let minus1 = r.ue_long();
       if minus1 > 31 {
         return;
       }
-      cpbs = minus1 + 1;
+      *count = minus1 as u8;
     }
+    let cpbs = u32::from(*count) + 1;
     for _ in 0..(u32::from(nal) + u32::from(vcl)) * cpbs {
       r.ue_long(); // bit_rate_value_minus1
       r.ue_long(); // cpb_size_value_minus1
@@ -2093,4 +2210,797 @@ fn hevc_hrd(r: &mut Reader<'_>, common: bool, max_sub_layers: i32) {
       r.bit(); // cbr_flag
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+//  HEVC sequence and picture parameter sets
+// ---------------------------------------------------------------------------
+
+/// What `ff_hevc_parse_sps` stores of a sequence parameter set that a
+/// picture parameter set read after it is read under
+/// ([`hevc_pps`]), and whether FFmpeg stored it with a warning.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct HevcSps {
+  /// `sps_seq_parameter_set_id`.
+  pub(super) id: u8,
+  bit_depth: i32,
+  /// 0 for a set of the second layer, which takes its format from the video
+  /// parameter set's and never sets this (hevc/ps.c:1311-1325).
+  bit_depth_chroma: i32,
+  /// The general `profile_idc`, 0 for a set of the second layer, which
+  /// reads no profile (ps.c:1281-1288).
+  profile_idc: u8,
+  log2_diff_max_min_coding_block_size: u32,
+  log2_ctb_size: u32,
+  ctb_width: i32,
+  ctb_height: i32,
+  /// Whether FFmpeg stored it with a warning that `AV_EF_EXPLODE` turns into
+  /// its refusal: reordered pictures past the decoded picture buffer
+  /// (`sps_max_num_reorder_pics`, ps.c:1416-1424), or an output window that
+  /// leaves no picture (1640-1650), which the conformance window's own test
+  /// rules out where the default display window is not applied — FFmpeg's
+  /// default, which this crate keeps (`apply_defdispwin`,
+  /// hevc/hevcdec.c:4204-4205; ps.c:76-81, 1389, 1633-1638).
+  pub(super) warned: bool,
+}
+
+/// A sequence parameter set FFmpeg refuses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct SpsRefused {
+  /// Whether the error is other than `AVERROR_INVALIDDATA`, which ends a
+  /// decoder's reading of the packet (`decode_nal_unit`,
+  /// hevc/hevcdec.c:3665-3672).
+  pub(super) aborts: bool,
+  /// The set's id, where the reading reached it.
+  pub(super) id: Option<u8>,
+}
+
+/// **`ff_hevc_parse_sps`** (hevc/ps.c:1239-1718) from the reader past the
+/// set's `sps_video_parameter_set_id`, for a unit of `nuh_layer_id` `layer`,
+/// against `vps`, the video parameter set the decoder holds under that id:
+/// what FFmpeg stores ([`HevcSps`]), or its refusal. The decoder's context is
+/// the one this crate opens: `err_recognition` 0, no
+/// `AV_CODEC_FLAG2_IGNORE_CROP`, `apply_defdispwin` 0. The C widths of the
+/// fields its tests compare are kept: `log2_max_poc_lsb` and the
+/// `log2_*_size`s `unsigned`, a sub-layer's buffering and reordering `int`,
+/// `num_long_term_ref_pics_sps` an `uint8_t`.
+pub(super) fn hevc_sps(
+  r: &mut Reader<'_>,
+  layer: u8,
+  vps: &VpsRead,
+) -> Result<HevcSps, SpsRefused> {
+  let invalid = |id| Err(SpsRefused { aborts: false, id });
+  let aborts = |id| Err(SpsRefused { aborts: true, id });
+  let mut max_sub_layers = r.bits(3) as i32 + 1;
+  // A set of a layer above the base whose sub-layers read 8 takes the
+  // video parameter set's (ps.c:1262-1278).
+  let multi_layer = layer > 0 && max_sub_layers == 8;
+  if multi_layer {
+    max_sub_layers = i32::from(vps.max_sub_layers);
+  }
+  if max_sub_layers > i32::from(vps.max_sub_layers) {
+    return invalid(None);
+  }
+  let mut profile_idc = 0;
+  if !multi_layer {
+    r.bit(); // sps_temporal_id_nesting_flag
+    // `parse_ptl`'s -1 is the set's error (ps.c:1281-1283).
+    match parse_ptl_profile(r, true, max_sub_layers) {
+      Some(idc) => profile_idc = idc,
+      None => return aborts(None),
+    }
+  }
+  let id = r.ue_long();
+  if id >= 16 {
+    return invalid(None);
+  }
+  let at = Some(id as u8);
+  let (chroma_format_idc, bit_depth, bit_depth_chroma, width, height, window);
+  if multi_layer {
+    // "SPS %d references an unsupported VPS extension", AVERROR(ENOSYS);
+    // a representation format other than the first, AVERROR_PATCHWELCOME
+    // (ps.c:1296-1309).
+    if vps.nb_layers == 1 {
+      return aborts(at);
+    }
+    if r.bit() && r.bits(8) != 0 {
+      return aborts(at);
+    }
+    let rep = vps.rep;
+    chroma_format_idc = if rep.separate_colour_plane {
+      0
+    } else {
+      i32::from(rep.chroma_format_idc)
+    };
+    bit_depth = i32::from(rep.bit_depth_luma);
+    bit_depth_chroma = 0;
+    width = i32::from(rep.width);
+    height = i32::from(rep.height);
+    // `av_image_check_size`'s AVERROR(EINVAL).
+    if !image_size_valid(width as u32, height as u32) {
+      return aborts(at);
+    }
+    window = rep.window;
+  } else {
+    let format = r.ue_long();
+    if format > 3 {
+      return invalid(at);
+    }
+    // separate_colour_plane_flag: coded as monochrome.
+    chroma_format_idc = if format == 3 && r.bit() {
+      0
+    } else {
+      format as i32
+    };
+    width = r.ue_long() as i32;
+    height = r.ue_long() as i32;
+    if !image_size_valid(width as u32, height as u32) {
+      return aborts(at);
+    }
+    window = if r.bit() {
+      // conformance_window_flag
+      match read_window(
+        r,
+        chroma_format_idc as usize,
+        i64::from(width),
+        i64::from(height),
+      ) {
+        Some(window) => window,
+        None => return invalid(at),
+      }
+    } else {
+      [0; 4]
+    };
+    bit_depth = r.ue_31() + 8;
+    if bit_depth > 16 {
+      return invalid(at);
+    }
+    bit_depth_chroma = r.ue_31() + 8;
+    if bit_depth_chroma > 16 || (chroma_format_idc != 0 && bit_depth_chroma != bit_depth) {
+      return invalid(at);
+    }
+  }
+  // `map_pixel_format` (ps.c:1190-1237): 8, 9, 10 or 12 bits.
+  if !matches!(bit_depth, 8 | 9 | 10 | 12) {
+    return invalid(at);
+  }
+  let log2_max_poc_lsb = r.ue_long().wrapping_add(4);
+  if log2_max_poc_lsb > 16 {
+    return invalid(at);
+  }
+  let mut warned = false;
+  if !multi_layer {
+    let start = if r.bit() { 0 } else { max_sub_layers - 1 };
+    for _ in start..max_sub_layers {
+      let buffering = r.ue_long().wrapping_add(1) as i32;
+      let reorder = r.ue_long() as i32;
+      r.ue_long(); // sps_max_latency_increase_plus1
+      if buffering as u32 > 16 {
+        return invalid(at);
+      }
+      // "sps_max_num_reorder_pics out of range": the buffering raised to
+      // fit, refused only under AV_EF_EXPLODE or past the buffer's 16
+      // (ps.c:1416-1424).
+      if reorder > buffering - 1 {
+        if reorder > 15 {
+          return invalid(at);
+        }
+        warned = true;
+      }
+    }
+  }
+  let log2_min_cb_size = r.ue_long().wrapping_add(3);
+  let log2_diff_max_min_cb = r.ue_long();
+  let log2_min_tb_size = r.ue_long().wrapping_add(2);
+  let log2_diff_max_min_tb = r.ue_long();
+  let log2_max_trafo_size = log2_diff_max_min_tb.wrapping_add(log2_min_tb_size);
+  if !(3..=30).contains(&log2_min_cb_size)
+    || log2_diff_max_min_cb > 30
+    || log2_min_tb_size >= log2_min_cb_size
+    || log2_min_tb_size < 2
+    || log2_diff_max_min_tb > 30
+  {
+    return invalid(at);
+  }
+  let depth_inter = r.ue_long() as i32;
+  let depth_intra = r.ue_long() as i32;
+  if r.bit() {
+    // scaling_list_enabled_flag; sps_infer_scaling_list_flag, read on the
+    // second layer alone, AVERROR_PATCHWELCOME (ps.c:1473-1480).
+    if multi_layer && r.bit() {
+      return aborts(at);
+    }
+    if r.bit() && !scaling_list_data(r) {
+      return invalid(at);
+    }
+  }
+  r.bit(); // amp_enabled_flag
+  r.bit(); // sample_adaptive_offset_enabled_flag
+  if r.bit() {
+    // pcm_enabled_flag: its sample bit depths within the set's.
+    let luma = r.bits(4) + 1;
+    let chroma = r.bits(4) + 1;
+    r.ue_long(); // log2_min_pcm_luma_coding_block_size_minus3
+    r.ue_long(); // log2_diff_max_min_pcm_luma_coding_block_size
+    if luma.max(chroma) as i32 > bit_depth {
+      return invalid(at);
+    }
+    r.bit(); // pcm_loop_filter_disabled_flag
+  }
+  let short_term_sets = r.ue_long();
+  if short_term_sets > 64 {
+    return invalid(at);
+  }
+  let mut num_delta_pocs = [0u8; 64];
+  for index in 0..short_term_sets as usize {
+    match short_term_rps(r, index, &num_delta_pocs) {
+      Some(count) => num_delta_pocs[index] = count,
+      None => return invalid(at),
+    }
+  }
+  if r.bit() {
+    // long_term_ref_pics_present_flag; the count an `uint8_t`.
+    let count = r.ue_long() as u8;
+    if count > 32 {
+      return invalid(at);
+    }
+    for _ in 0..count {
+      r.skip_field(log2_max_poc_lsb); // lt_ref_pic_poc_lsb_sps
+      r.bit(); // used_by_curr_pic_lt_sps_flag
+    }
+  }
+  r.bit(); // sps_temporal_mvp_enabled_flag
+  r.bit(); // strong_intra_smoothing_enabled_flag
+  if r.bit() {
+    hevc_vui(r, max_sub_layers);
+  }
+  if r.bit() {
+    // sps_extension_present_flag
+    let range = r.bit();
+    let multilayer = r.bit();
+    let three_d = r.bit();
+    let scc = r.bit();
+    r.skip(4); // sps_extension_4bits
+    if range {
+      r.skip(9);
+    }
+    if multilayer {
+      r.skip(1); // inter_view_mv_vert_constraint_flag
+    }
+    if three_d {
+      for view in 0..2 {
+        r.skip(2 + u64::from(view == 1));
+        r.ue_long(); // log2_ivmc_sub_pb_size_minus3
+        r.skip(if view == 0 { 4 } else { 5 });
+      }
+    }
+    if scc {
+      r.bit(); // curr_pic_ref_enabled_flag
+      if r.bit() {
+        // palette_mode_enabled_flag
+        r.ue(); // palette_max_size
+        r.ue(); // delta_palette_max_predictor_size
+        if r.bit() {
+          // sps_palette_predictor_initializers_present_flag, its count an
+          // `int` of `get_ue_golomb` plus 1.
+          let count = r.ue().wrapping_add(1);
+          if count > 128 {
+            return invalid(at);
+          }
+          let components = if chroma_format_idc == 0 { 1 } else { 3 };
+          for component in 0..components {
+            let depth = if component == 0 {
+              bit_depth
+            } else {
+              bit_depth_chroma
+            };
+            for _ in 0..count.max(0) {
+              r.skip_field(depth as u32);
+            }
+          }
+        }
+      }
+      r.bits(2); // motion_vector_resolution_control_idc
+      r.bit(); // intra_boundary_filtering_disabled_flag
+    }
+  }
+  // The output window, the conformance window alone: a warning, refused
+  // only under AV_EF_EXPLODE (ps.c:1640-1650). `unsigned` arithmetic.
+  let [left, right, top, bottom] = window;
+  if left >= (i32::MAX as u32).wrapping_sub(right)
+    || top >= (i32::MAX as u32).wrapping_sub(bottom)
+    || left.wrapping_add(right) >= width as u32
+    || top.wrapping_add(bottom) >= height as u32
+  {
+    warned = true;
+  }
+  let log2_ctb_size = log2_min_cb_size.wrapping_add(log2_diff_max_min_cb);
+  if !(4..=6).contains(&log2_ctb_size) {
+    return invalid(at);
+  }
+  let ctb_width = (width + (1 << log2_ctb_size) - 1) >> log2_ctb_size;
+  let ctb_height = (height + (1 << log2_ctb_size) - 1) >> log2_ctb_size;
+  let mask = (1u32 << log2_min_cb_size) - 1;
+  if width as u32 & mask != 0 || height as u32 & mask != 0 {
+    return invalid(at);
+  }
+  // `int`s compared with an `unsigned` difference.
+  let depth = log2_ctb_size - log2_min_tb_size;
+  if depth_inter as u32 > depth
+    || depth_intra as u32 > depth
+    || log2_max_trafo_size > log2_ctb_size.min(5)
+  {
+    return invalid(at);
+  }
+  // "Overread SPS": refused (ps.c:1711-1716).
+  if r.left() < 0 {
+    return invalid(at);
+  }
+  Ok(HevcSps {
+    id: id as u8,
+    bit_depth,
+    bit_depth_chroma,
+    profile_idc,
+    log2_diff_max_min_coding_block_size: log2_diff_max_min_cb,
+    log2_ctb_size,
+    ctb_width,
+    ctb_height,
+    warned,
+  })
+}
+
+/// **`ff_hevc_decode_short_term_rps`** (hevc/ps.c:113-260) for the
+/// `index`-th set of a sequence parameter set's, `num_delta_pocs` the counts
+/// of those before it: its own count (`uint8_t`), `None` where FFmpeg
+/// refuses it. Predicted from the set before it — every set but the first —
+/// it reads two flags at most for each of that set's pictures and one more;
+/// written out, its counts and each picture's distance. `abs_delta_rps` is an
+/// `uint16_t` and `num_negative_pics` an `uint8_t`, as there.
+fn short_term_rps(r: &mut Reader<'_>, index: usize, num_delta_pocs: &[u8; 64]) -> Option<u8> {
+  if index > 0 && r.bit() {
+    // inter_ref_pic_set_prediction_flag
+    let reference = num_delta_pocs[index - 1];
+    r.bit(); // delta_rps_sign
+    let abs_delta_rps = r.ue_long().wrapping_add(1) as u16;
+    if abs_delta_rps > 32768 {
+      return None;
+    }
+    let mut count = 0u32;
+    for _ in 0..=reference {
+      let used = r.bit();
+      if used || r.bit() {
+        count += 1;
+      }
+    }
+    return (count < 32).then_some(count as u8);
+  }
+  let negative = r.ue_long() as u8;
+  let positive = r.ue_long();
+  if negative >= 16 || positive >= 16 {
+    return None;
+  }
+  for _ in 0..u32::from(negative) + positive {
+    let delta = r.ue_long().wrapping_add(1) as i32;
+    if !(1..=32768).contains(&delta) {
+      return None;
+    }
+    r.bit(); // used_by_curr_pic_flag
+  }
+  Some(negative + positive as u8)
+}
+
+/// **`scaling_list_data`** (hevc/ps.c:1113-1188), as far as its verdict goes:
+/// `false` where FFmpeg refuses it — a list copied from one that is not
+/// before it, a DC coefficient outside -7 to 247.
+fn scaling_list_data(r: &mut Reader<'_>) -> bool {
+  for size_id in 0..4u32 {
+    let step = if size_id == 3 { 3 } else { 1 };
+    let mut matrix_id = 0u32;
+    while matrix_id < 6 {
+      if r.bit() {
+        // scaling_list_pred_mode_flag: the list itself.
+        if size_id > 1 && !(-7..=247).contains(&r.se()) {
+          return false;
+        }
+        for _ in 0..64.min(1 << (4 + (size_id << 1))) {
+          r.se(); // scaling_list_delta_coef
+        }
+      } else {
+        // A copy of an earlier list, `unsigned` arithmetic.
+        let delta = r.ue_long().wrapping_mul(step);
+        if delta != 0 && matrix_id < delta {
+          return false;
+        }
+      }
+      matrix_id += step;
+    }
+  }
+  true
+}
+
+/// **`decode_vui`** (hevc/ps.c:961-1081): the VUI of a sequence parameter
+/// set, which fails nothing, but whose reading FFmpeg starts again from the
+/// default display window as from its timing information where the timing
+/// information or the bitstream restriction runs short, or the VUI runs to
+/// the end of the set (1027-1036, 1051-1060, 1072-1080): the reader goes back,
+/// once. The default display window is read for its length alone
+/// (`read_window`'s answer is not looked at, 1005-1006), and a window that
+/// opens on 21 bits reading 0x100000, with 68 bits or more left, is taken as
+/// absent (995-1000).
+fn hevc_vui(r: &mut Reader<'_>, max_sub_layers: i32) {
+  common_vui(r);
+  r.bit(); // neutral_chroma_indication_flag
+  r.bit(); // field_seq_flag
+  r.bit(); // frame_field_info_present_flag
+  let backup = r.clone();
+  if !(r.left() >= 68 && r.peek(21) == 0x10_0000) && r.bit() {
+    // default_display_window_flag
+    for _ in 0..4 {
+      r.ue_long();
+    }
+  }
+  let mut cpb_cnt = [0u8; 7];
+  let mut retried = false;
+  loop {
+    if r.bit() {
+      // vui_timing_info_present_flag
+      if r.left() < 66 && !retried {
+        *r = backup.clone();
+        retried = true;
+        continue;
+      }
+      r.bits(32); // vui_num_units_in_tick
+      r.bits(32); // vui_time_scale
+      if r.bit() {
+        r.ue_long(); // vui_num_ticks_poc_diff_one_minus1
+      }
+      if r.bit() {
+        hevc_hrd(r, true, max_sub_layers, &mut cpb_cnt);
+      }
+    }
+    if r.bit() {
+      // bitstream_restriction_flag
+      if r.left() < 8 && !retried {
+        *r = backup.clone();
+        retried = true;
+        continue;
+      }
+      r.skip(3);
+      for _ in 0..5 {
+        r.ue_long();
+      }
+    }
+    if r.left() < 1 && !retried {
+      *r = backup.clone();
+      retried = true;
+      continue;
+    }
+    return;
+  }
+}
+
+/// What `ff_hevc_decode_nal_pps` does with a picture parameter set it reads
+/// past its ids.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum HevcPps {
+  /// Stored; `past_end` where its reading ran past its payload — "Overread
+  /// PPS", a warning, the set stored with its last fields read off the bytes
+  /// after it (hevc/ps.c:2458-2461).
+  Stored { past_end: bool },
+  /// Refused, `AVERROR_INVALIDDATA`.
+  Refused,
+  /// Not stored, and no error: more default reference pictures than 15
+  /// leave the set at `goto err` with `ret` still 0 (ps.c:2275-2280).
+  Dropped,
+}
+
+/// **`ff_hevc_decode_nal_pps`** (hevc/ps.c:2201-2471) from the reader past
+/// the set's `pps_seq_parameter_set_id`, against `sps`, the sequence
+/// parameter set the decoder holds under it, and `vps_max_layers`, the
+/// `vps_max_layers` of the video parameter set held under that one's id
+/// (2259-2260). Every field is read as FFmpeg reads it, its extensions among
+/// them; `setup_pps`, which reads nothing and fails only an allocation, is
+/// taken to pass (2069-2199). The C widths kept: `num_ref_loc_offsets`,
+/// `num_cm_ref_layers`, the colour mapping bit depths and
+/// `pps_num_palette_predictor_initializers` `uint8_t`s, the colour transform
+/// offsets `int8_t`s.
+pub(super) fn hevc_pps(r: &mut Reader<'_>, sps: &HevcSps, vps_max_layers: u8) -> HevcPps {
+  use HevcPps::{Dropped, Refused};
+  r.bit(); // dependent_slice_segments_enabled_flag
+  r.bit(); // output_flag_present_flag
+  r.bits(3); // num_extra_slice_header_bits
+  r.bit(); // sign_data_hiding_enabled_flag
+  r.bit(); // cabac_init_present_flag
+  let l0 = r.ue_31() + 1;
+  let l1 = r.ue_31() + 1;
+  if l0 >= 16 || l1 >= 16 {
+    return Dropped;
+  }
+  r.se(); // init_qp_minus26
+  r.bit(); // constrained_intra_pred_flag
+  let transform_skip = r.bit();
+  let depth = if r.bit() {
+    // cu_qp_delta_enabled_flag
+    r.ue_long() as i32
+  } else {
+    0
+  };
+  if depth < 0 || depth as u32 > sps.log2_diff_max_min_coding_block_size {
+    return Refused;
+  }
+  if !(-12..=12).contains(&r.se()) || !(-12..=12).contains(&r.se()) {
+    // pps_cb_qp_offset, pps_cr_qp_offset
+    return Refused;
+  }
+  r.bit(); // pps_slice_chroma_qp_offsets_present_flag
+  r.bit(); // weighted_pred_flag
+  r.bit(); // weighted_bipred_flag
+  r.bit(); // transquant_bypass_enabled_flag
+  let tiles = r.bit();
+  r.bit(); // entropy_coding_sync_enabled_flag
+  if tiles {
+    let columns = r.ue();
+    let rows = r.ue();
+    if columns < 0 || columns >= sps.ctb_width || rows < 0 || rows >= sps.ctb_height {
+      return Refused;
+    }
+    if !r.bit() {
+      // uniform_spacing_flag clear: each column's and row's width but the
+      // last, which must leave it one.
+      for (count, ctbs) in [(columns, sps.ctb_width), (rows, sps.ctb_height)] {
+        let mut sum = 0u64;
+        for _ in 0..count {
+          sum += u64::from(r.ue_long().wrapping_add(1));
+        }
+        if sum >= ctbs as u64 {
+          return Refused;
+        }
+      }
+    }
+    r.bit(); // loop_filter_across_tiles_enabled_flag
+  }
+  r.bit(); // pps_loop_filter_across_slices_enabled_flag
+  if r.bit() {
+    // deblocking_filter_control_present_flag
+    r.bit(); // deblocking_filter_override_enabled_flag
+    if !r.bit() {
+      // pps_deblocking_filter_disabled_flag clear
+      let beta = r.se();
+      let tc = r.se();
+      if !(-6..=6).contains(&beta) || !(-6..=6).contains(&tc) {
+        return Refused;
+      }
+    }
+  }
+  if r.bit() && !scaling_list_data(r) {
+    // pps_scaling_list_data_present_flag
+    return Refused;
+  }
+  r.bit(); // lists_modification_present_flag
+  if r.ue_long() > sps.log2_ctb_size {
+    // log2_parallel_merge_level_minus2
+    return Refused;
+  }
+  r.bit(); // slice_segment_header_extension_present_flag
+  if r.bit() {
+    // pps_extension_present_flag
+    let range = r.bit();
+    let multilayer = r.bit();
+    let three_d = r.bit();
+    let scc = r.bit();
+    r.skip(4); // pps_extension_4bits
+    // The range extension read only under a profile of 4 or more,
+    // AV_PROFILE_HEVC_REXT (ps.c:2433-2436).
+    if sps.profile_idc >= 4 && range && !pps_range_extension(r, transform_skip, sps) {
+      return Refused;
+    }
+    if multilayer && !pps_multilayer_extension(r, vps_max_layers) {
+      return Refused;
+    }
+    if three_d {
+      pps_3d_extension(r);
+    }
+    if scc && !pps_scc_extension(r, sps) {
+      return Refused;
+    }
+  }
+  HevcPps::Stored {
+    past_end: r.left() < 0,
+  }
+}
+
+/// `pps_range_extensions` (hevc/ps.c:1975-2013): `false` where refused.
+fn pps_range_extension(r: &mut Reader<'_>, transform_skip: bool, sps: &HevcSps) -> bool {
+  if transform_skip {
+    r.ue_31(); // log2_max_transform_skip_block_size_minus2
+  }
+  r.bit(); // cross_component_prediction_enabled_flag
+  if r.bit() {
+    // chroma_qp_offset_list_enabled_flag
+    r.ue_31(); // diff_cu_chroma_qp_offset_depth
+    let length = r.ue_31();
+    if length > 5 {
+      return false;
+    }
+    for _ in 0..=length {
+      r.se(); // cb_qp_offset_list
+      r.se(); // cr_qp_offset_list
+    }
+  }
+  let luma = r.ue_31();
+  let chroma = r.ue_31();
+  luma <= (sps.bit_depth - 10).max(0) && chroma <= (sps.bit_depth_chroma - 10).max(0)
+}
+
+/// `pps_multilayer_extension` (hevc/ps.c:1880-1927): `false` where refused.
+fn pps_multilayer_extension(r: &mut Reader<'_>, vps_max_layers: u8) -> bool {
+  r.bit(); // poc_reset_info_present_flag
+  if r.bit() {
+    r.bits(6); // pps_scaling_list_ref_layer_id
+  }
+  let offsets = r.ue() as u8;
+  if i32::from(offsets) > i32::from(vps_max_layers) - 1 {
+    return false;
+  }
+  for _ in 0..offsets {
+    r.bits(6); // ref_loc_offset_layer_id
+    for _ in 0..2 {
+      // scaled_ref_layer_offset_present_flag, ref_region_offset_present_flag
+      if r.bit() {
+        for _ in 0..4 {
+          r.se_long();
+        }
+      }
+    }
+    if r.bit() {
+      // resample_phase_set_present_flag
+      r.ue_31();
+      r.ue_31();
+      r.ue();
+      r.ue();
+    }
+  }
+  // colour_mapping_enabled_flag
+  !r.bit() || colour_mapping_table(r)
+}
+
+/// `colour_mapping_table` (hevc/ps.c:1844-1878): `false` where refused.
+fn colour_mapping_table(r: &mut Reader<'_>) -> bool {
+  let layers = r.ue().wrapping_add(1) as u8;
+  if layers > 62 {
+    return false;
+  }
+  for _ in 0..layers {
+    r.bits(6); // cm_ref_layer_id
+  }
+  let depth = r.bits(2);
+  let part_num_y = 1u32 << r.bits(2);
+  let mut bit_depths = [0u8; 4];
+  for depth in &mut bit_depths {
+    *depth = r.ue().wrapping_add(8) as u8;
+  }
+  let [luma_in, chroma_in, luma_out, chroma_out] = bit_depths;
+  if luma_out < luma_in || chroma_out < chroma_in {
+    return false;
+  }
+  let quant = r.bits(2) as i32;
+  let flc = r.bits(2) as i32 + 1;
+  if depth == 1 {
+    r.se_long(); // cm_adapt_threshold_u_delta
+    r.se_long(); // cm_adapt_threshold_v_delta
+  }
+  let residual = (10 + i32::from(luma_in) - i32::from(luma_out) - quant - flc).max(0) as u32;
+  colour_mapping_octants(r, 0, depth, part_num_y, residual);
+  true
+}
+
+/// `colour_mapping_octants` (hevc/ps.c:1807-1842).
+fn colour_mapping_octants(r: &mut Reader<'_>, at: u32, depth: u32, part_num_y: u32, residual: u32) {
+  if at < depth && r.bit() {
+    // split_octant_flag
+    for _ in 0..8 {
+      colour_mapping_octants(r, at + 1, depth, part_num_y, residual);
+    }
+    return;
+  }
+  for _ in 0..part_num_y * 4 {
+    if r.bit() {
+      // coded_res_flag
+      for _ in 0..3 {
+        let quotient = r.ue_long();
+        let remainder = if residual != 0 { r.bits(residual) } else { 0 };
+        if quotient != 0 || remainder != 0 {
+          r.bit(); // res_coeff_s
+        }
+      }
+    }
+  }
+}
+
+/// `pps_3d_extension` (hevc/ps.c:1951-1973), which refuses nothing: a flag
+/// for each depth value, read one at a time there, skipped at once here.
+fn pps_3d_extension(r: &mut Reader<'_>) {
+  if !r.bit() {
+    // dlts_present_flag
+    return;
+  }
+  let layers = r.bits(6) + 1;
+  let bits = r.bits(4) + 8;
+  for _ in 0..layers {
+    // dlt_flag set, dlt_pred_flag clear
+    if r.bit() && !r.bit() {
+      if r.bit() {
+        r.skip(1 << bits); // dlt_value_flag
+      } else {
+        delta_dlt(r, bits);
+      }
+    }
+  }
+}
+
+/// `delta_dlt` (hevc/ps.c:1929-1949).
+fn delta_dlt(r: &mut Reader<'_>, bits: u32) {
+  let values = r.bits(bits);
+  if values == 0 {
+    return;
+  }
+  let max_diff = if values > 1 { r.bits(bits) } else { 0 };
+  let min_diff_minus1 = if values > 2 && max_diff != 0 {
+    r.bits(log2(max_diff) + 1) as i32
+  } else {
+    -1
+  };
+  // `unsigned` against `int`.
+  let floor = (min_diff_minus1 + 1) as u32;
+  if max_diff > floor {
+    let length = log2(max_diff - floor) + 1;
+    r.skip(u64::from(values - 1) * u64::from(length));
+  }
+}
+
+/// `pps_scc_extension` (hevc/ps.c:2015-2067): `false` where refused.
+fn pps_scc_extension(r: &mut Reader<'_>, sps: &HevcSps) -> bool {
+  r.bit(); // pps_curr_pic_ref_enabled_flag
+  if r.bit() {
+    // residual_adaptive_colour_transform_enabled_flag
+    r.bit(); // pps_slice_act_qp_offsets_present_flag
+    // Each an `int8_t` of a `get_se_golomb` less an `unsigned`.
+    let mut offsets = [0i8; 3];
+    for (offset, less) in offsets.iter_mut().zip([5u32, 5, 3]) {
+      *offset = (r.se() as u32).wrapping_sub(less) as i8;
+    }
+    if offsets.iter().any(|&offset| offset <= -12 || offset >= 12) {
+      return false;
+    }
+  }
+  if r.bit() {
+    // pps_palette_predictor_initializers_present_flag
+    let count = r.ue() as u8;
+    if count > 0 {
+      if count > 128 {
+        return false;
+      }
+      let monochrome = r.bit();
+      let luma = r.ue_31().wrapping_add(8) as u8;
+      if i32::from(luma) != sps.bit_depth {
+        return false;
+      }
+      let mut chroma = 0u8;
+      if !monochrome {
+        chroma = r.ue_31().wrapping_add(8) as u8;
+        if i32::from(chroma) != sps.bit_depth_chroma {
+          return false;
+        }
+      }
+      for depth in [luma, chroma, chroma]
+        .into_iter()
+        .take(if monochrome { 1 } else { 3 })
+      {
+        for _ in 0..count {
+          r.skip_field(u32::from(depth));
+        }
+      }
+    }
+  }
+  true
 }

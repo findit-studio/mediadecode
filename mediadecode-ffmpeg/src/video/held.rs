@@ -52,9 +52,11 @@ pub(super) enum Held {
 pub(super) struct Record {
   /// The record's bytes.
   pub(super) bytes: Vec<u8>,
-  /// Whether it carries a set this crate takes as stored without reading it
-  /// whole — an HEVC sequence or picture parameter set — which a strict open
-  /// must vouch for before a decoder opens on it.
+  /// Whether FFmpeg's own decoder, opened on it strictly, witnesses what it
+  /// carries before a decoder opens on it: an HEVC record carrying a
+  /// sequence or picture parameter set, which this crate reads as FFmpeg
+  /// reads it ([`params::hevc_sps`], [`params::hevc_pps`]), the strict open a
+  /// second witness.
   pub(super) strict: bool,
 }
 
@@ -181,7 +183,7 @@ impl Held {
   /// video, or may — one held in doubt among them.
   pub(super) fn declares_alpha(&self) -> bool {
     match self {
-      Self::Hevc(held) => held.vps.iter().flatten().any(|vps| vps.alpha),
+      Self::Hevc(held) => held.vps.iter().flatten().any(|vps| vps.read.alpha),
       Self::H264(_) | Self::Other => false,
     }
   }
@@ -866,29 +868,43 @@ struct HevcSet {
 }
 
 /// A video parameter set held.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct VideoHeld {
   set: Arc<HevcSet>,
-  /// Whether FFmpeg reads it as alpha video.
-  alpha: bool,
-  /// `vps_max_sub_layers`.
-  max_sub_layers: u8,
+  /// What FFmpeg stored of it ([`params::hevc_vps`]).
+  read: params::VpsRead,
+  /// Whether its reading ran past its payload: what FFmpeg stored of it
+  /// was read off the bytes after it, which a record changes.
+  past_end: bool,
+  /// Whether a sequence parameter set this table holds no id of may be
+  /// stored referring to it: one read while it was in doubt, refused before
+  /// its id was read against the set held here, which may not be the one
+  /// the decoder holds. Such a set goes where this one is replaced for
+  /// certain (`remove_vps`, hevc/ps.c:102-111).
+  orphans: bool,
   doubt: bool,
 }
 
-/// A sequence parameter set held: the video parameter set it refers to.
-#[derive(Clone, Debug)]
+/// A sequence parameter set held: the video parameter set it refers to, and
+/// what FFmpeg stored of it — `None` for one held in doubt that was read
+/// against a video parameter set held in doubt and refused there.
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct HevcSequenceHeld {
   set: Arc<HevcSet>,
   vps_id: u8,
+  facts: Option<params::HevcSps>,
   doubt: bool,
 }
 
-/// A picture parameter set held: the sequence parameter set it refers to.
-#[derive(Clone, Debug)]
+/// A picture parameter set held: the sequence parameter set it refers to,
+/// and whether its reading ran past its payload — FFmpeg stores it so, its
+/// last fields read off the bytes after it (hevc/ps.c:2458-2461), which a
+/// record changes.
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct HevcPictureHeld {
   set: Arc<HevcSet>,
   sps_id: u8,
+  past_end: bool,
   doubt: bool,
 }
 
@@ -930,48 +946,14 @@ impl Hevc {
   fn same(&self, other: &Self) -> bool {
     self.nal_length() == other.nal_length()
       && self.framing_doubt == other.framing_doubt
-      && self
-        .vps
-        .iter()
-        .zip(other.vps.iter())
-        .all(|pair| match pair {
-          (None, None) => true,
-          (Some(a), Some(b)) => {
-            *a.set == *b.set
-              && a.alpha == b.alpha
-              && a.max_sub_layers == b.max_sub_layers
-              && a.doubt == b.doubt
-          }
-          _ => false,
-        })
-      && self
-        .sps
-        .iter()
-        .zip(other.sps.iter())
-        .all(|pair| match pair {
-          (None, None) => true,
-          (Some(a), Some(b)) => *a.set == *b.set && a.vps_id == b.vps_id && a.doubt == b.doubt,
-          _ => false,
-        })
-      && self
-        .pps
-        .iter()
-        .zip(other.pps.iter())
-        .all(|pair| match pair {
-          (None, None) => true,
-          (Some(a), Some(b)) => *a.set == *b.set && a.sps_id == b.sps_id && a.doubt == b.doubt,
-          _ => false,
-        })
+      && self.vps == other.vps
+      && self.sps == other.sps
+      && self.pps == other.pps
   }
 
   fn doubt_since(&mut self, proven: &Self) {
     for id in 0..self.vps.len() {
-      let same = match (&self.vps[id], &proven.vps[id]) {
-        (None, None) => true,
-        (Some(a), Some(b)) => *a.set == *b.set && a.doubt == b.doubt,
-        _ => false,
-      };
-      if !same {
+      if self.vps[id] != proven.vps[id] {
         let entry = self.vps[id].clone().or_else(|| proven.vps[id].clone());
         self.vps[id] = entry.map(|entry| VideoHeld {
           doubt: true,
@@ -980,17 +962,12 @@ impl Hevc {
       }
     }
     for id in 0..self.sps.len() {
-      let same = match (&self.sps[id], &proven.sps[id]) {
-        (None, None) => true,
-        (Some(a), Some(b)) => *a.set == *b.set && a.vps_id == b.vps_id && a.doubt == b.doubt,
-        _ => false,
-      };
       let refers_to_doubt = self.sps[id].as_ref().is_some_and(|sps| {
         self.vps[usize::from(sps.vps_id)]
           .as_ref()
           .is_none_or(|vps| vps.doubt)
       });
-      if !same || refers_to_doubt {
+      if self.sps[id] != proven.sps[id] || refers_to_doubt {
         let entry = self.sps[id].clone().or_else(|| proven.sps[id].clone());
         self.sps[id] = entry.map(|entry| HevcSequenceHeld {
           doubt: true,
@@ -999,17 +976,12 @@ impl Hevc {
       }
     }
     for id in 0..self.pps.len() {
-      let same = match (&self.pps[id], &proven.pps[id]) {
-        (None, None) => true,
-        (Some(a), Some(b)) => *a.set == *b.set && a.sps_id == b.sps_id && a.doubt == b.doubt,
-        _ => false,
-      };
       let refers_to_doubt = self.pps[id].as_ref().is_some_and(|pps| {
         self.sps[usize::from(pps.sps_id)]
           .as_ref()
           .is_none_or(|sps| sps.doubt)
       });
-      if !same || refers_to_doubt {
+      if self.pps[id] != proven.pps[id] || refers_to_doubt {
         let entry = self.pps[id].clone().or_else(|| proven.pps[id].clone());
         self.pps[id] = entry.map(|entry| HevcPictureHeld {
           doubt: true,
@@ -1029,11 +1001,26 @@ impl Hevc {
       return Ok(None);
     }
     if self.framing_doubt
-      || self.vps.iter().flatten().any(|vps| vps.doubt)
+      || self
+        .vps
+        .iter()
+        .flatten()
+        .any(|vps| vps.doubt || vps.orphans)
       || self.sps.iter().flatten().any(|sps| sps.doubt)
       || self.pps.iter().flatten().any(|pps| pps.doubt)
     {
       return Err(Unrecordable::Unknown);
+    }
+    // A set FFmpeg read past its payload holds what it read off the bytes
+    // after it, which a record changes: a video parameter set stored where
+    // its id held nothing (hevc/ps.c:944-952), a picture parameter set
+    // stored with a warning (2458-2461). FFmpeg refuses a sequence parameter
+    // set read so (1711-1716).
+    if self.vps.iter().flatten().any(|vps| vps.past_end) {
+      return Err(Unrecordable::PastEnd(ParameterSet::Video));
+    }
+    if self.pps.iter().flatten().any(|pps| pps.past_end) {
+      return Err(Unrecordable::PastEnd(ParameterSet::Picture));
     }
     let arrays: [(u8, ParameterSet, Vec<&HevcSet>); 3] = [
       (
@@ -1113,12 +1100,18 @@ fn hvcc(record: &[u8]) -> bool {
 /// What FFmpeg made of one HEVC parameter set a reading met.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Read {
-  /// Stored, or kept: the reading goes on.
+  /// Stored, kept, or dropped with no error: the reading goes on.
   Taken,
   /// Refused; `aborts` where the error is other than invalid data, which
   /// ends a decoder's reading of the packet (`decode_nal_unit`,
   /// hevc/hevcdec.c:3665-3672).
   Refused { aborts: bool },
+  /// What FFmpeg does with the set cannot be told: it is read against a set
+  /// held in doubt. The set is held in doubt; so is whether the reading goes
+  /// on, where a refusal would end it — any refusal in an extradata buffer,
+  /// in a packet one other than invalid data, which `may_end` says the set
+  /// can be refused with.
+  Unknown { may_end: bool },
 }
 
 /// A reading's view of an HEVC decoder's sets: `base` until the reading
@@ -1221,10 +1214,8 @@ impl<'a> HevcWrite<'a> {
   ///
   /// A unit whose parser this crate does not run — an SEI message, in a
   /// packet a slice — may end the reading: the sets after one are taken in
-  /// doubt. A video parameter set after a sequence or picture parameter set
-  /// is too, as the alpha reading has it (`params::VpsTable`): a sequence or
-  /// picture parameter set is read as far as its ids and taken as stored,
-  /// the rest vouched for where a record carries it ([`Record::strict`]).
+  /// doubt, as are the sets after one whose reading cannot be told
+  /// ([`Read::Unknown`]).
   fn read(&mut self, mem: &[u8], length: usize, nal_length: Option<usize>, extradata: bool) {
     let mut units = Walk::new(
       mem,
@@ -1238,34 +1229,26 @@ impl<'a> HevcWrite<'a> {
       return;
     }
     let mut scratch = Vec::new();
-    let (mut vps_certain, mut set_certain) = (true, true);
+    let mut certain = true;
     while let Some(Ok(unit)) = units.next() {
       let read = match unit.kind {
-        32 => self.vps(&units, &unit, &mut scratch, vps_certain),
-        33 => {
-          vps_certain = false;
-          self.sps(&units, &unit, &mut scratch, set_certain)
-        }
-        34 => {
-          vps_certain = false;
-          self.pps(&units, &unit, &mut scratch, set_certain)
-        }
+        32 => self.vps(&units, &unit, &mut scratch, certain),
+        33 => self.sps(&units, &unit, &mut scratch, certain),
+        34 => self.pps(&units, &unit, &mut scratch, certain),
         39 | 40 => {
-          vps_certain = false;
-          set_certain = false;
+          certain = false;
           Read::Taken
         }
         0..=9 | 16..=21 if !extradata => {
-          vps_certain = false;
-          set_certain = false;
+          certain = false;
           Read::Taken
         }
         _ => Read::Taken,
       };
-      if let Read::Refused { aborts } = read
-        && (extradata || aborts)
-      {
-        return;
+      match read {
+        Read::Refused { aborts } if extradata || aborts => return,
+        Read::Unknown { may_end } if extradata || may_end => certain = false,
+        Read::Taken | Read::Refused { .. } | Read::Unknown { .. } => {}
       }
     }
   }
@@ -1329,21 +1312,25 @@ impl<'a> HevcWrite<'a> {
     }
     edit.vps[id] = Some(VideoHeld {
       set,
-      alpha: read.alpha,
-      max_sub_layers: read.max_sub_layers,
+      read,
+      past_end,
+      // What may refer to the set replaced goes only where it is replaced
+      // for certain.
+      orphans: !replaces && held.is_some_and(|held| held.orphans),
       doubt,
     });
     Read::Taken
   }
 
   /// `ff_hevc_decode_nal_sps` (hevc/ps.c:1735-1786) on the sequence parameter
-  /// set `unit`, read as far as its id (`ff_hevc_parse_sps`, 1239-1294): the
-  /// video parameter set it refers to must be held, its sub-layers within
-  /// that one's, its profile, tier and level read whole — a failure there
-  /// ends a packet's reading (`parse_ptl`'s -1, 337-381) — and its id under
-  /// 16. Taken as stored past that: an identical set changes nothing
-  /// (`compare_sps`, 1729-1733, 1774-1780), any other drops the picture
-  /// parameter sets that refer to its id (`remove_sps`, 89-100).
+  /// set `unit`, read whole ([`params::hevc_sps`]) against the video
+  /// parameter set held under its id, which must be held (1252-1258): an
+  /// identical set changes nothing (`compare_sps`, 1729-1733, 1774-1780),
+  /// any other drops the picture parameter sets that refer to its id
+  /// (`remove_sps`, 89-100). Read against a video parameter set held in
+  /// doubt, what FFmpeg does with it cannot be told: the set is held in
+  /// doubt under its id, or, where the reading did not reach its id, the
+  /// video parameter set is held as one a set of an unknown id may refer to.
   fn sps(
     &mut self,
     walk: &Walk<'_>,
@@ -1357,27 +1344,51 @@ impl<'a> HevcWrite<'a> {
     let Some(vps) = self.now().vps[vps_id].clone() else {
       return Read::Refused { aborts: false };
     };
-    let mut max_sub_layers = reader.bits(3) as u8 + 1;
-    let multi_layer = unit.layer > 0 && max_sub_layers == 8;
-    if multi_layer {
-      max_sub_layers = vps.max_sub_layers;
-    }
-    if max_sub_layers > vps.max_sub_layers {
-      return Read::Refused { aborts: false };
-    }
-    if !multi_layer {
-      reader.bit(); // sps_temporal_id_nesting_flag
-      if !params::parse_ptl(&mut reader, true, i32::from(max_sub_layers)) {
-        return Read::Refused { aborts: true };
-      }
-    }
-    let id = reader.ue_long() as usize;
-    if id >= 16 {
-      return Read::Refused { aborts: false };
-    }
+    let parsed = params::hevc_sps(&mut reader, unit.layer, &vps.read);
     let size = ((unit.size_bits + 7) >> 3) as usize;
     let identity = memory.get(..size).unwrap_or(memory);
-    let doubt = !certain || vps.doubt;
+    let set = || {
+      Arc::new(HevcSet {
+        unit: Bytes::of(unit.raw()),
+        identity: Bytes::of(identity),
+      })
+    };
+    if vps.doubt {
+      let id = match parsed {
+        Ok(read) => Some(read.id),
+        Err(refused) => refused.id,
+      };
+      let edit = self.edit();
+      match id.map(usize::from) {
+        Some(id) => {
+          edit.sps_in_doubt(id);
+          if edit.sps[id].is_none() {
+            edit.sps[id] = Some(HevcSequenceHeld {
+              set: set(),
+              vps_id: vps_id as u8,
+              facts: parsed.ok(),
+              doubt: true,
+            });
+          }
+        }
+        None => {
+          if let Some(vps) = &mut edit.vps[vps_id] {
+            vps.orphans = true;
+          }
+        }
+      }
+      return Read::Unknown { may_end: true };
+    }
+    let read = match parsed {
+      Ok(read) => read,
+      Err(refused) => {
+        return Read::Refused {
+          aborts: refused.aborts,
+        };
+      }
+    };
+    let id = usize::from(read.id);
+    let doubt = !certain;
     let held = self.now().sps[id].clone();
     let identical = held
       .as_ref()
@@ -1385,10 +1396,6 @@ impl<'a> HevcWrite<'a> {
     if identical && held.as_ref().is_some_and(|held| !held.doubt || doubt) {
       return Read::Taken;
     }
-    let set = Arc::new(HevcSet {
-      unit: Bytes::of(unit.raw()),
-      identity: Bytes::of(identity),
-    });
     let replaces = held.as_ref().is_none_or(|held| !held.doubt) && !doubt && !identical;
     let edit = self.edit();
     if replaces {
@@ -1397,17 +1404,23 @@ impl<'a> HevcWrite<'a> {
       edit.sps_in_doubt(id);
     }
     edit.sps[id] = Some(HevcSequenceHeld {
-      set,
+      set: set(),
       vps_id: vps_id as u8,
+      facts: Some(read),
       doubt,
     });
     Read::Taken
   }
 
-  /// `ff_hevc_decode_nal_pps` (hevc/ps.c:2201-2271) on the picture parameter
-  /// set `unit`, read as far as its ids: an id under 64, an identical set
-  /// changing nothing (2219-2223), a sequence parameter set id under 16 that
-  /// is held. Taken as stored past that.
+  /// `ff_hevc_decode_nal_pps` (hevc/ps.c:2201-2471) on the picture parameter
+  /// set `unit`: an id under 64, an identical set changing nothing
+  /// (2219-2223), a sequence parameter set id under 16 that is held
+  /// (2248-2258), then the rest read whole ([`params::hevc_pps`]) against
+  /// that set and the video parameter set held under its id — a set read
+  /// past its payload stored as such. Read against a set held in doubt, what
+  /// FFmpeg does with it cannot be told: it is held in doubt. FFmpeg refuses
+  /// a picture parameter set only with invalid data, which ends no packet's
+  /// reading.
   fn pps(
     &mut self,
     walk: &Walk<'_>,
@@ -1437,15 +1450,31 @@ impl<'a> HevcWrite<'a> {
     let Some(sps) = self.now().sps[sps_id].clone() else {
       return Read::Refused { aborts: false };
     };
-    let set = Arc::new(HevcSet {
-      unit: Bytes::of(unit.raw()),
-      identity: Bytes::of(identity),
-    });
+    let vps = self.now().vps[usize::from(sps.vps_id)].clone();
+    let verdict = match (&sps.facts, &vps) {
+      (Some(facts), Some(vps)) if !sps.doubt && !vps.doubt => {
+        Some(params::hevc_pps(&mut reader, facts, vps.read.max_layers()))
+      }
+      _ => None,
+    };
+    let (past_end, doubt) = match verdict {
+      Some(params::HevcPps::Refused) => return Read::Refused { aborts: false },
+      Some(params::HevcPps::Dropped) => return Read::Taken,
+      Some(params::HevcPps::Stored { past_end }) => (past_end, !certain),
+      None => (false, true),
+    };
     self.edit().pps[id] = Some(HevcPictureHeld {
-      set,
+      set: Arc::new(HevcSet {
+        unit: Bytes::of(unit.raw()),
+        identity: Bytes::of(identity),
+      }),
       sps_id: sps_id as u8,
-      doubt: !certain || sps.doubt,
+      past_end,
+      doubt,
     });
+    if verdict.is_none() {
+      return Read::Unknown { may_end: false };
+    }
     Read::Taken
   }
 }

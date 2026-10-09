@@ -9791,11 +9791,14 @@ fn a_video_parameter_set_on_a_packet_that_is_no_keyframe_is_read() {
 /// ends before `direct_dependency_flag`, the auxiliary mask and the second
 /// layer's id read. With nothing of id 5 held, FFmpeg's reader goes on past
 /// the end and keeps the set as alpha video (hevc/ps.c:921-934, 944-952):
-/// the CRA anchors nothing and the end escalates by name. With the codec
-/// parameters' extradata holding a one-layer set of id 5 — the decoder
-/// serving opened on it — FFmpeg refuses the set read past its end
-/// (ps.c:944-949): the CRA anchors and the end is clean. Read by a reader
-/// that stops at a set's end, the first resynced at the CRA.
+/// the session reads it so, for good, and — since R18 — no decoder can be
+/// opened fresh holding a set whose tail was read off the bytes after it,
+/// which a record changes: the post-commit fallback is refused by name,
+/// `PastEnd(Video)`. With the codec parameters' extradata holding a
+/// one-layer set of id 5 — the decoder serving opened on it — FFmpeg refuses
+/// the set read past its end (ps.c:944-949): the CRA anchors and the end is
+/// clean. Read by a reader that stops at a set's end, the first read no
+/// alpha and resynced at the CRA.
 #[test]
 fn a_video_parameter_set_read_past_its_end_is_stored_only_under_an_id_held_by_nothing() {
   const AUXILIARY: u16 = 1 << (15 - 3);
@@ -9829,16 +9832,31 @@ fn a_video_parameter_set_read_past_its_end_is_stored_only_under_an_id_held_by_no
       packets: packets.clone(),
     };
     let (dec, delivered, escalated) = through_a_post_commit_failure(&with, at);
+    if declares {
+      // Read as alpha video, as FFmpeg keeps it; and no decoder can be opened
+      // fresh holding it, its tail read off the bytes after it, which a record
+      // changes.
+      assert!(dec.hevc_alpha, "{name}: read as alpha video");
+      assert!(
+        !dec.is_software(),
+        "{name}: the post-commit fallback refused"
+      );
+      assert_eq!(
+        dec.held.record(
+          crate::CodecId::HEVC.raw(),
+          &extradata_of(&with.parameters),
+          None
+        ),
+        Err(crate::Unrecordable::PastEnd(crate::ParameterSet::Video)),
+        "{name}: by name"
+      );
+      continue;
+    }
     assert!(dec.is_software(), "{name}: the hardware failed post-commit");
-    assert_eq!(
-      escalated, declares,
-      "{name}: the end escalates {declares}: {delivered:?}"
-    );
-    assert_eq!(
+    assert!(!escalated, "{name}: the end is clean: {delivered:?}");
+    assert!(
       delivered.iter().any(|&(_, open)| !open),
-      !declares,
-      "{name}: a picture closes the gap {}: {delivered:?}",
-      !declares
+      "{name}: a picture closes the gap: {delivered:?}"
     );
   }
 }
@@ -11280,5 +11298,138 @@ fn a_record_body_is_judged_after_the_packet_s_own_record() {
     sent_through(&mut dec, &mut dst, av_pkt);
     let (_, escalated) = drained(&mut dec, &mut dst);
     assert!(!escalated, "the stream after it decodes");
+  }
+}
+
+// ---------------------------------------------------------------------------
+//  R18 row 3: an HEVC picture parameter set read past its end has no record
+// ---------------------------------------------------------------------------
+
+/// The raw byte sequence payload of the NAL unit `unit` past its
+/// `header`-byte header, in `0`s and `1`s: its emulation prevention bytes
+/// removed, its `rbsp_stop_one_bit` and the zeros after it dropped.
+fn rbsp_payload_bits(unit: &[u8], header: usize) -> String {
+  let mut bytes = Vec::new();
+  let mut zeros = 0;
+  for &byte in &unit[header..] {
+    if zeros >= 2 && byte == 3 {
+      zeros = 0;
+      continue;
+    }
+    bytes.push(byte);
+    zeros = if byte == 0 { zeros + 1 } else { 0 };
+  }
+  let bits: String = bytes.iter().map(|byte| format!("{byte:08b}")).collect();
+  let stop = bits.rfind('1').expect("a stop bit");
+  bits[..stop].to_owned()
+}
+
+/// LAW (R18 row 3; Codex R17 [high]): **an HEVC picture parameter set FFmpeg
+/// reads past its end is held so, and no decoder is opened fresh on a record
+/// carrying it.** `ff_hevc_decode_nal_pps` stores such a set with a warning,
+/// its last fields read off the bytes after it (hevc/ps.c:2458-2461), which
+/// a record changes. An `x265` stream (128x96, an IDR every 8, its sets in
+/// its codec parameters alone), a packet of its own between 15 and the IDR
+/// — 17 then — carrying a PPS 1: the record's PPS 0 under id 1, whole; or
+/// the same cut before its last bit, `pps_extension_present_flag`, which
+/// FFmpeg reads off the stop bit and reads the extension's flags after it
+/// past the end. On a probe-era fallback at 10 on three threads, the whole
+/// one is carried by a record synthesized at the switch at 17, read back and
+/// opened strictly, and the session switches; the cut one has no record —
+/// `PastEnd(Picture)` — and the switch is declined, the one-thread decoder
+/// serving on: every picture comes out as a straight decode gives it either
+/// way. The hardware failing post-commit at 17, the cold decoder opens
+/// holding the whole one, and is refused by name for the cut one. Read as far
+/// as its ids, the cut set was held as stored, and a record carrying it was
+/// synthesized and taken.
+#[test]
+fn an_hevc_picture_parameter_set_read_past_its_end_has_no_record() {
+  use super::held::Held;
+  let hevc = crate::CodecId::HEVC.raw();
+  let params = "keyint=8:min-keyint=8:scenecut=0:bframes=0:open-gop=0:log-level=error";
+  let clip = encode_hevc_global(128, 96, 32, params);
+  let record = extradata_of(&clip.parameters);
+  let pps0 = annexb_units(&record)
+    .into_iter()
+    .find(|unit| (unit[0] >> 1) & 0x3f == 34)
+    .expect("the record's PPS")
+    .to_vec();
+  let bits = rbsp_payload_bits(&pps0, 2);
+  assert!(
+    bits.starts_with('1') && bits.ends_with('0'),
+    "PPS 0, its pps_extension_present_flag clear and last"
+  );
+  let whole = nal_unit_of_bits(&pps0[..2], &(ue_bits(1) + &bits[1..]));
+  let cut = nal_unit_of_bits(&pps0[..2], &(ue_bits(1) + &bits[1..bits.len() - 1]));
+  let three = core::num::NonZeroU32::new(3).expect("nonzero");
+  let held = Held::opened_on(hevc, &record);
+  for (name, pps, past_end) in [("whole", &whole, false), ("cut", &cut, true)] {
+    let carrying = [&[0, 0, 0, 1][..], pps].concat();
+    let after = held
+      .after_packet(None, Some(&carrying))
+      .expect("PPS 1 stored");
+    assert!(after.holds_pps(1), "{name}: PPS 1 held");
+    match after.record(hevc, &record, None) {
+      Err(crate::Unrecordable::PastEnd(crate::ParameterSet::Picture)) if past_end => {}
+      Ok(Some(_)) if !past_end => {}
+      other => panic!("{name}: {other:?}"),
+    }
+
+    let mut packets = clip.packets[..16].to_vec();
+    packets.push(Packet::copy(&carrying));
+    packets.extend(clip.packets[16..].iter().cloned());
+    let with = SyntheticClip {
+      parameters: clip.parameters.clone(),
+      packets,
+    };
+    assert!(with.packets[17].is_key(), "17 is an IDR");
+    let reference = straight(&with);
+    assert_eq!(reference.len(), 32, "{name}: the straight decode is whole");
+    let session = session_of(
+      behind_a_probe(&with, 10, crate::Threads::Count(three)),
+      &with,
+      |_, _| {},
+    );
+    assert_eq!(
+      session.threads[17],
+      Some(if past_end {
+        core::num::NonZeroU32::MIN
+      } else {
+        three
+      }),
+      "{name}: the switch at 17 fires where a record carries PPS 1"
+    );
+    assert!(
+      session.errors.is_empty(),
+      "{name}: no error: {:?}",
+      session.errors
+    );
+    assert!(
+      session.pictures == reference,
+      "{name}: every picture, as the straight decode"
+    );
+    let failed = session_of(behind_a_failure_at(&with, 17), &with, |_, _| {});
+    if past_end {
+      assert!(
+        failed
+          .errors
+          .iter()
+          .any(|error| error.starts_with("send 17:")
+            && error.contains("SetsUnrecordable")
+            && error.contains("PastEnd(Picture)")),
+        "{name}: the post-commit fallback refused by name: {:?}",
+        failed.errors
+      );
+    } else {
+      assert!(
+        failed.errors.is_empty(),
+        "{name}: no error, the end clean: {:?}",
+        failed.errors
+      );
+      assert!(
+        from_pts(&failed.pictures, 16) == from_pts(&reference, 16),
+        "{name}: every picture from 17 on, as the straight decode"
+      );
+    }
   }
 }
