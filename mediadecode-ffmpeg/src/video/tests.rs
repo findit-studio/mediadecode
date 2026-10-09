@@ -10780,3 +10780,96 @@ fn a_record_s_picture_parameter_set_is_read_against_the_sets_the_decoder_holds()
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+//  R17 row 7: a refusal collected with a picture is reported before it
+// ---------------------------------------------------------------------------
+
+/// Receives from `dec` until it answers a refusal, sending `clip`'s next
+/// packet whenever it needs input; answers the refused picture's `pts`. A
+/// picture delivered first is the failure this guards against.
+fn receive_to_the_refusal(
+  dec: &mut FfmpegVideoStreamDecoder,
+  dst: &mut VideoFrame<mediadecode::PixelFormat, VideoFrameExtra, FfmpegBytes>,
+  clip: &SyntheticClip,
+  next: &mut usize,
+) -> Option<i64> {
+  loop {
+    match dec.receive_frame(dst) {
+      Err(VideoDecodeError::Decode(Error::FrameBudgetExceeded(refused))) => {
+        return refused.pts();
+      }
+      Ok(Received::Frame) => panic!(
+        "a picture ({:?}) delivered before the refusal collected with it",
+        dst.pts()
+      ),
+      Ok(Received::NeedsInput) => {
+        crate::accepted(
+          dec.send_packet(&pushed(&clip.packets[*next])),
+          "send_packet",
+        );
+        *next += 1;
+      }
+      other => panic!("unexpected: {other:?}"),
+    }
+  }
+}
+
+/// LAW (R17 row 7; Codex R16 [medium]): **on frame threads a refusal
+/// collected with a picture is reported before that picture, which waits for
+/// the next receive, and a seek after it cannot erase it.** FFmpeg's H.264
+/// decoder on three threads; a worker records the refusal of the picture of
+/// `pts` 10 while FFmpeg hands out the next picture (scripted:
+/// `receive_refusal`). The receive answers `FrameBudgetExceeded` naming `pts`
+/// 10, by itself, and the next one delivers the picture; armed again for
+/// `pts` 11 with the caller seeking right after the refusal, it was reported
+/// all the same, and the stream sent again from the seek decodes to a clean
+/// end. Delivered first, the picture went out and the seek cleared the
+/// refusal unreported.
+#[test]
+fn on_frame_threads_a_refusal_collected_with_a_picture_is_reported_before_it() {
+  let clip = encode_h264_all_intra(128, 96, 12);
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let three = core::num::NonZeroU32::new(3).expect("nonzero");
+  let mut dec = FfmpegVideoStreamDecoder::open_as(
+    clip.parameters.clone(),
+    tb,
+    DecoderLimits::default().with_threads(crate::Threads::Count(three)),
+    DecodePath::Software,
+  )
+  .expect("the software road opens");
+  assert_eq!(dec.active_threads(), Some(three), "frame threads");
+  let mut dst = crate::empty_owned_video_frame();
+  let mut next = 0;
+  super::receive_refusal::arm(4096, 10);
+  assert_eq!(
+    receive_to_the_refusal(&mut dec, &mut dst, &clip, &mut next),
+    Some(10),
+    "the refusal first, naming its pts"
+  );
+  assert!(
+    matches!(dec.receive_frame(&mut dst), Ok(Received::Frame)),
+    "the picture it came with waited for the next receive"
+  );
+  super::receive_refusal::arm(4096, 11);
+  assert_eq!(
+    receive_to_the_refusal(&mut dec, &mut dst, &clip, &mut next),
+    Some(11),
+    "reported before the seek"
+  );
+  dec.flush().expect("the seek");
+  let mut log = Vec::new();
+  for av_pkt in &clip.packets {
+    crate::accepted(dec.send_packet(&pushed(av_pkt)), "send_packet");
+    answered(&mut dec, &mut dst, &mut log);
+  }
+  crate::accepted(dec.send_eof(), "send_eof");
+  answered(&mut dec, &mut dst, &mut log);
+  assert_eq!(refusals_in(&log), 0, "nothing more refused: {log:?}");
+  assert_eq!(
+    pictures_in(&log).len(),
+    clip.packets.len(),
+    "every picture after the seek: {log:?}"
+  );
+  assert_eq!(log.last(), Some(&Answer::Ended), "a clean end: {log:?}");
+}

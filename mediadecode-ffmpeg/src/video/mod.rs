@@ -998,6 +998,36 @@ pub(crate) mod replay_fault {
   }
 }
 
+/// Test-only: a refusal a frame thread's worker records while the next
+/// receive that gives a picture waits for it — what a worker declining the
+/// picture of one packet while FFmpeg hands out the next one's looks like to
+/// the session.
+#[cfg(test)]
+pub(crate) mod receive_refusal {
+  use core::cell::Cell;
+
+  std::thread_local! {
+    static ARMED: Cell<Option<crate::ffi::FrameRefusal>> = const { Cell::new(None) };
+  }
+
+  /// The next receive that gives a picture records a refusal of a picture
+  /// of `bytes` and `pts`, as a worker would during it.
+  pub(crate) fn arm(bytes: u64, pts: i64) {
+    ARMED.with(|armed| {
+      armed.set(Some(crate::ffi::FrameRefusal {
+        bytes,
+        audio: false,
+        pts: Some(pts),
+      }));
+    });
+  }
+
+  /// The refusal armed, once.
+  pub(super) fn take() -> Option<crate::ffi::FrameRefusal> {
+    ARMED.with(Cell::take)
+  }
+}
+
 /// Test-only: answers a software decoder gives the end of the stream
 /// before it is told — back pressure, or a refusal — scripted in order, the
 /// decoder itself told once the script is spent.
@@ -1092,6 +1122,12 @@ impl SwDecoder {
     refusals: &mut Refusals,
   ) -> Result<(), ffmpeg_next::Error> {
     let received = self.decoder.receive_frame(frame);
+    #[cfg(test)]
+    if received.is_ok()
+      && let Some(refusal) = receive_refusal::take()
+    {
+      crate::ffi::push_frame_refusal(self.state(), refusal);
+    }
     self.collect_refusals(refusals);
     received
   }
@@ -4117,6 +4153,16 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
                 let error = crate::decoder::software_exit(st, refusal);
                 self.failed_on_receive(refusal);
                 return Err(VideoDecodeError::Decode(error));
+              }
+              // A refusal collected with this picture — a frame thread's
+              // worker's, made while FFmpeg handed out this one — comes first,
+              // by itself: this one waits in the scratch holding for the next
+              // receive, so no flush between can erase a refusal the caller
+              // was never told of behind a picture it was.
+              if let Some(refusal) = self.refusals.pop() {
+                return Err(VideoDecodeError::Decode(Error::FrameBudgetExceeded(
+                  refusal,
+                )));
               }
               // SAFETY: the scratch frame is live (just filled by
               // `receive_frame`); convert takes what it needs out of
