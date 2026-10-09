@@ -388,6 +388,22 @@ fn a_count_past_2_53_is_refused_rather_than_read_rounded() {
 }
 
 #[test]
+fn a_count_the_export_writes_is_refused_before_any_search() {
+  // The gap before `a`, 2^53 + 1 frames at the edit rate: no ruler the
+  // search tries changes a record-side count, so none is walked, and the
+  // refusal names no search.
+  let refusal = match to_otio(&at_one_fps(TWO_53 + 1, TWO_53 + 2), OtioTarget::V0_15Plus) {
+    Err(Refused::NotRepresentable(refusal)) => refusal,
+    other => panic!("{other:?}"),
+  };
+  assert_eq!(refusal.searched(), None);
+  assert!(
+    alloc::string::ToString::to_string(&refusal).ends_with("does not hold exactly"),
+    "{refusal}"
+  );
+}
+
+#[test]
 fn a_media_range_whose_end_is_past_2_53_is_refused() {
   // The source range [2^53 - 1, 2^53 + 1): its start and its length are
   // held, the end OpenTimelineIO adds up from them is not, and in whole
@@ -558,23 +574,38 @@ fn every_count_in_the_goldens_is_one_an_f64_holds_exactly() {
 #[test]
 fn a_refusal_to_export_says_why() {
   let shown = |refused: Refused| alloc::string::ToString::to_string(&refused);
+  // A count the export would write: refused before any walk, no search
+  // made for it.
   assert_eq!(
     shown(Refused::NotRepresentable(NotRepresentable {
       at: Spot::Record(ClipAt::new(0, 0)),
       value: 9_007_199_254_740_993,
       rate: Rate::hz(1),
+      searched: None,
     })),
     "the gap before track 0, clip 0 counts 9007199254740993 ticks of 1/1 s, which \
      OpenTimelineIO's f64 does not hold exactly"
   );
+  // A count OpenTimelineIO derives: refused after the search, which says it
+  // was bounded and how.
   assert_eq!(
     shown(Refused::NotRepresentable(NotRepresentable {
       at: Spot::TrackPosition(ChildAt::new(0, 1)),
       value: 27_021_597_764_222_973,
       rate: Rate::hz(3),
+      searched: Some(RulerSearch { walks: 3 }),
     })),
     "the place of track 0, child 1 counts 27021597764222973 ticks of 1/3 s, which \
-     OpenTimelineIO's f64 does not hold exactly"
+     OpenTimelineIO's f64 does not hold exactly, in the last of 3 plans the bounded search \
+     walked, trying each clip in its own ruler, every ruler the timeline's operands are counted \
+     in that holds it, the 64 finest whole rates below its own that hold it, and the 64 \
+     coarsest whole rates below its own that hold it"
+  );
+  assert_eq!(
+    alloc::string::ToString::to_string(&RulerSearch { walks: 1 }),
+    "the one plan the bounded search walked, trying each clip in its own ruler, every ruler the \
+     timeline's operands are counted in that holds it, the 64 finest whole rates below its own \
+     that hold it, and the 64 coarsest whole rates below its own that hold it"
   );
   assert_eq!(
     shown(Refused::Validation(alloc::vec![

@@ -1109,3 +1109,358 @@ fn a_clip_only_its_neighbours_ruler_holds_is_written_in_it() {
     );
   }
 }
+
+/// One clip `a`, `ticks` ticks of 1/127 s from the first — a multiple of
+/// 127, so its record is a whole number of edit-rate ticks — its medium
+/// stated at `stated` fps, so planned in those frames, on a timeline at
+/// `edit` fps, prime to 127, from `start`. Neither the edit rate nor 1 holds
+/// a 127th of a second, so `a` has no named ruler, and its coarsest whole
+/// ruler is 127: its free rulers are 127 · m below `stated`.
+fn from_a_tick(stated: i32, edit: i32, ticks: i64, start: i64) -> Timeline {
+  let at = tb(1, edit);
+  let mut a = placed(
+    "a",
+    TimeRange::new(1, 1 + ticks, tb(1, 127)),
+    TimeRange::new(0, ticks / 127 * i64::from(edit), at),
+  );
+  a.media_mut().set_rate(Some(Rate::hz(stated)));
+  Timeline::new("t", Rate::hz(edit))
+    .with_start(Timestamp::new(start, at))
+    .with_track(video([a]))
+}
+
+/// The end of [`from_a_tick`]'s clip from the global start, as
+/// OpenTimelineIO's `operator+` reads it, were the clip written in 127 · `m`
+/// fps: its `ticks · m` rescaled into the edit rate, `(value · rate) /
+/// from`, and added.
+fn end_from(global: Read, ticks: i64, m: i64) -> f64 {
+  global
+    .plus(Read {
+      value: (ticks * m) as f64,
+      rate: (127 * m) as f64,
+    })
+    .value
+}
+
+/// Asserts that OpenTimelineIO's `read`, a double of 2^52 or more and so a
+/// whole number, lies less than half a tick from `num / den` ticks: read to
+/// the nearest tick, it is the exact count.
+fn within_half_a_tick(read: Read, num: i128, den: i128) {
+  assert!(read.value >= 4_503_599_627_370_496.0, "{read:?}");
+  let off = (read.value as i128 * den - num).unsigned_abs();
+  assert!(2 * off < den.unsigned_abs(), "{read:?} for {num}/{den}");
+}
+
+/// Codex round 6's `M`: ticks of 1/127 s, a multiple of 127, whose 101-fold
+/// lies within 2^53.
+const M6: i64 = 89_058_727_916_224;
+
+#[test]
+fn a_clip_the_coarsest_free_rulers_misread_is_written_in_the_finest_band() {
+  // Codex round 6's case: at 12 701 fps from 10^14, `a` runs M6 ticks of
+  // 1/127 s from the first, its medium stated at 12 827 = 101 · 127 fps. In
+  // its plan's frames its end from the global start lies past 2^53; its
+  // free rulers are 127 · m, m = 1 … 100. From each of the 64 coarsest
+  // OpenTimelineIO reads that end a tick late. The finest band, the 64 just
+  // below its plan's, holds rulers that read it exactly: every odd m from
+  // 65 — 8 255 = 65 · 127 fps, Codex's, among them — and the search, finest
+  // first, writes `a` in the first it reaches, 12 573 = 99 · 127.
+  let (edit, start) = (12_701, 100_000_000_000_000);
+  let text = to_otio(&from_a_tick(12_827, edit, M6, start), OtioTarget::V0_15Plus).unwrap();
+  assert_eq!(validate_json(&text, OtioTarget::V0_15Plus), Ok(()));
+  let ruler = |value: i64| Read {
+    value: value as f64,
+    rate: 12_573.0,
+  };
+  let kids = kids(&text, 0);
+  let Kid::Item {
+    start: from,
+    duration,
+  } = kids[0]
+  else {
+    panic!("{kids:?}");
+  };
+  assert_eq!((from, duration), (ruler(99), ruler(99 * M6)));
+  // Read back: its end from the global start by `operator+`, exactly; the
+  // end of a range of the track's duration from it, carried in 12 573ths,
+  // and that range's last tick, each to the nearest tick.
+  let root = json::parse(&text).unwrap();
+  let global = read(&member(&root, "global_start_time"));
+  let exact = M6 / 127 * i64::from(edit) + start;
+  assert_eq!(
+    global.plus(place(&kids, 0).1),
+    Read {
+      value: exact as f64,
+      rate: f64::from(edit)
+    }
+  );
+  let track = track_duration(&kids);
+  let (num, den) = (i128::from(exact) * 12_573, i128::from(edit));
+  within_half_a_tick(Read::end(global, track), num, den);
+  within_half_a_tick(Read::end_inclusive(global, track), num - den, den);
+  // In OpenTimelineIO's arithmetic: in the plan's frames, past 2^53; from
+  // each of the 64 coarsest rulers a tick late; from the finest, 12 700, a
+  // tick late too; from 12 573 and from 8 255, exactly.
+  let plan = global.plus(Read {
+    value: (101 * M6) as f64,
+    rate: 12_827.0,
+  });
+  assert_eq!(plan.value, 9_095_923_567_408_870.0);
+  for m in 1..=64 {
+    assert_eq!(end_from(global, M6, m), (exact + 1) as f64, "127 · {m}");
+  }
+  assert_eq!(end_from(global, M6, 100), (exact + 1) as f64);
+  assert_eq!(end_from(global, M6, 99), exact as f64);
+  assert_eq!(end_from(global, M6, 65), exact as f64);
+  assert_eq!(exact, 9_006_574_041_448_512);
+}
+
+/// How long the clip between the bands runs: ticks of 1/127 s, a multiple
+/// of 127, whose end from the global start below OpenTimelineIO reads a tick
+/// short from every whole ruler 127 · m below 32 512 = 256 · 127 fps but
+/// one, 16 383 = 129 · 127.
+const BETWEEN: i64 = 35_183_954_771_904;
+
+#[test]
+fn a_clip_only_a_ruler_between_the_free_bands_holds_is_refused_by_the_bounded_search() {
+  // At 32 511 fps from 2 · 10^11, `a` runs BETWEEN ticks of 1/127 s from
+  // the first, its medium stated at 32 512 = 256 · 127 fps: in its plan's
+  // frames its end from the global start lies past 2^53. Its free rulers are
+  // 127 · m, m = 1 … 255 — the finest band 192 … 255, the coarsest 1 … 64 —
+  // and from every one of them OpenTimelineIO reads that end a tick short.
+  // Between the bands, 16 383 = 129 · 127 fps reads it exactly, and the walk
+  // holds every value there: the timeline is representable, and the
+  // contract refuses it, in the last of 1 + 64 + 64 plans, saying so.
+  let (edit, start) = (32_511, 200_000_000_000);
+  let exact = BETWEEN / 127 * i64::from(edit) + start;
+  let refusal = match to_otio(
+    &from_a_tick(32_512, edit, BETWEEN, start),
+    OtioTarget::V0_15Plus,
+  ) {
+    Err(Refused::NotRepresentable(refusal)) => refusal,
+    other => panic!("{other:?}"),
+  };
+  assert_eq!(
+    (refusal.at(), refusal.value(), refusal.rate()),
+    (
+      Spot::Absolute(ChildAt::new(0, 0)),
+      i128::from(exact),
+      Rate::hz(edit)
+    )
+  );
+  let searched = refusal.searched().unwrap();
+  assert_eq!(searched.walks(), 1 + 64 + 64);
+  assert_eq!(
+    searched.bands(),
+    [
+      RulerBand::Operands,
+      RulerBand::Finest(64),
+      RulerBand::Coarsest(64)
+    ]
+  );
+  assert!(
+    refusal
+      .to_string()
+      .contains(", in the last of 129 plans the bounded search walked, "),
+    "{refusal}"
+  );
+  // In OpenTimelineIO's arithmetic: in the plan's frames, past 2^53; from
+  // every ruler of both bands, a tick short; between them, exactly from
+  // 127 · 129 and from no other.
+  let global = Read {
+    value: start as f64,
+    rate: f64::from(edit),
+  };
+  let plan = global.plus(Read {
+    value: (256 * BETWEEN) as f64,
+    rate: 32_512.0,
+  });
+  assert_eq!(plan.value, 9_007_292_427_759_188.0);
+  for m in (1..=64).chain(192..=255) {
+    assert_eq!(
+      end_from(global, BETWEEN, m),
+      (exact - 1) as f64,
+      "127 · {m}"
+    );
+  }
+  for m in 65..=191 {
+    assert_eq!(
+      end_from(global, BETWEEN, m) == exact as f64,
+      m == 129,
+      "127 · {m}"
+    );
+  }
+  // Written in 127 · 129 fps, the walk the export makes holds the track.
+  let ruler = derive::Ruler::new(Rate::hz(127 * 129));
+  let a = derive::Child::Item {
+    start: derive::Time::written(129, ruler),
+    duration: derive::Time::written(129 * i128::from(BETWEEN), ruler),
+  };
+  let global = derive::Time::written(i128::from(start), derive::Ruler::new(Rate::hz(edit)));
+  let duration = derive::track(0, &[a], global).unwrap();
+  assert_eq!(derive::stack(&[duration]), Ok(()));
+  assert_eq!(exact, 9_007_015_382_593_472);
+}
+
+#[test]
+fn a_ruler_the_timeline_counts_in_is_tried_before_a_free_one() {
+  // At 127 fps from 10^12, `a` runs `ticks` ticks of 1/127 s from zero, its
+  // medium stated at 12 827 = 101 · 127 fps: in its plan's frames its end
+  // from the global start lies past 2^53. The edit rate holds it, a ruler
+  // the timeline's operands are counted in, and so do the free 127 · m,
+  // m = 2 … 100 — the finest, 12 700, reads that end exactly too. A clip's
+  // list runs the operands' rulers before the free ones: `a` is written in
+  // the edit rate, as the global start and the gaps are.
+  let (ticks, start): (i64, i64) = (89_000_000_000_001, 1_000_000_000_000);
+  let edit = tb(1, 127);
+  let mut a = placed(
+    "a",
+    TimeRange::new(0, ticks, edit),
+    TimeRange::new(0, ticks, edit),
+  );
+  a.media_mut().set_rate(Some(Rate::hz(12_827)));
+  let timeline = Timeline::new("t", Rate::hz(127))
+    .with_start(Timestamp::new(start, edit))
+    .with_track(video([a]));
+  let text = to_otio(&timeline, OtioTarget::V0_15Plus).unwrap();
+  assert_eq!(validate_json(&text, OtioTarget::V0_15Plus), Ok(()));
+  let at = |value: i64, rate: f64| Read {
+    value: value as f64,
+    rate,
+  };
+  let kids = kids(&text, 0);
+  let Kid::Item {
+    start: from,
+    duration,
+  } = kids[0]
+  else {
+    panic!("{kids:?}");
+  };
+  assert_eq!((from, duration), (at(0, 127.0), at(ticks, 127.0)));
+  let global = read(&member(&json::parse(&text).unwrap(), "global_start_time"));
+  assert_eq!(global.plus(place(&kids, 0).1), at(start + ticks, 127.0));
+  // In OpenTimelineIO's arithmetic: in the plan's frames, past 2^53; in
+  // 12 700ths, exactly — the order, not the arithmetic, chose the edit rate.
+  assert_eq!(
+    global.plus(at(101 * ticks, 12_827.0)).value,
+    9_090_000_000_000_100.0
+  );
+  assert_eq!(
+    global.plus(at(100 * ticks, 12_700.0)),
+    at(100 * (start + ticks), 12_700.0)
+  );
+}
+
+/// How long the clip whose two free bands are one runs: ticks of 1/127 s, a
+/// multiple of 127, whose end from the global start below OpenTimelineIO
+/// reads a tick short from every whole ruler 127 · m below 8 255 = 65 · 127
+/// fps.
+const BOTH: i64 = 138_571_922_804_800;
+
+#[test]
+fn a_ruler_in_both_free_bands_is_tried_once() {
+  // At 8 129 fps from 10^14, `a` runs BOTH ticks of 1/127 s from the first,
+  // its medium stated at 8 255 = 65 · 127 fps: in its plan's frames its end
+  // from the global start lies past 2^53. Its free rulers are 127 · m,
+  // m = 1 … 64 — the 64 finest and the 64 coarsest alike — and from each
+  // OpenTimelineIO reads that end a tick short. Each is tried once: the
+  // refusal comes in the last of 1 + 64 plans.
+  let (edit, start) = (8_129, 100_000_000_000_000);
+  let exact = BOTH / 127 * i64::from(edit) + start;
+  let refusal = match to_otio(
+    &from_a_tick(8_255, edit, BOTH, start),
+    OtioTarget::V0_15Plus,
+  ) {
+    Err(Refused::NotRepresentable(refusal)) => refusal,
+    other => panic!("{other:?}"),
+  };
+  assert_eq!(
+    (refusal.at(), refusal.value(), refusal.rate()),
+    (
+      Spot::Absolute(ChildAt::new(0, 0)),
+      i128::from(exact),
+      Rate::hz(edit)
+    )
+  );
+  assert_eq!(
+    refusal.searched().map(|searched| searched.walks()),
+    Some(1 + 64)
+  );
+  // In OpenTimelineIO's arithmetic: in the plan's frames, past 2^53; from
+  // every one of the 64 rulers, a tick short.
+  let global = Read {
+    value: start as f64,
+    rate: f64::from(edit),
+  };
+  let plan = global.plus(Read {
+    value: (65 * BOTH) as f64,
+    rate: 8_255.0,
+  });
+  assert_eq!(plan.value, 9_108_724_988_462_818.0);
+  for m in 1..=64 {
+    assert_eq!(end_from(global, BOTH, m), (exact - 1) as f64, "127 · {m}");
+  }
+  assert_eq!(exact, 8_969_694_177_009_600);
+}
+
+/// How long the clip only its coarse rulers hold runs: ticks of 1/127 s, a
+/// multiple of 127, whose end from the global start below OpenTimelineIO
+/// reads a tick off from every ruler of the finest band below 32 512 =
+/// 256 · 127 fps, and exactly from 127 · 2^k, k = 0 … 6.
+const COARSE: i64 = 35_184_364_667_071;
+
+#[test]
+fn a_clip_only_its_coarsest_free_rulers_hold_is_written_in_one() {
+  // At 32 511 fps from 2 · 10^11, `a` runs COARSE ticks of 1/127 s from the
+  // first, its medium stated at 32 512 = 256 · 127 fps: in its plan's frames
+  // its end from the global start lies past 2^53. From every ruler of the
+  // finest band, 127 · m for m = 192 … 255, OpenTimelineIO reads that end a
+  // tick off; of the coarsest band, 127 · 2^k read it exactly. The search
+  // reaches the coarsest band after the finest, and runs it finest first:
+  // `a` is written in 8 128 = 64 · 127 fps.
+  let (edit, start) = (32_511, 200_000_000_000);
+  let text = to_otio(
+    &from_a_tick(32_512, edit, COARSE, start),
+    OtioTarget::V0_15Plus,
+  )
+  .unwrap();
+  assert_eq!(validate_json(&text, OtioTarget::V0_15Plus), Ok(()));
+  let ruler = |value: i64| Read {
+    value: value as f64,
+    rate: 8_128.0,
+  };
+  let kids = kids(&text, 0);
+  let Kid::Item {
+    start: from,
+    duration,
+  } = kids[0]
+  else {
+    panic!("{kids:?}");
+  };
+  assert_eq!((from, duration), (ruler(64), ruler(64 * COARSE)));
+  let global = read(&member(&json::parse(&text).unwrap(), "global_start_time"));
+  let exact = COARSE / 127 * i64::from(edit) + start;
+  assert_eq!(
+    global.plus(place(&kids, 0).1),
+    Read {
+      value: exact as f64,
+      rate: f64::from(edit)
+    }
+  );
+  // In OpenTimelineIO's arithmetic: in the plan's frames, past 2^53; from
+  // every ruler of the finest band, a tick off; from 127 · 64, exactly.
+  let plan = global.plus(Read {
+    value: (256 * COARSE) as f64,
+    rate: 32_512.0,
+  });
+  assert_eq!(plan.value, 9_007_397_360_921_940.0);
+  for m in 192..=255 {
+    assert_eq!(
+      (end_from(global, COARSE, m) - exact as f64).abs(),
+      1.0,
+      "127 · {m}"
+    );
+  }
+  assert_eq!(end_from(global, COARSE, 64), exact as f64);
+  assert_eq!(exact, 9_007_120_312_528_703);
+}

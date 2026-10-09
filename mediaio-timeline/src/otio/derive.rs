@@ -320,6 +320,7 @@ impl Time {
       at,
       value,
       rate: self.ruler.exact,
+      searched: None,
     }
   }
 }

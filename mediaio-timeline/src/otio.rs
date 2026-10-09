@@ -51,17 +51,31 @@
 //!   one ruler ends inclusively where it exactly does: its counts whole,
 //!   OpenTimelineIO's arithmetic on them is exact.
 //!
-//! Where OpenTimelineIO's arithmetic would round a value, the export
-//! searches the rulers the clips it is formed from may be written in: every
-//! ruler the timeline's own operands are counted in — the edit rate, at
-//! which the global start, the gaps and the transitions are written, and
-//! every clip's planned ruler — that holds a clip's source range exactly,
-//! however many, and the coarsest whole numbers of ticks a second below the
-//! ruler above that hold it, at most 64 of those a clip — moving one clip
-//! one ruler at a time, the one with the finest ruler first, the
-//! all-coarsest plan last. What no plan it tries holds, [`to_otio`] refuses
-//! ([`Refused::NotRepresentable`], naming the value the last plan could not
-//! hold): it never writes a document OpenTimelineIO would read rounded.
+//! **Exact, or refused.** Where OpenTimelineIO's arithmetic would round a
+//! value, the export writes the clips the value is formed from in other
+//! rulers that hold their source ranges exactly and walks the timeline
+//! again: a search, bounded by contract ([`RulerSearch`]). Besides its
+//! plan's ruler, a clip may be written in a ruler of three bands
+//! ([`RulerBand`]): every ruler the timeline's operands are counted in — the
+//! edit rate, at which the global start, the gaps and the transitions are
+//! written, the rate 1 a track's duration is summed from, and every clip's
+//! planned ruler — all of them; the 64 finest whole numbers of ticks a
+//! second below its plan's ruler that no operand is counted in; and the 64
+//! coarsest of those. One clip moves one ruler along its list at a time,
+//! the one with the finest ruler first. The guarantee is soundness: what the
+//! export writes, OpenTimelineIO reads back exactly. A timeline no plan the
+//! search walks holds, [`to_otio`] refuses ([`Refused::NotRepresentable`]),
+//! naming the value the last plan could not hold and what the search tried
+//! — its bands and its walks — so a refusal says the search was bounded: a
+//! timeline only a ruler outside the bands would hold is refused by this
+//! contract, and never written to be read rounded. Where the bound has been
+//! met, counts lie near 2^53 ticks of a clip's ruler — at the rates media
+//! run at, positions thousands of years in: 2^53 ticks are some 1 500 years
+//! even at 192 kHz. The rounding a real timeline meets is a rate or a
+//! rescale no `f64` holds exactly — NTSC's 30000/1001, or frames of one rate
+//! counted in another — and the half-tick hold settles it: written where
+//! OpenTimelineIO's double lands within half a tick of the exact count,
+//! refused by name where it does not.
 //!
 //! A source range's length is a whole number of edit-rate ticks (validation
 //! refuses one that is not), so laying a track's items end to end puts every
@@ -121,10 +135,10 @@ pub enum OtioTarget {
 ///   not [`validate`](fn@validate): its records could not be laid end to
 ///   end, which is how OpenTimelineIO places items.
 /// - [`Refused::NotRepresentable`] for a count OpenTimelineIO would read
-///   or derive rounded in every plan of rulers the export tries: one past
-///   2^53, where its `f64` no longer holds every whole number, or one its
-///   arithmetic would land half a tick off or more (see [the module's
-///   docs](self)).
+///   or derive rounded in every plan of rulers the export's bounded search
+///   tries ([`RulerSearch`]): one past 2^53, where its `f64` no longer holds
+///   every whole number, or one its arithmetic would land half a tick off
+///   or more (see [the module's docs](self)).
 pub fn to_otio(timeline: &Timeline, target: OtioTarget) -> Result<String, Refused> {
   validate(timeline).map_err(Refused::Validation)?;
   let tree = export::timeline(timeline, &layout_valid(timeline), target)
@@ -145,9 +159,11 @@ pub enum Refused {
   /// `validate` answers them.
   Validation(Vec<Refusal>),
   /// A count OpenTimelineIO would read or derive rounded in every plan of
-  /// rulers the export tries — past 2^53, where its `f64` no longer holds
-  /// every whole number, or landed half a tick off or more by its
-  /// arithmetic: the count the last plan tried could not hold.
+  /// rulers the export's bounded search tries — past 2^53, where its `f64`
+  /// no longer holds every whole number, or landed half a tick off or more
+  /// by its arithmetic: the count the last plan tried could not hold, and,
+  /// for a count OpenTimelineIO derives, what the search tried
+  /// ([`NotRepresentable::searched`]).
   NotRepresentable(NotRepresentable),
 }
 
@@ -182,11 +198,18 @@ impl core::error::Error for Refused {}
 /// can also come out of OpenTimelineIO's rescaling, or its branch on a
 /// rescaled double, half a tick off or more. Either way a reader would get,
 /// or add up from it, a rounded time.
+///
+/// A count OpenTimelineIO derives is refused after the export's search, in
+/// the last plan of rulers it walked, and the refusal says what the search
+/// tried ([`searched`](Self::searched)). A count the export would write is
+/// refused as the timeline holds it, before any walk: a record-side count
+/// at the edit rate, or a media range none of its own rulers holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NotRepresentable {
   at: Spot,
   value: i128,
   rate: Rate,
+  searched: Option<RulerSearch>,
 }
 
 impl NotRepresentable {
@@ -214,17 +237,152 @@ impl NotRepresentable {
   pub const fn rate(&self) -> Rate {
     self.rate
   }
+
+  /// What the export's search tried before it refused the count — its
+  /// bands and its walks — where OpenTimelineIO derives the count; `None`
+  /// where the export would write it, which no search is made for.
+  pub const fn searched(&self) -> Option<RulerSearch> {
+    self.searched
+  }
 }
 
-/// Writes `the place of track 0, child 1 counts 27021597764222973 ticks of
-/// 1/3 s, which OpenTimelineIO's f64 does not hold exactly`.
+/// Writes `the gap before track 0, clip 0 counts 9007199254740993 ticks of
+/// 1/1 s, which OpenTimelineIO's f64 does not hold exactly`, and for a count
+/// OpenTimelineIO derives, what the search tried after it:
+/// `…, in the last of 3 plans the bounded search walked, …`.
 impl fmt::Display for NotRepresentable {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     write!(f, "{} counts {} ticks", self.at, self.value)?;
     if let Some(tick) = self.rate.checked_to_timebase() {
       write!(f, " of {tick} s")?;
     }
-    f.write_str(", which OpenTimelineIO's f64 does not hold exactly")
+    f.write_str(", which OpenTimelineIO's f64 does not hold exactly")?;
+    if let Some(searched) = self.searched {
+      write!(f, ", in {searched}")?;
+    }
+    Ok(())
+  }
+}
+
+/// What the export's search tried before [`to_otio`] refused a count
+/// OpenTimelineIO derives: the bands of rulers it may write a clip in, and
+/// how many plans of rulers it walked.
+///
+/// The search is bounded, by contract. Where OpenTimelineIO's arithmetic
+/// would round a value, the export writes one of the clips the value is
+/// formed from in the next ruler of its list — the one whose ruler is the
+/// finest — and walks the timeline again. A clip's list runs:
+///
+/// 1. its plan's ruler;
+/// 2. [`RulerBand::Operands`], finest first;
+/// 3. [`RulerBand::Finest`], finest first;
+/// 4. [`RulerBand::Coarsest`], finest first, less any ruler already in the
+///    finest band;
+/// 5. its plan's ruler again, where every other ruler of the list is finer.
+///
+/// A clip never moves back along its list, so the walks are bounded: at
+/// most `1 + n · (d + 127)` for `n` clips and `d` distinct rates the
+/// timeline's operands are counted in. What the export writes,
+/// OpenTimelineIO reads back exactly; a timeline no plan the search walks
+/// holds is refused with the last plan's value, and with this record of
+/// what the search tried. A ruler outside the bands, or a plan of rulers
+/// the moves do not reach, is never tried: a timeline only such a plan
+/// would hold is refused by this contract, not misread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RulerSearch {
+  walks: usize,
+}
+
+/// The bands every search tries a clip in, in its list's order.
+const BANDS: [RulerBand; 3] = [
+  RulerBand::Operands,
+  RulerBand::Finest(export::FREE),
+  RulerBand::Coarsest(export::FREE),
+];
+
+impl RulerSearch {
+  /// The bands of rulers, besides its plan's, the search may write a clip
+  /// in, in the order a clip's list runs them.
+  pub const fn bands(&self) -> &'static [RulerBand] {
+    &BANDS
+  }
+
+  /// How many plans of rulers the search walked, the plan the export first
+  /// counted among them and the refused one last.
+  pub const fn walks(&self) -> usize {
+    self.walks
+  }
+}
+
+/// Writes `the last of 129 plans the bounded search walked, trying each clip
+/// in its own ruler, every ruler …, the 64 finest …, and the 64 coarsest …`.
+impl fmt::Display for RulerSearch {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    if self.walks == 1 {
+      f.write_str("the one plan the bounded search walked")?;
+    } else {
+      write!(
+        f,
+        "the last of {} plans the bounded search walked",
+        self.walks
+      )?;
+    }
+    f.write_str(", trying each clip in its own ruler")?;
+    let bands = self.bands();
+    for (index, band) in bands.iter().enumerate() {
+      f.write_str(if index + 1 == bands.len() {
+        ", and "
+      } else {
+        ", "
+      })?;
+      fmt::Display::fmt(band, f)?;
+    }
+    Ok(())
+  }
+}
+
+/// A band of the rulers the export's search may write a clip's source range
+/// in, besides its plan's ([`RulerSearch`]). Every ruler of a band holds the
+/// range exactly: its start and its length whole ticks of it, each within
+/// ±2^53.
+///
+/// Marked `#[non_exhaustive]`: a later band joins as a variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum RulerBand {
+  /// Every ruler the timeline's operands are counted in — the edit rate, at
+  /// which the global start, the gaps and the transitions are written, the
+  /// rate 1 OpenTimelineIO sums a track's duration from, and every clip's
+  /// planned ruler — that holds the range, finer or coarser than the clip's
+  /// own: all of them.
+  Operands,
+  /// The finest so many whole numbers of ticks a second strictly below the
+  /// clip's plan's rate that hold the range — multiples of the coarsest
+  /// whole ruler that does — and that no operand is counted in.
+  Finest(usize),
+  /// The coarsest so many whole numbers of ticks a second below the clip's
+  /// plan's rate that hold the range and that no operand is counted in.
+  Coarsest(usize),
+}
+
+/// Writes `every ruler the timeline's operands are counted in that holds
+/// it`, `the 64 finest whole rates below its own that hold it`, `the 64
+/// coarsest whole rates below its own that hold it`.
+impl fmt::Display for RulerBand {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      Self::Operands => {
+        f.write_str("every ruler the timeline's operands are counted in that holds it")
+      }
+      Self::Finest(count) => write!(
+        f,
+        "the {count} finest whole rates below its own that hold it"
+      ),
+      Self::Coarsest(count) => write!(
+        f,
+        "the {count} coarsest whole rates below its own that hold it"
+      ),
+    }
   }
 }
 
