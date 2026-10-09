@@ -20,6 +20,30 @@ use crate::{Clip, Refusal, Timeline, Track, validate};
 ///
 /// A timeline that does not validate has no layout; its refusals come back
 /// instead.
+///
+/// ```
+/// use core::num::NonZeroI32;
+///
+/// use mediaio_timeline::{Clip, Item, MediaRef, Rate, TimeRange, Timebase, Timeline, Track, TrackKind, layout};
+///
+/// let edit = Timebase::new(1, NonZeroI32::new(25).unwrap());
+/// let at = |name: &str, start: i64, end: i64| {
+///   Clip::new(name, MediaRef::new(name), TimeRange::new(0, end - start, edit), TimeRange::new(start, end, edit))
+/// };
+/// let timeline = Timeline::new("t", Rate::FPS_25).with_track(
+///   Track::new(TrackKind::Video, "V").with_clip(at("a", 10, 20)).with_clip(at("b", 30, 40)),
+/// );
+/// let laid = layout(&timeline).unwrap();
+/// let gaps: Vec<_> = laid.tracks()[0]
+///   .items()
+///   .iter()
+///   .filter_map(|item| match item {
+///     Item::Gap(gap) => Some((gap.start_pts(), gap.end_pts())),
+///     _ => None,
+///   })
+///   .collect();
+/// assert_eq!(gaps, [(0, 10), (20, 30)]);
+/// ```
 pub fn layout(timeline: &Timeline) -> Result<Layout<'_>, Vec<Refusal>> {
   validate(timeline)?;
   Ok(layout_valid(timeline))

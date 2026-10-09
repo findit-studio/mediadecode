@@ -1,5 +1,4 @@
-//! The editing timeline as data: tracks of clips at explicit record
-//! positions, with gain, fades and dissolves.
+#![doc = include_str!("../README.md")]
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![deny(missing_docs)]

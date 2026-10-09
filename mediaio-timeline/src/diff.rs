@@ -43,6 +43,27 @@ use crate::{Clip, Fade, Fades, Timeline};
 /// Only clips are compared. The timeline's own words (name, rate, start,
 /// notes), a track's words (kind, name, enabled), transitions, a clip's
 /// notes and its medium's words other than the locator are not.
+///
+/// ```
+/// use core::num::NonZeroI32;
+///
+/// use mediaio_timeline::{ChangeKind, Clip, MediaRef, Rate, TimeRange, Timebase, Timeline, Track, TrackKind, diff};
+///
+/// let edit = Timebase::new(1, NonZeroI32::new(25).unwrap());
+/// let at = |name: &str, start: i64| {
+///   Clip::new(name, MediaRef::new(name), TimeRange::new(0, 10, edit), TimeRange::new(start, start + 10, edit))
+/// };
+/// let before = Timeline::new("t", Rate::FPS_25).with_track(
+///   Track::new(TrackKind::Video, "V").with_clip(at("a", 0)).with_clip(at("b", 10)),
+/// );
+/// let mut after = before.clone();
+/// after.tracks_mut()[0].clips_mut()[1].set_record(TimeRange::new(20, 30, edit));
+/// let delta = diff(&before, &after);
+/// assert_eq!(delta.changes().len(), 1);
+/// assert_eq!(delta.changes()[0].kind(), ChangeKind::Moved);
+/// assert_eq!(delta.changes()[0].after(), Some(1));
+/// assert!(diff(&after, &after).is_empty());
+/// ```
 pub fn diff(before: &Timeline, after: &Timeline) -> Delta {
   let mut changes = Vec::new();
   let tracks = before.tracks().len().max(after.tracks().len());
