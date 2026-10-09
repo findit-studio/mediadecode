@@ -9,7 +9,7 @@
 //! | its tracks | one `Stack.1` named `tracks`, bottom track first |
 //! | [`Track`](crate::Track) | `Track.1`, `kind` `Video` or `Audio`, `enabled` |
 //! | [`Clip`](crate::Clip) | `Clip.2` under [`OtioTarget::V0_15Plus`], `Clip.1` under [`OtioTarget::Legacy`]; `enabled` |
-//! | its trim | `source_range`: `duration` is the record's length at the edit rate, `start_time` the source range's start |
+//! | its trim | `source_range`: the source range whole, `start_time` and `duration` in the medium's one ruler — by validation, a duration as long as the record |
 //! | [`MediaRef`](crate::MediaRef) | `ExternalReference.1` (under `DEFAULT_MEDIA` in `Clip.2`): `target_url` is the locator, `available_range` the available range |
 //! | a gap between records | `Gap.1` — derived by [`layout`](fn@crate::layout), never stored |
 //! | [`Transition`](crate::Transition) | `Transition.1`, `SMPTE_Dissolve`, its offsets at the edit rate |
@@ -17,9 +17,17 @@
 //! | gain, reel, the medium's rate, a fade's curve, [`Metadata`](crate::Metadata) | `metadata.mediaio`: `gain_db`, `reel`, `rate`, `fade` and `shape`, `metadata` |
 //!
 //! Every position on the record side is a whole count at the edit rate. A
-//! media-side time (a source start, an available range) is written in
-//! frames of the medium's stated rate when it lands on one, and otherwise in
-//! ticks of its own timebase, so every number written is exact.
+//! media-side range (a source range, an available range) is written whole in
+//! one ruler: frames of the medium's stated rate when its start and length
+//! both land on one, and otherwise ticks of its own timebase. Every number
+//! written is exact, and the end OpenTimelineIO derives from a range — its
+//! start rescaled to its duration's rate, plus the duration — is the range's
+//! own end. A source range's length is a whole number of edit-rate ticks
+//! (validation refuses one that is not), so laying a track's items end to
+//! end puts every clip on its record. Where a medium's ruler is not the edit
+//! rate, one track's items are counted in more than one rate, and
+//! OpenTimelineIO sums those in floating point: a position derived that way
+//! is read to the nearest frame, not truncated.
 //!
 //! OpenTimelineIO has no word for gain or a reel, so both ride in
 //! `metadata`; an application that does not read it — DaVinci Resolve among

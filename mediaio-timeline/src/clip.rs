@@ -19,9 +19,9 @@ use crate::Metadata;
 ///
 /// The record is **explicit**: it is stored, not derived from the clips
 /// before it, so trimming one clip moves no other. With no time-warp in
-/// schema 1 the two ranges are one stretch of time, and
-/// [`validate`](fn@crate::validate) holds the record's length to the source's,
-/// rescaled to the edit rate to the nearest tick.
+/// schema 1 the two ranges are one stretch of time:
+/// [`validate`](fn@crate::validate) holds the source range to a whole number
+/// of edit-rate ticks and the record to exactly that length.
 ///
 /// A clip is identified by its [`name`](Self::name) together with its
 /// medium's [`locator`](MediaRef::locator); [`diff`](fn@crate::diff) matches

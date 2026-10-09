@@ -52,8 +52,10 @@ const RATES: [Rate; 8] = [
   Rate::FPS_60,
 ];
 
-/// The rulers media are counted in — each finer than any frame above, so a
-/// record's length always survives the trip through one and back.
+/// The rulers media are counted in — each finer than any frame above. Not
+/// every one counts every frame of every rate exactly (a frame at 23.976 fps
+/// is 1839.3375 ticks at 44.1 kHz), so a clip's length is a whole number of
+/// the shortest stretch of frames its ruler does count exactly.
 fn media_rulers() -> [Timebase; 5] {
   [
     common::tb(1, 24_000),
@@ -67,6 +69,8 @@ fn media_rulers() -> [Timebase; 5] {
 struct Planned {
   gap: u64,
   length: u64,
+  /// The ruler the clip's medium is counted in.
+  ruler: Timebase,
   /// The transition into this clip from the one before, `(in, out)`.
   entering: Option<(u64, u64)>,
 }
@@ -88,7 +92,19 @@ fn timeline(seed: u64) -> Timeline {
     let count = rng.within(0, 6);
     let mut plan: Vec<Planned> = Vec::new();
     for index in 0..count {
-      let length = rng.within(6, 90);
+      let ruler = rng.pick(&media_rulers());
+      // Schema 1 has no time-warp: a source runs a whole number of frames,
+      // counted exactly in its ruler. Six to ninety frames, in steps of the
+      // shortest such stretch.
+      let step = (1..=1000)
+        .find(|&n| {
+          frames(n)
+            .checked_rescale_with(ruler, Rounding::Exact)
+            .is_some()
+        })
+        .unwrap();
+      let low = 6_u64.div_ceil(step);
+      let length = step * rng.within(low, (90 / step).max(low));
       let gap = if rng.one_in(2) { 0 } else { rng.within(1, 40) };
       let entering = (index > 0 && gap == 0 && rng.one_in(2)).then(|| {
         let before = plan[index as usize - 1].length;
@@ -97,6 +113,7 @@ fn timeline(seed: u64) -> Timeline {
       plan.push(Planned {
         gap,
         length,
+        ruler,
         entering,
       });
     }
@@ -106,21 +123,18 @@ fn timeline(seed: u64) -> Timeline {
       let leaving = plan.get(index + 1).and_then(|next| next.entering);
       let start = cursor + planned.gap;
       cursor = start + planned.length;
-      let ruler = rng.pick(&media_rulers());
+      let ruler = planned.ruler;
       let ticks = |length: Duration, rounding| {
         length
           .checked_rescale_with(ruler, rounding)
           .unwrap()
           .ticks()
       };
-      let source_length = ticks(frames(planned.length), Rounding::Nearest);
+      let source_length = ticks(frames(planned.length), Rounding::Exact);
       assert_eq!(
-        Duration::new(source_length, ruler)
-          .checked_rescale_to(edit)
-          .unwrap()
-          .ticks(),
-        planned.length,
-        "seed {seed}: the generator's media ruler cannot hold a frame"
+        Duration::new(source_length, ruler).checked_rescale_with(edit, Rounding::Exact),
+        Some(frames(planned.length)),
+        "seed {seed}: the source is no whole number of frames"
       );
       // Handles: as much media before and after the source range as the
       // transitions on either side play, and a little more.
@@ -277,37 +291,77 @@ fn the_export_passes_the_self_check_for_both_targets() {
   }
 }
 
-/// OpenTimelineIO places a track's items end to end; walk them as it does
-/// and the clips land on their records, frame for frame.
+/// OpenTimelineIO places a track's items end to end, each as long as its
+/// `source_range`'s duration. Every range is written in one ruler, so the end
+/// OpenTimelineIO derives from a clip's is its stored source range's end;
+/// and each duration, read in the ruler it is written in, is a whole number
+/// of edit-rate frames — so walking the items lands every clip on its
+/// record, exactly.
 #[test]
 fn the_export_places_every_clip_on_its_record() {
   for seed in 0..SEEDS {
     let timeline = timeline(seed);
-    let rate = timeline.rate().as_f64();
+    let edit = timeline.edit_timebase().unwrap();
     let text = to_otio(&timeline, OtioTarget::V0_15Plus).unwrap();
     let root: serde_json::Value = serde_json::from_str(&text).unwrap();
     let tracks = root["tracks"]["children"].as_array().unwrap();
     for (track, exported) in timeline.tracks().iter().zip(tracks) {
-      let mut at = 0.0;
-      let mut placed = Vec::new();
+      let mut clips = track.clips().iter();
+      let mut at = 0;
       for child in exported["children"].as_array().unwrap() {
         let schema = child["OTIO_SCHEMA"].as_str().unwrap();
         if schema == "Transition.1" {
           continue;
         }
-        let duration = &child["source_range"]["duration"];
-        assert_eq!(duration["rate"].as_f64().unwrap(), rate, "seed {seed}");
-        if schema == "Clip.2" {
-          placed.push(at);
-        }
-        at += duration["value"].as_f64().unwrap();
+        let range = &child["source_range"];
+        let rate = range["duration"]["rate"].as_f64().unwrap();
+        assert_eq!(
+          range["start_time"]["rate"].as_f64(),
+          Some(rate),
+          "seed {seed}: a range in two rates"
+        );
+        let start = range["start_time"]["value"].as_f64().unwrap() as i64;
+        let length = range["duration"]["value"].as_f64().unwrap() as i64;
+        let ruler = if schema == "Gap.1" {
+          assert_eq!(rate, timeline.rate().as_f64(), "seed {seed}");
+          edit
+        } else {
+          let clip = clips.next().unwrap();
+          assert_eq!(
+            clip.record().start_pts(),
+            at,
+            "seed {seed}: {}",
+            clip.name()
+          );
+          let ruler = ruler_written(clip, rate);
+          let written = TimeRange::new(start, start + length, ruler);
+          let stored = clip.source_range();
+          assert!(
+            written.start() == stored.start() && written.end() == stored.end(),
+            "seed {seed}: {} written as {written:?}, stored as {stored:?}",
+            clip.name()
+          );
+          ruler
+        };
+        let frames = Duration::new(length as u64, ruler)
+          .checked_rescale_with(edit, Rounding::Exact)
+          .unwrap_or_else(|| panic!("seed {seed}: a length between frames"));
+        at += frames.ticks() as i64;
       }
-      let records: Vec<f64> = track
-        .clips()
-        .iter()
-        .map(|clip| clip.record().start_pts() as f64)
-        .collect();
-      assert_eq!(placed, records, "seed {seed}");
+      assert!(clips.next().is_none(), "seed {seed}: a clip not exported");
+    }
+  }
+}
+
+/// The ruler a clip's range is written in: frames of its medium's stated
+/// rate where the export used them, else ticks of the source's timebase.
+fn ruler_written(clip: &Clip, rate: f64) -> Timebase {
+  match clip.media().rate() {
+    Some(stated) if stated.as_f64() == rate => stated.checked_to_timebase().unwrap(),
+    _ => {
+      let ticks = clip.source_range().timebase();
+      assert_eq!(Rate::checked_from_timebase(ticks).unwrap().as_f64(), rate);
+      ticks
     }
   }
 }

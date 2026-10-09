@@ -3,7 +3,7 @@
 use alloc::vec::Vec;
 use core::{cmp::Ordering, fmt};
 
-use mediatime::{Duration, ExactSeconds, Timebase, Timestamp};
+use mediatime::{Duration, ExactSeconds, Rounding, Timebase, Timestamp};
 
 use crate::{Clip, Timeline, Track, Transition, time::span};
 
@@ -23,9 +23,10 @@ use crate::{Clip, Timeline, Track, Transition, time::span};
 ///   two of their records overlap ([`Refusal::Overlap`]) — a transition
 ///   blends across a cut with media outside the records, so it is never an
 ///   overlap;
-/// - each record runs as long as its source range, rescaled to the edit rate
-///   to the nearest tick ([`Refusal::DurationMismatch`]) — there is no
-///   time-warp in schema 1;
+/// - each source range runs a whole number of edit-rate ticks
+///   ([`Refusal::SourceOffEditRate`]) and its record exactly as long
+///   ([`Refusal::DurationMismatch`]) — there is no time-warp in schema 1, so
+///   nothing may round a source onto the edit rate;
 /// - each source range lies inside its medium's available range when that
 ///   is known ([`Refusal::OutsideAvailable`]);
 /// - each transition sits on a cut two of its track's records share
@@ -108,17 +109,25 @@ fn judge_track(track_index: usize, track: &Track, edit: Option<Timebase>, out: &
       furthest = Some((index, record.end()));
     }
     if let Some(edit) = edit
-      && on_rate
       && media_stated
     {
-      let found = span(record);
-      let expected = span(clip.source_range()).checked_rescale_to(edit);
-      if expected.is_none_or(|expected| expected.ticks() != found.ticks()) {
-        out.push(Refusal::DurationMismatch(Mismatch {
-          clip: at,
-          expected,
-          found,
-        }));
+      // The source's length at the edit rate, exactly: with no time-warp in
+      // schema 1 a record cannot absorb a remainder. A length between ticks
+      // is the source's own defect; one too long to count at the edit rate
+      // matches no record.
+      let length = span(clip.source_range());
+      let expected = length.checked_rescale_with(edit, Rounding::Exact);
+      if expected.is_none() && length.checked_rescale_to(edit).is_some() {
+        out.push(Refusal::SourceOffEditRate(at));
+      } else if on_rate {
+        let found = span(record);
+        if expected.is_none_or(|expected| expected.ticks() != found.ticks()) {
+          out.push(Refusal::DurationMismatch(Mismatch {
+            clip: at,
+            expected,
+            found,
+          }));
+        }
       }
     }
     if media_stated
@@ -303,8 +312,11 @@ pub enum Refusal {
   OutOfOrder(ClipPair),
   /// Two records of one track overlap.
   Overlap(ClipPair),
-  /// A record's length is not its source range's, rescaled to the edit rate
-  /// to the nearest tick.
+  /// A source range's length is no whole number of edit-rate ticks. A
+  /// record runs exactly as long as its source (schema 1 has no time-warp),
+  /// so a source must rescale onto the edit rate exactly.
+  SourceOffEditRate(ClipAt),
+  /// A record's length is not its source range's, counted at the edit rate.
   DurationMismatch(Mismatch),
   /// A source range runs outside its medium's available range.
   OutsideAvailable(ClipAt),
@@ -342,6 +354,10 @@ impl fmt::Display for Refusal {
         f,
         "track {}: clip {}'s record overlaps clip {}'s",
         pair.track, pair.later, pair.earlier
+      ),
+      Self::SourceOffEditRate(at) => write!(
+        f,
+        "{at}: the source range's length is no whole number of edit-rate ticks"
       ),
       Self::DurationMismatch(mismatch) => {
         write!(
@@ -572,9 +588,9 @@ impl Mismatch {
     self.clip
   }
 
-  /// The source range's length rescaled to the edit rate to the nearest
-  /// tick — the record's length the source asks for — or `None` when that
-  /// count does not fit a `u64`.
+  /// The source range's length counted at the edit rate — the record's
+  /// length the source asks for — or `None` when that count does not fit a
+  /// `u64`.
   pub const fn expected(&self) -> Option<Duration> {
     self.expected
   }

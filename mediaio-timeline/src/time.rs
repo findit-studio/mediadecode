@@ -8,9 +8,9 @@
 //! |---|---|
 //! | instants compared across timebases: order, overlap, a cut both records share | `Timestamp`'s `Ord` and `Eq` (`cmp_semantic`) |
 //! | a source range inside its available range | `TimeRange::contains` |
-//! | a record's length from its source's, to the nearest tick | `Duration::checked_rescale_to` |
+//! | a source's length at the edit rate, exactly, or refused | `Duration::checked_rescale_with(_, Rounding::Exact)`, and `checked_rescale_to` to tell a length between ticks from one too long to count |
 //! | handles and blends summed across timebases | `ExactSeconds` |
-//! | a media-side time in frames only where it lands on one | `checked_rescale_with(_, Rounding::Exact)` |
+//! | a media-side range in frames only where its start and length both land on one | `checked_rescale_with(_, Rounding::Exact)` |
 //! | a rate as OpenTimelineIO's `f64`; a rate of zero refused | `Rate::as_f64`, `Rate::checked_to_timebase`, `Rate::checked_from_timebase` |
 //!
 //! One road is missing, and is filed as a `mediatime` row rather than built

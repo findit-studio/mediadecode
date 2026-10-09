@@ -11,7 +11,7 @@ use alloc::{
   vec::Vec,
 };
 
-use mediatime::{Duration, Rate, Rounding, TimeRange, Timebase, Timestamp};
+use mediatime::{Duration, Rate, Rounding, TimeRange, Timebase};
 
 use super::{OtioTarget, json::Value};
 use crate::{
@@ -111,7 +111,7 @@ fn children(laid: &TrackLayout<'_>, ruler: &Ruler, target: OtioTarget) -> Vec<Va
           }
           out.push(fade_transition(fade, FadeEdge::In, ruler));
         }
-        out.push(self::clip(clip, ruler, target));
+        out.push(self::clip(clip, target));
         after_gap = false;
         if let Some(fade) = fades.out() {
           out.push(fade_transition(fade, FadeEdge::Out, ruler));
@@ -137,18 +137,18 @@ fn leaving<'a>(track: &'a Track, clip: &Clip) -> Option<&'a Transition> {
     .find(|transition| transition.at() == end)
 }
 
-fn clip(clip: &Clip, ruler: &Ruler, target: OtioTarget) -> Value {
+fn clip(clip: &Clip, target: OtioTarget) -> Value {
   let mut words = Vec::new();
   if let Some(gain) = clip.gain() {
     words.push(("gain_db", Value::Number(format!("{:?}", gain.db()))));
   }
   let media = clip.media();
-  // How long the clip occupies its track is its record's length, at the
-  // edit rate; where it starts in its medium is a media-side instant.
-  let source_range = time_range(
-    rational_time(ruler.rate, count_unsigned(span(clip.record()).ticks())),
-    media_time(clip.source_range().start(), media.rate()),
-  );
+  // The source range whole, start and length in the medium's one ruler, so
+  // the end OpenTimelineIO derives from it — the start rescaled to the
+  // duration's rate, plus the duration — is the stored end. Validation holds
+  // the source's length to a whole number of edit-rate ticks, so the same
+  // duration is the record's length: the clip fills exactly its record.
+  let source_range = media_range(clip.source_range(), media.rate());
   let mut members = vec![
     (
       "OTIO_SCHEMA",
@@ -267,20 +267,10 @@ fn transition(metadata: Value, in_offset: Value, out_offset: Value) -> Value {
   ])
 }
 
-/// A media-side instant: in frames of the medium's stated rate when it lands
-/// on one, else in ticks of its own timebase — exact either way.
-fn media_time(at: Timestamp, rate: Option<Rate>) -> Value {
-  if let Some((per_second, ruler)) = media_ruler(rate)
-    && let Some(frames) = at.checked_rescale_with(ruler, Rounding::Exact)
-  {
-    return rational_time(per_second, count(frames.pts()));
-  }
-  rational_time(ticks_per_second(at.timebase()), count(at.pts()))
-}
-
-/// A media-side range, start and length in one ruler: frames of the
-/// medium's stated rate when both land on whole frames, else ticks of the
-/// range's own timebase.
+/// A media-side range — a source range or an available range — start and
+/// length in one ruler, never two: frames of the medium's stated rate when
+/// both land on whole frames, else ticks of the range's own timebase. Exact
+/// either way.
 fn media_range(range: TimeRange, rate: Option<Rate>) -> Value {
   let length = span(range);
   if let Some((per_second, ruler)) = media_ruler(rate)

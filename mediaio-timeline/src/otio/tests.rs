@@ -158,8 +158,9 @@ fn a_timeline_that_does_not_validate_is_refused_with_its_refusals() {
   );
 }
 
-/// The `start_time` of the first clip's `source_range`: its rate and value.
-fn source_start(timeline: &Timeline) -> (f64, f64) {
+/// The first clip's `source_range` as written: `(rate, start, duration)`,
+/// after checking that its start and its duration share that rate.
+fn source_range(timeline: &Timeline) -> (f64, f64, f64) {
   let text = to_otio(timeline, OtioTarget::Legacy).unwrap();
   let root = json::parse(&text).unwrap();
   let get = |value: &Value, key: &str| -> Value {
@@ -174,42 +175,97 @@ fn source_start(timeline: &Timeline) -> (f64, f64) {
   };
   let track = get(&get(&root, "tracks"), "children").as_array().unwrap()[0].clone();
   let clip = get(&track, "children").as_array().unwrap()[0].clone();
-  let start = get(&get(&clip, "source_range"), "start_time");
+  let range = get(&clip, "source_range");
+  let (start, duration) = (get(&range, "start_time"), get(&range, "duration"));
+  let rate = get(&duration, "rate").as_f64().unwrap();
+  assert_eq!(
+    get(&start, "rate").as_f64(),
+    Some(rate),
+    "a range written in two rates"
+  );
   (
-    get(&start, "rate").as_f64().unwrap(),
+    rate,
     get(&start, "value").as_f64().unwrap(),
+    get(&duration, "value").as_f64().unwrap(),
   )
 }
 
-#[test]
-fn a_source_start_on_a_frame_of_the_stated_rate_is_written_in_frames() {
-  let mut a = clip("a", 0, 24);
-  a.set_source_range(TimeRange::new(1001, 1001 + 24_024, tb(1, 24_000)));
-  a.media_mut().set_rate(Some(Rate::FPS_23_976));
-  let timeline =
-    Timeline::new("t", Rate::FPS_23_976).with_track(Track::new(TrackKind::Video, "V").with_clip({
-      let mut a = a;
-      a.set_record(TimeRange::new(0, 24, tb(1001, 24_000)));
-      a
-    }));
-  assert_eq!(source_start(&timeline), (24_000.0 / 1001.0, 1.0));
+/// One clip `a` playing `source` of a medium at `rate`, at the record
+/// [0, `frames`) of a timeline at `edit`.
+fn one_source(edit: Rate, frames: i64, source: TimeRange, rate: Option<Rate>) -> Timeline {
+  let mut a = clip("a", 0, frames);
+  a.set_source_range(source);
+  a.set_record(TimeRange::new(
+    0,
+    frames,
+    edit.checked_to_timebase().unwrap(),
+  ));
+  a.media_mut().set_rate(rate);
+  Timeline::new("t", edit).with_track(Track::new(TrackKind::Video, "V").with_clip(a))
 }
 
 #[test]
-fn a_source_start_between_frames_or_with_no_stated_rate_is_written_in_ticks() {
-  let between = {
-    let mut a = clip("a", 0, 24);
-    a.set_source_range(TimeRange::new(500, 500 + 24_000, tb(1, 24_000)));
-    a.media_mut().set_rate(Some(Rate::FPS_24));
-    one_track(Track::new(TrackKind::Video, "V").with_clip(a))
-  };
-  assert_eq!(source_start(&between), (24_000.0, 500.0));
-  let unstated = {
-    let mut a = clip("a", 0, 24);
-    a.set_source_range(TimeRange::new(1000, 1000 + 24_000, tb(1, 24_000)));
-    one_track(Track::new(TrackKind::Video, "V").with_clip(a))
-  };
-  assert_eq!(source_start(&unstated), (24_000.0, 1000.0));
+fn a_source_range_is_written_whole_in_the_mediums_ruler() {
+  // A second of 48 kHz sound from sample 1000, under 24 fps: the start and
+  // the length in samples, so the range OpenTimelineIO reads ends at 49 000,
+  // where the stored range ends — not at a length counted in frames.
+  let sound = one_source(
+    Rate::FPS_24,
+    24,
+    TimeRange::new(1000, 49_000, tb(1, 48_000)),
+    Some(Rate::hz(48_000)),
+  );
+  assert_eq!(source_range(&sound), (48_000.0, 1000.0, 48_000.0));
+  // On frames of the medium's stated rate: both in frames.
+  let movie = one_source(
+    Rate::FPS_23_976,
+    24,
+    TimeRange::new(1001, 1001 + 24_024, tb(1, 24_000)),
+    Some(Rate::FPS_23_976),
+  );
+  assert_eq!(source_range(&movie), (24_000.0 / 1001.0, 1.0, 24.0));
+}
+
+#[test]
+fn a_source_range_off_the_mediums_frames_is_written_in_ticks_start_and_length() {
+  // The start is half a frame in at 24 fps: both in ticks.
+  let between = one_source(
+    Rate::FPS_24,
+    24,
+    TimeRange::new(500, 500 + 24_000, tb(1, 24_000)),
+    Some(Rate::FPS_24),
+  );
+  assert_eq!(source_range(&between), (24_000.0, 500.0, 24_000.0));
+  // The start lands on a frame of the medium's 25 fps, the length — three
+  // frames at 24, 3.125 at 25 — does not: both in ticks, never one of each.
+  let start_only = one_source(
+    Rate::FPS_24,
+    3,
+    TimeRange::new(3600, 3600 + 11_250, tb(1, 90_000)),
+    Some(Rate::FPS_25),
+  );
+  assert_eq!(source_range(&start_only), (90_000.0, 3600.0, 11_250.0));
+  // No stated rate: ticks.
+  let unstated = one_source(
+    Rate::FPS_24,
+    24,
+    TimeRange::new(1000, 1000 + 24_000, tb(1, 24_000)),
+    None,
+  );
+  assert_eq!(source_range(&unstated), (24_000.0, 1000.0, 24_000.0));
+}
+
+#[test]
+fn a_source_off_the_edit_rate_is_not_exported() {
+  // [0, 1) at 48 per second is half a frame at 24 fps: a record of one frame
+  // would select twice the stored media, so the timeline is refused.
+  let half = one_source(Rate::FPS_24, 1, TimeRange::new(0, 1, tb(1, 48)), None);
+  assert_eq!(
+    to_otio(&half, OtioTarget::V0_15Plus),
+    Err(alloc::vec![Refusal::SourceOffEditRate(crate::ClipAt::new(
+      0, 0
+    ))])
+  );
 }
 
 #[test]

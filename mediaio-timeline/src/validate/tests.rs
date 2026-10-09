@@ -254,25 +254,51 @@ fn a_record_longer_than_its_source_is_refused() {
   assert_eq!(mismatch.found(), frames(48));
 }
 
-#[test]
-fn a_source_rescaled_to_the_nearest_frame_is_accepted() {
-  // 2002 samples are 1001/24000 s: 1.001 frames at 24 fps, nearest 1.
-  let mut timeline = Timeline::new("t", Rate::FPS_24);
-  timeline
-    .tracks_mut()
-    .push(Track::new(TrackKind::Audio, "A").with_clip(Clip::new(
+/// One clip playing `source` at `record`, on a 24 fps timeline.
+fn one_clip(source: TimeRange, record: TimeRange) -> Timeline {
+  Timeline::new("t", Rate::FPS_24).with_track(
+    Track::new(TrackKind::Audio, "A").with_clip(Clip::new(
       "s",
       MediaRef::new("s.wav"),
-      TimeRange::new(0, 2002, tb(1, 48_000)),
-      rec(0, 1),
-    )));
-  assert_eq!(validate(&timeline), Ok(()));
-  // 3000 samples are 1.5 frames, halfway: away from zero, to 2.
-  timeline.tracks_mut()[0].clips_mut()[0].set_source_range(TimeRange::new(0, 3000, tb(1, 48_000)));
-  let [Refusal::DurationMismatch(mismatch)] = refusals(&timeline)[..] else {
-    panic!("{:?}", refusals(&timeline));
-  };
-  assert_eq!(mismatch.expected(), Some(frames(2)));
+      source,
+      record,
+    )),
+  )
+}
+
+#[test]
+fn a_source_off_the_edit_rate_is_refused_whatever_its_record() {
+  // One tick at 48 per second is half a frame at 24 fps: no record holds it
+  // exactly, and with no time-warp nothing may round it to one frame.
+  for record in [rec(0, 1), rec(0, 0), rec(0, 2)] {
+    let refused = refusals(&one_clip(TimeRange::new(0, 1, tb(1, 48)), record));
+    assert!(
+      refused.contains(&Refusal::SourceOffEditRate(ClipAt::new(0, 0))),
+      "{record:?}: {refused:?}"
+    );
+    assert!(
+      !refused
+        .iter()
+        .any(|refusal| matches!(refusal, Refusal::DurationMismatch(_))),
+      "{refused:?}"
+    );
+  }
+  // 2002 samples at 48 kHz are 1.001 frames, 3000 are 1.5: neither is a
+  // whole frame, and neither rounds to one.
+  for samples in [2002, 3000] {
+    assert_eq!(
+      refusals(&one_clip(
+        TimeRange::new(0, samples, tb(1, 48_000)),
+        rec(0, 1)
+      )),
+      [Refusal::SourceOffEditRate(ClipAt::new(0, 0))]
+    );
+  }
+  // 2000 samples are one frame exactly.
+  assert_eq!(
+    validate(&one_clip(TimeRange::new(0, 2000, tb(1, 48_000)), rec(0, 1))),
+    Ok(())
+  );
 }
 
 #[test]
@@ -456,6 +482,10 @@ fn every_refusal_comes_back_at_once_in_the_documented_order() {
 fn refusals_name_what_they_refuse() {
   let shown = |refusal: Refusal| alloc::string::ToString::to_string(&refusal);
   assert_eq!(shown(Refusal::RateUnstated), "the edit rate is zero");
+  assert_eq!(
+    shown(Refusal::SourceOffEditRate(ClipAt::new(0, 2))),
+    "track 0, clip 2: the source range's length is no whole number of edit-rate ticks"
+  );
   assert_eq!(
     shown(Refusal::Overlap(ClipPair::new(1, 0, 2))),
     "track 1: clip 2's record overlaps clip 0's"
