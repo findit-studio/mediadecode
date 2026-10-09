@@ -12,6 +12,18 @@ fn tb(num: i32, den: i32) -> Timebase {
   Timebase::new(num, NonZeroI32::new(den).unwrap())
 }
 
+/// Reads a document from its text.
+///
+/// Through `serde_json::from_reader`, whose reader counts lines and columns
+/// as it goes. `from_str` finds an error's line afterwards with `memchr`,
+/// which aligns its reads by address: Miri's symbolic alignment check, run
+/// by the CI's Miri lanes, cannot follow that and stops on the read (it did
+/// on powerpc64, where `memchr` takes its portable word-at-a-time path).
+/// These laws read errors, so they read without `memchr`.
+fn read(text: &str) -> serde_json::Result<Timeline> {
+  serde_json::from_reader(text.as_bytes())
+}
+
 /// Every word of the model, present once. The document need not validate:
 /// it pins the wire names, not an edit.
 fn sample() -> Timeline {
@@ -164,7 +176,7 @@ fn the_wire_names_are_stable() {
 fn a_document_round_trips() {
   let timeline = sample();
   let text = serde_json::to_string(&timeline).unwrap();
-  let back: Timeline = serde_json::from_str(&text).unwrap();
+  let back = read(&text).unwrap();
   assert_eq!(back, timeline);
   assert_eq!(serde_json::to_string(&back).unwrap(), text);
 }
@@ -181,9 +193,7 @@ fn an_unknown_schema_is_refused_by_name_before_the_body_is_read() {
   // A later schema may reshape every field after its number: the refusal
   // names the schema, not the first field this reader cannot parse.
   let doc = r#"{"schema": 2, "name": 7, "tracks": "a shape schema 1 never had"}"#;
-  let error = serde_json::from_str::<Timeline>(doc)
-    .unwrap_err()
-    .to_string();
+  let error = read(doc).unwrap_err().to_string();
   assert!(
     error.contains("unknown timeline schema 2: this reader knows schema 1"),
     "{error}"
@@ -199,9 +209,7 @@ fn a_word_this_reader_does_not_know_is_refused_by_name() {
     1,
   );
   assert!(text.contains(r#""speed":2.0"#));
-  let error = serde_json::from_str::<Timeline>(&text)
-    .unwrap_err()
-    .to_string();
+  let error = read(&text).unwrap_err().to_string();
   assert!(error.contains("unknown field `speed`"), "{error}");
 }
 
@@ -215,9 +223,7 @@ fn a_word_inside_a_record_this_reader_does_not_know_is_refused_by_name() {
     1,
   );
   assert!(text.contains(r#""speed":2.0"#));
-  let error = serde_json::from_str::<Timeline>(&text)
-    .unwrap_err()
-    .to_string();
+  let error = read(&text).unwrap_err().to_string();
   assert!(error.contains("unknown field `speed`"), "{error}");
 }
 
@@ -300,9 +306,7 @@ fn a_required_word_left_out_is_refused_by_name() {
     serde_json::to_string(&sample())
       .unwrap()
       .replacen(r#""enabled":true,"gain""#, r#""gain""#, 1);
-  let error = serde_json::from_str::<Timeline>(&text)
-    .unwrap_err()
-    .to_string();
+  let error = read(&text).unwrap_err().to_string();
   assert!(error.contains("missing field `enabled`"), "{error}");
 }
 
@@ -312,7 +316,7 @@ fn an_optional_word_left_out_reads_as_absent() {
     .unwrap()
     .replacen(r#","reel":"A001""#, "", 1)
     .replacen(r#""gain":-6.0,"#, "", 1);
-  let back: Timeline = serde_json::from_str(&text).unwrap();
+  let back = read(&text).unwrap();
   let clip = &back.tracks()[0].clips()[0];
   assert_eq!(clip.gain(), None);
   assert_eq!(clip.media().reel(), None);
@@ -326,9 +330,7 @@ fn a_metadata_key_named_twice_is_refused_by_name() {
     r#""metadata":{"project":"law","project":"other"}"#,
     1,
   );
-  let error = serde_json::from_str::<Timeline>(&text)
-    .unwrap_err()
-    .to_string();
+  let error = read(&text).unwrap_err().to_string();
   assert!(
     error.contains("duplicate metadata key `project`"),
     "{error}"
@@ -342,9 +344,7 @@ fn a_gain_that_is_not_finite_is_refused() {
     serde_json::to_string(&sample())
       .unwrap()
       .replacen(r#""gain":-6.0"#, r#""gain":1e300"#, 1);
-  let error = serde_json::from_str::<Timeline>(&text)
-    .unwrap_err()
-    .to_string();
+  let error = read(&text).unwrap_err().to_string();
   assert!(error.contains("gain inf dB is not finite"), "{error}");
 }
 
