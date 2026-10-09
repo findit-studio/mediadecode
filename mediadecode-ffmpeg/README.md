@@ -69,37 +69,66 @@ pipes, network sources) can replay them through a software decoder of
 their own without re-demuxing.
 
 After the first picture nothing changes the road, on any path, and
-nothing is classified. Every call reaches libavcodec: a failure is that
-picture's own error, reported as the decoder minted it, and nothing of it
-is remembered. FFmpeg has no reliable signal that a hardware session is
-gone (`AVERROR_EXTERNAL`, for one, also answers a single picture), and
-whether a hardware session recovers is FFmpeg's, not this crate's.
-FFmpeg 9.0.1 does not always recover one. After a VideoToolbox restart
-that fails, every picture fails the same way until a new parameter set
-re-arms the restart, and `flush` does not change that: it drops the
-pictures and references the codec holds, and it rebuilds no hardware
-session. `VideoDecoder`'s documentation cites the FFmpeg lines.
+nothing is classified. A decoder failure, `VideoDecodeError::Decode`, is
+that picture's own error, reported as the decoder minted it, and nothing
+of it is remembered, so the next call reaches libavcodec. FFmpeg has no
+reliable signal that a hardware session is gone (`AVERROR_EXTERNAL`, for
+one, also answers a single picture), and whether a hardware session
+recovers is FFmpeg's, not this crate's. FFmpeg 9.0.1 does not always
+recover one. After a VideoToolbox restart that fails, every picture
+fails the same way until a new parameter set re-arms the restart, and
+`flush` does not change that: it drops the pictures and references the
+codec holds, and it rebuilds no hardware session. `VideoDecoder`'s
+documentation cites the FFmpeg lines.
 
-So a caller that sees failures persist rebuilds: it opens a session on
-`DecodePath::Software` from the same parameters and feeds it forward.
-When to do that is the caller's policy, not the decoder's, because it is
-the caller that sees the failures on all three roads (`send_packet`,
-`receive_frame` and `send_eof`), the packets' key flags and what it has
-delivered. The usage example below carries one such policy.
+A `VideoDecodeError::Convert` is the wrapper's own failure, not the
+decoder's: `FfmpegVideoStreamDecoder` could not convert a decoded
+picture into a frame (a frame ceiling, a pixel format or plane layout it
+cannot carry, an allocation). One that failed on an allocation parks the
+picture: the next `receive_frame` converts it again, and until one
+delivers it, `send_packet` and `send_eof` answer `Sent::MustDrain`
+without reaching libavcodec. That is the wrapper's back pressure, not a
+failure.
+
+So a caller that sees a hardware session's decoder failures persist
+rebuilds: it opens a session on `DecodePath::Software` from the same
+parameters and feeds it forward. What the new session can be fed depends
+on the road the failure came from:
+
+- **`send_packet`**: the failure names the packet in hand, and the new
+  session is given that packet.
+- **`receive_frame`**: the failure may concern a packet accepted earlier.
+  FFmpeg decouples input from output and may hold several pictures
+  (`libavcodec/avcodec.h` 90–139 in FFmpeg 9.0.1), so no packet is
+  named: the new session is given the next packet, and the caller
+  accepts the gap.
+- **`send_eof`**: the end has no packet to give a new session. What the
+  hardware session still held is recoverable only from packets kept from
+  before, or by a seek.
+
+When to rebuild is the caller's policy, not the decoder's, because it is
+the caller that sees the failures on the three roads, the packets' key
+flags and what it has delivered. What a policy counts is the hardware
+session's decoder failures; a `Convert` error is reported, not counted.
+The usage example below carries the simplest one.
 
 ## Usage
 
-A file's video track, decoded under one policy for a hardware session
-the caller stops trusting. It counts a failure on any of the three
-roads, and only a delivered picture ends the count. At
-`FAILURES_BEFORE_SOFTWARE` failures in a row it rebuilds on
-`DecodePath::Software`, replaying the packets it kept since the last
-packet flagged key.
+A file's video track, decoded under the simplest policy for a hardware
+session the caller stops trusting. It counts the hardware session's
+decoder failures on all three roads, and only a delivered picture ends
+the count. At `FAILURES_BEFORE_SOFTWARE` failures in a row it opens a
+session on `DecodePath::Software` from the same parameters and feeds it
+forward: the packet in hand when the failure came from `send_packet`,
+otherwise what comes next, the next packet or the end. It keeps no
+packets and replays nothing, so every picture the new session delivers
+is delivered as it is. A `Convert` error is reported, not counted: the
+example returns it, as it returns every error it does not handle.
 
 ```rust,no_run
 use ffmpeg_next as ffmpeg;
 use ffmpeg::{codec, format, media};
-use mediadecode::{Received, Sent, Timebase, decoder::VideoStreamDecoder, packet::PacketFlags};
+use mediadecode::{Received, Sent, Timebase, decoder::VideoStreamDecoder};
 use mediadecode_ffmpeg::{
   DecodePath, DecoderLimits, Error, FfmpegVideoStreamDecoder, PacketLimits, VideoDecodeError,
   VideoFrame, VideoPacket, empty_video_frame, video_packet_from_ffmpeg_in,
@@ -107,9 +136,9 @@ use mediadecode_ffmpeg::{
 
 type BoxError = Box<dyn std::error::Error>;
 
-/// This caller's threshold, not the decoder's: how many failures in a
-/// row, with no picture delivered between them, it takes from a hardware
-/// session before it rebuilds on software.
+/// This caller's threshold, not the decoder's: how many decoder failures
+/// in a row, with no picture delivered between them, it takes from a
+/// hardware session before it rebuilds on software.
 const FAILURES_BEFORE_SOFTWARE: u32 = 3;
 
 fn main() -> Result<(), BoxError> {
@@ -140,34 +169,31 @@ fn main() -> Result<(), BoxError> {
     let Some(pkt) =
       video_packet_from_ffmpeg_in(av_packet, time_base, PacketLimits::default())?
     else { continue };
-    track.push(pkt)?;
+    track.push(&pkt)?;
   }
   track.finish()
 }
 
 /// A video track decoded under this caller's policy for a hardware
 /// session it stops trusting.
+///
+/// The policy feeds forward and does nothing else: it keeps no packets,
+/// replays nothing and matches no pictures. That costs the pictures from
+/// a failure to the next keyframe: a new session holds no reference
+/// pictures, so libavcodec drops or conceals what comes before one, and
+/// what the hardware session still held goes with it. A caller that
+/// cannot afford that gap keeps the packets since the last clean keyframe
+/// and replays them with a picture identity of its own; that bookkeeping
+/// is the caller's design and is not shown here, because a doc example
+/// cannot carry it correctly.
 struct Track {
   parameters: codec::Parameters,
   time_base: Timebase,
   decoder: FfmpegVideoStreamDecoder,
   frame: VideoFrame,
-  /// Failures on any road since the last picture delivered.
+  /// The hardware session's decoder failures since the last picture
+  /// delivered.
   failures_in_a_row: u32,
-  /// The packets since the last one flagged key, kept while the session
-  /// is on hardware: this input is read once, and a software session
-  /// needs them to decode the group from its keyframe. A seekable input
-  /// could seek back instead. A stream can go a long way between
-  /// keyframes, so a caller that bounds this list feeds software forward
-  /// from the failing packet past the bound, and libavcodec conceals or
-  /// drops what comes before the next keyframe: that gap is the price.
-  since_key: Vec<VideoPacket>,
-  /// The PTS of the last picture delivered.
-  delivered_up_to: Option<i64>,
-  /// The input is over, so a session opened from here on is given the end.
-  at_end: bool,
-  /// The current session has taken the end.
-  end_taken: bool,
 }
 
 impl Track {
@@ -183,28 +209,25 @@ impl Track {
       decoder,
       frame: empty_video_frame(),
       failures_in_a_row: 0,
-      since_key: Vec::new(),
-      delivered_up_to: None,
-      at_end: false,
-      end_taken: false,
     })
   }
 
-  /// The `send_packet` road.
-  fn push(&mut self, pkt: VideoPacket) -> Result<(), BoxError> {
+  /// The `send_packet` road. A failure here names this packet.
+  fn push(&mut self, pkt: &VideoPacket) -> Result<(), BoxError> {
     loop {
-      match self.decoder.send_packet(&pkt) {
-        Ok(Sent::Accepted) => break,
+      match self.decoder.send_packet(pkt) {
+        Ok(Sent::Accepted) => return self.drain(),
         // Back pressure, not a failure: nothing was consumed, so drain
         // and offer this same packet again. The old idiom — submit
         // twice and treat the second failure as real — is what this
         // arm replaces.
         Ok(Sent::MustDrain) => self.drain()?,
-        // This send's own failure. The packet is kept all the same, so a
-        // software session opened for the failure is given it.
         Err(VideoDecodeError::Decode(e)) => {
-          self.keep(pkt);
-          self.failed(e)?;
+          // A software session opened for this failure is given this
+          // packet; otherwise the packet is behind us.
+          if self.failed(e)? {
+            continue;
+          }
           return self.drain();
         }
         // `VideoDecodeError` is `#[non_exhaustive]`: a fault this code
@@ -213,37 +236,27 @@ impl Track {
         Err(e) => return Err(e.into()),
       }
     }
-    self.keep(pkt);
-    self.drain()
   }
 
-  /// The `send_eof` road, then the tail.
+  /// The `send_eof` road, then the tail. The end has no packet: a
+  /// software session opened for a failure here is given the end and
+  /// nothing else, so what the hardware session still held is lost.
   fn finish(&mut self) -> Result<(), BoxError> {
-    self.at_end = true;
-    self.offer_end()?;
-    self.drain()
-  }
-
-  /// The end of the stream, offered on the same terms as a packet.
-  fn offer_end(&mut self) -> Result<(), BoxError> {
-    while !self.end_taken {
+    loop {
       match self.decoder.send_eof() {
-        Ok(Sent::Accepted) => self.end_taken = true,
+        Ok(Sent::Accepted) => return self.drain(),
         Ok(Sent::MustDrain) => self.drain()?,
         Err(VideoDecodeError::Decode(e)) => {
-          let on_software = self.decoder.is_software();
-          self.failed(e)?;
-          // A hardware session is offered the end again, and every
-          // refusal counts, so the count moves the end to software if
-          // nothing else does. Software keeps what it holds.
-          if on_software {
-            return Ok(());
+          if self.failed(e)? {
+            continue;
           }
+          // The end stays refused: what is ready is drained, and what
+          // the session still holds is lost with it.
+          return self.drain();
         }
         Err(e) => return Err(e.into()),
       }
     }
-    Ok(())
   }
 
   /// The `receive_frame` road: every picture the session has ready, up
@@ -255,82 +268,55 @@ impl Track {
       match self.decoder.receive_frame(&mut self.frame) {
         Ok(Received::Frame) => self.deliver(),
         Ok(Received::NeedsInput | Received::Ended) => return Ok(()),
-        // A picture's own failure can arrive here too: a decoded
-        // picture's transfer to the CPU, or FFmpeg's own post-processing
-        // of it. The next call is the session's to answer.
-        Err(VideoDecodeError::Decode(e)) => self.failed(e)?,
+        // A failure here may concern a packet accepted earlier: FFmpeg
+        // decouples input from output and may hold several pictures. No
+        // packet is named, so a software session opened for it is given
+        // the next packet.
+        Err(VideoDecodeError::Decode(e)) => {
+          if self.failed(e)? {
+            return Ok(());
+          }
+        }
+        // Not counted: a `Convert` error is the wrapper's own, a decoded
+        // picture it could not convert into a frame, and not a decoder
+        // failure. It is reported, as is anything this code has never
+        // heard of.
         Err(e) => return Err(e.into()),
       }
     }
   }
 
-  /// A picture, delivered to the rest of the program.
+  /// A picture, delivered to the rest of the program as it is.
   fn deliver(&mut self) {
-    let pts = self.frame.pts().map(|t| t.pts());
-    // A replay decodes again what the hardware session delivered.
-    // Pictures come out in presentation order, so one at or before the
-    // last PTS delivered is already the program's. (One without a PTS
-    // cannot be matched, and is delivered.)
-    if matches!((pts, self.delivered_up_to), (Some(p), Some(last)) if p <= last) {
-      return;
-    }
-    // The count of failures ends here, at a picture delivered, and
-    // nowhere else.
+    // The count ends here, at a delivered picture, and nowhere else.
     self.failures_in_a_row = 0;
-    self.delivered_up_to = pts.or(self.delivered_up_to);
     // self.frame.pixel_format(), .width(), .height(), .planes() — view
     // carriers: read them here and drop. A frame held is a pool slot
     // held. Use the `Owned*` family when a frame has to outlive this.
   }
 
-  /// A failure on any of the three roads: a send, a picture asked for,
-  /// or the end.
-  fn failed(&mut self, e: Error) -> Result<(), BoxError> {
+  /// A decoder failure on any of the three roads. On hardware it counts,
+  /// and at `FAILURES_BEFORE_SOFTWARE` the session is replaced by one on
+  /// `DecodePath::Software`, opened from the same parameters. Answers
+  /// whether it was, so the road can feed the new session.
+  fn failed(&mut self, e: Error) -> Result<bool, BoxError> {
     eprintln!("decode failure: {e}");
     // Software is where this policy ends: its failures are reported,
     // and the stream goes on.
-    if self.decoder.is_hardware() {
-      self.failures_in_a_row += 1;
-      if self.failures_in_a_row >= FAILURES_BEFORE_SOFTWARE {
-        self.rebuild_on_software()?;
-      }
+    if !self.decoder.is_hardware() {
+      return Ok(false);
     }
-    Ok(())
-  }
-
-  /// A session on `DecodePath::Software`, opened from the same
-  /// parameters and given what the hardware session was working on.
-  fn rebuild_on_software(&mut self) -> Result<(), BoxError> {
+    self.failures_in_a_row += 1;
+    if self.failures_in_a_row < FAILURES_BEFORE_SOFTWARE {
+      return Ok(false);
+    }
     self.decoder = FfmpegVideoStreamDecoder::open_as(
       self.parameters.clone(),
       self.time_base,
       DecoderLimits::default(),
       DecodePath::Software,
     )?;
-    self.end_taken = false;
-    // The packets since the last one flagged key, in order; `deliver`
-    // skips the pictures the hardware session already delivered.
-    for pkt in std::mem::take(&mut self.since_key) {
-      self.push(pkt)?;
-    }
-    // Then the end, when the input is already over.
-    if self.at_end {
-      self.offer_end()?;
-    }
-    Ok(())
-  }
-
-  /// Keeps a packet while the session is on hardware. One flagged key
-  /// starts the group again; on software nothing is kept.
-  fn keep(&mut self, pkt: VideoPacket) {
-    if !self.decoder.is_hardware() {
-      self.since_key.clear();
-      return;
-    }
-    if pkt.flags().contains(PacketFlags::KEY) {
-      self.since_key.clear();
-    }
-    self.since_key.push(pkt);
+    Ok(true)
   }
 }
 ```
@@ -350,10 +336,10 @@ for end-to-end demuxer-driven runs that cover all three streams.
   — `Auto` (what `open` does: probe hardware, fall back to software
   before the first picture), `AnyHardware` (the same probe, never
   software), `Software`, or the pin `Hardware(Backend)`. After the first
-  picture no path changes its decoder, and a failure is the picture's
-  own error; when to stop trusting a hardware session is the caller's
-  policy. `is_hardware()` / `is_software()` stay the live reading of where
-  a session is.
+  picture no path changes its decoder, and a decoder failure is the
+  picture's own error; when to stop trusting a hardware session is the
+  caller's policy. `is_hardware()` / `is_software()` stay the live
+  reading of where a session is.
 - **Demuxer**: `FfmpegDemuxer` — `mediadecode`'s `Demuxer` over
   `libavformat`, opened from a path (`open`) or from any
   `Read + Seek` byte source through a custom `AVIOContext`
