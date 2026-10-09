@@ -2557,6 +2557,15 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// refused by name before any decoder sees the packet, as a new extradata
   /// is ([`NewExtradata::of`], [`Error::ExtradataRejected`]): the packet
   /// stays the caller's, and nothing of the session changes.
+  ///
+  /// The packet's own `AV_PKT_DATA_NEW_EXTRADATA` comes first, as FFmpeg
+  /// applies it ahead of the body (h264dec.c:1038-1050): it is judged against
+  /// what the decoder holds, refused by name where FFmpeg would not apply it
+  /// whole, and the body is judged against what the decoder holds once it
+  /// applied it — a sequence parameter set it brings or replaces is the one
+  /// the body's picture parameter sets are read under. Nothing is committed
+  /// here: the session holds what the packet brings once a decoder may have
+  /// taken it ([`Self::commit_sets`]).
   fn refuse_record_body(&self, pkt: &Packet) -> Result<(), Error> {
     if self.codec_id() != crate::CodecId::H264.raw() {
       return Ok(());
@@ -2564,15 +2573,25 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     let Some(data) = pkt.data() else {
       return Ok(());
     };
-    let record = match self.held.h264_reading(new_extradata(pkt), data) {
+    let rejected = |reason| {
+      Error::ExtradataRejected(crate::ExtradataRejected::new(crate::CodecId::H264, reason))
+    };
+    let applied;
+    let held = match new_extradata(pkt) {
+      Some(record) => {
+        self.held.h264_verdict(record).map_err(rejected)?;
+        applied = self.held.with_record(record);
+        &applied
+      }
+      None => &self.held,
+    };
+    let record = match held.h264_reading(None, data) {
       Some(held::H264Reading::Record) => true,
       Some(held::H264Reading::Units(_)) => false,
       None => params::avcc_body(data),
     };
     if record {
-      self.held.h264_verdict(data).map_err(|reason| {
-        Error::ExtradataRejected(crate::ExtradataRejected::new(crate::CodecId::H264, reason))
-      })?;
+      held.h264_verdict(data).map_err(rejected)?;
     }
     Ok(())
   }

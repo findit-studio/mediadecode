@@ -11069,3 +11069,216 @@ fn a_replay_holds_the_sets_of_the_packets_it_fed_and_no_other() {
     "every picture from 16 on, as a straight decode from 16 gives it"
   );
 }
+
+// ---------------------------------------------------------------------------
+//  R18 row 2: a body record is judged after the packet's own record
+// ---------------------------------------------------------------------------
+
+/// `value` as an unsigned exp-Golomb code, `ue(v)`, in `0`s and `1`s.
+fn ue_bits(value: u32) -> String {
+  let coded = u64::from(value) + 1;
+  let width = 64 - coded.leading_zeros();
+  format!("{}{coded:b}", "0".repeat(width as usize - 1))
+}
+
+/// A NAL unit: `header`, then the raw byte sequence payload `bits` — `0`s
+/// and `1`s, its `rbsp_stop_one_bit` and the zeros after it added here — with
+/// the emulation prevention bytes a NAL unit carries.
+fn nal_unit_of_bits(header: &[u8], bits: &str) -> Vec<u8> {
+  let mut bits = format!("{bits}1");
+  while bits.len() % 8 != 0 {
+    bits.push('0');
+  }
+  let mut unit = header.to_vec();
+  let mut zeros = 0;
+  for chunk in bits.as_bytes().chunks(8) {
+    let byte = u8::from_str_radix(core::str::from_utf8(chunk).expect("ascii"), 2).expect("bits");
+    if zeros >= 2 && byte <= 3 {
+      unit.push(3);
+      zeros = 0;
+    }
+    unit.push(byte);
+    zeros = if byte == 0 { zeros + 1 } else { 0 };
+  }
+  unit
+}
+
+/// An H.264 sequence parameter set unit of id `sps_id`: High 4:4:4
+/// Predictive, 4:2:0 at `bit_depth` bits, 128x96 in frames, picture order
+/// type 2, one reference frame, no cropping and no VUI.
+fn h264_sps_unit(sps_id: u32, bit_depth: u32) -> Vec<u8> {
+  let mut bits = format!("{:08b}{:08b}{:08b}", 244, 0, 30); // profile, constraints, level
+  bits += &ue_bits(sps_id);
+  bits += &ue_bits(1); // chroma_format_idc
+  bits += &ue_bits(bit_depth - 8); // bit_depth_luma_minus8
+  bits += &ue_bits(bit_depth - 8); // bit_depth_chroma_minus8
+  bits += "00"; // qpprime_y_zero_transform_bypass_flag, seq_scaling_matrix_present_flag
+  bits += &ue_bits(0); // log2_max_frame_num_minus4
+  bits += &ue_bits(2); // pic_order_cnt_type
+  bits += &ue_bits(1); // max_num_ref_frames
+  bits += "0"; // gaps_in_frame_num_value_allowed_flag
+  bits += &ue_bits(7); // pic_width_in_mbs_minus1
+  bits += &ue_bits(5); // pic_height_in_map_units_minus1
+  bits += "1100"; // frame_mbs_only, direct_8x8_inference, frame_cropping, vui_parameters_present
+  nal_unit_of_bits(&[0x67], &bits)
+}
+
+/// An `avcC` record of `sps` entries and `pps` entries, its NAL length fields
+/// four bytes wide, its header's second and third bytes those of the first
+/// SPS and its third byte zero, as `is_avcc_extradata` reads a body
+/// (h264dec.c:1045).
+fn avcc_of(sps: &[&[u8]], pps: &[&[u8]]) -> Vec<u8> {
+  let first = sps.first().copied().unwrap_or(&[0x67, 66, 0, 30]);
+  let mut record = vec![1, first[1], 0, first[3], 0xFF, 0xE0 | sps.len() as u8];
+  for unit in sps {
+    record.extend_from_slice(
+      &u16::try_from(unit.len())
+        .expect("a short SPS")
+        .to_be_bytes(),
+    );
+    record.extend_from_slice(unit);
+  }
+  record.push(pps.len() as u8);
+  for unit in pps {
+    record.extend_from_slice(
+      &u16::try_from(unit.len())
+        .expect("a short PPS")
+        .to_be_bytes(),
+    );
+    record.extend_from_slice(unit);
+  }
+  record
+}
+
+/// LAW (R18 row 2; Codex R17 [high]): **a packet's body FFmpeg's H.264
+/// decoder reads as an `avcC` record is judged against what the decoder
+/// holds once it applied the packet's own new extradata**, which
+/// `h264_decode_frame` applies first (h264dec.c:1038-1050). A four-byte
+/// `avcC` stream A (128x96, SPS and PPS 0), on the software road, one thread:
+/// - **a set the packet's record brings**: a packet whose
+///   `AV_PKT_DATA_NEW_EXTRADATA` is an `avcC` record of one SPS 5 — a second
+///   stream B's, encoded under SPS and PPS 5 — and whose body is an `avcC`
+///   record of A's SPS 0 and B's PPS 5, which refers to SPS 5: FFmpeg stores
+///   SPS 5 from the record, then PPS 5 from the body. Taken, the session
+///   holds PPS 5, and B's packets after it, carrying no set, decode as a
+///   straight decode of B gives them. Judged against the sets held before
+///   the record, the body read `Unresolved` and was refused, and B's
+///   pictures were lost.
+/// - **a set the packet's record replaces**: SPS 5 held — taken from an
+///   earlier packet's record — a packet whose record replaces it with an SPS
+///   5 of 11 bits, under which FFmpeg's picture parameter set reader fails a
+///   PPS (h264_ps.c:747-752), and whose body is the same `avcC` record of
+///   SPS 0 and PPS 5: FFmpeg applies the body in part, PPS 5 skipped. The
+///   packet is refused by name, `ExtradataRejected`, the PPS `Unparsed`, no
+///   decoder taking it, and the stream after it decodes whole. Judged against
+///   the 8-bit SPS 5 held before the record, the body was taken.
+#[test]
+fn a_record_body_is_judged_after_the_packet_s_own_record() {
+  let (a, sps0, _) = encode_h264_avcc(128, 96, 16);
+  let b = encode_h264_global(
+    128,
+    96,
+    8,
+    "keyint=8:min-keyint=8:scenecut=0:bframes=0:open-gop=0:sps-id=5:log-level=error",
+  );
+  let (sps5, pps5) = sps_and_pps(&b);
+  assert_eq!(
+    (sps5[4] & 0xf8, pps5[1] & 0xf8),
+    (0x30, 0x30),
+    "B's SPS and PPS are id 5, its PPS referring to SPS 5"
+  );
+  let record_of_sps5 = avcc_of(&[&sps5], &[]);
+  let body = avcc_of(&[&sps0], &[&pps5]);
+  assert!(
+    super::params::avcc_body(&body),
+    "the body reads as a record"
+  );
+  let mut record_packet = with_new_extradata(Packet::copy(&body), &record_of_sps5);
+  record_packet.set_flags(ffmpeg_next::packet::Flags::KEY);
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let software = || {
+    FfmpegVideoStreamDecoder::open_as(
+      a.parameters.clone(),
+      tb,
+      DecoderLimits::default().with_threads(crate::Threads::Single),
+      DecodePath::Software,
+    )
+    .expect("the software road opens")
+  };
+
+  // A set the packet's record brings.
+  let b_packets: Vec<Packet> = b
+    .packets
+    .iter()
+    .map(|packet| {
+      let units = annexb_units(packet.data().expect("a payload"));
+      let mut moved = repacked(packet, &length_prefixed(&units, 4));
+      moved.set_pts(packet.pts().map(|pts| pts + 16));
+      moved.set_dts(packet.dts().map(|dts| dts + 16));
+      moved
+    })
+    .collect();
+  let mut packets = a.packets[..5].to_vec();
+  packets.push(record_packet.clone());
+  packets.extend(b_packets.iter().cloned());
+  let clip = SyntheticClip {
+    parameters: a.parameters.clone(),
+    packets,
+  };
+  let mut held_pps5 = false;
+  let session = session_of(software(), &clip, |index, dec| {
+    if index == 6 {
+      held_pps5 = dec.held.holds_pps(5);
+    }
+  });
+  assert!(
+    session.errors.is_empty(),
+    "the record's packet taken, nothing refused: {:?}",
+    session.errors
+  );
+  assert!(held_pps5, "the session holds PPS 5 once it is taken");
+  let b_alone = SyntheticClip {
+    parameters: {
+      let mut parameters = a.parameters.clone();
+      set_extradata(&mut parameters, &avcc_of(&[&sps5], &[&pps5]));
+      parameters
+    },
+    packets: b_packets,
+  };
+  let reference = straight(&b_alone);
+  assert_eq!(reference.len(), 8, "the straight decode of B is whole");
+  assert!(
+    from_pts(&session.pictures, 16) == reference,
+    "B's pictures, as a straight decode of B gives them"
+  );
+
+  // A set the packet's record replaces.
+  let mut dec = software();
+  let mut dst = crate::empty_owned_video_frame();
+  for av_pkt in &a.packets[..5] {
+    sent_through(&mut dec, &mut dst, av_pkt);
+    drained(&mut dec, &mut dst);
+  }
+  sent_through(
+    &mut dec,
+    &mut dst,
+    &with_new_extradata(a.packets[5].clone(), &record_of_sps5),
+  );
+  drained(&mut dec, &mut dst);
+  let replacing = with_new_extradata(Packet::copy(&body), &avcc_of(&[&h264_sps_unit(5, 11)], &[]));
+  let taken = super::live_sw::sent();
+  match dec.send_packet(&pushed(&replacing)) {
+    Err(VideoDecodeError::Decode(Error::ExtradataRejected(rejected))) => assert_eq!(
+      rejected.reason(),
+      crate::ExtradataRejection::Unparsed(crate::ParameterSet::Picture),
+      "the reason"
+    ),
+    other => panic!("the body FFmpeg applies in part is refused by name: {other:?}"),
+  }
+  assert_eq!(super::live_sw::sent(), taken, "no decoder took it");
+  for av_pkt in &a.packets[6..] {
+    sent_through(&mut dec, &mut dst, av_pkt);
+    let (_, escalated) = drained(&mut dec, &mut dst);
+    assert!(!escalated, "the stream after it decodes");
+  }
+}
