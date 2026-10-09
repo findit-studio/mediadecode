@@ -4,6 +4,7 @@ members = [
   "mediadecode",
   "mediadecode-ffmpeg",
   "mediadecode-webcodecs",
+  "mediaio-timeline",
 ]
 
 [workspace.package]

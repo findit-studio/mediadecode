@@ -1,0 +1,290 @@
+//! The stored document: its wire names, its round trip, and what a reader
+//! refuses by name.
+
+use core::num::NonZeroI32;
+
+use mediaio_timeline::{
+  Clip, Duration, Fade, FadeShape, Fades, Gain, MediaRef, Metadata, Rate, Schema, TimeRange,
+  Timebase, Timeline, Timestamp, Track, TrackKind, Transition,
+};
+
+fn tb(num: i32, den: i32) -> Timebase {
+  Timebase::new(num, NonZeroI32::new(den).unwrap())
+}
+
+/// Every word of the model, present once. The document need not validate:
+/// it pins the wire names, not an edit.
+fn sample() -> Timeline {
+  let edit = tb(1001, 24_000);
+  let media = tb(1, 24_000);
+  Timeline::new("doc", Rate::FPS_23_976)
+    .with_start(Timestamp::new(86_400, edit))
+    .with_metadata(Metadata::new().with("project", "law"))
+    .with_track(
+      Track::new(TrackKind::Video, "V1")
+        .with_clip(
+          Clip::new(
+            "a",
+            MediaRef::new("file:///media/a.mov")
+              .with_available_range(Some(TimeRange::new(0, 240_240, media)))
+              .with_rate(Some(Rate::FPS_23_976))
+              .with_reel(Some("A001".into())),
+            TimeRange::new(24_024, 120_120, media),
+            TimeRange::new(0, 96, edit),
+          )
+          .with_gain(Gain::from_db(-6.0))
+          .with_fades(Fades::new().with_out(Some(Fade::new(
+            Duration::new(24, edit),
+            FadeShape::EqualPower,
+          )))),
+        )
+        .with_transition(Transition::dissolve(
+          Timestamp::new(96, edit),
+          Duration::new(12, edit),
+          Duration::new(12, edit),
+        )),
+    )
+}
+
+/// Predicted by hand from the field declarations before the first run.
+const SAMPLE_PRETTY: &str = r#"{
+  "schema": 1,
+  "name": "doc",
+  "rate": {
+    "numerator": 24000,
+    "denominator": 1001
+  },
+  "start": {
+    "pts": 86400,
+    "timebase": {
+      "numerator": 1001,
+      "denominator": 24000
+    }
+  },
+  "metadata": {
+    "project": "law"
+  },
+  "tracks": [
+    {
+      "kind": "video",
+      "name": "V1",
+      "enabled": true,
+      "clips": [
+        {
+          "name": "a",
+          "media": {
+            "locator": "file:///media/a.mov",
+            "available_range": {
+              "start": 0,
+              "end": 240240,
+              "timebase": {
+                "numerator": 1,
+                "denominator": 24000
+              }
+            },
+            "rate": {
+              "numerator": 24000,
+              "denominator": 1001
+            },
+            "reel": "A001"
+          },
+          "source_range": {
+            "start": 24024,
+            "end": 120120,
+            "timebase": {
+              "numerator": 1,
+              "denominator": 24000
+            }
+          },
+          "record": {
+            "start": 0,
+            "end": 96,
+            "timebase": {
+              "numerator": 1001,
+              "denominator": 24000
+            }
+          },
+          "enabled": true,
+          "gain": -6.0,
+          "fades": {
+            "in": null,
+            "out": {
+              "duration": {
+                "ticks": 24,
+                "timebase": {
+                  "numerator": 1001,
+                  "denominator": 24000
+                }
+              },
+              "shape": "equal_power"
+            }
+          },
+          "metadata": {}
+        }
+      ],
+      "transitions": [
+        {
+          "kind": "dissolve",
+          "at": {
+            "pts": 96,
+            "timebase": {
+              "numerator": 1001,
+              "denominator": 24000
+            }
+          },
+          "in_offset": {
+            "ticks": 12,
+            "timebase": {
+              "numerator": 1001,
+              "denominator": 24000
+            }
+          },
+          "out_offset": {
+            "ticks": 12,
+            "timebase": {
+              "numerator": 1001,
+              "denominator": 24000
+            }
+          }
+        }
+      ]
+    }
+  ]
+}"#;
+
+#[test]
+fn the_wire_names_are_stable() {
+  assert_eq!(
+    serde_json::to_string_pretty(&sample()).unwrap(),
+    SAMPLE_PRETTY
+  );
+}
+
+#[test]
+fn a_document_round_trips() {
+  let timeline = sample();
+  let text = serde_json::to_string(&timeline).unwrap();
+  let back: Timeline = serde_json::from_str(&text).unwrap();
+  assert_eq!(back, timeline);
+  assert_eq!(serde_json::to_string(&back).unwrap(), text);
+}
+
+#[test]
+fn the_schema_is_the_first_field_written() {
+  let text = serde_json::to_string(&sample()).unwrap();
+  assert!(text.starts_with(r#"{"schema":1,"#), "{text}");
+  assert_eq!(sample().schema(), Schema::V1);
+}
+
+#[test]
+fn an_unknown_schema_is_refused_by_name_before_the_body_is_read() {
+  // A later schema may reshape every field after its number: the refusal
+  // names the schema, not the first field this reader cannot parse.
+  let doc = r#"{"schema": 2, "name": 7, "tracks": "a shape schema 1 never had"}"#;
+  let error = serde_json::from_str::<Timeline>(doc)
+    .unwrap_err()
+    .to_string();
+  assert!(
+    error.contains("unknown timeline schema 2: this reader knows schema 1"),
+    "{error}"
+  );
+}
+
+#[test]
+fn a_word_this_reader_does_not_know_is_refused_by_name() {
+  // `speed` is reserved for a later schema; schema 1 has no such word.
+  let text = serde_json::to_string(&sample()).unwrap().replacen(
+    r#""enabled":true,"gain""#,
+    r#""enabled":true,"speed":2.0,"gain""#,
+    1,
+  );
+  assert!(text.contains(r#""speed":2.0"#));
+  let error = serde_json::from_str::<Timeline>(&text)
+    .unwrap_err()
+    .to_string();
+  assert!(error.contains("unknown field `speed`"), "{error}");
+}
+
+#[test]
+fn a_required_word_left_out_is_refused_by_name() {
+  let text =
+    serde_json::to_string(&sample())
+      .unwrap()
+      .replacen(r#""enabled":true,"gain""#, r#""gain""#, 1);
+  let error = serde_json::from_str::<Timeline>(&text)
+    .unwrap_err()
+    .to_string();
+  assert!(error.contains("missing field `enabled`"), "{error}");
+}
+
+#[test]
+fn an_optional_word_left_out_reads_as_absent() {
+  let text = serde_json::to_string(&sample())
+    .unwrap()
+    .replacen(r#","reel":"A001""#, "", 1)
+    .replacen(r#""gain":-6.0,"#, "", 1);
+  let back: Timeline = serde_json::from_str(&text).unwrap();
+  let clip = &back.tracks()[0].clips()[0];
+  assert_eq!(clip.gain(), None);
+  assert_eq!(clip.media().reel(), None);
+  assert_eq!(clip.media().rate(), Some(Rate::FPS_23_976));
+}
+
+#[test]
+fn a_metadata_key_named_twice_is_refused_by_name() {
+  let text = serde_json::to_string(&sample()).unwrap().replacen(
+    r#""metadata":{"project":"law"}"#,
+    r#""metadata":{"project":"law","project":"other"}"#,
+    1,
+  );
+  let error = serde_json::from_str::<Timeline>(&text)
+    .unwrap_err()
+    .to_string();
+  assert!(
+    error.contains("duplicate metadata key `project`"),
+    "{error}"
+  );
+}
+
+#[test]
+fn a_gain_that_is_not_finite_is_refused() {
+  // 1e300 has no f32: it reads as infinity, which no gain is.
+  let text =
+    serde_json::to_string(&sample())
+      .unwrap()
+      .replacen(r#""gain":-6.0"#, r#""gain":1e300"#, 1);
+  let error = serde_json::from_str::<Timeline>(&text)
+    .unwrap_err()
+    .to_string();
+  assert!(error.contains("gain inf dB is not finite"), "{error}");
+}
+
+#[test]
+fn a_gain_is_finite_by_construction() {
+  assert_eq!(Gain::from_db(-6.0).map(Gain::db), Some(-6.0));
+  assert_eq!(Gain::from_db(f32::NAN), None);
+  assert_eq!(Gain::from_db(f32::INFINITY), None);
+  assert_eq!(Gain::from_db(f32::NEG_INFINITY), None);
+  assert_eq!(Gain::UNITY.db(), 0.0);
+}
+
+#[test]
+fn metadata_iterates_in_key_order_whatever_the_insertion_order() {
+  let metadata = Metadata::new().with("b", "2").with("a", "1");
+  let entries: Vec<_> = metadata.iter().collect();
+  assert_eq!(entries, [("a", "1"), ("b", "2")]);
+  assert_eq!(metadata, [("a", "1"), ("b", "2")].into_iter().collect());
+  assert_eq!(metadata.get("a"), Some("1"));
+  assert_eq!(metadata.len(), 2);
+}
+
+#[test]
+fn a_new_timeline_counts_its_start_at_the_edit_rate() {
+  let timeline = Timeline::new("t", Rate::FPS_25);
+  assert_eq!(timeline.start().timebase(), tb(1, 25));
+  assert_eq!(timeline.edit_timebase(), Some(tb(1, 25)));
+  // A rate of zero has no timebase; the start falls back to 1/1.
+  let zero = Timeline::new("t", Rate::hz(0));
+  assert_eq!(zero.edit_timebase(), None);
+  assert_eq!(zero.start().timebase(), Timebase::default());
+}
