@@ -2578,10 +2578,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// and nothing of the session changes. FFmpeg's H.264 decoder reads an
   /// empty body as the end of the stream, handing out a picture it was
   /// holding back, and returns before it reads the packet's new extradata
-  /// (`h264_decode_frame`, h264dec.c:1034-1036, 978-1016): a record riding
+  /// (`h264_decode_frame`, h264dec.c:1034-1036, 978-1017): a record riding
   /// one is refused by name ([`crate::ExtradataRejection::Bodiless`]). Its
   /// MPEG decoders read an empty packet as the end of their pictures too
-  /// (mpeg12dec.c:2556-2568, h263dec.c:452-470, vc1dec.c:843-854), and what an
+  /// (mpeg12dec.c:2556-2568, h263dec.c:452-472, vc1dec.c:843-854), and what an
   /// implementation that wraps another makes of one is not this crate's to
   /// read; one carrying nothing at all would be the end of the stream itself
   /// (decode.c:745-752). Those are answered `AVERROR(EINVAL)`, what

@@ -12009,7 +12009,7 @@ fn an_hevc_record_riding_a_packet_with_no_body_is_applied() {
 /// session changes.** FFmpeg's H.264 decoder reads an empty body as the end
 /// of the stream — it hands out a picture it was holding back — and returns
 /// before it reads the packet's `AV_PKT_DATA_NEW_EXTRADATA`
-/// (`h264_decode_frame`, h264dec.c:1034-1036, 978-1016): a packet with no
+/// (`h264_decode_frame`, h264dec.c:1034-1036, 978-1017): a packet with no
 /// body applies no record, however it is handed over. A `libx264` stream, 32
 /// frames, IDRs every 8 and two B-frames; a packet with no body ahead of its
 /// IDR 16 carrying a second stream's record (160x96, SPS and PPS 0). On the

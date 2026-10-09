@@ -121,7 +121,10 @@ The backend-agnostic core it adapts has its own log at
   naming the reason; the packet stays the caller's and nothing of the
   session changes (below). A packet body FFmpeg reads as an `avcC` record
   is judged the same way, against the sets the decoder holds once it
-  applied the packet's own new extradata, which FFmpeg applies first.
+  applied the packet's own new extradata, which FFmpeg applies first. So is
+  an H.264 record riding a packet with no body, which FFmpeg's decoder reads
+  as the end of the stream before it reads the record
+  (`ExtradataRejection::Bodiless`).
 
 - **`Error::SetsUnrecordable`** (`SetsUnrecordable { codec, reason }`, with
   `Unrecordable`, both exported; `Unrecordable` is `#[non_exhaustive]`): a
@@ -432,6 +435,19 @@ The backend-agnostic core it adapts has its own log at
   parameters as opened, an `avcC` stream
   whose length fields changed never anchored, ended in a false
   `PostCommitNeverResynced`, and never returned to the session's threads.
+  A packet with no body that carries side data — what libavformat hands over
+  for a sample of no bytes at a change of sample description — reaches
+  FFmpeg's own HEVC decoder, which applies its record and reads no unit, in
+  the one shape libavcodec takes it in, no data at all, and its record is
+  followed as any packet's; a probe's rescue history records it so too.
+  Rebuilt with a body of size 0 that was not null, it was refused
+  `AVERROR(EINVAL)` before the decoder read its side data, and the record
+  and the parameter sets held were left unknown. Every other packet with no
+  body is refused before any decoder sees it, nothing of the session moved:
+  an H.264 record riding one by name (`Bodiless`, above); another codec's,
+  whose FFmpeg decoders read an empty packet as the end of the stream, one
+  for a decoder that wraps another, and one carrying nothing at all
+  `AVERROR(EINVAL)`, the answer libavcodec gives it in libavformat's shape.
 
 - **A picture the allocator judge refused is named even where FFmpeg
   conceals it.** FFmpeg's H.264 decoder drops a slice whose picture it
@@ -483,10 +499,14 @@ The backend-agnostic core it adapts has its own log at
   switch declined: among the reasons a set whose last fields FFmpeg read off
   the bytes after it, which a record changes — an HEVC picture parameter
   set it stores so, a video parameter set it stores so under an id holding
-  nothing. An H.264 set is told from another as FFmpeg tells it, by its
-  parsed form and the bytes it keeps of it, not its raw bytes: the same set
-  repeated before a three-byte start code rather than a four-byte one
-  replaces nothing. A probe-era fallback's replay starts from what the
+  nothing. An H.264 set is told from another as FFmpeg tells it — by the
+  first 4096 bytes of it FFmpeg keeps and every field its reading stores,
+  not by its raw bytes: the same set repeated before a three-byte start code
+  rather than a four-byte one replaces nothing, nor does a set of more than
+  4096 bytes repeated with other bytes past them that no field reads, nor a
+  set read past its end repeated with the same bytes after it; a field
+  FFmpeg stores from past those 4096 bytes still tells a set apart. A
+  probe-era fallback's replay starts from what the
   hardware held when its history began, and moves what is held by the
   packets it feeds alone, each read as the decoder serving reads it: a seek
   that drops what the budget left unfed leaves none of their sets behind.

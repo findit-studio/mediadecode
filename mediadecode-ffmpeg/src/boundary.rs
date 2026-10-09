@@ -889,8 +889,8 @@ pub fn ffmpeg_packet_from_owned_video_packet(
 /// its `AV_PKT_DATA_NEW_EXTRADATA` and reads no unit
 /// (`hevc_receive_frame`, hevc/hevcdec.c:3855-3872), while its H.264 and
 /// MPEG decoders read an empty packet as the end of the stream, handing out
-/// a picture they were holding back (h264dec.c:1034-1036, 978-1016;
-/// mpeg12dec.c:2556-2568; h263dec.c:452-470; vc1dec.c:843-854) — so the
+/// a picture they were holding back (h264dec.c:1034-1036, 978-1017;
+/// mpeg12dec.c:2556-2568; h263dec.c:452-472; vc1dec.c:843-854) — so the
 /// session decides which decoder is handed one
 /// (`CarrierVideoStreamDecoder::refuse_bodiless`). A packet that carries no
 /// side data either is rebuilt as libavformat delivers it whatever this
