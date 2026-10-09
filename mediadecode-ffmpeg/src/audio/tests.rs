@@ -333,3 +333,47 @@ fn the_end_refuses_a_packet_with_no_body_and_drops_what_waits() {
     "the record reported dropped at the flush"
   );
 }
+
+/// LAW (R21 row 2; Codex R20 [high]): **of AAC records deferred, the later
+/// whole one rides; a record of no bytes folds nothing.** FFmpeg's AAC
+/// decoder reads a record as the whole of its configuration, the earlier
+/// discarded (`aac_decode_frame`, aac/aacdec.c:2580-2589), and for one of no
+/// bytes discards its configuration and fails the packet: an object type of
+/// 0 is no type it decodes (aac/aacdec.c:1177-1182). Three AAC streams of
+/// FFmpeg's own encoder: 44.1 kHz mono; a 32 kHz mono stream's record on a
+/// packet with no body, then the 22.05 kHz stereo stream's record on
+/// another, then a record of no bytes on a third; then the stereo stream.
+/// The session hears every frame as the straight decode of the stereo
+/// stream's record on its first packet. Coalesced by type, as R20 coalesced
+/// them, the record of no bytes rode that packet, the decoder dropped its
+/// configuration, and the stereo stream was not heard.
+#[test]
+fn of_aac_records_deferred_the_later_whole_one_rides_and_one_of_no_bytes_folds_nothing() {
+  use ffmpeg_next::{ChannelLayout, codec::Id};
+  let a = encode(Id::AAC, 44_100, ChannelLayout::MONO, 12);
+  let c = encode(Id::AAC, 32_000, ChannelLayout::MONO, 4);
+  let b = encode(Id::AAC, 22_050, ChannelLayout::STEREO, 12);
+  let (reference, errors) = session_hears(&a_then_b(&a, &b, false), |_, _| {});
+  assert!(errors.is_empty(), "the straight decode: {errors:?}");
+  let mut clip = a_then_b(&a, &b, true);
+  let at = a.packets.len();
+  clip.packets.insert(
+    at,
+    with_new_extradata(ffmpeg_next::Packet::empty(), &extradata_of(&c.parameters)),
+  );
+  clip.packets.insert(
+    at + 2,
+    with_new_extradata(ffmpeg_next::Packet::empty(), &[]),
+  );
+  assert!(
+    (at..at + 3).all(|index| clip.packets[index].data().is_none()),
+    "three packets with no body"
+  );
+  let (heard, errors) = session_hears(&clip, |_, _| {});
+  assert!(
+    errors.is_empty() && heard == reference,
+    "every frame, as the straight decode of the later record on the next packet: errors \
+     {errors:?}, the second stream heard at {:?}",
+    heard.last().map(|heard| (heard.0, heard.1))
+  );
+}

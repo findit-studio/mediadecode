@@ -13316,3 +13316,235 @@ fn a_record_deferred_onto_a_packet_whose_read_is_unknown_is_spent_and_in_doubt()
     "pinned: nothing waits, the record in doubt"
   );
 }
+
+// ---------------------------------------------------------------------------
+//  R21 row 2: records deferred fold through what the decoder holds
+// ---------------------------------------------------------------------------
+
+/// The start-coded HEVC units of `data`'s Annex B stream whose type is one of
+/// `kinds`, in order.
+fn hevc_units_of_kinds(data: &[u8], kinds: &[u8]) -> Vec<u8> {
+  annexb_units(data)
+    .into_iter()
+    .filter(|unit| {
+      unit
+        .first()
+        .is_some_and(|head| kinds.contains(&((head >> 1) & 0x3f)))
+    })
+    .flat_map(|unit| [0u8, 0, 0, 1].into_iter().chain(unit.iter().copied()))
+    .collect()
+}
+
+/// `a`, then each of `records` as `AV_PKT_DATA_NEW_EXTRADATA` on a packet
+/// with no body of its own, then `b`, `b`'s timestamps after `a`'s, on `a`'s
+/// codec parameters; `own`, where given, carried as `b`'s first packet's own
+/// `AV_PKT_DATA_NEW_EXTRADATA`.
+fn with_records_between(
+  a: &SyntheticClip,
+  records: &[&[u8]],
+  b: &SyntheticClip,
+  own: Option<&[u8]>,
+) -> SyntheticClip {
+  let shift = a.packets.len() as i64;
+  let mut packets: Vec<Packet> = a.packets.clone();
+  for record in records {
+    packets.push(with_new_extradata(Packet::empty(), record));
+  }
+  for (index, packet) in b.packets.iter().enumerate() {
+    let mut moved = repacked(packet, packet.data().expect("a payload"));
+    moved.set_pts(packet.pts().map(|pts| pts + shift));
+    moved.set_dts(packet.dts().map(|dts| dts + shift));
+    if index == 0
+      && let Some(own) = own
+    {
+      moved = with_new_extradata(moved, own);
+    }
+    packets.push(moved);
+  }
+  SyntheticClip {
+    parameters: a.parameters.clone(),
+    packets,
+  }
+}
+
+/// LAW (R21 row 2; Codex R20 [high]): **records deferred fold through what
+/// the decoder holds: an SPS-only record, then a PPS-only one, both apply.**
+/// FFmpeg's H.264 and HEVC decoders apply the ids a record carries and keep
+/// every other they hold (`ff_h264_decode_extradata`, h264_parse.c:466-524;
+/// `ff_hevc_decode_extradata`, hevc/parse.c:79-145), while a packet carries
+/// one entry of a type (packet.c:203-211). Two streams of each codec, 128x96
+/// then 160x96, every set under id 0; between them, a packet with no body
+/// carrying the second's SPS alone (HEVC: its VPS and SPS), then another
+/// carrying its PPS alone, read against the first — an SPS of its own, the
+/// second's — then the second stream, no set in band. The second record is
+/// judged against what the decoder would hold once it applied the first,
+/// and the record the IDR carries is the one that gives the decoder both,
+/// synthesized from what is held: every picture comes out as FFmpeg decodes
+/// the second stream's whole record on its IDR, on the software road, on a
+/// probe-era fallback at 10 on three threads, and on one two packets after
+/// the IDR, whose replay feeds the IDR from the probe's history carrying
+/// that record whole. Coalesced by type, as R20
+/// coalesced them, the PPS-only record took the SPS-only one's place, the
+/// IDR was decoded under the first stream's SPS, and its pictures differed.
+#[test]
+fn records_deferred_fold_and_an_sps_only_then_a_pps_only_record_both_apply() {
+  let three = core::num::NonZeroU32::new(3).expect("nonzero");
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let h264 = "keyint=8:min-keyint=8:scenecut=0:bframes=2:b-adapt=0:open-gop=0:log-level=error";
+  let hevc = "keyint=8:min-keyint=8:scenecut=0:bframes=2:open-gop=0:log-level=error";
+  let streams = [
+    (
+      "h264",
+      encode_h264_global(128, 96, 16, h264),
+      encode_h264_global(160, 96, 16, h264),
+    ),
+    (
+      "hevc",
+      encode_hevc_global(128, 96, 16, hevc),
+      encode_hevc_global(160, 96, 16, hevc),
+    ),
+  ];
+  let mut differ = Vec::new();
+  for (name, a, b) in streams {
+    let sets = extradata_of(&b.parameters);
+    let (first, second) = if name == "h264" {
+      (h264_units_of_kind(&sets, 7), h264_units_of_kind(&sets, 8))
+    } else {
+      (
+        hevc_units_of_kinds(&sets, &[32, 33]),
+        hevc_units_of_kinds(&sets, &[34]),
+      )
+    };
+    assert!(
+      !first.is_empty() && !second.is_empty(),
+      "{name}: the second stream's sets, split"
+    );
+    let clip = with_records_between(&a, &[&first, &second], &b, None);
+    let reference = ffmpeg_decodes(&with_records_between(&a, &[], &b, Some(&sets)));
+    assert_eq!(reference.len(), 32, "{name}: FFmpeg's decode is whole");
+
+    let software = FfmpegVideoStreamDecoder::open_as(
+      clip.parameters.clone(),
+      tb,
+      DecoderLimits::default().with_threads(crate::Threads::Single),
+      DecodePath::Software,
+    )
+    .expect("the software road opens");
+    let mut waiting = None;
+    let session = session_of(software, &clip, |index, dec| {
+      if index == 18 {
+        waiting = Some(dec.deferred_kinds_for_test());
+      }
+    });
+    assert!(
+      session.errors.is_empty(),
+      "{name}, software: nothing refused: {:?}",
+      session.errors
+    );
+    if session.pictures != reference {
+      differ.push(format!("{name}, software"));
+    }
+    assert_eq!(
+      waiting,
+      Some(vec![NEW_EXTRADATA]),
+      "{name}, software: one record waits for the IDR"
+    );
+
+    let session = session_of(
+      behind_a_probe(&clip, 10, crate::Threads::Count(three)),
+      &clip,
+      |_, _| {},
+    );
+    assert!(
+      session.errors.is_empty(),
+      "{name}, a probe-era fallback: nothing refused: {:?}",
+      session.errors
+    );
+    if session.pictures != reference {
+      differ.push(format!("{name}, a probe-era fallback"));
+    }
+
+    // The hardware takes the IDR carrying the record that gives both and
+    // fails two packets after it: the probe's history carries that packet,
+    // whole, and the replay feeds it.
+    let session = session_of(
+      behind_a_probe(&clip, 18, crate::Threads::Count(three)),
+      &clip,
+      |_, _| {},
+    );
+    assert!(
+      session.errors.is_empty(),
+      "{name}, a probe-era fallback after the IDR: nothing refused: {:?}",
+      session.errors
+    );
+    if session.pictures != reference {
+      differ.push(format!("{name}, a probe-era fallback after the IDR"));
+    }
+  }
+  assert!(
+    differ.is_empty(),
+    "every picture, as FFmpeg decodes the whole record on the IDR; differing: {differ:?}"
+  );
+}
+
+/// LAW (R21 row 2; Codex R20 [high]): **a record of no bytes folds nothing,
+/// and a packet's own record folds after the ones that wait.** FFmpeg's H.264
+/// decoder applies nothing for a record of no bytes (h264_parse.c:472-473).
+/// Two `libx264` streams, 128x96 then 160x96: the second's record on a packet
+/// with no body, then a record of no bytes on another — the second's record
+/// still waits, and every picture comes out as FFmpeg decodes it on the IDR;
+/// the IDR carrying a record of no bytes of its own, the same. The second's
+/// SPS alone on a packet with no body, and its PPS alone as the IDR's own
+/// record: the IDR carries the record that gives the decoder both, and every
+/// picture comes out alike. Coalesced by type, as R20 coalesced them, the
+/// record of no bytes took the second's place or the IDR's own replaced it,
+/// and the second stream decoded under the first's sets.
+#[test]
+fn a_record_of_no_bytes_folds_nothing_and_a_packet_s_own_record_folds_after() {
+  let params = "keyint=8:min-keyint=8:scenecut=0:bframes=2:b-adapt=0:open-gop=0:log-level=error";
+  let (a, b) = (
+    encode_h264_global(128, 96, 16, params),
+    encode_h264_global(160, 96, 16, params),
+  );
+  let sets = extradata_of(&b.parameters);
+  let reference = ffmpeg_decodes(&with_records_between(&a, &[], &b, Some(&sets)));
+  assert_eq!(reference.len(), 32, "FFmpeg's decode is whole");
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let (sps, pps) = (h264_units_of_kind(&sets, 7), h264_units_of_kind(&sets, 8));
+  let mut differ = Vec::new();
+  for (name, clip) in [
+    (
+      "a record of no bytes after",
+      with_records_between(&a, &[&sets, &[]], &b, None),
+    ),
+    (
+      "the IDR's own record of no bytes",
+      with_records_between(&a, &[&sets], &b, Some(&[])),
+    ),
+    (
+      "the IDR's own PPS after an SPS",
+      with_records_between(&a, &[&sps], &b, Some(&pps)),
+    ),
+  ] {
+    let software = FfmpegVideoStreamDecoder::open_as(
+      clip.parameters.clone(),
+      tb,
+      DecoderLimits::default().with_threads(crate::Threads::Single),
+      DecodePath::Software,
+    )
+    .expect("the software road opens");
+    let session = session_of(software, &clip, |_, _| {});
+    assert!(
+      session.errors.is_empty(),
+      "{name}: nothing refused: {:?}",
+      session.errors
+    );
+    if session.pictures != reference {
+      differ.push(name);
+    }
+  }
+  assert!(
+    differ.is_empty(),
+    "every picture, as FFmpeg decodes the whole record on the IDR; differing: {differ:?}"
+  );
+}

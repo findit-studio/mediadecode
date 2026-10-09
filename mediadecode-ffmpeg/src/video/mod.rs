@@ -261,9 +261,11 @@ pub struct CarrierVideoStreamDecoder<C: crate::FfmpegCarrier> {
   /// taking an end of sequence off the CRA after it, and its H.264 decoder
   /// would hand out a picture it holds back and never read the record. A
   /// new extradata among it is judged when it is deferred, as it will be on
-  /// that packet ([`Self::judge_deferred`]), and is read with that packet —
-  /// its keyframe rule, its sets, the extradata a decoder takes with it — as
-  /// that packet's own, which is where FFmpeg applies it.
+  /// that packet, and folded into the one record that waits — for H.264 and
+  /// HEVC through what the decoder would hold once it applied each in stream
+  /// order ([`Self::fold_deferred`]). That record is read with the packet it
+  /// rides — its keyframe rule, its sets, the extradata a decoder takes with
+  /// it — as that packet's own, which is where FFmpeg applies it.
   deferred: boundary::Deferred,
   /// **How the session read the packet it is sending**, where it decided a
   /// decoder may have taken it ([`Self::commit_sets`]); `None` while no
@@ -272,6 +274,14 @@ pub struct CarrierVideoStreamDecoder<C: crate::FfmpegCarrier> {
   /// spent where a decoder took it or may have read it, waiting where none
   /// saw it.
   sent_as: Option<Commit>,
+  /// `true` while the packet the session is sending carries a record a
+  /// packet with no body deferred ([`Self::deferred`]): judged when that
+  /// packet was handed over, against what the decoder would hold when it
+  /// applies it, and not judged again ([`Self::judged_against`]). What the
+  /// decoder holds can change between the two — an error on a receive puts
+  /// sets it was not seen to read in doubt — and a record refused for that
+  /// on the packet it rides would wait for the next one, refused again.
+  record_judged: bool,
   /// Set, with what left it so, when whether the decoder serving applied a
   /// packet's `AV_PKT_DATA_NEW_EXTRADATA` cannot be told
   /// ([`crate::ExtradataDoubt`]): a decoder refused the packet with an error
@@ -1414,6 +1424,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       probe_extradata: None,
       deferred: boundary::Deferred::default(),
       sent_as: None,
+      record_judged: false,
       extradata_unknown: None,
       extradata_provisional: false,
       held,
@@ -2206,7 +2217,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       pkt,
       &self.parameters,
       self.limits.max_codec_parameter_bytes(),
-      Some(&self.held),
+      self.judged_against(),
     )
     .map_err(VideoDecodeError::Decode)?;
     if self.restart.is_none()
@@ -2585,29 +2596,144 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     Sets { aso, alpha, held }
   }
 
-  /// **A new extradata a packet with no body carries is judged as it will be
-  /// judged on the packet with a body it rides** ([`Self::deferred`];
-  /// [`NewExtradata::of`]): refused by name, nothing deferred and the packet
-  /// still the caller's, where the parameters with it would pass their
-  /// ceiling, or the stream is H.264 and FFmpeg's decoder would not apply it
-  /// whole — read against what the decoder holds, which no packet changes
-  /// before that one. The later of two deferred replaces the earlier, so
-  /// each is read against what is held alone.
-  fn judge_deferred(&self, side_data: &[crate::extras::SideDataEntry]) -> Result<(), Error> {
-    let Some(record) = deferred_record(side_data) else {
-      return Ok(());
+  /// **The new extradata a packet with no body carries, folded into the
+  /// record that waits for the next packet with a body** ([`Self::deferred`]):
+  /// the record that waits from it on, `None` where it carries none, or one
+  /// of no bytes, which FFmpeg's decoders apply as nothing
+  /// (h264_parse.c:472-473; hevc/hevcdec.c:3855-3856).
+  ///
+  /// **Judged as it will be judged on that packet** ([`NewExtradata::of`]),
+  /// against what the decoder will hold when it applies it — what it holds
+  /// now with the record that waits applied: the parameters' ceiling, and
+  /// for H.264 FFmpeg's verdict. Refused by name, nothing deferred and the
+  /// packet still the caller's, where either refuses it; a record judged so
+  /// is not judged again on the packet it rides ([`Self::record_judged`]).
+  ///
+  /// **H.264 and HEVC records change the parameter sets they carry and keep
+  /// every other the decoder holds** — FFmpeg clears nothing before it
+  /// applies one (`ff_h264_decode_extradata`, h264_parse.c:466-524;
+  /// `ff_hevc_decode_extradata`, hevc/parse.c:79-145) — so an SPS-only
+  /// record then a PPS-only one change both, while a packet carries one
+  /// entry of a type (`av_packet_add_side_data`, packet.c:203-211). The
+  /// first record waits as it is: applied to what the decoder holds, it is
+  /// its own equivalent. A later one is folded through what the decoder
+  /// would hold once it applied every record in stream order
+  /// ([`held::Held::with_record`], FFmpeg's drop rules with it), and the
+  /// record that waits from then on is the one that gives the decoder all of
+  /// that, synthesized from it as a decoder opened fresh is given what is
+  /// held ([`held::Held::record`]); refused by name where no record can
+  /// ([`Error::SetsUnrecordable`]). Of every other video codec the later
+  /// record waits: FFmpeg's other video decoders read none.
+  fn fold_deferred(
+    &self,
+    side_data: &[crate::extras::SideDataEntry],
+  ) -> Result<Option<Vec<u8>>, Error> {
+    let Some(arriving) = deferred_record(side_data) else {
+      return Ok(None);
     };
     fits(
-      record,
+      arriving,
       &self.parameters,
       self.limits.max_codec_parameter_bytes(),
     )?;
-    if codec_id_of(&self.parameters) == crate::CodecId::H264.raw() {
-      self.held.h264_verdict(record).map_err(|reason| {
+    let codec = self.codec_id();
+    let waiting = self
+      .deferred
+      .record()
+      .filter(|_| codec == crate::CodecId::H264.raw() || codec == crate::CodecId::HEVC.raw());
+    let applied;
+    let held = match waiting {
+      Some(waiting) => {
+        applied = self.held.with_record(waiting);
+        &applied
+      }
+      None => &self.held,
+    };
+    if codec == crate::CodecId::H264.raw() {
+      held.h264_verdict(arriving).map_err(|reason| {
         Error::ExtradataRejected(crate::ExtradataRejected::new(crate::CodecId::H264, reason))
       })?;
     }
-    Ok(())
+    if waiting.is_none() {
+      return Ok(Some(arriving.to_vec()));
+    }
+    self.folded(held, arriving, None).map(Some)
+  }
+
+  /// **The record a packet with a body carries where a record waits for
+  /// it** ([`Self::deferred`]): the one that waits, where the packet carries
+  /// none of its own, or one of no bytes. Where it carries one, its own is
+  /// folded after the one that waits, in stream order — judged first as it
+  /// would be on its own, against what the decoder will hold once it applied
+  /// the one that waits ([`Self::fold_deferred`]) — for H.264 and HEVC; for
+  /// another video codec its own, the later. `None` where nothing waits, or
+  /// the packet's own goes as it is.
+  fn riding_for(
+    &self,
+    body: &[u8],
+    own: &[crate::extras::SideDataEntry],
+  ) -> Result<Option<Vec<u8>>, Error> {
+    let Some(waiting) = self.deferred.record() else {
+      return Ok(None);
+    };
+    let Some(own) = deferred_record(own) else {
+      return Ok(Some(waiting.to_vec()));
+    };
+    let codec = self.codec_id();
+    if codec != crate::CodecId::H264.raw() && codec != crate::CodecId::HEVC.raw() {
+      return Ok(None);
+    }
+    let held = self.held.with_record(waiting);
+    if codec == crate::CodecId::H264.raw() {
+      held.h264_verdict(own).map_err(|reason| {
+        Error::ExtradataRejected(crate::ExtradataRejected::new(crate::CodecId::H264, reason))
+      })?;
+    }
+    self.folded(&held, own, Some(body)).map(Some)
+  }
+
+  /// **The one record that gives the decoder what it would hold once it
+  /// applied `record` after `held`** — `held` being what it holds with the
+  /// records before `record` applied: `record` itself where it gives all of
+  /// that alone, a record synthesized from it otherwise
+  /// ([`held::Held::record`]; `next`, the body the decoder reads after it,
+  /// as for a decoder opened fresh). Refused by name where no record carries
+  /// it ([`Error::SetsUnrecordable`]), or where the parameters with it would
+  /// pass their ceiling ([`Error::ParametersTooLarge`]). The record is
+  /// applied to the decoder serving, not opened on, so FFmpeg's strict open
+  /// is no witness of it ([`held::Record::strict`]): the reading that holds
+  /// each record's sets as FFmpeg stores them is.
+  fn folded(
+    &self,
+    held: &held::Held,
+    record: &[u8],
+    next: Option<&[u8]>,
+  ) -> Result<Vec<u8>, Error> {
+    let codec = self.codec_id();
+    let bytes = held
+      .with_record(record)
+      .record(codec, record, next)
+      .map_err(|reason| {
+        Error::SetsUnrecordable(crate::SetsUnrecordable::new(
+          crate::CodecId::from_raw(codec),
+          reason,
+        ))
+      })?
+      .map_or_else(|| record.to_vec(), |synthesized| synthesized.bytes);
+    fits(
+      &bytes,
+      &self.parameters,
+      self.limits.max_codec_parameter_bytes(),
+    )?;
+    Ok(bytes)
+  }
+
+  /// What a packet's new extradata is judged against before a decoder takes
+  /// it ([`NewExtradata::of`]): what the decoder holds — nothing for a
+  /// record a packet with no body deferred, judged when that packet was
+  /// handed over ([`Self::record_judged`]).
+  fn judged_against(&self) -> Option<&held::Held> {
+    (!self.record_judged).then_some(&self.held)
   }
 
   /// **A packet's body FFmpeg's H.264 decoder reads as an `avcC` record**
@@ -2639,7 +2765,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     let applied;
     let held = match new_extradata(pkt) {
       Some(record) => {
-        self.held.h264_verdict(record).map_err(rejected)?;
+        if !self.record_judged {
+          self.held.h264_verdict(record).map_err(rejected)?;
+        }
         applied = self.held.with_record(record);
         &applied
       }
@@ -3116,7 +3244,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
         pkt,
         &self.parameters,
         self.limits.max_codec_parameter_bytes(),
-        Some(&self.held),
+        self.judged_against(),
       )?,
       PostCommitInput::FrameTime | PostCommitInput::Eof => None,
     };
@@ -3582,6 +3710,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       probe_extradata: None,
       deferred: boundary::Deferred::default(),
       sent_as: None,
+      record_judged: false,
       extradata_unknown: None,
       extradata_provisional: false,
       held,
@@ -3851,12 +3980,16 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     let phase = self.phase();
     // A packet with no body is handed to no decoder: its side data waits for
     // the next packet with one ([`Self::deferred`]), a new extradata among it
-    // judged now as it will be judged there.
-    if packet.data().as_ref().is_empty() {
-      self
-        .judge_deferred(packet.extra().side_data())
-        .map_err(VideoDecodeError::Decode)?;
+    // judged now as it will be judged there and folded into the record that
+    // waits. A packet with a body carries that record, its own folded after
+    // it.
+    let side_data = packet.extra().side_data();
+    let record = if packet.data().as_ref().is_empty() {
+      self.fold_deferred(side_data)
+    } else {
+      self.riding_for(packet.data().as_ref(), side_data)
     }
+    .map_err(VideoDecodeError::Decode)?;
     // Scoped submission: the rebuilt `AVPacket` never leaves this call,
     // which is what lets the view lane share its buffer with libavcodec
     // rather than copy into it. See `boundary::with_ffmpeg_video_packet`.
@@ -3882,6 +4015,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       self.install_probe_extradata();
       self.held_base = None;
     }
+    // A record that waited was judged when its packet with no body was
+    // handed over, a packet's own folded after it just now: it rides as
+    // judged.
+    self.record_judged = record.is_some() && !packet.data().as_ref().is_empty();
     // Out of `self` while the decoder's road, which borrows all of it, runs.
     let mut deferred = core::mem::take(&mut self.deferred);
     // The packet as the decoder's road gets it, carrying what a packet with
@@ -3898,9 +4035,16 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       };
       (answer, disposition)
     };
-    let submitted =
-      boundary::with_ffmpeg_video_packet::<C, _>(packet, limits, route, &mut deferred, send);
+    let submitted = boundary::with_ffmpeg_video_packet::<C, _>(
+      packet,
+      limits,
+      route,
+      &mut deferred,
+      boundary::Record::Folded(record.as_deref()),
+      send,
+    );
     self.deferred = deferred;
+    self.record_judged = false;
     // A replay that fed the end a `send_eof` left owed ended the session in
     // this send: no packet comes to carry what waits.
     if self.eof_sent {
@@ -3944,7 +4088,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       av_pkt,
       &self.parameters,
       self.limits.max_codec_parameter_bytes(),
-      Some(&self.held),
+      self.judged_against(),
     )
     .map_err(VideoDecodeError::Decode)?;
     match &mut self.state {
