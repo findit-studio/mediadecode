@@ -11,7 +11,7 @@
 //! | a source's length at the edit rate, exactly, or refused | `Duration::checked_rescale_with(_, Rounding::Exact)`, and `checked_rescale_to` to tell a length between ticks from one too long to count |
 //! | handles and blends summed across timebases | `ExactSeconds` |
 //! | a media-side range in frames only where its start and length both land on one | `checked_rescale_with(_, Rounding::Exact)` |
-//! | a media-side range recounted in a coarser whole-rate ruler that holds it: the coarsest, where its own rulers count past 2^53, or one the export's search tries | `checked_rescale_with(_, Rounding::Exact)`, which answers only where the ruler holds it |
+//! | a media-side range recounted in another ruler that holds it: the coarsest whole-rate one, where its own rulers count past 2^53, or one the export's search tries — a ruler the timeline's operands are counted in, or a coarser whole rate | `checked_rescale_with(_, Rounding::Exact)`, which answers only where the ruler holds it |
 //! | a rate as OpenTimelineIO's `f64`; a rate of zero refused | `Rate::as_f64`, `Rate::checked_to_timebase`, `Rate::checked_from_timebase` |
 //! | a range's length, or none past `i64::MAX` ticks | `Timestamp::checked_signed_duration_since` |
 //! | what OpenTimelineIO derives from an exported document, exactly: its sums, the longest track, and a range's last tick | `ExactSeconds` (`from_timestamp`, `checked_add`, `checked_sub`, `Ord`) |

@@ -168,15 +168,23 @@ export holds both:
   in one ruler ends inclusively where it exactly does.
 
 Where OpenTimelineIO would round a value, the export searches the rulers
-the clips the value is formed from may be written in: each whole number of
-ticks a second that holds a clip's source range exactly, from the ruler
-above down to the coarsest such — at most 64 a clip, past that its own and
-the 63 coarsest. It moves one clip one ruler coarser at a time — of the
-clips the refused value is formed from, the one with the finest ruler — and
-walks again, so clips can meet on a ruler they share, or one move while its
-neighbour keeps its own. A clip never moves back, so the search ends within
-`1 + n · 63` walks for `n` clips, the all-coarsest plan last. What no plan it
-tries holds is refused, `Refused::NotRepresentable`, naming where
+the clips the value is formed from may be written in. A clip's rulers are
+its own; every ruler the timeline's operands are counted in — the edit
+rate, at which the global start, the gaps and the transitions are written,
+the rate 1 OpenTimelineIO sums a track's duration from, and every clip's
+planned ruler — that holds its source range exactly, finer or coarser than
+its own, all of them; and the coarsest whole numbers of ticks a second
+below its own that hold the range, at most 64. So where OpenTimelineIO
+would rescale a clip into the edit rate or into a neighbour's ruler, the
+search can write the clip in that ruler itself. It moves one clip to its
+next ruler at a time — of the clips the refused value is formed from, the
+one with the finest ruler; a clip's rulers run from its own through the
+others, finest first, to its coarsest, its own again last where every
+other is finer — and walks again, so clips can meet on a ruler they
+share, or one move while its neighbour keeps its own. A clip never moves
+back, so for `n` clips and `d` distinct operand rulers the search ends
+within `1 + n · (d + 63)` walks, the all-coarsest plan last. What no plan
+it tries holds is refused, `Refused::NotRepresentable`, naming where
 (`otio::Spot`; a child of an exported track is an `otio::ChildAt`), the
 count the last plan could not hold and the ruler it is counted in — never
 written to be read rounded.
