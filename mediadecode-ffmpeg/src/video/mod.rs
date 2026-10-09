@@ -2425,9 +2425,11 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       } else {
         core::slice::from_raw_parts(data, size)
       };
+      // An HEVC stream's auxiliary layer as the decoder holds its video
+      // parameter sets, not as the record reads from nothing.
       access::KeyframeRule::of(self.codec_id(), extradata)
         .permitting_aso(self.h264_aso)
-        .declaring_alpha(self.hevc_alpha)
+        .with_alpha(self.held.declares_alpha() || self.hevc_alpha)
     }
   }
 
@@ -2445,7 +2447,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     let rule = match record {
       Some(extradata) => access::KeyframeRule::of(self.codec_id(), extradata)
         .permitting_aso(self.h264_aso)
-        .declaring_alpha(self.hevc_alpha),
+        .with_alpha(self.held.with_record(extradata).declares_alpha() || self.hevc_alpha),
       None => {
         let rule = self.keyframe_rule();
         if self.extradata_unknown.is_some() && rule.reads_extradata() {
@@ -2500,26 +2502,19 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       return Sets::default();
     }
     let record = new_extradata(pkt);
-    // What the decoder holds once it has read the packet: its record, then
-    // its units.
-    let held = self.held.after_packet(record, pkt.data()).map(Box::new);
+    // What the decoder holds once it has read the packet — its record, then
+    // its units — and whether an HEVC video parameter set they carry is one
+    // FFmpeg stores as alpha video, read against the sets the decoder holds
+    // across packets as FFmpeg reads it: its identity and past-its-end rules
+    // turn on the ids held (hevc/ps.c:797-802, 944-949).
+    let (held, packet_alpha) = self.held.after_packet_reading_alpha(record, pkt.data());
+    let held = held.map(Box::new);
     let rule = match record {
       Some(extradata) => access::KeyframeRule::of(codec, extradata),
       None => self.keyframe_rule(),
     };
     let units = pkt.data();
-    let alpha = hevc && {
-      // The video parameter sets the decoder certainly holds: what it read of
-      // the active extradata, where that is known and read — opened on it, or
-      // read off the packet that brought it. A packet's own new extradata is
-      // read first, as FFmpeg reads it ahead of the packet's units
-      // (`hevc_receive_frame`, hevc/hevcdec.c:3855-3860).
-      let mut held = self.vps_held();
-      if let Some(record) = record {
-        held.read_extradata(record);
-      }
-      rule.declares_alpha() || units.is_some_and(|data| rule.units_declare_alpha(data, &mut held))
-    };
+    let alpha = hevc && (packet_alpha || self.held.declares_alpha());
     // An H.264 packet's own sequence parameter sets, read as the decoder
     // reads its body: a record's entries where it reads the body as a record
     // (h264dec.c:1045-1050), the units it frames otherwise — under every
@@ -2569,35 +2564,6 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       })?;
     }
     Ok(())
-  }
-
-  /// **The video parameter sets the HEVC decoder serving certainly holds**,
-  /// for FFmpeg's rule that a set read past its unit is stored only under an
-  /// id the decoder holds nothing of (`ff_hevc_decode_nal_vps`,
-  /// hevc/ps.c:944-949): the sets of the active extradata, as the decoder
-  /// stores them reading it — every decoder serving was opened on it, or read
-  /// the packet that brought it, and a decoder never drops a set it stored,
-  /// only replaces it — where that extradata is known and read; none where it
-  /// is provisional or unknown ([`Self::extradata_provisional`],
-  /// [`Self::extradata_unknown`]), where the decoder may still frame the
-  /// stream by an older record.
-  fn vps_held(&self) -> params::VpsTable {
-    let mut held = params::VpsTable::default();
-    if self.extradata_unknown.is_some() || self.extradata_provisional {
-      return held;
-    }
-    // SAFETY: the owned, deep-copied parameters' pointer, only read;
-    // `extradata` is read for `extradata_size` bytes, which FFmpeg
-    // allocated together.
-    unsafe {
-      let raw = self.parameters.as_ptr();
-      if raw.is_null() || (*raw).extradata.is_null() {
-        return held;
-      }
-      let size = usize::try_from((*raw).extradata_size).unwrap_or(0);
-      held.read_extradata(core::slice::from_raw_parts((*raw).extradata, size));
-    }
-    held
   }
 
   /// **A decoder may have taken the packet `sets` were read off**

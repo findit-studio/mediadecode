@@ -10873,3 +10873,73 @@ fn on_frame_threads_a_refusal_collected_with_a_picture_is_reported_before_it() {
   );
   assert_eq!(log.last(), Some(&Answer::Ended), "a clean end: {log:?}");
 }
+
+// ---------------------------------------------------------------------------
+//  R17 row 8: the video parameter sets a decoder holds persist across packets
+// ---------------------------------------------------------------------------
+
+/// LAW (R17 row 8; Codex R16 [medium]): **a video parameter set FFmpeg reads
+/// past its end is judged against the sets the decoder holds from earlier
+/// packets, not only those of its extradata.** The R6 `x265` CRA stream,
+/// empty extradata, every keyframe carrying VPS 0 — one layer — in band; the
+/// packet before a CRA, no keyframe, carrying a VPS 0 of two layers whose
+/// payload ends before `direct_dependency_flag`, its auxiliary mask and the
+/// second layer's id read. FFmpeg holds packet 0's VPS 0, so it refuses the
+/// set read past its end (hevc/ps.c:944-949): the hardware failing
+/// post-commit at the CRA, the CRA anchors and the end is clean, no alpha
+/// read. Rebuilt from the extradata alone, the table held nothing of id 0,
+/// read the set as alpha, and made it the session's for good: nothing
+/// anchored and the end escalated.
+#[test]
+fn a_video_parameter_set_read_past_its_end_is_judged_against_the_sets_held_in_band() {
+  const AUXILIARY: u16 = 1 << (15 - 3);
+  let clip = encode_hevc_cra_with_headers(128, 96, 40);
+  assert!(
+    extradata_of(&clip.parameters).is_empty(),
+    "the sets come in band alone"
+  );
+  let at = keyframe_after(&clip, 3);
+  let before = at - 1;
+  assert!(
+    !clip.packets[before].is_key(),
+    "the packet before is no keyframe"
+  );
+  let data = clip.packets[before].data().expect("a payload").to_vec();
+  let cut = hevc_vps_cut(0, 1, Some(AUXILIARY), 1, VpsCut::BeforeDirectDependency);
+  let mut packets = clip.packets.clone();
+  packets[before] = repacked(
+    &clip.packets[before],
+    &[&[0, 0, 0, 1][..], &cut, &data].concat(),
+  );
+  let with = SyntheticClip {
+    parameters: clip.parameters.clone(),
+    packets,
+  };
+  // FFmpeg's own decoder, fed the stream to the packet before the CRA, holds
+  // packet 0's set and refuses the one read past its end: no alpha output.
+  let mut sw = super::open_sw_decoder(
+    &with.parameters,
+    DecoderLimits::default().with_threads(crate::Threads::Single),
+    None,
+  )
+  .expect("an HEVC decoder");
+  let mut picture = alloc_av_video_frame().expect("a frame");
+  let mut refusals = super::Refusals::default();
+  for packet in &with.packets[..=before] {
+    sw.submit(packet, &mut refusals)
+      .expect("FFmpeg decodes the packet");
+    while sw.receive(&mut picture, &mut refusals).is_ok() {}
+  }
+  assert!(
+    !sw.outputs_alpha(),
+    "FFmpeg refuses the set read past its end"
+  );
+  let (dec, delivered, escalated) = through_a_post_commit_failure(&with, at);
+  assert!(dec.is_software(), "the hardware failed post-commit");
+  assert!(!dec.hevc_alpha, "no alpha read");
+  assert!(!escalated, "the end is clean: {delivered:?}");
+  assert!(
+    delivered.iter().any(|&(_, open)| !open),
+    "a picture closes the gap: {delivered:?}"
+  );
+}

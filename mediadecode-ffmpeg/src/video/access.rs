@@ -222,23 +222,18 @@ impl KeyframeRule {
   }
 
   /// Whether this HEVC rule's stream declares an auxiliary layer (`alpha`).
+  #[cfg(test)]
   pub(crate) const fn declares_alpha(self) -> bool {
     matches!(self, Self::Hevc { alpha: true, .. })
   }
 
-  /// This rule, for an HEVC stream, with an auxiliary layer declared where
-  /// `alpha` says a video parameter set the session read elsewhere — or the
-  /// output the decoder serving negotiated — declares one; any other rule as
-  /// it is.
-  pub(crate) const fn declaring_alpha(self, alpha: bool) -> Self {
+  /// This rule, for an HEVC stream, declaring an auxiliary layer exactly
+  /// where `alpha` says — what the session reads of the sets the decoder
+  /// holds, in place of the rule's own reading of a record from nothing; any
+  /// other rule as it is.
+  pub(crate) const fn with_alpha(self, alpha: bool) -> Self {
     match self {
-      Self::Hevc {
-        nal_length,
-        alpha: own,
-      } => Self::Hevc {
-        nal_length,
-        alpha: own || alpha,
-      },
+      Self::Hevc { nal_length, .. } => Self::Hevc { nal_length, alpha },
       other => other,
     }
   }
@@ -247,6 +242,7 @@ impl KeyframeRule {
   /// video parameter set FFmpeg stores as alpha video, against the sets
   /// `held` says the decoder holds — which the reading updates; `false`
   /// under any other rule.
+  #[cfg(test)]
   pub(crate) fn units_declare_alpha(self, data: &[u8], held: &mut super::params::VpsTable) -> bool {
     match self {
       Self::Hevc { nal_length, .. } => hevc_units_declare_auxiliary(data, nal_length, held),

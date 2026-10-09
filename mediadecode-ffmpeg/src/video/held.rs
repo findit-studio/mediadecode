@@ -88,8 +88,23 @@ impl Held {
   /// first, as FFmpeg applies it before the packet's units (h264dec.c:
   /// 1038-1044; hevc/hevcdec.c:3855-3860); `None` where nothing changes.
   pub(super) fn after_packet(&self, record: Option<&[u8]>, data: Option<&[u8]>) -> Option<Self> {
+    self.after_packet_reading_alpha(record, data).0
+  }
+
+  /// [`Self::after_packet`], and whether the packet — its record or its
+  /// units — carries an HEVC video parameter set FFmpeg stores as alpha
+  /// video, or may: read against the sets the decoder holds, as FFmpeg reads
+  /// it, an identical set changing nothing and a set read past its end
+  /// refused under an id held (hevc/ps.c:797-802, 944-949); an id held in
+  /// doubt read as possibly holding nothing, so the reading errs toward
+  /// alpha.
+  pub(super) fn after_packet_reading_alpha(
+    &self,
+    record: Option<&[u8]>,
+    data: Option<&[u8]>,
+  ) -> (Option<Self>, bool) {
     match self {
-      Self::Other => None,
+      Self::Other => (None, false),
       Self::H264(held) => {
         let mut write = H264Write::new(held);
         if let Some(record) = record {
@@ -100,7 +115,7 @@ impl Held {
         if let Some(data) = data {
           write.body(data);
         }
-        write.next.map(|next| Self::H264(Box::new(next)))
+        (write.next.map(|next| Self::H264(Box::new(next))), false)
       }
       Self::Hevc(held) => {
         let mut write = HevcWrite::new(held);
@@ -110,8 +125,18 @@ impl Held {
         if applied && let Some(data) = data {
           write.units(data);
         }
-        write.next.map(|next| Self::Hevc(Box::new(next)))
+        let alpha = write.alpha;
+        (write.next.map(|next| Self::Hevc(Box::new(next))), alpha)
       }
+    }
+  }
+
+  /// Whether the HEVC decoder holds a video parameter set it reads as alpha
+  /// video, or may — one held in doubt among them.
+  pub(super) fn declares_alpha(&self) -> bool {
+    match self {
+      Self::Hevc(held) => held.vps.iter().flatten().any(|vps| vps.alpha),
+      Self::H264(_) | Self::Other => false,
     }
   }
 
