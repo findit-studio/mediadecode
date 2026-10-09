@@ -31,14 +31,14 @@ is hardware or nothing.
   hardware session reports each failure as it was minted — a refusal
   this crate made by its name (`HwSurfaceTooLarge`,
   `HwTransferTooLarge`, `FrameBudgetExceeded`), anything else as
-  `Error::Ffmpeg` with libavcodec's errno — and the next call reaches
-  libavcodec, as the software road reports a corrupt packet's
-  `AVERROR_INVALIDDATA` and decodes on. `flush` leaves the session
-  serving. Until now `AVERROR_EXTERNAL`, `AVERROR_BUG`, `AVERROR_BUG2`,
-  `AVERROR_UNKNOWN`, `AVERROR_INVALIDDATA` and `EINVAL` from a committed
-  backend, and a coded surface the `get_format` callback declined over
-  the caller's ceiling, became a post-commit `AllBackendsFailed`, which
-  `Auto` answered by degrading to software.
+  `Error::Ffmpeg` with libavcodec's errno — and nothing of it is
+  remembered, so every call reaches libavcodec. Whether a hardware
+  session recovers is FFmpeg's, not this crate's. Until now
+  `AVERROR_EXTERNAL`, `AVERROR_BUG`, `AVERROR_BUG2`, `AVERROR_UNKNOWN`,
+  `AVERROR_INVALIDDATA` and `EINVAL` from a committed backend, and a
+  coded surface the `get_format` callback declined over the caller's
+  ceiling, became a post-commit `AllBackendsFailed`, which `Auto`
+  answered by degrading to software.
 
   FFmpeg has no reliable signal that a hardware session is gone, which
   is why none is read. In FFmpeg 9.0.1, `AVERROR_EXTERNAL` also answers
@@ -49,22 +49,32 @@ is hardware or nothing.
   one HEVC picture its tables cannot describe (`nvdec_hevc.c` 200–227).
   A hardware format `ff_get_format` withdraws says only that the
   hwaccel's setup failed, not why (`decode.c` 1341–1343 and 1348–1357).
-  And FFmpeg recovers a VideoToolbox session itself: a malfunction or an
-  invalidated session marks it for a restart (`videotoolbox.c`
-  1076–1077), as does an H.264 SPS whose profile/level bytes differ
-  (446–450), and the next picture stops the session and starts a new one
-  (1062–1068); a restart that fails answers `AVERROR_EXTERNAL`
-  (1066–1067), and a later parameter set that marks the session again
-  has the next picture try once more.
+
+  Nor does FFmpeg always recover a session. A malfunction or an
+  invalidated session marks a VideoToolbox session for a restart
+  (`videotoolbox.c` 1076–1077), as does an H.264 SPS whose profile/level
+  bytes differ (446–450), and the next picture stops the session and
+  starts a new one (1062–1068). A restart that fails answers
+  `AVERROR_EXTERNAL` (1066–1067) and leaves no session behind, because
+  the stop released it (518–522): VideoToolbox answers every picture
+  after it with `AVERROR_INVALIDDATA` (1071–1072) until a new parameter
+  set re-arms the restart (446–450). `flush` does not rebuild one:
+  `avcodec_flush_buffers` reaches only the codec's own flush
+  (`libavcodec/avcodec.c` 417–418), which drops the pictures and
+  references the codec holds.
 
   **When to stop trusting a hardware session is the caller's policy.**
-  The caller sees the errors, the packets' key flags and what it has
-  delivered. One recipe: after `N` consecutive failures, or one failure
-  on a packet flagged key, open a session on `DecodePath::Software` from
-  the same parameters and feed it forward — the packet the error
-  answered when it came from `send_packet`, otherwise the next one.
-  libavcodec conceals or drops what comes before the next keyframe and
-  decodes normally from there.
+  A caller that sees failures persist rebuilds: it opens a session on
+  `DecodePath::Software` from the same parameters and feeds it forward.
+  The caller sees the failures on all three roads (`send_packet`,
+  `receive_frame` and `send_eof`), the packets' key flags and what it
+  has delivered. The README's usage example is one policy: it counts a
+  failure from any road, and only a delivered picture ends the count; at
+  a threshold of its own it opens `Software`, replays the packets it kept
+  since the last packet flagged key, skips by PTS the pictures the
+  hardware session already delivered, and goes on. A caller that keeps
+  nothing feeds software forward from the failing packet, and libavcodec
+  conceals or drops what comes before the next keyframe.
 
 - **`AllBackendsFailed` is the probe's alone.** Its `origin()` is always
   `FallbackOrigin::Probe`.
