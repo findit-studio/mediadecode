@@ -16,6 +16,9 @@ use crate::{Clip, Timeline, Track, Transition, time::span};
 /// - every position on it — the start, each record, each fade, each
 ///   transition — is counted at the edit rate ([`Refusal::OffEditRate`]);
 /// - each clip's medium has a real ruler ([`Refusal::MediaRateUnstated`]);
+/// - no range of a clip runs longer than `i64::MAX` ticks of its timebase
+///   ([`Refusal::RangeTooLong`]) — no timeline needs one, and its length has
+///   no exact count here;
 /// - each record starts at or after the timeline's zero
 ///   ([`Refusal::RecordBeforeZero`]) and covers some time
 ///   ([`Refusal::EmptyRecord`]);
@@ -41,10 +44,11 @@ use crate::{Clip, Timeline, Track, Transition, time::span};
 ///
 /// Refusals come back in a fixed order: the timeline's own, then track by
 /// track — each clip's, then each transition's, then each clip's blends.
-/// The checks that need the edit rate are skipped while it is unstated, and
+/// The checks that need the edit rate are skipped while it is unstated,
 /// those that read a clip's media ruler are skipped for a clip whose medium
-/// has none, so those two defects are not reported again by every check
-/// that would read them.
+/// has none, and those that measure a range are skipped for a range too long
+/// to measure, so those defects are not reported again by every check that
+/// would read them.
 ///
 /// The time arithmetic is `mediatime`'s, compared exactly across timebases.
 pub fn validate(timeline: &Timeline) -> Result<(), Vec<Refusal>> {
@@ -84,6 +88,21 @@ fn judge_track(track_index: usize, track: &Track, edit: Option<Timebase>, out: &
     if !media_stated {
       out.push(Refusal::MediaRateUnstated(at));
     }
+    let record_span = span(record);
+    let source_span = span(clip.source_range());
+    let available_span = clip.media().available_range().map(span);
+    for (range, measured) in [
+      (ClipRange::Record, record_span.is_some()),
+      (ClipRange::Source, source_span.is_some()),
+      (
+        ClipRange::Available,
+        available_span.is_none_or(|span| span.is_some()),
+      ),
+    ] {
+      if !measured {
+        out.push(Refusal::RangeTooLong(RangeAt::new(at, range)));
+      }
+    }
     if record.start() < Timestamp::new(0, record.timebase()) {
       out.push(Refusal::RecordBeforeZero(at));
     }
@@ -110,24 +129,24 @@ fn judge_track(track_index: usize, track: &Track, edit: Option<Timebase>, out: &
     }
     if let Some(edit) = edit
       && media_stated
+      && let Some(length) = source_span
     {
       // The source's length at the edit rate, exactly: with no time-warp in
       // schema 1 a record cannot absorb a remainder. A length between ticks
       // is the source's own defect; one too long to count at the edit rate
       // matches no record.
-      let length = span(clip.source_range());
       let expected = length.checked_rescale_with(edit, Rounding::Exact);
       if expected.is_none() && length.checked_rescale_to(edit).is_some() {
         out.push(Refusal::SourceOffEditRate(at));
-      } else if on_rate {
-        let found = span(record);
-        if expected.is_none_or(|expected| expected.ticks() != found.ticks()) {
-          out.push(Refusal::DurationMismatch(Mismatch {
-            clip: at,
-            expected,
-            found,
-          }));
-        }
+      } else if on_rate
+        && let Some(found) = record_span
+        && expected.is_none_or(|expected| expected.ticks() != found.ticks())
+      {
+        out.push(Refusal::DurationMismatch(Mismatch {
+          clip: at,
+          expected,
+          found,
+        }));
       }
     }
     if media_stated
@@ -208,7 +227,9 @@ fn judge_track(track_index: usize, track: &Track, edit: Option<Timebase>, out: &
       leaving.map(Transition::in_offset),
     );
     let blends = ExactSeconds::from_duration(head).checked_add(ExactSeconds::from_duration(tail));
-    if blends.is_none_or(|blends| blends > ExactSeconds::from_duration(span(record))) {
+    if let Some(length) = span(record)
+      && blends.is_none_or(|blends| blends > ExactSeconds::from_duration(length))
+    {
       out.push(Refusal::BlendsOverrunClip(at));
     }
   }
@@ -303,6 +324,11 @@ pub enum Refusal {
   /// A clip's medium has no real ruler: a stated rate of zero, or a source
   /// or available range counted in a degenerate (`0/den`) timebase.
   MediaRateUnstated(ClipAt),
+  /// One of a clip's ranges runs longer than `i64::MAX` ticks of its
+  /// timebase. No timeline needs one, and its length has no exact count
+  /// here: measured by `mediatime`'s `total_pts`, which saturates, two such
+  /// ranges of different lengths would compare equal.
+  RangeTooLong(RangeAt),
   /// A record starts before the timeline's zero.
   RecordBeforeZero(ClipAt),
   /// A record covers no time.
@@ -341,6 +367,7 @@ impl fmt::Display for Refusal {
       Self::RateUnstated => f.write_str("the edit rate is zero"),
       Self::OffEditRate(place) => write!(f, "{place} is not counted at the edit rate"),
       Self::MediaRateUnstated(at) => write!(f, "{at}: the medium has no real ruler"),
+      Self::RangeTooLong(at) => write!(f, "{at} runs longer than i64::MAX ticks"),
       Self::RecordBeforeZero(at) => {
         write!(f, "{at}: the record starts before the timeline's zero")
       }
@@ -542,6 +569,61 @@ impl EdgeAt {
   /// Which edge.
   pub const fn edge(&self) -> Edge {
     self.edge
+  }
+}
+
+/// One of the three ranges a clip carries.
+///
+/// Marked `#[non_exhaustive]`: a later range joins as a variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[non_exhaustive]
+pub enum ClipRange {
+  /// Its record, on the timeline.
+  Record,
+  /// Its source range, in its medium.
+  Source,
+  /// Its medium's available range.
+  Available,
+}
+
+impl ClipRange {
+  const fn noun(self) -> &'static str {
+    match self {
+      Self::Record => "the record",
+      Self::Source => "the source range",
+      Self::Available => "the available range",
+    }
+  }
+}
+
+/// One range of one clip: what [`Refusal::RangeTooLong`] names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RangeAt {
+  clip: ClipAt,
+  range: ClipRange,
+}
+
+impl RangeAt {
+  /// The `range` of `clip`.
+  pub const fn new(clip: ClipAt, range: ClipRange) -> Self {
+    Self { clip, range }
+  }
+
+  /// The clip.
+  pub const fn clip(&self) -> ClipAt {
+    self.clip
+  }
+
+  /// Which of its ranges.
+  pub const fn range(&self) -> ClipRange {
+    self.range
+  }
+}
+
+/// Writes `the source range of track 0, clip 2`.
+impl fmt::Display for RangeAt {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    write!(f, "{} of {}", self.range.noun(), self.clip)
   }
 }
 

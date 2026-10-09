@@ -100,7 +100,7 @@ fn children(laid: &TrackLayout<'_>, ruler: &Ruler, target: OtioTarget) -> Vec<Va
   for (index, item) in items.iter().enumerate() {
     match item {
       Item::Gap(range) => {
-        out.push(gap(span(*range), ruler));
+        out.push(gap(length_of(*range), ruler));
         after_gap = true;
       }
       Item::Clip(clip) => {
@@ -272,7 +272,7 @@ fn transition(metadata: Value, in_offset: Value, out_offset: Value) -> Value {
 /// both land on whole frames, else ticks of the range's own timebase. Exact
 /// either way.
 fn media_range(range: TimeRange, rate: Option<Rate>) -> Value {
-  let length = span(range);
+  let length = length_of(range);
   if let Some((per_second, ruler)) = media_ruler(rate)
     && let Some(start) = range.start().checked_rescale_with(ruler, Rounding::Exact)
     && let Some(frames) = length.checked_rescale_with(ruler, Rounding::Exact)
@@ -287,6 +287,13 @@ fn media_range(range: TimeRange, rate: Option<Rate>) -> Value {
     rational_time(per_second, count_unsigned(length.ticks())),
     rational_time(per_second, count(range.start_pts())),
   )
+}
+
+/// A range's length. Only a valid timeline is exported, and validation
+/// holds every range of it within `i64::MAX` ticks, the gaps between its
+/// records with them.
+fn length_of(range: TimeRange) -> Duration {
+  span(range).unwrap_or_default()
 }
 
 /// A stated media rate, as OpenTimelineIO's `f64` and as the timebase one

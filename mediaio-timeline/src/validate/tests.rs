@@ -302,6 +302,37 @@ fn a_source_off_the_edit_rate_is_refused_whatever_its_record() {
 }
 
 #[test]
+fn a_range_longer_than_i64_max_ticks_is_refused() {
+  // Measured by `total_pts`, which saturates, [i64::MIN, i64::MAX) is as
+  // long as [0, i64::MAX): this source would pass for its record.
+  let widest = TimeRange::new(i64::MIN, i64::MAX, edit());
+  let at = |range| Refusal::RangeTooLong(RangeAt::new(ClipAt::new(0, 0), range));
+  assert_eq!(
+    refusals(&one_clip(widest, rec(0, i64::MAX))),
+    [at(ClipRange::Source)]
+  );
+  // A range of exactly `i64::MAX` ticks is measured.
+  assert_eq!(
+    validate(&one_clip(rec(0, i64::MAX), rec(0, i64::MAX))),
+    Ok(())
+  );
+  // An available range as wide, with the source inside it.
+  let mut timeline = one_clip(rec(0, 24), rec(0, 24));
+  clip_mut(&mut timeline, 0, 0)
+    .media_mut()
+    .set_available_range(Some(widest));
+  assert_eq!(refusals(&timeline), [at(ClipRange::Available)]);
+  // A record as wide: refused, and starting before the zero.
+  assert_eq!(
+    refusals(&one_clip(rec(0, 24), widest)),
+    [
+      at(ClipRange::Record),
+      Refusal::RecordBeforeZero(ClipAt::new(0, 0))
+    ]
+  );
+}
+
+#[test]
 fn a_source_outside_its_available_range_is_refused() {
   let mut timeline = baseline();
   clip_mut(&mut timeline, 0, 0)
@@ -482,6 +513,13 @@ fn every_refusal_comes_back_at_once_in_the_documented_order() {
 fn refusals_name_what_they_refuse() {
   let shown = |refusal: Refusal| alloc::string::ToString::to_string(&refusal);
   assert_eq!(shown(Refusal::RateUnstated), "the edit rate is zero");
+  assert_eq!(
+    shown(Refusal::RangeTooLong(RangeAt::new(
+      ClipAt::new(1, 0),
+      ClipRange::Available
+    ))),
+    "the available range of track 1, clip 0 runs longer than i64::MAX ticks"
+  );
   assert_eq!(
     shown(Refusal::SourceOffEditRate(ClipAt::new(0, 2))),
     "track 0, clip 2: the source range's length is no whole number of edit-rate ticks"

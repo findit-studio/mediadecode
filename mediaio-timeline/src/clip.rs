@@ -32,7 +32,9 @@ use crate::Metadata;
 pub struct Clip {
   name: String,
   media: MediaRef,
+  #[serde(deserialize_with = "crate::wire::time_range")]
   source_range: TimeRange,
+  #[serde(deserialize_with = "crate::wire::time_range")]
   record: TimeRange,
   enabled: bool,
   gain: Option<Gain>,
@@ -201,6 +203,7 @@ impl Clip {
 #[serde(deny_unknown_fields)]
 pub struct MediaRef {
   locator: String,
+  #[serde(default, deserialize_with = "crate::wire::option_time_range")]
   available_range: Option<TimeRange>,
   rate: Option<Rate>,
   reel: Option<String>,

@@ -13,21 +13,32 @@
 //! | a media-side range in frames only where its start and length both land on one | `checked_rescale_with(_, Rounding::Exact)` |
 //! | a rate as OpenTimelineIO's `f64`; a rate of zero refused | `Rate::as_f64`, `Rate::checked_to_timebase`, `Rate::checked_from_timebase` |
 //!
+//! | a range's length, or none past `i64::MAX` ticks | `Timestamp::checked_signed_duration_since` |
+//!
 //! One road is missing, and is filed as a `mediatime` row rather than built
 //! here: a range's exact length as a [`Duration`] — [`span`].
 
 use mediatime::{Duration, TimeRange};
 
-/// `range`'s length, counted in its own timebase.
+/// `range`'s length, counted in its own timebase, or `None` for a range
+/// longer than `i64::MAX` ticks.
 ///
 /// `mediatime` 0.5 measures a range as `total_pts` (an `i64` that saturates
-/// at `i64::MAX`) or `duration` (a `core::time::Duration`, truncated to the
-/// nanosecond), and has no road to its own exact [`Duration`]; that road is
-/// filed as a `mediatime` row, `TimeRange::span(&self) -> Duration`. Until
-/// it lands this reads `total_pts`, which is never negative, so a range
-/// longer than `i64::MAX` ticks — no medium is — measures `i64::MAX`.
-pub(crate) const fn span(range: TimeRange) -> Duration {
-  Duration::new(range.total_pts() as u64, range.timebase())
+/// at `i64::MAX`, so two ranges of different lengths can measure alike) or
+/// `duration` (a `core::time::Duration`, truncated to the nanosecond), and
+/// has no road to its own exact [`Duration`]; that road is filed as a
+/// `mediatime` row, `TimeRange::span(&self) -> Duration`. Until it lands
+/// this takes the checked difference of the endpoints, which has no answer
+/// past `i64::MAX` ticks. No timeline needs such a range: the document's
+/// reader and [`validate`](fn@crate::validate) refuse one by name
+/// ([`Refusal::RangeTooLong`](crate::Refusal::RangeTooLong)), so a length
+/// never stands in for another.
+pub(crate) fn span(range: TimeRange) -> Option<Duration> {
+  range
+    .end()
+    .checked_signed_duration_since(&range.start())
+    .and_then(|length| u64::try_from(length.ticks()).ok())
+    .map(|ticks| Duration::new(ticks, range.timebase()))
 }
 
 #[cfg(test)]

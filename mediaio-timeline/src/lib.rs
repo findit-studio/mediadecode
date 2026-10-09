@@ -16,6 +16,7 @@ mod time;
 mod timeline;
 mod transition;
 mod validate;
+mod wire;
 
 pub use clip::{Clip, Fade, FadeShape, Fades, Gain, MediaRef};
 pub use diff::{Change, ChangeKind, Delta, diff};
@@ -25,7 +26,8 @@ pub use schema::Schema;
 pub use timeline::{Timeline, Track, TrackKind};
 pub use transition::{Transition, TransitionKind};
 pub use validate::{
-  ClipAt, ClipPair, Edge, EdgeAt, Mismatch, Place, Refusal, TransitionAt, validate,
+  ClipAt, ClipPair, ClipRange, Edge, EdgeAt, Mismatch, Place, RangeAt, Refusal, TransitionAt,
+  validate,
 };
 
 // The time words the model is written in, so a caller needs no `mediatime`

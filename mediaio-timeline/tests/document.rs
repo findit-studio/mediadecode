@@ -260,6 +260,32 @@ fn a_gain_that_is_not_finite_is_refused() {
 }
 
 #[test]
+fn a_range_longer_than_i64_max_ticks_is_refused_by_the_reader() {
+  for (range, path) in [
+    ("record", "/tracks/0/clips/0/record"),
+    ("source_range", "/tracks/0/clips/0/source_range"),
+    ("available_range", "/tracks/0/clips/0/media/available_range"),
+  ] {
+    let mut doc = serde_json::to_value(sample()).unwrap();
+    let end = doc.pointer(path).unwrap()["end"].clone();
+    doc.pointer_mut(path).unwrap()["start"] = serde_json::json!(i64::MIN);
+    let error = serde_json::from_value::<Timeline>(doc)
+      .unwrap_err()
+      .to_string();
+    let named = format!(
+      "time range [{}, {end}) runs longer than i64::MAX ticks",
+      i64::MIN
+    );
+    assert!(error.contains(&named), "{range}: {error}");
+  }
+  // A range of exactly `i64::MAX` ticks reads.
+  let mut doc = serde_json::to_value(sample()).unwrap();
+  doc["tracks"][0]["clips"][0]["record"]["end"] = serde_json::json!(i64::MAX);
+  let back: Timeline = serde_json::from_value(doc).unwrap();
+  assert_eq!(back.tracks()[0].clips()[0].record().end_pts(), i64::MAX);
+}
+
+#[test]
 fn a_gain_is_finite_by_construction() {
   assert_eq!(Gain::from_db(-6.0).map(Gain::db), Some(-6.0));
   assert_eq!(Gain::from_db(f32::NAN), None);
