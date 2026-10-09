@@ -112,10 +112,14 @@ pub(crate) mod ops {
   /// body must be storage nobody else can read, which means a copy on
   /// either lane. A packet built to be **submitted and dropped** inside
   /// one crate-private call never escapes to anywhere a `&mut` can be
-  /// taken from it, so the view lane may share there.
+  /// taken from it, so the view lane may share there. The one decoder
+  /// that hands back what it is sent, the video decoder's hardware
+  /// probe, keeps copies of its own (`decoder::try_clone_packet`), so
+  /// nothing it hands back shares the carrier's buffer either.
   #[derive(Debug, Clone, Copy, PartialEq, Eq)]
   pub enum BodyRoute {
-    /// The body is copied into storage the packet alone owns.
+    /// The body is copied into storage the packet alone owns. For a
+    /// packet handed to a caller.
     Copy,
     /// The body may share the carrier's buffer, if this lane can prove
     /// that is safe for a decoder to read. Only ever asked for from a
@@ -632,6 +636,10 @@ impl ops::CarrierOps for View {
       // one allocation, one of them mutable, from entirely safe code.
       // Copying here is what makes that unconstructible.
       BodyRoute::Copy => crate::boundary::try_packet_copy(body.as_ref()),
+      // **A scoped submission may share**, on every road: the packet is
+      // dropped inside the call, and the one decoder that hands back
+      // what it is sent — the video decoder's hardware probe — keeps
+      // copies.
       BodyRoute::Submission => crate::boundary::share_or_copy(body),
     }
   }

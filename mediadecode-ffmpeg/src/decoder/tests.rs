@@ -22,40 +22,6 @@ fn is_transient_recognises_eagain_and_eof() {
   assert!(!is_transient(&other));
 }
 
-/// `is_hw_decode_failure` is the post-commit reclassification predicate:
-/// a HW-only decoder's non-transient, non-EOF error means the committed
-/// backend can't decode this content, so the wrapper must fall back to SW.
-/// It must fire for the broad-by-design HW-failure set
-/// (`External`/`Bug`/`Bug2`/`Unknown`/`InvalidData` plus the transfer
-/// path's `Other { EINVAL }`) and must NOT fire for the transient set
-/// (`EAGAIN`) or genuine `Eof` — trapping `Eof` would loop the caller in
-/// infinite fallback-retry.
-#[test]
-fn is_hw_decode_failure_covers_hw_failures_excludes_transient_and_eof() {
-  // Reclassify-to-fallback set.
-  assert!(is_hw_decode_failure(&ffmpeg_next::Error::External));
-  assert!(is_hw_decode_failure(&ffmpeg_next::Error::Bug));
-  assert!(is_hw_decode_failure(&ffmpeg_next::Error::Bug2));
-  assert!(is_hw_decode_failure(&ffmpeg_next::Error::Unknown));
-  assert!(is_hw_decode_failure(&ffmpeg_next::Error::InvalidData));
-  // Transfer-path unsupported CPU pix_fmt: AVERROR(EINVAL).
-  assert!(is_hw_decode_failure(&ffmpeg_next::Error::Other {
-    errno: libc::EINVAL,
-  }));
-
-  // Must NOT fire: genuine end-of-stream must propagate.
-  assert!(!is_hw_decode_failure(&ffmpeg_next::Error::Eof));
-  // Must NOT fire: EAGAIN backpressure is transient (and excluded by the
-  // call sites' `is_transient` guard, but verify the predicate too).
-  assert!(!is_hw_decode_failure(&ffmpeg_next::Error::Other {
-    errno: ffmpeg_next::error::EAGAIN,
-  }));
-  // A non-HW `Other` errno (e.g. ENOMEM) is not a HW-decode failure.
-  assert!(!is_hw_decode_failure(&ffmpeg_next::Error::Other {
-    errno: libc::ENOMEM,
-  }));
-}
-
 /// Regression: a `codec::Parameters` with a null inner pointer must be
 /// rejected at the entrypoint, not deref'd. ffmpeg-next's
 /// `Parameters::new()` does not check `avcodec_parameters_alloc()`, so a
@@ -1900,23 +1866,23 @@ fn a_latched_refusal_outranks_the_errno_in_every_committed_phase() {
          caller would feed a decoder that already declined the frame",
       ),
       Ok(Received::Frame) => panic!("{name}: a declined surface produced a frame"),
-      // **Wrapped, and that is the point.** A declined coded surface
-      // means this hardware backend cannot take this stream, so it is a
-      // fallback signal and travels in the envelope that makes the
-      // wrapper open a software decoder — the same outcome the H.264
-      // spelling of the same fact has always produced. What must survive
-      // the envelope is the cause: the caller reads the attempts to find
+      // **Named, and that is the point.** The refusal is this picture's
+      // own error, reported as it was minted: the caller reads it to find
       // out *why*, and "a ceiling you configured" is the one answer it
       // can act on.
-      Err(Error::AllBackendsFailed(p)) => {
-        let cause = format!("{:?}", p.attempts());
-        assert!(
-          cause.contains("HwSurfaceTooLarge") && cause.contains("8294400"),
-          "{name}: the refusal must reach the attempt log with its numbers: {cause}",
-        );
+      Err(Error::HwSurfaceTooLarge(p)) => {
+        assert_eq!(p.bytes(), 8_294_400, "{name}: the refusal's own numbers");
       }
       Err(other) => panic!("{name}: expected the latched refusal, got {other:?}"),
     }
+
+    // Nothing is remembered: the next call reaches libavcodec and answers
+    // the phase's own flow state.
+    let again = dec.receive_frame(&mut frame);
+    assert!(
+      matches!(again, Ok(Received::NeedsInput | Received::Ended)),
+      "{name}: the next call reaches libavcodec, got {again:?}",
+    );
   }
 }
 
@@ -1964,17 +1930,11 @@ fn a_latched_refusal_outranks_the_errno_on_the_send_road_too() {
   match dec.send_eof() {
     Ok(Sent::Accepted) => panic!("a repeated end silently accepted over a refusal"),
     Ok(Sent::MustDrain) => panic!("back pressure promised over a refusal"),
-    // **Wrapped, and that is the second half of the fix.** Minting the
-    // refusal was never enough: returned plain it went nowhere, because
-    // the wrapper opens software only on `AllBackendsFailed`. A declined
-    // surface on the send road now takes the same road it takes on the
-    // receive road — the fallback — carrying its own numbers.
-    Err(Error::AllBackendsFailed(p)) => {
-      let cause = format!("{:?}", p.attempts());
-      assert!(
-        cause.contains("HwSurfaceTooLarge") && cause.contains("8294400"),
-        "the refusal must reach the attempt log with its numbers: {cause}",
-      );
+    // **Named on the send road too.** On a committed backend the
+    // refusal is this submission's own error, as on the receive road,
+    // carrying its own numbers.
+    Err(Error::HwSurfaceTooLarge(p)) => {
+      assert_eq!(p.bytes(), 8_294_400, "the refusal's own numbers");
     }
     Err(other) => panic!(
       "the latched refusal must outrank libavcodec's report on the send road too, \
@@ -1983,61 +1943,51 @@ fn a_latched_refusal_outranks_the_errno_on_the_send_road_too() {
   }
 }
 
-/// **Regression: a verdict is minted once, and `post_commit_hw_failure`
-/// records the one it was given rather than reaching for another.**
+/// **Regression: a verdict is minted once, and the committed route
+/// reports the one it was given rather than reaching for another.**
 ///
-/// It used to call [`VideoDecoder::hw_exit`] itself. That was right
-/// while it was the *first* funnel on its road and wrong the moment it
-/// was the second: the receive road mints at the top of its arm, and a
-/// funnel **consumes** the latch it reads, so the second call found
-/// nothing and recorded the errno libavcodec had reported over a coded
-/// surface this crate declined. A caller reading `AllBackendsFailed` to
-/// find out why no backend worked was told `InvalidData` — true about
-/// what FFmpeg saw, false about what happened, and not the actionable
-/// cause (a configured ceiling) the caller could have acted on.
+/// The committed reading used to call [`VideoDecoder::hw_exit`] itself.
+/// That was right while it was the *first* funnel on its road and wrong
+/// the moment it was the second: the receive road mints at the top of its
+/// arm, and a funnel **consumes** the latch it reads, so the second call
+/// found nothing and reported the errno libavcodec had given over a coded
+/// surface this crate declined — true about what FFmpeg saw, false about
+/// what happened, and not the actionable cause (a configured ceiling) the
+/// caller could have acted on.
 ///
-/// Both halves are pinned here, because either alone would pass for the
-/// wrong reason: that the latch survives the call (nothing was
-/// consumed), and that what lands in the attempt log is the argument.
+/// [`VideoDecoder::hw_route`] funnels nothing. Both halves are pinned
+/// anyway, because either alone would pass for the wrong reason: that the
+/// latch survives the route (nothing was consumed), and that what the
+/// caller is handed is the verdict the route was given.
 #[test]
-fn the_post_commit_failure_records_the_verdict_it_was_given() {
+fn the_committed_route_reports_the_verdict_it_was_given() {
   let dec = committed_decoder();
   crate::ffi::declare_ceiling_declined_for_test(dec.state.callback_state, 8_294_400, 2_073_600);
 
-  // Handed a raw error while a refusal sits latched: it must record the
-  // raw one. Reaching for the latch here is precisely the bug.
-  let recorded = dec.post_commit_hw_failure(Error::Ffmpeg(ffmpeg_next::Error::InvalidData));
-  let Error::AllBackendsFailed(p) = &recorded else {
-    panic!("expected AllBackendsFailed, got {recorded:?}");
-  };
-  let cause = format!("{:?}", p.attempts());
+  // Handed a raw failure while a refusal sits latched: the route must
+  // report the raw one. Reaching for the latch here is precisely the bug.
+  let reported_raw = reported(dec.hw_route(
+    Error::Ffmpeg(ffmpeg_next::Error::External),
+    BareVerdict::CandidateFailure,
+  ));
   assert!(
-    cause.contains("Invalid data"),
-    "it must record the verdict it was handed: {cause}",
-  );
-  assert!(
-    !cause.contains("HwSurfaceTooLarge"),
-    "it must not mint a second verdict — that is the double-funnel: {cause}",
+    matches!(reported_raw, Error::Ffmpeg(ffmpeg_next::Error::External)),
+    "it must report the verdict it was handed, not mint a second one: {reported_raw:?}",
   );
 
-  // And the latch is untouched, which is what makes the caller's own
-  // mint the only one. If this call had funnelled, the refusal would be
-  // gone and the road that minted first would have lost it.
+  // And the latch is untouched, which is what makes the road's own mint
+  // the only one.
   let verdict = dec.hw_exit(Error::Ffmpeg(ffmpeg_next::Error::InvalidData));
   assert!(
     matches!(verdict, Error::HwSurfaceTooLarge(ref q) if q.bytes() == 8_294_400),
-    "the latch must survive an untouched `post_commit_hw_failure`: {verdict:?}",
+    "the latch must survive the committed route: {verdict:?}",
   );
 
   // Threaded onward, the refusal is what a caller reads.
-  let threaded = dec.post_commit_hw_failure(verdict);
-  let Error::AllBackendsFailed(p) = &threaded else {
-    panic!("expected AllBackendsFailed, got {threaded:?}");
-  };
-  let cause = format!("{:?}", p.attempts());
+  let threaded = reported(dec.hw_route(verdict, BareVerdict::CandidateFailure));
   assert!(
-    cause.contains("HwSurfaceTooLarge") && cause.contains("8294400"),
-    "the threaded verdict must reach the attempt log with its numbers: {cause}",
+    matches!(threaded, Error::HwSurfaceTooLarge(ref p) if p.bytes() == 8_294_400),
+    "the threaded verdict must reach the caller with its numbers: {threaded:?}",
   );
 }
 
@@ -2049,12 +1999,11 @@ fn the_post_commit_failure_records_the_verdict_it_was_given() {
 /// funnel call from redundant into destructive, and it is why "mint once
 /// and thread" is a rule rather than a preference.
 ///
-/// The committed receive road's `is_hw_decode_failure` branch needs a
-/// hardware backend to reach in this harness — the errnos it selects on
-/// are what a HW backend produces, and a software decoder refuses the
-/// packets that would provoke them at `send_packet` instead. So the road
-/// is covered by the lanes above and this one rather than end to end,
-/// and saying so is better than implying otherwise.
+/// The hardware errnos themselves need a hardware backend to produce in
+/// this harness — a software decoder never answers with them — so the
+/// committed receive road is covered by the lanes above and this one
+/// rather than end to end, and saying so is better than implying
+/// otherwise.
 #[test]
 fn a_funnel_consumes_what_it_collects() {
   let dec = committed_decoder();
@@ -2076,46 +2025,33 @@ fn a_funnel_consumes_what_it_collects() {
 }
 
 /// **Regression: the HEVC spelling of a declined surface reaches the
-/// caller, and takes the fallback with it.**
+/// caller by name.**
 ///
 /// `get_hw_format` runs again on a **post-commit format change** — an
 /// HEVC SPS switch mid-stream — so the ceiling can decline a coded
 /// surface there, latch [`Error::HwSurfaceTooLarge`], and return
-/// `AV_PIX_FMT_NONE`. H.264 normalises that to `InvalidData` and was
-/// covered. FFmpeg 9's HEVC path propagates the `-1`, `ffmpeg-next` maps
-/// it to `Other { errno: 1 }`, and [`is_hw_decode_failure`] does not
-/// match it — so the road returned the raw errno unfunnelled: an
-/// EPERM-shaped red herring, no software fallback, and the latch left
-/// standing to be collected by whatever ran next.
+/// `AV_PIX_FMT_NONE`. H.264 normalises that to `InvalidData`. FFmpeg
+/// 9.0.1's HEVC path returns the `-1` (`hevc/hevcdec.c` 712–714 and
+/// 3260–3264), `ffmpeg-next` maps it to `Other { errno: 1 }`, and that
+/// errno says nothing of its own — so a road that reported the errno
+/// returned an EPERM-shaped red herring and left the latch standing to be
+/// collected by whatever ran next.
 ///
-/// The predicate widened to the truer condition rather than to one more
-/// errno. Enumerating spellings is a census of how each codec in each
-/// FFmpeg release happens to say one thing, and this was the missing
-/// entry; **a latched surface refusal is the signal itself**, whatever
-/// wrapper the codec put around it.
+/// **A latched surface refusal is what the caller reads**, whatever
+/// wrapper the codec put around it: on a committed backend it is that
+/// picture's own error, carrying its own numbers.
 #[test]
 fn a_declined_surface_reaches_the_caller_whatever_errno_the_codec_wrapped_it_in() {
-  // The spelling that was missed. Nothing about the lane depends on it
-  // beyond `is_hw_decode_failure` NOT matching it — which is the whole
-  // reason the old road fell through.
+  // The HEVC spelling.
   let hevc = ffmpeg_next::Error::Other { errno: 1 };
-  assert!(
-    !is_hw_decode_failure(&hevc),
-    "if the errno list ever grows to cover this, the lane below stops \
-     testing the widening and must be rebuilt on a spelling it misses",
-  );
 
   let dec = committed_decoder();
   crate::ffi::declare_ceiling_declined_for_test(dec.state.callback_state, 8_294_400, 2_073_600);
 
   let out = reported(dec.hw_failure(hevc, BareVerdict::CandidateFailure));
-  let Error::AllBackendsFailed(p) = &out else {
-    panic!("a declined surface must ask for the software fallback, got {out:?}");
-  };
-  let cause = format!("{:?}", p.attempts());
   assert!(
-    cause.contains("HwSurfaceTooLarge") && cause.contains("8294400"),
-    "the verdict must carry its own numbers, not the codec's errno: {cause}",
+    matches!(out, Error::HwSurfaceTooLarge(ref p) if p.bytes() == 8_294_400),
+    "the refusal's own numbers, not the codec's errno: {out:?}",
   );
 
   // And the latch is spent, so nothing downstream inherits it.
@@ -2126,41 +2062,25 @@ fn a_declined_surface_reaches_the_caller_whatever_errno_the_codec_wrapped_it_in(
   );
 }
 
-/// The other answers the predicate must keep giving — **paired with the
-/// spellings their real producers use.**
+/// The other answer the routing must keep giving — **paired with the
+/// spellings its real producer uses.**
 ///
-/// The previous version of this lane paired the budget latch with a
-/// synthetic `Other { errno: 1 }` and passed while the bug was live,
-/// because that errno is one [`is_hw_decode_failure`] does not match —
-/// so the `or`'s second arm never fired and the exclusion was never
-/// tested. `judge_buffer` answers libavcodec `-EINVAL`, which it **does**
-/// match, and that is the pairing that mattered.
-///
-/// The lesson is older than this round: a regression is only worth its
-/// name if it is built from what the producer actually emits. A
-/// convenient value that happens to travel the same road proves the road
-/// works for convenient values.
+/// `judge_buffer` refuses by answering libavcodec `-EINVAL`, and
+/// libavcodec says `InvalidData` for corrupt input on the same road; a
+/// failed VideoToolbox restart says `AVERROR_EXTERNAL`. A budget refusal
+/// names the action that can succeed — raise the ceiling — and must
+/// travel unwrapped whatever errno rides with it.
 #[test]
-fn a_budget_refusal_never_triggers_the_fallback_whatever_errno_rides_with_it() {
-  // **The producer's own spelling, asserted rather than assumed.**
-  // `judge_buffer` refuses by returning `-EINVAL` — the only thing a
-  // `get_buffer2` callback can answer — and the predicate's errno arm
-  // matches it. If either fact ever changes, this lane says so instead
-  // of quietly testing nothing.
-  let einval = ffmpeg_next::Error::Other {
-    errno: libc::EINVAL,
-  };
-  assert!(
-    is_hw_decode_failure(&einval),
-    "the errno arm must match `judge_buffer`'s own answer, or this lane \
-     stops testing the exclusion it exists for",
-  );
-
-  // Both spellings a budget refusal can arrive with: the one it emits,
-  // and the one libavcodec uses for corrupt input on the same road.
+fn a_budget_refusal_travels_unwrapped_whatever_errno_rides_with_it() {
   for (name, raw) in [
-    ("judge_buffer's own -EINVAL", einval),
+    (
+      "judge_buffer's own -EINVAL",
+      ffmpeg_next::Error::Other {
+        errno: libc::EINVAL,
+      },
+    ),
     ("libavcodec's InvalidData", ffmpeg_next::Error::InvalidData),
+    ("a failed restart's EXTERNAL", ffmpeg_next::Error::External),
   ] {
     let dec = committed_decoder();
     crate::ffi::declare_frame_budget_declined_for_test(dec.state.callback_state, 12_582_912);
@@ -2169,50 +2089,18 @@ fn a_budget_refusal_never_triggers_the_fallback_whatever_errno_rides_with_it() {
     assert!(
       matches!(out, Error::FrameBudgetExceeded(ref p) if p.bytes() == 12_582_912),
       "{name}: a budget refusal must travel unwrapped, naming the action that \
-       can succeed — raise the ceiling — rather than sending the caller down a \
-       fallback that will be refused by the same ceiling: {out:?}",
+       can succeed — raise the ceiling: {out:?}",
     );
   }
 }
 
-/// The no-latch answer: an errno with nothing named behind it is judged
-/// on its own, which is the only arm where it gets a vote.
-#[test]
-fn an_unnamed_failure_is_still_judged_on_its_errno() {
-  // Recognised: a real hardware decode failure latches nothing, so the
-  // errno is all there is and it must still reach the fallback road.
-  let dec = committed_decoder();
-  let out = reported(dec.hw_failure(
-    ffmpeg_next::Error::InvalidData,
-    BareVerdict::CandidateFailure,
-  ));
-  assert!(
-    matches!(out, Error::AllBackendsFailed(_)),
-    "an unnamed hardware decode failure must still ask for the fallback: {out:?}",
-  );
-
-  // Unrecognised, and nothing named: it travels as itself. Inventing a
-  // hardware failure from every unknown errno would be the mirror of the
-  // bug this predicate just lost.
-  let dec = committed_decoder();
-  let out = reported(dec.hw_failure(
-    ffmpeg_next::Error::Other { errno: 1 },
-    BareVerdict::CandidateFailure,
-  ));
-  assert!(
-    matches!(out, Error::Ffmpeg(ffmpeg_next::Error::Other { errno: 1 })),
-    "an unrecognised errno with nothing latched must travel as itself: {out:?}",
-  );
-}
-
 /// The same exclusion on the **committed receive route**, where the
-/// verdict is minted by `hw_receive` and the predicate only routes it.
+/// verdict is minted by `hw_receive` and the routing only reads it.
 ///
 /// The route matters separately from the predicate: it is the one that
 /// holds an already-minted verdict, so a regression there could take the
 /// form of re-deriving instead of mis-judging. What a caller must see is
-/// the budget refusal itself — unwrapped, with its numbers, and no
-/// fallback envelope around it.
+/// the budget refusal itself — unwrapped, with its numbers.
 #[test]
 fn the_committed_receive_route_lets_a_budget_refusal_travel_unwrapped() {
   let mut dec = committed_decoder();
@@ -2224,11 +2112,6 @@ fn the_committed_receive_route_lets_a_budget_refusal_travel_unwrapped() {
     Err(Error::FrameBudgetExceeded(p)) => {
       assert_eq!(p.bytes(), 12_582_912, "the refusal's own numbers");
     }
-    Err(Error::AllBackendsFailed(p)) => panic!(
-      "a budget refusal took the fallback road — software will be refused by the \
-       same ceiling, and the actionable error is now buried: {:?}",
-      p.attempts(),
-    ),
     Err(other) => panic!("expected the budget refusal, got {other:?}"),
   }
 }
@@ -2247,21 +2130,165 @@ fn reported(route: HwRoute) -> Error {
   }
 }
 
+/// Errnos a committed hardware backend can answer with,
+/// `AVERROR_EXTERNAL` and `ENOSYS` among them.
+#[cfg(test)]
+const COMMITTED_FAILURES: [ffmpeg_next::Error; 9] = [
+  ffmpeg_next::Error::External,
+  ffmpeg_next::Error::Other {
+    errno: libc::ENOSYS,
+  },
+  ffmpeg_next::Error::InvalidData,
+  ffmpeg_next::Error::Unknown,
+  ffmpeg_next::Error::Bug,
+  ffmpeg_next::Error::Bug2,
+  ffmpeg_next::Error::Other {
+    errno: libc::EINVAL,
+  },
+  ffmpeg_next::Error::Other {
+    errno: libc::ENOMEM,
+  },
+  ffmpeg_next::Error::Other { errno: 1 },
+];
+
+/// LAW (row 1): **after the first picture a failure is that picture's
+/// own error, reported as it was minted, and nothing is remembered — the
+/// next packet reaches libavcodec.**
+///
+/// FFmpeg has no reliable signal that a hardware session is gone. In
+/// FFmpeg 9.0.1 `AVERROR_EXTERNAL` also answers one picture
+/// (`libavcodec/videotoolbox.c` 126–129 and 556–559), `ENOSYS` is NVDEC's
+/// answer to one HEVC picture (`nvdec_hevc.c` 200–227), and a failed
+/// VideoToolbox restart (`videotoolbox.c` 1066–1067) is FFmpeg's to try
+/// again, once a new parameter set re-arms it (446–450 and 1062–1068) —
+/// until then every picture fails the same way (1071–1072). So no errno
+/// is read as more than its picture's: each comes back as itself, and the
+/// call after it reaches libavcodec. That is all this law pins; whether
+/// the session behind the call recovers is FFmpeg's.
+///
+/// How "reaches libavcodec" is seen: libavcodec is handed the end first,
+/// behind the session's back, so its own answer to any packet is
+/// `AVERROR_EOF` — a word only libavcodec says here. A session that
+/// remembered the failure would answer with the failure instead.
+///
+/// PLANT: a latch restored — `hw_route` remembering an
+/// `AVERROR_EXTERNAL` and `send_packet` refusing with it — turns this red
+/// at "the next packet reaches libavcodec".
+#[test]
+fn a_committed_failure_is_its_pictures_own_and_the_next_packet_reaches_libavcodec() {
+  for raw in COMMITTED_FAILURES {
+    let mut dec = committed_decoder();
+    dec
+      .state
+      .inner
+      .send_eof()
+      .expect("libavcodec takes the end");
+
+    let out = reported(dec.hw_failure(raw, BareVerdict::CandidateFailure));
+    assert!(
+      matches!(out, Error::Ffmpeg(e) if e == raw),
+      "{raw:?}: reported as it was minted, got {out:?}",
+    );
+
+    let packet = crate::boundary::try_packet_copy(&[0u8; 16]).expect("a submittable packet");
+    let sent = dec.send_packet(&packet);
+    assert!(
+      matches!(sent, Err(Error::Ffmpeg(ffmpeg_next::Error::Eof))),
+      "{raw:?}: the next packet reaches libavcodec, which answers with the end it \
+       holds — got {sent:?}",
+    );
+    let mut frame = crate::Frame::empty().expect("frame slot");
+    let received = dec.receive_frame(&mut frame);
+    assert!(
+      matches!(received, Ok(Received::Ended)),
+      "{raw:?}: the next picture asked for reaches libavcodec too — got {received:?}",
+    );
+  }
+}
+
+/// LAW (row 1): **after a committed failure and a `flush`, the end
+/// reaches libavcodec.** Nothing about the failure outlives a seek in
+/// this decoder: after the flush the end is taken, libavcodec holds it —
+/// a second end sent straight to it is refused, which only a libavcodec
+/// that took the first one does — and the drain answers the end.
+///
+/// That is all it pins. `flush` rebuilds no hardware session: it reaches
+/// only the codec's own flush (`libavcodec/avcodec.c` 417–418 in FFmpeg
+/// 9.0.1), so a session FFmpeg left without a decoder stays without one.
+///
+/// The plant above turns this red at "after a flush the end reaches
+/// libavcodec" when the restored latch survives `flush`.
+#[test]
+fn after_a_committed_failure_and_a_flush_the_end_reaches_libavcodec() {
+  for raw in COMMITTED_FAILURES {
+    let mut dec = committed_decoder();
+    let out = reported(dec.hw_failure(raw, BareVerdict::CandidateFailure));
+    assert!(
+      matches!(out, Error::Ffmpeg(e) if e == raw),
+      "{raw:?}: reported as it was minted, got {out:?}",
+    );
+
+    dec.flush();
+    let eof = dec.send_eof();
+    assert!(
+      matches!(eof, Ok(Sent::Accepted)),
+      "{raw:?}: after a flush the end reaches libavcodec — it is taken, got {eof:?}",
+    );
+    assert!(
+      matches!(dec.state.inner.send_eof(), Err(ffmpeg_next::Error::Eof)),
+      "{raw:?}: the end reached libavcodec, which refuses a second one",
+    );
+    let mut frame = crate::Frame::empty().expect("frame slot");
+    assert_eq!(
+      dec
+        .receive_frame(&mut frame)
+        .expect("a drained decoder answers the end"),
+      Received::Ended,
+      "{raw:?}",
+    );
+  }
+}
+
+/// LAW (row 2): **while a candidate is on trial, every failure still
+/// advances the probe.** The probe is the only reader of a failure:
+/// before the first picture, a failed restart and a picture's
+/// `AVERROR_INVALIDDATA` alike mean this candidate cannot be trusted with
+/// the stream.
+#[test]
+fn the_probe_advances_on_every_failure_as_before() {
+  for failure in [
+    ffmpeg_next::Error::External,
+    ffmpeg_next::Error::Other {
+      errno: libc::ENOSYS,
+    },
+    ffmpeg_next::Error::InvalidData,
+    ffmpeg_next::Error::Unknown,
+  ] {
+    let dec = auditioning_decoder();
+    match dec.hw_failure(failure, BareVerdict::CandidateFailure) {
+      HwRoute::Advance(Error::Ffmpeg(e)) => assert_eq!(e, failure),
+      HwRoute::Advance(other) => panic!("{failure:?}: advanced with {other:?}"),
+      HwRoute::Report(err) => {
+        panic!("{failure:?}: a candidate's failure must advance the probe, got Report({err:?})")
+      }
+    }
+  }
+}
+
 /// **The send road's cross product: both refusals, both flow signals,
 /// both phases, both send faces.**
 ///
 /// The transient send arms returned their funnel's result the instant
 /// they had it. For a flow signal that is right; for anything else it
-/// was a dead end. `hw_send` can mint [`Error::HwSurfaceTooLarge`], and
-/// a minted refusal returned plain goes nowhere: the wrapper opens
-/// software only on [`Error::AllBackendsFailed`], so it simply stopped,
-/// and a probe still auditioning never advanced past the candidate that
-/// had just declined the surface.
+/// was a dead end. `hw_send` can mint [`Error::HwSurfaceTooLarge`], and a
+/// minted refusal returned plain went nowhere: a probe still auditioning
+/// never advanced past the candidate that had just declined the surface.
 ///
 /// Sixteen cells, and the two refusals must part company in every one:
 /// a **surface** refusal routes — the probe advances while auditioning,
-/// the fallback fires once committed — while a **budget** refusal exits
-/// direct and unwrapped, because software would meet the same ceiling.
+/// and once committed it is the submission's own error — while a
+/// **budget** refusal exits direct and unwrapped, because software would
+/// meet the same ceiling.
 #[test]
 fn the_send_roads_route_a_surface_refusal_and_report_a_budget_one() {
   #[derive(Clone, Copy)]
@@ -2323,20 +2350,22 @@ fn the_send_roads_route_a_surface_refusal_and_report_a_budget_one() {
         match (latch, out) {
           // A declined surface is this backend's refusal to take the
           // stream. Auditioning, the probe advances and — with no
-          // backend left — surfaces the exhaustion; committed, the
-          // fallback envelope is what makes the wrapper open software.
-          // Either way the shape is `AllBackendsFailed` and the cause
-          // survives inside it.
-          (Latch::Surface, Err(Error::AllBackendsFailed(p))) => {
+          // backend left — surfaces the exhaustion, the cause in its
+          // attempt log.
+          (Latch::Surface, Err(Error::AllBackendsFailed(p))) if auditioning => {
             let cause = format!("{:?}", p.attempts());
             assert!(
               cause.contains("HwSurfaceTooLarge") && cause.contains("8294400"),
               "{name}: the refusal must reach the attempt log with its numbers: {cause}",
             );
           }
+          // Committed, the submission's own error, with its numbers.
+          (Latch::Surface, Err(Error::HwSurfaceTooLarge(p))) if !auditioning => {
+            assert_eq!(p.bytes(), 8_294_400, "{name}: the refusal's own numbers");
+          }
           (Latch::Surface, other) => panic!(
-            "{name}: a declined surface must route, not exit plain — returned plain it \
-             reaches no fallback and advances no probe: {other:?}",
+            "{name}: a declined surface must advance a running probe and otherwise \
+             reach the caller by name: {other:?}",
           ),
           // A budget refusal names the action that can succeed. Wrapping
           // it would send the caller to a decoder the same ceiling will
@@ -2441,4 +2470,377 @@ fn the_public_decoder_has_a_timed_construction_road() {
       mediadecode::Timebase,
     ) -> Result<VideoDecoder> = VideoDecoder::open_with_limits_timed;
   }
+}
+
+/// Side of the rawvideo pictures the rescue lanes send, in pixels. The
+/// format is `GRAY8`, one byte a pixel.
+const RAW_SIDE: i32 = 16;
+
+/// Bytes in one such picture: the payload rawvideo takes as one packet.
+const RAW_PICTURE: usize = (RAW_SIDE * RAW_SIDE) as usize;
+
+/// A decoder on trial with no backend left to advance to, over
+/// libavcodec's rawvideo decoder.
+///
+/// Rawvideo takes any payload of a picture's size, so a lane chooses
+/// every byte it sends. libavcodec decodes the first packet as it is
+/// sent and holds the second until a picture is asked for
+/// (`avcodec_send_packet`, `libavcodec/decode.c` 745–758 in FFmpeg
+/// 9.0.1): two sends taken, and no back pressure.
+fn raw_auditioning_decoder() -> VideoDecoder {
+  ffmpeg_next::init().expect("ffmpeg init");
+  let mut parameters = ffmpeg_next::codec::Parameters::new();
+  // SAFETY: `parameters` owns a live, zeroed `AVCodecParameters`; every
+  // field written is a plain scalar.
+  unsafe {
+    let raw = parameters.as_mut_ptr();
+    (*raw).codec_type = ffmpeg_next::ffi::AVMediaType::AVMEDIA_TYPE_VIDEO;
+    (*raw).codec_id = ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_RAWVIDEO;
+    (*raw).width = RAW_SIDE;
+    (*raw).height = RAW_SIDE;
+    (*raw).format = ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_GRAY8 as i32;
+  }
+  VideoDecoder::from_software_for_test(
+    parameters,
+    crate::limits::DecoderLimits::default(),
+    /*auditioning=*/ true,
+  )
+  .expect("a software-backed rawvideo candidate on trial")
+}
+
+/// One picture's packet, every byte `fill`.
+fn raw_packet(fill: u8) -> Packet {
+  crate::boundary::try_packet_copy(&[fill; RAW_PICTURE]).expect("a submittable packet")
+}
+
+/// Where a packet's payload is, and how many references its buffer has.
+fn payload_of(packet: &Packet) -> (usize, i32) {
+  // SAFETY: the packet is live; `data` and `buf` are plain fields, and
+  // `av_buffer_get_ref_count` only reads the buffer's atomic count.
+  unsafe {
+    let raw = packet.as_ptr();
+    assert!(!(*raw).buf.is_null(), "the lanes send refcounted packets");
+    (
+      (*raw).data as usize,
+      ffmpeg_next::ffi::av_buffer_get_ref_count((*raw).buf),
+    )
+  }
+}
+
+/// Whether every byte of `packet`'s payload is `fill`.
+fn holds(packet: &Packet, fill: u8) -> bool {
+  packet
+    .data()
+    .is_some_and(|bytes| bytes.iter().all(|&byte| byte == fill))
+}
+
+/// LAW: **the probe's copy shares nothing with its source, and costs
+/// what its source was charged.**
+///
+/// [`try_clone_packet`] is how the probe records a packet. Its
+/// `av_packet_ref` leaves the record sharing the source's payload
+/// buffer, so the record is then made writable, which copies the
+/// payload into a buffer of its own; the side data is the copy
+/// `av_packet_copy_props` makes of each entry. The sizes are the
+/// source's, so the charge the pre-flight computes from the source —
+/// `size` and [`packet_side_data_bytes`] — is the copy's.
+///
+/// PLANT: `av_packet_make_writable` skipped in [`try_clone_packet`]
+/// turns this red at "a payload of its own".
+#[test]
+fn the_probes_copy_shares_nothing_with_its_source() {
+  use ffmpeg_next::ffi::{AVPacketSideDataType, av_packet_new_side_data};
+
+  ffmpeg_next::init().expect("ffmpeg init");
+  let mut source = crate::boundary::try_packet_copy(&[0x5A; 1024]).expect("a source packet");
+  // SAFETY: `source` owns a live packet; the entry is FFmpeg's own
+  // allocation of 16 bytes, written only through the pointer it returns.
+  unsafe {
+    let entry = av_packet_new_side_data(
+      source.as_mut_ptr(),
+      AVPacketSideDataType::AV_PKT_DATA_STRINGS_METADATA,
+      16,
+    );
+    assert!(!entry.is_null(), "the entry must exist to be copied");
+    core::ptr::write_bytes(entry, 0xC3, 16);
+  }
+
+  let copy = try_clone_packet(&source).expect("an uncapped copy");
+  let (source_at, source_refs) = payload_of(&source);
+  let (copy_at, copy_refs) = payload_of(&copy);
+  assert_eq!(copy.data(), source.data(), "the same bytes");
+  assert_ne!(copy_at, source_at, "in a payload of its own");
+  assert_eq!(
+    (source_refs, copy_refs),
+    (1, 1),
+    "each buffer referenced by its own packet alone",
+  );
+
+  // Read as raw fields, never through the bindgen enum the entry also
+  // carries.
+  let side = |packet: &Packet| -> (usize, Vec<u8>) {
+    // SAFETY: the packet is live and carries one entry, checked first;
+    // `data` and `size` are plain fields of it.
+    unsafe {
+      let raw = packet.as_ptr();
+      assert_eq!((*raw).side_data_elems, 1, "one entry");
+      let entry = (*raw).side_data;
+      let (data, size) = ((*entry).data, (*entry).size);
+      (
+        data as usize,
+        std::slice::from_raw_parts(data, size).to_vec(),
+      )
+    }
+  };
+  let (source_side_at, source_side) = side(&source);
+  let (copy_side_at, copy_side) = side(&copy);
+  assert_eq!(copy_side, source_side, "the same side data");
+  assert_ne!(copy_side_at, source_side_at, "in an entry of its own");
+
+  let charge = |packet: &Packet| {
+    packet.size() + packet_side_data_bytes(packet, MAX_PROBE_PACKET_SIDE_DATA_ENTRIES)
+  };
+  assert_eq!(
+    charge(&copy),
+    charge(&source),
+    "the copy costs what its source was charged",
+  );
+}
+
+/// LAW: **a rescued packet keeps the bytes it was sent with, whatever
+/// the caller writes to its own packet afterwards, and a write to it
+/// reaches nothing the caller holds.**
+///
+/// `Packet::data_mut` lends `&mut [u8]` without consulting writability,
+/// and [`Error::AllBackendsFailed`] hands the probe's history to the
+/// caller as owned packets. A history that shared the caller's payloads
+/// would carry the caller's writes after the send into what it hands
+/// back, and would give safe code two `&mut [u8]` over one allocation.
+/// So the probe records copies, charged what the packets were.
+///
+/// The probe exhausts on the road a caller meets it on. The first
+/// picture asked for is a CPU frame from a context on trial as hardware,
+/// so its download fails — `av_hwframe_transfer_data` answers `EINVAL`
+/// for a frame with no hardware frames context — and no backend is left
+/// to advance to.
+///
+/// PLANT: `av_packet_make_writable` skipped in [`try_clone_packet`]
+/// turns this red at "the bytes it was sent with".
+#[test]
+fn a_rescued_packet_keeps_the_bytes_it_was_sent_with() {
+  let mut dec = raw_auditioning_decoder();
+  let fills = [0x11u8, 0x22];
+  let mut sent: Vec<Packet> = fills.iter().map(|&fill| raw_packet(fill)).collect();
+  for packet in &sent {
+    assert_eq!(dec.send_packet(packet).expect("taken"), Sent::Accepted);
+  }
+  assert_eq!(
+    dec.probe.as_ref().expect("still on trial").buffered_bytes,
+    fills.len() * RAW_PICTURE,
+    "each copy is charged its payload",
+  );
+
+  // The caller writes to its own packets after the send, through safe
+  // code.
+  for packet in &mut sent {
+    packet.data_mut().expect("a payload").fill(0xEE);
+  }
+
+  let mut frame = crate::Frame::empty().expect("frame slot");
+  let Err(Error::AllBackendsFailed(p)) = dec.receive_frame(&mut frame) else {
+    panic!("a CPU frame on trial fails the only backend, and the probe exhausts");
+  };
+  let mut rescued = p.into_unconsumed_packets();
+  assert_eq!(
+    rescued.len(),
+    fills.len(),
+    "every packet the probe took comes back"
+  );
+  for (packet, &fill) in rescued.iter().zip(&fills) {
+    assert!(
+      holds(packet, fill),
+      "{fill:#04x}: the bytes it was sent with, not the caller's later writes",
+    );
+    assert_eq!(
+      payload_of(packet).1,
+      1,
+      "{fill:#04x}: referenced by the rescued packet alone",
+    );
+  }
+
+  // And the other way: a write to a rescued packet reaches nothing the
+  // caller holds.
+  for packet in &mut rescued {
+    packet.data_mut().expect("a payload").fill(0x55);
+  }
+  for packet in &sent {
+    assert!(
+      holds(packet, 0xEE),
+      "a write to a rescued packet reached the caller's"
+    );
+  }
+}
+
+/// LAW: **a copy the probe cannot make refuses the send by name, before
+/// libavcodec sees the packet, and leaves the packet with the caller.**
+///
+/// The refusal is the probe's own, as at its byte ceiling:
+/// [`Error::AllBackendsFailed`] with the history recorded so far and no
+/// attempt, since no backend failed. The session stays where it was, on
+/// the same backend and no longer on trial.
+///
+/// The allocator fails it, through `av_max_alloc` in a child process of
+/// its own: capped at 512 bytes, `av_packet_ref`'s `AVBufferRef` is
+/// still allocated and the payload `av_packet_make_writable` copies into
+/// (8,192 bytes and the padding) is not.
+///
+/// PLANT: `av_packet_make_writable` skipped in [`try_clone_packet`]
+/// turns this red at "refused by name".
+#[test]
+fn a_copy_the_probe_cannot_make_refuses_the_send_by_name() {
+  use crate::fault_subprocess::{cap_ffmpeg_allocations, in_subprocess, uncap_ffmpeg_allocations};
+
+  in_subprocess(
+    "decoder::tests::a_copy_the_probe_cannot_make_refuses_the_send_by_name",
+    || {
+      let mut dec = raw_auditioning_decoder();
+      let first = raw_packet(0x11);
+      assert_eq!(dec.send_packet(&first).expect("taken"), Sent::Accepted);
+
+      let mut refused = crate::boundary::try_packet_copy(&[0x77; 8192]).expect("a packet");
+      cap_ffmpeg_allocations(512);
+      let answer = dec.send_packet(&refused);
+      uncap_ffmpeg_allocations();
+
+      let Err(Error::AllBackendsFailed(p)) = answer else {
+        panic!("a copy that cannot be made is refused by name, got {answer:?}");
+      };
+      assert!(
+        p.attempts().is_empty(),
+        "the probe's own refusal: no backend failed, got {:?}",
+        p.attempts(),
+      );
+      let history = p.into_unconsumed_packets();
+      assert!(
+        history.len() == 1 && holds(&history[0], 0x11),
+        "the history recorded before the refusal, without the refused packet",
+      );
+
+      // The packet is the caller's again: neither the copy that failed
+      // nor libavcodec holds a reference to it.
+      assert_eq!(
+        payload_of(&refused).1,
+        1,
+        "nothing else references the packet"
+      );
+      assert!(holds(&refused, 0x77), "its bytes untouched");
+      refused.data_mut().expect("a payload").fill(0x78);
+
+      // The same backend, no longer on trial; and libavcodec never saw
+      // the packet. Offered now it is taken, where a decoder already
+      // holding one packet beside a waiting picture answers back
+      // pressure (`decode.c` 746–747).
+      assert_eq!(dec.phase(), SessionPhase::Streaming);
+      assert_eq!(
+        dec.send_packet(&refused).expect("offered again"),
+        Sent::Accepted,
+        "libavcodec never saw the refused packet",
+      );
+    },
+  );
+}
+
+/// LAW: **a candidate is replayed copies, and the history stays the
+/// probe's own.**
+///
+/// `avcodec_send_packet` takes a reference to what it is sent and may
+/// hold it past the call (`libavcodec/decode.c` 748 and 754). A
+/// candidate replayed the history's own packets would share their
+/// buffers for as long as it holds them, and a candidate the probe
+/// commits stays the session's: when it fails in its turn and the
+/// history goes to the caller, the caller's `&mut [u8]` would cover
+/// bytes a live decoder reads.
+///
+/// The candidate is opened in software through
+/// [`VideoDecoder::advance_probe_with`]. Two packets, so the replay
+/// leaves one picture waiting and one packet held, and asks for no
+/// drain.
+///
+/// PLANT: the replay sending the history's own packet turns this red
+/// at "the candidate holds none of the history".
+#[test]
+fn a_candidate_is_replayed_copies_and_the_history_stays_the_probes_own() {
+  let mut dec = raw_auditioning_decoder();
+  dec
+    .probe
+    .as_mut()
+    .expect("on trial")
+    .remaining_backends
+    .push(Backend::Cuda);
+  let fills = [0x11u8, 0x22];
+  let sent: Vec<Packet> = fills.iter().map(|&fill| raw_packet(fill)).collect();
+  for packet in &sent {
+    assert_eq!(dec.send_packet(packet).expect("taken"), Sent::Accepted);
+  }
+
+  dec
+    .advance_probe_with(
+      Error::Ffmpeg(ffmpeg_next::Error::InvalidData),
+      VideoDecoder::software_state_for_test,
+    )
+    .expect("the candidate takes the replay and is committed");
+  assert_eq!(
+    dec.backend(),
+    Backend::Cuda,
+    "the candidate is the session's"
+  );
+  for (packet, &fill) in dec
+    .probe
+    .as_ref()
+    .expect("still on trial: no picture yet")
+    .buffered_packets
+    .iter()
+    .zip(&fills)
+  {
+    assert_eq!(
+      payload_of(packet).1,
+      1,
+      "{fill:#04x}: the candidate holds none of the history",
+    );
+  }
+
+  // The candidate fails in its turn, on the first picture asked for, and
+  // the history goes to the caller while the candidate stays the
+  // session's, holding what it was replayed.
+  let mut frame = crate::Frame::empty().expect("frame slot");
+  let Err(Error::AllBackendsFailed(p)) = dec.receive_frame(&mut frame) else {
+    panic!("the candidate fails on a CPU frame, and the probe exhausts");
+  };
+  assert_eq!(
+    p.attempts().len(),
+    2,
+    "the first backend's failure and the candidate's: {:?}",
+    p.attempts(),
+  );
+  assert_eq!(
+    p.unconsumed_packets().len(),
+    fills.len(),
+    "every packet the probe took comes back"
+  );
+  for (packet, &fill) in p.unconsumed_packets().iter().zip(&fills) {
+    assert!(
+      holds(packet, fill),
+      "{fill:#04x}: the bytes it was sent with"
+    );
+    assert_eq!(
+      payload_of(packet).1,
+      1,
+      "{fill:#04x}: referenced by the rescued packet alone, beside a live candidate",
+    );
+  }
+  assert_eq!(
+    dec.backend(),
+    Backend::Cuda,
+    "and that candidate is still live"
+  );
 }

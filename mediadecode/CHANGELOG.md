@@ -11,6 +11,14 @@ The sibling FFmpeg adapter has its own log at
 
 ## [Unreleased]
 
+### Changed
+
+- `adapter`'s send-direction rule now says what a decoder that hands
+  back what it is sent owes: copies of its own, so the scoped send
+  stays zero-copy on every road. It said the body is copied wherever a
+  history is being recorded, which `mediadecode-ffmpeg` 0.16.0 no
+  longer does: its hardware probe records copies.
+
 ## [0.15.1] - 2026-10-05
 
 ### Added

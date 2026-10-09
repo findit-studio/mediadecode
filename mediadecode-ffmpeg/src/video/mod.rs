@@ -1,72 +1,56 @@
-//! `mediadecode::VideoStreamDecoder` impl with HW + SW fallback.
+//! `mediadecode::VideoStreamDecoder` impl over FFmpeg's hardware and
+//! software decoders.
 //!
-//! [`FfmpegVideoStreamDecoder`] starts on the hardware path: an inner
-//! [`crate::VideoDecoder`] that auto-probes VideoToolbox / VAAPI /
-//! NVDEC / D3D11VA. When every HW backend fails — at `open` time
-//! (no backend opens) or mid-stream ([`crate::Error::AllBackendsFailed`]
-//! from `send_packet` / `receive_frame` / `send_eof`) — we transparently
-//! fall back to a **software** `ffmpeg::decoder::Video` opened from the
-//! same `Parameters`.
+//! [`FfmpegVideoStreamDecoder`] opens on the [`DecodePath`] it is given:
 //!
-//! Two HW-exhaustion shapes feed the same fallback, distinguished by an
-//! **explicit origin** the `AllBackendsFailed` carries
-//! ([`crate::error::FallbackOrigin`]) — *not* by whether its rescued
-//! `unconsumed_packets` is empty (both shapes can be empty: a probe-era
-//! failure on the first packet has no prior history, exactly like every
-//! post-commit failure):
+//! * **`Auto`** — what `open` does — probes the platform's hardware
+//!   backends in order through [`crate::VideoDecoder`]. When none of them
+//!   takes the stream before its first picture, it falls back to a
+//!   **software** `ffmpeg::decoder::Video` opened from the same
+//!   `Parameters`, and that fallback is lossless: the probe keeps every
+//!   packet it consumed and hands them back in
+//!   [`AllBackendsFailed`](crate::Error::AllBackendsFailed), and they are
+//!   replayed into the software decoder — then the packet the probe
+//!   refused — before anything else, so a non-seekable input loses
+//!   nothing. A probe that exhausts at `open` opens software at once.
+//! * **`AnyHardware`** is the same probe with software taken away: when no
+//!   backend takes the stream before its first picture, the session
+//!   reports [`AllBackendsFailed`](crate::Error::AllBackendsFailed) with
+//!   the packets the probe took (none, when no backend opens at all), and
+//!   the caller decides what to replay them into.
+//! * **`Hardware(b)`** is that one backend or nothing, committed at open.
+//! * **`Software`** is libavcodec's own decoder, with no probe.
 //!
-//! * **Probe-era** (pre-first-frame, [`crate::error::FallbackOrigin::Probe`]):
-//!   the inner decoder buffered every packet it consumed and surfaces them in
-//!   `unconsumed_packets`. We **replay exactly those** through the SW decoder
-//!   (lossless — no frame was delivered yet), then route the still-unconsumed
-//!   current packet (the one the inner decoder failed on / refused) to SW
-//!   ourselves. This is the original pre-runtime-fallback behaviour and is
-//!   unchanged.
-//! * **Post-commit** (after the first frame, the inner probe is gone,
-//!   [`crate::error::FallbackOrigin::PostCommit`]): a runtime HW-decode failure
-//!   — e.g. VideoToolbox choking on H.264 High 4:2:2 10-bit — is reclassified
-//!   to `AllBackendsFailed` by the inner decoder with an **empty**
-//!   `unconsumed_packets` (the probe buffer no longer exists). Here we
-//!   **degrade and continue** rather than reconstruct: open the SW decoder with
-//!   an empty replay set and let it **resync at the next keyframe**. Fed forward
-//!   packets from the failure point, the SW decoder naturally produces nothing
-//!   until that keyframe, then decodes normally from there. The bounded span
-//!   from the failure point to the next keyframe is dropped — an accepted,
-//!   **loudly logged** gap (a single `tracing::warn!`), not a silent one. The
-//!   indexing pipeline this serves prefers a small logged gap over the
-//!   error-prone mid-stream-reconstruction state machine a lossless replay
-//!   would require (see findit-studio/mediadecode#12). The *bounded*-ness is
-//!   **enforced, not assumed**: a post-commit fallback enters a degraded-resync
-//!   mode that holds until a **keyframe-anchored** resync — the SW decoder
-//!   delivering a frame *after* a keyframe was fed to it across the gap. (Gating
-//!   on a keyframe, not on *any* frame, matters because a lenient codec will
-//!   decode a lone P-frame from the dropped span into a concealed frame; that
-//!   must not count as a resync, or the one-GOP bound isn't truly enforced.) If
-//!   EOF is reached while the mode is still pending — no keyframe ever arrived
-//!   across the gap and the whole tail was lost — `receive_frame` escalates with
-//!   a distinct [`VideoDecodeError::PostCommitNeverResynced`] (and a
-//!   `tracing::error!`) rather than surfacing a clean end-of-stream that would
-//!   swallow the tail silently. So the gap is either bounded-and-logged (a real
-//!   keyframe resync happened) or reported-at-EOF (it never did) — never
-//!   silent-and-unbounded.
+//! # After the first picture, nothing changes the road
 //!
-//!   The post-commit path retains and reconstructs **zero** frames: it opens SW
-//!   cold, forwards only the failure arm's current packet (or EOF), and lets SW
-//!   resync naturally. It never populates the replay-frame queue, so the
-//!   replay/conversion machinery the probe-era path uses cannot touch it.
+//! Once a backend has committed — at its first picture, or at open when
+//! it was named — the session stays on it, and nothing is classified.
+//! Every decoder failure ([`VideoDecodeError::Decode`]) is that picture's
+//! own error, reported as it was minted, and nothing of it is remembered,
+//! so the next call reaches libavcodec. Whether a hardware session
+//! recovers is FFmpeg's: after a VideoToolbox restart that fails, every
+//! picture fails the same way until a new parameter set re-arms the
+//! restart, and `flush` rebuilds no hardware session (see
+//! [`crate::VideoDecoder`] for the lines). This wrapper neither waits for
+//! a recovery nor rules one out.
 //!
-//! The probe-era replay happens before the new packet (or the next
-//! `receive_frame` poll) is processed, so a probe-era HW exhaustion on a
-//! non-seekable input loses no compressed data. The post-commit path
-//! intentionally accepts the next-keyframe gap.
+//! A [`VideoDecodeError::Convert`] is this wrapper's own failure to
+//! convert a decoded picture into a frame, not the decoder's. One that
+//! failed on an allocation parks the picture, and until a `receive_frame`
+//! delivers it, `send_packet` and `send_eof` answer `Sent::MustDrain`
+//! without reaching libavcodec: back pressure, not a failure.
 //!
-//! After the transition the decoder stays on SW for the rest of its
-//! life — there's no probe-back-to-HW logic; once we've decided the
-//! stream isn't HW-decodable, that decision is sticky.
+//! **`Auto` does not go on in software at that point.** A software
+//! decoder that starts mid-stream holds no reference pictures, and after
+//! the first picture this session keeps no packets to give it, so it
+//! cannot switch without a gap. Whether to switch, and what gap to
+//! accept, is the caller's: it sees the failures and what it has
+//! delivered, and it decides what to keep. [`DecodePath`] describes the
+//! simplest policy.
 //!
-//! Frames produced by either path are converted via
-//! [`crate::convert::av_frame_to_video_frame`] so the consumer sees
-//! the same `mediadecode::VideoFrame<PixelFormat, VideoFrameExtra,
+//! Frames produced by either decoder are converted via
+//! [`crate::convert::av_frame_to_video_frame`] so the consumer sees the
+//! same `mediadecode::VideoFrame<PixelFormat, VideoFrameExtra,
 //! FfmpegBytes>` shape regardless of which backend produced it.
 
 use std::collections::VecDeque;
@@ -102,28 +86,97 @@ use crate::{
 /// Which decode path a video session takes — the choice
 /// [`CarrierVideoStreamDecoder::open_as`] is given.
 ///
-/// # The arms differ in what they PERMIT, not only in where they start
+/// # Three words and a pin, and what each permits
 ///
-/// [`Auto`](Self::Auto) is a preference: it starts on hardware and is
-/// free to end on software, at open or mid-stream. The other two are
-/// **pins**, and a pin that a mid-stream failure could quietly undo
-/// would not be one — so a session opened on either of them stays on
-/// the path it was opened on for its whole life, and a hardware failure
-/// that `Auto` would degrade through is reported instead.
+/// - [`Auto`](Self::Auto): before the first picture, the platform's
+///   hardware backends in probe order, the packets taken so far replayed
+///   across them; when none takes the stream, software, the same packets
+///   replayed into it. After it, the decoder that produced it.
+/// - [`AnyHardware`](Self::AnyHardware): the same probe, and never
+///   software — when no backend takes the stream,
+///   [`Error::AllBackendsFailed`] hands back the packets the probe took.
+///   After the first picture, the backend that produced it.
+/// - [`Software`](Self::Software): libavcodec's own decoder, with no
+///   probe, before and after.
+/// - [`Hardware(b)`](Self::Hardware), the pin: backend `b`, committed at
+///   open; nothing else is tried, before or after.
 ///
-/// That is the difference the two consumers of this door need. A
-/// determinism comparison decodes *one stream* both ways and compares
-/// the pixels; a run that silently swapped paths halfway would compare
-/// nothing and say it had. An operator turning hardware off for a lane
-/// over a driver that produces wrong pixels needs it to stay off.
+/// **After the first picture nothing changes the road, on any path, and
+/// nothing is classified.** A decoder failure
+/// ([`VideoDecodeError::Decode`]) is that picture's own error, reported as
+/// it was minted, and nothing of it is remembered, so the next call
+/// reaches libavcodec. Whether a hardware session recovers is FFmpeg's:
+/// after a VideoToolbox restart that fails, every picture fails the same
+/// way until a new parameter set re-arms the restart, and `flush` rebuilds
+/// no hardware session. See [`VideoDecoder`](crate::VideoDecoder) for the
+/// lines.
 ///
-/// # Observability is unchanged
+/// # When to stop trusting a hardware session
+///
+/// A caller that sees a hardware session's decoder failures persist
+/// rebuilds: it opens a session on [`Software`](Self::Software) from the
+/// same parameters and feeds it forward. When to do so is the caller's
+/// policy, not this crate's, because it is the caller that sees the
+/// failures on all three roads, the packets' key flags and what it has
+/// delivered. What the new session can be fed depends on the road the
+/// failure came from:
+///
+/// - **`send_packet`**: the failure names the packet in hand, and the new
+///   session is given that packet.
+/// - **`receive_frame`**: the failure may concern a packet accepted
+///   earlier. FFmpeg decouples input from output and may hold several
+///   pictures (`libavcodec/avcodec.h` 90–139 in FFmpeg 9.0.1), so no
+///   packet is named: the new session is given the next packet, and the
+///   caller accepts the gap.
+/// - **`send_eof`**: the end has no packet to give a new session. What
+///   the hardware session still held is recoverable only from packets
+///   kept from before, or by a seek.
+///
+/// What a policy counts is the hardware session's decoder failures,
+/// [`VideoDecodeError::Decode`]. A [`VideoDecodeError::Convert`] is this
+/// wrapper's own: a decoded picture it could not convert into a frame (a
+/// frame ceiling, a pixel format or plane layout it cannot carry, an
+/// allocation). It is reported, not counted. One that failed on an
+/// allocation parks the picture: the next `receive_frame` converts it
+/// again, and until one delivers it `send_packet` and `send_eof` answer
+/// [`Sent::MustDrain`] without reaching libavcodec. That is the wrapper's
+/// back pressure, not a failure.
+///
+/// The example in the [crate documentation](crate) is the simplest such
+/// policy:
+///
+/// - It counts the hardware session's decoder failures from all three
+///   roads, and only a delivered picture ends the count.
+/// - At a threshold of its own it opens [`Software`](Self::Software) from
+///   the same parameters and feeds it forward, road by road as above.
+///   Every picture the new session delivers is delivered as it is.
+/// - On software its failures are reported and the stream goes on:
+///   software is where the policy ends.
+///
+/// It keeps no packets, so the pictures from a failure to the next
+/// keyframe are lost: the new session holds no reference pictures, and
+/// libavcodec drops or conceals what comes before one. A caller that
+/// cannot afford that gap keeps packets and replays them with a picture
+/// identity of its own; that bookkeeping is the caller's design, and the
+/// example does not show it.
+///
+/// The words differ in what they **permit**, not only where they start.
+/// That is the difference the consumers of this door need. A determinism
+/// comparison decodes *one stream* both ways and compares the pixels; a
+/// run that silently swapped paths halfway would compare nothing and say
+/// it had. An operator turning hardware off for a lane over a driver that
+/// produces wrong pixels needs it to stay off. And a node that sends
+/// hardware and software sessions to separate pools needs a hardware
+/// session that never quietly becomes a software one — which is what
+/// [`AnyHardware`](Self::AnyHardware) is for.
+///
+/// # Observability
 ///
 /// [`is_hardware`](CarrierVideoStreamDecoder::is_hardware) and
 /// [`is_software`](CarrierVideoStreamDecoder::is_software) read where a
 /// session **is**, which stays a live reading — under
-/// [`Auto`](Self::Auto) it can still change once, and under the pins it
-/// answers what was pinned because nothing can move it.
+/// [`Auto`](Self::Auto) it can change once, during the probe, and under
+/// the others it answers what was chosen because nothing can move it.
 ///
 /// This type deliberately grows **no** `is_*` predicates of its own,
 /// where most vocabularies in this crate do. They would spell the
@@ -136,40 +189,58 @@ use crate::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DecodePath {
   /// Probe the platform's hardware backends in order and fall back to
-  /// software — at open, and again on a mid-stream hardware failure.
+  /// software when none takes the stream before its first picture, the
+  /// packets the probe consumed replayed into it so nothing is lost.
+  /// After the first picture the session stays on the decoder that
+  /// produced it.
   ///
-  /// What [`CarrierVideoStreamDecoder::open`] has always done, and what
-  /// it still does.
+  /// What [`CarrierVideoStreamDecoder::open`] does.
   Auto,
+  /// **Any of the platform's hardware backends, and never software.**
+  ///
+  /// The same probe as [`Auto`](Self::Auto): the backends in the
+  /// platform's probe order, the packets taken before the first picture
+  /// replayed across them as each one is tried. Where `Auto` would then
+  /// open software, this arm refuses — at
+  /// [`open_as`](CarrierVideoStreamDecoder::open_as) when no backend
+  /// opens (on a platform with no hardware backend at all, at once), and
+  /// on the road that met it when the probe exhausts later — with
+  /// [`Error::AllBackendsFailed`] carrying every backend's attempt and the
+  /// packets the probe took, so the caller can replay them into a
+  /// software session of its own. After the first picture it is the
+  /// backend that produced it, as on every path.
+  ///
+  /// [`is_hardware`](CarrierVideoStreamDecoder::is_hardware) answers
+  /// `true` for the session's whole life.
+  AnyHardware,
   /// **This hardware backend, or nothing.** No other backend is probed
   /// and software is never opened.
   ///
   /// A backend that cannot be opened for the stream fails the
-  /// [`open_as`](CarrierVideoStreamDecoder::open_as) call. A backend
-  /// that opens and then fails to decode surfaces
-  /// [`Error::AllBackendsFailed`] from the send or receive road that
-  /// met it, carrying that backend and what it said — the same error
-  /// [`Auto`](Self::Auto) treats as its cue to degrade, reported here
-  /// because degrading is what this arm declines.
+  /// [`open_as`](CarrierVideoStreamDecoder::open_as) call. The backend is
+  /// committed from open, so every failure after it is that picture's
+  /// own error, as on every path.
   Hardware(Backend),
   /// **Software, with no probe at all.**
   ///
   /// Opens `libavcodec`'s own decoder for the stream directly. There is
   /// no hardware in this session to fail, so there is nothing for it to
-  /// fall back from — the terminal state [`Auto`](Self::Auto) reaches
-  /// by degrading, entered on purpose.
+  /// fall back from — the state [`Auto`](Self::Auto) reaches when its
+  /// probe exhausts, entered on purpose.
   Software,
 }
 
-/// `mediadecode::VideoStreamDecoder` impl with transparent HW → SW
-/// fallback.
+/// `mediadecode::VideoStreamDecoder` impl over FFmpeg's hardware and
+/// software decoders, on the [`DecodePath`] it was opened on — under
+/// [`DecodePath::Auto`], hardware with a lossless fallback to software
+/// before the first picture.
 pub struct CarrierVideoStreamDecoder<C: crate::FfmpegCarrier> {
   state: DecodeState,
   /// The path this session was opened on — see [`DecodePath`].
   ///
   /// Read for exactly one question, [`Self::may_open_software`]: whether
-  /// a hardware exhaustion is this session's cue to degrade or its cue
-  /// to report. Kept as the whole choice rather than reduced to that
+  /// a probe's exhaustion is this session's cue to open software or its
+  /// cue to report. Kept as the whole choice rather than reduced to that
   /// bit so a session can say what it *is*, not only what it allows.
   path: DecodePath,
   /// Codec parameters retained so we can open a software
@@ -194,33 +265,6 @@ pub struct CarrierVideoStreamDecoder<C: crate::FfmpegCarrier> {
   /// frames at EOF would hang waiting for an EOF they already saw on
   /// the HW path.
   eof_sent: bool,
-  /// `true` between a **post-commit** fallback firing and a *keyframe-anchored*
-  /// resync (the SW decoder delivering a frame **after** a keyframe was fed to
-  /// it across the gap). A post-commit fallback opens SW cold and drops the
-  /// bounded span up to the next keyframe; the promise is that the span is
-  /// *bounded* — SW resyncs at that keyframe. This flag makes the promise
-  /// enforced rather than assumed: while it is set we have no proof SW ever
-  /// recovered from a real keyframe. It is cleared only when SW delivers a frame
-  /// *and* [`Self::degraded_keyframe_seen`] is set (a lone concealed P-frame a
-  /// lenient codec emits from the gap does **not** clear it); if EOF is reached
-  /// while it is still set the loss is escalated (a distinct loud error) rather
-  /// than silently swallowing the whole tail. Probe-era fallbacks never set it —
-  /// they replay losslessly and produce frames immediately.
-  degraded_resync_pending: bool,
-  /// `true` once a **keyframe** packet has been successfully fed to the SW
-  /// decoder while [`Self::degraded_resync_pending`] is set — i.e. a real resync
-  /// anchor crossed the gap. The pending flag clears only on a delivered SW
-  /// frame *after* this is set, so a concealed non-keyframe frame (a lenient
-  /// codec decoding a lone P-frame from the dropped span) cannot masquerade as a
-  /// resync and prematurely clear the guard. Set alongside `enter`/cleared with
-  /// the pending flag.
-  degraded_keyframe_seen: bool,
-  /// Packets fed to the SW decoder since the post-commit fallback fired while
-  /// [`Self::degraded_resync_pending`] is set — i.e. across the unresolved
-  /// resync gap. Reported in the escalation message so the lost span is
-  /// quantified ("N packets, no keyframe found"). Reset whenever the flag
-  /// clears or on `flush`.
-  degraded_packets_since_fallback: u64,
   /// Source-stream time base, used to label produced frames.
   time_base: Timebase,
   /// The lane this decoder captures into. A marker: the carrier
@@ -254,8 +298,9 @@ pub struct CarrierVideoStreamDecoder<C: crate::FfmpegCarrier> {
 
 /// Hardware-decode seam behind [`DecodeState::Hw`]. In production this is
 /// the real [`VideoDecoder`]; tests substitute a fake to drive the
-/// post-commit fallback path without a live GPU. Mirrors the subset of
-/// `VideoDecoder`'s surface the wrapper drives on the HW path.
+/// probe-era fallback and the committed road without a live GPU. Mirrors
+/// the subset of `VideoDecoder`'s surface the wrapper drives on the HW
+/// path.
 pub(crate) trait HwInner: Send {
   /// See [`VideoDecoder::send_packet`].
   fn send_packet(&mut self, packet: &Packet) -> Result<Sent, Error>;
@@ -270,18 +315,6 @@ pub(crate) trait HwInner: Send {
   /// HW decoder, so [`FfmpegVideoStreamDecoder::hardware_inner`] can keep
   /// exposing it. Returns `None` for a test fake.
   fn as_video_decoder(&self) -> Option<&VideoDecoder>;
-
-  /// Whether a packet submitted **now** would be recorded for replay.
-  ///
-  /// The probe keeps a rescue history so that a decoder which exhausts
-  /// every backend can hand the caller everything FFmpeg consumed since
-  /// open. It records by `av_packet_ref`, and
-  /// [`AllBackendsFailed::into_unconsumed_packets`] hands those
-  /// recordings out as owned, **mutable** `Packet`s — which is why the
-  /// view lane must not share its carrier's storage into a submission
-  /// that could be recorded. See
-  /// [`CarrierVideoStreamDecoder::send_packet_impl`].
-  fn records_submissions(&self) -> bool;
 
   /// See [`VideoDecoder::scaled_output_capability`].
   ///
@@ -305,11 +338,6 @@ pub(crate) trait HwInner: Send {
 }
 
 impl HwInner for VideoDecoder {
-  #[inline]
-  fn records_submissions(&self) -> bool {
-    self.is_probing()
-  }
-
   #[inline]
   fn send_packet(&mut self, packet: &Packet) -> Result<Sent, Error> {
     VideoDecoder::send_packet(self, packet)
@@ -347,9 +375,10 @@ impl HwInner for VideoDecoder {
 
 /// Internal: which backend is currently driving the decode.
 enum DecodeState {
-  /// Hardware-backed decoder (auto-probe). May transition to `Sw` on
-  /// `AllBackendsFailed`. Boxed behind [`HwInner`] so tests can inject a
-  /// fake HW decoder.
+  /// Hardware-backed decoder. Under [`DecodePath::Auto`] it may
+  /// transition to `Sw` on its probe's `AllBackendsFailed`, before the
+  /// first picture, and at no other time. Boxed behind [`HwInner`] so
+  /// tests can inject a fake HW decoder.
   Hw(Box<dyn HwInner>),
   /// Software decoder. Terminal state.
   Sw(SwDecoder),
@@ -386,7 +415,7 @@ impl SwDecoder {
   /// `Deref` alone was not enough: it exposes the decoder and hides the
   /// state, so every call site kept wrapping raw and the budget refusal
   /// had no way out on the whole software road — including the replay
-  /// and cold-fallback helpers, which drop the state when they finish.
+  /// helper, which drops the state when it finishes.
   pub(crate) fn state(&self) -> *const crate::ffi::CallbackState {
     &*self._callback_state
   }
@@ -405,38 +434,22 @@ impl core::ops::DerefMut for SwDecoder {
   }
 }
 
-/// What the cold SW decoder is fed on a **post-commit** degrade transition,
-/// named by the failure arm so the three shapes stay mutually exclusive (a
-/// current packet and EOF are never forwarded together). The post-commit path
-/// retains no replay frames, so this is the *only* thing handed to the new SW
-/// decoder at fallback time. See [`FfmpegVideoStreamDecoder::degrade_to_sw`].
-enum PostCommitInput<'a> {
-  /// `send_packet` arm: forward this current packet — the one the HW decoder
-  /// refused (so it was never in any replay set). If it is a keyframe it is the
-  /// resync anchor.
-  Packet(&'a Packet),
-  /// `receive_frame` arm: a frame-time failure has no current packet to forward.
-  FrameTime,
-  /// `send_eof` arm: EOF was pending on the HW path; re-forward it to the cold
-  /// SW so tail-delaying codecs don't hang.
-  Eof,
-}
-
 impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// Opens a decoder for the given codec parameters with the default
   /// HW backend probe order. If the HW probe can't open any backend,
   /// falls back to a software `ffmpeg::decoder::Video` immediately —
   /// `open` only returns `Err` when both paths fail.
   ///
-  /// Subsequent mid-stream `AllBackendsFailed` from the HW path
-  /// triggers the same SW fallback (with rescued packets replayed).
+  /// A probe that exhausts later, before the first picture, triggers the
+  /// same software fallback with its rescued packets replayed. After the
+  /// first picture nothing changes the road — see [`DecodePath`].
   ///
   /// `limits` bounds what one decoded frame may cost. It is taken here
   /// rather than through a builder because half of it —
   /// [`DecoderLimits::max_pixels`] — is written into every
   /// `AVCodecContext` this decoder opens, and a context's ceiling
   /// cannot be moved after `avcodec_open2`. That includes the contexts
-  /// opened later, by a mid-stream fallback or a probe advance: the
+  /// opened later, by a probe-era fallback or a probe advance: the
   /// limits are retained for exactly that reason.
   pub(crate) fn open_impl(
     parameters: Parameters,
@@ -453,6 +466,25 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     time_base: Timebase,
     limits: DecoderLimits,
     path: DecodePath,
+  ) -> Result<Self, Error> {
+    Self::open_as_in(
+      parameters,
+      time_base,
+      limits,
+      path,
+      crate::backend::probe_order(),
+    )
+  }
+
+  /// [`Self::open_as_impl`] with the probe order named — the platform's
+  /// own for every public constructor, and an empty one for the lane
+  /// that stands on a platform with no hardware backend at all.
+  pub(crate) fn open_as_in(
+    parameters: Parameters,
+    time_base: Timebase,
+    limits: DecoderLimits,
+    path: DecodePath,
+    order: &[Backend],
   ) -> Result<Self, Error> {
     // ffmpeg-next's `Parameters` carries an optional `owner: Rc<dyn Any>`
     // (when constructed from `stream.parameters()` it points back at
@@ -475,10 +507,11 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     let hw_scratch = Frame::empty()?;
     let sw_scratch = alloc_av_video_frame()?;
     let state = match path {
-      DecodePath::Auto => match VideoDecoder::open_with_frame_limits_timed(
+      DecodePath::Auto => match VideoDecoder::open_probing(
         try_clone_parameters(&owned_parameters, limits.max_codec_parameter_bytes())?,
         limits,
-        time_base,
+        Some(time_base),
+        order,
       ) {
         Ok(hw) => DecodeState::Hw(Box::new(hw)),
         Err(Error::AllBackendsFailed(_)) => {
@@ -489,6 +522,16 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
         }
         Err(other) => return Err(other),
       },
+      // **The same probe, and no software behind it.** An exhaustion at
+      // open is the answer — `AllBackendsFailed` with every backend's
+      // attempt and no packet, since none was sent — where `Auto` would
+      // have read it as its cue to open software.
+      DecodePath::AnyHardware => DecodeState::Hw(Box::new(VideoDecoder::open_probing(
+        try_clone_parameters(&owned_parameters, limits.max_codec_parameter_bytes())?,
+        limits,
+        Some(time_base),
+        order,
+      )?)),
       // **The named backend, and no probe order at all.** Nothing is
       // tried before it and nothing after it, which is what makes the
       // arm a pin: an open that fails is the answer, where `Auto` would
@@ -517,9 +560,6 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       sw_scratch,
       sw_replay_frames: VecDeque::new(),
       eof_sent: false,
-      degraded_resync_pending: false,
-      degraded_keyframe_seen: false,
-      degraded_packets_since_fallback: 0,
       time_base,
       limits,
       scratch_pending: false,
@@ -556,10 +596,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// `Unsupported`, and each refusal has its own reason rather than a
   /// shared shrug:
   ///
-  /// - **A session that has degraded to software.** The stage is the
-  ///   hardware road's; this answer follows the session, so it flips to
-  ///   `Unsupported` the moment a fallback commits, and a caller that
-  ///   asks again learns it.
+  /// - **A session that fell back to software during its probe.** The
+  ///   stage is the hardware road's; this answer follows the session, so
+  ///   it flips to `Unsupported` the moment the fallback commits, and a
+  ///   caller that asks again learns it.
   /// - **The other hardware backends.** [`Backend::Vaapi`],
   ///   [`Backend::Cuda`] and [`Backend::D3d11va`] are wired in source
   ///   (`Backend::av_hwdevice_type`, `probe_order`) but cannot be
@@ -718,24 +758,29 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     self.time_base
   }
 
-  /// Whether this session may open a software decoder in answer to a
-  /// hardware exhaustion.
+  /// Whether this session may open a software decoder in answer to its
+  /// probe's exhaustion.
   ///
-  /// **The one place the pin is enforced**, consulted by all three
-  /// roads that can meet [`Error::AllBackendsFailed`] — the two send
-  /// arms and the receive arm. It is one predicate rather than three
-  /// conditions because the pin is one promise: a session opened on
+  /// **The one place a path that excludes software is enforced**,
+  /// consulted by all three roads that can meet a probe-era
+  /// [`Error::AllBackendsFailed`] — the two send arms and the receive
+  /// arm. It is one predicate rather than three conditions because the
+  /// promise is one: a session opened on [`DecodePath::AnyHardware`] or
   /// [`DecodePath::Hardware`] ends on hardware or ends in an error, and
-  /// a road that forgot to ask would break that promise silently,
-  /// which is the failure mode a caller cannot see.
+  /// a road that forgot to ask would break that promise silently, which
+  /// is the failure mode a caller cannot see.
+  ///
+  /// It is a question for the probe era only. After the first picture no
+  /// path opens software: a failure there is that picture's own error, on
+  /// every path.
   ///
   /// [`DecodePath::Software`] answers `true` and it costs nothing:
   /// `DecodeState::Sw` is terminal, so no hardware exhaustion can
   /// reach a road that asks. Answering for it by state rather than by
-  /// pin would make the predicate say something it does not mean.
+  /// path would make the predicate say something it does not mean.
   #[cfg_attr(not(tarpaulin), inline(always))]
   const fn may_open_software(&self) -> bool {
-    !matches!(self.path, DecodePath::Hardware(_))
+    matches!(self.path, DecodePath::Auto | DecodePath::Software)
   }
 
   /// Internal: **probe-era** transition from HW to SW. Replays the rescued
@@ -744,13 +789,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// seamlessly. No frame was delivered on the HW path yet, so replaying the
   /// history is lossless.
   ///
-  /// Only the probe-era branches drive this. The **post-commit** path does
-  /// *not* — it retains and reconstructs zero frames, opening SW cold via
-  /// [`Self::degrade_to_sw`] and resyncing at the next keyframe instead of
-  /// replaying. (That is why this method's replay/drain machinery — and the
-  /// finding that the in-transaction drain doesn't cover later frame
-  /// *conversion* — cannot affect the post-commit path: it never produces a
-  /// post-commit replay frame to convert.)
+  /// It is the only transition from hardware to software, and only
+  /// [`DecodePath::Auto`] takes it: after the first picture nothing
+  /// changes the road.
   ///
   /// **Transactional**: drained replay frames accumulate in a local
   /// queue; we only commit them to `self.sw_replay_frames` and switch
@@ -905,9 +946,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     // `FallbackFailed` — breaking probe-era recovery on non-seekable input.
     // Draining to EAGAIN/EOF here forces any such error to surface now, so it is
     // wrapped as `FallbackFailed` (retaining the rescued packets) and the
-    // decoder stays on HW — nothing is committed. (Only the probe-era path
-    // reaches this; the post-commit path degrades via `degrade_to_sw` and never
-    // replays, so it has no drained frames to commit or convert.)
+    // decoder stays on HW — nothing is committed.
     drain_into(&mut sw, sw_state, &mut local_replay)?;
     // Commit: only after replay, any EOF forwarding, AND the final drain
     // succeeded do we move the new SW decoder and queue into `self`.
@@ -916,236 +955,20 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     Ok(())
   }
 
-  /// **Post-commit** degrade-and-continue transition: open the SW decoder
-  /// **cold** and forward only the failure-arm's input, retaining and
-  /// reconstructing **zero** frames. This is the whole post-commit path: open
-  /// SW, forward the current packet (or EOF), degrade-track — nothing is drained
-  /// into `sw_replay_frames`, so there is no replayed frame to convert later and
-  /// no terminal-drain transaction to reason about. SW naturally produces no
-  /// frame until the next keyframe arrives across the gap, then decodes normally;
-  /// the failure-point→next-keyframe span is the accepted, logged drop.
-  ///
-  /// **Transactional (SW-open only)**: `self.state` flips to `Sw` *only after*
-  /// `open_sw_decoder` and the input forward succeed. On any failure the new SW
-  /// decoder is dropped and the decoder is left on its prior HW state, the error
-  /// surfaced as [`Error::FallbackFailed`] (with an empty rescue set — a
-  /// post-commit failure never carries unconsumed packets). With no replay-frame
-  /// retention there is nothing else to roll back.
-  ///
-  /// On a clean commit it enters degraded-resync mode (see
-  /// [`Self::enter_degraded_resync`]); if the forwarded current packet is itself
-  /// a keyframe, the resync anchor is recorded immediately
-  /// ([`Self::note_degraded_keyframe`]).
-  ///
-  /// # `eof_pending`
-  ///
-  /// Whether the session's end-of-stream has already been **committed**,
-  /// and so must be re-forwarded into the cold decoder. Carried as a
-  /// local argument for the same two reasons the probe-era road carries
-  /// it (see [`Self::fall_back_to_sw`]): it is read from `eof_sent`
-  /// before anything is mutated, so a fallback that fails leaves no
-  /// half-truth behind — and one question deserves one mechanism on
-  /// both fallback roads.
-  ///
-  /// It is **not** expressed by selecting [`PostCommitInput::Eof`],
-  /// even though that arm forwards the same call. That enum is named by
-  /// the *failure arm* — which road raised the exhaustion — and the
-  /// `warn!` each site emits says so; borrowing the EOF arm for a
-  /// frame-time failure would make it lie about where the failure came
-  /// from.
-  fn degrade_to_sw(&mut self, input: PostCommitInput<'_>, eof_pending: bool) -> Result<(), Error> {
-    match self.degrade_to_sw_inner(input, eof_pending) {
-      Ok(()) => Ok(()),
-      // **A budget refusal is not a fallback failure.** It travels
-      // unwrapped, and the spelling was chosen rather than inherited:
-      //
-      // * `FallbackFailed` means the fallback *machinery* could not
-      //   complete, and its contract is to hand back the unconsumed
-      //   packets so a caller can re-drive them. On this road that set
-      //   is empty by construction — the probe buffer is gone and no
-      //   replay frames are retained — so the envelope carries no
-      //   recovery affordance at all, only a label.
-      // * And the label is the wrong one. Re-driving is the natural
-      //   response to a fallback failure, and re-driving a budget
-      //   refusal under the same limits refuses identically. Naming it
-      //   a fallback failure invites an action that cannot succeed,
-      //   while `FrameBudgetExceeded` names the one that can: raise
-      //   the ceiling, or accept the refusal.
-      //
-      // So it keeps the same spelling here as on every other road. One
-      // fact, one name.
-      Err(budget @ Error::FrameBudgetExceeded(_)) => Err(budget),
-      // Everything else really is the machinery failing, and keeps the
-      // envelope — empty rescue set and all, which is what a
-      // post-commit failure has to hand back.
-      Err(source) => Err(Error::FallbackFailed(FallbackFailed::new(
-        Box::new(source),
-        std::vec::Vec::new(),
-      ))),
-    }
-  }
-
-  /// Worker for [`Self::degrade_to_sw`]. Opens SW cold, forwards the arm's input,
-  /// and on success commits + enters degraded-resync mode. Returns `Err` (and
-  /// commits nothing) if SW cannot open or the forward fails.
-  fn degrade_to_sw_inner(
-    &mut self,
-    input: PostCommitInput<'_>,
-    eof_pending: bool,
-  ) -> Result<(), Error> {
-    // The invariant [`PostCommitInput`] documents, stated where it can
-    // be checked: a current packet and an end-of-stream are never
-    // forwarded together. The send road cannot violate it — its own
-    // gate refuses every packet once `eof_sent` is committed — so this
-    // records the coupling rather than defending against it.
-    debug_assert!(
-      !(matches!(input, PostCommitInput::Packet(_)) && eof_pending),
-      "a current packet and a committed EOF must never be forwarded together",
-    );
-    let mut sw = open_sw_decoder(&self.parameters, self.limits, Some(self.time_base))?;
-    // Captured before the decoder is borrowed for the forward, and
-    // before it can be dropped on the error road: this temporary
-    // decoder owns the callback state, so a `judge_buffer` refusal
-    // recorded during either forward below dies with it unless the
-    // reason is collected here. That was the last software road still
-    // wrapping libavcodec's `EINVAL` raw.
-    let state = sw.state();
-    let mut forwarded_keyframe = false;
-    let mut forwarded_packet = false;
-    match input {
-      PostCommitInput::Packet(pkt) => {
-        // The HW decoder REFUSED this packet, so it was never decoded; forward
-        // it to the cold SW. A failure here surfaces (it is not silently
-        // dropped) and rolls back to HW.
-        sw.send_packet(pkt)
-          .map_err(|e| crate::decoder::software_exit(state, e))?;
-        forwarded_keyframe = pkt.is_key();
-        forwarded_packet = true;
-      }
-      // Neither of these forwards a packet; the end-of-stream below is
-      // the only thing they can hand the cold decoder.
-      PostCommitInput::FrameTime | PostCommitInput::Eof => {}
-    }
-    // **The end of the stream is re-forwarded here, on every arm that
-    // has one, and that is the fix rather than an extra.**
-    //
-    // The cold decoder knows nothing: it was opened a moment ago, from
-    // codec parameters alone. If the session had already been told the
-    // stream ended and this new decoder is not, it answers `EAGAIN` to
-    // every drain — which reaches the caller as
-    // [`Received::NeedsInput`], an instruction to send another packet.
-    // On a session whose end is committed there is no legal way to obey
-    // that: both send gates refuse. The caller loops, or quietly
-    // accepts a truncated tail, until `flush`.
-    //
-    // It used to be reachable only through the `Eof` failure arm, so
-    // the frame-time road — a post-commit exhaustion raised *while
-    // draining*, after EOF was accepted — opened cold and stayed cold.
-    // A cold decoder has no buffered output, so this cannot answer
-    // `EAGAIN` itself.
-    if eof_pending {
-      sw.send_eof()
-        .map_err(|e| crate::decoder::software_exit(state, e))?;
-    }
-    // Commit: only after a clean open + forward.
-    self.state = DecodeState::Sw(sw);
-    self.enter_degraded_resync();
-    if forwarded_keyframe {
-      // The refused current packet was itself the resync anchor.
-      self.note_degraded_keyframe(true);
-    }
-    if forwarded_packet {
-      self.count_degraded_packet();
-    }
-    Ok(())
-  }
-
-  /// Enter post-commit degraded mode after a post-commit fallback commits: the
-  /// SW decoder opened cold and the span up to the next keyframe is being
-  /// dropped. We hold this mode until SW proves a *keyframe-anchored* resync
-  /// (a delivered frame after a keyframe was fed — see
-  /// [`Self::note_degraded_keyframe`] / [`Self::resync_on_frame`]) and the EOF
-  /// escalation in [`VideoStreamDecoder::receive_frame`]. Called only on the
-  /// post-commit path, only after a clean commit. Resets the keyframe-seen anchor
-  /// and the gap counter.
-  #[inline]
-  fn enter_degraded_resync(&mut self) {
-    self.degraded_resync_pending = true;
-    self.degraded_keyframe_seen = false;
-    self.degraded_packets_since_fallback = 0;
-  }
-
-  /// Record that a packet fed to the SW decoder across an unresolved post-commit
-  /// gap was a **keyframe** — the resync anchor. Only a frame delivered *after*
-  /// this clears the pending flag, so a lenient codec's concealed P-frame can't
-  /// masquerade as a resync. A no-op outside degraded mode, or for a
-  /// non-keyframe.
-  #[inline]
-  fn note_degraded_keyframe(&mut self, is_key: bool) {
-    if self.degraded_resync_pending && is_key {
-      self.degraded_keyframe_seen = true;
-    }
-  }
-
-  /// Count one packet fed to the SW decoder while a post-commit resync is still
-  /// unproven, so the EOF escalation can quantify the lost tail. A no-op once
-  /// SW has resynced (the flag is clear).
-  #[inline]
-  fn count_degraded_packet(&mut self) {
-    if self.degraded_resync_pending {
-      self.degraded_packets_since_fallback = self.degraded_packets_since_fallback.saturating_add(1);
-    }
-  }
-
-  /// A SW frame was delivered. Clear post-commit degraded mode **only if** a
-  /// keyframe was fed across the gap ([`Self::degraded_keyframe_seen`]) — that is
-  /// a real keyframe-anchored resync, so the dropped span is now the promised
-  /// *bounded* gap. A frame delivered with no keyframe yet (a concealed P-frame
-  /// from the dropped span) leaves the guard set, so the one-GOP bound stays
-  /// enforced and the EOF escalation still fires if no keyframe ever arrives.
-  /// Idempotent; a no-op outside degraded mode (steady state, probe-era replay).
-  #[inline]
-  fn resync_on_frame(&mut self) {
-    if self.degraded_resync_pending && self.degraded_keyframe_seen {
-      self.clear_degraded_resync();
-    }
-  }
-
-  /// Unconditionally reset post-commit degraded-mode state. Used where the gap
-  /// is moot regardless of resync proof: a `flush` (seek/reset re-anchors the
-  /// stream) and the cleanup after an EOF escalation has already fired (so a
-  /// follow-up poll sees plain EOF, not a repeated escalation). The
-  /// frame-delivery path uses the keyframe-gated [`Self::resync_on_frame`]
-  /// instead.
-  #[inline]
-  fn clear_degraded_resync(&mut self) {
-    self.degraded_resync_pending = false;
-    self.degraded_keyframe_seen = false;
-    self.degraded_packets_since_fallback = 0;
-  }
-
   /// The one place a delivered frame is committed.
   ///
   /// Every road that hands a frame to the caller passes through here —
   /// the hardware scratch, the software scratch, both replay-queue
   /// entries, and the retry of a parked frame — so the bookkeeping a
   /// delivery owes cannot be attached to some of them and forgotten on
-  /// others. It was: a parked software frame delivered on the retry
-  /// road skipped [`Self::resync_on_frame`], so the last recovered
-  /// frame of a degraded stream could leave the resync guard standing
-  /// and turn a clean EOF into a false
-  /// [`PostCommitNeverResynced`].
+  /// others.
   fn commit_delivery(
     &mut self,
     frame: VideoFrame<mediadecode::PixelFormat, VideoFrameExtra, C::Buffer>,
     dst: &mut VideoFrame<mediadecode::PixelFormat, VideoFrameExtra, C::Buffer>,
   ) {
-    // The seat is free once a carrier exists for what it held.
+    // The scratch is free once a carrier exists for what it held.
     self.scratch_pending = false;
-    // A delivered frame is what clears a keyframe-anchored resync. A
-    // no-op on every road that never entered degraded mode, which is
-    // why it can be unconditional here.
-    self.resync_on_frame();
     *dst = frame;
   }
 
@@ -1161,50 +984,6 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     } else {
       crate::decoder::SessionPhase::Streaming
     }
-  }
-
-  /// Reads a drain answer against the session's own committed end.
-  ///
-  /// Routes a settled end through the post-commit gap check.
-  ///
-  /// **The `NeedsInput`-past-the-end reading moved out of here.** It
-  /// used to be this method's own comparison against `eof_sent` — one
-  /// more road deriving the session's phase for itself, which is the
-  /// habit [`SessionPhase`](crate::decoder::SessionPhase) ended. The
-  /// classifier makes that reading now, for every road at once, and
-  /// what is left here is the part that is genuinely this wrapper's:
-  /// an end is not clean if a post-commit gap never closed.
-  fn settle(&mut self, status: Received) -> Result<Received, VideoDecodeError> {
-    match status {
-      Received::Ended => self.ended(),
-      other => Ok(other),
-    }
-  }
-
-  /// The end of the stream, read against a post-commit gap that never
-  /// closed.
-  ///
-  /// One place, because there are now two spellings that reach it — the
-  /// substrate's `AVERROR_EOF` and a settled [`Received::NeedsInput`]
-  /// past a committed end — and a lost tail must escalate on both. The
-  /// flag is cleared as it fires so a caller draining to the end sees
-  /// the escalation once and the plain end afterwards.
-  fn ended(&mut self) -> Result<Received, VideoDecodeError> {
-    if !self.degraded_resync_pending {
-      return Ok(Received::Ended);
-    }
-    let packets_lost = self.degraded_packets_since_fallback;
-    tracing::error!(
-      packets_lost,
-      "mediadecode-ffmpeg: post-commit HW->SW fallback never resynced before EOF — \
-       {packets_lost} packets fed to the software decoder produced no frame (no \
-       keyframe found across the gap); the stream tail from the fallback point was \
-       lost",
-    );
-    self.clear_degraded_resync();
-    Err(VideoDecodeError::PostCommitNeverResynced(
-      PostCommitNeverResynced::new(packets_lost),
-    ))
   }
 
   /// Internal: convert the active scratch frame into a
@@ -1241,10 +1020,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
 #[cfg(test)]
 impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// Build a decoder around an injected HW seam, bypassing the real probe.
-  /// Lets tests drive the post-commit fallback path with a [`HwInner`] fake
-  /// instead of a live GPU. The SW fallback still opens the **real**
-  /// `ffmpeg::decoder::Video` from `parameters`, so a fallback in these tests
-  /// genuinely decodes.
+  /// Lets tests drive the probe-era fallback and the committed road with a
+  /// [`HwInner`] fake instead of a live GPU. The SW fallback still opens
+  /// the **real** `ffmpeg::decoder::Video` from `parameters`, so a fallback
+  /// in these tests genuinely decodes.
   pub(crate) fn from_hw_inner_for_test(
     hw: Box<dyn HwInner>,
     parameters: Parameters,
@@ -1260,7 +1039,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// through: a pin's promise is about what happens when the hardware
   /// fails after opening, and the only way to reach that on a machine
   /// whose GPU works is to inject a seam that fails on demand. See
-  /// `a_hardware_pin_reports_a_mid_stream_exhaustion_instead_of_degrading`.
+  /// `a_hardware_pin_reports_its_probes_exhaustion_instead_of_falling_back`.
   pub(crate) fn from_hw_inner_for_test_as(
     hw: Box<dyn HwInner>,
     parameters: Parameters,
@@ -1277,9 +1056,6 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       sw_scratch: alloc_av_video_frame()?,
       sw_replay_frames: VecDeque::new(),
       eof_sent: false,
-      degraded_resync_pending: false,
-      degraded_keyframe_seen: false,
-      degraded_packets_since_fallback: 0,
       time_base,
       limits,
       scratch_pending: false,
@@ -1294,31 +1070,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     self.eof_sent
   }
 
-  /// Whether a post-commit fallback is awaiting a keyframe-anchored resync.
-  /// Lets the escalation tests observe the degraded-resync state machine.
-  pub(crate) const fn degraded_resync_pending_for_test(&self) -> bool {
-    self.degraded_resync_pending
-  }
-
-  /// Whether a keyframe has been fed to the SW decoder across the unresolved
-  /// post-commit gap (the resync anchor). Lets the keyframe-gating test confirm
-  /// a concealed P-frame does not set it (so the resync clear stays blocked).
-  pub(crate) const fn degraded_keyframe_seen_for_test(&self) -> bool {
-    self.degraded_keyframe_seen
-  }
-
-  /// Whether the post-commit path retained any replay frames — must always be
-  /// empty for a post-commit fallback (it retains zero). Lets the finding-1
-  /// dissolution test assert no replay frame was ever queued.
+  /// Whether the probe-era replay queue is empty — so a lane can tell a
+  /// frame parked in the scratch from one still waiting in the queue.
   pub(crate) fn sw_replay_frames_is_empty_for_test(&self) -> bool {
     self.sw_replay_frames.is_empty()
-  }
-
-  /// Packets fed to SW across an unresolved post-commit resync gap. Lets the
-  /// counter test confirm packets crossing the gap from the `send_packet` arm
-  /// are tallied (and cleared on resync).
-  pub(crate) const fn degraded_packets_since_fallback_for_test(&self) -> u64 {
-    self.degraded_packets_since_fallback
   }
 }
 
@@ -1380,19 +1135,18 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     // which is what lets the view lane share its buffer with libavcodec
     // rather than copy into it. See `boundary::with_ffmpeg_video_packet`.
     let limits = self.limits.packet_limits();
-    // **The route depends on what this decoder does with what it is
-    // sent.** While the hardware probe is open it `av_packet_ref`s
-    // every accepted packet into a rescue history, and
-    // `AllBackendsFailed::into_unconsumed_packets` hands those out as
-    // owned, mutable `Packet`s — so a shared body would escape this
-    // call as a live mutable alias of a carrier the caller may still be
-    // reading. Inside that window the body is copied; once the probe
-    // has committed, nothing is recorded and the send is zero-copy
-    // again. The software road never records.
-    let route = match &self.state {
-      DecodeState::Hw(hw) if hw.records_submissions() => crate::carrier::BodyRoute::Copy,
-      _ => crate::carrier::BodyRoute::Submission,
-    };
+    // **One route, on every road.** The submission may share its
+    // carrier's buffer — wherever `boundary::share_or_copy` can prove
+    // the padding — in the probe window as after it, hardware or
+    // software. libavcodec may keep a reference past the call and does
+    // not write through it (`libavcodec/avcodec.h` 2333–2335 in FFmpeg
+    // 9.0.1). The one thing that keeps what it is sent *and hands it
+    // back* is the hardware probe, whose rescue history goes to the
+    // caller as owned, mutable `Packet`s
+    // (`AllBackendsFailed::into_unconsumed_packets`); it records copies
+    // of its own (`decoder::try_clone_packet`), so nothing it hands back
+    // addresses a carrier.
+    let route = crate::carrier::BodyRoute::Submission;
     boundary::with_ffmpeg_video_packet::<C, _>(packet, limits, route, |av_pkt| {
       match &mut self.state {
         DecodeState::Hw(hw) => match hw.send_packet(av_pkt) {
@@ -1400,7 +1154,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
           // both states travel on unchanged.
           Ok(status) => Ok(status),
           Err(Error::AllBackendsFailed(p)) => {
-            // **A pinned hardware session reports rather than degrades.**
+            // **A pinned hardware session reports rather than falls back.**
             // See [`Self::may_open_software`]: this is the exhaustion
             // `DecodePath::Auto` reads as its cue to open software, and
             // the pin's whole content is that it is not that cue here.
@@ -1409,41 +1163,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
             if !self.may_open_software() {
               return Err(VideoDecodeError::Decode(Error::AllBackendsFailed(p)));
             }
-            // Route on the EXPLICIT origin, never on whether `rescued` is empty (a
-            // probe-era first-packet cap trip is *also* empty).
-            if p.origin().is_post_commit() {
-              // Post-commit: DEGRADE AND CONTINUE. No lossless mid-stream
-              // reconstruction — the SW decoder opens cold, retains zero replay
-              // frames, and resyncs at the next keyframe. The current packet (the
-              // one HW REFUSED) is forwarded to that cold SW: if it is the resync
-              // keyframe SW decodes from it, otherwise SW drops it until a keyframe
-              // arrives. The bounded span from here to that keyframe is dropped — a
-              // loudly logged gap (see the `warn!`), not a silent one.
-              tracing::warn!(
-                backend = ?p.attempts().last().map(|(b, _)| *b),
-                pts = ?av_pkt.pts(),
-                "mediadecode-ffmpeg: HW decode failed post-commit; falling back to \
-                 software, resyncing at next keyframe — a bounded span of frames \
-                 may be dropped at this boundary",
-              );
-              // Transactional SW-open + current-packet forward; degrade-tracking
-              // (incl. keyframe-anchor recording) happens inside on a clean commit.
-              // A failure surfaces `FallbackFailed` and stays on HW.
-              // A clean degrade forwarded this very packet into the
-              // cold software decoder, so it was consumed.
-              // `false`: this road is unreachable once the end is
-              // committed — `send_packet_impl`'s first gate refuses
-              // every packet past `eof_sent` — so there is no EOF to
-              // re-forward, and forwarding one alongside a packet is
-              // the pairing [`PostCommitInput`] forbids.
-              return self
-                .degrade_to_sw(PostCommitInput::Packet(av_pkt), false)
-                .map(|()| Sent::Accepted)
-                .map_err(VideoDecodeError::Decode);
-            }
-            // Probe-era: replay the inner decoder's buffered history (lossless —
-            // no frame was delivered yet), then forward the still-unconsumed
-            // current packet to SW.
+            // The probe exhausted before the first picture: replay the
+            // inner decoder's buffered history (lossless — no frame was
+            // delivered yet), then forward the still-unconsumed current
+            // packet to SW.
             let rescued = p.into_unconsumed_packets();
             // `eof_pending` is the committed EOF state — never pre-mutated here.
             let eof_pending = self.eof_sent;
@@ -1469,22 +1192,12 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
         },
         DecodeState::Sw(sw) => {
           let st = sw.state();
-          if let Err(e) = sw.send_packet(av_pkt) {
-            // Funnel, then gate. **Nothing below runs on back pressure**,
-            // which is the point of returning here rather than falling
-            // through: a packet libavcodec did not take must not be
-            // counted across the resync gap or recorded as a keyframe
-            // anchor, or a caller's honest re-offer would double-count
-            // it.
-            return crate::decoder::software_send(st, e, phase).map_err(VideoDecodeError::Decode);
+          match sw.send_packet(av_pkt) {
+            Ok(()) => Ok(Sent::Accepted),
+            // Funnel, then gate: a refusal the allocator judge latched
+            // comes back named, and back pressure is `MustDrain`.
+            Err(e) => crate::decoder::software_send(st, e, phase).map_err(VideoDecodeError::Decode),
           }
-          // A keyframe fed across an unresolved post-commit gap is the resync
-          // anchor; record it so the next delivered frame can clear the guard.
-          self.note_degraded_keyframe(av_pkt.is_key());
-          // Count packets crossing an unresolved post-commit resync gap so the
-          // escalation at EOF can report how much tail was lost.
-          self.count_degraded_packet();
-          Ok(Sent::Accepted)
         }
       }
     })
@@ -1498,9 +1211,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     // Deliver any frames produced during SW fallback replay before
     // pulling new ones from the SW decoder. This is the queue
     // populated by `fall_back_to_sw` when SW returned EAGAIN during
-    // packet replay — a **probe-era** path only (the post-commit path retains
-    // no replay frames), so `resync_on_frame` here is a no-op (probe-era never
-    // enters degraded mode).
+    // packet replay.
     // **Peeked, not popped.** A replayed frame is the rescue history's
     // only copy: popping it before the conversion committed lost it to
     // any allocation failure, which is the one thing this queue exists
@@ -1547,42 +1258,17 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
             return self.deliver_frame(dst);
           }
           // The hardware seam already classified the two flow signals.
-          // They still pass the session's own end: see [`Self::settle`].
-          Ok(status) => return self.settle(status),
+          Ok(status) => return Ok(status),
           Err(Error::AllBackendsFailed(p)) => {
-            // The pin, on the receive road — see
+            // The same gate, on the receive road — see
             // [`Self::may_open_software`] and the identical gate on the
             // two send roads.
             if !self.may_open_software() {
               return Err(VideoDecodeError::Decode(Error::AllBackendsFailed(p)));
             }
-            // HW exhausted at frame-time. There is no current packet here.
-            // Route on the explicit origin.
-            if p.origin().is_post_commit() {
-              // Post-commit: DEGRADE AND CONTINUE — open SW cold (no current
-              // packet to forward, no replay frames retained) and resync at the
-              // next keyframe, dropping the bounded span up to it. Loud single
-              // `warn!` marks that accepted gap. A clean commit enters degraded
-              // mode; a SW-open failure surfaces `FallbackFailed` and stays HW.
-              tracing::warn!(
-                backend = ?p.attempts().last().map(|(b, _)| *b),
-                "mediadecode-ffmpeg: HW decode failed post-commit at frame-time; \
-                 falling back to software, resyncing at next keyframe — a bounded \
-                 span of frames may be dropped at this boundary",
-              );
-              // **The committed end travels with the fallback.** Read
-              // before anything mutates, exactly as the probe-era road
-              // below reads it. Without it the cold decoder answers
-              // `EAGAIN` forever on a session no send can feed.
-              let eof_pending = self.eof_sent;
-              self
-                .degrade_to_sw(PostCommitInput::FrameTime, eof_pending)
-                .map_err(VideoDecodeError::Decode)?;
-              // Nothing to deliver yet — fall through to the loop; the next
-              // iteration takes the Sw arm and pulls from the cold SW decoder.
-              continue;
-            }
-            // Probe-era: replay the buffered history (lossless).
+            // The probe exhausted at frame time, before the first picture:
+            // replay the buffered history (lossless). There is no current
+            // packet here.
             let rescued = p.into_unconsumed_packets();
             // `eof_pending` is the committed EOF state — never pre-mutated here.
             let eof_pending = self.eof_sent;
@@ -1653,29 +1339,16 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
                   return Err(VideoDecodeError::Convert(e));
                 }
               };
-              // SW produced a frame. The commit point clears degraded mode only
-              // if a keyframe was fed across the gap — a real keyframe-anchored
-              // resync, so the dropped span is the promised bounded gap. A
-              // concealed P-frame (no keyframe yet) does not clear it (see
-              // `resync_on_frame`).
               self.commit_delivery(new_frame, dst);
               return Ok(Received::Frame);
             }
             // Funnel first — so a recorded budget refusal is named
-            // rather than laundered — read as a status second (`EAGAIN`
-            // is `NeedsInput`, `Eof` is `Ended`, and the errno stops
-            // inside this crate either way), and settled against the
-            // session's own end third.
-            //
-            // That last step is where a post-commit resync that never
-            // closed becomes [`VideoDecodeError::PostCommitNeverResynced`]
-            // instead of a clean end that would swallow the tail — and
-            // it now catches the end however the codec spelled it. See
-            // [`Self::settle`] and [`Self::ended`].
+            // rather than laundered — and read as a status second:
+            // `EAGAIN` is `NeedsInput`, `Eof` is `Ended`, and the errno
+            // stops inside this crate either way.
             Err(e) => {
-              let status =
-                crate::decoder::software_receive(st, e, phase).map_err(VideoDecodeError::Decode)?;
-              return self.settle(status);
+              return crate::decoder::software_receive(st, e, phase)
+                .map_err(VideoDecodeError::Decode);
             }
           }
         }
@@ -1691,10 +1364,8 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     if !self.phase().accepts_input() {
       return Err(Self::after_eof());
     }
-    // As `send_packet`: EOF can commit a fallback too, and the escalation
-    // it may raise reads the resync standing a parked frame has not yet
-    // had the chance to clear. Nothing was recorded, so drain and signal
-    // again.
+    // As `send_packet`: EOF can commit a fallback too. Nothing was
+    // recorded, so drain and signal again.
     if self.scratch_pending {
       return Ok(Sent::MustDrain);
     }
@@ -1704,11 +1375,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
         // The seam classified libavcodec's back pressure already.
         Ok(status) => Ok(status),
         Err(Error::AllBackendsFailed(p)) => {
-          // The pin, on the EOF road — see [`Self::may_open_software`].
-          // Returned rather than folded into `outcome`: the commit below
-          // fires only on `Ok(Sent::Accepted)`, so the two roads agree,
-          // and leaving early keeps the fallback body at the nesting it
-          // was written at.
+          // The same gate, on the EOF road — see
+          // [`Self::may_open_software`]. Returned rather than folded into
+          // `outcome`: the commit below fires only on `Ok(Sent::Accepted)`,
+          // so the two roads agree.
           if !self.may_open_software() {
             return Err(VideoDecodeError::Decode(Error::AllBackendsFailed(p)));
           }
@@ -1720,36 +1390,14 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
           // fallback inject an EOF into SW even though this `send_eof` errored.
           // `self.eof_sent` is committed only after the whole operation succeeds
           // (the `outcome` check below), keeping the fallback all-or-nothing.
-          if p.origin().is_post_commit() {
-            // Post-commit: DEGRADE AND CONTINUE — open SW cold, re-forward EOF
-            // (no current packet, no replay frames). The cold SW produces no
-            // frame from EOF alone, so the drain-to-EOF in `receive_frame`
-            // escalates (`PostCommitNeverResynced`) unless a later keyframe-fed
-            // poll resyncs first. A clean commit enters degraded mode; a SW-open
-            // failure surfaces `FallbackFailed` and stays HW.
-            tracing::warn!(
-              backend = ?p.attempts().last().map(|(b, _)| *b),
-              "mediadecode-ffmpeg: HW decode failed post-commit at EOF; falling \
-               back to software — a bounded span of tail frames may be dropped",
-            );
-            // Both fallback roads forward the EOF inside their own
-            // transaction, so a clean commit means it was recorded.
-            // `true`: this *is* the end being sent. `eof_sent` is not
-            // committed until the whole operation succeeds, so the
-            // intent is passed locally rather than read back.
-            self
-              .degrade_to_sw(PostCommitInput::Eof, true)
-              .map(|()| Sent::Accepted)
-              .map_err(VideoDecodeError::Decode)
-          } else {
-            // Probe-era: replay the buffered history (lossless), re-forwarding
-            // EOF inside the transaction.
-            let rescued = p.into_unconsumed_packets();
-            self
-              .fall_back_to_sw(rescued, true)
-              .map(|()| Sent::Accepted)
-              .map_err(VideoDecodeError::Decode)
-          }
+          //
+          // Replay the buffered history (lossless), re-forwarding EOF inside
+          // the transaction.
+          let rescued = p.into_unconsumed_packets();
+          self
+            .fall_back_to_sw(rescued, true)
+            .map(|()| Sent::Accepted)
+            .map_err(VideoDecodeError::Decode)
         }
         Err(other) => Err(VideoDecodeError::Decode(other)),
       },
@@ -1788,10 +1436,6 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     // Flush ends the drain phase; the decoder accepts new packets
     // after this, so reset EOF tracking.
     self.eof_sent = false;
-    // A flush (seek/reset) re-anchors the stream — any in-flight post-commit
-    // resync tracking from before the flush is moot. Clear it so the next EOF
-    // doesn't escalate over a now-irrelevant pre-flush gap.
-    self.clear_degraded_resync();
     match &mut self.state {
       // The HW seam's `flush` returns `Result` for a uniform trait; the
       // real `VideoDecoder::flush` is infallible (always `Ok`).
@@ -1808,8 +1452,7 @@ macro_rules! video_lane_face {
       /// Opens a video decoder for `parameters`, probing hardware
       /// backends in order and falling back to software.
       ///
-      /// [`open_as`](Self::open_as)`(.., DecodePath::Auto)`, which is
-      /// what this has always done.
+      /// [`open_as`](Self::open_as)`(.., DecodePath::Auto)`.
       pub fn open(
         parameters: Parameters,
         time_base: Timebase,
@@ -1820,10 +1463,11 @@ macro_rules! video_lane_face {
 
       /// Opens a video decoder on a **named decode path**.
       ///
-      /// [`DecodePath::Auto`] is [`open`](Self::open) exactly; the
-      /// other two arms pin the session to hardware or to software for
-      /// its whole life. See [`DecodePath`] for what a pin promises and
-      /// what it costs.
+      /// [`DecodePath::Auto`] is [`open`](Self::open) exactly;
+      /// [`DecodePath::AnyHardware`] keeps the session to the platform's
+      /// hardware backends and the other two arms pin it to one backend or
+      /// to software, each for its whole life. See [`DecodePath`] for what
+      /// each permits and what it costs.
       ///
       /// Everything else about the session is unchanged — the same
       /// [`VideoStreamDecoder`] face, the same frames, the same
@@ -1834,9 +1478,13 @@ macro_rules! video_lane_face {
       ///
       /// # Errors
       ///
+      /// [`DecodePath::AnyHardware`] fails here with
+      /// [`Error::AllBackendsFailed`] when no hardware backend opens for
+      /// the stream — at once on a platform with none — carrying every
+      /// backend's attempt and no packet, since none was sent.
       /// [`DecodePath::Hardware`] fails here when the named backend
-      /// cannot be opened for the stream — where [`DecodePath::Auto`]
-      /// would have gone on to software. [`DecodePath::Software`] fails
+      /// cannot be opened for the stream. [`DecodePath::Auto`] would have
+      /// gone on to software in both cases. [`DecodePath::Software`] fails
       /// only where libavcodec has no decoder for the stream, or the
       /// context cannot be built.
       ///
@@ -1883,9 +1531,9 @@ macro_rules! video_lane_face {
       ///
       /// `Supported` on a live VideoToolbox session on an Apple
       /// target, `Unsupported` everywhere else — including on a
-      /// session that has degraded to software, which is why this
-      /// reads the session's live state rather than a fact recorded
-      /// once at open.
+      /// session that fell back to software during its probe, which is
+      /// why this reads the session's live state rather than a fact
+      /// recorded once at open.
       pub fn scaled_output_capability(&self) -> ScaledOutputCapability {
         self.scaled_output_capability_impl()
       }
@@ -1977,39 +1625,6 @@ fn open_sw_decoder(
   })
 }
 
-/// Payload for [`VideoDecodeError::PostCommitNeverResynced`].
-///
-/// A **post-commit** HW->SW fallback degraded the stream (dropping the
-/// bounded span up to the next keyframe) but the software decoder
-/// reached EOF without ever producing a frame — it never resynced, so
-/// the entire tail from the failure point was lost. The "bounded,
-/// logged gap" the post-commit path promises did not materialise (no
-/// keyframe arrived before EOF), so the loss is surfaced loudly here
-/// instead of being silently swallowed as a clean end-of-stream.
-#[derive(thiserror::Error, Debug)]
-#[error(
-  "post-commit HW->SW fallback never resynced before EOF: {packets_lost} packets fed to the \
-   software decoder produced no frame (no keyframe found across the gap) — the stream tail \
-   from the fallback point was lost"
-)]
-pub struct PostCommitNeverResynced {
-  packets_lost: u64,
-}
-
-impl PostCommitNeverResynced {
-  /// Constructs a `PostCommitNeverResynced` payload.
-  #[inline]
-  pub const fn new(packets_lost: u64) -> Self {
-    Self { packets_lost }
-  }
-  /// Packets fed to the software decoder across the unresolved resync
-  /// gap.
-  #[inline]
-  pub const fn packets_lost(&self) -> u64 {
-    self.packets_lost
-  }
-}
-
 /// Error type for [`FfmpegVideoStreamDecoder`] — **faults and the
 /// send-side refusal**.
 ///
@@ -2018,9 +1633,6 @@ impl PostCommitNeverResynced {
 /// [`Received`] states out of `receive_frame`; they used to arrive as
 /// `Decode(Ffmpeg(Other { errno: EAGAIN }))` and `Decode(Ffmpeg(Eof))`,
 /// which is to say they had no name at this tier at all.
-/// [`Self::PostCommitNeverResynced`] is the deliberate exception on the
-/// end-of-stream road: it is not "the stream ended", it is "the stream
-/// ended and the tail was lost", which is a fault.
 ///
 /// **Open fault taxonomy, so it is `#[non_exhaustive]`.** New ways to
 /// fail are discovered — a backend, a ceiling, a corruption a codec
@@ -2044,10 +1656,6 @@ pub enum VideoDecodeError {
   /// types failed.
   #[error(transparent)]
   Convert(#[from] ConvertError),
-  /// A **post-commit** HW->SW fallback degraded the stream but the
-  /// software decoder reached EOF without ever producing a frame.
-  #[error(transparent)]
-  PostCommitNeverResynced(#[from] PostCommitNeverResynced),
 }
 
 #[cfg(test)]

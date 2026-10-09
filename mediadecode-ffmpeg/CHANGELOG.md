@@ -9,7 +9,148 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 The backend-agnostic core it adapts has its own log at
 [`mediadecode/CHANGELOG.md`](../mediadecode/CHANGELOG.md).
 
-## [Unreleased]
+## [0.16.0] — unreleased
+
+A committed hardware session reports every decoder failure as that
+picture's own and changes nothing after its first picture; when to stop
+trusting it is the caller's policy. `DecodePath::AnyHardware` is a
+session that is hardware or nothing.
+
+### Changed (BREAKING)
+
+- **`DecodePath::Auto` no longer degrades after the first picture.**
+  `Auto` probes at open — the platform's hardware backends in order,
+  the packets taken before the first picture replayed across them, then
+  software with the same packets replayed, losslessly — and at no other
+  time. The in-session degrade is gone: the cold software decoder opened
+  mid-stream, its one-GOP gap, and the keyframe-anchored resync guard
+  that watched over it.
+
+- **After the first picture every decoder failure is that picture's own
+  error, on every path, and nothing is classified or remembered.** A
+  committed hardware session reports each `VideoDecodeError::Decode` as
+  it was minted — a refusal this crate made by its name
+  (`HwSurfaceTooLarge`, `HwTransferTooLarge`, `FrameBudgetExceeded`),
+  anything else as `Error::Ffmpeg` with libavcodec's errno — and nothing
+  of it is remembered, so the next call reaches libavcodec. Whether a
+  hardware session recovers is FFmpeg's, not this crate's. Until now
+  `AVERROR_EXTERNAL`, `AVERROR_BUG`, `AVERROR_BUG2`, `AVERROR_UNKNOWN`,
+  `AVERROR_INVALIDDATA` and `EINVAL` from a committed backend, and a
+  coded surface the `get_format` callback declined over the caller's
+  ceiling, became a post-commit `AllBackendsFailed`, which `Auto`
+  answered by degrading to software.
+
+  FFmpeg has no reliable signal that a hardware session is gone, which
+  is why none is read. In FFmpeg 9.0.1, `AVERROR_EXTERNAL` also answers
+  a single picture: VideoToolbox's frame post-processing and buffer
+  creation (`libavcodec/videotoolbox.c` 126–129 and 556–559), and every
+  failed CUDA call under NVDEC (`libavutil/cuda_check.h` 52), the decode
+  of one picture included (`nvdec.c` 662). `ENOSYS` is NVDEC's answer to
+  one HEVC picture its tables cannot describe (`nvdec_hevc.c` 200–227).
+  A hardware format `ff_get_format` withdraws says only that the
+  hwaccel's setup failed, not why (`decode.c` 1341–1343 and 1348–1357).
+
+  Nor does FFmpeg always recover a session. A malfunction or an
+  invalidated session marks a VideoToolbox session for a restart
+  (`videotoolbox.c` 1076–1077), as does an H.264 SPS whose profile/level
+  bytes differ (446–450), and the next picture stops the session and
+  starts a new one (1062–1068). A restart that fails answers
+  `AVERROR_EXTERNAL` (1066–1067) and leaves no session behind, because
+  the stop released it (518–522): VideoToolbox answers every picture
+  after it with `AVERROR_INVALIDDATA` (1071–1072) until a new parameter
+  set re-arms the restart (446–450). `flush` does not rebuild one:
+  `avcodec_flush_buffers` reaches only the codec's own flush
+  (`libavcodec/avcodec.c` 417–418), which drops the pictures and
+  references the codec holds.
+
+  **When to stop trusting a hardware session is the caller's policy.**
+  A caller that sees a hardware session's decoder failures persist
+  rebuilds: it opens a session on `DecodePath::Software` from the same
+  parameters and feeds it forward. The caller sees the failures on all
+  three roads, the packets' key flags and what it has delivered, and
+  what it can feed the new session depends on the road:
+
+  - a `send_packet` failure names the packet in hand, and the new
+    session is given that packet;
+  - a `receive_frame` failure may concern a packet accepted earlier,
+    because FFmpeg decouples input from output and may hold several
+    pictures (`libavcodec/avcodec.h` 90–139), so the new session is
+    given the next packet and the caller accepts the gap;
+  - `send_eof` has no packet: what the hardware session still held at
+    the end is recoverable only from packets kept from before, or by a
+    seek.
+
+  The policy counts `VideoDecodeError::Decode`. A
+  `VideoDecodeError::Convert` is the wrapper's own failure to convert a
+  decoded picture into a frame, and it is reported, not counted. One
+  that failed on an allocation parks the picture: until a
+  `receive_frame` delivers it, `send_packet` and `send_eof` answer
+  `Sent::MustDrain` without reaching libavcodec, which is the wrapper's
+  back pressure and not a failure.
+
+  The README's usage example is the simplest policy. It counts the
+  hardware session's decoder failures from all three roads, and only a
+  delivered picture ends the count; at a threshold of its own it opens
+  `Software` from the same parameters and feeds it forward, and every
+  picture the new session delivers is delivered as it is. It keeps no
+  packets, so the pictures from the failure to the next keyframe are
+  lost: libavcodec drops or conceals what comes before one. A lossless
+  replay is the caller's own design and is not shown.
+
+- **`AllBackendsFailed` is the probe's alone.** Its `origin()` is always
+  `FallbackOrigin::Probe`.
+
+- **`DecodePath` gains an arm,** `AnyHardware`, so an exhaustive `match`
+  on it must name the new arm.
+
+### Changed
+
+- **The view lane's probe-window copy is retired.** A scoped submission
+  shares its carrier's buffer with libavcodec on every road, before the
+  first picture as after it, wherever the padding behind the payload is
+  provable. From 0.9.0 the body was copied while the hardware probe
+  recorded, because the probe kept its rescue history by reference. It
+  now records copies of its own (see **Fixed**), which left each
+  probe-era packet on the view lane copied twice; the probe's copy is
+  the one copy now.
+
+### Added
+
+- **`DecodePath::AnyHardware`**: the platform's hardware backends in
+  probe order, the probe-era packets replayed across them, and never
+  software. When no backend takes the stream it refuses with
+  `Error::AllBackendsFailed` — at `open_as`, with every backend's
+  attempt and no packet (at once on a platform with no hardware
+  backend), or on the road that met the probe's exhaustion, with the
+  packets the probe took. `is_hardware()` answers `true` for the
+  session's whole life.
+
+### Removed (BREAKING)
+
+- **`VideoDecodeError::PostCommitNeverResynced`**, its payload
+  `PostCommitNeverResynced` (`new`, `packets_lost`), and the variant's
+  generated `is_` / `unwrap_` / `try_unwrap_` accessors: the post-commit
+  degrade whose lost tail it reported is gone.
+- **`AllBackendsFailed::new_post_commit`**: no `AllBackendsFailed` is
+  raised after the first picture.
+- **`FallbackOrigin::PostCommit`** and `FallbackOrigin::is_post_commit`:
+  nothing is collected after the first picture, so no era is left for
+  it to name.
+
+### Fixed
+
+- **The probe's rescued packets are its own copies.** It recorded each
+  packet it took by reference — `av_packet_ref` shares the payload
+  buffer (`libavcodec/packet.c` 461–468 in FFmpeg 9.0.1) — so the
+  packets `AllBackendsFailed` hands back shared the caller's payloads:
+  the caller's writes after a send reached them, and `data_mut` on the
+  two lent aliasing `&mut [u8]` from safe code. The probe now copies
+  each payload as it records it (`av_packet_ref`, then
+  `av_packet_make_writable`, both checked) and charges the copy what
+  it charged the reference; a copy that cannot be made refuses the
+  send with `AllBackendsFailed` before libavcodec sees the packet. A
+  backend on trial is replayed copies, so none of what is handed back
+  is shared with a decoder.
 
 ## [0.15.1] - 2026-10-05
 

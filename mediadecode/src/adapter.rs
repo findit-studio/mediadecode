@@ -191,15 +191,15 @@
 //! caller's second, mutable handle is, and refusing it would have
 //! refused every embedded picture there is.
 //!
-//! **A submission that can be recorded cannot be shared.** "Built,
-//! submitted and dropped inside one call" is a claim about a function,
-//! and it stops being true when the thing you submit to *keeps* what it
-//! is given. A hardware probe that records packets so it can replay
-//! them after a fallback, and then hands that history to the caller as
-//! owned mutable packets, turns a scoped submission into an escape.
-//! Where such a history is being recorded, the body is copied; where
-//! nothing records — every software road, and the hardware road after
-//! it commits — the send stays zero-copy.
+//! **What a decoder hands back, it copies.** "Built, submitted and
+//! dropped inside one call" is a claim about a function, and it stops
+//! being true when the thing you submit to *keeps* what it is given by
+//! reference and hands it back. A hardware probe that records packets
+//! so it can replay them after a fallback, and then hands that history
+//! to the caller as owned mutable packets, would turn a scoped
+//! submission into an escape. So the recorder keeps copies of its own,
+//! and the send stays zero-copy on every road — before the probe
+//! commits as after it, hardware or software.
 //!
 //! ## Two more rules the send direction adds
 //!

@@ -889,17 +889,18 @@ pub fn ffmpeg_packet_from_owned_video_packet(
 /// this function returns: no value that can produce a `&mut` into the
 /// shared bytes ever exists.
 ///
-/// **Which is why the route is the caller's to choose.** "Dropped
-/// before this returns" is a claim about this function, and a decoder
-/// that *records* what it is sent makes it false: the video decoder's
-/// hardware probe `av_packet_ref`s every accepted packet into a rescue
-/// history, and `FallbackFailed::unconsumed_packets` hands those
-/// recordings to the caller as owned, **mutable** `Packet`s. A
-/// submission that could be recorded must therefore carry
-/// [`BodyRoute::Copy`], so that what enters the history is storage
-/// nobody else reads. Callers with no history — every software road,
-/// and the hardware road after commit — pass
-/// [`BodyRoute::Submission`] and keep the zero-copy send.
+/// **The one recorder keeps copies.** "Dropped before this returns" is
+/// a claim about this function, and a decoder that kept what it is sent
+/// by reference and handed it back would carry the shared body past it.
+/// The video decoder's hardware probe is that recorder: it keeps every
+/// accepted packet in a rescue history, which `AllBackendsFailed` — or
+/// a failed fallback's `FallbackFailed` — hands to the caller as owned,
+/// **mutable** `Packet`s. It records copies of its own
+/// (`decoder::try_clone_packet`), so nothing in that history addresses
+/// the carrier, and every video send passes [`BodyRoute::Submission`],
+/// in the probe window as after it. [`BodyRoute::Copy`] is for a packet
+/// handed to a caller — [`ffmpeg_packet_from_video_packet`] and its
+/// siblings.
 pub(crate) fn with_ffmpeg_video_packet<C: crate::FfmpegCarrier + crate::CarrierOps, T>(
   packet: &mediadecode::packet::VideoPacket<VideoPacketExtra, C::Buffer>,
   limits: PacketLimits,

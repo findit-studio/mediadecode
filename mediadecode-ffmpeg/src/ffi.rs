@@ -342,6 +342,19 @@ pub(crate) fn declare_frame_budget_declined_for_test(state: *mut CallbackState, 
 /// build's discriminant set. The return value is either `wanted` (a known
 /// constant) or `AV_PIX_FMT_NONE` (also a known constant) — both safe to
 /// produce as `AVPixelFormat`.
+///
+/// # A missing hardware format says nothing about why
+///
+/// When `wanted` is not on offer the callback declines and records
+/// nothing, because the list holds no cause to record. `ff_get_format`
+/// withdraws a hardware format after **any** failed hwaccel setup and
+/// asks again without it (`libavcodec/decode.c` 1341–1343 and 1348–1357
+/// in FFmpeg 9.0.1): a failed allocation of the hwaccel's private data
+/// (1194–1198) and the backend's own setup error (1202–1211) arrive as
+/// the same shorter list. The codec then fails the picture in its own
+/// words, and that error is routed as any other — a failed candidate
+/// while the probe runs, the picture's own error after the first
+/// picture.
 pub(crate) unsafe extern "C" fn get_hw_format(
   ctx: *mut AVCodecContext,
   pix_fmts: *const AVPixelFormat,
@@ -373,6 +386,9 @@ pub(crate) unsafe extern "C" fn get_hw_format(
     // We bail at the sentinel; reads up to and including it are in-bounds.
     let v = unsafe { ptr::read(p) };
     if v == none_int {
+      // The hardware format is not on offer, and the list cannot say
+      // why: a withdrawn format means only that the hwaccel's setup
+      // failed. Nothing is recorded — see the function's documentation.
       return AVPixelFormat::AV_PIX_FMT_NONE;
     }
     if v == wanted_int {

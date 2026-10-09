@@ -35,7 +35,8 @@ see. That type is gone.
 
 `FfmpegVideoStreamDecoder` mirrors the `send_packet` / `receive_frame`
 shape of `ffmpeg::decoder::Video`, auto-probes the host's HW backends,
-and falls through to a software decoder when none open. Audio and
+and falls through to a software decoder when none takes the stream
+before its first picture. Audio and
 subtitles use parallel `FfmpegAudioStreamDecoder` /
 `FfmpegSubtitleStreamDecoder` types.
 
@@ -57,26 +58,90 @@ Output frames are CPU-side, downloaded with `av_hwframe_transfer_data`
 — downstream
 [`colconv`](https://github.com/findit-studio/colconv) handles it.
 
-If every HW backend opens but later fails at decode time and the
-software backend is also unavailable, the error surfaces as
-`VideoDecodeError::Decode(Error::AllBackendsFailed(p))` carrying any
-packets the decoder had already accepted from the demuxer (accessible
-via `p.unconsumed_packets()` / `p.into_unconsumed_packets()`) — so
-non-seekable callers (live streams, pipes, network sources) can replay
-them through their own software decoder without re-demuxing.
+The probe keeps every packet it consumes until the first picture comes
+out. When no backend takes the stream by then, `open` (that is,
+`DecodePath::Auto`) replays those packets into the software decoder, so
+nothing is lost; `DecodePath::AnyHardware` and a `DecodePath::Hardware`
+pin report `VideoDecodeError::Decode(Error::AllBackendsFailed(p))`
+instead, carrying them (`p.unconsumed_packets()` /
+`p.into_unconsumed_packets()`) — so non-seekable callers (live streams,
+pipes, network sources) can replay them through a software decoder of
+their own without re-demuxing.
+
+After the first picture nothing changes the road, on any path, and
+nothing is classified. A decoder failure, `VideoDecodeError::Decode`, is
+that picture's own error, reported as the decoder minted it, and nothing
+of it is remembered, so the next call reaches libavcodec. FFmpeg has no
+reliable signal that a hardware session is gone (`AVERROR_EXTERNAL`, for
+one, also answers a single picture), and whether a hardware session
+recovers is FFmpeg's, not this crate's. FFmpeg 9.0.1 does not always
+recover one. After a VideoToolbox restart that fails, every picture
+fails the same way until a new parameter set re-arms the restart, and
+`flush` does not change that: it drops the pictures and references the
+codec holds, and it rebuilds no hardware session. `VideoDecoder`'s
+documentation cites the FFmpeg lines.
+
+A `VideoDecodeError::Convert` is the wrapper's own failure, not the
+decoder's: `FfmpegVideoStreamDecoder` could not convert a decoded
+picture into a frame (a frame ceiling, a pixel format or plane layout it
+cannot carry, an allocation). One that failed on an allocation parks the
+picture: the next `receive_frame` converts it again, and until one
+delivers it, `send_packet` and `send_eof` answer `Sent::MustDrain`
+without reaching libavcodec. That is the wrapper's back pressure, not a
+failure.
+
+So a caller that sees a hardware session's decoder failures persist
+rebuilds: it opens a session on `DecodePath::Software` from the same
+parameters and feeds it forward. What the new session can be fed depends
+on the road the failure came from:
+
+- **`send_packet`**: the failure names the packet in hand, and the new
+  session is given that packet.
+- **`receive_frame`**: the failure may concern a packet accepted earlier.
+  FFmpeg decouples input from output and may hold several pictures
+  (`libavcodec/avcodec.h` 90–139 in FFmpeg 9.0.1), so no packet is
+  named: the new session is given the next packet, and the caller
+  accepts the gap.
+- **`send_eof`**: the end has no packet to give a new session. What the
+  hardware session still held is recoverable only from packets kept from
+  before, or by a seek.
+
+When to rebuild is the caller's policy, not the decoder's, because it is
+the caller that sees the failures on the three roads, the packets' key
+flags and what it has delivered. What a policy counts is the hardware
+session's decoder failures; a `Convert` error is reported, not counted.
+The usage example below carries the simplest one.
 
 ## Usage
 
+A file's video track, decoded under the simplest policy for a hardware
+session the caller stops trusting. It counts the hardware session's
+decoder failures on all three roads, and only a delivered picture ends
+the count. At `FAILURES_BEFORE_SOFTWARE` failures in a row it opens a
+session on `DecodePath::Software` from the same parameters and feeds it
+forward: the packet in hand when the failure came from `send_packet`,
+otherwise what comes next, the next packet or the end. It keeps no
+packets and replays nothing, so every picture the new session delivers
+is delivered as it is. A `Convert` error is reported, not counted: the
+example returns it, as it returns every error it does not handle.
+
 ```rust,no_run
 use ffmpeg_next as ffmpeg;
-use ffmpeg::{format, media};
+use ffmpeg::{codec, format, media};
 use mediadecode::{Received, Sent, Timebase, decoder::VideoStreamDecoder};
 use mediadecode_ffmpeg::{
-  DecoderLimits, Error as FfmpegError, FfmpegVideoStreamDecoder, PacketLimits,
-  VideoDecodeError, empty_video_frame, video_packet_from_ffmpeg_in,
+  DecodePath, DecoderLimits, Error, FfmpegVideoStreamDecoder, PacketLimits, VideoDecodeError,
+  VideoFrame, VideoPacket, empty_video_frame, video_packet_from_ffmpeg_in,
 };
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+type BoxError = Box<dyn std::error::Error>;
+
+/// This caller's threshold, not the decoder's: how many decoder failures
+/// in a row, with no picture delivered between them, it takes from a
+/// hardware session before it rebuilds on software.
+const FAILURES_BEFORE_SOFTWARE: u32 = 3;
+
+fn main() -> Result<(), BoxError> {
   ffmpeg::init()?;
 
   let path = std::env::args().nth(1).expect("usage: <input-file>");
@@ -87,22 +152,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     stream.time_base().numerator(),
     std::num::NonZeroI32::new(stream.time_base().denominator()).unwrap(),
   );
+  // A copy of its own: a software session opened later opens from it.
+  let parameters = stream.parameters().clone();
 
-  // Probes HW backends in order, falls back to software.
-  let mut decoder =
-    match FfmpegVideoStreamDecoder::open(stream.parameters(), time_base, DecoderLimits::default())
-    {
-    Ok(d) => d,
-    Err(FfmpegError::AllBackendsFailed(p)) => {
-      // No backend at all could open this stream — including software.
-      // `unconsumed_packets` is empty at open-time. Caller decides.
-      let _unconsumed_packets = p.into_unconsumed_packets();
-      return Ok(());
-    }
-    Err(e) => return Err(e.into()),
-  };
-
-  let mut frame = empty_video_frame();
+  let mut track = Track::open(parameters, time_base)?;
   for (s, av_packet) in input.packets() {
     if s.index() != stream_index { continue; }
     // `Ok(None)` is an empty packet; an `Err` is a payload that is
@@ -116,48 +169,155 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let Some(pkt) =
       video_packet_from_ffmpeg_in(av_packet, time_base, PacketLimits::default())?
     else { continue };
+    track.push(&pkt)?;
+  }
+  track.finish()
+}
 
-    match decoder.send_packet(&pkt) {
-      Ok(Sent::Accepted) => {}
-      // Back pressure, not a failure: nothing was consumed, so drain
-      // and offer this same packet again. The old idiom — submit
-      // twice and treat the second failure as real — is what this
-      // arm replaces.
-      Ok(Sent::MustDrain) => {
-        while decoder.receive_frame(&mut frame)? == Received::Frame {}
-        // (re-offer `pkt`; elided here for brevity)
+/// A video track decoded under this caller's policy for a hardware
+/// session it stops trusting.
+///
+/// The policy feeds forward and does nothing else: it keeps no packets,
+/// replays nothing and matches no pictures. That costs the pictures from
+/// a failure to the next keyframe: a new session holds no reference
+/// pictures, so libavcodec drops or conceals what comes before one, and
+/// what the hardware session still held goes with it. A caller that
+/// cannot afford that gap keeps the packets since the last clean keyframe
+/// and replays them with a picture identity of its own; that bookkeeping
+/// is the caller's design and is not shown here, because a doc example
+/// cannot carry it correctly.
+struct Track {
+  parameters: codec::Parameters,
+  time_base: Timebase,
+  decoder: FfmpegVideoStreamDecoder,
+  frame: VideoFrame,
+  /// The hardware session's decoder failures since the last picture
+  /// delivered.
+  failures_in_a_row: u32,
+}
+
+impl Track {
+  fn open(parameters: codec::Parameters, time_base: Timebase) -> Result<Self, BoxError> {
+    // Probes HW backends in order and falls back to software when none
+    // takes the stream before its first picture — so an error here means
+    // software could not open it either.
+    let decoder =
+      FfmpegVideoStreamDecoder::open(parameters.clone(), time_base, DecoderLimits::default())?;
+    Ok(Self {
+      parameters,
+      time_base,
+      decoder,
+      frame: empty_video_frame(),
+      failures_in_a_row: 0,
+    })
+  }
+
+  /// The `send_packet` road. A failure here names this packet.
+  fn push(&mut self, pkt: &VideoPacket) -> Result<(), BoxError> {
+    loop {
+      match self.decoder.send_packet(pkt) {
+        Ok(Sent::Accepted) => return self.drain(),
+        // Back pressure, not a failure: nothing was consumed, so drain
+        // and offer this same packet again. The old idiom — submit
+        // twice and treat the second failure as real — is what this
+        // arm replaces.
+        Ok(Sent::MustDrain) => self.drain()?,
+        Err(VideoDecodeError::Decode(e)) => {
+          // A software session opened for this failure is given this
+          // packet; otherwise the packet is behind us.
+          if self.failed(e)? {
+            continue;
+          }
+          return self.drain();
+        }
+        // `VideoDecodeError` is `#[non_exhaustive]`: a fault this code
+        // has never heard of takes the generic road, which is the right
+        // handling for one.
+        Err(e) => return Err(e.into()),
       }
-      Err(VideoDecodeError::Decode(FfmpegError::AllBackendsFailed(p))) => {
-        // Runtime exhaustion: rescued packets are the bytes the decoder
-        // already consumed from `input`. Replay them through your own
-        // software decoder before the current packet so non-seekable
-        // sources recover cleanly.
-        let _unconsumed_packets = p.into_unconsumed_packets();
-        return Ok(());
-      }
-      // `VideoDecodeError` is `#[non_exhaustive]`: a fault this code
-      // has never heard of takes the generic road, which is the right
-      // handling for one.
-      Err(e) => return Err(e.into()),
-    }
-    // `receive_frame` answers `Received`, so the loop stops on a state
-    // rather than on "whatever the last error was" — and a real
-    // receive-side failure leaves through `?` instead of ending the
-    // drain silently.
-    while decoder.receive_frame(&mut frame)? == Received::Frame {
-      // frame.pixel_format(), frame.width(), frame.height(),
-      // frame.planes() — view carriers: read them here and drop. A
-      // frame held is a pool slot held. Use the `Owned*` family when a
-      // frame has to outlive the loop.
     }
   }
-  // The end-of-stream is offered on the same terms as a packet.
-  while decoder.send_eof()? == Sent::MustDrain {
-    while decoder.receive_frame(&mut frame)? == Received::Frame {}
+
+  /// The `send_eof` road, then the tail. The end has no packet: a
+  /// software session opened for a failure here is given the end and
+  /// nothing else, so what the hardware session still held is lost.
+  fn finish(&mut self) -> Result<(), BoxError> {
+    loop {
+      match self.decoder.send_eof() {
+        Ok(Sent::Accepted) => return self.drain(),
+        Ok(Sent::MustDrain) => self.drain()?,
+        Err(VideoDecodeError::Decode(e)) => {
+          if self.failed(e)? {
+            continue;
+          }
+          // The end stays refused: what is ready is drained, and what
+          // the session still holds is lost with it.
+          return self.drain();
+        }
+        Err(e) => return Err(e.into()),
+      }
+    }
   }
-  // The tail, and its end has its own word.
-  while decoder.receive_frame(&mut frame)? != Received::Ended {}
-  Ok(())
+
+  /// The `receive_frame` road: every picture the session has ready, up
+  /// to `NeedsInput`, or to `Ended` once the end is taken. `Received` is
+  /// a state, so the loop stops on one rather than on whatever the last
+  /// error was.
+  fn drain(&mut self) -> Result<(), BoxError> {
+    loop {
+      match self.decoder.receive_frame(&mut self.frame) {
+        Ok(Received::Frame) => self.deliver(),
+        Ok(Received::NeedsInput | Received::Ended) => return Ok(()),
+        // A failure here may concern a packet accepted earlier: FFmpeg
+        // decouples input from output and may hold several pictures. No
+        // packet is named, so a software session opened for it is given
+        // the next packet.
+        Err(VideoDecodeError::Decode(e)) => {
+          if self.failed(e)? {
+            return Ok(());
+          }
+        }
+        // Not counted: a `Convert` error is the wrapper's own, a decoded
+        // picture it could not convert into a frame, and not a decoder
+        // failure. It is reported, as is anything this code has never
+        // heard of.
+        Err(e) => return Err(e.into()),
+      }
+    }
+  }
+
+  /// A picture, delivered to the rest of the program as it is.
+  fn deliver(&mut self) {
+    // The count ends here, at a delivered picture, and nowhere else.
+    self.failures_in_a_row = 0;
+    // self.frame.pixel_format(), .width(), .height(), .planes() — view
+    // carriers: read them here and drop. A frame held is a pool slot
+    // held. Use the `Owned*` family when a frame has to outlive this.
+  }
+
+  /// A decoder failure on any of the three roads. On hardware it counts,
+  /// and at `FAILURES_BEFORE_SOFTWARE` the session is replaced by one on
+  /// `DecodePath::Software`, opened from the same parameters. Answers
+  /// whether it was, so the road can feed the new session.
+  fn failed(&mut self, e: Error) -> Result<bool, BoxError> {
+    eprintln!("decode failure: {e}");
+    // Software is where this policy ends: its failures are reported,
+    // and the stream goes on.
+    if !self.decoder.is_hardware() {
+      return Ok(false);
+    }
+    self.failures_in_a_row += 1;
+    if self.failures_in_a_row < FAILURES_BEFORE_SOFTWARE {
+      return Ok(false);
+    }
+    self.decoder = FfmpegVideoStreamDecoder::open_as(
+      self.parameters.clone(),
+      self.time_base,
+      DecoderLimits::default(),
+      DecodePath::Software,
+    )?;
+    Ok(true)
+  }
 }
 ```
 
@@ -173,12 +333,13 @@ for end-to-end demuxer-driven runs that cover all three streams.
   their error types: `VideoDecodeError`, `AudioDecodeError`,
   `SubtitleDecodeError`.
 - **Decode path**: `DecodePath` and `FfmpegVideoStreamDecoder::open_as`
-  — `Auto` (what `open` does: probe hardware, fall back to software),
-  `Hardware(Backend)` or `Software`. The two named arms are **pins**:
-  a session opened on one stays on it, so a backend that fails at open
-  fails the call and one that fails mid-stream reports rather than
-  degrading behind the caller. `is_hardware()` / `is_software()` stay
-  the live reading of where a session is.
+  — `Auto` (what `open` does: probe hardware, fall back to software
+  before the first picture), `AnyHardware` (the same probe, never
+  software), `Software`, or the pin `Hardware(Backend)`. After the first
+  picture no path changes its decoder, and a decoder failure is the
+  picture's own error; when to stop trusting a hardware session is the
+  caller's policy. `is_hardware()` / `is_software()` stay the live
+  reading of where a session is.
 - **Demuxer**: `FfmpegDemuxer` — `mediadecode`'s `Demuxer` over
   `libavformat`, opened from a path (`open`) or from any
   `Read + Seek` byte source through a custom `AVIOContext`
@@ -245,7 +406,7 @@ is what opts into them.
 | `MEDIADECODE_SAMPLE_VIDEO` | `tests/decode_via_trait.rs` |
 | `MEDIADECODE_SAMPLE_AUDIO` | the audio-through-trait case (any container with an audio track) |
 | `MEDIADECODE_SAMPLE_SUBTITLE` | the subtitle-through-trait case (needs a container that really carries a subtitle track) |
-| `MEDIADECODE_FX3_SAMPLE` | the Sony FX3 H.264 High 4:2:2 10-bit mid-stream HW→SW fallback case |
+| `MEDIADECODE_FX3_SAMPLE` | the Sony FX3 H.264 High 4:2:2 10-bit probe-era HW→SW fallback case |
 
 ```sh
 HWDECODE_SAMPLE_VIDEO=/path/to/clip.mp4 cargo test --test hw_smoke -- --ignored
