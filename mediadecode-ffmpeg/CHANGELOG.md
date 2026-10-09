@@ -103,6 +103,17 @@ session that is hardware or nothing.
 - **`DecodePath` gains an arm,** `AnyHardware`, so an exhaustive `match`
   on it must name the new arm.
 
+### Changed
+
+- **The view lane's probe-window copy is retired.** A scoped submission
+  shares its carrier's buffer with libavcodec on every road, before the
+  first picture as after it, wherever the padding behind the payload is
+  provable. From 0.9.0 the body was copied while the hardware probe
+  recorded, because the probe kept its rescue history by reference. It
+  now records copies of its own (see **Fixed**), which left each
+  probe-era packet on the view lane copied twice; the probe's copy is
+  the one copy now.
+
 ### Added
 
 - **`DecodePath::AnyHardware`**: the platform's hardware backends in
