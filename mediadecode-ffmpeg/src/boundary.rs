@@ -910,15 +910,19 @@ fn preflight(
 /// judged by the caps every packet is ([`check_side_data_budget`]); together
 /// they are at most twice them.
 ///
-/// **It goes where the packet it rides goes**: taken with it, refused with
-/// it — the refusal the packet's, and the side data's — except under back
-/// pressure, when the same packet is offered again and carries it again. A
-/// rebuild that fails before the decoder's road is reached leaves it for the
-/// next. The end of the stream, past which no packet comes, and a flush,
-/// which abandons the position, drop it and say so ([`Self::abandon`]):
-/// libavcodec's own flush drops a packet it took and had not decoded, its
-/// side data with it (`avcodec_flush_buffers`, avcodec.c:411-412;
-/// `ff_decode_flush_buffers`, decode.c:2370-2371).
+/// **What becomes of it is what the session reads of the packet it rides**
+/// ([`Disposition`]), where it forms its answer. Spent where a decoder took
+/// that packet, or may have read it — the session then reads it as it reads
+/// the packet's own record, in doubt where the read is unproven. Waiting for
+/// the next packet with a body where no decoder saw it: back pressure, a
+/// rebuild refused before the decoder's road, a refusal this crate makes
+/// before any decoder (a body FFmpeg would read as a record it applies only
+/// in part, a hardware probe that cannot record the packet). The end of the
+/// stream, past which no packet comes, and a flush, which abandons the
+/// position, drop it and say so ([`Self::abandon`]): libavcodec's own flush
+/// drops a packet it took and had not decoded, its side data with it
+/// (`avcodec_flush_buffers`, avcodec.c:411-412; `ff_decode_flush_buffers`,
+/// decode.c:2370-2371).
 #[derive(Debug, Default)]
 pub(crate) struct Deferred {
   entries: Vec<SideDataEntry>,
@@ -993,6 +997,12 @@ impl Deferred {
     Ok(std::borrow::Cow::Owned(carried))
   }
 
+  /// What rode a packet a decoder took, or may have read, is spent: it is
+  /// never offered again ([`Disposition`]).
+  fn spend(&mut self) {
+    self.entries.clear();
+  }
+
   /// **Drops what is deferred where no packet will carry it** — `at`, the
   /// end of the stream or a flush — and says so, naming the side data's
   /// types (`AV_PKT_DATA_*`, as FFmpeg numbers them). No decoder saw it, so
@@ -1059,6 +1069,24 @@ pub(crate) mod abandoned {
   }
 }
 
+/// **What became of the packet with a body that what was deferred rode**
+/// ([`Deferred`]), as the session read it where it formed its answer — the
+/// reading it makes of that packet's own record and parameter sets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Disposition {
+  /// A decoder took it: what rode it is spent.
+  Taken,
+  /// No decoder saw it: refused before any decoder's queue — by this crate,
+  /// or by libavcodec as back pressure or the end. What rode it waits for
+  /// the next packet with a body: the same packet offered again, or the one
+  /// after it.
+  Untaken,
+  /// Whether a decoder read it cannot be told. What rode it is spent, and
+  /// the session reads it as it reads any record whose read is unproven: in
+  /// doubt.
+  Unknown,
+}
+
 /// What a scoped submission did with a packet ([`with_ffmpeg_video_packet`]
 /// and its siblings).
 #[derive(Debug)]
@@ -1078,10 +1106,10 @@ pub(crate) enum Submission<T> {
 /// deferred left as it was where it is refused. With no body it is not
 /// submitted: its side data is deferred and nothing else of it kept. With
 /// one, it is rebuilt by `assemble` carrying what is deferred in front of
-/// its own side data, lent to `submit`, and dropped before this returns;
-/// what rode it goes with it unless `again` reads `submit`'s answer as back
-/// pressure, under which the caller offers the same packet again.
-#[allow(clippy::too_many_arguments)]
+/// its own side data, lent to `submit`, and dropped before this returns.
+/// `submit` answers with the [`Disposition`] of the packet, read where its
+/// answer was formed: what rode it is spent where a decoder took it or may
+/// have read it, and waits where no decoder saw it.
 fn submission<T>(
   flags: MdPacketFlags,
   body: &[u8],
@@ -1089,8 +1117,7 @@ fn submission<T>(
   limits: PacketLimits,
   deferred: &mut Deferred,
   assemble: impl FnOnce(&[SideDataEntry]) -> Result<Packet, PacketBuildError>,
-  submit: impl FnOnce(&Packet) -> T,
-  again: impl FnOnce(&T) -> bool,
+  submit: impl FnOnce(&Packet) -> (T, Disposition),
 ) -> Result<Submission<T>, PacketBuildError> {
   preflight(flags, body, side_data, limits)?;
   if body.is_empty() {
@@ -1100,10 +1127,11 @@ fn submission<T>(
   let av_packet = deferred
     .onto(side_data)
     .and_then(|carried| assemble(&carried))?;
-  let answer = submit(&av_packet);
+  let (answer, disposition) = submit(&av_packet);
   drop(av_packet);
-  if !again(&answer) {
-    deferred.entries.clear();
+  match disposition {
+    Disposition::Untaken => {}
+    Disposition::Taken | Disposition::Unknown => deferred.spend(),
   }
   Ok(Submission::Answered(answer))
 }
@@ -1175,15 +1203,14 @@ pub fn ffmpeg_packet_from_owned_video_packet(
 /// **A packet with no body is not submitted** ([`submission`]): its side
 /// data waits in `deferred` and rides the next packet with a body, which
 /// `submit` is lent carrying it — and so does a probe's rescue history,
-/// which records that packet. `again` reads `submit`'s answer for back
-/// pressure.
+/// which records that packet. `submit` answers with the packet's
+/// [`Disposition`].
 pub(crate) fn with_ffmpeg_video_packet<C: crate::FfmpegCarrier + crate::CarrierOps, T>(
   packet: &mediadecode::packet::VideoPacket<VideoPacketExtra, C::Buffer>,
   limits: PacketLimits,
   route: BodyRoute,
   deferred: &mut Deferred,
-  submit: impl FnOnce(&Packet) -> T,
-  again: impl FnOnce(&T) -> bool,
+  submit: impl FnOnce(&Packet) -> (T, Disposition),
 ) -> std::result::Result<Submission<T>, PacketBuildError> {
   submission(
     packet.flags(),
@@ -1193,7 +1220,6 @@ pub(crate) fn with_ffmpeg_video_packet<C: crate::FfmpegCarrier + crate::CarrierO
     deferred,
     |carried| assemble_video_packet::<C>(packet, route, carried),
     submit,
-    again,
   )
 }
 
@@ -1271,8 +1297,7 @@ pub(crate) fn with_ffmpeg_audio_packet<C: crate::FfmpegCarrier + crate::CarrierO
   limits: PacketLimits,
   route: BodyRoute,
   deferred: &mut Deferred,
-  submit: impl FnOnce(&Packet) -> T,
-  again: impl FnOnce(&T) -> bool,
+  submit: impl FnOnce(&Packet) -> (T, Disposition),
 ) -> std::result::Result<Submission<T>, PacketBuildError> {
   submission(
     packet.flags(),
@@ -1282,7 +1307,6 @@ pub(crate) fn with_ffmpeg_audio_packet<C: crate::FfmpegCarrier + crate::CarrierO
     deferred,
     |carried| assemble_audio_packet::<C>(packet, route, carried),
     submit,
-    again,
   )
 }
 
@@ -1360,8 +1384,7 @@ pub(crate) fn with_ffmpeg_subtitle_packet<C: crate::FfmpegCarrier + crate::Carri
   limits: PacketLimits,
   route: BodyRoute,
   deferred: &mut Deferred,
-  submit: impl FnOnce(&Packet) -> T,
-  again: impl FnOnce(&T) -> bool,
+  submit: impl FnOnce(&Packet) -> (T, Disposition),
 ) -> std::result::Result<Submission<T>, PacketBuildError> {
   submission(
     packet.flags(),
@@ -1371,7 +1394,6 @@ pub(crate) fn with_ffmpeg_subtitle_packet<C: crate::FfmpegCarrier + crate::Carri
     deferred,
     |carried| assemble_subtitle_packet::<C>(packet, route, carried),
     submit,
-    again,
   )
 }
 
@@ -3374,8 +3396,7 @@ mod tests {
       limits,
       BodyRoute::Submission,
       &mut deferred,
-      |_| unreachable!("a packet with no body is not submitted"),
-      |(): &()| false,
+      |_| -> ((), Disposition) { unreachable!("a packet with no body is not submitted") },
     )
     .expect("taken");
     assert!(matches!(submitted, Submission::NoBody));
@@ -3402,8 +3423,7 @@ mod tests {
       limits,
       BodyRoute::Submission,
       &mut deferred,
-      |_| unreachable!("a packet with no body is not submitted"),
-      |(): &()| false,
+      |_| -> ((), Disposition) { unreachable!("a packet with no body is not submitted") },
     )
     .expect("taken");
     assert!(matches!(submitted, Submission::NoBody));
@@ -3430,8 +3450,7 @@ mod tests {
       limits,
       BodyRoute::Submission,
       &mut deferred,
-      |_| unreachable!("a packet with no body is not submitted"),
-      |(): &()| false,
+      |_| -> ((), Disposition) { unreachable!("a packet with no body is not submitted") },
     )
     .expect("taken");
     assert!(matches!(submitted, Submission::NoBody));
@@ -3462,9 +3481,12 @@ mod tests {
   /// own matrix, is lent to the decoder's road carrying the second record in
   /// front of its own matrix; answered back pressure, it carries both again
   /// when offered again; taken, nothing waits. A packet refused before the
-  /// merge — its body over the budget — leaves what waits for the next. The
-  /// audio and subtitle roads defer the same way. What waits at the end is
-  /// dropped and said so. Kept first, the first record rode the packet.
+  /// merge — its body over the budget — leaves what waits for the next, and
+  /// so does one the decoder's road refused before any decoder saw it
+  /// (`Disposition::Untaken`); one whose read cannot be told spends it
+  /// (`Disposition::Unknown`). The audio and subtitle roads defer the same
+  /// way. What waits at the end is dropped and said so. Kept first, the
+  /// first record rode the packet.
   #[test]
   fn a_packet_with_no_body_is_never_submitted_and_its_side_data_rides_the_next() {
     const MATRIX: i32 = AVPacketSideDataType::AV_PKT_DATA_DISPLAYMATRIX as i32;
@@ -3487,7 +3509,7 @@ mod tests {
     );
 
     let mut deferred = Deferred::default();
-    let offer = |deferred: &mut Deferred, packet, again: bool| {
+    let offer = |deferred: &mut Deferred, packet, disposition: Disposition| {
       let mut lent = None;
       let answer = with_ffmpeg_video_packet::<crate::Owned, _>(
         &packet,
@@ -3496,9 +3518,8 @@ mod tests {
         deferred,
         |av| {
           lent = Some(carried(av));
-          again
+          ((), disposition)
         },
-        |again| *again,
       );
       (
         answer.map(|submitted| matches!(submitted, Submission::NoBody)),
@@ -3513,7 +3534,7 @@ mod tests {
       video(&[], vec![entry(NEW_EXTRADATA, &[5, 6])]),
       video(&[], Vec::new()),
     ] {
-      let (answer, lent) = offer(&mut deferred, packet, false);
+      let (answer, lent) = offer(&mut deferred, packet, Disposition::Taken);
       assert!(
         matches!(answer, Ok(true)) && lent.is_none(),
         "a packet with no body is not submitted"
@@ -3530,7 +3551,7 @@ mod tests {
     );
     let with_body = || video(&[9, 9, 9], vec![entry(MATRIX, &[8])]);
     let expected = vec![(NEW_EXTRADATA, vec![5, 6]), (MATRIX, vec![8])];
-    let (answer, lent) = offer(&mut deferred, with_body(), true);
+    let (answer, lent) = offer(&mut deferred, with_body(), Disposition::Untaken);
     assert!(matches!(answer, Ok(false)));
     assert_eq!(
       lent.as_ref(),
@@ -3542,7 +3563,7 @@ mod tests {
       vec![NEW_EXTRADATA, MATRIX],
       "back pressure: kept"
     );
-    let (_, lent) = offer(&mut deferred, with_body(), false);
+    let (_, lent) = offer(&mut deferred, with_body(), Disposition::Taken);
     assert_eq!(
       lent.as_ref(),
       Some(&expected),
@@ -3554,7 +3575,7 @@ mod tests {
     let (answer, _) = offer(
       &mut deferred,
       video(&[], vec![entry(NEW_EXTRADATA, &[1])]),
-      false,
+      Disposition::Taken,
     );
     assert!(matches!(answer, Ok(true)));
     let small = PacketLimits::default().with_max_packet_bytes(2);
@@ -3563,14 +3584,46 @@ mod tests {
       small,
       BodyRoute::Submission,
       &mut deferred,
-      |_| unreachable!("refused before the decoder's road"),
-      |(): &()| false,
+      |_| -> ((), Disposition) { unreachable!("refused before the decoder's road") },
     );
     assert!(matches!(
       refused,
       Err(PacketBuildError::SendPayloadTooLarge(_))
     ));
     assert_eq!(deferred.kinds(), vec![NEW_EXTRADATA], "still waiting");
+    // Refused on the decoder's road before any decoder saw it: still waiting,
+    // and carried by the packet after it.
+    let (_, lent) = offer(&mut deferred, with_body(), Disposition::Untaken);
+    assert_eq!(
+      lent,
+      Some(vec![(NEW_EXTRADATA, vec![1]), (MATRIX, vec![8])]),
+      "carried by the refused packet"
+    );
+    assert_eq!(
+      deferred.kinds(),
+      vec![NEW_EXTRADATA],
+      "untaken: still waiting"
+    );
+    // Its read unknown: spent, never offered again.
+    let (_, lent) = offer(&mut deferred, with_body(), Disposition::Unknown);
+    assert_eq!(
+      lent,
+      Some(vec![(NEW_EXTRADATA, vec![1]), (MATRIX, vec![8])]),
+      "carried by the packet whose read is unknown"
+    );
+    assert!(deferred.kinds().is_empty(), "unknown: spent");
+    let (_, lent) = offer(&mut deferred, with_body(), Disposition::Taken);
+    assert_eq!(
+      lent,
+      Some(vec![(MATRIX, vec![8])]),
+      "the packet after it carries its own alone"
+    );
+    let (answer, _) = offer(
+      &mut deferred,
+      video(&[], vec![entry(NEW_EXTRADATA, &[1])]),
+      Disposition::Taken,
+    );
+    assert!(matches!(answer, Ok(true)));
 
     // The end drops it, and says so.
     let _ = abandoned::take();
@@ -3594,8 +3647,7 @@ mod tests {
       limits,
       BodyRoute::Submission,
       &mut deferred,
-      |_| unreachable!("a packet with no body is not submitted"),
-      |(): &()| false,
+      |_| -> ((), Disposition) { unreachable!("a packet with no body is not submitted") },
     )
     .expect("taken");
     assert!(matches!(first, Submission::NoBody));
@@ -3605,8 +3657,10 @@ mod tests {
       limits,
       BodyRoute::Submission,
       &mut deferred,
-      |av| lent = Some(carried(av)),
-      |(): &()| false,
+      |av| {
+        lent = Some(carried(av));
+        ((), Disposition::Taken)
+      },
     )
     .expect("submitted");
     assert_eq!(lent, Some(vec![(NEW_EXTRADATA, vec![3])]), "audio");
@@ -3623,8 +3677,7 @@ mod tests {
       limits,
       BodyRoute::Submission,
       &mut deferred,
-      |_| unreachable!("a packet with no body is not submitted"),
-      |(): &()| false,
+      |_| -> ((), Disposition) { unreachable!("a packet with no body is not submitted") },
     )
     .expect("taken");
     assert!(matches!(first, Submission::NoBody));
@@ -3634,8 +3687,10 @@ mod tests {
       limits,
       BodyRoute::Submission,
       &mut deferred,
-      |av| lent = Some(carried(av)),
-      |(): &()| false,
+      |av| {
+        lent = Some(carried(av));
+        ((), Disposition::Taken)
+      },
     )
     .expect("submitted");
     assert_eq!(lent, Some(vec![(NEW_EXTRADATA, vec![4])]), "subtitle");

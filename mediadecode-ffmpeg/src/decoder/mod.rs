@@ -1198,7 +1198,8 @@ impl VideoDecoder {
   /// bytes would push the probe past [`MAX_PROBE_PACKETS`] or
   /// [`MAX_PROBE_PACKET_BYTES`], or [`av_packet_ref`] fails ENOMEM —
   /// `send_packet` returns [`Error::AllBackendsFailed`] **without
-  /// invoking** `state.inner.send_packet` on this packet. The caller's
+  /// invoking** `state.inner.send_packet` on this packet, and the payload
+  /// says so (`AllBackendsFailed::before_any_decoder`). The caller's
   /// packet stays in their hand and `unconsumed_packets` carries the
   /// pre-existing buffered history, so they can replay
   /// `unconsumed_packets` plus the current packet through their
@@ -1229,10 +1230,9 @@ impl VideoDecoder {
             "hwdecode: probe rescue exhausted before consuming packet; \
              returning AllBackendsFailed without invoking decoder"
           );
-          return Err(Error::AllBackendsFailed(AllBackendsFailed::new(
-            probe.attempts,
-            probe.buffered_packets,
-          )));
+          return Err(Error::AllBackendsFailed(
+            AllBackendsFailed::before_any_decoder(probe.attempts, probe.buffered_packets),
+          ));
         }
         // Step 2: byte / packet count cap. `packet_side_data_bytes`
         // clamps its walk to MAX_PROBE_PACKET_SIDE_DATA_ENTRIES as
@@ -1256,10 +1256,9 @@ impl VideoDecoder {
             "hwdecode: probe rescue exhausted before consuming packet; \
              returning AllBackendsFailed without invoking decoder"
           );
-          return Err(Error::AllBackendsFailed(AllBackendsFailed::new(
-            probe.attempts,
-            probe.buffered_packets,
-          )));
+          return Err(Error::AllBackendsFailed(
+            AllBackendsFailed::before_any_decoder(probe.attempts, probe.buffered_packets),
+          ));
         }
         // Step 3: pre-clone before consuming. `av_packet_ref` is a
         // refcounted shallow clone (no payload deep-copy) but can still
@@ -1274,10 +1273,9 @@ impl VideoDecoder {
               "hwdecode: packet clone failed before consuming; \
                returning AllBackendsFailed without invoking decoder"
             );
-            return Err(Error::AllBackendsFailed(AllBackendsFailed::new(
-              probe.attempts,
-              probe.buffered_packets,
-            )));
+            return Err(Error::AllBackendsFailed(
+              AllBackendsFailed::before_any_decoder(probe.attempts, probe.buffered_packets),
+            ));
           }
         }
       } else {

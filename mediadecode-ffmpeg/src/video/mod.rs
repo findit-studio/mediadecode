@@ -265,6 +265,13 @@ pub struct CarrierVideoStreamDecoder<C: crate::FfmpegCarrier> {
   /// its keyframe rule, its sets, the extradata a decoder takes with it — as
   /// that packet's own, which is where FFmpeg applies it.
   deferred: boundary::Deferred,
+  /// **How the session read the packet it is sending**, where it decided a
+  /// decoder may have taken it ([`Self::commit_sets`]); `None` while no
+  /// decoder may have. The side data a packet with no body deferred onto
+  /// that packet goes with it as this says ([`boundary::Disposition`]):
+  /// spent where a decoder took it or may have read it, waiting where none
+  /// saw it.
+  sent_as: Option<Commit>,
   /// Set, with what left it so, when whether the decoder serving applied a
   /// packet's `AV_PKT_DATA_NEW_EXTRADATA` cannot be told
   /// ([`crate::ExtradataDoubt`]): a decoder refused the packet with an error
@@ -1406,6 +1413,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       parameters: owned_parameters,
       probe_extradata: None,
       deferred: boundary::Deferred::default(),
+      sent_as: None,
       extradata_unknown: None,
       extradata_provisional: false,
       held,
@@ -2662,7 +2670,12 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// as they were kept until it is seen to read it
   /// ([`Self::held_proven`]); read, as they are; whether it read it unknown,
   /// every set the packet changed in doubt.
+  ///
+  /// The one place the session decides a decoder may have taken the packet
+  /// it is sending, so what a packet with no body deferred onto it goes as
+  /// this says ([`Self::sent_as`]).
   fn commit_sets(&mut self, sets: Sets, commit: Commit) {
+    self.sent_as = Some(commit);
     follow(&mut self.held, &mut self.held_proven, sets.held, commit);
     if sets.aso && !self.h264_aso {
       self.h264_aso = true;
@@ -2678,7 +2691,15 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
          seek, and a post-commit fallback's gap ends escalated",
       );
     }
-    if sets.alpha && !self.hevc_alpha {
+    if sets.alpha {
+      self.note_alpha();
+    }
+  }
+
+  /// The stream decodes an auxiliary layer as alpha, for good
+  /// ([`Self::hevc_alpha`]); said once, naming the reason.
+  fn note_alpha(&mut self) {
+    if !self.hevc_alpha {
       self.hevc_alpha = true;
       tracing::warn!(
         reason = access::KeyframeRule::Hevc {
@@ -2703,14 +2724,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       && self.codec_id() == crate::CodecId::HEVC.raw()
       && matches!(&self.state, DecodeState::Sw(sw) if sw.outputs_alpha())
     {
-      self.commit_sets(
-        Sets {
-          aso: false,
-          alpha: true,
-          held: None,
-        },
-        Commit::Read,
-      );
+      self.note_alpha();
     }
   }
 
@@ -3567,6 +3581,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       parameters: owned_parameters,
       probe_extradata: None,
       deferred: boundary::Deferred::default(),
+      sent_as: None,
       extradata_unknown: None,
       extradata_provisional: false,
       held,
@@ -3870,180 +3885,213 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     // Out of `self` while the decoder's road, which borrows all of it, runs.
     let mut deferred = core::mem::take(&mut self.deferred);
     // The packet as the decoder's road gets it, carrying what a packet with
-    // no body deferred onto it ([`Self::deferred`]).
+    // no body deferred onto it ([`Self::deferred`]), and what became of it
+    // there, read where the road decides a decoder may have taken it
+    // ([`Self::sent_as`]).
     let send = |av_pkt: &Packet| {
-      self.note_output_alpha();
-      // The software road reads the packet once what a fallback's replay owes
-      // the decoder is fed ([`Self::send_on_software`]).
-      if !matches!(self.state, DecodeState::Hw(_)) {
-        return self.send_on_software(av_pkt, phase);
-      }
-      // A body the decoder would read as a record it would not apply whole is
-      // refused before the hardware takes the packet.
-      self
-        .refuse_record_body(av_pkt)
-        .map_err(VideoDecodeError::Decode)?;
-      // What the packet's parameter sets say of the stream, read before the
-      // hardware takes it and the session's only once a decoder may have
-      // taken it ([`Self::commit_sets`]).
-      let sets = self.sets_of(av_pkt);
-      // The extradata the packet carries, copied before the hardware sees
-      // it: the stream's once it takes it.
-      let extradata = NewExtradata::of(
-        av_pkt,
-        &self.parameters,
-        self.limits.max_codec_parameter_bytes(),
-        Some(&self.held),
-      )
-      .map_err(VideoDecodeError::Decode)?;
-      match &mut self.state {
-        DecodeState::Hw(hw) => match hw.send_packet(av_pkt) {
-          // The seam already classified libavcodec's back pressure, so
-          // both states travel on unchanged. A keyframe the hardware took
-          // is the first one after a seek, if one was pending: the next
-          // keyframe the software road sees is not.
-          Ok(status) => {
-            if matches!(status, Sent::Accepted) {
-              if av_pkt.is_key() {
-                self.seeked = false;
-              }
-              // The hardware decodes what a submission hands it inside that
-              // submission, one thread, and libavcodec takes a packet only
-              // into an empty input slot: it has read every packet before
-              // this one.
-              self.extradata_read();
-              self.commit_sets(sets, Commit::Taken);
-              if let Some(extradata) = extradata {
-                self.took_extradata(extradata, probing, false);
-              }
-            }
-            Ok(status)
-          }
-          Err(Error::AllBackendsFailed(p)) => {
-            // **A pinned hardware session reports rather than degrades.**
-            // See [`Self::may_open_software`]: this is the exhaustion
-            // `DecodePath::Auto` reads as its cue to open software, and
-            // the pin's whole content is that it is not that cue here.
-            // Reported with the payload intact, so the caller keeps the
-            // backend, its error, and any rescued packets.
-            if !self.may_open_software() {
-              // The hardware failed on the packet, which it may have read.
-              self.commit_sets(sets, Commit::Doubt);
-              return Err(VideoDecodeError::Decode(Error::AllBackendsFailed(p)));
-            }
-            // Route on the EXPLICIT origin, never on whether `rescued` is empty (a
-            // probe-era first-packet cap trip is *also* empty).
-            if p.origin().is_post_commit() {
-              // Post-commit: DEGRADE AND CONTINUE. No lossless mid-stream
-              // reconstruction — the SW decoder opens cold, retains zero replay
-              // frames, and resyncs at the next keyframe. The current packet (the
-              // one HW REFUSED) is forwarded to that cold SW: if it is the resync
-              // keyframe SW decodes from it, otherwise SW drops it until a keyframe
-              // arrives. The bounded span from here to that keyframe is dropped — a
-              // loudly logged gap (see the `warn!`), not a silent one.
-              tracing::warn!(
-                backend = ?p.attempts().last().map(|(b, _)| *b),
-                pts = ?av_pkt.pts(),
-                "mediadecode-ffmpeg: HW decode failed post-commit; falling back to \
-                 software, resyncing at next keyframe — a bounded span of frames \
-                 may be dropped at this boundary",
-              );
-              // Transactional SW-open + current-packet forward; degrade-tracking
-              // (incl. keyframe-anchor recording) happens inside on a clean commit.
-              // A failure surfaces `FallbackFailed` and stays on HW.
-              // A clean degrade forwarded this very packet into the
-              // cold software decoder, so it was consumed.
-              // `false`: this road is unreachable once the end is
-              // committed — `send_packet_impl`'s first gate refuses
-              // every packet past `eof_sent` — so there is no EOF to
-              // re-forward, and forwarding one alongside a packet is
-              // the pairing [`PostCommitInput`] forbids.
-              let degraded = self.degrade_to_sw(PostCommitInput::Packet(av_pkt), false);
-              // The cold decoder took the packet, or the hardware, failing on
-              // it, may have read it.
-              let commit = if degraded.is_ok() {
-                Commit::Taken
-              } else {
-                Commit::Doubt
-              };
-              self.commit_sets(sets, commit);
-              if degraded.is_err() {
-                // The hardware failed on this packet, and nothing replaced it:
-                // whether it applied the new extradata the packet carries, or
-                // read a provisional one's packet, cannot be told, and it is
-                // still the decoder serving.
-                if extradata.is_some() {
-                  self.extradata_in_doubt(crate::ExtradataDoubt::HardwareFailed);
-                } else {
-                  self.reported_while_provisional(crate::ExtradataDoubt::HardwareFailed);
-                }
-              }
-              return degraded
-                .map(|()| Sent::Accepted)
-                .map_err(VideoDecodeError::Decode);
-            }
-            // Probe-era: replay the inner decoder's buffered history (lossless —
-            // no frame was delivered yet), then forward the still-unconsumed
-            // current packet to SW.
-            let rescued = p.into_unconsumed_packets();
-            // `eof_pending` is the committed EOF state — never pre-mutated here.
-            let eof_pending = self.eof_sent;
-            self
-              .fall_back_to_sw(rescued, eof_pending)
-              .map_err(VideoDecodeError::Decode)?;
-            // Forward the new (still-unconsumed) current packet to the
-            // software road — the HW decoder REFUSED it, so it was not in the
-            // replay set. It is the road's next packet like any other: a
-            // keyframe here is where the session's threads come back. A
-            // failure surfaces (it is not silently dropped), and back pressure
-            // is reported as such rather than mistaken for one: the fallback
-            // committed either way, and the caller re-offers the packet. The
-            // software road reads it against what the replay's decoder holds.
-            drop(sets);
-            self.send_on_software(av_pkt, phase)
-          }
-          Err(other) => {
-            // No refusal of the hardware's says it decoded this packet
-            // (`taken_by_hardware_despite`), and any may be an earlier
-            // packet's, a provisional extradata's unread one among them.
-            let taken = taken_by_hardware_despite(&other);
-            match taken {
-              Taken::Yes => self.extradata_read(),
-              Taken::Unknown(doubt) => self.reported_while_provisional(doubt),
-              Taken::No => {}
-            }
-            match taken {
-              Taken::Yes => self.commit_sets(sets, Commit::Read),
-              Taken::Unknown(_) => self.commit_sets(sets, Commit::Doubt),
-              Taken::No => {}
-            }
-            // The new extradata it carries is the session's where the
-            // refusal says the hardware decoded the packet, and unknown
-            // where it does not say: a decode error does not.
-            if let Some(extradata) = extradata {
-              self.refused_with_extradata(extradata, taken, probing);
-            }
-            Err(VideoDecodeError::Decode(other))
-          }
-        },
-        DecodeState::Sw(_) | DecodeState::SwClosed => {
-          drop((sets, extradata));
-          self.send_on_software(av_pkt, phase)
-        }
-      }
+      self.sent_as = None;
+      let answer = self.send_rebuilt(av_pkt, phase, probing);
+      let disposition = match self.sent_as.take() {
+        None => boundary::Disposition::Untaken,
+        Some(Commit::Taken | Commit::Read) => boundary::Disposition::Taken,
+        Some(Commit::Doubt) => boundary::Disposition::Unknown,
+      };
+      (answer, disposition)
     };
-    let submitted = boundary::with_ffmpeg_video_packet::<C, _>(
-      packet,
-      limits,
-      route,
-      &mut deferred,
-      send,
-      |answer| matches!(answer, Ok(Sent::MustDrain)),
-    );
+    let submitted =
+      boundary::with_ffmpeg_video_packet::<C, _>(packet, limits, route, &mut deferred, send);
     self.deferred = deferred;
+    // A replay that fed the end a `send_eof` left owed ended the session in
+    // this send: no packet comes to carry what waits.
+    if self.eof_sent {
+      self.deferred.abandon(boundary::Abandoned::End);
+    }
     match submitted.map_err(|e| VideoDecodeError::Decode(Error::PacketBuild(e)))? {
       boundary::Submission::NoBody => Ok(Sent::Accepted),
       boundary::Submission::Answered(answer) => answer,
+    }
+  }
+
+  /// **The packet the boundary rebuilt, on the decoder's road**: the
+  /// software road once what a fallback's replay owes is fed
+  /// ([`Self::send_on_software`]), the hardware's otherwise — its probe,
+  /// its failures and the fallbacks they open. `probing` says the hardware
+  /// records what it takes for a probe-era replay.
+  fn send_rebuilt(
+    &mut self,
+    av_pkt: &Packet,
+    phase: crate::decoder::SessionPhase,
+    probing: bool,
+  ) -> Result<Sent, VideoDecodeError> {
+    self.note_output_alpha();
+    // The software road reads the packet once what a fallback's replay owes
+    // the decoder is fed ([`Self::send_on_software`]).
+    if !matches!(self.state, DecodeState::Hw(_)) {
+      return self.send_on_software(av_pkt, phase);
+    }
+    // A body the decoder would read as a record it would not apply whole is
+    // refused before the hardware takes the packet.
+    self
+      .refuse_record_body(av_pkt)
+      .map_err(VideoDecodeError::Decode)?;
+    // What the packet's parameter sets say of the stream, read before the
+    // hardware takes it and the session's only once a decoder may have
+    // taken it ([`Self::commit_sets`]).
+    let sets = self.sets_of(av_pkt);
+    // The extradata the packet carries, copied before the hardware sees
+    // it: the stream's once it takes it.
+    let extradata = NewExtradata::of(
+      av_pkt,
+      &self.parameters,
+      self.limits.max_codec_parameter_bytes(),
+      Some(&self.held),
+    )
+    .map_err(VideoDecodeError::Decode)?;
+    match &mut self.state {
+      DecodeState::Hw(hw) => match hw.send_packet(av_pkt) {
+        // The seam already classified libavcodec's back pressure, so
+        // both states travel on unchanged. A keyframe the hardware took
+        // is the first one after a seek, if one was pending: the next
+        // keyframe the software road sees is not.
+        Ok(status) => {
+          if matches!(status, Sent::Accepted) {
+            if av_pkt.is_key() {
+              self.seeked = false;
+            }
+            // The hardware decodes what a submission hands it inside that
+            // submission, one thread, and libavcodec takes a packet only
+            // into an empty input slot: it has read every packet before
+            // this one.
+            self.extradata_read();
+            self.commit_sets(sets, Commit::Taken);
+            if let Some(extradata) = extradata {
+              self.took_extradata(extradata, probing, false);
+            }
+          }
+          Ok(status)
+        }
+        Err(Error::AllBackendsFailed(p)) => {
+          // **A pinned hardware session reports rather than degrades.**
+          // See [`Self::may_open_software`]: this is the exhaustion
+          // `DecodePath::Auto` reads as its cue to open software, and
+          // the pin's whole content is that it is not that cue here.
+          // Reported with the payload intact, so the caller keeps the
+          // backend, its error, and any rescued packets.
+          if !self.may_open_software() {
+            // The hardware failed on the packet, which it may have read, and
+            // nothing replaced it: whether it applied the new extradata the
+            // packet carries, or read a provisional one's packet, cannot be
+            // told. Unless its probe gave up before any decoder was handed
+            // the packet, which then changes nothing.
+            if !p.untaken() {
+              self.commit_sets(sets, Commit::Doubt);
+              if extradata.is_some() {
+                self.extradata_in_doubt(crate::ExtradataDoubt::HardwareFailed);
+              } else {
+                self.reported_while_provisional(crate::ExtradataDoubt::HardwareFailed);
+              }
+            }
+            return Err(VideoDecodeError::Decode(Error::AllBackendsFailed(p)));
+          }
+          // Route on the EXPLICIT origin, never on whether `rescued` is empty (a
+          // probe-era first-packet cap trip is *also* empty).
+          if p.origin().is_post_commit() {
+            // Post-commit: DEGRADE AND CONTINUE. No lossless mid-stream
+            // reconstruction — the SW decoder opens cold, retains zero replay
+            // frames, and resyncs at the next keyframe. The current packet (the
+            // one HW REFUSED) is forwarded to that cold SW: if it is the resync
+            // keyframe SW decodes from it, otherwise SW drops it until a keyframe
+            // arrives. The bounded span from here to that keyframe is dropped — a
+            // loudly logged gap (see the `warn!`), not a silent one.
+            tracing::warn!(
+              backend = ?p.attempts().last().map(|(b, _)| *b),
+              pts = ?av_pkt.pts(),
+              "mediadecode-ffmpeg: HW decode failed post-commit; falling back to \
+               software, resyncing at next keyframe — a bounded span of frames \
+               may be dropped at this boundary",
+            );
+            // Transactional SW-open + current-packet forward; degrade-tracking
+            // (incl. keyframe-anchor recording) happens inside on a clean commit.
+            // A failure surfaces `FallbackFailed` and stays on HW.
+            // A clean degrade forwarded this very packet into the
+            // cold software decoder, so it was consumed.
+            // `false`: this road is unreachable once the end is
+            // committed — `send_packet_impl`'s first gate refuses
+            // every packet past `eof_sent` — so there is no EOF to
+            // re-forward, and forwarding one alongside a packet is
+            // the pairing [`PostCommitInput`] forbids.
+            let degraded = self.degrade_to_sw(PostCommitInput::Packet(av_pkt), false);
+            // The cold decoder took the packet, or the hardware, failing on
+            // it, may have read it.
+            let commit = if degraded.is_ok() {
+              Commit::Taken
+            } else {
+              Commit::Doubt
+            };
+            self.commit_sets(sets, commit);
+            if degraded.is_err() {
+              // The hardware failed on this packet, and nothing replaced it:
+              // whether it applied the new extradata the packet carries, or
+              // read a provisional one's packet, cannot be told, and it is
+              // still the decoder serving.
+              if extradata.is_some() {
+                self.extradata_in_doubt(crate::ExtradataDoubt::HardwareFailed);
+              } else {
+                self.reported_while_provisional(crate::ExtradataDoubt::HardwareFailed);
+              }
+            }
+            return degraded
+              .map(|()| Sent::Accepted)
+              .map_err(VideoDecodeError::Decode);
+          }
+          // Probe-era: replay the inner decoder's buffered history (lossless —
+          // no frame was delivered yet), then forward the still-unconsumed
+          // current packet to SW.
+          let rescued = p.into_unconsumed_packets();
+          // `eof_pending` is the committed EOF state — never pre-mutated here.
+          let eof_pending = self.eof_sent;
+          self
+            .fall_back_to_sw(rescued, eof_pending)
+            .map_err(VideoDecodeError::Decode)?;
+          // Forward the new (still-unconsumed) current packet to the
+          // software road — the HW decoder REFUSED it, so it was not in the
+          // replay set. It is the road's next packet like any other: a
+          // keyframe here is where the session's threads come back. A
+          // failure surfaces (it is not silently dropped), and back pressure
+          // is reported as such rather than mistaken for one: the fallback
+          // committed either way, and the caller re-offers the packet. The
+          // software road reads it against what the replay's decoder holds.
+          drop(sets);
+          self.send_on_software(av_pkt, phase)
+        }
+        Err(other) => {
+          // No refusal of the hardware's says it decoded this packet
+          // (`taken_by_hardware_despite`), and any may be an earlier
+          // packet's, a provisional extradata's unread one among them.
+          let taken = taken_by_hardware_despite(&other);
+          match taken {
+            Taken::Yes => self.extradata_read(),
+            Taken::Unknown(doubt) => self.reported_while_provisional(doubt),
+            Taken::No => {}
+          }
+          match taken {
+            Taken::Yes => self.commit_sets(sets, Commit::Read),
+            Taken::Unknown(_) => self.commit_sets(sets, Commit::Doubt),
+            Taken::No => {}
+          }
+          // The new extradata it carries is the session's where the
+          // refusal says the hardware decoded the packet, and unknown
+          // where it does not say: a decode error does not.
+          if let Some(extradata) = extradata {
+            self.refused_with_extradata(extradata, taken, probing);
+          }
+          Err(VideoDecodeError::Decode(other))
+        }
+      },
+      DecodeState::Sw(_) | DecodeState::SwClosed => {
+        drop((sets, extradata));
+        self.send_on_software(av_pkt, phase)
+      }
     }
   }
 
@@ -5506,6 +5554,20 @@ fn taken_despite(raw: ffmpeg_next::Error, named: &Error, in_step: bool) -> Taken
     (ffmpeg_next::Error::Other { errno }, _) if errno == ffmpeg_next::error::EAGAIN => Taken::No,
     (_, Error::FrameBudgetExceeded(_) | Error::HwSurfaceTooLarge(_)) if in_step => Taken::Yes,
     _ => Taken::Unknown(crate::ExtradataDoubt::Reported(raw)),
+  }
+}
+
+/// **What a software decoder that decodes in step refusing a packet with
+/// `raw`, named `named`, leaves of the side data a packet with no body
+/// deferred onto it** ([`boundary::Disposition`]), read as [`taken_despite`]
+/// reads the packet: the audio and subtitle roads, whose decoders decode
+/// what a call hands them inside that call and keep no extradata state of
+/// their own to leave in doubt.
+pub(crate) fn refused_in_step(raw: ffmpeg_next::Error, named: &Error) -> boundary::Disposition {
+  match taken_despite(raw, named, true) {
+    Taken::Yes => boundary::Disposition::Taken,
+    Taken::No => boundary::Disposition::Untaken,
+    Taken::Unknown(_) => boundary::Disposition::Unknown,
   }
 }
 

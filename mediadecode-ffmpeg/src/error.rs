@@ -851,6 +851,11 @@ pub struct AllBackendsFailed {
   /// Whether this was raised during the probe or post-commit. The wrapper's
   /// fallback replay routes on this, never on `unconsumed_packets` emptiness.
   origin: FallbackOrigin,
+  /// Whether no decoder was handed the packet whose send raised this: the
+  /// probe's history could not record it — its side data entries, its
+  /// bytes or its clone — and gave up before any decoder took it
+  /// ([`Self::before_any_decoder`]).
+  untaken: bool,
 }
 
 impl AllBackendsFailed {
@@ -868,6 +873,20 @@ impl AllBackendsFailed {
       attempts,
       unconsumed_packets,
       origin: FallbackOrigin::Probe,
+      untaken: false,
+    }
+  }
+  /// [`Self::new`], raised by a send whose packet no decoder was handed: the
+  /// probe's history could not record it, and the probe gave up before the
+  /// decoder took it ([`crate::VideoDecoder::send_packet`]).
+  #[inline]
+  pub(crate) fn before_any_decoder(
+    attempts: Vec<(Backend, Box<Error>)>,
+    unconsumed_packets: Vec<Packet>,
+  ) -> Self {
+    Self {
+      untaken: true,
+      ..Self::new(attempts, unconsumed_packets)
     }
   }
   /// Constructs a post-commit [`AllBackendsFailed`] payload — raised after the
@@ -881,6 +900,7 @@ impl AllBackendsFailed {
       attempts,
       unconsumed_packets: Vec::new(),
       origin: FallbackOrigin::PostCommit,
+      untaken: false,
     }
   }
   /// Per-backend errors collected during probing, in the order tried.
@@ -893,6 +913,13 @@ impl AllBackendsFailed {
   #[inline]
   pub const fn origin(&self) -> FallbackOrigin {
     self.origin
+  }
+  /// Whether no decoder was handed the packet whose send raised this
+  /// ([`Self::before_any_decoder`]). Otherwise a decoder may have read it
+  /// before it failed.
+  #[inline]
+  pub(crate) const fn untaken(&self) -> bool {
+    self.untaken
   }
   /// Packets the decoder consumed from the caller before exhaustion.
   /// Replay them through a software decoder for non-seekable inputs.

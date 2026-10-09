@@ -12892,3 +12892,427 @@ fn a_second_set_too_long_to_keep_replaces_the_first(
     assert!(outputs_alpha, "FFmpeg reads the set as alpha");
   }
 }
+
+// ---------------------------------------------------------------------------
+//  R21 row 1: what a packet with no body deferred goes as its carrier goes
+// ---------------------------------------------------------------------------
+
+/// A four-byte `avcC` stream of 16 frames (128x96); a packet with no body
+/// carrying, as `AV_PKT_DATA_NEW_EXTRADATA`, the four-byte `avcC` record of
+/// a second stream (160x96); a packet whose body FFmpeg's H.264 decoder
+/// reads as an `avcC` record it would apply only in part — an SPS it skips,
+/// its id read out of range (h264_ps.c:317-322) — and the second stream,
+/// framed by its record. Answers that clip and the clip FFmpeg decodes as
+/// the session should: the first stream, then the second with its record on
+/// its IDR, the refused packet absent.
+fn h264_record_deferred_across_a_refused_body() -> (SyntheticClip, SyntheticClip) {
+  let (a, sps, pps) = encode_h264_avcc(128, 96, 16);
+  let (b, b_sps, b_pps) = encode_h264_avcc(160, 96, 16);
+  let record = avcc(&b_sps, &b_pps, 4);
+  let mut bad_sps = sps.clone();
+  bad_sps[4] = 0x04;
+  let mut clip = a.packets.clone();
+  let mut reference = a.packets.clone();
+  clip.push(with_new_extradata(Packet::empty(), &record));
+  clip.push(Packet::copy(&avcc(&bad_sps, &pps, 4)));
+  for (index, packet) in b.packets.iter().enumerate() {
+    let mut moved = repacked(packet, packet.data().expect("a payload"));
+    moved.set_pts(packet.pts().map(|pts| pts + 16));
+    moved.set_dts(packet.dts().map(|dts| dts + 16));
+    clip.push(repacked(&moved, moved.data().expect("a payload")));
+    if index == 0 {
+      moved = with_new_extradata(moved, &record);
+    }
+    reference.push(moved);
+  }
+  (
+    SyntheticClip {
+      parameters: a.parameters.clone(),
+      packets: clip,
+    },
+    SyntheticClip {
+      parameters: a.parameters,
+      packets: reference,
+    },
+  )
+}
+
+/// LAW (R21 row 1; Codex R20 [high]): **a record a packet with no body
+/// deferred waits through a packet refused before any decoder saw it, and
+/// rides the packet after it.** A four-byte `avcC` stream; a packet with no
+/// body carrying a second stream's record (16); a packet whose body FFmpeg
+/// would read as a record it applies only in part, refused by name before
+/// any decoder sees it (17, `refuse_record_body`: `ExtradataRejected`,
+/// `Unparsed(Sequence)`); then the second stream from its IDR (18). The
+/// refused packet carried the record, and no decoder saw it
+/// (`boundary::Disposition::Untaken`): the record still waits, rides the IDR
+/// 18, and every picture comes out as FFmpeg decodes the record on the IDR —
+/// on the software road and on a probe-era fallback at 10 on three threads.
+/// Spent with the refused packet, as the boolean of R20 spent it on every
+/// answer but back pressure, the record was lost and the second stream
+/// decoded under the first's sets.
+#[test]
+fn a_record_deferred_waits_through_a_packet_refused_before_any_decoder() {
+  let (clip, reference) = h264_record_deferred_across_a_refused_body();
+  assert!(
+    clip.packets[16].data().is_none() && clip.packets[18].is_key(),
+    "16 has no body, 18 is the second stream's IDR"
+  );
+  let reference = ffmpeg_decodes(&reference);
+  assert_eq!(reference.len(), 32, "FFmpeg's decode is whole");
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let refused = |errors: &[String]| {
+    errors.len() == 1
+      && errors[0].starts_with("send 17:")
+      && errors[0].contains("ExtradataRejected")
+      && errors[0].contains("Unparsed")
+  };
+
+  let software = FfmpegVideoStreamDecoder::open_as(
+    clip.parameters.clone(),
+    tb,
+    DecoderLimits::default().with_threads(crate::Threads::Single),
+    DecodePath::Software,
+  )
+  .expect("the software road opens");
+  let mut waiting = Vec::new();
+  let session = session_of(software, &clip, |index, dec| {
+    if index == 18 || index == 19 {
+      waiting.push(dec.deferred_kinds_for_test());
+    }
+  });
+  assert!(
+    refused(&session.errors),
+    "software: the body refused by name, the only error: {:?}",
+    session.errors
+  );
+  assert!(
+    session.pictures == reference,
+    "software: every picture, as FFmpeg decodes the record on the IDR"
+  );
+  assert_eq!(
+    waiting,
+    vec![vec![NEW_EXTRADATA], Vec::new()],
+    "software: the record waits through 17, then rides 18"
+  );
+
+  let three = core::num::NonZeroU32::new(3).expect("nonzero");
+  let session = session_of(
+    behind_a_probe(&clip, 10, crate::Threads::Count(three)),
+    &clip,
+    |_, _| {},
+  );
+  assert!(
+    refused(&session.errors),
+    "a probe-era fallback: the body refused by name, the only error: {:?}",
+    session.errors
+  );
+  assert!(
+    session.pictures == reference,
+    "a probe-era fallback: every picture, as FFmpeg decodes the record on the IDR"
+  );
+}
+
+/// A hardware seam decoding with FFmpeg's own software decoder on one thread
+/// whose probe gives up on the packet it would take as its `gives_up_at`-th:
+/// its history cannot record it — too many side data entries, too many
+/// bytes, a clone that failed — and it gives up before any decoder is handed
+/// it, as `VideoDecoder::send_packet`'s pre-flight does
+/// (`AllBackendsFailed::before_any_decoder`). The probe ends there, or at its
+/// first picture out; the packet offered again is taken.
+struct SoftwareHw {
+  sw: super::SwDecoder,
+  refusals: super::Refusals,
+  taken: usize,
+  gives_up_at: usize,
+  probing: bool,
+  history: Vec<Packet>,
+}
+
+impl SoftwareHw {
+  fn giving_up_at(parameters: &Parameters, gives_up_at: usize) -> Self {
+    let one_thread = DecoderLimits::default().with_threads(crate::Threads::Single);
+    Self {
+      sw: super::open_sw_decoder(parameters, one_thread, None).expect("FFmpeg's decoder"),
+      refusals: super::Refusals::default(),
+      taken: 0,
+      gives_up_at,
+      probing: true,
+      history: Vec::new(),
+    }
+  }
+}
+
+impl HwInner for SoftwareHw {
+  fn records_submissions(&self) -> bool {
+    self.probing
+  }
+
+  fn send_packet(&mut self, packet: &Packet) -> Result<Sent, Error> {
+    if self.probing && self.taken == self.gives_up_at {
+      self.probing = false;
+      return Err(Error::AllBackendsFailed(
+        crate::error::AllBackendsFailed::before_any_decoder(
+          Vec::new(),
+          core::mem::take(&mut self.history),
+        ),
+      ));
+    }
+    match self.sw.submit(packet, &mut self.refusals) {
+      Ok(()) => {
+        self.taken += 1;
+        if self.probing {
+          self
+            .history
+            .push(crate::decoder::try_clone_packet(packet).expect("a clone"));
+        }
+        Ok(Sent::Accepted)
+      }
+      Err(ffmpeg_next::Error::Other { errno }) if errno == ffmpeg_next::error::EAGAIN => {
+        Ok(Sent::MustDrain)
+      }
+      Err(error) => Err(Error::Ffmpeg(error)),
+    }
+  }
+
+  fn receive_frame(&mut self, frame: &mut Frame) -> Result<Received, Error> {
+    match self.sw.receive(frame.as_inner_mut(), &mut self.refusals) {
+      Ok(()) => {
+        self.probing = false;
+        Ok(Received::Frame)
+      }
+      Err(ffmpeg_next::Error::Other { errno }) if errno == ffmpeg_next::error::EAGAIN => {
+        Ok(Received::NeedsInput)
+      }
+      Err(ffmpeg_next::Error::Eof) => Ok(Received::Ended),
+      Err(error) => Err(Error::Ffmpeg(error)),
+    }
+  }
+
+  fn send_eof(&mut self) -> Result<Sent, Error> {
+    self
+      .sw
+      .send_eof(&mut self.refusals)
+      .map(|()| Sent::Accepted)
+      .map_err(Error::Ffmpeg)
+  }
+
+  fn flush(&mut self) -> Result<(), Error> {
+    self.sw.flush();
+    Ok(())
+  }
+
+  fn as_video_decoder(&self) -> Option<&VideoDecoder> {
+    None
+  }
+}
+
+/// LAW (R21 row 1; Codex R20 [high]): **a record a packet with no body
+/// deferred waits through a packet the hardware's probe gave up on before
+/// any decoder was handed it, and rides it offered again.** A session opened
+/// on a `libx264` stream's record (128x96, SPS and PPS 0) is sent a packet
+/// with no body carrying a second stream's record (160x96, SPS and PPS 0),
+/// then that stream from its IDR. On a hardware road pinned to its backend,
+/// its probe gives up on the IDR — the history could not record it: too many
+/// side data entries, too many bytes, or its clone failed, the three
+/// pre-flight refusals of `VideoDecoder::send_packet`, each answering
+/// `AllBackendsFailed::before_any_decoder` — and the session reports the
+/// exhaustion, nothing of the stream changed (`Disposition::Untaken`). The
+/// record still waits, rides the IDR the caller offers again, and every
+/// picture comes out as FFmpeg decodes the record on the IDR. On the
+/// session's own road the probe's exhaustion opens software, which takes
+/// the IDR carrying the record within the same send. Spent with the refused
+/// IDR, as R20 spent it, the second stream decoded under the first's sets.
+#[test]
+fn a_record_deferred_waits_through_a_packet_the_probe_gave_up_on() {
+  let params = "keyint=8:min-keyint=8:scenecut=0:bframes=2:b-adapt=0:open-gop=0:log-level=error";
+  let a = encode_h264_global(128, 96, 16, params);
+  let b = encode_h264_global(160, 96, 16, params);
+  let record = extradata_of(&b.parameters);
+  let mut packets = vec![with_new_extradata(Packet::empty(), &record)];
+  packets.extend(b.packets.iter().cloned());
+  let clip = SyntheticClip {
+    parameters: a.parameters.clone(),
+    packets,
+  };
+  let mut on_the_idr = b.packets.clone();
+  on_the_idr[0] = with_new_extradata(
+    repacked(&b.packets[0], b.packets[0].data().expect("a payload")),
+    &record,
+  );
+  let reference = ffmpeg_decodes(&SyntheticClip {
+    parameters: a.parameters.clone(),
+    packets: on_the_idr,
+  });
+  assert_eq!(reference.len(), 16, "FFmpeg's decode is whole");
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+
+  // Pinned: the exhaustion reported, the IDR offered again.
+  let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test_as(
+    Box::new(SoftwareHw::giving_up_at(&clip.parameters, 0)),
+    clip.parameters.clone(),
+    tb,
+    DecodePath::Hardware(Backend::VideoToolbox),
+  )
+  .expect("build a pinned test decoder");
+  let mut dst = crate::empty_owned_video_frame();
+  let mut pictures: Vec<Picture> = Vec::new();
+  let mut exhausted = 0;
+  let mut waiting = Vec::new();
+  let mut drain = |dec: &mut FfmpegVideoStreamDecoder, pictures: &mut Vec<Picture>| loop {
+    match dec.receive_frame(&mut dst) {
+      Ok(Received::Frame) => pictures.push((
+        dst.pts().map_or(i64::MIN, |t| t.pts()),
+        dst
+          .planes()
+          .iter()
+          .map(|plane| plane.data_ref().as_ref().to_vec())
+          .collect(),
+      )),
+      Ok(Received::NeedsInput | Received::Ended) => break,
+      Err(error) => panic!("receive: {error:?}"),
+    }
+  };
+  for (index, av_pkt) in clip.packets.iter().enumerate() {
+    loop {
+      match dec.send_packet(&pushed(av_pkt)) {
+        Ok(Sent::Accepted) => break,
+        Ok(Sent::MustDrain) => drain(&mut dec, &mut pictures),
+        Err(VideoDecodeError::Decode(Error::AllBackendsFailed(_))) if index == 1 => {
+          exhausted += 1;
+          waiting.push(dec.deferred_kinds_for_test());
+        }
+        Err(error) => panic!("send {index}: {error:?}"),
+      }
+    }
+    drain(&mut dec, &mut pictures);
+  }
+  crate::accepted(dec.send_eof(), "send_eof");
+  drain(&mut dec, &mut pictures);
+  assert_eq!(exhausted, 1, "pinned: the probe gave up on the IDR once");
+  assert!(
+    pictures == reference,
+    "pinned: every picture, as FFmpeg decodes the record on the IDR"
+  );
+  assert_eq!(
+    waiting,
+    vec![vec![NEW_EXTRADATA]],
+    "pinned: the record still waits"
+  );
+  assert!(
+    dec.extradata_unknown_for_test().is_none(),
+    "pinned: nothing in doubt, no decoder saw the IDR"
+  );
+
+  // The session's own road: software opened at the exhaustion takes the IDR
+  // carrying the record.
+  let auto = FfmpegVideoStreamDecoder::from_hw_inner_for_test(
+    Box::new(SoftwareHw::giving_up_at(&clip.parameters, 0)),
+    clip.parameters.clone(),
+    tb,
+  )
+  .expect("build test decoder");
+  let session = session_of(auto, &clip, |_, _| {});
+  assert!(
+    session.errors.is_empty(),
+    "the session's road: nothing refused: {:?}",
+    session.errors
+  );
+  assert!(
+    session.pictures == reference,
+    "the session's road: every picture, as FFmpeg decodes the record on the IDR"
+  );
+}
+
+/// LAW (R21 row 1; Codex R20 [high]): **a record a packet with no body
+/// deferred onto a packet whose read cannot be told is spent with it, and in
+/// doubt as the packet's own record would be.** Two `libx264` streams, the
+/// second's record on a packet with no body between them (16), the second's
+/// IDR (17) taken by the software decoder and reported failed with invalid
+/// data, which does not say whether FFmpeg's decoder applied the record
+/// (`taken_despite`; `boundary::Disposition::Unknown`): nothing waits after
+/// it, and the session's extradata is unknown, as it is for a record the IDR
+/// carried itself. On a hardware road pinned to its backend, the hardware
+/// failing on the IDR — no probe that gave up before any decoder, but a
+/// failure of a decoder that may have read it — the same: the exhaustion
+/// reported, nothing waits, the extradata unknown (`HardwareFailed`).
+#[test]
+fn a_record_deferred_onto_a_packet_whose_read_is_unknown_is_spent_and_in_doubt() {
+  let params = "keyint=8:min-keyint=8:scenecut=0:bframes=2:b-adapt=0:open-gop=0:log-level=error";
+  let (a, b) = (
+    encode_h264_global(128, 96, 16, params),
+    encode_h264_global(160, 96, 16, params),
+  );
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  for carried in [Carried::Record, Carried::Next] {
+    let clip = with_the_next_sets_in_band(&a, &b, carried);
+    let idr = if carried == Carried::Record { 17 } else { 16 };
+    let software = FfmpegVideoStreamDecoder::open_as(
+      clip.parameters.clone(),
+      tb,
+      DecoderLimits::default().with_threads(crate::Threads::Single),
+      DecodePath::Software,
+    )
+    .expect("the software road opens");
+    let mut after = None;
+    let session = session_of(software, &clip, |index, dec| {
+      if index == idr {
+        dec.fail_next_packet_for_test();
+      }
+      if index == idr + 1 {
+        after = Some((
+          dec.deferred_kinds_for_test(),
+          dec.extradata_unknown_for_test(),
+        ));
+      }
+    });
+    assert!(
+      session.errors.len() == 1 && session.errors[0].starts_with(&format!("send {idr}:")),
+      "{carried:?}: the IDR reported failed, the only error: {:?}",
+      session.errors
+    );
+    assert_eq!(
+      after,
+      Some((
+        Vec::new(),
+        Some(crate::ExtradataDoubt::Reported(
+          ffmpeg_next::Error::InvalidData
+        ))
+      )),
+      "{carried:?}: nothing waits, the record in doubt"
+    );
+  }
+
+  let clip = with_the_next_sets_in_band(&a, &b, Carried::Record);
+  let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test_as(
+    Box::new(FakeHw::failing(
+      128,
+      96,
+      usize::MAX,
+      16,
+      FailShape::ProbeEra,
+    )),
+    clip.parameters.clone(),
+    tb,
+    DecodePath::Hardware(Backend::VideoToolbox),
+  )
+  .expect("build a pinned test decoder");
+  for av_pkt in &clip.packets[..17] {
+    crate::accepted(dec.send_packet(&pushed(av_pkt)), "the hardware takes it");
+  }
+  assert!(
+    matches!(
+      dec.send_packet(&pushed(&clip.packets[17])),
+      Err(VideoDecodeError::Decode(Error::AllBackendsFailed(_)))
+    ),
+    "pinned: the exhaustion reported at the IDR"
+  );
+  assert_eq!(
+    (
+      dec.deferred_kinds_for_test(),
+      dec.extradata_unknown_for_test()
+    ),
+    (Vec::new(), Some(crate::ExtradataDoubt::HardwareFailed)),
+    "pinned: nothing waits, the record in doubt"
+  );
+}

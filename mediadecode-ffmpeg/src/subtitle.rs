@@ -243,15 +243,19 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierSubtitleStreamDecoder<C
       // A packet with no body is not submitted: its side data rides the
       // next packet with one ([`Self::deferred`]).
       &mut self.deferred,
-      |av_pkt| {
-        decoder.decode(av_pkt, scratch).map_err(|e| {
+      // The inline decode answers no back pressure — a held cue was refused
+      // above, before the packet was rebuilt — so what rode the packet is
+      // spent with it, but where its refusal says no decoder saw it
+      // ([`boundary::Disposition`]).
+      |av_pkt| match decoder.decode(av_pkt, scratch) {
+        Ok(got) => (Ok(got), boundary::Disposition::Taken),
+        Err(e) => {
           // SAFETY: the callback state outlives this decoder.
-          SubtitleDecodeError::Decode(crate::decoder::software_exit(unsafe { &*state }, e))
-        })
+          let named = crate::decoder::software_exit(unsafe { &*state }, e);
+          let disposition = crate::video::refused_in_step(e, &named);
+          (Err(SubtitleDecodeError::Decode(named)), disposition)
+        }
       },
-      // The inline decode answers no back pressure: a held cue was refused
-      // above, before the packet was rebuilt.
-      |_| false,
     )
     .map_err(|e| SubtitleDecodeError::Decode(Error::PacketBuild(e)))?;
     let got = match submitted {

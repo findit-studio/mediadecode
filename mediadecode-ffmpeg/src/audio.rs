@@ -210,15 +210,21 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierAudioStreamDecoder<C> {
         // Funnel, then gate — the same two steps the receive road
         // takes. A frame the allocator judge refused surfaces named,
         // not as the `EINVAL` a corrupt file also produces; whatever
-        // survives the funnel is read for back pressure.
+        // survives the funnel is read for back pressure. What rode the
+        // packet goes as the packet went ([`boundary::Disposition`]):
+        // taken, back pressure, or a refusal read as the video road reads
+        // one.
         match decoder.send_packet(av_pkt) {
-          Ok(()) => Ok(Sent::Accepted),
-          Err(e) => {
-            crate::decoder::software_send(state, e, phase).map_err(AudioDecodeError::Decode)
-          }
+          Ok(()) => (Ok(Sent::Accepted), boundary::Disposition::Taken),
+          Err(e) => match crate::decoder::software_send(state, e, phase) {
+            Ok(sent) => (Ok(sent), boundary::Disposition::Untaken),
+            Err(named) => {
+              let disposition = crate::video::refused_in_step(e, &named);
+              (Err(AudioDecodeError::Decode(named)), disposition)
+            }
+          },
         }
       },
-      |answer| matches!(answer, Ok(Sent::MustDrain)),
     )
     .map_err(|e| AudioDecodeError::Decode(Error::PacketBuild(e)))?;
     match submitted {
