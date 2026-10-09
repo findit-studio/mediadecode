@@ -2179,28 +2179,8 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     pkt: &Packet,
     phase: crate::decoder::SessionPhase,
   ) -> Result<Sent, VideoDecodeError> {
-    // An error the drain has not reported yet comes before anything more.
-    if self.deferred_error.is_some() {
-      return Ok(Sent::MustDrain);
-    }
-    // A fallback's replay left packets to feed: they come before this one.
-    let replayed = self.replay_pending();
-    // It fed the end of the stream a `send_eof` left owed: the session has
-    // ended, and this packet comes after it. An error the replay met waits
-    // for the drain.
-    if self.eof_sent {
-      if let Err(error) = replayed {
-        self.deferred_error = Some(error);
-      }
-      return Err(Self::after_eof());
-    }
-    match replayed {
-      Ok(true) => {}
-      Ok(false) => return Ok(Sent::MustDrain),
-      Err(error) => {
-        self.deferred_error = Some(error);
-        return Ok(Sent::MustDrain);
-      }
+    if let Some(answer) = self.feed_what_is_owed() {
+      return answer;
     }
     // The packet comes after every packet the replay fed: it is read against
     // what the decoder holds once it has read them.
@@ -2382,6 +2362,40 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       self.count_degraded_packet();
     }
     Ok(Sent::Accepted)
+  }
+
+  /// **What a fallback's replay owes the decoder serving, fed before the
+  /// session reads anything the caller sends next** — a packet with a body,
+  /// or the record a packet with no body carries — so that it is read against
+  /// every packet before it, in stream order ([`Self::replay_pending`]): an
+  /// error the drain has not reported comes first, and a replay that cannot
+  /// complete now answers back pressure, the packet untaken. `None` where
+  /// nothing is owed, or all of it was fed; the end of the stream, where the
+  /// replay fed the end a `send_eof` left owed and the packet comes after it.
+  fn feed_what_is_owed(&mut self) -> Option<Result<Sent, VideoDecodeError>> {
+    // An error the drain has not reported yet comes before anything more.
+    if self.deferred_error.is_some() {
+      return Some(Ok(Sent::MustDrain));
+    }
+    // A fallback's replay left packets to feed: they come before this one.
+    let replayed = self.replay_pending();
+    // It fed the end of the stream a `send_eof` left owed: the session has
+    // ended, and this packet comes after it. An error the replay met waits
+    // for the drain.
+    if self.eof_sent {
+      if let Err(error) = replayed {
+        self.deferred_error = Some(error);
+      }
+      return Some(Err(Self::after_eof()));
+    }
+    match replayed {
+      Ok(true) => None,
+      Ok(false) => Some(Ok(Sent::MustDrain)),
+      Err(error) => {
+        self.deferred_error = Some(error);
+        Some(Ok(Sent::MustDrain))
+      }
+    }
   }
 
   /// **A switch to the session's threads declined**: no decoder could be
@@ -3978,6 +3992,17 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       return Ok(Sent::MustDrain);
     }
     let phase = self.phase();
+    // What a fallback's replay owes the decoder is fed first: the packet — its
+    // body, or the record a packet with no body carries, judged and folded
+    // below — is read against every packet before it, in stream order. A
+    // replay that cannot complete now answers back pressure, nothing of the
+    // packet taken or deferred.
+    if let Some(answer) = self.feed_what_is_owed() {
+      if self.eof_sent {
+        self.deferred.abandon(boundary::Abandoned::End);
+      }
+      return answer;
+    }
     // A packet with no body is handed to no decoder: its side data waits for
     // the next packet with one ([`Self::deferred`]), a new extradata among it
     // judged now as it will be judged there and folded into the record that

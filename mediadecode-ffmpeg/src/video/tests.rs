@@ -13548,3 +13548,223 @@ fn a_record_of_no_bytes_folds_nothing_and_a_packet_s_own_record_folds_after() {
     "every picture, as FFmpeg decodes the whole record on the IDR; differing: {differ:?}"
   );
 }
+
+// ---------------------------------------------------------------------------
+//  R21 row 3: a record with no body is judged after every earlier packet
+// ---------------------------------------------------------------------------
+
+/// LAW (R21 row 3; Codex R20 [high]): **a record a packet with no body
+/// carries is judged after every packet before it, a fallback's replay fed
+/// first.** An H.264 stream (128x96, SPS and PPS 0) whose last packet, no
+/// keyframe, carries a second stream's SPS 15 ahead of its own units; a
+/// packet with no body carrying that stream's PPS 15 alone, which refers to
+/// SPS 15; then the second stream, its IDR referring to PPS 15. The hardware
+/// takes the first stream and exhausts at the receive after it: the
+/// probe-era fallback's replay stops at its budget, two and a half pictures,
+/// the packet carrying SPS 15 unfed, and the receive answers "needs input".
+/// Sent then, the packet with no body feeds what the replay owes before its
+/// record is judged — back pressure while the replay cannot complete — and
+/// the record, read against SPS 15, is taken and rides the IDR: every
+/// picture comes out as FFmpeg decodes the clip with PPS 15 on the IDR.
+/// Judged before the replay, against sets without SPS 15, the record was
+/// refused `Unresolved` and the second stream lost.
+#[test]
+fn a_record_with_no_body_is_judged_after_the_replay_feeds_the_packets_before_it() {
+  let params = "keyint=8:min-keyint=8:scenecut=0:bframes=2:b-adapt=0:open-gop=0:log-level=error";
+  let a = encode_h264_global(128, 96, 16, params);
+  let b = encode_h264_global(128, 96, 16, &format!("{params}:sps-id=15"));
+  let b_sets = extradata_of(&b.parameters);
+  let (sps, pps) = (
+    h264_units_of_kind(&b_sets, 7),
+    h264_units_of_kind(&b_sets, 8),
+  );
+  assert!(!sps.is_empty() && !pps.is_empty(), "SPS and PPS 15");
+  let mut first = a.packets.clone();
+  let last = first.len() - 1;
+  assert!(
+    !first[last].is_key(),
+    "the first stream's last packet is no keyframe"
+  );
+  let data = first[last].data().expect("a payload").to_vec();
+  first[last] = repacked(&a.packets[last], &[&sps[..], &data[..]].concat());
+  let with_sps = SyntheticClip {
+    parameters: a.parameters.clone(),
+    packets: first,
+  };
+  let clip = with_records_between(&with_sps, &[&pps], &b, None);
+  let reference = ffmpeg_decodes(&with_records_between(&with_sps, &[], &b, Some(&pps)));
+  assert_eq!(reference.len(), 32, "FFmpeg's decode is whole");
+
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test(
+    Box::new(FakeHw::failing_at_receive(128, 96)),
+    clip.parameters.clone(),
+    tb,
+  )
+  .expect("build test decoder")
+  .with_threads_for_test(crate::Threads::Single)
+  .with_max_replay_bytes_for_test(picture_bytes(&clip) * 5 / 2);
+  let mut dst = crate::empty_owned_video_frame();
+  let mut pictures: Vec<Picture> = Vec::new();
+  let mut errors = Vec::new();
+  let mut drain = |dec: &mut FfmpegVideoStreamDecoder,
+                   pictures: &mut Vec<Picture>,
+                   errors: &mut Vec<String>| loop {
+    match dec.receive_frame(&mut dst) {
+      Ok(Received::Frame) => pictures.push((
+        dst.pts().map_or(i64::MIN, |t| t.pts()),
+        dst
+          .planes()
+          .iter()
+          .map(|plane| plane.data_ref().as_ref().to_vec())
+          .collect(),
+      )),
+      Ok(Received::NeedsInput | Received::Ended) => break,
+      Err(error) => errors.push(format!("receive: {error:?}")),
+    }
+  };
+  for av_pkt in &clip.packets[..16] {
+    crate::accepted(dec.send_packet(&pushed(av_pkt)), "the hardware takes it");
+  }
+  // The receive that falls back: the replay stops at its budget.
+  drain(&mut dec, &mut pictures, &mut errors);
+  assert!(
+    dec.pending_history.len() >= 2,
+    "the replay stopped with the packet carrying SPS 15 unfed: {} left",
+    dec.pending_history.len()
+  );
+  let mut held_back = 0;
+  for (index, av_pkt) in clip.packets.iter().enumerate().skip(16) {
+    loop {
+      match dec.send_packet(&pushed(av_pkt)) {
+        Ok(Sent::Accepted) => break,
+        Ok(Sent::MustDrain) => {
+          if index == 16 {
+            held_back += 1;
+          }
+          drain(&mut dec, &mut pictures, &mut errors);
+        }
+        Err(error) => {
+          errors.push(format!("send {index}: {error:?}"));
+          break;
+        }
+      }
+    }
+    drain(&mut dec, &mut pictures, &mut errors);
+  }
+  crate::accepted(dec.send_eof(), "send_eof");
+  drain(&mut dec, &mut pictures, &mut errors);
+  assert!(errors.is_empty(), "nothing refused: {errors:?}");
+  assert!(
+    pictures == reference,
+    "every picture, as FFmpeg decodes the clip with PPS 15 on the IDR"
+  );
+  assert!(
+    held_back >= 1,
+    "the packet with no body waited for the replay"
+  );
+}
+
+/// LAW (R21 row 3; Codex R20 [high]): **a packet's own record is folded
+/// after the record that waits, against every packet before it, a
+/// fallback's replay fed first.** An H.264 stream (128x96, SPS and PPS 0)
+/// whose last packet carries, after its own units, a second stream's SPS 0
+/// (160x96) — FFmpeg's PPS 0 stays bound to the first's (h264_ps.c:731-738);
+/// a packet with no body carrying the second's PPS 0, judged on the
+/// hardware against the SPS that packet brought, and waiting; the hardware
+/// exhausts at the receive after it, its probe-era replay stopping at two
+/// and a half pictures with the packet carrying the SPS unfed; then the
+/// second stream, its IDR carrying the second's SPS 0 again as its own
+/// record. The IDR feeds what the replay owes before its record is folded
+/// after the one that waits: the PPS bound to the second's SPS, the record
+/// that rides gives the decoder both, and every picture comes out as FFmpeg
+/// decodes the clip with the second's record on the IDR. Folded before the
+/// replay, against sets without the second's SPS, the PPS was bound to the
+/// first's, which the IDR's SPS supersedes: no record carried that
+/// (`Superseded`), and the IDR was refused by name.
+#[test]
+fn a_packet_s_own_record_is_folded_after_the_replay_feeds_the_packets_before_it() {
+  let params = "keyint=8:min-keyint=8:scenecut=0:bframes=2:b-adapt=0:open-gop=0:log-level=error";
+  let a = encode_h264_global(128, 96, 16, params);
+  let b = encode_h264_global(160, 96, 16, params);
+  let sets = extradata_of(&b.parameters);
+  let (sps, pps) = (h264_units_of_kind(&sets, 7), h264_units_of_kind(&sets, 8));
+  let mut first = a.packets.clone();
+  let last = first.len() - 1;
+  let data = first[last].data().expect("a payload").to_vec();
+  first[last] = repacked(&a.packets[last], &[&data[..], &sps[..]].concat());
+  let with_sps = SyntheticClip {
+    parameters: a.parameters.clone(),
+    packets: first,
+  };
+  let clip = with_records_between(&with_sps, &[&pps], &b, Some(&sps));
+  let reference = ffmpeg_decodes(&with_records_between(&with_sps, &[], &b, Some(&sets)));
+  assert_eq!(reference.len(), 32, "FFmpeg's decode is whole");
+
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test(
+    Box::new(FakeHw::failing_at_receive(128, 96)),
+    clip.parameters.clone(),
+    tb,
+  )
+  .expect("build test decoder")
+  .with_threads_for_test(crate::Threads::Single)
+  .with_max_replay_bytes_for_test(picture_bytes(&clip) * 5 / 2);
+  let mut dst = crate::empty_owned_video_frame();
+  let mut pictures: Vec<Picture> = Vec::new();
+  let mut errors = Vec::new();
+  let mut drain = |dec: &mut FfmpegVideoStreamDecoder,
+                   pictures: &mut Vec<Picture>,
+                   errors: &mut Vec<String>| loop {
+    match dec.receive_frame(&mut dst) {
+      Ok(Received::Frame) => pictures.push((
+        dst.pts().map_or(i64::MIN, |t| t.pts()),
+        dst
+          .planes()
+          .iter()
+          .map(|plane| plane.data_ref().as_ref().to_vec())
+          .collect(),
+      )),
+      Ok(Received::NeedsInput | Received::Ended) => break,
+      Err(error) => errors.push(format!("receive: {error:?}")),
+    }
+  };
+  for av_pkt in &clip.packets[..17] {
+    crate::accepted(
+      dec.send_packet(&pushed(av_pkt)),
+      "the hardware takes it, or the record waits",
+    );
+  }
+  assert_eq!(
+    dec.deferred_kinds_for_test(),
+    vec![NEW_EXTRADATA],
+    "the PPS waits"
+  );
+  // The receive that falls back: the replay stops at its budget.
+  drain(&mut dec, &mut pictures, &mut errors);
+  assert!(
+    dec.pending_history.len() >= 2,
+    "the replay stopped with the packet carrying the second's SPS unfed: {} left",
+    dec.pending_history.len()
+  );
+  for (index, av_pkt) in clip.packets.iter().enumerate().skip(17) {
+    loop {
+      match dec.send_packet(&pushed(av_pkt)) {
+        Ok(Sent::Accepted) => break,
+        Ok(Sent::MustDrain) => drain(&mut dec, &mut pictures, &mut errors),
+        Err(error) => {
+          errors.push(format!("send {index}: {error:?}"));
+          break;
+        }
+      }
+    }
+    drain(&mut dec, &mut pictures, &mut errors);
+  }
+  crate::accepted(dec.send_eof(), "send_eof");
+  drain(&mut dec, &mut pictures, &mut errors);
+  assert!(errors.is_empty(), "nothing refused: {errors:?}");
+  assert!(
+    pictures == reference,
+    "every picture, as FFmpeg decodes the clip with the second's record on the IDR"
+  );
+}
