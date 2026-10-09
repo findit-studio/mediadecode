@@ -425,8 +425,11 @@ fn a_media_range_whose_end_is_past_2_53_is_refused() {
     (Spot::Source(ClipAt::new(0, 0)), i128::from(TWO_53) + 1)
   );
   assert_eq!(searched(&timeline), Some(1));
-  // An available range 2^53 + 1 seconds long: it keeps the ruler its plan
-  // gives it, so no search could change it — refused before any walk.
+  // An available range 2^53 + 1 seconds long: none of its own rulers holds
+  // it whole, nor does seconds, the one ruler the timeline's operands are
+  // counted in, and every whole rate that lands on it is a multiple of a
+  // second. Refused before any walk, the search's bands tried and no plan
+  // walked: the search never moves an available range.
   let mut timeline = at_one_fps(0, 2);
   timeline.tracks_mut()[0].clips_mut()[0]
     .media_mut()
@@ -435,10 +438,11 @@ fn a_media_range_whose_end_is_past_2_53_is_refused() {
     not_representable(&timeline),
     (Spot::Available(ClipAt::new(0, 0)), i128::from(TWO_53) + 1)
   );
-  assert_eq!(searched(&timeline), None);
+  assert_eq!(searched(&timeline), Some(0));
   // The available range [2^53 - 3, 2^53 + 1), around a source range that
   // ends within 2^53: its start and its length are held, its end is not —
-  // held with them as it is planned, so refused before any walk too.
+  // held with them as it is planned, in seconds as in every ruler of the
+  // bands, so refused before any walk too.
   let mut timeline = at_one_fps(0, 2);
   let clip = &mut timeline.tracks_mut()[0].clips_mut()[0];
   clip.set_source_range(TimeRange::new(TWO_53 - 3, TWO_53 - 1, second));
@@ -449,7 +453,7 @@ fn a_media_range_whose_end_is_past_2_53_is_refused() {
     not_representable(&timeline),
     (Spot::Available(ClipAt::new(0, 0)), i128::from(TWO_53) + 1)
   );
-  assert_eq!(searched(&timeline), None);
+  assert_eq!(searched(&timeline), Some(0));
 }
 
 #[test]
@@ -636,8 +640,9 @@ fn a_refusal_to_export_says_why() {
      the timeline's operands are counted in that holds it, the 64 finest whole rates below its \
      plan's that hold it, and the 64 coarsest whole rates below its plan's that hold it"
   );
-  // A source range no ruler of the search's bands writes: refused as the
-  // timeline holds it, the bands tried and no plan walked.
+  // A source range no ruler of the search's bands writes, or an available
+  // range none of them holds whole: refused as the timeline holds it, the
+  // bands tried and no plan walked.
   assert_eq!(
     shown(Refused::NotRepresentable(NotRepresentable {
       at: Spot::Source(ClipAt::new(0, 0)),
@@ -646,7 +651,18 @@ fn a_refusal_to_export_says_why() {
       searched: Some(RulerSearch { walks: 0 }),
     })),
     "the source range of track 0, clip 0 counts 9007199254740994 ticks of 1/1 s, which \
-     OpenTimelineIO's f64 does not hold exactly, in any of the clip's own rulers or of the \
+     OpenTimelineIO's f64 does not hold exactly, in any of the range's own rulers or of the \
+     bounded search's bands, so the search walked no plan"
+  );
+  assert_eq!(
+    shown(Refused::NotRepresentable(NotRepresentable {
+      at: Spot::Available(ClipAt::new(0, 0)),
+      value: 9_007_199_254_740_993,
+      rate: Rate::hz(1),
+      searched: Some(RulerSearch { walks: 0 }),
+    })),
+    "the available range of track 0, clip 0 counts 9007199254740993 ticks of 1/1 s, which \
+     OpenTimelineIO's f64 does not hold exactly, in any of the range's own rulers or of the \
      bounded search's bands, so the search walked no plan"
   );
   assert_eq!(

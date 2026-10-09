@@ -8,15 +8,17 @@
 //! child — each count written within ±2^53, the whole numbers an `f64` holds
 //! exactly; a clip's source range in the first of its own rulers that writes
 //! it, or else in the first ruler the timeline's operands are counted in
-//! that does ([`source_plan`]) — and the walk, [`mod@derive`], forms what
-//! OpenTimelineIO derives from those counts, in its own arithmetic, holding
-//! each: a source range's end among them, which the plan leaves to the walk.
-//! Where the walk refuses a value, a search ([`settle`]) writes the clips it
-//! is formed from in other rulers that hold their source ranges — every
-//! ruler the timeline's own operands are counted in, and the finest and the
-//! coarsest whole ones below a clip's plan's — one clip one ruler at a time,
-//! and walks again; what no plan it tries holds is refused, with the last
-//! walk's refusal and what the search tried.
+//! that does ([`source_plan`]); its medium's available range likewise, in the
+//! first that holds it whole, its end with it ([`available_plan`]) — and the
+//! walk, [`mod@derive`], forms what OpenTimelineIO derives from those counts,
+//! in its own arithmetic, holding each: a source range's end among them,
+//! which the plan leaves to the walk. Where the walk refuses a value, a
+//! search ([`settle`]) writes the clips it is formed from in other rulers
+//! that hold their source ranges — every ruler the timeline's own operands
+//! are counted in, and the finest and the coarsest whole ones below a clip's
+//! plan's — one clip one ruler at a time, and walks again; what no plan it
+//! tries holds is refused, with the last walk's refusal and what the search
+//! tried.
 
 use alloc::{
   collections::BTreeSet,
@@ -112,9 +114,10 @@ enum Planned<'a> {
 }
 
 /// A track's children in OpenTimelineIO's order — items end to end, each
-/// transition between the two items it joins — each count written held
-/// within ±2^53, a clip's source range planned among the timeline's
-/// `operands` where none of its own rulers writes it ([`source_plan`]).
+/// transition between the two items it joins — each count written held within
+/// ±2^53, a clip's source range planned among the timeline's `operands` where
+/// none of its own rulers writes it ([`source_plan`]), and its medium's
+/// available range where none holds it whole ([`available_plan`]).
 ///
 /// A fade is a dissolve against a gap: a fade-in after the gap before its
 /// clip, a fade-out before the gap after it. Where the clip abuts another
@@ -192,7 +195,8 @@ fn fade_planned(fade: Fade, at: EdgeAt, edit: Ruler) -> Result<Planned<'static>,
 /// the source's length to a whole number of edit-rate ticks, so the same
 /// duration is the record's length: the clip fills exactly its record. The
 /// medium's available range, where it is known, in the first of its own
-/// rulers that holds it whole ([`available_plan`]).
+/// rulers, else of the rulers the timeline's `operands` are counted in, that
+/// holds it whole ([`available_plan`]).
 fn clip_planned<'a>(
   clip: &'a Clip,
   at: ClipAt,
@@ -207,7 +211,7 @@ fn clip_planned<'a>(
   )?;
   let available = media
     .available_range()
-    .map(|range| available_plan(range, media.rate(), Spot::Available(at)))
+    .map(|range| available_plan(range, media.rate(), Spot::Available(at), operands))
     .transpose()?;
   Ok(Planned::Clip {
     clip,
@@ -445,6 +449,10 @@ fn choices(tracks: &[Vec<Planned<'_>>], operands: &BTreeSet<Rate>) -> Vec<Choice
 /// depends on it: it is planned in one of these rates ([`source_plan`]),
 /// and the set is every clip's planned ruler, its too — planning it adds
 /// none.
+///
+/// A medium's available range gives no rate, wherever it is planned
+/// ([`available_plan`]): OpenTimelineIO derives nothing from it but its own
+/// two ends, so no operand is ever counted in its ruler.
 fn operands(laid: &Layout<'_>, edit: Ruler) -> BTreeSet<Rate> {
   let clips = laid
     .tracks()
@@ -776,7 +784,8 @@ fn own_plan(range: TimeRange, rate: Option<Rate>) -> Option<Counted> {
 ///    writes it ([`own_plan`]);
 /// 2. where none of them writes it, the first of the timeline's `operands`
 ///    that writes it, finest first, as the search runs
-///    [`RulerBand::Operands`](super::RulerBand::Operands).
+///    [`RulerBand::Operands`](super::RulerBand::Operands)
+///    ([`operand_plan`]).
 ///
 /// Its end is the walk's to hold ([`sources`]), and the search's to settle
 /// by writing the clip in a ruler of its list that holds it ([`rulers`]).
@@ -802,34 +811,69 @@ fn source_plan(
   if let Some(own) = own_plan(range, rate) {
     return Ok(own);
   }
-  let length = length_of(range);
-  let written = operands
-    .iter()
-    .rev()
-    .filter_map(|&rate| recount(range, length, rate))
-    .find(Counted::written);
-  if let Some(written) = written {
+  if let Some(written) = operand_plan(range, operands, Counted::written) {
     return Ok(written);
   }
   own_ticks(range).within(false, at, Some(RulerSearch { walks: 0 }))
 }
 
-/// The available range of a clip's medium, `range`, in the first of its own
-/// rulers ([`own_rulers`]) that holds it whole, its end held here with its
-/// start and its length: OpenTimelineIO derives nothing from it but its own
-/// two ends, and the search keeps the ruler its plan gives it. One none of
-/// them holds whole is refused with its own count past 2^53, before any
-/// walk, naming no search.
+/// The available range of a clip's medium, `range`, planned: start and
+/// length in one ruler, the first that holds it whole — its start, its
+/// length and the end they make within ±2^53:
+///
+/// 1. of its own rulers ([`own_rulers`]);
+/// 2. where none of them does, of the timeline's `operands`, finest first
+///    ([`operand_plan`]).
+///
+/// Its end is held here with its start and its length, not left to the
+/// walk: OpenTimelineIO derives nothing from an available range but its own
+/// two ends, and the search never writes it in another ruler, so no walk
+/// could change that end. Its ruler is no operand ([`operands`]).
+///
+/// As for a source range ([`source_plan`]), only a ruler at a fractional
+/// rate can hold a range none of its own rulers holds whole: every whole
+/// rate that lands on it is a multiple of its coarsest whole ruler, one of
+/// its own, and counts its start, its length and its end in that ruler's
+/// counts times the multiple, no smaller. A range none of the operands'
+/// rulers holds whole either is refused before any walk, with its own count
+/// past 2^53 — its start, its length or its end — and with the search's
+/// bands, no ruler of which holds it ([`RulerSearch::walks`] 0).
 fn available_plan(
   range: TimeRange,
   rate: Option<Rate>,
   at: Spot,
+  operands: &BTreeSet<Rate>,
 ) -> Result<Counted, NotRepresentable> {
-  let rulers = own_rulers(range, rate);
-  match rulers.into_iter().flatten().find(Counted::held) {
-    Some(whole) => Ok(whole),
-    None => own_ticks(range).within(true, at, None),
+  let own = own_rulers(range, rate)
+    .into_iter()
+    .flatten()
+    .find(Counted::held);
+  if let Some(whole) = own {
+    return Ok(whole);
   }
+  if let Some(whole) = operand_plan(range, operands, Counted::held) {
+    return Ok(whole);
+  }
+  own_ticks(range).within(true, at, Some(RulerSearch { walks: 0 }))
+}
+
+/// `range` in the first ruler the timeline's `operands` are counted in,
+/// finest first, that counts it so it `fits` — the plan's pass over
+/// [`RulerBand::Operands`](super::RulerBand::Operands) for a media-side range
+/// none of its own rulers fits: a source range none writes, its end left to
+/// the walk ([`Counted::written`]); an available range none holds whole, its
+/// end held with it ([`Counted::held`]).
+fn operand_plan(
+  range: TimeRange,
+  operands: &BTreeSet<Rate>,
+  fits: fn(&Counted) -> bool,
+) -> Option<Counted> {
+  let length = length_of(range);
+  operands
+    .iter()
+    .rev()
+    .filter_map(|&rate| recount(range, length, rate))
+    .find(fits)
 }
 
 /// A range counted in one ruler: the ruler, and the range's start and

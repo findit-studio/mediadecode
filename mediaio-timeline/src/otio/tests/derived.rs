@@ -1910,8 +1910,8 @@ fn a_source_range_no_ruler_of_the_bands_writes_is_refused_before_any_walk() {
   );
   assert!(
     refused.to_string().ends_with(
-      ", in any of the clip's own rulers or of the bounded search's bands, so the search walked \
-       no plan"
+      ", in any of the range's own rulers or of the bounded search's bands, so the search \
+       walked no plan"
     ),
     "{refused}"
   );
@@ -2001,5 +2001,191 @@ fn a_source_range_an_operand_ruler_writes_but_none_ends_is_refused_after_the_wal
       ", in the one plan the bounded search walked, trying each clip in its plan's ruler, "
     ),
     "{refused}"
+  );
+}
+
+/// `timeline`, the medium of its first track's first clip available from
+/// `from` to `to` seconds.
+fn available_from(mut timeline: Timeline, from: i64, to: i64) -> Timeline {
+  timeline.tracks_mut()[0].clips_mut()[0]
+    .media_mut()
+    .set_available_range(Some(TimeRange::new(from, to, second())));
+  timeline
+}
+
+/// The available range of the medium of track 0's first child, as `text`
+/// writes it for OpenTimelineIO 0.15 and later: its start and its duration,
+/// read.
+fn available_read(text: &str) -> (Read, Read) {
+  let root = json::parse(text).unwrap();
+  let tracks = member(&member(&root, "tracks"), "children");
+  let track = tracks.as_array().unwrap()[0].clone();
+  let clip = member(&track, "children").as_array().unwrap()[0].clone();
+  let reference = member(&member(&clip, "media_references"), "DEFAULT_MEDIA");
+  let range = member(&reference, "available_range");
+  (
+    read(&member(&range, "start_time")),
+    read(&member(&range, "duration")),
+  )
+}
+
+#[test]
+fn an_available_range_none_of_its_own_rulers_holds_is_written_in_the_edit_rate() {
+  // At one frame every two seconds, `a` plays [2^53 + 2, 2^53 + 4) seconds
+  // of a medium available over [2^53 + 2, 2^53 + 6) seconds. Its own rulers
+  // — seconds, its timebase's and its coarsest whole one — count the
+  // available range's start past 2^53. Of the rulers the timeline's operands
+  // are counted in, finest first — seconds, then the edit rate's frames —
+  // the edit rate holds it whole: from 2^52 + 1, two long, ending at
+  // 2^52 + 3. Written there, beside the source range in the same frames, it
+  // reads back as [2^53 + 2, 2^53 + 6) seconds exactly.
+  let frames = |value: i64| Read {
+    value: value as f64,
+    rate: 0.5,
+  };
+  let timeline = available_from(seconds_from(TWO_53 + 2, 2), TWO_53 + 2, TWO_53 + 6);
+  let text = to_otio(&timeline, OtioTarget::V0_15Plus).unwrap();
+  assert_eq!(validate_json(&text, OtioTarget::V0_15Plus), Ok(()));
+  let Kid::Item { start, duration } = kids(&text, 0)[0] else {
+    panic!("{text}");
+  };
+  assert_eq!((start, duration), (frames(TWO_53 / 2 + 1), frames(1)));
+  let (start, duration) = available_read(&text);
+  assert_eq!((start, duration), (frames(TWO_53 / 2 + 1), frames(2)));
+  let end = Read::end(start, duration);
+  assert_eq!(end, frames(TWO_53 / 2 + 3));
+  assert_eq!(Read::end_inclusive(start, duration), frames(TWO_53 / 2 + 2));
+  assert_eq!(
+    (start.at(1.0), end.at(1.0)),
+    ((TWO_53 + 2) as f64, (TWO_53 + 6) as f64)
+  );
+}
+
+#[test]
+fn an_available_range_its_own_rulers_cannot_end_is_written_in_the_edit_rate_apart_from_its_source()
+{
+  // At one frame every two seconds, `a` plays [2^53 - 2, 2^53) seconds,
+  // held whole in seconds, its own ruler; its medium is available over
+  // [2^53 - 2, 2^53 + 2) seconds, which seconds start within 2^53 but end
+  // past it, and no whole rate is coarser than a second. The edit rate
+  // holds the available range whole: from 2^52 - 1, two long, ending at
+  // 2^52 + 1. Each range is planned on its own — the source range keeps its
+  // seconds, the available range is written in frames — and each reads
+  // back exactly.
+  let at = |value: i64, rate: f64| Read {
+    value: value as f64,
+    rate,
+  };
+  let timeline = available_from(seconds_from(TWO_53 - 2, 2), TWO_53 - 2, TWO_53 + 2);
+  let text = to_otio(&timeline, OtioTarget::V0_15Plus).unwrap();
+  assert_eq!(validate_json(&text, OtioTarget::V0_15Plus), Ok(()));
+  let Kid::Item { start, duration } = kids(&text, 0)[0] else {
+    panic!("{text}");
+  };
+  assert_eq!((start, duration), (at(TWO_53 - 2, 1.0), at(2, 1.0)));
+  assert_eq!(Read::end(start, duration), at(TWO_53, 1.0));
+  let (start, duration) = available_read(&text);
+  assert_eq!((start, duration), (at(TWO_53 / 2 - 1, 0.5), at(2, 0.5)));
+  let end = Read::end(start, duration);
+  assert_eq!(end, at(TWO_53 / 2 + 1, 0.5));
+  assert_eq!(
+    (start.at(1.0), end.at(1.0)),
+    ((TWO_53 - 2) as f64, (TWO_53 + 2) as f64)
+  );
+}
+
+#[test]
+fn an_available_range_no_ruler_of_the_bands_holds_is_refused_before_any_walk() {
+  // At one frame every two seconds, `a` plays [2^53 + 2, 2^53 + 4) seconds
+  // of a medium available over [2^53 + 1, 2^53 + 5) seconds: seconds count
+  // the available range's start past 2^53, and the edit rate's frames do
+  // not land on its odd start. Every whole rate that lands on it is a
+  // multiple of a second, so no ruler of the bands holds it whole. The
+  // search never moves an available range: refused as the timeline holds
+  // it, with the bands tried and no walk.
+  let refused = refusal(&available_from(
+    seconds_from(TWO_53 + 2, 2),
+    TWO_53 + 1,
+    TWO_53 + 5,
+  ));
+  assert_eq!(
+    (refused.at(), refused.value(), refused.rate()),
+    (
+      Spot::Available(ClipAt::new(0, 0)),
+      i128::from(TWO_53) + 1,
+      Rate::hz(1)
+    )
+  );
+  let searched = refused.searched().unwrap();
+  assert_eq!(searched.walks(), 0);
+  assert_eq!(
+    searched.bands(),
+    [
+      RulerBand::Operands,
+      RulerBand::Finest(64),
+      RulerBand::Coarsest(64)
+    ]
+  );
+  assert!(
+    refused.to_string().ends_with(
+      ", in any of the range's own rulers or of the bounded search's bands, so the search \
+       walked no plan"
+    ),
+    "{refused}"
+  );
+  // At one frame a second, `a` plays [2^53 - 2, 2^53) seconds of a medium
+  // available over [2^53 - 2, 2^53 + 2): seconds, the one ruler the
+  // timeline's operands are counted in, end it past 2^53. Refused the same
+  // way, at its end — which the edit rate's frames hold at one frame every
+  // two seconds.
+  let at_one_fps = Timeline::new("t", Rate::hz(1)).with_track(video([placed(
+    "a",
+    TimeRange::new(TWO_53 - 2, TWO_53, second()),
+    TimeRange::new(0, 2, second()),
+  )]));
+  let refused = refusal(&available_from(at_one_fps, TWO_53 - 2, TWO_53 + 2));
+  assert_eq!(
+    (refused.at(), refused.value(), refused.rate()),
+    (
+      Spot::Available(ClipAt::new(0, 0)),
+      i128::from(TWO_53) + 2,
+      Rate::hz(1)
+    )
+  );
+  assert_eq!(refused.searched().map(|searched| searched.walks()), Some(0));
+}
+
+#[test]
+fn an_available_range_an_operand_ruler_writes_but_cannot_end_is_refused_before_any_walk() {
+  // At one frame every two seconds, `a` plays [2^53 + 2, 2^53 + 4) seconds
+  // of a medium available over [2^53 + 2, 2^54 + 2) seconds. Seconds count
+  // its start past 2^53; the edit rate's frames write its start and its
+  // length — from 2^52 + 1, 2^52 long — but end it at 2^53 + 1, past the
+  // bound. No walk reads an available range, so the plan holds its end
+  // with its start and its length: no ruler of the bands holds it whole,
+  // and it is refused before any walk.
+  let refused = refusal(&available_from(
+    seconds_from(TWO_53 + 2, 2),
+    TWO_53 + 2,
+    2 * TWO_53 + 2,
+  ));
+  assert_eq!(
+    (refused.at(), refused.value(), refused.rate()),
+    (
+      Spot::Available(ClipAt::new(0, 0)),
+      i128::from(TWO_53) + 2,
+      Rate::hz(1)
+    )
+  );
+  assert_eq!(refused.searched().map(|searched| searched.walks()), Some(0));
+  // Written in those frames, OpenTimelineIO would read its end a frame
+  // early: 2^52 + 1 and 2^52 added in its f64 make 2^53, not 2^53 + 1.
+  let frames = |value: i64| Read {
+    value: value as f64,
+    rate: 0.5,
+  };
+  assert_eq!(
+    Read::end(frames(TWO_53 / 2 + 1), frames(TWO_53 / 2)),
+    frames(TWO_53)
   );
 }

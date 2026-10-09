@@ -36,14 +36,17 @@
 //!   holds its start and its length exactly, when its counts there are
 //!   within 2^53. Of those three rulers, a range is written in the first
 //!   whose counts end it within ±2^53 too, where one does; where none does,
-//!   an available range is refused, and a source range is written in the
-//!   first that writes its start and its length, its end left to the walk
-//!   below and to the search. A source range none of the three writes is
-//!   written in the first ruler the timeline's operands are counted in that
-//!   does, finest first — one at a fractional rate, as every whole rate
-//!   that lands on a range is a multiple of the coarsest, which counts it in
-//!   the smallest counts — and refused only where none of those writes it
-//!   either;
+//!   a source range is written in the first that writes its start and its
+//!   length, its end left to the walk below and to the search. A source
+//!   range none of the three writes is written in the first ruler the
+//!   timeline's operands are counted in that does, finest first, its end
+//!   left to the walk likewise; an available range none of the three ends
+//!   within ±2^53, in the first ruler the timeline's operands are counted in
+//!   whose counts do, finest first — the walk never reads an available
+//!   range, so its end is held here. Each such ruler is at a fractional
+//!   rate, as every whole rate that lands on a range is a multiple of the
+//!   coarsest, which counts it in the smallest counts; and a range none of
+//!   them writes — or, an available range, ends within ±2^53 — is refused;
 //! - every count OpenTimelineIO derives from the document — the end of each
 //!   clip's source range, its start plus its length; each child's place on
 //!   its track, from zero in the child's own rate with every item before it
@@ -78,18 +81,18 @@
 //! the one with the finest ruler first. The guarantee is soundness: what the
 //! export writes, OpenTimelineIO reads back exactly. A timeline no plan the
 //! search walks holds, [`to_otio`] refuses ([`Refused::NotRepresentable`]),
-//! naming the value the last plan could not hold and what the search tried
-//! — its bands and its walks, none where no ruler of the bands writes a
-//! clip's source range — so a refusal says the search was bounded: a
-//! timeline only a ruler outside the bands would hold is refused by this
-//! contract, and never written to be read rounded. Where the bound has been
-//! met, counts lie near 2^53 ticks of a clip's ruler — at the rates media
-//! run at, positions thousands of years in: 2^53 ticks are some 1 500 years
-//! even at 192 kHz. The rounding a real timeline meets is a rate or a
-//! rescale no `f64` holds exactly — NTSC's 30000/1001, or frames of one rate
-//! counted in another — and the half-tick hold settles it: written where
-//! OpenTimelineIO's double lands within half a tick of the exact count,
-//! refused by name where it does not.
+//! naming the value the last plan could not hold and what the search tried —
+//! its bands and its walks, none where no ruler of the bands writes a clip's
+//! source range or holds its medium's available range whole — so a refusal
+//! says the search was bounded: a timeline only a ruler outside the bands
+//! would hold is refused by this contract, and never written to be read
+//! rounded. Where the bound has been met, counts lie near 2^53 ticks of a
+//! clip's ruler — at the rates media run at, positions thousands of years in:
+//! 2^53 ticks are some 1 500 years even at 192 kHz. The rounding a real
+//! timeline meets is a rate or a rescale no `f64` holds exactly — NTSC's
+//! 30000/1001, or frames of one rate counted in another — and the half-tick
+//! hold settles it: written where OpenTimelineIO's double lands within half a
+//! tick of the exact count, refused by name where it does not.
 //!
 //! A source range's length is a whole number of edit-rate ticks (validation
 //! refuses one that is not), so laying a track's items end to end puts every
@@ -176,9 +179,9 @@ pub enum Refused {
   /// rulers the export's bounded search tries — past 2^53, where its `f64`
   /// no longer holds every whole number, or landed half a tick off or more
   /// by its arithmetic: the count the last plan tried could not hold, and,
-  /// for a count OpenTimelineIO derives or a source range no ruler of the
-  /// search's bands writes, what the search tried
-  /// ([`NotRepresentable::searched`]).
+  /// for a count OpenTimelineIO derives, a source range no ruler of the
+  /// search's bands writes or an available range none holds whole, what the
+  /// search tried ([`NotRepresentable::searched`]).
   NotRepresentable(NotRepresentable),
 }
 
@@ -219,15 +222,16 @@ impl core::error::Error for Refused {}
 /// tried ([`searched`](Self::searched)) — a clip's source range's end
 /// among them. Refused as the timeline holds it, before any walk: a count
 /// the export would write at the edit rate, which no ruler the search tries
-/// changes; an available range none of its own rulers holds whole, its end
-/// with its start and its length, as it keeps the ruler its plan gives it;
-/// and a source range no ruler of the search's bands writes — its start or
-/// its length past 2^53 in each of its own rulers and in each ruler the
-/// timeline's operands are counted in, the only rulers of the bands that
-/// can write a range its own cannot: every whole rate that lands on a range
-/// is a multiple of its coarsest whole ruler, one of its own, which counts
-/// it in the smallest counts. That refusal says what the search tried too:
-/// its bands, and no walk.
+/// changes; a source range no ruler of the search's bands writes — its
+/// start or its length past 2^53 in each of its own rulers and in each
+/// ruler the timeline's operands are counted in; and an available range no
+/// ruler of the bands holds whole — its start, its length or its end past
+/// 2^53 in each of those, its end held with its start and its length, as
+/// the search never moves it. The operands' rulers are the only rulers of
+/// the bands that can write or hold a range its own cannot: every whole
+/// rate that lands on a range is a multiple of its coarsest whole ruler, one
+/// of its own, which counts it in the smallest counts. Those two refusals
+/// say what the search tried too: its bands, and no walk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NotRepresentable {
   at: Spot,
@@ -265,11 +269,10 @@ impl NotRepresentable {
   /// What the export's search tried before it refused the count — its
   /// bands and its walks: where OpenTimelineIO derives the count, a source
   /// range's end among them, the plans it walked; for a source range no
-  /// ruler of the bands writes, none ([`RulerSearch::walks`] 0), the range
-  /// refused as the timeline holds it. `None` for a count refused before
-  /// any walk that the search never writes in another ruler: one the export
-  /// writes at the edit rate, or an available range, which keeps the ruler
-  /// its plan gives it.
+  /// ruler of the bands writes, or an available range none of them holds
+  /// whole, none ([`RulerSearch::walks`] 0), the range refused as the
+  /// timeline holds it. `None` only for a count the export writes at the
+  /// edit rate, refused before any walk: the search tries no ruler for it.
   pub const fn searched(&self) -> Option<RulerSearch> {
     self.searched
   }
@@ -279,8 +282,9 @@ impl NotRepresentable {
 /// 1/1 s, which OpenTimelineIO's f64 does not hold exactly`, and for a count
 /// OpenTimelineIO derives, what the search tried after it:
 /// `…, in the last of 3 plans the bounded search walked, …` — or, for a
-/// source range no ruler of the bands writes, `…, in any of the clip's own
-/// rulers or of the bounded search's bands, so the search walked no plan`.
+/// source range no ruler of the bands writes or an available range none
+/// holds whole, `…, in any of the range's own rulers or of the bounded
+/// search's bands, so the search walked no plan`.
 impl fmt::Display for NotRepresentable {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     write!(f, "{} counts {} ticks", self.at, self.value)?;
@@ -296,8 +300,9 @@ impl fmt::Display for NotRepresentable {
 }
 
 /// What the export's search tried before [`to_otio`] refused a count
-/// OpenTimelineIO derives: the bands of rulers it may write a clip in, and
-/// how many plans of rulers it walked.
+/// OpenTimelineIO derives, or a clip's media-side range before any walk:
+/// the bands of rulers it may write a clip in, and how many plans of rulers
+/// it walked.
 ///
 /// The search is bounded, by contract. Where OpenTimelineIO's arithmetic
 /// would round a value, the export writes one of the clips the value is
@@ -320,10 +325,13 @@ impl fmt::Display for NotRepresentable {
 /// OpenTimelineIO reads back exactly; a timeline no plan the search walks
 /// holds is refused with the last plan's value, and with this record of
 /// what the search tried. A source range no ruler of the bands writes has
-/// no plan to walk: it is refused as the timeline holds it, with this
-/// record and no walk. A ruler outside the bands, or a plan of rulers the
-/// moves do not reach, is never tried: a timeline only such a plan would
-/// hold is refused by this contract, not misread.
+/// no plan to walk; nor has an available range none of them holds whole —
+/// planned as a source range is, in its own rulers and then the operands',
+/// but held whole there, its end with its start and its length, as the
+/// search never moves it. Either is refused as the timeline holds it, with
+/// this record and no walk. A ruler outside the bands, or a plan of rulers
+/// the moves do not reach, is never tried: a timeline only such a plan
+/// would hold is refused by this contract, not misread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RulerSearch {
   walks: usize,
@@ -345,7 +353,8 @@ impl RulerSearch {
 
   /// How many plans of rulers the search walked, the plan the export first
   /// counted among them and the refused one last; 0 where no ruler of the
-  /// bands writes a clip's source range, which leaves no plan to walk.
+  /// bands writes a clip's source range, or holds its medium's available
+  /// range whole, which leaves no plan to walk.
   pub const fn walks(&self) -> usize {
     self.walks
   }
@@ -353,14 +362,14 @@ impl RulerSearch {
 
 /// Writes `the last of 129 plans the bounded search walked, trying each clip
 /// in its plan's ruler, every ruler …, the 64 finest …, and the 64 coarsest
-/// …`; with no walk, `any of the clip's own rulers or of the bounded
+/// …`; with no walk, `any of the range's own rulers or of the bounded
 /// search's bands, so the search walked no plan`.
 impl fmt::Display for RulerSearch {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     match self.walks {
       0 => {
         return f.write_str(
-          "any of the clip's own rulers or of the bounded search's bands, so the search walked \
+          "any of the range's own rulers or of the bounded search's bands, so the search walked \
            no plan",
         );
       }
