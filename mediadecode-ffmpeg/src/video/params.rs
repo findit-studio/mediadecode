@@ -513,6 +513,16 @@ impl<'m> Iterator for Walk<'m> {
   }
 }
 
+impl<'m> Unit<'m> {
+  /// The unit's raw bytes as the splitter took them — `nal->raw_data` for
+  /// `nal->raw_size` bytes, its header first, emulation prevention bytes in
+  /// place.
+  pub(super) fn raw(&self) -> &'m [u8] {
+    let raw: &'m [u8] = self.raw;
+    &raw[..self.consumed.min(raw.len())]
+  }
+}
+
 impl Unit<'_> {
   /// `nal->gb` as the splitter leaves it, over `memory` ([`Walk::memory`]):
   /// the unit's payload bits, the index past its header.
@@ -990,18 +1000,26 @@ fn scaling_list(r: &mut Reader<'_>, size: usize) -> bool {
 /// What FFmpeg does with an H.264 picture parameter set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Pps {
-  Stored,
+  /// Stored under `id`, read against the sequence parameter set held under
+  /// `sps` (`pps->sps`, h264_ps.c:738); `past_end` where its reading ran past
+  /// its payload — FFmpeg's reader reads on into what follows, and nothing
+  /// fails the set for it.
+  Stored {
+    id: usize,
+    sps: usize,
+    past_end: bool,
+  },
   Failed,
-  /// It refers to a sequence parameter set the reading has not met: FFmpeg's
-  /// answer depends on what the decoder holds already.
+  /// It refers to a sequence parameter set the decoder does not hold.
   Unresolved,
 }
 
 /// **`ff_h264_decode_picture_parameter_set`** (h264_ps.c:698-847) read from
 /// `r`, past the unit's header, over a unit of `bit_length` payload bits,
-/// against the sequence parameter sets `sps` holds.
-fn h264_pps(r: &mut Reader<'_>, bit_length: u64, sps: &[Option<Sps>; 32]) -> Pps {
-  if r.ue() as u32 >= 256 {
+/// against the sequence parameter sets `sets` holds.
+fn h264_pps(r: &mut Reader<'_>, bit_length: u64, sets: &impl H264Sets) -> Pps {
+  let id = r.ue() as u32;
+  if id >= 256 {
     // pps_id
     return Pps::Failed;
   }
@@ -1009,7 +1027,7 @@ fn h264_pps(r: &mut Reader<'_>, bit_length: u64, sps: &[Option<Sps>; 32]) -> Pps
   if sps_id >= 32 {
     return Pps::Failed;
   }
-  let Some(sps) = sps[sps_id as usize] else {
+  let Some(sps) = sets.sps(sps_id as usize) else {
     return Pps::Unresolved;
   };
   if sps.bit_depth_luma > 14 || matches!(sps.bit_depth_luma, 11 | 13) {
@@ -1053,7 +1071,44 @@ fn h264_pps(r: &mut Reader<'_>, bit_length: u64, sps: &[Option<Sps>; 32]) -> Pps
       return Pps::Failed;
     }
   }
-  Pps::Stored
+  Pps::Stored {
+    id: id as usize,
+    sps: sps_id as usize,
+    past_end: r.left() < 0,
+  }
+}
+
+/// **Where a reading of H.264 parameter sets puts what FFmpeg stores**: the
+/// sequence parameter sets a picture parameter set is read against
+/// (`ps->sps_list`, h264_ps.c:731-738), and every set FFmpeg stores, with
+/// the unit it read it off. The bare table of facts keeps the facts alone,
+/// for a verdict; the sets a decoder holds keep the units too
+/// (`super::held`).
+pub(super) trait H264Sets {
+  /// What the sequence parameter set held under `id` says to a picture
+  /// parameter set read now; `None` where none is held.
+  fn sps(&self, id: usize) -> Option<Sps>;
+  /// FFmpeg stores `sps` under `id`, read off `unit` the `reading`-th of the
+  /// three ways it reads one: 1, the unit; 2, its raw bytes after its
+  /// header; 3, the unit, truncation let stand (h264_parse.c:383-397,
+  /// h264dec.c:698-712).
+  fn store_sps(&mut self, id: usize, sps: Sps, unit: &Unit<'_>, reading: u8);
+  /// FFmpeg stores the picture parameter set `unit` under `id`, read against
+  /// the sequence parameter set held under `sps`; `past_end` where its
+  /// reading ran past its payload.
+  fn store_pps(&mut self, id: usize, sps: usize, unit: &Unit<'_>, past_end: bool);
+}
+
+impl H264Sets for [Option<Sps>; 32] {
+  fn sps(&self, id: usize) -> Option<Sps> {
+    self.get(id).copied().flatten()
+  }
+
+  fn store_sps(&mut self, id: usize, sps: Sps, _: &Unit<'_>, _: u8) {
+    self[id] = Some(sps);
+  }
+
+  fn store_pps(&mut self, _: usize, _: usize, _: &Unit<'_>, _: bool) {}
 }
 
 /// A parameter set FFmpeg did not store, and why.
@@ -1063,18 +1118,31 @@ enum Unstored {
   Unresolved,
 }
 
+/// **The three readings FFmpeg gives a sequence parameter set** — the unit,
+/// its raw bytes after its header, the unit with truncation let stand
+/// (`decode_extradata_ps`, h264_parse.c:383-397; `decode_nal_units`,
+/// h264dec.c:698-712) — `unit` read over `memory` ([`Walk::memory`]) and its
+/// raw bytes over `mem`, the buffer it was cut from: the set's id, what it
+/// says and which reading stored it; `None` where none does.
+fn h264_sps_readings(unit: &Unit<'_>, memory: &[u8], mem: &[u8]) -> Option<(usize, Sps, u8)> {
+  h264_sps(&mut unit.reader(memory), false)
+    .map(|(id, sps)| (id, sps, 1))
+    .or_else(|| h264_sps(&mut unit.raw_reader(mem), false).map(|(id, sps)| (id, sps, 2)))
+    .or_else(|| h264_sps(&mut unit.reader(memory), true).map(|(id, sps)| (id, sps, 3)))
+}
+
 /// **`decode_extradata_ps`** (h264_parse.c:367-415) over the first `length`
 /// bytes of `mem`, length-prefixed by two bytes where `nalff` (an `avcC`
 /// entry) or start-coded: each sequence parameter set read the three ways
-/// it reads one — the unit, its raw bytes, the unit with truncation let
-/// stand — each picture parameter set once, every other unit passed over.
-/// The first set it does not store ends the reading, as there; a split that
-/// fails stores nothing and answers success, as there.
-fn h264_sets(
+/// it reads one ([`h264_sps_readings`]), each picture parameter set once,
+/// every other unit passed over, each set stored in `sets` as FFmpeg stores
+/// it. The first set it does not store ends the reading, as there; a split
+/// that fails stores nothing and answers success, as there.
+fn h264_sets<S: H264Sets>(
   mem: &[u8],
   length: usize,
   nalff: bool,
-  sps: &mut [Option<Sps>; 32],
+  sets: &mut S,
 ) -> Result<(), Unstored> {
   let mut units = Walk::new(mem, length, 2, Codec::H264, nalff, true);
   if !units.accepted() {
@@ -1085,18 +1153,15 @@ fn h264_sets(
     match unit.kind {
       7 => {
         let memory = units.memory(&unit, &mut scratch);
-        let stored = h264_sps(&mut unit.reader(memory), false)
-          .or_else(|| h264_sps(&mut unit.raw_reader(mem), false))
-          .or_else(|| h264_sps(&mut unit.reader(memory), true));
-        let Some((id, set)) = stored else {
+        let Some((id, sps, reading)) = h264_sps_readings(&unit, memory, mem) else {
           return Err(Unstored::Failed(crate::ParameterSet::Sequence));
         };
-        sps[id] = Some(set);
+        sets.store_sps(id, sps, &unit, reading);
       }
       8 => {
         let memory = units.memory(&unit, &mut scratch);
-        match h264_pps(&mut unit.reader(memory), unit.size_bits, sps) {
-          Pps::Stored => {}
+        match h264_pps(&mut unit.reader(memory), unit.size_bits, sets) {
+          Pps::Stored { id, sps, past_end } => sets.store_pps(id, sps, &unit, past_end),
           Pps::Failed => return Err(Unstored::Failed(crate::ParameterSet::Picture)),
           Pps::Unresolved => return Err(Unstored::Unresolved),
         }
@@ -1119,12 +1184,12 @@ const ESCAPE_LIMIT: usize = (i16::MAX as usize - PADDING) / 3;
 /// bytes put in, for records whose sets were stored unescaped. Answers what
 /// the retry did not store, or the record's rejection where the entry is
 /// too large to retry.
-fn h264_entry(
+fn h264_entry<S: H264Sets>(
   mem: &[u8],
   nalsize: usize,
-  sps: &mut [Option<Sps>; 32],
+  sets: &mut S,
 ) -> Result<(), crate::ExtradataRejection> {
-  let Err(first) = h264_sets(mem, nalsize, true, sps) else {
+  let Err(first) = h264_sets(mem, nalsize, true, sets) else {
     return Ok(());
   };
   if nalsize / 2 >= ESCAPE_LIMIT {
@@ -1134,7 +1199,7 @@ fn h264_entry(
     }));
   }
   let escaped = escape(&mem[..nalsize]);
-  h264_sets(&escaped, escaped.len(), true, sps).map_err(rejection)
+  h264_sets(&escaped, escaped.len(), true, sets).map_err(rejection)
 }
 
 /// The escaping `decode_extradata_ps_mp4` gives an entry: an `03` put in
@@ -1164,6 +1229,112 @@ fn rejection(unstored: Unstored) -> crate::ExtradataRejection {
   }
 }
 
+/// What **`ff_h264_decode_extradata`** (h264_parse.c:466-524) did to a
+/// decoder: its verdict, and the framing it left.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Extradata {
+  /// `Ok` where the record applied whole; the reason otherwise
+  /// ([`h264_record`]).
+  pub(super) verdict: Result<(), crate::ExtradataRejection>,
+  /// `is_avc` as it left it: set by an `avcC` record before anything else is
+  /// read (h264_parse.c:477-479), cleared by any other (518).
+  pub(super) is_avc: bool,
+  /// The NAL length size it stored: an `avcC` record's, where its reading
+  /// reached the end (516); `None` where it stored none.
+  pub(super) nal_length_size: Option<u8>,
+}
+
+/// **`ff_h264_decode_extradata`** (h264_parse.c:466-524) applying `record`
+/// to `sets`, every set FFmpeg stores stored there, and what it did besides
+/// ([`Extradata`]). A set it fails to parse is skipped and the reading goes
+/// on, as there; an `avcC` entry running past the record, or too large for
+/// the escaping retry, ends it, the sets before it stored and the NAL length
+/// size not. The verdict is the first thing that kept the record from
+/// applying whole.
+pub(super) fn h264_extradata<S: H264Sets>(record: &[u8], sets: &mut S) -> Extradata {
+  if record.first() != Some(&1) {
+    return Extradata {
+      verdict: h264_sets(record, record.len(), false, sets).map_err(rejection),
+      is_avc: false,
+      nal_length_size: None,
+    };
+  }
+  let ended = |verdict| Extradata {
+    verdict: Err(verdict),
+    is_avc: true,
+    nal_length_size: None,
+  };
+  if record.len() < 7 {
+    return ended(crate::ExtradataRejection::TooShort { size: record.len() });
+  }
+  let mut at = 6usize;
+  let mut first = None;
+  let sequence = usize::from(record[5] & 0x1f);
+  if let Some(end) = h264_entries(
+    record,
+    &mut at,
+    sequence,
+    crate::ParameterSet::Sequence,
+    sets,
+    &mut first,
+  ) {
+    return ended(end);
+  }
+  // The picture parameter sets' count is the byte after the sequence
+  // parameter sets: a padding zero where the record ends there.
+  let pictures = usize::from(record.get(at).copied().unwrap_or(0));
+  at += 1;
+  if let Some(end) = h264_entries(
+    record,
+    &mut at,
+    pictures,
+    crate::ParameterSet::Picture,
+    sets,
+    &mut first,
+  ) {
+    return ended(end);
+  }
+  Extradata {
+    verdict: first.map_or(Ok(()), Err),
+    is_avc: true,
+    nal_length_size: Some((record[4] & 3) + 1),
+  }
+}
+
+/// `count` `avcC` entries of kind `set` from `at` in `record`, each read
+/// by [`h264_entry`] into `sets` and `at` moved past it; the first that
+/// FFmpeg does not apply whole recorded in `first`. Answers the verdict
+/// that ends the record's reading — an entry running past the record, or
+/// too large for the escaping retry (h264_parse.c:489-498, 503-512) — where
+/// one does.
+fn h264_entries<S: H264Sets>(
+  record: &[u8],
+  at: &mut usize,
+  count: usize,
+  set: crate::ParameterSet,
+  sets: &mut S,
+  first: &mut Option<crate::ExtradataRejection>,
+) -> Option<crate::ExtradataRejection> {
+  let byte = |at: usize| record.get(at).copied().unwrap_or(0);
+  for _ in 0..count {
+    let nalsize = ((usize::from(byte(*at)) << 8) | usize::from(byte(*at + 1))) + 2;
+    if nalsize > record.len().saturating_sub(*at) {
+      return Some(first.unwrap_or(crate::ExtradataRejection::Overrun(set)));
+    }
+    match h264_entry(&record[*at..], nalsize, sets) {
+      Ok(()) => {}
+      Err(oversized @ crate::ExtradataRejection::Oversized(_)) => {
+        return Some(first.unwrap_or(oversized));
+      }
+      Err(skipped) => {
+        first.get_or_insert(skipped);
+      }
+    }
+    *at += nalsize;
+  }
+  None
+}
+
 /// **FFmpeg's verdict on an H.264 extradata a packet carries** — what
 /// `ff_h264_decode_extradata` (h264_parse.c:466-524) makes of it, whose
 /// answer `h264_decode_frame` drops (h264dec.c:1038-1044): `Ok` where it
@@ -1188,37 +1359,59 @@ fn rejection(unstored: Unstored) -> crate::ExtradataRejection {
 ///
 /// Any of them leaves the decoder on parameters other than the record's.
 pub(crate) fn h264_record(record: &[u8]) -> Result<(), crate::ExtradataRejection> {
-  let mut sps = [None; 32];
-  if record.first() != Some(&1) {
-    return h264_sets(record, record.len(), false, &mut sps).map_err(rejection);
+  h264_extradata(record, &mut [None; 32]).verdict
+}
+
+/// **The parameter sets FFmpeg's H.264 decoder reads off a packet's
+/// units**, stored in `sets` as it stores them — `decode_nal_units`
+/// (h264dec.c:584-760) over a packet split as the decoder's framing says,
+/// length-prefixed by `nal_length_size` bytes where `is_avc`, start-coded
+/// otherwise, every unit copied (`ff_h2645_packet_split` without
+/// `H2645_FLAG_SMALL_PADDING`, h264dec.c:609-610): each sequence parameter
+/// set read the three ways FFmpeg reads one (h264dec.c:698-712) and each
+/// picture parameter set once (716-727), a set none of them stores passed
+/// over; nothing where the split fails (611-615); and the reading ending at
+/// an IDR slice whose header reads as a P slice's, "Invalid inter IDR frame"
+/// (634-640). A hardware accelerator's `decode_params` (701-706, 718-723) is
+/// taken to pass: VideoToolbox's copies the unit (videotoolbox.c:434-450).
+pub(super) fn h264_packet<S: H264Sets>(
+  data: &[u8],
+  is_avc: bool,
+  nal_length_size: usize,
+  sets: &mut S,
+) {
+  let mut units = Walk::new(
+    data,
+    data.len(),
+    nal_length_size,
+    Codec::H264,
+    is_avc,
+    false,
+  );
+  if !units.accepted() {
+    return;
   }
-  if record.len() < 7 {
-    return Err(crate::ExtradataRejection::TooShort { size: record.len() });
-  }
-  let byte = |at: usize| record.get(at).copied().unwrap_or(0);
-  let mut at = 6usize;
-  let mut entries = |at: &mut usize,
-                     count: usize,
-                     set: crate::ParameterSet|
-   -> Result<(), crate::ExtradataRejection> {
-    for _ in 0..count {
-      let nalsize = ((usize::from(byte(*at)) << 8) | usize::from(byte(*at + 1))) + 2;
-      if nalsize > record.len().saturating_sub(*at) {
-        return Err(crate::ExtradataRejection::Overrun(set));
+  let mut scratch = Vec::new();
+  while let Some(Ok(unit)) = units.next() {
+    match unit.kind {
+      5 if unit.head::<2>()[1] & 0xfc == 0x98 => return,
+      7 => {
+        let memory = units.memory(&unit, &mut scratch);
+        if let Some((id, sps, reading)) = h264_sps_readings(&unit, memory, data) {
+          sets.store_sps(id, sps, &unit, reading);
+        }
       }
-      h264_entry(&record[*at..], nalsize, &mut sps)?;
-      *at += nalsize;
+      8 => {
+        let memory = units.memory(&unit, &mut scratch);
+        if let Pps::Stored { id, sps, past_end } =
+          h264_pps(&mut unit.reader(memory), unit.size_bits, sets)
+        {
+          sets.store_pps(id, sps, &unit, past_end);
+        }
+      }
+      _ => {}
     }
-    Ok(())
-  };
-  entries(
-    &mut at,
-    usize::from(record[5] & 0x1f),
-    crate::ParameterSet::Sequence,
-  )?;
-  let pictures = usize::from(byte(at));
-  at += 1;
-  entries(&mut at, pictures, crate::ParameterSet::Picture)
+  }
 }
 
 /// Whether an `avcC` record's entries hold a sequence parameter set that
@@ -1316,7 +1509,7 @@ impl VpsTable {
     let read = hevc_vps(&mut reader);
     let alpha = match read {
       Err(aborts) => return Vps::Refused { aborts },
-      Ok(alpha) => alpha,
+      Ok(read) => read.alpha,
     };
     // Read past its unit: kept only where nothing of its id is held.
     if reader.left() < 0 && self.held[id].is_some() {
@@ -1430,13 +1623,25 @@ impl VpsTable {
   }
 }
 
+/// What `ff_hevc_decode_nal_vps` stores of a video parameter set that a
+/// reading after it needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct VpsRead {
+  /// Whether FFmpeg reads it as alpha video (`ff_hevc_is_alpha_video`,
+  /// hevc/hevcdec.c:440-457).
+  pub(super) alpha: bool,
+  /// `vps_max_sub_layers`, which bounds a sequence parameter set's own
+  /// (hevc/ps.c:1262-1278).
+  pub(super) max_sub_layers: u8,
+}
+
 /// **`ff_hevc_decode_nal_vps`** (hevc/ps.c:786-959) from the reader past the
-/// set's id, as far as its verdict goes: `Ok` with whether the set it stores
-/// is alpha video, `Err` with whether its refusal ends a decoder's reading of
-/// the packet. The test for a reading run past the unit, which needs the
-/// table, is the caller's ([`VpsTable::read`]).
-fn hevc_vps(r: &mut Reader<'_>) -> Result<bool, bool> {
-  const INVALID: Result<bool, bool> = Err(false);
+/// set's id, as far as its verdict goes: `Ok` with what the set it stores
+/// says ([`VpsRead`]), `Err` with whether its refusal ends a decoder's
+/// reading of the packet. The test for a reading run past the unit, which
+/// needs the table, is the caller's ([`VpsTable::read`]).
+pub(super) fn hevc_vps(r: &mut Reader<'_>) -> Result<VpsRead, bool> {
+  const INVALID: Result<VpsRead, bool> = Err(false);
   // vps_base_layer_internal_flag, vps_base_layer_available_flag.
   let (internal, available) = (r.bit(), r.bit());
   if !internal || !available {
@@ -1498,6 +1703,10 @@ fn hevc_vps(r: &mut Reader<'_>) -> Result<bool, bool> {
       mask: 0,
       layer_id: 0,
     };
+    let read = |alpha| VpsRead {
+      alpha,
+      max_sub_layers: max_sub_layers as u8,
+    };
     match vps_extension(
       r,
       &mut ext,
@@ -1506,15 +1715,18 @@ fn hevc_vps(r: &mut Reader<'_>) -> Result<bool, bool> {
       layer_sets,
       layer1_included,
     ) {
-      Ok(()) => return Ok(ext.alpha()),
+      Ok(()) => return Ok(read(ext.alpha())),
       // "Broken VPS extension, treating as alpha video" where two layers,
       // the second's id and the auxiliary type were read; one layer
       // otherwise (ps.c:921-939).
-      Err(Unsupported::PatchWelcome) => return Ok(ext.alpha()),
+      Err(Unsupported::PatchWelcome) => return Ok(read(ext.alpha())),
       Err(Unsupported::Invalid) => return INVALID,
     }
   }
-  Ok(false)
+  Ok(VpsRead {
+    alpha: false,
+    max_sub_layers: max_sub_layers as u8,
+  })
 }
 
 /// What `decode_vps_ext` set before it returned: the layers, the mask and
@@ -1733,7 +1945,7 @@ fn vps_extension(
 /// `profile_tier_level`s (`decode_profile_tier_level`, ps.c:262-335, 88 bits
 /// whichever profile it names) each refused where fewer bits are left than
 /// it reads: `false` where it fails.
-fn parse_ptl(r: &mut Reader<'_>, profile_present: bool, max_sub_layers: i32) -> bool {
+pub(super) fn parse_ptl(r: &mut Reader<'_>, profile_present: bool, max_sub_layers: i32) -> bool {
   let common = |r: &mut Reader<'_>| {
     if r.left() < 88 {
       return false;

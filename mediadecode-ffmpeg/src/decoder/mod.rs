@@ -1074,7 +1074,10 @@ impl VideoDecoder {
       | Error::ExtradataUnknown(_)
       // The session's reading of a packet's new extradata, before any
       // decoder sees the packet.
-      | Error::ExtradataRejected(_) => VerdictRouting::Direct,
+      | Error::ExtradataRejected(_)
+      // The session's open of a software decoder on what the decoder
+      // serving holds; no hardware funnel mints it.
+      | Error::SetsUnrecordable(_) => VerdictRouting::Direct,
     }
   }
 

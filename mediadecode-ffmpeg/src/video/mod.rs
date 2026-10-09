@@ -127,6 +127,10 @@ mod access;
 /// How FFmpeg 9 reads an H.264 or HEVC parameter set.
 mod params;
 
+/// The parameter sets a decoder holds, and the record a decoder opened fresh
+/// opens on to hold them too.
+mod held;
+
 /// The most pictures the software road's queue of pictures waiting for
 /// delivery holds at once — a cheap second bound beside its byte budget
 /// ([`DecoderLimits::max_replay_bytes`]). The queue takes a fallback
@@ -293,6 +297,28 @@ pub struct CarrierVideoStreamDecoder<C: crate::FfmpegCarrier> {
   /// a new extradata it could not parse): either leaves the extradata
   /// unknown ([`Self::extradata_unknown`]).
   extradata_provisional: bool,
+  /// **The parameter sets the decoder serving holds**, as FFmpeg 9 holds
+  /// them ([`held::Held`]): every set of every record it applied and every
+  /// set a packet it took carried in band, by id, and its framing — what a
+  /// decoder opened fresh must hold too ([`Self::opening`]). Updated where a
+  /// decoder may have taken a packet ([`Self::commit_sets`]); a set whose
+  /// reading cannot be told is held in doubt.
+  held: held::Held,
+  /// What the decoder serving held when it was last seen to read every
+  /// packet it took — `None` while it is seen to have — kept while sets
+  /// that packets it took carried may still be unread: a flush, or an error
+  /// that may be such a packet's, puts every set that differs from it in
+  /// doubt ([`Self::held_doubt`]).
+  held_proven: Option<Box<held::Held>>,
+  /// What the decoder held when the hardware probe's history began, where
+  /// that was a flush rather than the open — the sets a probe-era fallback's
+  /// replay must start from ([`Self::fall_back_to_sw_inner`]); `None` for the
+  /// open, whose record gives them.
+  held_base: Option<Box<held::Held>>,
+  /// `true` once a switch to the session's threads was declined because no
+  /// decoder could be opened holding what the decoder serving holds: said
+  /// once.
+  switch_declined: bool,
   /// `true` once an H.264 sequence parameter set the session read — in its
   /// codec parameters, in a new extradata, among the units of a keyframe —
   /// permits arbitrary slice order (`access::KeyframeRule::H264`), and a
@@ -1324,6 +1350,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
         DecodeState::Sw(open_sw_decoder(&owned_parameters, limits, Some(time_base))?)
       }
     };
+    let held = held_of(&owned_parameters);
     Ok(Self {
       state,
       path,
@@ -1331,6 +1358,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       probe_extradata: None,
       extradata_unknown: None,
       extradata_provisional: false,
+      held,
+      held_proven: None,
+      held_base: None,
+      switch_declined: false,
       h264_aso: false,
       hevc_alpha: false,
       hw_scratch,
@@ -1710,8 +1741,19 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     unconsumed_packets: &[ffmpeg_next::Packet],
     eof_pending: bool,
   ) -> Result<usize, Error> {
+    // The replay starts from what the hardware held when its history began
+    // — the open, or a flush — and reads the history again.
+    let base = match &self.held_base {
+      Some(base) => (**base).clone(),
+      None => held_of(&self.parameters),
+    };
+    let opening = self.opening_from(&base, None)?;
     let one_thread = self.limits.with_threads(crate::Threads::Single);
-    let mut sw = open_sw_decoder(&self.parameters, one_thread, Some(self.time_base))?;
+    let mut sw = open_sw_decoder(
+      opening.parameters.as_ref().unwrap_or(&self.parameters),
+      one_thread,
+      Some(self.time_base),
+    )?;
     let mut local_replay = ReplayQueue::default();
     let mut local_refusals = Refusals::default();
     let mut progress = Replay::default();
@@ -1738,6 +1780,23 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     // its refusals left in doubt is the replaced decoder's, not this one's.
     self.probe_extradata = None;
     self.extradata_unknown = None;
+    if let Some(parameters) = opening.parameters {
+      self.parameters = parameters;
+    }
+    // The replay's decoder holds what it started from with the history read
+    // again — what the hardware refused, and left in doubt, is not in it;
+    // until it is seen to have read all of it, what it started from is what
+    // it is known to hold.
+    let mut replayed = opening.held.clone();
+    for pkt in unconsumed_packets {
+      if let Some(next) = replayed.after_packet(new_extradata(pkt), pkt.data()) {
+        replayed = next;
+      }
+    }
+    self.held = replayed;
+    self.held_base = None;
+    let read_all = progress.fed == unconsumed_packets.len() && drained == Drained::Empty && in_step;
+    self.held_proven = (!read_all).then(|| Box::new(opening.held));
     let installed = match progress.extradata.take() {
       Some(extradata) => {
         extradata.install(&mut self.parameters);
@@ -1871,20 +1930,25 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// ([`DecodeState::SwClosed`]), the error is returned — the packet was
   /// not taken — and the next send opens one again.
   ///
-  /// # On the packet's extradata
+  /// # On the packet's extradata, and the sets held
   ///
-  /// Where the packet the new decoder is opened for carries a new extradata
-  /// (`replacement`), the decoder opens on a copy of the session's parameters
-  /// carrying it ([`Self::carrying`]), committed once the decoder serves
-  /// ([`Self::commit_opened`]) — never on the retained parameters first,
-  /// whose record may be one a decoder cannot open on.
+  /// The new decoder opens holding what the one it replaces held, with the
+  /// packet's new extradata (`replacement`) applied, if it carries one
+  /// ([`Self::opening`]): on that record, or on the session's parameters,
+  /// where either gives it exactly that, and otherwise on a copy of the
+  /// session's parameters carrying a record synthesized from what is held —
+  /// never on the retained parameters first, whose record may be one a
+  /// decoder cannot open on. The opening is committed once the decoder serves
+  /// ([`Self::commit_opened`]); where no record carries what is held, the
+  /// open is refused by name ([`Error::SetsUnrecordable`]).
   fn open_after_drain(&mut self, replacement: Option<NewExtradata>) -> Result<(), Error> {
     if let DecodeState::Sw(sw) = &self.state {
       sw.give_up_refusals(&mut self.refusals);
     }
     self.state = DecodeState::SwClosed;
-    let carrying = self.carrying(replacement)?;
-    let parameters = carrying.as_ref().unwrap_or(&self.parameters);
+    let opening = self.opening(replacement.as_ref().map(NewExtradata::bytes))?;
+    drop(replacement);
+    let parameters = opening.parameters.as_ref().unwrap_or(&self.parameters);
     let one_thread = self.limits.with_threads(crate::Threads::Single);
     let sw = if self.sw_threads_pending {
       self.sw_threads_pending = false;
@@ -1920,7 +1984,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     };
     self.state = DecodeState::Sw(sw);
     self.sw_output_settled = true;
-    self.commit_opened(carrying);
+    self.commit_opened(opening);
     Ok(())
   }
 
@@ -2077,7 +2141,13 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       if !self.sw_replay_frames.is_empty() {
         return Ok(Sent::MustDrain);
       }
-      self.restart = Some(Restart { eof_sent: false });
+      // A decoder on the session's threads opens holding what this one
+      // holds, or the switch is declined and this one serves on: nothing is
+      // drained or closed before that is known.
+      match self.opening(new_extradata(pkt)) {
+        Ok(_) => self.restart = Some(Restart { eof_sent: false }),
+        Err(error) => self.decline_switch(&error),
+      }
     }
     if self.restart.is_some() {
       match self.drain_for_restart() {
@@ -2179,9 +2249,11 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
             Taken::No => {}
           }
           // A decoder that may have taken the packet may have read its
-          // parameter sets.
-          if taken != Taken::No {
-            self.commit_sets(sets);
+          // parameter sets: it did where the refusal says it decoded it.
+          match taken {
+            Taken::Yes => self.commit_sets(sets, Commit::Read),
+            Taken::Unknown(_) => self.commit_sets(sets, Commit::Doubt),
+            Taken::No => {}
           }
           // The new extradata it carries is the session's where the refusal
           // says the decoder decoded the packet, and unknown where it does
@@ -2197,13 +2269,13 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     if let Some(depth) = self.reorder_on_submit.take() {
       self.reorder_override = Some(depth);
     }
-    self.commit_sets(sets);
-    self.sw_output_settled = false;
     // libavcodec takes a packet only into an empty input slot: a decoder
     // that decodes in step has read every packet before this one.
     if in_step {
       self.extradata_read();
     }
+    self.commit_sets(sets, Commit::Taken);
+    self.sw_output_settled = false;
     // The decoder took it: its extradata is the stream's now, provisionally
     // until the decoder is seen to read it.
     if let Some(extradata) = extradata {
@@ -2219,6 +2291,22 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       self.count_degraded_packet();
     }
     Ok(Sent::Accepted)
+  }
+
+  /// **A switch to the session's threads declined**: no decoder could be
+  /// opened holding what the decoder serving holds — `error`, by name — so
+  /// the one-thread decoder serves on, nothing drained or closed, and the
+  /// next clean point tries again. Said once.
+  fn decline_switch(&mut self, error: &Error) {
+    if !self.switch_declined {
+      self.switch_declined = true;
+      tracing::warn!(
+        %error,
+        "mediadecode-ffmpeg: a switch to the session's threads was declined: no decoder could be \
+         opened holding the parameter sets the decoder serving holds; the one-thread decoder \
+         serves on, and the next clean point tries again",
+      );
+    }
   }
 
   /// Whether a decoder opened on the session's [`Threads`](crate::Threads)
@@ -2319,16 +2407,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
 
   /// The stream's codec id, as the 32-bit integer its parameters hold.
   fn codec_id(&self) -> i32 {
-    // SAFETY: the owned, deep-copied parameters' pointer, only read;
-    // `codec_id` is read as the 32-bit integer the field holds, never formed
-    // into a bindgen enum.
-    unsafe {
-      let raw = self.parameters.as_ptr();
-      if raw.is_null() {
-        return crate::CodecId::NONE.raw();
-      }
-      core::ptr::read(core::ptr::addr_of!((*raw).codec_id) as *const i32)
-    }
+    codec_id_of(&self.parameters)
   }
 
   /// **What `pkt`'s parameter sets say of the stream**, read without
@@ -2356,6 +2435,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       return Sets::default();
     }
     let record = new_extradata(pkt);
+    // What the decoder holds once it has read the packet: its record, then
+    // its units.
+    let held = self.held.after_packet(record, pkt.data()).map(Box::new);
     let rule = match record {
       Some(extradata) => access::KeyframeRule::of(codec, extradata),
       None => self.keyframe_rule(),
@@ -2376,6 +2458,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     Sets {
       aso: h264 && (rule.permits_aso() || units.is_some_and(|data| rule.units_permit_aso(data))),
       alpha,
+      held,
     }
   }
 
@@ -2416,7 +2499,26 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// the reason. A packet refused before any decoder saw it, or answered with
   /// back pressure or the end, commits nothing: a sequence parameter set no
   /// decoder read must not take every later anchor and switch.
-  fn commit_sets(&mut self, sets: Sets) {
+  ///
+  /// What the decoder holds once it has read the packet is what it holds
+  /// from here ([`Self::held`]), as `commit` says it read it: taken, the sets
+  /// as they were kept until it is seen to read it
+  /// ([`Self::held_proven`]); read, as they are; whether it read it unknown,
+  /// every set the packet changed in doubt.
+  fn commit_sets(&mut self, sets: Sets, commit: Commit) {
+    if let Some(next) = sets.held {
+      let mut next = *next;
+      match commit {
+        Commit::Taken => {
+          if self.held_proven.is_none() {
+            self.held_proven = Some(Box::new(self.held.clone()));
+          }
+        }
+        Commit::Read => {}
+        Commit::Doubt => next.doubt_since(&self.held),
+      }
+      self.held = next;
+    }
     if sets.aso && !self.h264_aso {
       self.h264_aso = true;
       tracing::warn!(
@@ -2456,20 +2558,37 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       && self.codec_id() == crate::CodecId::HEVC.raw()
       && matches!(&self.state, DecodeState::Sw(sw) if sw.outputs_alpha())
     {
-      self.commit_sets(Sets {
-        aso: false,
-        alpha: true,
-      });
+      self.commit_sets(
+        Sets {
+          aso: false,
+          alpha: true,
+          held: None,
+        },
+        Commit::Read,
+      );
     }
   }
 
-  /// **What a decoder opened for a packet carrying `replacement` opens on**:
-  /// with none, nothing here — the session's own parameters
-  /// ([`Self::parameters`]); with one, a copy of them carrying it in place of
-  /// their extradata, which the session commits only once the decoder opened
-  /// on it serves ([`Self::commit_opened`]). The one opening for every road
-  /// that opens a decoder for the packet it then hands it: a reopen
-  /// ([`Self::open_after_drain`]), the post-commit fallback's cold decoder.
+  /// **What a decoder opened fresh for a packet carrying `replacement` opens
+  /// on** ([`Opening`]), so that it holds what the decoder serving holds
+  /// ([`Self::held`]) with the packet's record applied, as FFmpeg applies it
+  /// ahead of the packet: the session's own parameters where their record
+  /// gives it exactly that, as does a packet's record that carries every set
+  /// held; otherwise a copy of the session's parameters carrying a record
+  /// synthesized from what is held ([`held::Held::record`]). The opening for
+  /// every road that opens a decoder fresh: a switch and a reopen
+  /// ([`Self::open_after_drain`]), the post-commit fallback's cold decoder;
+  /// the session commits it once the decoder opened on it serves
+  /// ([`Self::commit_opened`]).
+  ///
+  /// Refused by name, nothing opened, where no record carries what is held
+  /// ([`Error::SetsUnrecordable`]): whether a set is held cannot be told, a
+  /// set or the framing has no record that gives it, or the record does not
+  /// read back as what is held — for HEVC, FFmpeg's own decoder opened on it
+  /// strictly ([`opens_strictly`]) refusing a set it carries; or the
+  /// decoder that would open wraps another implementation. And by name
+  /// where the parameters with the record would pass their ceiling
+  /// ([`Error::ParametersTooLarge`]).
   ///
   /// The open reads the extradata — FFmpeg's HEVC decoder parses it there
   /// and fails the open on a record it cannot read (`hevc_decode_init`,
@@ -2477,28 +2596,72 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// the packet's record replaced them failed for good on an unreadable
   /// retained record, while the packet carrying the stream's replacement
   /// never reached a decoder.
-  fn carrying(&self, replacement: Option<NewExtradata>) -> Result<Option<Parameters>, Error> {
-    replacement
-      .map(|extradata| {
-        let mut parameters =
-          try_clone_parameters(&self.parameters, self.limits.max_codec_parameter_bytes())?;
-        extradata.install(&mut parameters);
-        Ok(parameters)
-      })
-      .transpose()
+  fn opening(&self, replacement: Option<&[u8]>) -> Result<Opening, Error> {
+    self.opening_from(&self.held, replacement)
   }
 
-  /// The decoder opened on `opened_on` — a copy of the session's parameters
-  /// carrying a packet's new extradata ([`Self::carrying`]), or `None` for
-  /// the session's own — serves: those parameters are the session's, their
-  /// extradata known and read, since the open applied it; opened on the
+  /// [`Self::opening`], for a decoder that must hold `held`.
+  fn opening_from(&self, held: &held::Held, replacement: Option<&[u8]>) -> Result<Opening, Error> {
+    let held = match replacement {
+      Some(record) => held.with_record(record),
+      None => held.clone(),
+    };
+    let codec = self.codec_id();
+    let refused = |reason| {
+      Error::SetsUnrecordable(crate::SetsUnrecordable::new(
+        crate::CodecId::from_raw(codec),
+        reason,
+      ))
+    };
+    let record = held
+      .record(codec, replacement.unwrap_or(record_of(&self.parameters)))
+      .map_err(refused)?;
+    let Some(bytes) = record
+      .as_ref()
+      .map(|record| &record.bytes[..])
+      .or(replacement)
+    else {
+      return Ok(Opening {
+        parameters: None,
+        held,
+      });
+    };
+    let mut parameters =
+      try_clone_parameters(&self.parameters, self.limits.max_codec_parameter_bytes())?;
+    NewExtradata::copy_of(
+      bytes,
+      &self.parameters,
+      self.limits.max_codec_parameter_bytes(),
+    )?
+    .install(&mut parameters);
+    if let Some(record) = &record {
+      // The sets held are FFmpeg's own decoders' reading: a decoder that
+      // wraps another implementation reads its own way.
+      if !wrapper_name(crate::decoder::find_decoder(&parameters)?).is_null() {
+        return Err(refused(crate::Unrecordable::Wrapped));
+      }
+      if record.strict && !opens_strictly(&parameters, self.limits)? {
+        return Err(refused(crate::Unrecordable::Unverified));
+      }
+    }
+    Ok(Opening {
+      parameters: Some(parameters),
+      held,
+    })
+  }
+
+  /// The decoder opened on `opening` ([`Self::opening`]) serves: the
+  /// parameters it opened on are the session's — a packet's new extradata,
+  /// or a record synthesized from what is held, known and read, since the
+  /// open applied it — and it holds what the opening says. Opened on the
   /// session's own, it replaces a decoder that may not have read a
   /// provisional extradata's packet.
-  fn commit_opened(&mut self, opened_on: Option<Parameters>) {
-    if let Some(parameters) = opened_on {
+  fn commit_opened(&mut self, opening: Opening) {
+    if let Some(parameters) = opening.parameters {
       self.parameters = parameters;
       self.extradata_unknown = None;
     }
+    self.held = opening.held;
     self.extradata_read();
   }
 
@@ -2552,20 +2715,38 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     );
     self.extradata_unknown = Some(doubt);
     self.extradata_provisional = false;
+    self.held_doubt();
   }
 
   /// The decoder serving was seen to read the packet whose new extradata is
-  /// provisional ([`Self::extradata_provisional`]): it is the stream's.
+  /// provisional ([`Self::extradata_provisional`]): it is the stream's. Seen
+  /// to read every packet it took, it holds every set they carried
+  /// ([`Self::held_proven`]).
   fn extradata_read(&mut self) {
     self.extradata_provisional = false;
+    self.held_proven = None;
   }
 
   /// The decoder serving reported `doubt` while the active extradata was
   /// provisional ([`Self::extradata_provisional`]): the report may be the
-  /// unread packet's own, so the extradata is unknown. Nothing otherwise.
+  /// unread packet's own, so the extradata is unknown. Nothing otherwise. A
+  /// set a packet it was not seen to read carried is in doubt the same way
+  /// ([`Self::held_doubt`]).
   fn reported_while_provisional(&mut self, doubt: crate::ExtradataDoubt) {
     if self.extradata_provisional {
       self.extradata_in_doubt(doubt);
+    } else {
+      self.held_doubt();
+    }
+  }
+
+  /// **Whether the decoder serving read the packets it took cannot be told
+  /// any more** — an error that may be such a packet's, a flush that drops
+  /// what it had not read: every set that differs from what it held when it
+  /// was last seen to read every packet ([`Self::held_proven`]) is in doubt.
+  fn held_doubt(&mut self) {
+    if let Some(proven) = self.held_proven.take() {
+      self.held.doubt_since(&proven);
     }
   }
 
@@ -2699,7 +2880,13 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       // the same parameters until a packet carrying extradata is taken. Nor
       // a packet's new extradata the decoder would not have applied whole:
       // re-driven, the same record meets the same reading.
-      Err(unknown @ (Error::ExtradataUnknown(_) | Error::ExtradataRejected(_))) => Err(unknown),
+      // Nor a decoder that cannot be opened holding what the hardware
+      // holds: re-driven, the same sets meet the same reading.
+      Err(
+        unknown @ (Error::ExtradataUnknown(_)
+        | Error::ExtradataRejected(_)
+        | Error::SetsUnrecordable(_)),
+      ) => Err(unknown),
       // Everything else really is the machinery failing, and keeps the
       // envelope — empty rescue set and all, which is what a
       // post-commit failure has to hand back.
@@ -2748,9 +2935,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       }
     }
     // The extradata the forwarded packet carries — one the parameters'
-    // ceiling cannot hold refused before a decoder opens — is what the cold
-    // decoder opens on, in a copy of the session's parameters committed with
-    // it ([`Self::carrying`]).
+    // ceiling cannot hold refused before a decoder opens — is applied to what
+    // the hardware holds, which the cold decoder opens holding
+    // ([`Self::opening`]): on that record, the session's parameters, or a
+    // record synthesized from what is held, committed with it.
     let extradata = match input {
       PostCommitInput::Packet(pkt) => NewExtradata::of(
         pkt,
@@ -2759,10 +2947,11 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       )?,
       PostCommitInput::FrameTime | PostCommitInput::Eof => None,
     };
-    let carrying = self.carrying(extradata)?;
+    let opening = self.opening(extradata.as_ref().map(NewExtradata::bytes))?;
+    drop(extradata);
     let one_thread = self.limits.with_threads(crate::Threads::Single);
     let mut sw = open_sw_decoder(
-      carrying.as_ref().unwrap_or(&self.parameters),
+      opening.parameters.as_ref().unwrap_or(&self.parameters),
       one_thread,
       Some(self.time_base),
     )?;
@@ -2823,7 +3012,8 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     // are the session's.
     self.state = DecodeState::Sw(sw);
     self.refusals.append(&mut refusals);
-    self.commit_opened(carrying);
+    self.commit_opened(opening);
+    self.held_base = None;
     self.sw_threads_pending = self.session_threads_run();
     self.enter_degraded_resync();
     self.sw_output_settled = forwarded.is_none() && !eof_pending;
@@ -3207,6 +3397,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   ) -> Result<Self, Error> {
     let limits = DecoderLimits::default();
     let owned_parameters = try_clone_parameters(&parameters, limits.max_codec_parameter_bytes())?;
+    let held = held_of(&owned_parameters);
     Ok(Self {
       state: DecodeState::Hw(hw),
       path,
@@ -3214,6 +3405,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       probe_extradata: None,
       extradata_unknown: None,
       extradata_provisional: false,
+      held,
+      held_proven: None,
+      held_base: None,
+      switch_declined: false,
       h264_aso: false,
       hevc_alpha: false,
       hw_scratch: Frame::empty()?,
@@ -3492,6 +3687,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     let probing = matches!(&self.state, DecodeState::Hw(hw) if hw.records_submissions());
     if matches!(self.state, DecodeState::Hw(_)) && !probing {
       self.install_probe_extradata();
+      self.held_base = None;
     }
     boundary::with_ffmpeg_video_packet::<C, _>(packet, limits, route, |av_pkt| {
       self.note_output_alpha();
@@ -3519,7 +3715,6 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
           // keyframe the software road sees is not.
           Ok(status) => {
             if matches!(status, Sent::Accepted) {
-              self.commit_sets(sets);
               if av_pkt.is_key() {
                 self.seeked = false;
               }
@@ -3528,6 +3723,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
               // into an empty input slot: it has read every packet before
               // this one.
               self.extradata_read();
+              self.commit_sets(sets, Commit::Taken);
               if let Some(extradata) = extradata {
                 self.took_extradata(extradata, probing, false);
               }
@@ -3543,7 +3739,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
             // backend, its error, and any rescued packets.
             if !self.may_open_software() {
               // The hardware failed on the packet, which it may have read.
-              self.commit_sets(sets);
+              self.commit_sets(sets, Commit::Doubt);
               return Err(VideoDecodeError::Decode(Error::AllBackendsFailed(p)));
             }
             // Route on the EXPLICIT origin, never on whether `rescued` is empty (a
@@ -3576,7 +3772,12 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
               let degraded = self.degrade_to_sw(PostCommitInput::Packet(av_pkt), false);
               // The cold decoder took the packet, or the hardware, failing on
               // it, may have read it.
-              self.commit_sets(sets);
+              let commit = if degraded.is_ok() {
+                Commit::Taken
+              } else {
+                Commit::Doubt
+              };
+              self.commit_sets(sets, commit);
               if degraded.is_err() {
                 // The hardware failed on this packet, and nothing replaced it:
                 // whether it applied the new extradata the packet carries, or
@@ -3607,7 +3808,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
             // keyframe here is where the session's threads come back. A
             // failure surfaces (it is not silently dropped), and back pressure
             // is reported as such rather than mistaken for one: the fallback
-            // committed either way, and the caller re-offers the packet.
+            // committed either way, and the caller re-offers the packet. Its
+            // sets are read against what the replay's decoder holds.
+            drop(sets);
+            let sets = self.sets_of(av_pkt);
             self.send_on_software(av_pkt, phase, sets)
           }
           Err(other) => {
@@ -3620,8 +3824,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
               Taken::Unknown(doubt) => self.reported_while_provisional(doubt),
               Taken::No => {}
             }
-            if taken != Taken::No {
-              self.commit_sets(sets);
+            match taken {
+              Taken::Yes => self.commit_sets(sets, Commit::Read),
+              Taken::Unknown(_) => self.commit_sets(sets, Commit::Doubt),
+              Taken::No => {}
             }
             // The new extradata it carries is the session's where the
             // refusal says the hardware decoded the packet, and unknown
@@ -4070,6 +4276,13 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     self.install_probe_extradata();
     if self.extradata_provisional {
       self.extradata_in_doubt(crate::ExtradataDoubt::Flushed);
+    }
+    // So may a packet carrying a parameter set, which the decoder keeps
+    // only where it read it: it is in doubt ([`Self::held_doubt`]). The
+    // probe's history begins again here, from what the hardware holds.
+    self.held_doubt();
+    if matches!(&self.state, DecodeState::Hw(hw) if hw.records_submissions()) {
+      self.held_base = Some(Box::new(self.held.clone()));
     }
     self.deferred_error = None;
     // And a parked frame belongs to the position being abandoned.
@@ -4813,16 +5026,66 @@ fn new_extradata(pkt: &Packet) -> Option<&[u8]> {
   }
 }
 
+/// The extradata `parameters` carry: `extradata_size` bytes, empty where
+/// there are none.
+fn record_of(parameters: &Parameters) -> &[u8] {
+  // SAFETY: the parameters' pointer, only read; `extradata` is read for
+  // `extradata_size` bytes, which FFmpeg allocated together, borrowed for as
+  // long as `parameters` is.
+  unsafe {
+    let raw = parameters.as_ptr();
+    if raw.is_null() || (*raw).extradata.is_null() {
+      return &[];
+    }
+    let size = usize::try_from((*raw).extradata_size).unwrap_or(0);
+    core::slice::from_raw_parts((*raw).extradata, size)
+  }
+}
+
+/// The codec id `parameters` carry, as the 32-bit integer the field holds.
+fn codec_id_of(parameters: &Parameters) -> i32 {
+  // SAFETY: the parameters' pointer, only read; `codec_id` is read as the
+  // 32-bit integer the field holds, never formed into a bindgen enum.
+  unsafe {
+    let raw = parameters.as_ptr();
+    if raw.is_null() {
+      return crate::CodecId::NONE.raw();
+    }
+    core::ptr::read(core::ptr::addr_of!((*raw).codec_id) as *const i32)
+  }
+}
+
+/// What a decoder opened on `parameters` holds ([`held::Held::opened_on`]).
+fn held_of(parameters: &Parameters) -> held::Held {
+  held::Held::opened_on(codec_id_of(parameters), record_of(parameters))
+}
+
 /// What a packet's parameter sets say of the stream's slices and layers,
 /// read before any road takes it and changing nothing
 /// (`CarrierVideoStreamDecoder::sets_of`); the session's for good once a
 /// decoder may have taken the packet (`CarrierVideoStreamDecoder::commit_sets`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default)]
 struct Sets {
   /// An H.264 sequence parameter set permitting arbitrary slice order.
   aso: bool,
   /// An HEVC video parameter set declaring an auxiliary layer.
   alpha: bool,
+  /// What the decoder holds once it has read the packet, where that changes
+  /// ([`held::Held::after_packet`]).
+  held: Option<Box<held::Held>>,
+}
+
+/// What is known of a decoder's reading of a packet it may have taken, for
+/// the sets the packet carries (`CarrierVideoStreamDecoder::commit_sets`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Commit {
+  /// It took the packet, and may not have read it yet: libavcodec takes a
+  /// packet into its input slot, and a frame thread decodes it later.
+  Taken,
+  /// It read the packet.
+  Read,
+  /// Whether it read the packet cannot be told: a refusal that does not say.
+  Doubt,
 }
 
 /// Whether a decoder took a packet whose submission it refused, as far as
@@ -4942,6 +5205,36 @@ fn taken_by_hardware_despite(error: &Error) -> Taken {
   }
 }
 
+/// Refuses by name ([`Error::ParametersTooLarge`]) `record` where
+/// `parameters` with it in place of their extradata would hold more heap
+/// bytes than `max_parameter_bytes` allows — measured as the open's choke
+/// point measures them (`crate::decoder::build_codec_context`), which would
+/// refuse them at the next decoder opened on them.
+fn fits(record: &[u8], parameters: &Parameters, max_parameter_bytes: usize) -> Result<(), Error> {
+  let padding = ffmpeg_next::ffi::AV_INPUT_BUFFER_PADDING_SIZE as usize;
+  // SAFETY: only the pointer is read; a live one is measured, which
+  // allocates nothing.
+  let rest = unsafe {
+    let raw = parameters.as_ptr();
+    if raw.is_null() {
+      Some(0)
+    } else {
+      crate::extras::measure_parameters(raw)
+        .and_then(|footprint| footprint.total_without_extradata())
+    }
+  };
+  let projected = rest
+    .and_then(|rest| rest.checked_add(record.len()))
+    .and_then(|bytes| bytes.checked_add(padding))
+    .unwrap_or(usize::MAX);
+  if projected > max_parameter_bytes {
+    return Err(Error::ParametersTooLarge(
+      crate::demuxer::ParametersTooLarge::new(0, projected, max_parameter_bytes),
+    ));
+  }
+  Ok(())
+}
+
 /// Extradata a packet carried as `AV_PKT_DATA_NEW_EXTRADATA`, copied the way
 /// codec parameters hold theirs — `av_malloc`ed with
 /// `AV_INPUT_BUFFER_PADDING_SIZE` zeroed bytes behind it — before the packet
@@ -4981,40 +5274,30 @@ impl NewExtradata {
     let Some(extradata) = new_extradata(pkt) else {
       return Ok(None);
     };
-    let padding = ffmpeg_next::ffi::AV_INPUT_BUFFER_PADDING_SIZE as usize;
-    // SAFETY: only the pointer is read; a live one is measured, which
-    // allocates nothing.
-    let rest = unsafe {
-      let raw = parameters.as_ptr();
-      if raw.is_null() {
-        Some(0)
-      } else {
-        crate::extras::measure_parameters(raw)
-          .and_then(|footprint| footprint.total_without_extradata())
-      }
-    };
-    let projected = rest
-      .and_then(|rest| rest.checked_add(extradata.len()))
-      .and_then(|bytes| bytes.checked_add(padding))
-      .unwrap_or(usize::MAX);
-    if projected > max_parameter_bytes {
-      return Err(Error::ParametersTooLarge(
-        crate::demuxer::ParametersTooLarge::new(0, projected, max_parameter_bytes),
-      ));
-    }
-    // SAFETY: only the pointer is read, and the codec id as the 32-bit
-    // integer the field holds, never formed into a bindgen enum.
-    let h264 = unsafe {
-      let raw = parameters.as_ptr();
-      !raw.is_null()
-        && core::ptr::read(core::ptr::addr_of!((*raw).codec_id) as *const i32)
-          == crate::CodecId::H264.raw()
-    };
-    if h264 {
+    fits(extradata, parameters, max_parameter_bytes)?;
+    if codec_id_of(parameters) == crate::CodecId::H264.raw() {
       params::h264_record(extradata).map_err(|reason| {
         Error::ExtradataRejected(crate::ExtradataRejected::new(crate::CodecId::H264, reason))
       })?;
     }
+    Self::allocated(extradata).map(Some)
+  }
+
+  /// A copy of `record`, refused by name where `parameters` with it in place
+  /// of their extradata would pass `max_parameter_bytes` ([`fits`]).
+  fn copy_of(
+    record: &[u8],
+    parameters: &Parameters,
+    max_parameter_bytes: usize,
+  ) -> Result<Self, Error> {
+    fits(record, parameters, max_parameter_bytes)?;
+    Self::allocated(record)
+  }
+
+  /// `extradata`, copied into an `av_malloc` allocation with zeroed padding
+  /// behind it.
+  fn allocated(extradata: &[u8]) -> Result<Self, Error> {
+    let padding = ffmpeg_next::ffi::AV_INPUT_BUFFER_PADDING_SIZE as usize;
     let Ok(size) = core::ffi::c_int::try_from(extradata.len()) else {
       return Err(Error::Ffmpeg(ffmpeg_next::Error::InvalidData));
     };
@@ -5032,7 +5315,14 @@ impl NewExtradata {
       core::ptr::copy_nonoverlapping(extradata.as_ptr(), data.as_ptr(), extradata.len());
       core::ptr::write_bytes(data.as_ptr().add(extradata.len()), 0, padding);
     }
-    Ok(Some(Self { data, size }))
+    Ok(Self { data, size })
+  }
+
+  /// The copy's bytes.
+  fn bytes(&self) -> &[u8] {
+    // SAFETY: `data` is this copy's own allocation of at least `size` bytes,
+    // all written, borrowed for as long as `self` is.
+    unsafe { core::slice::from_raw_parts(self.data.as_ptr(), self.size as usize) }
   }
 
   /// Installs this as `parameters`' extradata, the old freed: the stream's
@@ -5061,6 +5351,49 @@ impl Drop for NewExtradata {
     // SAFETY: `data` is this copy's own `av_malloc` allocation, not
     // installed (`install` does not drop).
     unsafe { ffmpeg_next::ffi::av_free(self.data.as_ptr().cast()) };
+  }
+}
+
+/// What a decoder opened fresh opens on, and what it then holds
+/// (`CarrierVideoStreamDecoder::opening`).
+struct Opening {
+  /// The parameters it opens on: a copy of the session's carrying a packet's
+  /// new extradata or a record synthesized from what is held; `None` for the
+  /// session's own.
+  parameters: Option<Parameters>,
+  /// What it holds once opened: what the decoder serving holds, with the
+  /// packet's record applied.
+  held: held::Held,
+}
+
+/// **Whether FFmpeg's decoder for `parameters`' codec stores every parameter
+/// set their extradata carries**: it is opened on them strictly —
+/// `err_recognition` set to `AV_EF_EXPLODE` alone, one thread — and closed
+/// again. FFmpeg's HEVC decoder then fails the open at the first set it
+/// refuses, where it would otherwise skip it and go on: `hevc_decode_nal_units`
+/// answers the set's error under `AV_EF_EXPLODE` (hevc/parse.c:72-73),
+/// `ff_hevc_decode_extradata` hands it on (120-125, 132-134), and
+/// `hevc_decode_init` fails the open (hevc/hevcdec.c:4167-4172). The strict
+/// open refuses, besides, three sets the decoder serving stores with a
+/// warning — a video or sequence parameter set whose reordered pictures
+/// overrun its buffering, a sequence parameter set whose cropping leaves no
+/// picture (hevc/ps.c:858-862, 1416-1421, 1640-1648) — so where it answers
+/// yes, the decoder opened on the same parameters stores the same sets.
+fn opens_strictly(parameters: &Parameters, limits: DecoderLimits) -> Result<bool, Error> {
+  let one_thread = limits.with_threads(crate::Threads::Single);
+  let (mut ctx, _callback_state) = build_codec_context(parameters, one_thread, None)?;
+  // SAFETY: `ctx` owns a live, not yet opened `AVCodecContext`; one plain
+  // integer field is written, and no reference into it is kept.
+  unsafe {
+    (*ctx.as_mut_ptr()).err_recognition = ffmpeg_next::ffi::AV_EF_EXPLODE as core::ffi::c_int;
+  }
+  let codec = crate::decoder::find_decoder(parameters)?;
+  match ctx.decoder().open_as(codec) {
+    Ok(_opened) => Ok(true),
+    Err(ffmpeg_next::Error::Other { errno }) if errno == libc::ENOMEM => {
+      Err(Error::Ffmpeg(ffmpeg_next::Error::Other { errno }))
+    }
+    Err(_) => Ok(false),
   }
 }
 

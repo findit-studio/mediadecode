@@ -193,6 +193,117 @@ pub enum Error {
   /// [`ExtradataRejected`].
   #[error(transparent)]
   ExtradataRejected(#[from] ExtradataRejected),
+
+  /// A decoder the session would open fresh — a post-commit fallback's, a
+  /// reopen — could not be opened holding the parameter sets the decoder it
+  /// takes over from holds: no record re-creates them, or whether that
+  /// decoder holds one cannot be told; see [`SetsUnrecordable`].
+  #[error(transparent)]
+  SetsUnrecordable(#[from] SetsUnrecordable),
+}
+
+/// Payload for [`Error::SetsUnrecordable`].
+///
+/// FFmpeg's H.264 and HEVC decoders keep every parameter set they store, by
+/// id, for as long as they live — from the extradata they were opened on,
+/// from a packet's `AV_PKT_DATA_NEW_EXTRADATA`, and from every packet that
+/// carries one in band, whatever its key flag — and a record replaces only
+/// the ids it carries. A decoder opened fresh holds only the sets of the
+/// record it is opened on: on a stream whose sets came in band, an IDR
+/// carrying none fails on it, and every picture to the next set is lost. So
+/// the session keeps what the decoder serving holds, as FFmpeg 9 reads it,
+/// and opens a decoder fresh — a switch to the session's threads, a reopen,
+/// a post-commit fallback's cold decoder, a probe-era fallback's replay — on
+/// a record carrying all of it, in the framing that decoder reads packets
+/// in, read back as FFmpeg reads it before it is used.
+///
+/// Where no record can carry what the decoder serving holds, or whether it
+/// holds a set cannot be told ([`Unrecordable`]), the decoder is not opened:
+/// a switch to the session's threads is declined, the decoder serving kept,
+/// and a reopen or a fallback is refused by this name, the packet still the
+/// caller's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+  "no decoder for {codec:?} could be opened holding the parameter sets the decoder serving holds: \
+   {reason}"
+)]
+pub struct SetsUnrecordable {
+  codec: crate::CodecId,
+  reason: Unrecordable,
+}
+
+impl SetsUnrecordable {
+  /// Constructs a [`SetsUnrecordable`] payload.
+  #[inline]
+  pub const fn new(codec: crate::CodecId, reason: Unrecordable) -> Self {
+    Self { codec, reason }
+  }
+  /// The stream's codec.
+  #[inline]
+  pub const fn codec(&self) -> crate::CodecId {
+    self.codec
+  }
+  /// Why no record carries what the decoder serving holds.
+  #[inline]
+  pub const fn reason(&self) -> Unrecordable {
+    self.reason
+  }
+}
+
+/// Why no record carries the parameter sets a decoder holds
+/// ([`SetsUnrecordable`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Unrecordable {
+  /// Whether the decoder holds a set cannot be told: a packet carrying it
+  /// was refused with an error that does not say whether the decoder read
+  /// it, or a flush dropped it before the decoder was seen to read it.
+  Unknown,
+  /// An H.264 picture parameter set the decoder holds was read under a
+  /// sequence parameter set its id no longer holds, and is decoded under
+  /// that one: a record reads every sequence parameter set first, and
+  /// binds the picture parameter set to the one held now.
+  Superseded,
+  /// The decoder frames packets as no record sets it to: H.264 start codes
+  /// with a NAL length size of four left from an earlier `avcC` record, under
+  /// which FFmpeg re-guesses the framing of every packet.
+  Framing,
+  /// A set whose reading ran past its payload: its last fields were read off
+  /// the bytes after it, which a record does not reproduce.
+  PastEnd(ParameterSet),
+  /// More sets than an `avcC` record counts: 31 sequence or 255 picture
+  /// parameter sets.
+  TooMany(ParameterSet),
+  /// A set longer than the 16-bit length of a record's entry.
+  Oversized(ParameterSet),
+  /// The record, read back as FFmpeg reads it, would not give the decoder
+  /// what the decoder serving holds — for HEVC, FFmpeg's decoder opened on
+  /// it strictly (`AV_EF_EXPLODE`) refuses a set it carries.
+  Unverified,
+  /// The decoder is an implementation that wraps another, whose parameter
+  /// sets this crate does not read.
+  Wrapped,
+}
+
+impl core::fmt::Display for Unrecordable {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    match self {
+      Self::Unknown => f.write_str("whether the decoder holds a parameter set cannot be told"),
+      Self::Superseded => f.write_str(
+        "a picture parameter set was read under a sequence parameter set its id no longer holds",
+      ),
+      Self::Framing => f.write_str("the decoder frames packets as no record sets it to"),
+      Self::PastEnd(set) => write!(f, "a {set}'s reading ran past its payload"),
+      Self::TooMany(set) => write!(f, "more {set}s than the record counts"),
+      Self::Oversized(set) => write!(f, "a {set} longer than a record's entry"),
+      Self::Unverified => {
+        f.write_str("the record, read back as FFmpeg reads it, does not give what is held")
+      }
+      Self::Wrapped => f.write_str(
+        "the decoder wraps another implementation, whose parameter sets this crate does not read",
+      ),
+    }
+  }
 }
 
 /// Payload for [`Error::ExtradataRejected`].
@@ -300,6 +411,8 @@ pub enum ParameterSet {
   Sequence,
   /// A picture parameter set.
   Picture,
+  /// An HEVC video parameter set.
+  Video,
 }
 
 impl core::fmt::Display for ParameterSet {
@@ -307,6 +420,7 @@ impl core::fmt::Display for ParameterSet {
     f.write_str(match self {
       Self::Sequence => "sequence parameter set",
       Self::Picture => "picture parameter set",
+      Self::Video => "video parameter set",
     })
   }
 }

@@ -128,7 +128,8 @@ pub use demuxer::{
 pub use error::{
   Error, ExtradataDoubt, ExtradataRejected, ExtradataRejection, ExtradataUnknown,
   FrameBudgetExceeded, FrameMedium, HwSurfaceTooLarge, HwTransferTooLarge, ParameterSet,
-  ReplayQueueFull, Result, ResyncUnprovable, UnpricedFrame, UnpricedHolding, UnrecoveredOutput,
+  ReplayQueueFull, Result, ResyncUnprovable, SetsUnrecordable, UnpricedFrame, UnpricedHolding,
+  Unrecordable, UnrecoveredOutput,
 };
 pub use frame::Frame;
 pub use image::{CarrierImageDecoder, Corrupt, CorruptSource, ImageDecodeError, InputTooLarge};

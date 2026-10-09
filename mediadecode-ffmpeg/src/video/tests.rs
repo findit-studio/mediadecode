@@ -9842,3 +9842,565 @@ fn a_video_parameter_set_read_past_its_end_is_stored_only_under_an_id_held_by_no
     );
   }
 }
+
+// ---------------------------------------------------------------------------
+//  R17 row 1: a decoder opened fresh holds what the decoder serving held
+// ---------------------------------------------------------------------------
+
+/// An H.264 clip from `libx264` under `params`, its parameter sets in the
+/// codec parameters' extradata alone (start-coded), none in band.
+fn encode_h264_global(width: u32, height: u32, frames: usize, params: &str) -> SyntheticClip {
+  use ffmpeg_next as ff;
+  ff::init().expect("ffmpeg init");
+  let codec = ff::codec::encoder::find_by_name("libx264").expect("libx264 is linked");
+  let mut options = ff::Dictionary::new();
+  options.set("x264-params", params);
+  encode_clip(codec, width, height, frames, options, |enc| {
+    enc.set_flags(ff::codec::Flags::GLOBAL_HEADER);
+  })
+}
+
+/// An HEVC clip from `libx265` under `params`, its parameter sets in the
+/// codec parameters' extradata alone (start-coded), none in band.
+fn encode_hevc_global(width: u32, height: u32, frames: usize, params: &str) -> SyntheticClip {
+  use ffmpeg_next as ff;
+  ff::init().expect("ffmpeg init");
+  let codec = ff::codec::encoder::find_by_name("libx265").expect("libx265 is linked");
+  let mut options = ff::Dictionary::new();
+  options.set("x265-params", params);
+  encode_clip(codec, width, height, frames, options, |enc| {
+    enc.set_flags(ff::codec::Flags::GLOBAL_HEADER);
+  })
+}
+
+/// Where a stream's parameter sets ride in band ([`with_the_next_sets_in_band`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Carried {
+  /// Ahead of the units of the packet before them.
+  Ahead,
+  /// After the units of the packet before them.
+  After,
+  /// In a packet of their own, no keyframe.
+  Alone,
+}
+
+/// `a`, then `b`, `b`'s timestamps after `a`'s, on `a`'s codec parameters:
+/// `b`'s parameter sets — its codec parameters' start-coded extradata —
+/// carried in band where `carried` says, by `a`'s last packet, no keyframe,
+/// or in a packet of their own between the two; no packet of `b` carries
+/// any.
+fn with_the_next_sets_in_band(
+  a: &SyntheticClip,
+  b: &SyntheticClip,
+  carried: Carried,
+) -> SyntheticClip {
+  let sets = extradata_of(&b.parameters);
+  assert!(!sets.is_empty(), "b's sets are in its codec parameters");
+  let last = a.packets.len() - 1;
+  assert!(!a.packets[last].is_key(), "a's last packet is no keyframe");
+  let shift = a.packets.len() as i64;
+  let mut packets: Vec<Packet> = a.packets.clone();
+  let data = packets[last].data().expect("a payload").to_vec();
+  match carried {
+    Carried::Ahead => packets[last] = repacked(&a.packets[last], &[&sets[..], &data[..]].concat()),
+    Carried::After => packets[last] = repacked(&a.packets[last], &[&data[..], &sets[..]].concat()),
+    Carried::Alone => packets.push(Packet::copy(&sets)),
+  }
+  for packet in &b.packets {
+    let mut moved = repacked(packet, packet.data().expect("a payload"));
+    moved.set_pts(packet.pts().map(|pts| pts + shift));
+    moved.set_dts(packet.dts().map(|dts| dts + shift));
+    packets.push(moved);
+  }
+  SyntheticClip {
+    parameters: a.parameters.clone(),
+    packets,
+  }
+}
+
+/// A picture delivered: its timestamp and its planes.
+type Picture = (i64, Vec<Vec<u8>>);
+
+/// The pictures a straight decode of `clip` on one thread delivers.
+fn straight(clip: &SyntheticClip) -> Vec<Picture> {
+  let (pictures, _) = decode_on_software(
+    clip,
+    DecoderLimits::default().with_threads(crate::Threads::Single),
+  );
+  pictures
+    .into_iter()
+    .map(|(pts, planes)| (pts.map_or(i64::MIN, |t| t.pts()), planes))
+    .collect()
+}
+
+/// What a session made of a clip: the pictures it delivered, the errors it
+/// answered, and the threads serving after each send.
+struct Session {
+  pictures: Vec<Picture>,
+  errors: Vec<String>,
+  threads: Vec<Option<core::num::NonZeroU32>>,
+}
+
+/// Drives `clip` through `dec`, every packet sent until taken and every
+/// picture drained, an error answered recorded and passed over — a packet
+/// refused is not sent again; `before(index, dec)` runs ahead of each send.
+fn session_of(
+  mut dec: FfmpegVideoStreamDecoder,
+  clip: &SyntheticClip,
+  mut before: impl FnMut(usize, &mut FfmpegVideoStreamDecoder),
+) -> Session {
+  let mut dst = crate::empty_owned_video_frame();
+  let mut pictures = Vec::new();
+  let mut errors = Vec::new();
+  let mut threads = Vec::new();
+  let mut drain = |dec: &mut FfmpegVideoStreamDecoder,
+                   pictures: &mut Vec<Picture>,
+                   errors: &mut Vec<String>| loop {
+    match dec.receive_frame(&mut dst) {
+      Ok(Received::Frame) => pictures.push((
+        dst.pts().map_or(i64::MIN, |t| t.pts()),
+        dst
+          .planes()
+          .iter()
+          .map(|plane| plane.data_ref().as_ref().to_vec())
+          .collect(),
+      )),
+      Ok(Received::NeedsInput | Received::Ended) => break,
+      Err(error) => errors.push(format!("{error:?}")),
+    }
+  };
+  for (index, av_pkt) in clip.packets.iter().enumerate() {
+    before(index, &mut dec);
+    loop {
+      match dec.send_packet(&pushed(av_pkt)) {
+        Ok(Sent::Accepted) => break,
+        Ok(Sent::MustDrain) => drain(&mut dec, &mut pictures, &mut errors),
+        Err(error) => {
+          errors.push(format!("send {index}: {error:?}"));
+          break;
+        }
+      }
+    }
+    threads.push(dec.active_threads());
+    drain(&mut dec, &mut pictures, &mut errors);
+  }
+  crate::accepted(dec.send_eof(), "send_eof");
+  drain(&mut dec, &mut pictures, &mut errors);
+  Session {
+    pictures,
+    errors,
+    threads,
+  }
+}
+
+/// A session over `clip` behind a hardware seam that buffers what it is sent
+/// and exhausts at `fail_at`, its software decoders on `threads`.
+fn behind_a_probe(
+  clip: &SyntheticClip,
+  fail_at: usize,
+  threads: crate::Threads,
+) -> FfmpegVideoStreamDecoder {
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  FfmpegVideoStreamDecoder::from_hw_inner_for_test(
+    Box::new(FakeHw::failing(16, 16, 0, fail_at, FailShape::ProbeEra)),
+    clip.parameters.clone(),
+    tb,
+  )
+  .expect("build test decoder")
+  .with_threads_for_test(threads)
+}
+
+/// A session over `clip` on a hardware seam that decodes up to `at` and
+/// fails post-commit there.
+fn behind_a_failure_at(clip: &SyntheticClip, at: usize) -> FfmpegVideoStreamDecoder {
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  FfmpegVideoStreamDecoder::from_hw_inner_for_test(
+    Box::new(FakeHw::failing(128, 96, at, at, FailShape::PostCommit)),
+    clip.parameters.clone(),
+    tb,
+  )
+  .expect("build test decoder")
+}
+
+/// The pictures `pictures` delivered from `pts` on.
+fn from_pts(pictures: &[Picture], pts: i64) -> Vec<Picture> {
+  pictures
+    .iter()
+    .filter(|(at, _)| *at >= pts)
+    .cloned()
+    .collect()
+}
+
+/// The two H.264 streams of row 1's laws, the second's sets carried in band
+/// by the first's last packet: `new_ids` — the second encoded under SPS and
+/// PPS ids 15, ahead of the first's units, the record keeping ids 0 — or
+/// replacing ids 0 at a larger picture size, after the first's units.
+fn h264_sets_carried_in_band(new_ids: bool) -> SyntheticClip {
+  let params = "keyint=8:min-keyint=8:scenecut=0:bframes=2:b-adapt=0:open-gop=0:log-level=error";
+  let a = encode_h264_global(128, 96, 16, params);
+  let b = if new_ids {
+    encode_h264_global(128, 96, 16, &format!("{params}:sps-id=15"))
+  } else {
+    encode_h264_global(160, 96, 16, params)
+  };
+  with_the_next_sets_in_band(
+    &a,
+    &b,
+    if new_ids {
+      Carried::Ahead
+    } else {
+      Carried::After
+    },
+  )
+}
+
+/// LAW (R17 row 1, the author's own; Codex R16 [high]): **a decoder opened
+/// fresh at a switch holds the parameter sets the stream carried in band, and
+/// loses no picture.** An H.264 stream whose record holds SPS and PPS 0, and
+/// whose packet 15 — no keyframe — carries ahead of its own units the SPS and
+/// PPS 15 of the stream after it, whose IDR 16 refers to PPS 15 and carries no
+/// set. On a probe-era fallback at 10 on three threads the session switches at
+/// 16: the decoder it opens there holds SPS and PPS 15 — a record carrying the
+/// record's sets and those in band — and every picture comes out as a straight
+/// decode on one thread gives it, none lost, no error. Then the same with the
+/// second stream's sets replacing ids 0 at a larger picture size, after
+/// packet 15's own units: the record synthesized carries the replacement.
+/// Opened on the record alone, the decoder at 16 held no PPS 15, or the
+/// smaller picture's sets, and lost the stream after it.
+#[test]
+fn a_decoder_opened_at_a_switch_holds_the_sets_the_stream_carried_in_band() {
+  let three = core::num::NonZeroU32::new(3).expect("nonzero");
+  for (new_ids, name) in [(true, "new ids"), (false, "replaced ids")] {
+    let clip = h264_sets_carried_in_band(new_ids);
+    assert!(
+      clip.packets[16].is_key() && !clip.packets[15].is_key(),
+      "{name}: 16 is the second stream's IDR"
+    );
+    let reference = straight(&clip);
+    assert_eq!(reference.len(), 32, "{name}: the straight decode is whole");
+    let session = session_of(
+      behind_a_probe(&clip, 10, crate::Threads::Count(three)),
+      &clip,
+      |_, _| {},
+    );
+    assert_eq!(
+      (session.threads[15], session.threads[16]),
+      (Some(core::num::NonZeroU32::MIN), Some(three)),
+      "{name}: one thread to 15, three from the switch at 16"
+    );
+    assert!(
+      session.errors.is_empty(),
+      "{name}: no error: {:?}",
+      session.errors
+    );
+    assert_eq!(
+      session.pictures.len(),
+      reference.len(),
+      "{name}: every picture"
+    );
+    for (index, (got, want)) in session.pictures.iter().zip(&reference).enumerate() {
+      assert!(
+        got == want,
+        "{name}: picture {index} differs from the straight decode's"
+      );
+    }
+  }
+}
+
+/// LAW (R17 row 1): **the same across a post-commit fallback and a reopen.**
+/// The two streams of the switch's law. The hardware takes 0 to 15 and fails
+/// post-commit at 16: the cold decoder opens holding what the hardware held —
+/// the sets 15 carried among them — the IDR 16 anchors, and every picture from
+/// 16 on comes out as the straight decode gives it, the end clean. A session
+/// on software, one thread, whose decoder is closed before 16 — as a switch
+/// whose opens all failed leaves it — opens one at 16 holding them too, and
+/// every picture from 16 on comes out alike. Opened on the record alone, the
+/// cold decoder lost the stream after 16, the end escalated, and the reopened
+/// one lost it too.
+#[test]
+fn a_decoder_opened_fresh_by_a_fallback_or_a_reopen_holds_the_sets_carried_in_band() {
+  for (new_ids, name) in [(true, "new ids"), (false, "replaced ids")] {
+    let clip = h264_sets_carried_in_band(new_ids);
+    let reference = from_pts(&straight(&clip), 16);
+    assert_eq!(reference.len(), 16, "{name}: the second stream's pictures");
+
+    // The hardware's post-commit fallback at 16.
+    let session = session_of(behind_a_failure_at(&clip, 16), &clip, |_, _| {});
+    assert!(
+      session.errors.is_empty(),
+      "{name}: no error, the end clean: {:?}",
+      session.errors
+    );
+    assert!(
+      from_pts(&session.pictures, 16) == reference,
+      "{name}: every picture from 16 on, as the straight decode gives it"
+    );
+
+    // A reopen at 16.
+    let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+    let dec = FfmpegVideoStreamDecoder::open_as(
+      clip.parameters.clone(),
+      tb,
+      DecoderLimits::default().with_threads(crate::Threads::Single),
+      DecodePath::Software,
+    )
+    .expect("the software road opens");
+    let session = session_of(dec, &clip, |index, dec| {
+      if index == 16 {
+        // The decoder closed, as `open_after_drain` closes it.
+        if let DecodeState::Sw(sw) = &dec.state {
+          sw.give_up_refusals(&mut dec.refusals);
+        }
+        dec.state = DecodeState::SwClosed;
+      }
+    });
+    assert!(
+      session.errors.is_empty(),
+      "{name}: no error: {:?}",
+      session.errors
+    );
+    assert!(
+      from_pts(&session.pictures, 16) == reference,
+      "{name}: every picture from 16 on, as the straight decode gives it"
+    );
+  }
+}
+
+/// LAW (R17 row 1, the HEVC twin): **a decoder opened fresh holds the video,
+/// sequence and picture parameter sets an HEVC stream carried in band.** Two
+/// `x265` streams, 128x96 then 160x96, the second's VPS, SPS and PPS — ids 0,
+/// replacing the record's — carried by a packet of their own between them,
+/// no packet of the second carrying any. On a probe-era fallback at 10 on
+/// three threads the session switches at the second's IDR 17, on a record
+/// synthesized from what is held — FFmpeg's decoder opened on it strictly
+/// first — and every picture comes out as a straight decode gives it; the
+/// hardware failing post-commit at 17, the cold decoder holds them too, 17
+/// anchors and the end is clean. Opened on the record alone, both decoders
+/// held the first stream's sets and lost the second.
+#[test]
+fn a_decoder_opened_fresh_holds_the_hevc_sets_carried_in_band() {
+  let params = "keyint=8:min-keyint=8:scenecut=0:bframes=0:open-gop=0:log-level=error";
+  let clip = with_the_next_sets_in_band(
+    &encode_hevc_global(128, 96, 16, params),
+    &encode_hevc_global(160, 96, 16, params),
+    Carried::Alone,
+  );
+  assert!(clip.packets[17].is_key(), "17 is the second stream's IDR");
+  let reference = straight(&clip);
+  assert_eq!(reference.len(), 32, "the straight decode is whole");
+  let three = core::num::NonZeroU32::new(3).expect("nonzero");
+  let session = session_of(
+    behind_a_probe(&clip, 10, crate::Threads::Count(three)),
+    &clip,
+    |_, _| {},
+  );
+  assert_eq!(
+    (session.threads[16], session.threads[17]),
+    (Some(core::num::NonZeroU32::MIN), Some(three)),
+    "one thread to 16, three from the switch at 17"
+  );
+  assert!(session.errors.is_empty(), "no error: {:?}", session.errors);
+  assert_eq!(session.pictures.len(), reference.len(), "every picture");
+  for (index, (got, want)) in session.pictures.iter().zip(&reference).enumerate() {
+    assert!(
+      got == want,
+      "picture {index} differs from the straight decode's"
+    );
+  }
+  let session = session_of(behind_a_failure_at(&clip, 17), &clip, |_, _| {});
+  assert!(
+    session.errors.is_empty(),
+    "no error, the end clean: {:?}",
+    session.errors
+  );
+  assert!(
+    from_pts(&session.pictures, 16) == from_pts(&reference, 16),
+    "every picture from 17 on, as the straight decode gives it"
+  );
+}
+
+/// The units of kind `kind` (H.264's `nal_unit_type`) in a start-coded
+/// buffer, start-coded.
+fn h264_units_of_kind(data: &[u8], kind: u8) -> Vec<u8> {
+  annexb_units(data)
+    .into_iter()
+    .filter(|unit| unit[0] & 0x1f == kind)
+    .flat_map(|unit| [0u8, 0, 0, 1].into_iter().chain(unit.iter().copied()))
+    .collect()
+}
+
+/// LAW (R17 row 1): **where no record re-creates what the decoder holds, a
+/// fresh decoder is refused by name, and a switch is declined, the serving
+/// decoder kept.** An H.264 stream whose record holds SPS and PPS 0, its
+/// packet 15 carrying after its own units a second stream's SPS 0 — a larger
+/// picture — and no PPS: FFmpeg keeps PPS 0 bound to the SPS it was read
+/// under (h264_ps.c:731-738), and decodes a slice under that one
+/// (h264_slice.c:1746-1747), which a record — every SPS read before any PPS —
+/// cannot re-create. Held-level: the sets after 15 have no record
+/// (`Superseded`); with the PPS read again after the SPS they have one, read
+/// back as FFmpeg reads it. On a probe-era fallback at 10 on three threads
+/// the switch at 16 is declined and the one-thread decoder serves on; the
+/// hardware failing post-commit at 16, the fallback is refused by name; a
+/// decoder closed before 16 is reopened by none, by name. A set held in
+/// doubt has no record either (`Unknown`); nor a start-coded record taking
+/// over from a four-byte `avcC` one, under which FFmpeg re-guesses every
+/// packet's framing (`Framing`).
+#[test]
+fn where_no_record_carries_what_is_held_a_fresh_decoder_is_refused_by_name() {
+  use super::held::Held;
+  let h264 = crate::CodecId::H264.raw();
+  let params = "keyint=8:min-keyint=8:scenecut=0:bframes=2:b-adapt=0:open-gop=0:log-level=error";
+  let a = encode_h264_global(128, 96, 16, params);
+  let b = encode_h264_global(160, 96, 16, params);
+  let record = extradata_of(&a.parameters);
+  let b_sets = extradata_of(&b.parameters);
+  let (b_sps, b_pps) = (
+    h264_units_of_kind(&b_sets, 7),
+    h264_units_of_kind(&b_sets, 8),
+  );
+
+  // Held-level.
+  let held = Held::opened_on(h264, &record);
+  let superseded = held
+    .after_packet(None, Some(&b_sps))
+    .expect("the SPS replaces id 0");
+  assert_eq!(
+    superseded.record(h264, &record),
+    Err(crate::Unrecordable::Superseded),
+    "PPS 0 bound to the SPS it was read under"
+  );
+  let rebound = superseded
+    .after_packet(None, Some(&b_pps))
+    .expect("the PPS is read again");
+  let synthesized = rebound
+    .record(h264, &record)
+    .expect("a record re-creates it")
+    .expect("not the record's own");
+  assert!(
+    Held::opened_on(h264, &synthesized.bytes).same(&rebound),
+    "read back as FFmpeg reads it"
+  );
+  let mut doubtful = rebound.clone();
+  doubtful.doubt_since(&held);
+  assert_eq!(
+    doubtful.record(h264, &record),
+    Err(crate::Unrecordable::Unknown),
+    "a set in doubt"
+  );
+  let (sps, pps) = sps_and_pps(&a);
+  let four = Held::opened_on(h264, &avcc(&sps, &pps, 4));
+  let start_coded = four.with_record(&b_sets);
+  assert_eq!(
+    start_coded.record(h264, &b_sets),
+    Err(crate::Unrecordable::Framing),
+    "start codes under a four-byte NAL length size"
+  );
+
+  // The session.
+  let mut packets = a.packets.clone();
+  let last = packets.len() - 1;
+  let data = packets[last].data().expect("a payload").to_vec();
+  packets[last] = repacked(&a.packets[last], &[&data[..], &b_sps[..]].concat());
+  packets.extend(b.packets.iter().map(|packet| {
+    let mut moved = repacked(packet, packet.data().expect("a payload"));
+    moved.set_pts(packet.pts().map(|pts| pts + 16));
+    moved.set_dts(packet.dts().map(|dts| dts + 16));
+    moved
+  }));
+  let clip = SyntheticClip {
+    parameters: a.parameters.clone(),
+    packets,
+  };
+  let three = core::num::NonZeroU32::new(3).expect("nonzero");
+  let session = session_of(
+    behind_a_probe(&clip, 10, crate::Threads::Count(three)),
+    &clip,
+    |_, _| {},
+  );
+  assert_eq!(
+    session.threads[16],
+    Some(core::num::NonZeroU32::MIN),
+    "the switch at 16 declined, the one-thread decoder serving on"
+  );
+  let refused = |errors: &[String]| {
+    errors.iter().any(|error| {
+      error.starts_with("send 16:")
+        && error.contains("SetsUnrecordable")
+        && error.contains("Superseded")
+    })
+  };
+  let failed = session_of(behind_a_failure_at(&clip, 16), &clip, |_, _| {});
+  assert!(
+    refused(&failed.errors),
+    "the post-commit fallback at 16 refused by name: {:?}",
+    failed.errors
+  );
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let dec = FfmpegVideoStreamDecoder::open_as(
+    clip.parameters.clone(),
+    tb,
+    DecoderLimits::default().with_threads(crate::Threads::Single),
+    DecodePath::Software,
+  )
+  .expect("the software road opens");
+  let reopened = session_of(dec, &clip, |index, dec| {
+    if index == 16 {
+      if let DecodeState::Sw(sw) = &dec.state {
+        sw.give_up_refusals(&mut dec.refusals);
+      }
+      dec.state = DecodeState::SwClosed;
+    }
+  });
+  assert!(
+    refused(&reopened.errors),
+    "the reopen at 16 refused by name: {:?}",
+    reopened.errors
+  );
+}
+
+/// LAW (R17 row 1, HEVC): **an HEVC set that replaces another drops the sets
+/// that refer to it, as FFmpeg's decoder does** (`remove_vps`,
+/// `remove_sps`, hevc/ps.c:89-111): an `x265` record's VPS 0 replaced in band
+/// by another one-layer VPS 0, and the SPS and PPS that referred to it are
+/// gone — a record synthesized from what is held carries the new VPS alone,
+/// read back as FFmpeg reads it; the record's VPS sent again unchanged drops
+/// nothing (ps.c:797-802).
+#[test]
+fn an_hevc_set_that_replaces_another_drops_what_referred_to_it() {
+  use super::held::Held;
+  let hevc = crate::CodecId::HEVC.raw();
+  let params = "keyint=8:min-keyint=8:scenecut=0:bframes=0:open-gop=0:log-level=error";
+  let clip = encode_hevc_global(128, 96, 8, params);
+  let record = extradata_of(&clip.parameters);
+  let held = Held::opened_on(hevc, &record);
+  let vps = annexb_units(&record)
+    .into_iter()
+    .find(|unit| (unit[0] >> 1) & 0x3f == 32)
+    .expect("the record's VPS")
+    .to_vec();
+  assert!(
+    held
+      .after_packet(None, Some(&[&[0, 0, 0, 1][..], &vps].concat()))
+      .is_none(),
+    "the same VPS again changes nothing"
+  );
+  let replaced = held
+    .after_packet(
+      None,
+      Some(&[&[0, 0, 0, 1][..], &hevc_vps(0, 0, None, 0)].concat()),
+    )
+    .expect("a new VPS 0");
+  let synthesized = replaced
+    .record(hevc, &record)
+    .expect("a record re-creates it")
+    .expect("not the record's own");
+  assert_eq!(
+    synthesized.bytes,
+    [&[0, 0, 1][..], &hevc_vps(0, 0, None, 0)].concat(),
+    "the new VPS alone"
+  );
+  assert!(
+    Held::opened_on(hevc, &synthesized.bytes).same(&replaced),
+    "read back as FFmpeg reads it"
+  );
+}
