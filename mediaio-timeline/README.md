@@ -152,7 +152,12 @@ export holds both:
   range is written in the first whose counts end it within ±2^53 too; where
   none does, an available range is refused, and a source range is written
   in the first that writes its start and its length, its end left to the
-  walk and to the search below.
+  walk and to the search below. A source range none of those rulers writes
+  is written in the first ruler the timeline's operands are counted in that
+  does, finest first — a ruler at a fractional rate, such as the edit rate
+  at one frame every two seconds, as every whole rate that lands on a range
+  is a multiple of the coarsest, which counts it in the smallest counts —
+  and refused only where none of those writes it either.
 - **what OpenTimelineIO derives from it**, computed operation for operation
   and branch for branch as OpenTimelineIO computes it, beside its exact
   value: the end of each clip's source range; each child's place on its
@@ -186,17 +191,19 @@ writes the clips the value is formed from in other rulers that hold their
 source ranges exactly and walks the timeline again — a search, bounded by
 contract. A clip's rulers, in the order the search tries them:
 
-1. its own: frames of its medium's stated rate, ticks of its source's
-   timebase, or the coarsest whole rate that holds the range;
+1. its plan's: one of its own — frames of its medium's stated rate, ticks
+   of its source's timebase, or the coarsest whole rate that holds the
+   range — or, where none of those writes the range, the first ruler the
+   timeline's operands are counted in that does;
 2. every ruler the timeline's operands are counted in that holds the range
    — the edit rate, at which the global start, the gaps and the transitions
    are written, the rate 1 OpenTimelineIO sums a track's duration from, and
-   every clip's planned ruler — finer or coarser than its own, all of them,
-   finest first;
-3. the 64 finest whole numbers of ticks a second below its own that hold
-   the range and that no operand is counted in, finest first;
+   every clip's planned ruler — finer or coarser than its plan's, all of
+   them, finest first;
+3. the 64 finest whole numbers of ticks a second below its plan's that
+   hold the range and that no operand is counted in, finest first;
 4. the 64 coarsest of those, finest first, less any already listed;
-5. its own again, where every other is finer.
+5. its plan's again, where every other is finer.
 
 So where OpenTimelineIO would rescale a clip into the edit rate or into a
 neighbour's ruler, the search can write the clip in that ruler itself. It
@@ -212,14 +219,17 @@ exported track is an `otio::ChildAt`), the count the last plan could not
 hold and the ruler it is counted in — and, for a count OpenTimelineIO
 derives, a source range's end among them, what the search tried:
 `otio::RulerSearch`, its bands (`otio::RulerBand`) and its walks. So a
-refusal says the search was bounded. Refused before any walk, naming no
+refusal says the search was bounded. A source range no ruler of the bands
+writes — its start or its length past 2^53 in each of its own rulers and
+in each ruler the timeline's operands are counted in, the only rulers of
+the bands that can write a range its own cannot — leaves the search no
+plan to walk: it is refused before any walk, and says so, naming the bands
+and no walk (`RulerSearch::walks` 0). Refused before any walk, naming no
 search: a count written at the edit rate, which no ruler of the search
-changes; a source range none of its own rulers writes, its start or its
-length past 2^53 in each, which leaves the search no plan to start from;
-an available range none of them holds whole, which keeps its plan's
-ruler. A timeline that only a ruler outside the bands, or a plan of
-rulers the moves do not reach, would hold is refused by this contract,
-never written to be read rounded: a complete search would try every
+changes; an available range none of its own rulers holds whole, which
+keeps its plan's ruler. A timeline that only a ruler outside the bands,
+or a plan of rulers the moves do not reach, would hold is refused by this
+contract, never written to be read rounded: a complete search would try every
 holding ruler of every clip together, a product space with no closed form
 for OpenTimelineIO's double rounding. Where the bound has been met, counts
 lie near 2^53 ticks of a clip's ruler — at the rates media run at,

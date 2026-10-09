@@ -68,8 +68,11 @@ The crate's first release, as 0.1.0.
   ruler that holds it, and of its own rulers in the first that ends it
   within ±2^53 too — a source range none ends is written in one that
   writes its start and its length, its end left to the walk and the
-  search. Every count OpenTimelineIO derives from the document — the end
-  of each clip's source range; each child's place on its track, from zero
+  search, and a source range none of them writes in the first ruler the
+  timeline's operands are counted in that does, finest first (one at a
+  fractional rate: every whole rate that lands on a range is a multiple of
+  the coarsest). Every count OpenTimelineIO derives from the document —
+  the end of each clip's source range; each child's place on its track, from zero
   in the child's own rate, and in the timeline; each item's visible range
   with its neighbouring transitions' handles; each track's duration and the
   stack's, the longest as OpenTimelineIO picks it; the global start added
@@ -83,10 +86,10 @@ The crate's first release, as 0.1.0.
   its double less than half a tick from the exact count. Exact, or
   refused: where a derived value would round, a
   search bounded by contract writes the clips it is formed from in other
-  rulers that hold their source ranges — a clip's own, then every ruler the
-  timeline's operands are counted in (the edit rate, 1, every clip's
+  rulers that hold their source ranges — a clip's plan's, then every ruler
+  the timeline's operands are counted in (the edit rate, 1, every clip's
   planned ruler), never capped, then the 64 finest and the 64 coarsest
-  whole rates below its own — one clip one ruler at a time, the finest
+  whole rates below its plan's — one clip one ruler at a time, the finest
   first, within `1 + n · (d + 127)` walks for `n` clips and `d` operand
   rulers. Every range ends where it is stored, and the exported items, laid
   end to end, put every clip on its record. Refuses with `otio::Refused`:
@@ -97,10 +100,12 @@ The crate's first release, as 0.1.0.
   source range's end among them, what the search tried,
   `otio::RulerSearch`: its bands (`otio::RulerBand`) and its walks — where
   no plan the search tries holds a count, naming the last plan's. A count
-  written at the edit rate, a source range none of its own rulers writes
-  and an available range none of them holds whole are refused before any
-  walk, naming no search. A timeline only a ruler outside the bands would
-  hold is refused by that contract, not misread.
+  written at the edit rate and an available range none of its own rulers
+  holds whole are refused before any walk, naming no search; a source
+  range no ruler of the bands writes — none of its own, none the
+  timeline's operands are counted in — is refused before any walk too,
+  naming the bands and no walk. A timeline only a ruler outside the bands
+  would hold is refused by that contract, not misread.
 
 - **`otio::validate_json`**: the structural self-check — a strict JSON
   reader and OpenTimelineIO's schema shape, requiring exactly the keys each
