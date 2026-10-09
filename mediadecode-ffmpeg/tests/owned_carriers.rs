@@ -2767,14 +2767,11 @@ fn every_hardware_exit_names_the_coded_surface_refusal() {
   let path = corpus.cropped_h264();
 
   /// Pulls the named refusal out of whichever shape an exit wrapped it
-  /// in — directly, inside a backend-attempt log, or as the cause of a
-  /// lost road (the explicit-backend road below has committed at open,
-  /// so a declined surface there loses its road).
+  /// in — directly, or inside a backend-attempt log.
   fn named(e: &Error) -> Option<mediadecode_ffmpeg::HwSurfaceTooLarge> {
     match e {
       Error::HwSurfaceTooLarge(p) => Some(*p),
       Error::AllBackendsFailed(f) => f.attempts().iter().find_map(|(_, inner)| named(inner)),
-      Error::HardwareRoadLost(lost) => named(lost.source()),
       _ => None,
     }
   }

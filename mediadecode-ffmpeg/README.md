@@ -68,25 +68,33 @@ instead, carrying them (`p.unconsumed_packets()` /
 pipes, network sources) can replay them through a software decoder of
 their own without re-demuxing.
 
-After the first picture nothing changes the road, on any path. A picture
-the hardware fails to decode is that picture's error, as a corrupt packet
-is on the software road, and the session decodes on — FFmpeg's own model
-of a hardware failure. Only FFmpeg's own signals that no session can
-continue lose the road: `Error::HardwareRoadLost`, by name, after which the
-session refuses every call with it. To go on, open a session on
-`DecodePath::Software` from the same parameters and feed it forward from
-the packet the loss was reported on; libavcodec decodes from the next
-keyframe.
+After the first picture nothing changes the road, on any path, and
+nothing is classified. A failure there is that picture's own error,
+reported as the decoder minted it — on hardware as a corrupt packet is on
+the software road — and the next packet decodes; nothing is remembered,
+and `flush` leaves the session serving. FFmpeg has no reliable signal that
+a hardware session is gone (`AVERROR_EXTERNAL`, for one, also answers a
+single picture), and it may restart a hardware session on its own at a
+later parameter set; `VideoDecoder`'s documentation cites the FFmpeg 9.0.1
+lines.
+
+When to stop trusting a hardware session is the caller's policy: the
+caller sees the errors, the packets' key flags and what it has delivered.
+One recipe: after `N` consecutive failures, or one failure on a packet
+flagged key, open a session on `DecodePath::Software` from the same
+parameters and feed it forward — the packet the error answered when it
+came from `send_packet`, otherwise the next one. libavcodec conceals or
+drops what comes before the next keyframe and decodes normally from there.
 
 ## Usage
 
 ```rust,no_run
 use ffmpeg_next as ffmpeg;
 use ffmpeg::{format, media};
-use mediadecode::{Received, Sent, Timebase, decoder::VideoStreamDecoder};
+use mediadecode::{Received, Sent, Timebase, decoder::VideoStreamDecoder, packet::PacketFlags};
 use mediadecode_ffmpeg::{
-  DecoderLimits, Error as FfmpegError, FfmpegVideoStreamDecoder, PacketLimits,
-  VideoDecodeError, empty_video_frame, video_packet_from_ffmpeg_in,
+  DecoderLimits, FfmpegVideoStreamDecoder, PacketLimits, VideoDecodeError, empty_video_frame,
+  video_packet_from_ffmpeg_in,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -108,6 +116,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     FfmpegVideoStreamDecoder::open(stream.parameters(), time_base, DecoderLimits::default())?;
 
   let mut frame = empty_video_frame();
+  // When to stop trusting a hardware session is this code's policy, not
+  // the decoder's: here, three failures in a row, or one on a keyframe.
+  let mut failures_in_a_row = 0u32;
   for (s, av_packet) in input.packets() {
     if s.index() != stream_index { continue; }
     // `Ok(None)` is an empty packet; an `Err` is a payload that is
@@ -123,7 +134,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     else { continue };
 
     match decoder.send_packet(&pkt) {
-      Ok(Sent::Accepted) => {}
+      Ok(Sent::Accepted) => failures_in_a_row = 0,
       // Back pressure, not a failure: nothing was consumed, so drain
       // and offer this same packet again. The old idiom — submit
       // twice and treat the second failure as real — is what this
@@ -132,13 +143,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         while decoder.receive_frame(&mut frame)? == Received::Frame {}
         // (re-offer `pkt`; elided here for brevity)
       }
-      Err(VideoDecodeError::Decode(FfmpegError::HardwareRoadLost(lost))) => {
-        // The committed hardware decoder can no longer decode this
-        // stream, and the session takes nothing more. Open one on
-        // `DecodePath::Software` from the same parameters and feed it
-        // this packet and the ones after it.
-        let _backend = lost.backend();
-        return Ok(());
+      // After the first picture a failure is that picture's own — on
+      // hardware as on software — and the next packet decodes.
+      Err(VideoDecodeError::Decode(e)) if decoder.is_hardware() => {
+        failures_in_a_row += 1;
+        if failures_in_a_row >= 3 || pkt.flags().contains(PacketFlags::KEY) {
+          // Open a session on `DecodePath::Software` from the same
+          // parameters and feed it this packet and the ones after it
+          // (elided here for brevity).
+          return Err(e.into());
+        }
+        continue;
       }
       // `VideoDecodeError` is `#[non_exhaustive]`: a fault this code
       // has never heard of takes the generic road, which is the right
@@ -181,10 +196,10 @@ for end-to-end demuxer-driven runs that cover all three streams.
   — `Auto` (what `open` does: probe hardware, fall back to software
   before the first picture), `AnyHardware` (the same probe, never
   software), `Software`, or the pin `Hardware(Backend)`. After the first
-  picture no path changes its decoder: a hardware failure is the
-  picture's own error, and a lost road is `Error::HardwareRoadLost`.
-  `is_hardware()` / `is_software()` stay the live reading of where a
-  session is.
+  picture no path changes its decoder, and a failure is the picture's
+  own error; when to stop trusting a hardware session is the caller's
+  policy. `is_hardware()` / `is_software()` stay the live reading of where
+  a session is.
 - **Demuxer**: `FfmpegDemuxer` — `mediadecode`'s `Demuxer` over
   `libavformat`, opened from a path (`open`) or from any
   `Read + Seek` byte source through a custom `AVIOContext`

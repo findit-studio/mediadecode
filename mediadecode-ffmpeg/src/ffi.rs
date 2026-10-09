@@ -248,17 +248,6 @@ pub(crate) struct CallbackState {
   pub(crate) declined_pixels: core::sync::atomic::AtomicI64,
   /// The ceiling it was refused against.
   pub(crate) declined_limit: core::sync::atomic::AtomicI64,
-  /// Set by [`get_hw_format`] when the formats libavcodec offers do not
-  /// include [`Self::wanted`].
-  ///
-  /// Left here for the reason a declined ceiling is: the callback can
-  /// only answer `AV_PIX_FMT_NONE`, and the codec reports that in the
-  /// words a corrupt picture earns. The fact behind it is that the
-  /// hardware could not be set up for the stream's parameters —
-  /// `ff_get_format` withdraws the hardware format when the hwaccel's own
-  /// setup fails, and asks again without it — and the funnels name it
-  /// [`Error::HwFormatNotOffered`](crate::Error::HwFormatNotOffered).
-  pub(crate) format_not_offered: core::sync::atomic::AtomicBool,
   /// The caller's [`FrameLimits::max_frame_bytes`](crate::FrameLimits::max_frame_bytes),
   /// verbatim.
   ///
@@ -319,20 +308,6 @@ pub(crate) fn take_frame_budget_declination(
   declined.then_some((bytes, limit, audio))
 }
 
-/// Reads and clears the [`CallbackState::format_not_offered`] latch.
-///
-/// Clear-on-read, as the other two latches are: a decline reported
-/// twice would be a decline invented once.
-pub(crate) fn take_format_not_offered(state: *const CallbackState) -> bool {
-  use core::sync::atomic::Ordering;
-  if state.is_null() {
-    return false;
-  }
-  // SAFETY: `state` is the live `CallbackState` the caller owns; it is
-  // freed only after the codec context it belongs to.
-  unsafe { (*state).format_not_offered.swap(false, Ordering::Acquire) }
-}
-
 /// Latches an allocator-judge frame-budget refusal, as `judge_buffer`
 /// does when a decoded frame would cost more than the caller's ceiling.
 ///
@@ -367,6 +342,19 @@ pub(crate) fn declare_frame_budget_declined_for_test(state: *mut CallbackState, 
 /// build's discriminant set. The return value is either `wanted` (a known
 /// constant) or `AV_PIX_FMT_NONE` (also a known constant) — both safe to
 /// produce as `AVPixelFormat`.
+///
+/// # A missing hardware format says nothing about why
+///
+/// When `wanted` is not on offer the callback declines and records
+/// nothing, because the list holds no cause to record. `ff_get_format`
+/// withdraws a hardware format after **any** failed hwaccel setup and
+/// asks again without it (`libavcodec/decode.c` 1341–1343 and 1348–1357
+/// in FFmpeg 9.0.1): a failed allocation of the hwaccel's private data
+/// (1194–1198) and the backend's own setup error (1202–1211) arrive as
+/// the same shorter list. The codec then fails the picture in its own
+/// words, and that error is routed as any other — a failed candidate
+/// while the probe runs, the picture's own error after the first
+/// picture.
 pub(crate) unsafe extern "C" fn get_hw_format(
   ctx: *mut AVCodecContext,
   pix_fmts: *const AVPixelFormat,
@@ -398,16 +386,9 @@ pub(crate) unsafe extern "C" fn get_hw_format(
     // We bail at the sentinel; reads up to and including it are in-bounds.
     let v = unsafe { ptr::read(p) };
     if v == none_int {
-      // **The hardware format is not on offer** — never offered for
-      // these parameters, or withdrawn by `ff_get_format` after the
-      // hwaccel's own setup failed (`libavcodec/decode.c` 1341–1357 in
-      // FFmpeg 9.0.1). See [`CallbackState::format_not_offered`].
-      if !state.is_null() {
-        use core::sync::atomic::Ordering;
-        // SAFETY: as above — the live `CallbackState` this crate put in
-        // `opaque`.
-        unsafe { (*state).format_not_offered.store(true, Ordering::Release) };
-      }
+      // The hardware format is not on offer, and the list cannot say
+      // why: a withdrawn format means only that the hwaccel's setup
+      // failed. Nothing is recorded — see the function's documentation.
       return AVPixelFormat::AV_PIX_FMT_NONE;
     }
     if v == wanted_int {
@@ -667,23 +648,6 @@ pub(crate) fn declare_ceiling_declined_for_test(
   }
 }
 
-/// Latches the [`CallbackState::format_not_offered`] decline exactly as
-/// the `get_format` callback does, so a lane can exercise the funnels
-/// that collect it without a hardware backend whose setup fails.
-///
-/// # Safety
-///
-/// `state` must be null or a live [`CallbackState`] the caller owns.
-#[cfg(test)]
-pub(crate) fn declare_format_not_offered_for_test(state: *mut CallbackState) {
-  use core::sync::atomic::Ordering;
-  if state.is_null() {
-    return;
-  }
-  // SAFETY: the caller guarantees `state` is live for the call.
-  unsafe { (*state).format_not_offered.store(true, Ordering::Release) };
-}
-
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -750,7 +714,6 @@ mod tests {
       ceiling_declined: core::sync::atomic::AtomicBool::new(false),
       declined_pixels: core::sync::atomic::AtomicI64::new(0),
       declined_limit: core::sync::atomic::AtomicI64::new(0),
-      format_not_offered: core::sync::atomic::AtomicBool::new(false),
       max_frame_bytes: u64::MAX,
       frame_budget_declined: core::sync::atomic::AtomicBool::new(false),
       declined_frame_bytes: core::sync::atomic::AtomicU64::new(0),
@@ -780,19 +743,8 @@ mod tests {
       ],
     );
     assert_eq!(got, AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX);
-    assert!(
-      !take_format_not_offered(&state),
-      "a format that was on offer must not be recorded as withdrawn",
-    );
   }
 
-  /// LAW: **a hardware format missing from the offer is recorded, not
-  /// only declined.** This is the list `ff_get_format` hands the
-  /// callback again after the hwaccel's own setup failed — VideoToolbox's
-  /// `ENOSYS` for a format it cannot take, discarded at `decode.c`
-  /// 1341–1343 — and the decline alone would reach a caller as the
-  /// codec's `AVERROR_INVALIDDATA`. The latch is what lets the funnel
-  /// name it, and reading it clears it.
   #[test]
   fn returns_none_when_wanted_absent() {
     let state = make_state(AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX);
@@ -804,14 +756,6 @@ mod tests {
       ],
     );
     assert_eq!(got, AVPixelFormat::AV_PIX_FMT_NONE);
-    assert!(
-      take_format_not_offered(&state),
-      "a hardware format missing from the offer must be recorded for the funnel",
-    );
-    assert!(
-      !take_format_not_offered(&state),
-      "reading the latch clears it, so one decline is reported once",
-    );
   }
 
   #[test]

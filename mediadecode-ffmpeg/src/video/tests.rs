@@ -842,13 +842,14 @@ fn inert_seam_builds_on_hardware() {
 /// FFmpeg 9.0.1 offers VideoToolbox for every 10-bit H.264 stream that is
 /// not RGB, 4:2:2 included (`libavcodec/h264_slice.c` 812–815), so the
 /// probe opens on it. A VideoToolbox that cannot take the format fails its
-/// session's creation (`ENOSYS`, `videotoolbox.c` 1023–1025), which
-/// `ff_get_format` swallows (`decode.c` 1341–1357) and the funnel names
-/// `HwFormatNotOffered`. No picture has come out yet, so that is the probe
-/// era: `Auto` falls back to software with the probe's packets replayed,
-/// and the whole stream decodes. Were this road ever to fail only after
-/// its first picture, the session would report `HardwareRoadLost` — and
-/// this check says so rather than passing.
+/// session's creation (`ENOSYS`, `videotoolbox.c` 1023–1025), and
+/// `ff_get_format` withdraws the hardware format and asks again without it
+/// (`decode.c` 1341–1343 and 1348–1357), so the codec fails the picture in
+/// its own words. No picture has come out yet, so that is the probe era:
+/// `Auto` falls back to software with the probe's packets replayed, and
+/// the whole stream decodes. Were this road ever to fail only after its
+/// first picture, the session would stay on hardware and report that
+/// picture's own error — and this check says so rather than passing.
 ///
 /// An **instrumented experiment**: it captures the starting backend, where
 /// the session moved to software, how many pictures had come out by then,
@@ -1012,11 +1013,11 @@ fn fx3_high_422_10bit_falls_back_to_software_and_decodes_whole_stream() {
   assert_eq!(
     obs.pictures_before_move,
     Some(0),
-    "the fallback must come before the first picture — a later failure would be a lost road, \
-     not a fallback"
+    "the fallback must come before the first picture — a later failure would be that \
+     picture's own error, not a fallback"
   );
 
-  // (3) Nothing aborted the drive: no lost road, no decode fault.
+  // (3) Nothing aborted the drive: no decode fault.
   assert!(
     obs.abort.is_none(),
     "the drive aborted before EOF on the real H.264 codec: {:?}",
@@ -1088,8 +1089,7 @@ impl Fx3Observation {
   }
 
   /// Drain every ready frame, recording delivered PTS. Returns `Err(Debug)`
-  /// on any fault — a lost road included — since that is the decisive
-  /// observation.
+  /// on any fault, since that is the decisive observation.
   fn drain(
     &mut self,
     dec: &mut FfmpegVideoStreamDecoder,
@@ -1977,7 +1977,7 @@ fn a_hardware_pin_on_an_absent_backend_fails_instead_of_falling_back() {
 /// and it learns the backend failed rather than silently receiving
 /// software pixels for the rest of the stream. After the first picture
 /// there is no exhaustion to report on any path — see
-/// `ffmpegs_own_signal_loses_the_road_by_name_on_every_hardware_path`.
+/// `after_the_first_picture_nothing_changes_the_road_on_any_path`.
 #[test]
 fn a_hardware_pin_reports_its_probes_exhaustion_instead_of_falling_back() {
   let (w, h) = (64u32, 48u32);
@@ -2132,33 +2132,33 @@ fn the_auto_path_still_falls_back_where_a_pin_would_not() {
 }
 
 // ---------------------------------------------------------------------------
-//  The committed road: a picture's error is its own, a lost road is named
+//  The committed road: every failure is its picture's own
 // ---------------------------------------------------------------------------
 
 /// A committed hardware seam with FFmpeg's own software decoder standing
 /// in for the hardware: every picture comes out of libavcodec, and where
 /// the script says so the hardware answers a raw errno instead — on a
 /// send (the packet's picture is lost), on a picture asked for (that
-/// picture is lost), or at the end of the stream.
+/// picture is lost), or at the end of the stream, the first time it is
+/// offered.
 ///
-/// **Every failure is read through the committed road's own reading**,
-/// [`crate::decoder::CommittedRoad`], as `VideoDecoder`'s committed arms
-/// read theirs — scripted ones and libavcodec's alike. So what reaches the
-/// wrapper is what production would hand it, a lost road refuses what
-/// follows exactly as production's does, and a plant in that reading
-/// shows here.
+/// **Each failure reaches the wrapper the way `VideoDecoder`'s committed
+/// arms hand one over:** the verdict as it was minted — with nothing
+/// latched, `Error::Ffmpeg` and the errno — and nothing remembered, so the
+/// next call reaches the decoder behind the seam. What the wrapper does
+/// with it is what it does in production; `VideoDecoder`'s own half is
+/// pinned in `decoder/tests.rs`.
 struct ScriptedHw {
   sw: super::SwDecoder,
-  road: crate::decoder::CommittedRoad,
   /// `(send index, errno)`: that send is answered with the errno.
   failing_sends: Vec<(usize, ffmpeg_next::Error)>,
-  /// `(picture index, errno)`: that picture, asked for, is answered with
-  /// the errno instead.
-  failing_pictures: Vec<(usize, ffmpeg_next::Error)>,
-  /// What the end of the stream is answered with, when it fails.
+  /// `(pts, errno)`: the picture with that PTS, asked for, is answered
+  /// with the errno instead.
+  failing_pictures: Vec<(i64, ffmpeg_next::Error)>,
+  /// What the end of the stream is answered with, the first time it is
+  /// offered.
   failing_eof: Option<ffmpeg_next::Error>,
   sent: usize,
-  pictures: usize,
 }
 
 impl ScriptedHw {
@@ -2166,12 +2166,10 @@ impl ScriptedHw {
     Self {
       sw: super::open_sw_decoder(parameters, DecoderLimits::default(), None)
         .expect("FFmpeg's own decoder for the stream"),
-      road: crate::decoder::CommittedRoad::default(),
       failing_sends: Vec::new(),
       failing_pictures: Vec::new(),
       failing_eof: None,
       sent: 0,
-      pictures: 0,
     }
   }
 
@@ -2180,21 +2178,14 @@ impl ScriptedHw {
     self
   }
 
-  fn failing_picture(mut self, at: usize, raw: ffmpeg_next::Error) -> Self {
-    self.failing_pictures.push((at, raw));
+  fn failing_picture(mut self, pts: i64, raw: ffmpeg_next::Error) -> Self {
+    self.failing_pictures.push((pts, raw));
     self
   }
 
   fn failing_eof(mut self, raw: ffmpeg_next::Error) -> Self {
     self.failing_eof = Some(raw);
     self
-  }
-
-  /// The committed road's reading of what the hardware said.
-  fn verdict(&mut self, raw: ffmpeg_next::Error) -> Error {
-    self
-      .road
-      .verdict(Backend::VideoToolbox, Error::Ffmpeg(raw), raw)
   }
 }
 
@@ -2205,13 +2196,10 @@ impl HwInner for ScriptedHw {
   }
 
   fn send_packet(&mut self, packet: &Packet) -> Result<Sent, Error> {
-    if let Some(lost) = self.road.refusal() {
-      return Err(lost);
-    }
     let index = self.sent;
     if let Some(&(_, raw)) = self.failing_sends.iter().find(|(at, _)| *at == index) {
       self.sent += 1;
-      return Err(self.verdict(raw));
+      return Err(Error::Ffmpeg(raw));
     }
     match self.sw.send_packet(packet) {
       Ok(()) => {
@@ -2224,21 +2212,21 @@ impl HwInner for ScriptedHw {
       }
       Err(raw) => {
         self.sent += 1;
-        Err(self.verdict(raw))
+        Err(Error::Ffmpeg(raw))
       }
     }
   }
 
   fn receive_frame(&mut self, frame: &mut Frame) -> Result<Received, Error> {
-    if let Some(lost) = self.road.refusal() {
-      return Err(lost);
-    }
     match self.sw.receive_frame(frame.as_inner_mut()) {
       Ok(()) => {
-        let index = self.pictures;
-        self.pictures += 1;
-        match self.failing_pictures.iter().find(|(at, _)| *at == index) {
-          Some(&(_, raw)) => Err(self.verdict(raw)),
+        let pts = frame.as_inner_mut().pts();
+        match self
+          .failing_pictures
+          .iter()
+          .find(|(at, _)| Some(*at) == pts)
+        {
+          Some(&(_, raw)) => Err(Error::Ffmpeg(raw)),
           None => Ok(Received::Frame),
         }
       }
@@ -2246,23 +2234,20 @@ impl HwInner for ScriptedHw {
         Ok(Received::NeedsInput)
       }
       Err(ffmpeg_next::Error::Eof) => Ok(Received::Ended),
-      Err(raw) => Err(self.verdict(raw)),
+      Err(raw) => Err(Error::Ffmpeg(raw)),
     }
   }
 
   fn send_eof(&mut self) -> Result<Sent, Error> {
-    if let Some(lost) = self.road.refusal() {
-      return Err(lost);
-    }
-    if let Some(raw) = self.failing_eof {
-      return Err(self.verdict(raw));
+    if let Some(raw) = self.failing_eof.take() {
+      return Err(Error::Ffmpeg(raw));
     }
     match self.sw.send_eof() {
       Ok(()) => Ok(Sent::Accepted),
       Err(ffmpeg_next::Error::Other { errno }) if errno == ffmpeg_next::error::EAGAIN => {
         Ok(Sent::MustDrain)
       }
-      Err(raw) => Err(self.verdict(raw)),
+      Err(raw) => Err(Error::Ffmpeg(raw)),
     }
   }
 
@@ -2295,37 +2280,128 @@ fn pushed(clip: &SyntheticClip, index: usize) -> crate::OwnedVideoPacket {
     .expect("packet has a buffer")
 }
 
-/// LAW (row 1): **a picture's own error keeps the road, and the next
-/// packet decodes — on every path that can hold hardware.**
+/// What a session answered across a clip: the pictures that came out, by
+/// PTS, and each failure as `(road, packet index, errno)` — the index of
+/// the packet just sent for a send or a picture, the clip's length for
+/// the end.
+#[derive(Debug, Default)]
+struct Answers {
+  pictures: Vec<i64>,
+  failures: Vec<(&'static str, usize, ffmpeg_next::Error)>,
+}
+
+/// Drains a session after the packet at `index`. A picture that fails is
+/// recorded and the drain goes on: the next call is the session's to
+/// answer.
+fn drain_answers(
+  dec: &mut FfmpegVideoStreamDecoder,
+  answers: &mut Answers,
+  index: usize,
+  path: DecodePath,
+) {
+  let mut dst = crate::empty_owned_video_frame();
+  loop {
+    match dec.receive_frame(&mut dst) {
+      Ok(Received::Frame) => answers
+        .pictures
+        .push(dst.pts().map_or(i64::MIN, |t| t.pts())),
+      Ok(Received::NeedsInput | Received::Ended) => break,
+      Err(VideoDecodeError::Decode(Error::Ffmpeg(e))) => {
+        answers.failures.push(("picture", index, e))
+      }
+      Err(other) => panic!(
+        "{path:?}, packet {index}: a picture's failure is reported as it was minted, got {other:?}"
+      ),
+    }
+  }
+}
+
+/// Feeds the whole clip and its end, draining after each, and records what
+/// came back. Every failure must arrive as it was minted, and the session
+/// must still be on hardware after every call — nothing changes the road.
+/// An end that fails is offered once more, as a caller would.
+fn feed_through_failures(
+  dec: &mut FfmpegVideoStreamDecoder,
+  clip: &SyntheticClip,
+  path: DecodePath,
+) -> Answers {
+  let mut answers = Answers::default();
+  for index in 0..clip.packets.len() {
+    match dec.send_packet(&pushed(clip, index)) {
+      Ok(Sent::Accepted) => {}
+      Ok(Sent::MustDrain) => panic!("{path:?}: a decoder drained after every packet pushed back"),
+      Err(VideoDecodeError::Decode(Error::Ffmpeg(e))) => answers.failures.push(("send", index, e)),
+      Err(other) => panic!(
+        "{path:?}, packet {index}: a send's failure is reported as it was minted, got {other:?}"
+      ),
+    }
+    assert!(
+      dec.is_hardware() && !dec.is_software(),
+      "{path:?}, packet {index}: nothing changes the road after the first picture",
+    );
+    drain_answers(dec, &mut answers, index, path);
+    assert!(
+      dec.is_hardware() && !dec.is_software(),
+      "{path:?}, packet {index}: nothing changes the road after the first picture",
+    );
+  }
+  let end = clip.packets.len();
+  match dec.send_eof() {
+    Ok(Sent::Accepted) => {}
+    Ok(Sent::MustDrain) => panic!("{path:?}: a drained decoder pushed back on the end"),
+    Err(VideoDecodeError::Decode(Error::Ffmpeg(e))) => {
+      answers.failures.push(("end", end, e));
+      crate::accepted(dec.send_eof(), "the end, offered again after its failure");
+    }
+    Err(other) => panic!("{path:?}: the end's failure is reported as it was minted, got {other:?}"),
+  }
+  assert!(
+    dec.is_hardware() && !dec.is_software(),
+    "{path:?}, at the end: nothing changes the road after the first picture",
+  );
+  drain_answers(dec, &mut answers, end, path);
+  answers
+}
+
+/// LAW (row 1): **after the first picture every failure is its picture's
+/// own, on every path that can hold hardware — reported as it was minted,
+/// the session kept, the next packet decoded.**
 ///
-/// FFmpeg reports a picture the hardware failed to decode as that
-/// picture's error and keeps the session (`libavcodec/videotoolbox.c`
-/// 1075–1079 in FFmpeg 9.0.1; `h264_picture.c` 206–210). The seam answers
-/// three such errors on mid-GOP packets, each read through the committed
-/// road's own reading. Each must reach the caller as itself, the session
-/// must stay on hardware throughout, and every other packet's picture must
-/// come out — the shape of the software road reporting a corrupt packet's
+/// FFmpeg has no reliable signal that a hardware session is gone, so
+/// nothing after the first picture is classified: in FFmpeg 9.0.1
+/// `AVERROR_EXTERNAL` also answers one picture (`libavcodec/videotoolbox.c`
+/// 126–129 and 556–559), and `ENOSYS` is NVDEC's answer to one HEVC
+/// picture (`nvdec_hevc.c` 200–227). The seam fails three sends and two
+/// pictures asked for, `AVERROR_EXTERNAL` and `ENOSYS` among them. Each
+/// must reach the caller as itself on the road that met it, the session
+/// must stay on hardware throughout, and every other picture must come
+/// out — the shape of the software road reporting a corrupt packet's
 /// `AVERROR_INVALIDDATA` and decoding on.
 ///
-/// PLANT: widening the committed road's reading to `AVERROR_INVALIDDATA`
-/// — the broad reading this replaced — turns this red at "the road is
-/// kept".
+/// PLANT: a wrapper that remembers a failure and refuses what follows
+/// turns this red at "the next packet decodes".
 #[test]
-fn a_pictures_own_error_keeps_the_road_on_every_hardware_path() {
+fn every_failure_after_the_first_picture_is_its_pictures_own_on_every_hardware_path() {
   let (w, h) = (64u32, 48u32);
   let clip = encode_synthetic_clip(w, h, 12, 4);
   let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
-  let script = [
-    (3usize, ffmpeg_next::Error::InvalidData),
-    (6, ffmpeg_next::Error::Unknown),
-    (
-      9,
-      ffmpeg_next::Error::Other {
-        errno: libc::EINVAL,
-      },
-    ),
+  let enosys = ffmpeg_next::Error::Other {
+    errno: libc::ENOSYS,
+  };
+  let failing_sends = [
+    (2usize, ffmpeg_next::Error::External),
+    (5, enosys),
+    (9, ffmpeg_next::Error::InvalidData),
   ];
-  for &(at, _) in &script {
+  let failing_pictures = [
+    (6i64, ffmpeg_next::Error::Unknown),
+    (10, ffmpeg_next::Error::External),
+  ];
+  for at in failing_sends
+    .iter()
+    .map(|&(at, _)| at)
+    .chain(failing_pictures.iter().map(|&(pts, _)| pts as usize))
+  {
     assert!(
       !clip.packets[at].is_key(),
       "the scripted failures sit on P-frames"
@@ -2337,11 +2413,14 @@ fn a_pictures_own_error_keeps_the_road_on_every_hardware_path() {
     DecodePath::AnyHardware,
     DecodePath::Hardware(Backend::VideoToolbox),
   ] {
-    let seam = script
+    let seam = failing_sends
       .iter()
       .fold(ScriptedHw::new(&clip.parameters), |seam, &(at, raw)| {
         seam.failing_send(at, raw)
       });
+    let seam = failing_pictures
+      .iter()
+      .fold(seam, |seam, &(pts, raw)| seam.failing_picture(pts, raw));
     let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test_as(
       Box::new(seam),
       clip.parameters.clone(),
@@ -2350,275 +2429,197 @@ fn a_pictures_own_error_keeps_the_road_on_every_hardware_path() {
     )
     .expect("build test decoder");
 
-    let mut pictures = Vec::new();
-    let mut errors = Vec::new();
-    for index in 0..clip.packets.len() {
-      match dec.send_packet(&pushed(&clip, index)) {
-        Ok(Sent::Accepted) => {}
-        Ok(Sent::MustDrain) => panic!("{path:?}: a decoder drained after every packet pushed back"),
-        Err(VideoDecodeError::Decode(Error::Ffmpeg(e))) => errors.push((index, e)),
-        Err(other) => panic!(
-          "{path:?}, packet {index}: the road is kept — a picture's own error comes back as \
-           itself, got {other:?}"
-        ),
-      }
-      assert!(
-        dec.is_hardware() && !dec.is_software(),
-        "{path:?}, packet {index}: the session stays on hardware",
-      );
-      drain_pictures(&mut dec, &mut pictures);
-    }
-    crate::accepted(dec.send_eof(), "send_eof");
-    drain_pictures(&mut dec, &mut pictures);
+    let answers = feed_through_failures(&mut dec, &clip, path);
 
     assert_eq!(
-      errors, script,
-      "{path:?}: each picture's error, as itself, on the packet that met it"
+      answers.pictures,
+      [0, 1, 3, 4, 7, 8, 11],
+      "{path:?}: every other picture came out — the next packet decodes after each failure",
     );
-    let expected: Vec<i64> = (0..clip.packets.len() as i64)
-      .filter(|pts| !script.iter().any(|&(at, _)| at as i64 == *pts))
-      .collect();
     assert_eq!(
-      pictures, expected,
-      "{path:?}: every other packet's picture came out — the next packet decodes",
+      answers.failures,
+      [
+        ("send", 2, ffmpeg_next::Error::External),
+        ("send", 5, enosys),
+        ("picture", 6, ffmpeg_next::Error::Unknown),
+        ("send", 9, ffmpeg_next::Error::InvalidData),
+        ("picture", 10, ffmpeg_next::Error::External),
+      ],
+      "{path:?}: each failure, as itself, on the road and the packet that met it",
     );
-    assert!(dec.is_hardware() && !dec.is_software());
+    assert!(
+      dec.sw_replay_frames_is_empty_for_test(),
+      "{path:?}: nothing was replayed into anything",
+    );
   }
 }
 
-/// LAW (rows 1 and 2): **FFmpeg's own signal loses the road by name on
-/// every path that can hold hardware; the session stays where it is and
-/// refuses what follows the same.**
+/// Where a scripted failure arrives.
+#[derive(Clone, Copy, Debug)]
+enum FailureRoad {
+  /// On the send of the packet at this index.
+  Send(usize),
+  /// On the picture with this PTS, asked for.
+  Picture(i64),
+  /// On the end of the stream, the first time it is offered.
+  Eof,
+}
+
+/// LAW (rows 1 and 2): **after the first picture nothing changes the road
+/// — under `Auto` as on every path, on each of the three roads a failure
+/// arrives on.**
 ///
-/// `AVERROR_EXTERNAL` is a failed VideoToolbox restart
-/// (`libavcodec/videotoolbox.c` 1066–1067 in FFmpeg 9.0.1) and `ENOSYS` a
-/// picture the hardware cannot describe (`nvdec_hevc.c` 200–227). The
-/// pictures before the loss come out; the loss itself arrives as
-/// [`Error::HardwareRoadLost`] naming the backend, the commit era and the
-/// signal; and every packet, picture and end after it — across a `flush`
-/// too — is refused with that same error. Past a failed restart FFmpeg's
-/// own answer would be `AVERROR_INVALIDDATA` for every picture
-/// (1071–1072), so a session that went on asking would report one bad
-/// picture after another for a road that is gone. Nothing opens software
-/// behind the caller.
+/// `Auto` probes at open and at no other time. An `AVERROR_EXTERNAL` on a
+/// send, on a picture asked for, or at the end of the stream is that
+/// call's own error: it is reported as itself on that road, the session
+/// stays on hardware, nothing reaches the probe-era replay queue, and the
+/// next call decodes — every other picture comes out, and the end drains.
+/// A failed VideoToolbox restart answers `AVERROR_EXTERNAL`
+/// (`libavcodec/videotoolbox.c` 1066–1067 in FFmpeg 9.0.1), and FFmpeg
+/// tries the restart again once a parameter set marks the session
+/// (446–450 and 1062–1068); the session is left to FFmpeg's own recovery
+/// and to the caller's policy.
 ///
-/// PLANT: removing the committed road's refusal turns this red at
-/// "refused the same".
+/// PLANT: an `Auto` that opens software on a committed session's failure
+/// turns this red at "nothing changes the road".
 #[test]
-fn ffmpegs_own_signal_loses_the_road_by_name_on_every_hardware_path() {
+fn after_the_first_picture_nothing_changes_the_road_on_any_path() {
   let (w, h) = (64u32, 48u32);
   let clip = encode_synthetic_clip(w, h, 12, 4);
   let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
-  let fail_at = 5;
+  let external = ffmpeg_next::Error::External;
 
   for path in [
     DecodePath::Auto,
     DecodePath::AnyHardware,
     DecodePath::Hardware(Backend::VideoToolbox),
   ] {
-    for signal in [
-      ffmpeg_next::Error::External,
-      ffmpeg_next::Error::Other {
-        errno: libc::ENOSYS,
-      },
+    for road in [
+      FailureRoad::Send(5),
+      FailureRoad::Picture(5),
+      FailureRoad::Eof,
     ] {
+      let seam = ScriptedHw::new(&clip.parameters);
+      let (seam, expected) = match road {
+        FailureRoad::Send(at) => (seam.failing_send(at, external), ("send", at)),
+        FailureRoad::Picture(pts) => (
+          seam.failing_picture(pts, external),
+          ("picture", pts as usize),
+        ),
+        FailureRoad::Eof => (seam.failing_eof(external), ("end", clip.packets.len())),
+      };
       let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test_as(
-        Box::new(ScriptedHw::new(&clip.parameters).failing_send(fail_at, signal)),
+        Box::new(seam),
         clip.parameters.clone(),
         tb,
         path,
       )
       .expect("build test decoder");
-      let is_this_loss = |e: &VideoDecodeError| {
-        matches!(
-          e,
-          VideoDecodeError::Decode(Error::HardwareRoadLost(lost))
-            if lost.backend() == Backend::VideoToolbox
-              && lost.origin().is_post_commit()
-              && matches!(lost.source(), Error::Ffmpeg(s) if *s == signal)
-        )
+
+      let answers = feed_through_failures(&mut dec, &clip, path);
+
+      let failed = match road {
+        FailureRoad::Send(at) => Some(at as i64),
+        FailureRoad::Picture(pts) => Some(pts),
+        FailureRoad::Eof => None,
       };
-
-      let mut pictures = Vec::new();
-      for index in 0..fail_at {
-        crate::accepted(dec.send_packet(&pushed(&clip, index)), "send_packet");
-        drain_pictures(&mut dec, &mut pictures);
-      }
+      let expected_pictures: Vec<i64> = (0..clip.packets.len() as i64)
+        .filter(|pts| Some(*pts) != failed)
+        .collect();
       assert_eq!(
-        pictures,
-        (0..fail_at as i64).collect::<Vec<_>>(),
-        "{path:?}: the pictures before the loss came out"
+        answers.pictures, expected_pictures,
+        "{path:?} {road:?}: every other picture came out — the next call decodes",
       );
-
-      let loss = dec
-        .send_packet(&pushed(&clip, fail_at))
-        .expect_err("the hardware's signal must be reported");
-      assert!(
-        is_this_loss(&loss),
-        "{path:?} {signal:?}: the road is lost, by name: {loss:?}"
+      assert_eq!(
+        answers.failures,
+        [(expected.0, expected.1, external)],
+        "{path:?} {road:?}: the failure, as itself, on the road that met it",
       );
       assert!(
         dec.is_hardware() && !dec.is_software(),
-        "{path:?} {signal:?}: nothing changes the road after the first picture",
+        "{path:?} {road:?}: nothing changes the road after the first picture",
       );
-
-      let mut dst = crate::empty_owned_video_frame();
-      for round in ["after the loss", "after a flush"] {
-        for index in (fail_at + 1)..clip.packets.len() {
-          let sent = dec.send_packet(&pushed(&clip, index));
-          assert!(
-            matches!(&sent, Err(e) if is_this_loss(e)),
-            "{path:?} {signal:?} {round}, packet {index}: refused the same, got {sent:?}",
-          );
-        }
-        let received = dec.receive_frame(&mut dst);
-        assert!(
-          matches!(&received, Err(e) if is_this_loss(e)),
-          "{path:?} {signal:?} {round}: a picture is refused the same, got {received:?}",
-        );
-        let eof = dec.send_eof();
-        assert!(
-          matches!(&eof, Err(e) if is_this_loss(e)),
-          "{path:?} {signal:?} {round}: the end is refused the same, got {eof:?}",
-        );
-        assert!(
-          !dec.eof_sent_for_test(),
-          "a refused end is not a committed one"
-        );
-        dec.flush().expect("flush");
-      }
-      assert!(dec.is_hardware() && !dec.is_software());
+      assert!(
+        dec.sw_replay_frames_is_empty_for_test(),
+        "{path:?} {road:?}: nothing was replayed into anything",
+      );
     }
   }
 }
 
-/// Where a scripted loss of the road arrives.
-#[derive(Clone, Copy, Debug)]
-enum LossRoad {
-  /// On the send of the packet at this index.
-  Send(usize),
-  /// On the picture at this index, asked for.
-  Picture(usize),
-  /// On the end of the stream.
-  Eof,
-}
-
-/// LAW (row 2): **after the first picture nothing changes the road under
-/// `Auto` — on any of the three roads a hardware failure arrives on.**
-///
-/// `Auto` probes at open and at no other time. A road lost on a send, on a
-/// picture asked for, or at the end of the stream is reported by name on
-/// that road; the session stays on hardware; nothing reaches the
-/// probe-era replay queue; and every call after it is refused the same.
-/// Decided by FFmpeg 9.0.1's source: past a failed restart its session
-/// holds no decoder, and its own next answer would be
-/// `AVERROR_INVALIDDATA` for every picture (`libavcodec/videotoolbox.c`
-/// 1071–1072) — so a session that went on asking would report one bad
-/// picture after another for a road that is gone.
-///
-/// PLANT: an `Auto` that opens software on a lost road turns this red at
-/// "nothing changes the road".
+/// LAW (row 1): **`flush` after a failure leaves the session serving, on
+/// every path that can hold hardware.** An `AVERROR_EXTERNAL` on a send,
+/// then a seek's flush: the packets from the next keyframe on decode as on
+/// any session, every picture from that keyframe comes out, and the
+/// session is still on hardware.
 #[test]
-fn after_the_first_picture_nothing_changes_the_road_under_auto() {
+fn flush_after_a_failure_leaves_the_session_serving_on_every_hardware_path() {
   let (w, h) = (64u32, 48u32);
   let clip = encode_synthetic_clip(w, h, 12, 4);
   let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
-  let external = ffmpeg_next::Error::External;
-  let is_the_loss = |e: &VideoDecodeError| {
-    matches!(
-      e,
-      VideoDecodeError::Decode(Error::HardwareRoadLost(lost))
-        if lost.backend() == Backend::VideoToolbox
-          && lost.origin().is_post_commit()
-          && matches!(lost.source(), Error::Ffmpeg(ffmpeg_next::Error::External))
-    )
-  };
+  let fail_at = 2;
+  let resume_at = 4;
+  assert!(
+    !clip.packets[fail_at].is_key() && clip.packets[resume_at].is_key(),
+    "the failure sits on a P-frame, and the seek lands on a keyframe",
+  );
 
-  for road in [LossRoad::Send(5), LossRoad::Picture(5), LossRoad::Eof] {
-    let seam = ScriptedHw::new(&clip.parameters);
-    let seam = match road {
-      LossRoad::Send(at) => seam.failing_send(at, external),
-      LossRoad::Picture(at) => seam.failing_picture(at, external),
-      LossRoad::Eof => seam.failing_eof(external),
-    };
+  for path in [
+    DecodePath::Auto,
+    DecodePath::AnyHardware,
+    DecodePath::Hardware(Backend::VideoToolbox),
+  ] {
     let mut dec = FfmpegVideoStreamDecoder::from_hw_inner_for_test_as(
-      Box::new(seam),
+      Box::new(
+        ScriptedHw::new(&clip.parameters).failing_send(fail_at, ffmpeg_next::Error::External),
+      ),
       clip.parameters.clone(),
       tb,
-      DecodePath::Auto,
+      path,
     )
     .expect("build test decoder");
 
-    let mut dst = crate::empty_owned_video_frame();
     let mut pictures = Vec::new();
-    let mut loss = None;
-    'feed: for index in 0..clip.packets.len() {
-      match dec.send_packet(&pushed(&clip, index)) {
-        Ok(Sent::Accepted) => {}
-        Ok(Sent::MustDrain) => panic!("{road:?}: a decoder drained after every packet pushed back"),
-        Err(e) => {
-          loss = Some(e);
-          break 'feed;
-        }
-      }
-      loop {
-        match dec.receive_frame(&mut dst) {
-          Ok(Received::Frame) => pictures.push(dst.pts().map_or(i64::MIN, |t| t.pts())),
-          Ok(Received::NeedsInput | Received::Ended) => break,
-          Err(e) => {
-            loss = Some(e);
-            break 'feed;
-          }
-        }
-      }
+    for index in 0..fail_at {
+      crate::accepted(dec.send_packet(&pushed(&clip, index)), "send_packet");
+      drain_pictures(&mut dec, &mut pictures);
     }
-    let loss = loss.unwrap_or_else(|| {
-      dec
-        .send_eof()
-        .expect_err("the end of the stream must meet the loss")
-    });
-
+    let failed = dec.send_packet(&pushed(&clip, fail_at));
     assert!(
-      is_the_loss(&loss),
-      "{road:?}: the road is lost, by name: {loss:?}"
+      matches!(
+        failed,
+        Err(VideoDecodeError::Decode(Error::Ffmpeg(
+          ffmpeg_next::Error::External
+        )))
+      ),
+      "{path:?}: the send's own failure, as itself, got {failed:?}",
     );
-    let before = match road {
-      LossRoad::Send(at) | LossRoad::Picture(at) => at,
-      LossRoad::Eof => clip.packets.len(),
-    };
+
+    dec.flush().expect("flush");
+    let mut after = Vec::new();
+    for index in resume_at..clip.packets.len() {
+      crate::accepted(
+        dec.send_packet(&pushed(&clip, index)),
+        "after a flush the session serves",
+      );
+      drain_pictures(&mut dec, &mut after);
+    }
+    crate::accepted(dec.send_eof(), "after a flush the session serves the end");
+    drain_pictures(&mut dec, &mut after);
+
     assert_eq!(
       pictures,
-      (0..before as i64).collect::<Vec<_>>(),
-      "{road:?}: the pictures before the loss came out",
+      [0, 1],
+      "{path:?}: the pictures before the failure"
+    );
+    assert_eq!(
+      after,
+      (resume_at as i64..clip.packets.len() as i64).collect::<Vec<_>>(),
+      "{path:?}: after a flush the session serves — every picture from the keyframe on",
     );
     assert!(
       dec.is_hardware() && !dec.is_software(),
-      "{road:?}: nothing changes the road after the first picture",
-    );
-    assert!(
-      dec.sw_replay_frames_is_empty_for_test(),
-      "{road:?}: nothing was replayed into anything",
-    );
-
-    // Refused the same, on every road.
-    let sent = dec.send_packet(&pushed(&clip, 0));
-    assert!(
-      matches!(&sent, Err(e) if is_the_loss(e)),
-      "{road:?}: the next packet is refused the same, got {sent:?}",
-    );
-    let received = dec.receive_frame(&mut dst);
-    assert!(
-      matches!(&received, Err(e) if is_the_loss(e)),
-      "{road:?}: the next picture is refused the same, got {received:?}",
-    );
-    let eof = dec.send_eof();
-    assert!(
-      matches!(&eof, Err(e) if is_the_loss(e)),
-      "{road:?}: the end is refused the same, got {eof:?}",
-    );
-    assert!(
-      dec.is_hardware() && !dec.is_software(),
-      "{road:?}: nothing changes the road after the first picture",
+      "{path:?}: nothing changes the road after the first picture",
     );
   }
 }
@@ -2798,8 +2799,8 @@ fn any_hardware_hands_back_the_probes_packets_and_never_opens_software() {
 /// never a software session** — whatever its hardware makes of the
 /// stream. The probe opens on a backend or refuses at open with no packet
 /// consumed; after that the session decodes on hardware, reports its
-/// probe's exhaustion, or reports a picture's error or a lost road — and
-/// at no point has it opened software.
+/// probe's exhaustion, or reports a picture's own error — and at no point
+/// has it opened software.
 #[test]
 fn any_hardware_never_becomes_software_on_this_platform() {
   let (w, h) = (64u32, 48u32);

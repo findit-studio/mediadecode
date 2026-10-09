@@ -24,33 +24,21 @@
 //! # After the first picture, nothing changes the road
 //!
 //! Once a backend has committed — at its first picture, or at open when
-//! it was named — the session stays on it. FFmpeg's own model of a
-//! hardware failure is per picture (see [`crate::VideoDecoder`]), so a
-//! picture the hardware fails is that picture's error, returned as itself,
-//! and the next packet decodes — as the software road returns a corrupt
-//! packet's `AVERROR_INVALIDDATA` and goes on. Only the loss of the road
-//! itself ends a committed hardware session:
-//! [`HardwareRoadLost`](crate::Error::HardwareRoadLost), on FFmpeg's own
-//! signals, after which the session refuses every call with that same
-//! error. [`is_hardware`](CarrierVideoStreamDecoder::is_hardware) still
-//! answers `true`: the session is where it was, and decodes nothing more.
+//! it was named — the session stays on it, and nothing is classified.
+//! Every failure is that picture's own error, reported as it was minted,
+//! and the next packet decodes, as the software road returns a corrupt
+//! packet's `AVERROR_INVALIDDATA` and goes on. Nothing is remembered from
+//! one call to the next, and `flush` leaves the session serving. FFmpeg
+//! may restart a hardware session on its own at a later parameter set
+//! (see [`crate::VideoDecoder`] for the lines); this wrapper neither
+//! waits for that nor rules it out.
 //!
 //! **`Auto` does not go on in software at that point.** A software
 //! decoder that starts mid-stream holds no reference pictures, so no
-//! session can do it without a gap, and the caller — which knows what it
-//! has delivered and what it can replay — is the one placed to decide how
-//! to close it.
-//!
-//! # The recipe for a lost road
-//!
-//! Open a session on [`DecodePath::Software`] from the same parameters and
-//! feed it forward: the packet the loss was reported on, when it came from
-//! `send_packet`, and every packet after it. libavcodec drops or conceals
-//! what comes before the next keyframe and decodes normally from there, so
-//! a keyframe-only reader loses nothing. A full decode that cannot afford
-//! the gap keeps the packets since the last clean keyframe, replays them
-//! into the software session, and drops the pictures it had already
-//! delivered.
+//! session can switch without a gap, and the caller — which sees the
+//! errors, the packets' key flags and what it has delivered — is the one
+//! placed to decide when to switch and how to close the gap. The recipe
+//! is on [`DecodePath`].
 //!
 //! Frames produced by either decoder are converted via
 //! [`crate::convert::av_frame_to_video_frame`] so the consumer sees the
@@ -105,14 +93,23 @@ use crate::{
 /// - [`Hardware(b)`](Self::Hardware), the pin: backend `b`, committed at
 ///   open; nothing else is tried, before or after.
 ///
-/// **After the first picture nothing changes the road, on any path.** A
-/// hardware failure there is that picture's own error, returned as the
-/// software road returns a corrupt packet's, and the session decodes on;
-/// a loss of the road itself is [`Error::HardwareRoadLost`], by name, and
-/// the session takes nothing more. What to do then is on
-/// [`HardwareRoadLost`](crate::HardwareRoadLost): open a session on
-/// [`Software`](Self::Software) from the same parameters and feed it
-/// forward.
+/// **After the first picture nothing changes the road, on any path, and
+/// nothing is classified.** A failure there is that picture's own error,
+/// reported as it was minted — on hardware as the software road reports
+/// a corrupt packet's — and the session decodes on. FFmpeg may restart a
+/// hardware session on its own at a later parameter set; see
+/// [`VideoDecoder`](crate::VideoDecoder) for the lines.
+///
+/// # When to stop trusting a hardware session
+///
+/// That is the caller's policy, not this crate's: the caller sees the
+/// errors, the packets' key flags and what it has delivered. One recipe:
+/// after `N` consecutive failures, or one failure on a packet flagged
+/// key, open a session on [`Software`](Self::Software) from the same
+/// parameters and feed it forward — the packet the error answered when
+/// it came from `send_packet`, otherwise the next one. libavcodec
+/// conceals or drops what comes before the next keyframe and decodes
+/// normally from there.
 ///
 /// The words differ in what they **permit**, not only where they start.
 /// That is the difference the consumers of this door need. A determinism
@@ -172,9 +169,8 @@ pub enum DecodePath {
   ///
   /// A backend that cannot be opened for the stream fails the
   /// [`open_as`](CarrierVideoStreamDecoder::open_as) call. The backend is
-  /// committed from open, so a failure after it is that picture's own
-  /// error or, on FFmpeg's own signals, the road lost by name —
-  /// [`Error::HardwareRoadLost`], carrying this backend and what it said.
+  /// committed from open, so every failure after it is that picture's
+  /// own error, as on every path.
   Hardware(Backend),
   /// **Software, with no probe at all.**
   ///
@@ -185,8 +181,10 @@ pub enum DecodePath {
   Software,
 }
 
-/// `mediadecode::VideoStreamDecoder` impl with transparent HW → SW
-/// fallback.
+/// `mediadecode::VideoStreamDecoder` impl over FFmpeg's hardware and
+/// software decoders, on the [`DecodePath`] it was opened on — under
+/// [`DecodePath::Auto`], hardware with a lossless fallback to software
+/// before the first picture.
 pub struct CarrierVideoStreamDecoder<C: crate::FfmpegCarrier> {
   state: DecodeState,
   /// The path this session was opened on — see [`DecodePath`].
@@ -741,8 +739,8 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// is the failure mode a caller cannot see.
   ///
   /// It is a question for the probe era only. After the first picture no
-  /// path opens software: a lost road is reported by name
-  /// ([`Error::HardwareRoadLost`]) on every path.
+  /// path opens software: a failure there is that picture's own error, on
+  /// every path.
   ///
   /// [`DecodePath::Software`] answers `true` and it costs nothing:
   /// `DecodeState::Sw` is terminal, so no hardware exhaustion can
@@ -1009,7 +1007,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// through: a pin's promise is about what happens when the hardware
   /// fails after opening, and the only way to reach that on a machine
   /// whose GPU works is to inject a seam that fails on demand. See
-  /// `a_hardware_pin_reports_a_mid_stream_exhaustion_instead_of_degrading`.
+  /// `a_hardware_pin_reports_its_probes_exhaustion_instead_of_falling_back`.
   pub(crate) fn from_hw_inner_for_test_as(
     hw: Box<dyn HwInner>,
     parameters: Parameters,
