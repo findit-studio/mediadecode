@@ -126,6 +126,21 @@ session that is hardware or nothing.
   nothing is collected after the first picture, so no era is left for
   it to name.
 
+### Fixed
+
+- **The probe's rescued packets are its own copies.** It recorded each
+  packet it took by reference — `av_packet_ref` shares the payload
+  buffer (`libavcodec/packet.c` 461–468 in FFmpeg 9.0.1) — so the
+  packets `AllBackendsFailed` hands back shared the caller's payloads:
+  the caller's writes after a send reached them, and `data_mut` on the
+  two lent aliasing `&mut [u8]` from safe code. The probe now copies
+  each payload as it records it (`av_packet_ref`, then
+  `av_packet_make_writable`, both checked) and charges the copy what
+  it charged the reference; a copy that cannot be made refuses the
+  send with `AllBackendsFailed` before libavcodec sees the packet. A
+  backend on trial is replayed copies, so none of what is handed back
+  is shared with a decoder.
+
 ## [0.15.1] - 2026-10-05
 
 ### Added
