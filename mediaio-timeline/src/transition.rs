@@ -22,8 +22,11 @@ use serde::{Deserialize, Serialize};
 #[serde(deny_unknown_fields)]
 pub struct Transition {
   kind: TransitionKind,
+  #[serde(deserialize_with = "crate::wire::timestamp")]
   at: Timestamp,
+  #[serde(deserialize_with = "crate::wire::duration")]
   in_offset: Duration,
+  #[serde(deserialize_with = "crate::wire::duration")]
   out_offset: Duration,
 }
 

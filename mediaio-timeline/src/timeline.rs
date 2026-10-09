@@ -26,7 +26,9 @@ use crate::{Clip, Metadata, Schema, Transition};
 pub struct Timeline {
   schema: Schema,
   name: String,
+  #[serde(deserialize_with = "crate::wire::rate")]
   rate: Rate,
+  #[serde(deserialize_with = "crate::wire::timestamp")]
   start: Timestamp,
   metadata: Metadata,
   tracks: Vec<Track>,

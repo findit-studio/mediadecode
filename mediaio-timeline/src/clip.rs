@@ -205,6 +205,7 @@ pub struct MediaRef {
   locator: String,
   #[serde(default, deserialize_with = "crate::wire::option_time_range")]
   available_range: Option<TimeRange>,
+  #[serde(default, deserialize_with = "crate::wire::option_rate")]
   rate: Option<Rate>,
   reel: Option<String>,
 }
@@ -354,6 +355,7 @@ impl Fades {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Fade {
+  #[serde(deserialize_with = "crate::wire::duration")]
   duration: Duration,
   shape: FadeShape,
 }

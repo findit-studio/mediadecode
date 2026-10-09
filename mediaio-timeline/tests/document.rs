@@ -206,6 +206,95 @@ fn a_word_this_reader_does_not_know_is_refused_by_name() {
 }
 
 #[test]
+fn a_word_inside_a_record_this_reader_does_not_know_is_refused_by_name() {
+  // A later schema's `speed` beside a record's `start` must not read as
+  // schema 1 with the word dropped.
+  let text = serde_json::to_string(&sample()).unwrap().replacen(
+    r#""record":{"start":0,"#,
+    r#""record":{"start":0,"speed":2.0,"#,
+    1,
+  );
+  assert!(text.contains(r#""speed":2.0"#));
+  let error = serde_json::from_str::<Timeline>(&text)
+    .unwrap_err()
+    .to_string();
+  assert!(error.contains("unknown field `speed`"), "{error}");
+}
+
+/// Every time value the sample carries, by JSON pointer, its timebase among
+/// them.
+const TIME_VALUES: [&str; 18] = [
+  "/rate",
+  "/start",
+  "/start/timebase",
+  "/tracks/0/clips/0/media/available_range",
+  "/tracks/0/clips/0/media/available_range/timebase",
+  "/tracks/0/clips/0/media/rate",
+  "/tracks/0/clips/0/source_range",
+  "/tracks/0/clips/0/source_range/timebase",
+  "/tracks/0/clips/0/record",
+  "/tracks/0/clips/0/record/timebase",
+  "/tracks/0/clips/0/fades/out/duration",
+  "/tracks/0/clips/0/fades/out/duration/timebase",
+  "/tracks/0/transitions/0/at",
+  "/tracks/0/transitions/0/at/timebase",
+  "/tracks/0/transitions/0/in_offset",
+  "/tracks/0/transitions/0/in_offset/timebase",
+  "/tracks/0/transitions/0/out_offset",
+  "/tracks/0/transitions/0/out_offset/timebase",
+];
+
+#[test]
+fn every_time_value_refuses_a_word_it_does_not_know() {
+  for pointer in TIME_VALUES {
+    let mut doc = serde_json::to_value(sample()).unwrap();
+    doc
+      .pointer_mut(pointer)
+      .and_then(serde_json::Value::as_object_mut)
+      .unwrap_or_else(|| panic!("{pointer} is no object"))
+      .insert("speed".into(), serde_json::json!(2.0));
+    let error = match serde_json::from_value::<Timeline>(doc) {
+      Ok(_) => panic!("{pointer}: read with the word dropped"),
+      Err(error) => error.to_string(),
+    };
+    assert!(
+      error.contains("unknown field `speed`"),
+      "{pointer}: {error}"
+    );
+  }
+}
+
+#[test]
+fn a_time_value_reads_only_what_mediatime_could_hold() {
+  let refused = |pointer: &str, key: &str, value: serde_json::Value| {
+    let mut doc = serde_json::to_value(sample()).unwrap();
+    doc.pointer_mut(pointer).unwrap()[key] = value;
+    serde_json::from_value::<Timeline>(doc)
+      .unwrap_err()
+      .to_string()
+  };
+  for pointer in ["/rate", "/tracks/0/clips/0/record/timebase"] {
+    let error = refused(pointer, "numerator", serde_json::json!(-1));
+    assert!(
+      error.contains("timebase numerator must not be negative"),
+      "{pointer}: {error}"
+    );
+    let error = refused(pointer, "denominator", serde_json::json!(-24));
+    assert!(
+      error.contains("timebase denominator must be positive"),
+      "{pointer}: {error}"
+    );
+    let error = refused(pointer, "denominator", serde_json::json!(0));
+    assert!(error.contains("nonzero"), "{pointer}: {error}");
+  }
+  let error = refused("/tracks/0/clips/0/record", "end", serde_json::json!(-1));
+  assert!(
+    error.contains("time range end must not precede start"),
+    "{error}"
+  );
+}
+
+#[test]
 fn a_required_word_left_out_is_refused_by_name() {
   let text =
     serde_json::to_string(&sample())
