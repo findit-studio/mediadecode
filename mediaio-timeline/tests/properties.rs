@@ -379,6 +379,73 @@ fn the_export_places_every_clip_on_its_record() {
   }
 }
 
+/// OpenTimelineIO's `RationalTime` sum, written again from its C++ for the
+/// property below (`opentime/rationalTime.h` 70–75, 316–326): carried in the
+/// higher rate, the other value rescaled to it as `value * rate / from`.
+fn otio_plus(a: (f64, f64), b: (f64, f64)) -> (f64, f64) {
+  let rescaled = |(value, from): (f64, f64), to: f64| {
+    if to == from { value } else { value * to / from }
+  };
+  if a.1 < b.1 {
+    (rescaled(a, b.1) + b.0, b.1)
+  } else {
+    (rescaled(b, a.1) + a.0, a.1)
+  }
+}
+
+/// Read back as OpenTimelineIO reads it — each clip's place on its track
+/// from zero in the clip's own rate, every item before it added
+/// (`opentimelineio/track.cpp` 51–92) — every clip lands within a millionth
+/// of a tick of its record, in whichever rate OpenTimelineIO carries it.
+#[test]
+fn opentimelineio_reads_every_clip_back_where_its_record_puts_it() {
+  for seed in 0..SEEDS {
+    let timeline = timeline(seed);
+    let edit = timeline.rate();
+    let text = to_otio(&timeline, OtioTarget::V0_15Plus).unwrap();
+    let root: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let tracks = root["tracks"]["children"].as_array().unwrap();
+    for (track, exported) in timeline.tracks().iter().zip(tracks) {
+      let children = exported["children"].as_array().unwrap();
+      // Each item's duration as `(value, rate)`; a transition overlaps its
+      // neighbours and adds none.
+      let durations: Vec<Option<(f64, f64)>> = children
+        .iter()
+        .map(|child| {
+          let duration = &child["source_range"]["duration"];
+          (child["OTIO_SCHEMA"] != "Transition.1").then(|| {
+            (
+              duration["value"].as_f64().unwrap(),
+              duration["rate"].as_f64().unwrap(),
+            )
+          })
+        })
+        .collect();
+      let mut clips = track.clips().iter();
+      for (index, child) in children.iter().enumerate() {
+        if !child["OTIO_SCHEMA"].as_str().unwrap().starts_with("Clip") {
+          continue;
+        }
+        let clip = clips.next().unwrap();
+        let rate = durations[index].unwrap().1;
+        let (place, carried) = durations[..index]
+          .iter()
+          .flatten()
+          .fold((0.0, rate), |sum, &duration| otio_plus(sum, duration));
+        let seconds =
+          clip.record().start_pts() as f64 * f64::from(edit.den().get()) / f64::from(edit.num());
+        let record = seconds * carried;
+        assert!(
+          (place - record).abs() < 1e-6,
+          "seed {seed}: {} read back at {place}, its record at {record}, {carried} a second",
+          clip.name()
+        );
+      }
+      assert!(clips.next().is_none(), "seed {seed}: a clip not exported");
+    }
+  }
+}
+
 /// The ruler a clip's range is written in: frames of its medium's stated
 /// rate where the export used them, else ticks of the source's timebase.
 fn ruler_written(clip: &Clip, rate: f64) -> Timebase {

@@ -370,11 +370,12 @@ fn a_count_past_2_53_is_refused_rather_than_read_rounded() {
     not_representable(&at_one_fps(TWO_53 + 1, TWO_53 + 2)),
     (a, past)
   );
-  // A gap of 2^53 and a clip of one: each count is held, but the record ends
-  // at their sum, 2^53 + 1, where OpenTimelineIO adds them up.
+  // A gap of 2^53 and a clip of one: each count is held, but the clip ends
+  // at their sum, 2^53 + 1, where OpenTimelineIO adds them up — the place
+  // of the clip, the track's second child.
   assert_eq!(
     not_representable(&at_one_fps(TWO_53, TWO_53 + 1)),
-    (a, past)
+    (Spot::TrackPosition(ChildAt::new(0, 1)), past)
   );
   // The start, at the edit rate.
   let early = at_one_fps(0, 1).with_start(Timestamp::new(-TWO_53 - 1, tb(1, 1)));
@@ -561,9 +562,19 @@ fn a_refusal_to_export_says_why() {
     shown(Refused::NotRepresentable(NotRepresentable {
       at: Spot::Record(ClipAt::new(0, 0)),
       value: 9_007_199_254_740_993,
+      rate: Rate::hz(1),
     })),
-    "the record of track 0, clip 0 counts 9007199254740993 ticks: past 2^53, where \
-     OpenTimelineIO's f64 no longer holds every whole number"
+    "the gap before track 0, clip 0 counts 9007199254740993 ticks of 1/1 s, which \
+     OpenTimelineIO's f64 does not hold exactly"
+  );
+  assert_eq!(
+    shown(Refused::NotRepresentable(NotRepresentable {
+      at: Spot::TrackPosition(ChildAt::new(0, 1)),
+      value: 27_021_597_764_222_973,
+      rate: Rate::hz(3),
+    })),
+    "the place of track 0, child 1 counts 27021597764222973 ticks of 1/3 s, which \
+     OpenTimelineIO's f64 does not hold exactly"
   );
   assert_eq!(
     shown(Refused::Validation(alloc::vec![
@@ -941,3 +952,5 @@ fn a_document_that_is_not_json_is_refused_as_syntax() {
     "byte 1: expected a value"
   );
 }
+
+mod derived;
