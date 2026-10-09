@@ -4,8 +4,8 @@
 mod common;
 
 use mediaio_timeline::{
-  ChangeKind, Clip, Duration, Fade, FadeShape, Fades, Gain, Item, MediaRef, Rate, TimeRange,
-  Timebase, Timeline, Timestamp, Track, TrackKind, Transition, diff, layout,
+  ChangeKind, Clip, ClipId, Duration, Fade, FadeShape, Fades, Gain, Item, MediaRef, Rate,
+  TimeRange, Timebase, Timeline, Timestamp, Track, TrackKind, Transition, diff, layout,
   otio::{OtioTarget, to_otio, validate_json},
   validate,
 };
@@ -146,7 +146,14 @@ fn timeline(seed: u64) -> Timeline {
       let source_start = available_start + head as i64 + rng.within(0, 500) as i64;
       let source_end = source_start + source_length as i64;
       let available_end = source_end + tail as i64 + rng.within(0, 500) as i64;
-      let mut media = MediaRef::new(format!("file:///{track_index}/{index}"));
+      // Now and then a cut back: the name and the medium of a clip placed
+      // earlier on the track, under an id of its own.
+      let placed = if index > 0 && rng.one_in(4) {
+        rng.within(0, index as u64 - 1)
+      } else {
+        index as u64
+      };
+      let mut media = MediaRef::new(format!("file:///{track_index}/{placed}"));
       if !rng.one_in(4) {
         media.set_available_range(Some(TimeRange::new(available_start, available_end, ruler)));
       }
@@ -174,7 +181,8 @@ fn timeline(seed: u64) -> Timeline {
         .then(|| Gain::from_db(-(rng.within(0, 240) as f32) / 10.0).unwrap());
       track.clips_mut().push(
         Clip::new(
-          format!("c{index}"),
+          ClipId::new(format!("{track_index}.{index}")),
+          format!("c{placed}"),
           media,
           TimeRange::new(source_start, source_end, ruler),
           TimeRange::new(start as i64, cursor as i64, edit),
@@ -250,8 +258,23 @@ fn diff_names_exactly_the_change_made() {
     let clip = (seed as usize) % before.tracks()[track].clips().len();
     let mut after = before.clone();
     let edited = &mut after.tracks_mut()[track].clips_mut()[clip];
-    let enabled = edited.enabled();
-    edited.set_enabled(!enabled);
+    let kind = match seed % 3 {
+      0 => {
+        let enabled = edited.enabled();
+        edited.set_enabled(!enabled);
+        ChangeKind::EnabledFlipped
+      }
+      1 => {
+        let name = format!("{}, renamed", edited.name());
+        edited.set_name(name);
+        ChangeKind::Renamed
+      }
+      _ => {
+        let locator = format!("{}, moved", edited.media().locator());
+        edited.media_mut().set_locator(locator);
+        ChangeKind::Relinked
+      }
+    };
     let changes = diff(&before, &after).unwrap();
     let changes: Vec<_> = changes
       .changes()
@@ -267,7 +290,7 @@ fn diff_names_exactly_the_change_made() {
       .collect();
     assert_eq!(
       changes,
-      [(track, ChangeKind::EnabledFlipped, Some(clip), Some(clip))],
+      [(track, kind, Some(clip), Some(clip))],
       "seed {seed}"
     );
   }
@@ -387,6 +410,7 @@ fn the_generator_reaches_every_word() {
     unknown_available: usize,
     media_rates: usize,
     reels: usize,
+    cut_backs: usize,
     rulers: std::collections::BTreeSet<String>,
     rates: std::collections::BTreeSet<String>,
   }
@@ -410,6 +434,14 @@ fn the_generator_reaches_every_word() {
         .clips()
         .windows(2)
         .filter(|pair| pair[0].record().end() == pair[1].record().start())
+        .count();
+      seen.cut_backs += (0..track.clips().len())
+        .filter(|&index| {
+          let clip = &track.clips()[index];
+          track.clips()[..index].iter().any(|earlier| {
+            earlier.name() == clip.name() && earlier.media().locator() == clip.media().locator()
+          })
+        })
         .count();
       for clip in track.clips() {
         seen.clips += 1;
@@ -443,6 +475,7 @@ fn the_generator_reaches_every_word() {
   enough(seen.unknown_available, "unknown available ranges");
   enough(seen.media_rates, "media rates");
   enough(seen.reels, "reels");
+  enough(seen.cut_backs, "cut-backs");
   assert_eq!(seen.rulers.len(), media_rulers().len(), "{seen:?}");
   assert_eq!(seen.rates.len(), RATES.len(), "{seen:?}");
 }

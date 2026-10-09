@@ -1,16 +1,16 @@
 use core::num::NonZeroI32;
 
 use super::*;
-use crate::{
-  ClipPair, Duration, Fade, FadeShape, Gain, MediaRef, Rate, Timebase, Track, TrackKind,
-};
+use crate::{ClipId, Duration, Fade, FadeShape, Gain, MediaRef, Rate, Timebase, Track, TrackKind};
 
 fn edit() -> Timebase {
   Timebase::new(1, NonZeroI32::new(25).unwrap())
 }
 
+/// The clip `name`, its id its name too.
 fn clip(name: &str, start: i64, end: i64) -> Clip {
   Clip::new(
+    ClipId::new(name),
     name,
     MediaRef::new(alloc::format!("file:///{name}.mov")),
     TimeRange::new(100, 100 + end - start, edit()),
@@ -142,6 +142,8 @@ fn a_clip_changed_every_way_is_reported_once_per_way_in_kind_order() {
   b.set_source_range(TimeRange::new(0, 10, edit()));
   b.set_gain(Gain::from_db(-6.0));
   b.set_enabled(false);
+  b.set_name("b2");
+  b.set_media(MediaRef::new("file:///b2.mov"));
   assert_eq!(
     kinds(&diff(&before(), &after).unwrap()),
     [
@@ -149,6 +151,8 @@ fn a_clip_changed_every_way_is_reported_once_per_way_in_kind_order() {
       (0, ChangeKind::Retimed, Some(1), Some(1)),
       (0, ChangeKind::Regained, Some(1), Some(1)),
       (0, ChangeKind::EnabledFlipped, Some(1), Some(1)),
+      (0, ChangeKind::Renamed, Some(1), Some(1)),
+      (0, ChangeKind::Relinked, Some(1), Some(1)),
     ]
   );
 }
@@ -171,22 +175,26 @@ fn trimming_one_clip_moves_no_other() {
 }
 
 #[test]
-fn a_clip_is_identified_by_its_name_and_its_locator() {
-  // Same name, another medium: the old clip is removed, a new one added.
-  let mut after = before();
-  clip_mut(&mut after, 0, 2).set_media(MediaRef::new("file:///elsewhere.mov"));
-  assert_eq!(
-    kinds(&diff(&before(), &after).unwrap()),
-    [
-      (0, ChangeKind::Added, None, Some(2)),
-      (0, ChangeKind::Removed, Some(2), None),
-    ]
-  );
-  // A renamed clip is another clip too.
+fn a_clip_is_identified_by_its_id() {
+  // Renamed, it is the same clip.
   let mut renamed = before();
   clip_mut(&mut renamed, 0, 2).set_name("c2");
   assert_eq!(
     kinds(&diff(&before(), &renamed).unwrap()),
+    [(0, ChangeKind::Renamed, Some(2), Some(2))]
+  );
+  // Pointed at another medium, the same clip.
+  let mut relinked = before();
+  clip_mut(&mut relinked, 0, 2).set_media(MediaRef::new("file:///elsewhere.mov"));
+  assert_eq!(
+    kinds(&diff(&before(), &relinked).unwrap()),
+    [(0, ChangeKind::Relinked, Some(2), Some(2))]
+  );
+  // Under another id, the same name and medium are another clip.
+  let mut reminted = before();
+  clip_mut(&mut reminted, 0, 2).set_id(ClipId::new("c, again"));
+  assert_eq!(
+    kinds(&diff(&before(), &reminted).unwrap()),
     [
       (0, ChangeKind::Added, None, Some(2)),
       (0, ChangeKind::Removed, Some(2), None),
@@ -195,14 +203,17 @@ fn a_clip_is_identified_by_its_name_and_its_locator() {
 }
 
 #[test]
-fn a_track_naming_one_clip_twice_is_ambiguous() {
-  // `a` twice before — at 0 from source frame 100, and at 20 from source
-  // frame 0 — and only the second after, unchanged. Matching by occurrence
-  // would pair the first with it and report the first moved and retimed and
-  // the second removed; nothing says which `a` remains.
+fn two_placements_of_one_medium_are_two_clips() {
+  // Codex's case: `a` placed twice — at 0 from source frame 100, and at 20
+  // from source frame 0 — under the ids a0 and a1, and only a1 after,
+  // unchanged. By name and locator nothing says which `a` remains, and by
+  // occurrence a0 would be reported moved and retimed and a1 removed. By id,
+  // a0 is removed and nothing else changed.
   let mut first = clip("a", 0, 10);
+  first.set_id(ClipId::new("a0"));
   first.set_source_range(TimeRange::new(100, 110, edit()));
   let mut second = clip("a", 20, 30);
+  second.set_id(ClipId::new("a1"));
   second.set_source_range(TimeRange::new(0, 10, edit()));
   let twice = Timeline::new("t", Rate::FPS_25)
     .with_track(Track::new(TrackKind::Audio, "A").with_clip(clip("d", 0, 20)))
@@ -213,25 +224,36 @@ fn a_track_naming_one_clip_twice_is_ambiguous() {
     );
   let mut once = twice.clone();
   once.tracks_mut()[1].clips_mut().remove(0);
-  let ambiguous = diff(&twice, &once).unwrap_err();
+  assert_eq!(
+    kinds(&diff(&twice, &once).unwrap()),
+    [(1, ChangeKind::Removed, Some(0), None)]
+  );
+  assert_eq!(
+    kinds(&diff(&once, &twice).unwrap()),
+    [(1, ChangeKind::Added, None, Some(0))]
+  );
+  assert!(diff(&twice, &twice).unwrap().is_empty());
+}
+
+#[test]
+fn a_timeline_carrying_one_id_twice_is_ambiguous() {
+  // `a`'s id on `d` too, on the other track: a clip `a` of the other side
+  // could be matched with either.
+  let mut twice = before();
+  clip_mut(&mut twice, 1, 0).set_id(ClipId::new("a"));
+  let ambiguous = diff(&twice, &before()).unwrap_err();
   assert_eq!(ambiguous.side(), Side::Before);
-  assert_eq!(ambiguous.clips(), ClipPair::new(1, 0, 1));
+  assert_eq!(
+    ambiguous.clips(),
+    IdClash::new(ClipAt::new(0, 0), ClipAt::new(1, 0))
+  );
   assert_eq!(
     alloc::string::ToString::to_string(&ambiguous),
-    "before, track 1: clips 0 and 1 share a name and a locator"
+    "before: track 1, clip 0 has the id of track 0, clip 0"
   );
   // On the other side, too, and the side before is named first.
-  assert_eq!(diff(&once, &twice).unwrap_err().side(), Side::After);
+  assert_eq!(diff(&before(), &twice).unwrap_err().side(), Side::After);
   assert_eq!(diff(&twice, &twice).unwrap_err().side(), Side::Before);
-  // One name with two media is two clips, and so is one medium under two
-  // names.
-  let mut renamed = twice.clone();
-  clip_mut(&mut renamed, 1, 1).set_name("a2");
-  let mut moved = twice;
-  clip_mut(&mut moved, 1, 1).set_media(MediaRef::new("file:///elsewhere.mov"));
-  for timeline in [renamed, moved] {
-    assert!(diff(&timeline, &timeline).unwrap().is_empty());
-  }
 }
 
 #[test]

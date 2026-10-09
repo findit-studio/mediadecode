@@ -33,7 +33,11 @@
                 "children": [
                     {
                         "OTIO_SCHEMA": "Clip.2",
-                        "metadata": {},
+                        "metadata": {
+                            "mediaio": {
+                                "id": "clip-1"
+                            }
+                        },
                         "name": "a",
                         "source_range": {
                             "OTIO_SCHEMA": "TimeRange.1",
@@ -98,7 +102,11 @@
                     },
                     {
                         "OTIO_SCHEMA": "Clip.2",
-                        "metadata": {},
+                        "metadata": {
+                            "mediaio": {
+                                "id": "clip-2"
+                            }
+                        },
                         "name": "b",
                         "source_range": {
                             "OTIO_SCHEMA": "TimeRange.1",
@@ -244,6 +252,7 @@
                         "OTIO_SCHEMA": "Clip.2",
                         "metadata": {
                             "mediaio": {
+                                "id": "clip-3",
                                 "gain_db": -6.0
                             }
                         },

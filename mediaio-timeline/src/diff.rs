@@ -8,19 +8,21 @@ use core::{cmp::Ordering, fmt};
 
 use mediatime::{TimeRange, Timestamp};
 
-use crate::{Clip, ClipPair, Fade, Fades, Timeline};
+use crate::{Clip, ClipAt, Fade, Fades, IdClash, Timeline};
 
 /// What changed from `before` to `after`, clip by clip, per track.
 ///
-/// Tracks are matched by index. Within a track a clip is identified by its
-/// [`name`](Clip::name) together with its medium's
-/// [`locator`](crate::MediaRef::locator), and the identity must be unique in
-/// its track for a match to mean anything. A track of either side that names
-/// one identity twice is refused with [`Ambiguous`] rather than matched by
-/// occurrence, which would report a clip that stayed put as moved and one
-/// that stayed as removed; [`validate`](fn@crate::validate) refuses such a
-/// track too ([`Refusal::DuplicateClip`](crate::Refusal::DuplicateClip)). A
-/// stable `id` word is reserved for a later schema.
+/// Tracks are matched by index, and within a track a clip by its
+/// [`id`](Clip::id) alone: a clip renamed, or pointed at another medium,
+/// keeps its id and is the same clip, while two placements of one medium —
+/// a cut back to a shot — are two clips. A clip that changes track is
+/// removed from one and added to the other.
+///
+/// An id names one clip of a timeline. A side that carries one twice is
+/// refused with [`Ambiguous`] rather than matched by occurrence, which would
+/// report a clip that stayed put as moved and one that stayed as removed;
+/// [`validate`](fn@crate::validate) refuses such a timeline too
+/// ([`Refusal::DuplicateClipId`](crate::Refusal::DuplicateClipId)).
 ///
 /// A clip only in `after` is [`Added`](ChangeKind::Added); one only in
 /// `before` is [`Removed`](ChangeKind::Removed). A clip in both is reported
@@ -33,7 +35,10 @@ use crate::{Clip, ClipPair, Fade, Fades, Timeline};
 ///   stretch of its medium;
 /// - [`Regained`](ChangeKind::Regained) — its gain or its fades changed;
 /// - [`EnabledFlipped`](ChangeKind::EnabledFlipped) — it was enabled and is
-///   disabled, or the other way round.
+///   disabled, or the other way round;
+/// - [`Renamed`](ChangeKind::Renamed) — its name changed;
+/// - [`Relinked`](ChangeKind::Relinked) — its medium's locator changed: it
+///   reads another medium.
 ///
 /// Ranges and lengths compare by the time they cover, so a range recounted
 /// in another timebase over the same instants is not a change.
@@ -50,11 +55,11 @@ use crate::{Clip, ClipPair, Fade, Fades, Timeline};
 /// ```
 /// use core::num::NonZeroI32;
 ///
-/// use mediaio_timeline::{ChangeKind, Clip, MediaRef, Rate, TimeRange, Timebase, Timeline, Track, TrackKind, diff};
+/// use mediaio_timeline::{ChangeKind, Clip, ClipId, MediaRef, Rate, TimeRange, Timebase, Timeline, Track, TrackKind, diff};
 ///
 /// let edit = Timebase::new(1, NonZeroI32::new(25).unwrap());
 /// let at = |name: &str, start: i64| {
-///   Clip::new(name, MediaRef::new(name), TimeRange::new(0, 10, edit), TimeRange::new(start, start + 10, edit))
+///   Clip::new(ClipId::new(name), name, MediaRef::new(name), TimeRange::new(0, 10, edit), TimeRange::new(start, start + 10, edit))
 /// };
 /// let before = Timeline::new("t", Rate::FPS_25).with_track(
 ///   Track::new(TrackKind::Video, "V").with_clip(at("a", 0)).with_clip(at("b", 10)),
@@ -69,13 +74,8 @@ use crate::{Clip, ClipPair, Fade, Fades, Timeline};
 /// ```
 pub fn diff(before: &Timeline, after: &Timeline) -> Result<Delta, Ambiguous> {
   for (side, timeline) in [(Side::Before, before), (Side::After, after)] {
-    for (index, track) in timeline.tracks().iter().enumerate() {
-      if let Some((earlier, later)) = first_duplicate(track.clips()) {
-        return Err(Ambiguous {
-          side,
-          clips: ClipPair::new(index, earlier, later),
-        });
-      }
+    if let Some(clips) = first_clash(timeline) {
+      return Err(Ambiguous { side, clips });
     }
   }
   let mut changes = Vec::new();
@@ -103,32 +103,35 @@ pub fn diff(before: &Timeline, after: &Timeline) -> Result<Delta, Ambiguous> {
   Ok(Delta { changes })
 }
 
-/// The first clip of `clips` with an earlier clip's identity, and the
-/// earlier clip: `(earlier, later)`.
-fn first_duplicate(clips: &[Clip]) -> Option<(usize, usize)> {
+/// The first clip of `timeline` carrying an earlier clip's id, in the
+/// timeline's order, with the first clip to carry it.
+fn first_clash(timeline: &Timeline) -> Option<IdClash> {
   let mut first = BTreeMap::new();
-  for (index, clip) in clips.iter().enumerate() {
-    match first.entry(clip.identity()) {
-      Entry::Vacant(slot) => {
-        slot.insert(index);
+  for (track_index, track) in timeline.tracks().iter().enumerate() {
+    for (index, clip) in track.clips().iter().enumerate() {
+      let at = ClipAt::new(track_index, index);
+      match first.entry(clip.id().as_str()) {
+        Entry::Vacant(slot) => {
+          slot.insert(at);
+        }
+        Entry::Occupied(slot) => return Some(IdClash::new(*slot.get(), at)),
       }
-      Entry::Occupied(slot) => return Some((*slot.get(), index)),
     }
   }
   None
 }
 
-/// Matches `before`'s clips with `after`'s by identity, unique on each side.
+/// Matches `before`'s clips with `after`'s by id, unique on each side.
 fn diff_track(track: usize, before: &[Clip], after: &[Clip], out: &mut Vec<Change>) {
-  // Each identity's clip in `after`, waiting to be matched.
-  let mut waiting: BTreeMap<(&str, &str), usize> = after
+  // Each id's clip in `after`, waiting to be matched.
+  let mut waiting: BTreeMap<&str, usize> = after
     .iter()
     .enumerate()
-    .map(|(index, clip)| (clip.identity(), index))
+    .map(|(index, clip)| (clip.id().as_str(), index))
     .collect();
   let mut matched = alloc::vec![false; after.len()];
   for (index, clip) in before.iter().enumerate() {
-    let Some(partner) = waiting.remove(&clip.identity()) else {
+    let Some(partner) = waiting.remove(clip.id().as_str()) else {
       out.push(Change::new(track, ChangeKind::Removed, Some(index), None));
       continue;
     };
@@ -147,6 +150,12 @@ fn diff_track(track: usize, before: &[Clip], after: &[Clip], out: &mut Vec<Chang
     }
     if then.enabled() != now.enabled() {
       out.push(pair(ChangeKind::EnabledFlipped));
+    }
+    if then.name() != now.name() {
+      out.push(pair(ChangeKind::Renamed));
+    }
+    if then.media().locator() != now.media().locator() {
+      out.push(pair(ChangeKind::Relinked));
     }
   }
   for (index, matched) in matched.into_iter().enumerate() {
@@ -184,43 +193,43 @@ const fn rank(kind: ChangeKind) -> u8 {
     ChangeKind::Retimed => 3,
     ChangeKind::Regained => 4,
     ChangeKind::EnabledFlipped => 5,
+    ChangeKind::Renamed => 6,
+    ChangeKind::Relinked => 7,
   }
 }
 
-/// Why [`diff`] refused: a track of one side names one clip identity — a
-/// name and a locator — twice, so a clip of the other side could be matched
-/// with either.
+/// Why [`diff`] refused: one side carries one clip id on two clips, so a
+/// clip of the other side could be matched with either.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Ambiguous {
   side: Side,
-  clips: ClipPair,
+  clips: IdClash,
 }
 
 impl Ambiguous {
-  /// The timeline whose track names the identity twice.
+  /// The timeline that carries the id twice.
   pub const fn side(&self) -> Side {
     self.side
   }
 
-  /// The track and its first two clips with the identity.
-  pub const fn clips(&self) -> ClipPair {
+  /// Its first two clips carrying the id.
+  pub const fn clips(&self) -> IdClash {
     self.clips
   }
 }
 
-/// Writes `before, track 0: clips 0 and 1 share a name and a locator`.
+/// Writes `before: track 1, clip 0 has the id of track 0, clip 2`.
 impl fmt::Display for Ambiguous {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     write!(
       f,
-      "{}, track {}: clips {} and {} share a name and a locator",
+      "{}: {} has the id of {}",
       match self.side {
         Side::Before => "before",
         Side::After => "after",
       },
-      self.clips.track(),
-      self.clips.earlier(),
-      self.clips.later()
+      self.clips.later(),
+      self.clips.first()
     )
   }
 }
@@ -330,6 +339,10 @@ pub enum ChangeKind {
   Regained,
   /// The clip was enabled and is disabled, or the other way round.
   EnabledFlipped,
+  /// The clip's name changed.
+  Renamed,
+  /// The clip's medium's locator changed: it reads another medium.
+  Relinked,
 }
 
 #[cfg(test)]

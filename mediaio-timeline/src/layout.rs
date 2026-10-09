@@ -24,11 +24,11 @@ use crate::{Clip, Refusal, Timeline, Track, validate};
 /// ```
 /// use core::num::NonZeroI32;
 ///
-/// use mediaio_timeline::{Clip, Item, MediaRef, Rate, TimeRange, Timebase, Timeline, Track, TrackKind, layout};
+/// use mediaio_timeline::{Clip, ClipId, Item, MediaRef, Rate, TimeRange, Timebase, Timeline, Track, TrackKind, layout};
 ///
 /// let edit = Timebase::new(1, NonZeroI32::new(25).unwrap());
 /// let at = |name: &str, start: i64, end: i64| {
-///   Clip::new(name, MediaRef::new(name), TimeRange::new(0, end - start, edit), TimeRange::new(start, end, edit))
+///   Clip::new(ClipId::new(name), name, MediaRef::new(name), TimeRange::new(0, end - start, edit), TimeRange::new(start, end, edit))
 /// };
 /// let timeline = Timeline::new("t", Rate::FPS_25).with_track(
 ///   Track::new(TrackKind::Video, "V").with_clip(at("a", 10, 20)).with_clip(at("b", 30, 40)),

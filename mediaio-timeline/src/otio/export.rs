@@ -174,7 +174,7 @@ fn leaving<'a>(track: &'a Track, clip: &Clip) -> Option<(usize, &'a Transition)>
 }
 
 fn clip(clip: &Clip, at: ClipAt, target: OtioTarget) -> Result<Value, NotRepresentable> {
-  let mut words = Vec::new();
+  let mut words = vec![("id", text(clip.id().as_str()))];
   if let Some(gain) = clip.gain() {
     words.push(("gain_db", Value::Number(format!("{:?}", gain.db()))));
   }

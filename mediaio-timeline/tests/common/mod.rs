@@ -4,8 +4,8 @@
 use core::num::NonZeroI32;
 
 use mediaio_timeline::{
-  Clip, Duration, Fade, FadeShape, Fades, Gain, MediaRef, Metadata, Rate, TimeRange, Timebase,
-  Timeline, Timestamp, Track, TrackKind, Transition,
+  Clip, ClipId, Duration, Fade, FadeShape, Fades, Gain, MediaRef, Metadata, Rate, TimeRange,
+  Timebase, Timeline, Timestamp, Track, TrackKind, Transition,
 };
 
 pub fn tb(num: i32, den: i32) -> Timebase {
@@ -13,7 +13,7 @@ pub fn tb(num: i32, den: i32) -> Timebase {
 }
 
 /// Two tracks, three clips, a dissolve and two fades, at 23.976 fps from
-/// 01:00:00:00.
+/// 01:00:00:00. The clips' ids are `clip-1` to `clip-3`, in that order.
 ///
 /// - V1: `a` at [0, 96) plays frames 24–120 of a 240-frame movie (reel
 ///   A001); a 12 + 12-frame dissolve at 96 into `b` at [96, 144), frames
@@ -32,6 +32,7 @@ pub fn law() -> Timeline {
     .with_track(
       Track::new(TrackKind::Video, "V1")
         .with_clip(Clip::new(
+          ClipId::new("clip-1"),
           "a",
           MediaRef::new("file:///media/a.mov")
             .with_available_range(Some(TimeRange::new(0, 240_240, movie)))
@@ -42,6 +43,7 @@ pub fn law() -> Timeline {
         ))
         .with_clip(
           Clip::new(
+            ClipId::new("clip-2"),
             "b",
             MediaRef::new("file:///media/b.mov")
               .with_available_range(Some(TimeRange::new(0, 480_480, movie)))
@@ -60,6 +62,7 @@ pub fn law() -> Timeline {
     .with_track(
       Track::new(TrackKind::Audio, "A1").with_clip(
         Clip::new(
+          ClipId::new("clip-3"),
           "a-sound",
           MediaRef::new("file:///media/a.wav")
             .with_available_range(Some(TimeRange::new(0, 480_480, sound)))

@@ -5,7 +5,8 @@ use core::num::NonZeroI32;
 
 use super::*;
 use crate::{
-  Clip, Fade, FadeShape, Fades, MediaRef, Rate, TimeRange, Timeline, Track, TrackKind, Transition,
+  Clip, ClipId, Fade, FadeShape, Fades, MediaRef, Rate, TimeRange, Timeline, Track, TrackKind,
+  Transition,
 };
 
 fn tb(num: i32, den: i32) -> Timebase {
@@ -34,7 +35,8 @@ fn fade(n: u64) -> Option<Fade> {
 
 /// Two tracks. V1: `a` [0, 48) and `b` [48, 96) with a dissolve of 6 + 6
 /// frames at 48, both media holding ten seconds at 24 fps. A1: `m` [24, 72),
-/// two seconds of 48 kHz sound with 12-frame fades at both edges.
+/// two seconds of 48 kHz sound with 12-frame fades at both edges. Each
+/// clip's id is its name.
 fn baseline() -> Timeline {
   let video = |name: &str| {
     MediaRef::new(alloc::format!("file:///{name}.mov"))
@@ -45,12 +47,14 @@ fn baseline() -> Timeline {
     .with_track(
       Track::new(TrackKind::Video, "V1")
         .with_clip(Clip::new(
+          ClipId::new("a"),
           "a",
           video("a"),
           TimeRange::new(24, 72, edit()),
           rec(0, 48),
         ))
         .with_clip(Clip::new(
+          ClipId::new("b"),
           "b",
           video("b"),
           TimeRange::new(48, 96, edit()),
@@ -61,6 +65,7 @@ fn baseline() -> Timeline {
     .with_track(
       Track::new(TrackKind::Audio, "A1").with_clip(
         Clip::new(
+          ClipId::new("m"),
           "m",
           MediaRef::new("file:///m.wav")
             .with_available_range(Some(TimeRange::new(0, 480_000, tb(1, 48_000))))
@@ -178,6 +183,7 @@ fn a_record_before_the_zero_is_refused() {
 fn an_empty_record_is_refused() {
   let mut timeline = baseline();
   timeline.tracks_mut()[1].clips_mut().push(Clip::new(
+    ClipId::new("e"),
     "e",
     MediaRef::new("file:///e.wav"),
     TimeRange::new(0, 0, tb(1, 48_000)),
@@ -203,6 +209,7 @@ fn clips_out_of_record_order_are_refused() {
 fn overlapping_records_are_refused() {
   let mut timeline = baseline();
   timeline.tracks_mut()[1].clips_mut().push(Clip::new(
+    ClipId::new("n"),
     "n",
     MediaRef::new("file:///n.mov"),
     TimeRange::new(0, 24, edit()),
@@ -221,6 +228,7 @@ fn an_overlap_with_a_record_further_back_than_the_last_is_refused() {
   let mut timeline = Timeline::new("t", Rate::FPS_24);
   let clip = |name: &str, start: i64, end: i64| {
     Clip::new(
+      ClipId::new(name),
       name,
       MediaRef::new(name),
       TimeRange::new(0, end - start, edit()),
@@ -242,48 +250,83 @@ fn an_overlap_with_a_record_further_back_than_the_last_is_refused() {
   );
 }
 
+/// `m` placed again on its track at `record`, playing `source` of its
+/// medium, under the id `id`.
+fn place_m_again(timeline: &mut Timeline, id: &str, record: TimeRange, source: TimeRange) {
+  let mut again = timeline.tracks()[1].clips()[0].clone();
+  again.set_id(ClipId::new(id));
+  again.set_record(record);
+  again.set_source_range(source);
+  timeline.tracks_mut()[1].clips_mut().push(again);
+}
+
 #[test]
-fn a_clip_identity_named_twice_in_one_track_is_refused() {
-  // `m` again later on its track: the same name and the same medium.
+fn a_cut_back_to_one_medium_is_valid() {
+  // `m` again later on its track — the same name, the same medium, another
+  // stretch of it — under an id of its own: two clips, both valid.
+  let sound = tb(1, 48_000);
   let mut timeline = baseline();
-  let again = timeline.tracks()[1].clips()[0].clone();
-  timeline.tracks_mut()[1].clips_mut().push({
-    let mut again = again;
-    again.set_record(rec(100, 148));
-    again
-  });
+  place_m_again(
+    &mut timeline,
+    "m, again",
+    rec(100, 148),
+    TimeRange::new(240_000, 336_000, sound),
+  );
+  assert_eq!(validate(&timeline), Ok(()));
+  // And looped: the same stretch once more, right after.
+  place_m_again(
+    &mut timeline,
+    "m, looped",
+    rec(148, 196),
+    TimeRange::new(240_000, 336_000, sound),
+  );
+  assert_eq!(validate(&timeline), Ok(()));
+}
+
+#[test]
+fn an_id_two_clips_carry_is_refused() {
+  // `m` placed again under its own id.
+  let sound = tb(1, 48_000);
+  let mut timeline = baseline();
+  let source = TimeRange::new(240_000, 336_000, sound);
+  place_m_again(&mut timeline, "m", rec(100, 148), source);
+  let clash = |first: (usize, usize), later: (usize, usize)| {
+    Refusal::DuplicateClipId(IdClash::new(
+      ClipAt::new(first.0, first.1),
+      ClipAt::new(later.0, later.1),
+    ))
+  };
+  assert_eq!(refusals(&timeline), [clash((1, 0), (1, 1))]);
+  // A third carrier is paired with the first.
+  place_m_again(&mut timeline, "m", rec(200, 248), source);
   assert_eq!(
     refusals(&timeline),
-    [Refusal::DuplicateClip(ClipPair::new(1, 0, 1))]
+    [clash((1, 0), (1, 1)), clash((1, 0), (1, 2))]
   );
-  // A third use is paired with the first.
-  let third = timeline.tracks()[1].clips()[0].clone();
-  timeline.tracks_mut()[1].clips_mut().push({
-    let mut third = third;
-    third.set_record(rec(200, 248));
-    third
-  });
+  // Unique in the timeline, not only in a track: `a`'s id on the sound
+  // track.
+  let mut timeline = baseline();
+  clip_mut(&mut timeline, 1, 0).set_id(ClipId::new("a"));
+  assert_eq!(refusals(&timeline), [clash((0, 0), (1, 0))]);
+}
+
+#[test]
+fn an_empty_id_is_refused() {
+  let mut timeline = baseline();
+  clip_mut(&mut timeline, 0, 1).set_id(ClipId::new(""));
+  assert_eq!(
+    refusals(&timeline),
+    [Refusal::EmptyClipId(ClipAt::new(0, 1))]
+  );
+  // Each is refused, and two are no duplicate: an empty id is none.
+  clip_mut(&mut timeline, 1, 0).set_id(ClipId::new(""));
   assert_eq!(
     refusals(&timeline),
     [
-      Refusal::DuplicateClip(ClipPair::new(1, 0, 1)),
-      Refusal::DuplicateClip(ClipPair::new(1, 0, 2)),
+      Refusal::EmptyClipId(ClipAt::new(0, 1)),
+      Refusal::EmptyClipId(ClipAt::new(1, 0)),
     ]
   );
-  // Another name, or another medium, is another clip; and one identity on
-  // two tracks is two clips.
-  clip_mut(&mut timeline, 1, 1).set_name("m2");
-  clip_mut(&mut timeline, 1, 2)
-    .media_mut()
-    .set_locator("file:///m2.wav");
-  assert_eq!(validate(&timeline), Ok(()));
-  let shared = timeline.tracks()[0].clips()[0].clone();
-  timeline.tracks_mut()[1].clips_mut().push({
-    let mut shared = shared;
-    shared.set_record(rec(300, 348));
-    shared
-  });
-  assert_eq!(validate(&timeline), Ok(()));
 }
 
 #[test]
@@ -300,14 +343,15 @@ fn a_record_longer_than_its_source_is_refused() {
 
 /// One clip playing `source` at `record`, on a 24 fps timeline.
 fn one_clip(source: TimeRange, record: TimeRange) -> Timeline {
-  Timeline::new("t", Rate::FPS_24).with_track(
-    Track::new(TrackKind::Audio, "A").with_clip(Clip::new(
+  Timeline::new("t", Rate::FPS_24).with_track(Track::new(TrackKind::Audio, "A").with_clip(
+    Clip::new(
+      ClipId::new("s"),
       "s",
       MediaRef::new("s.wav"),
       source,
       record,
-    )),
-  )
+    ),
+  ))
 }
 
 #[test]
@@ -542,12 +586,14 @@ fn every_refusal_comes_back_at_once_in_the_documented_order() {
     .media_mut()
     .set_available_range(Some(TimeRange::new(30, 75, edit())));
   clip_mut(&mut timeline, 1, 0).set_fades(Fades::new().with_in(fade(49)));
+  clip_mut(&mut timeline, 1, 0).set_id(ClipId::new("a"));
   assert_eq!(
     refusals(&timeline),
     [
       Refusal::OffEditRate(Place::Start),
       Refusal::OutsideAvailable(ClipAt::new(0, 0)),
       Refusal::HandleMissing(EdgeAt::new(ClipAt::new(0, 0), Edge::Out)),
+      Refusal::DuplicateClipId(IdClash::new(ClipAt::new(0, 0), ClipAt::new(1, 0))),
       Refusal::BlendsOverrunClip(ClipAt::new(1, 0)),
     ]
   );
@@ -558,8 +604,15 @@ fn refusals_name_what_they_refuse() {
   let shown = |refusal: Refusal| alloc::string::ToString::to_string(&refusal);
   assert_eq!(shown(Refusal::RateUnstated), "the edit rate is zero");
   assert_eq!(
-    shown(Refusal::DuplicateClip(ClipPair::new(1, 0, 3))),
-    "track 1: clip 3 has clip 0's name and locator"
+    shown(Refusal::DuplicateClipId(IdClash::new(
+      ClipAt::new(0, 2),
+      ClipAt::new(1, 0)
+    ))),
+    "track 1, clip 0 has the id of track 0, clip 2"
+  );
+  assert_eq!(
+    shown(Refusal::EmptyClipId(ClipAt::new(0, 3))),
+    "track 0, clip 3: the clip has no id"
   );
   assert_eq!(
     shown(Refusal::RangeTooLong(RangeAt::new(

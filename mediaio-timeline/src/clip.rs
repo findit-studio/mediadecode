@@ -23,15 +23,16 @@ use crate::Metadata;
 /// [`validate`](fn@crate::validate) holds the source range to a whole number
 /// of edit-rate ticks and the record to exactly that length.
 ///
-/// A clip is identified by its [`name`](Self::name) together with its
-/// medium's [`locator`](MediaRef::locator), and [`diff`](fn@crate::diff)
-/// matches clips that way, so the identity is unique within a track:
-/// [`validate`](fn@crate::validate) refuses a track that names one twice. A
-/// stable `id` word is reserved for a later schema, as is `speed`: neither is
-/// part of schema 1.
+/// A clip is identified by its [`id`](Self::id), which its creator mints,
+/// unique in the timeline. [`diff`](fn@crate::diff) matches clips by it
+/// alone, so a clip renamed or pointed at another medium is still the same
+/// clip. Its name and its medium may repeat: a cut back to one shot, or a
+/// loop of it, places one medium twice, under two ids. `speed` is reserved
+/// for a later schema; it is no part of schema 1.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Clip {
+  id: ClipId,
   name: String,
   media: MediaRef,
   #[serde(deserialize_with = "crate::wire::time_range")]
@@ -45,15 +46,17 @@ pub struct Clip {
 }
 
 impl Clip {
-  /// A clip playing `source_range` of `media` at `record` — enabled, with no
-  /// gain, no fades and no metadata.
+  /// The clip `id`, playing `source_range` of `media` at `record` — enabled,
+  /// with no gain, no fades and no metadata.
   pub fn new(
+    id: ClipId,
     name: impl Into<String>,
     media: MediaRef,
     source_range: TimeRange,
     record: TimeRange,
   ) -> Self {
     Self {
+      id,
       name: name.into(),
       media,
       source_range,
@@ -65,14 +68,15 @@ impl Clip {
     }
   }
 
-  /// The clip's name — half of its identity, with the medium's locator.
-  pub const fn name(&self) -> &str {
-    self.name.as_str()
+  /// The clip's identity, unique in its timeline.
+  pub const fn id(&self) -> &ClipId {
+    &self.id
   }
 
-  /// The clip's identity: its name and its medium's locator.
-  pub(crate) const fn identity(&self) -> (&str, &str) {
-    (self.name(), self.media.locator())
+  /// The clip's name. Two clips may share one: the [`id`](Self::id) tells
+  /// them apart.
+  pub const fn name(&self) -> &str {
+    self.name.as_str()
   }
 
   /// The medium the clip reads.
@@ -119,6 +123,13 @@ impl Clip {
   /// The clip's own notes, for editing in place.
   pub const fn metadata_mut(&mut self) -> &mut Metadata {
     &mut self.metadata
+  }
+
+  /// Gives the clip another id in place: a copy placed elsewhere, or the
+  /// second half of a clip cut in two, is another clip.
+  pub fn set_id(&mut self, id: ClipId) -> &mut Self {
+    self.id = id;
+    self
   }
 
   /// Renames the clip in place.
@@ -192,6 +203,41 @@ impl Clip {
   }
 }
 
+/// A clip's identity: a word its creator mints, unique in its timeline.
+///
+/// The model reads no meaning into an id — a UUID, a counter, an edit
+/// plan's own key — beyond that it is not empty. It is minted once per
+/// placement: a shot cut back to is two clips with two ids, and so is one
+/// medium placed on a video and an audio track.
+/// [`validate`](fn@crate::validate) refuses an empty id
+/// ([`Refusal::EmptyClipId`](crate::Refusal::EmptyClipId)) and one two
+/// clips of a timeline carry
+/// ([`Refusal::DuplicateClipId`](crate::Refusal::DuplicateClipId)), and
+/// [`diff`](fn@crate::diff) matches clips by it. On the wire an id is the
+/// bare string.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ClipId(String);
+
+impl ClipId {
+  /// The id `id`.
+  pub fn new(id: impl Into<String>) -> Self {
+    Self(id.into())
+  }
+
+  /// The id, as the string it is.
+  pub const fn as_str(&self) -> &str {
+    self.0.as_str()
+  }
+}
+
+/// Writes the id as it is.
+impl fmt::Display for ClipId {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.write_str(&self.0)
+  }
+}
+
 /// The medium a clip reads: where to find it, and what is known about it.
 ///
 /// [`locator`](Self::locator) is the medium's address as the caller names it
@@ -228,7 +274,7 @@ impl MediaRef {
     }
   }
 
-  /// The medium's address — half of a clip's identity, with its name.
+  /// The medium's address.
   pub const fn locator(&self) -> &str {
     self.locator.as_str()
   }

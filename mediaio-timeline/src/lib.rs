@@ -18,7 +18,7 @@ mod transition;
 mod validate;
 mod wire;
 
-pub use clip::{Clip, Fade, FadeShape, Fades, Gain, MediaRef};
+pub use clip::{Clip, ClipId, Fade, FadeShape, Fades, Gain, MediaRef};
 pub use diff::{Ambiguous, Change, ChangeKind, Delta, Side, diff};
 pub use layout::{Item, Layout, TrackLayout, layout};
 pub use metadata::Metadata;
@@ -26,8 +26,8 @@ pub use schema::Schema;
 pub use timeline::{Timeline, Track, TrackKind};
 pub use transition::{Transition, TransitionKind};
 pub use validate::{
-  ClipAt, ClipPair, ClipRange, Edge, EdgeAt, Mismatch, Place, RangeAt, Refusal, TransitionAt,
-  validate,
+  ClipAt, ClipPair, ClipRange, Edge, EdgeAt, IdClash, Mismatch, Place, RangeAt, Refusal,
+  TransitionAt, validate,
 };
 
 // The time words the model is written in, so a caller needs no `mediatime`

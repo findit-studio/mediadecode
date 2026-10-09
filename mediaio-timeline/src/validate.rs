@@ -29,9 +29,11 @@ use crate::{Clip, Timeline, Track, Transition, time::span};
 ///   two of their records overlap ([`Refusal::Overlap`]) — a transition
 ///   blends across a cut with media outside the records, so it is never an
 ///   overlap;
-/// - no two clips of a track share a name and a locator
-///   ([`Refusal::DuplicateClip`]) — that pair is a clip's identity, which
-///   [`diff`](fn@crate::diff) matches by;
+/// - each clip carries an id ([`Refusal::EmptyClipId`]) that no other clip
+///   of the timeline carries ([`Refusal::DuplicateClipId`]) — the id is a
+///   clip's identity, which [`diff`](fn@crate::diff) matches by. Names and
+///   media may repeat: a cut back to one shot places it twice, under two
+///   ids;
 /// - each source range runs a whole number of edit-rate ticks
 ///   ([`Refusal::SourceOffEditRate`]) and its record exactly as long
 ///   ([`Refusal::DurationMismatch`]) — there is no time-warp in schema 1, so
@@ -59,6 +61,8 @@ use crate::{Clip, Timeline, Track, Transition, time::span};
 /// The time arithmetic is `mediatime`'s, compared exactly across timebases.
 pub fn validate(timeline: &Timeline) -> Result<(), Vec<Refusal>> {
   let mut refusals = Vec::new();
+  // Each id's first clip, across the timeline.
+  let mut ids = BTreeMap::new();
   let edit = timeline.edit_timebase();
   match edit {
     None => refusals.push(Refusal::RateUnstated),
@@ -69,7 +73,7 @@ pub fn validate(timeline: &Timeline) -> Result<(), Vec<Refusal>> {
     }
   }
   for (index, track) in timeline.tracks().iter().enumerate() {
-    judge_track(index, track, edit, &mut refusals);
+    judge_track(index, track, edit, &mut ids, &mut refusals);
   }
   if refusals.is_empty() {
     Ok(())
@@ -78,13 +82,17 @@ pub fn validate(timeline: &Timeline) -> Result<(), Vec<Refusal>> {
   }
 }
 
-fn judge_track(track_index: usize, track: &Track, edit: Option<Timebase>, out: &mut Vec<Refusal>) {
+fn judge_track<'a>(
+  track_index: usize,
+  track: &'a Track,
+  edit: Option<Timebase>,
+  ids: &mut BTreeMap<&'a str, ClipAt>,
+  out: &mut Vec<Refusal>,
+) {
   let clips = track.clips();
   // The record reaching furthest so far, by index and end: a later record
   // starting before that end overlaps it.
   let mut furthest: Option<(usize, Timestamp)> = None;
-  // Each identity's first clip.
-  let mut identities = BTreeMap::new();
   for (index, clip) in clips.iter().enumerate() {
     let at = ClipAt::new(track_index, index);
     let record = clip.record();
@@ -135,16 +143,18 @@ fn judge_track(track_index: usize, track: &Track, edit: Option<Timebase>, out: &
     if furthest.is_none_or(|(_, end)| record.end() > end) {
       furthest = Some((index, record.end()));
     }
-    match identities.entry(clip.identity()) {
-      Entry::Vacant(slot) => {
-        slot.insert(index);
-      }
-      Entry::Occupied(slot) => {
-        out.push(Refusal::DuplicateClip(ClipPair::new(
-          track_index,
-          *slot.get(),
-          index,
-        )));
+    // An empty id is refused once, and is no id the others could share.
+    let id = clip.id().as_str();
+    if id.is_empty() {
+      out.push(Refusal::EmptyClipId(at));
+    } else {
+      match ids.entry(id) {
+        Entry::Vacant(slot) => {
+          slot.insert(at);
+        }
+        Entry::Occupied(slot) => {
+          out.push(Refusal::DuplicateClipId(IdClash::new(*slot.get(), at)));
+        }
       }
     }
     if let Some(edit) = edit
@@ -358,10 +368,12 @@ pub enum Refusal {
   OutOfOrder(ClipPair),
   /// Two records of one track overlap.
   Overlap(ClipPair),
-  /// A clip has the name and the locator of an earlier clip of its track.
-  /// That pair is a clip's identity, which [`diff`](fn@crate::diff) matches
-  /// by, so it is unique within a track.
-  DuplicateClip(ClipPair),
+  /// A clip's id is empty: a clip carries the id its creator minted.
+  EmptyClipId(ClipAt),
+  /// A clip carries the id of an earlier clip of the timeline, on its track
+  /// or another. An id is a clip's identity, which
+  /// [`diff`](fn@crate::diff) matches by, so it is unique in the timeline.
+  DuplicateClipId(IdClash),
   /// A source range's length is no whole number of edit-rate ticks. A
   /// record runs exactly as long as its source (schema 1 has no time-warp),
   /// so a source must rescale onto the edit rate exactly.
@@ -406,11 +418,10 @@ impl fmt::Display for Refusal {
         "track {}: clip {}'s record overlaps clip {}'s",
         pair.track, pair.later, pair.earlier
       ),
-      Self::DuplicateClip(pair) => write!(
-        f,
-        "track {}: clip {} has clip {}'s name and locator",
-        pair.track, pair.later, pair.earlier
-      ),
+      Self::EmptyClipId(at) => write!(f, "{at}: the clip has no id"),
+      Self::DuplicateClipId(clash) => {
+        write!(f, "{} has the id of {}", clash.later, clash.first)
+      }
       Self::SourceOffEditRate(at) => write!(
         f,
         "{at}: the source range's length is no whole number of edit-rate ticks"
@@ -521,6 +532,32 @@ impl ClipPair {
 
   /// The later clip's index in its track.
   pub const fn later(&self) -> usize {
+    self.later
+  }
+}
+
+/// Two clips of one timeline carrying one id: the first to carry it, in the
+/// timeline's order — track by track, clip by clip — and a later one. What
+/// [`Refusal::DuplicateClipId`] and [`Ambiguous`](crate::Ambiguous) name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct IdClash {
+  first: ClipAt,
+  later: ClipAt,
+}
+
+impl IdClash {
+  /// `later` carrying the id `first` carries.
+  pub const fn new(first: ClipAt, later: ClipAt) -> Self {
+    Self { first, later }
+  }
+
+  /// The first clip to carry the id.
+  pub const fn first(&self) -> ClipAt {
+    self.first
+  }
+
+  /// A later clip carrying it.
+  pub const fn later(&self) -> ClipAt {
     self.later
   }
 }

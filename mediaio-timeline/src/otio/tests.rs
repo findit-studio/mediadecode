@@ -3,8 +3,8 @@ use core::num::NonZeroI32;
 
 use super::{json::Value, *};
 use crate::{
-  Clip, Duration, Fade, FadeShape, Fades, MediaRef, Rate, TimeRange, Timebase, Timestamp, Track,
-  TrackKind, Transition,
+  Clip, ClipId, Duration, Fade, FadeShape, Fades, MediaRef, Rate, TimeRange, Timebase, Timestamp,
+  Track, TrackKind, Transition,
 };
 
 fn tb(num: i32, den: i32) -> Timebase {
@@ -15,8 +15,10 @@ fn edit() -> Timebase {
   tb(1, 24)
 }
 
+/// The clip `name`, its id its name too.
 fn clip(name: &str, start: i64, end: i64) -> Clip {
   Clip::new(
+    ClipId::new(name),
     name,
     MediaRef::new(format!("file:///{name}.mov")),
     TimeRange::new(0, end - start, edit()),
@@ -142,6 +144,40 @@ fn a_dissolve_sits_between_the_two_clips_it_joins() {
   );
   timeline.tracks_mut()[0].clips_mut()[1].set_source_range(TimeRange::new(10, 34, edit()));
   assert_eq!(children(&timeline), ["a", "Dissolve(4, 2)", "b", "c"]);
+}
+
+#[test]
+fn a_cut_back_exports_each_placement_under_its_id() {
+  // `a`, `b`, then `a` again from further into its medium: one medium placed
+  // twice, two clips.
+  let mut again = clip("a", 48, 72);
+  again.set_id(ClipId::new("a, again"));
+  again.set_source_range(TimeRange::new(24, 48, edit()));
+  let timeline = one_track(
+    Track::new(TrackKind::Video, "V")
+      .with_clip(clip("a", 0, 24))
+      .with_clip(clip("b", 24, 48))
+      .with_clip(again),
+  );
+  assert_eq!(validate(&timeline), Ok(()));
+  assert_eq!(children(&timeline), ["a", "b", "a"]);
+  // Each clip's id rides in its metadata, so a reader tells the two apart.
+  let text = to_otio(&timeline, OtioTarget::V0_15Plus).unwrap();
+  let root = json::parse(&text).unwrap();
+  let track = member(&member(&root, "tracks"), "children")
+    .as_array()
+    .unwrap()[0]
+    .clone();
+  let ids: Vec<_> = member(&track, "children")
+    .as_array()
+    .unwrap()
+    .iter()
+    .map(|clip| {
+      let ours = member(&member(clip, "metadata"), "mediaio");
+      String::from(member(&ours, "id").as_str().unwrap())
+    })
+    .collect();
+  assert_eq!(ids, ["a", "b", "a, again"]);
 }
 
 #[test]
@@ -304,6 +340,7 @@ fn at_one_fps(start: i64, end: i64) -> Timeline {
   one_track_at(
     Rate::hz(1),
     Clip::new(
+      ClipId::new("a"),
       "a",
       MediaRef::new("file:///a.mov"),
       TimeRange::new(0, end - start, second),

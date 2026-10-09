@@ -174,7 +174,7 @@ refused.
 use core::num::NonZeroI32;
 
 use mediaio_timeline::{
-  Clip, ClipPair, Duration, Fade, FadeShape, Fades, MediaRef, Rate, Refusal, TimeRange,
+  Clip, ClipId, ClipPair, Duration, Fade, FadeShape, Fades, MediaRef, Rate, Refusal, TimeRange,
   Timebase, Timeline, Timestamp, Track, TrackKind, Transition, TransitionAt,
   otio::{OtioTarget, to_otio, validate_json},
   validate,
@@ -184,6 +184,7 @@ let edit = Timebase::new(1, NonZeroI32::new(25).unwrap());
 let frames = |n| Duration::new(n, edit);
 let shot = |name: &str, start: i64| {
   Clip::new(
+    ClipId::new(format!("{name}-1")),
     name,
     MediaRef::new(format!("file:///media/{name}.mov"))
       .with_available_range(Some(TimeRange::new(0, 250, edit))),

@@ -14,7 +14,7 @@
 //! | a gap between records | `Gap.1` — derived by [`layout`](fn@crate::layout), never stored |
 //! | [`Transition`](crate::Transition) | `Transition.1`, `SMPTE_Dissolve`, its offsets at the edit rate |
 //! | a [`Fade`](crate::Fade) | `Transition.1`, `SMPTE_Dissolve` against a gap — a gap of no length where the clip abuts a clip or a track's end |
-//! | gain, reel, the medium's rate, a fade's curve, [`Metadata`](crate::Metadata) | `metadata.mediaio`: `gain_db`, `reel`, `rate`, `fade` and `shape`, `metadata` |
+//! | a clip's [`id`](crate::Clip::id), gain, reel, the medium's rate, a fade's curve, [`Metadata`](crate::Metadata) | `metadata.mediaio`: `id`, `gain_db`, `reel`, `rate`, `fade` and `shape`, `metadata` |
 //!
 //! Every position on the record side is a whole count at the edit rate. A
 //! media-side range (a source range, an available range) is written whole in
@@ -45,9 +45,11 @@
 //! those in floating point: a position derived that way is read to the
 //! nearest frame, not truncated.
 //!
-//! OpenTimelineIO has no word for gain or a reel, so both ride in
-//! `metadata`; an application that does not read it — DaVinci Resolve among
-//! them — applies neither. Available ranges and the start are written as the
+//! OpenTimelineIO has no word for a clip's id, its gain or a reel, so all
+//! three ride in `metadata` — the id so that a reader can tell each clip
+//! again, its name and medium being free to repeat. An application that does
+//! not read it — DaVinci Resolve among them — applies neither gain nor reel.
+//! Available ranges and the start are written as the
 //! timeline holds them: a medium read through `mediadecode` starts at zero
 //! until the read side exposes the container's timecode, so its available
 //! range does not yet carry the camera's timecode.

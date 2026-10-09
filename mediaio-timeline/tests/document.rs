@@ -4,8 +4,8 @@
 use core::num::NonZeroI32;
 
 use mediaio_timeline::{
-  Clip, Duration, Fade, FadeShape, Fades, Gain, MediaRef, Metadata, Rate, Schema, TimeRange,
-  Timebase, Timeline, Timestamp, Track, TrackKind, Transition,
+  Clip, ClipId, Duration, Fade, FadeShape, Fades, Gain, MediaRef, Metadata, Rate, Schema,
+  TimeRange, Timebase, Timeline, Timestamp, Track, TrackKind, Transition,
 };
 
 fn tb(num: i32, den: i32) -> Timebase {
@@ -36,6 +36,7 @@ fn sample() -> Timeline {
       Track::new(TrackKind::Video, "V1")
         .with_clip(
           Clip::new(
+            ClipId::new("clip-1"),
             "a",
             MediaRef::new("file:///media/a.mov")
               .with_available_range(Some(TimeRange::new(0, 240_240, media)))
@@ -83,6 +84,7 @@ const SAMPLE_PRETTY: &str = r#"{
       "enabled": true,
       "clips": [
         {
+          "id": "clip-1",
           "name": "a",
           "media": {
             "locator": "file:///media/a.mov",
@@ -297,6 +299,25 @@ fn a_time_value_reads_only_what_mediatime_could_hold() {
   assert!(
     error.contains("time range end must not precede start"),
     "{error}"
+  );
+}
+
+#[test]
+fn a_clip_without_its_id_is_refused_by_name() {
+  let text = serde_json::to_string(&sample())
+    .unwrap()
+    .replacen(r#""id":"clip-1","#, "", 1);
+  assert!(!text.contains(r#""id""#), "{text}");
+  let error = read(&text).unwrap_err().to_string();
+  assert!(error.contains("missing field `id`"), "{error}");
+  // An empty id reads: `validate` is where it is refused.
+  let empty =
+    serde_json::to_string(&sample())
+      .unwrap()
+      .replacen(r#""id":"clip-1""#, r#""id":"""#, 1);
+  assert_eq!(
+    read(&empty).unwrap().tracks()[0].clips()[0].id().as_str(),
+    ""
   );
 }
 

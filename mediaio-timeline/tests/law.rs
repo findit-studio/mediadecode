@@ -6,7 +6,7 @@
 mod common;
 
 use mediaio_timeline::{
-  ChangeKind, Delta, Gain, Item, TimeRange, Timeline, diff, layout,
+  ChangeKind, ClipId, Delta, Gain, Item, TimeRange, Timeline, diff, layout,
   otio::{OtioTarget, to_otio, validate_json},
   validate,
 };
@@ -84,9 +84,11 @@ fn every_kind_of_change_to_the_law_timeline_is_reported() {
   };
   assert_eq!(
     changed(&|t| {
+      // `a` placed again, on the sound track: another clip, with its own id.
       let clip = t.tracks()[0].clips()[0].clone();
       t.tracks_mut()[1].clips_mut().push({
         let mut c = clip;
+        c.set_id(ClipId::new("clip-4"));
         c.set_record(TimeRange::new(120, 216, edit));
         c
       });
@@ -126,5 +128,19 @@ fn every_kind_of_change_to_the_law_timeline_is_reported() {
       t.tracks_mut()[0].clips_mut()[1].set_enabled(false);
     }),
     [(0, ChangeKind::EnabledFlipped)]
+  );
+  assert_eq!(
+    changed(&|t| {
+      t.tracks_mut()[0].clips_mut()[0].set_name("a, take 2");
+    }),
+    [(0, ChangeKind::Renamed)]
+  );
+  assert_eq!(
+    changed(&|t| {
+      t.tracks_mut()[1].clips_mut()[0]
+        .media_mut()
+        .set_locator("file:///media/a-mixed.wav");
+    }),
+    [(1, ChangeKind::Relinked)]
   );
 }

@@ -1,7 +1,7 @@
 use core::num::NonZeroI32;
 
 use super::*;
-use crate::{MediaRef, Rate, Timebase, TrackKind};
+use crate::{ClipId, MediaRef, Rate, Timebase, TrackKind};
 
 fn edit() -> Timebase {
   Timebase::new(1, NonZeroI32::new(25).unwrap())
@@ -9,6 +9,7 @@ fn edit() -> Timebase {
 
 fn clip(name: &str, start: i64, end: i64) -> Clip {
   Clip::new(
+    ClipId::new(name),
     name,
     MediaRef::new(name),
     TimeRange::new(0, end - start, edit()),
