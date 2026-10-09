@@ -118,6 +118,29 @@ pub enum Error {
   #[error(transparent)]
   HwSurfaceTooLarge(#[from] HwSurfaceTooLarge),
 
+  /// libavcodec offered no format this backend decodes into, so the
+  /// hardware could not be set up for the stream's parameters.
+  ///
+  /// **The `ENOSYS` class at a (re-)creation, named where it can be
+  /// seen.** A hardware session that cannot take the stream's
+  /// parameters says so from its own setup — VideoToolbox answers
+  /// `ENOSYS` for a format it cannot take (`libavcodec/videotoolbox.c`
+  /// 1020–1028 in FFmpeg 9.0.1) — and `ff_get_format` discards that
+  /// answer, withdraws the hardware format and asks the `get_format`
+  /// callback again without it (`decode.c` 1341–1357). A codec can also
+  /// leave the hardware format out of its offer for parameters it does
+  /// not accelerate. Either way the callback can only decline, and the
+  /// codec reports the decline in its own words — `AVERROR_INVALIDDATA`
+  /// from H.264 (`h264dec.c` 1061–1066), `-1` from HEVC
+  /// (`hevc/hevcdec.c` 3260–3264) — the same words a corrupt picture
+  /// earns. So the callback records the fact, and this is its name.
+  ///
+  /// While backends are on trial it fails the candidate, as any failure
+  /// there does; on a committed backend it loses the road (see
+  /// [`HardwareRoadLost`]).
+  #[error("libavcodec offered no {0:?} hardware format for this stream's parameters")]
+  HwFormatNotOffered(Backend),
+
   /// The codec does not advertise a hardware configuration matching the
   /// requested backend (via `avcodec_get_hw_config`).
   #[error("codec does not support backend {0:?}")]
@@ -146,6 +169,14 @@ pub enum Error {
   /// gives a free `impl From<FallbackFailed> for Error`.
   #[error(transparent)]
   FallbackFailed(#[from] FallbackFailed),
+
+  /// The backend a session committed to can no longer decode the
+  /// stream, on one of FFmpeg's own signals for that. See
+  /// [`HardwareRoadLost`] for which signals those are and what a caller
+  /// does next. `#[from]` gives a free
+  /// `impl From<HardwareRoadLost> for Error`.
+  #[error(transparent)]
+  HardwareRoadLost(#[from] HardwareRoadLost),
 }
 
 /// Payload for [`Error::HwDeviceInitFailed`].
@@ -399,6 +430,110 @@ impl std::fmt::Debug for FallbackFailed {
         &format_args!("[{} packets]", self.unconsumed_packets.len()),
       )
       .finish()
+  }
+}
+
+/// Payload for [`Error::HardwareRoadLost`].
+///
+/// The backend a session committed to can no longer decode this stream.
+/// A backend commits at its first picture, or at open when the caller
+/// named it ([`DecodePath::Hardware`](crate::DecodePath::Hardware)).
+///
+/// # Only on FFmpeg's own signals
+///
+/// FFmpeg models a hardware decode failure per picture. In FFmpeg
+/// 9.0.1's `libavcodec/videotoolbox.c`, a picture VideoToolbox fails to
+/// decode answers `AVERROR_UNKNOWN` and the session stays (1075–1079);
+/// a malfunction or an invalidated session also marks it for a restart
+/// (1076–1077), and the next picture stops and restarts it (1062–1068).
+/// H.264 reports such a picture as "hardware accelerator failed to
+/// decode picture" and returns its error (`h264_picture.c` 206–210), and
+/// the next packet decodes as usual. So a committed session reports a
+/// picture's failure as that picture's error and goes on, as the
+/// software decoder reports a corrupt packet's `AVERROR_INVALIDDATA` and
+/// goes on. The road is lost only where FFmpeg itself says no session
+/// can continue:
+///
+/// - **`AVERROR_EXTERNAL`** — the restart failed (`videotoolbox.c`
+///   1066–1067), so no session is left to decode with.
+/// - **`ENOSYS` on a picture** — the hardware cannot describe this
+///   picture's parameters: NVDEC refuses an HEVC picture whose tiles,
+///   chroma QP offsets or references exceed its API's tables
+///   (`nvdec_hevc.c` 200–227), and refuses the next one the same way.
+/// - **[`Error::HwFormatNotOffered`]** — at a re-creation, the hardware
+///   could not be set up for the stream's new parameters: the `ENOSYS`
+///   class, which `ff_get_format` swallows before it can reach a caller.
+/// - **[`Error::HwSurfaceTooLarge`]** — at a re-creation, the coded
+///   surface the new parameters ask for is over the caller's ceiling.
+///
+/// [`Self::source`] is which of these it was.
+///
+/// # After the loss
+///
+/// The session takes nothing more: every later `send_packet`,
+/// `send_eof` and `receive_frame` answers this same error, and `flush`
+/// does not bring the road back. That is FFmpeg's own state — after a
+/// failed restart the session holds no decoder, and each later picture
+/// answers `AVERROR_INVALIDDATA` (`videotoolbox.c` 1071–1072), which
+/// would otherwise read as one bad picture after another.
+///
+/// To go on decoding, open a session on
+/// [`DecodePath::Software`](crate::DecodePath::Software) from the same
+/// parameters and feed it forward: from the packet this error answered
+/// when it came from `send_packet`, from the next packet otherwise. A
+/// software decoder that starts mid-stream holds no reference pictures,
+/// so libavcodec drops or conceals what comes before the next keyframe
+/// and decodes normally from there.
+#[derive(Debug, thiserror::Error)]
+#[error(
+  "the {backend:?} hardware decoder can no longer decode this stream ({source}); the session \
+   takes nothing more — open one on DecodePath::Software and feed it forward"
+)]
+pub struct HardwareRoadLost {
+  /// The backend whose road was lost.
+  backend: Backend,
+  /// Where in the session's life it was lost.
+  origin: FallbackOrigin,
+  /// What the backend said.
+  source: Box<Error>,
+}
+
+impl HardwareRoadLost {
+  /// Constructs a [`HardwareRoadLost`] payload.
+  ///
+  /// Not `const fn`, for the same reason as [`FallbackFailed::new`]:
+  /// the boxed source carries a destructor.
+  #[inline]
+  pub fn new(backend: Backend, origin: FallbackOrigin, source: Box<Error>) -> Self {
+    Self {
+      backend,
+      origin,
+      source,
+    }
+  }
+  /// The backend whose road was lost.
+  #[inline]
+  pub const fn backend(&self) -> Backend {
+    self.backend
+  }
+  /// Where in the session's life the road was lost:
+  /// [`FallbackOrigin::PostCommit`]. Before commit a failure advances
+  /// the probe instead, and the probe's exhaustion is
+  /// [`AllBackendsFailed`].
+  #[inline]
+  pub const fn origin(&self) -> FallbackOrigin {
+    self.origin
+  }
+  /// What the backend said — one of the signals listed above.
+  #[inline]
+  pub fn source(&self) -> &Error {
+    &self.source
+  }
+  /// Consume the payload, returning the backend, the origin and the
+  /// moved source error.
+  #[inline]
+  pub fn into_parts(self) -> (Backend, FallbackOrigin, Box<Error>) {
+    (self.backend, self.origin, self.source)
   }
 }
 

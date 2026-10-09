@@ -117,7 +117,10 @@ use mediadecode::{Received, Sent, decoder::ScaledOutputCapability};
 
 use crate::{
   backend::{self, Backend},
-  error::{AllBackendsFailed, Error, HwDeviceInitFailed, Result},
+  error::{
+    AllBackendsFailed, Error, FallbackOrigin, HardwareRoadLost, HwDeviceInitFailed,
+    HwSurfaceTooLarge, Result,
+  },
   ffi::{CallbackState, codec_supports_hwaccel, get_hw_format},
   frame::Frame,
 };
@@ -145,15 +148,18 @@ use crate::{
 /// is delivered the probe collapses and subsequent calls go straight to the
 /// active (committed) backend.
 ///
-/// The committed backend can still fail at runtime — e.g. VideoToolbox can
-/// decode a clip's first frames and then hit content its kernel can't handle
-/// (H.264 High 4:2:2 10-bit), surfacing `AVERROR_EXTERNAL`. Post-commit a
-/// non-transient, non-EOF error from the committed backend is reclassified to
-/// [`Error::AllBackendsFailed`] (see the `is_hw_decode_failure` predicate), so
-/// the [`crate::FfmpegVideoStreamDecoder`] wrapper still recognises it as a
-/// HW-path exhaustion and falls back to software. The post-commit
-/// `unconsumed_packets` is empty (the probe buffer is gone); the wrapper's
-/// rolling since-last-keyframe buffer supplies the replay set.
+/// # After commit
+///
+/// A committed backend answers the way FFmpeg's own model of a hardware
+/// failure says it should: per picture. A picture the hardware fails to
+/// decode is that picture's error — returned as itself, as the software
+/// decoder returns a corrupt packet's `AVERROR_INVALIDDATA` — and the
+/// session goes on to the next packet. Only FFmpeg's own signals that no
+/// session can continue lose the road, and then the decoder says so by
+/// name, [`Error::HardwareRoadLost`], and takes nothing more: every later
+/// call answers the same error, `flush` included. See [`HardwareRoadLost`]
+/// for the signals, read from FFmpeg 9.0.1's source, and for what a caller
+/// does next.
 pub struct VideoDecoder {
   /// Live FFmpeg state for the currently active backend.
   state: DecoderState,
@@ -200,6 +206,18 @@ pub struct VideoDecoder {
   /// guessing. The probe machinery still reads it for replay; it simply
   /// no longer owns it.
   eof_sent: bool,
+  /// What a failure means once a backend has committed, and whether the
+  /// road is still there. See [`CommittedRoad`].
+  ///
+  /// **It survives `flush`.** A lost road is the session's state, not
+  /// the stream position's. After a failed VideoToolbox restart FFmpeg
+  /// holds no session (`libavcodec/videotoolbox.c` 1065–1068; released
+  /// at 518–522), and a flush builds none: `avcodec_flush_buffers`
+  /// reaches only the codec's own flush (`avcodec.c` 417–418), the
+  /// VideoToolbox hwaccel has no flush of its own, and H.264 keeps its
+  /// hardware format afterwards without asking `get_format` again
+  /// (`h264_slice.c` 918–921), so nothing sets the hardware up anew.
+  road: CommittedRoad,
   /// The GPU-side scaled-output stage — see [`crate::vtscale`]. Carries
   /// the caller's standing [`Self::request_scaled_output`] and, on the
   /// VideoToolbox road, the cached pixel-transfer session and fitted
@@ -389,8 +407,10 @@ impl SessionPhase {
 
 /// How a funnel verdict routes. See [`VideoDecoder::verdict_routing`].
 enum VerdictRouting {
-  /// The name says this backend cannot decode this content.
-  CandidateFailed,
+  /// The name says this backend cannot take this stream. On trial that
+  /// is the candidate failing; on a committed backend the road is lost,
+  /// and this is why.
+  CandidateFailed(RoadLoss),
   /// The name says retrying a backend cannot help — report it as it is.
   Direct,
   /// Nothing was named; the road's own reading decides.
@@ -415,6 +435,83 @@ enum HwRoute {
   Report(Error),
   /// The active candidate failed: advance the probe and retry.
   Advance(Error),
+}
+
+/// Why a committed hardware road was lost — plain data, so the refusal
+/// can be minted again for every call that follows the loss. See
+/// [`HardwareRoadLost`] for what each cause means.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum RoadLoss {
+  /// One of FFmpeg's own signals, reaching the caller as itself — see
+  /// [`loses_the_road`].
+  Signal(ffmpeg_next::Error),
+  /// The coded surface a re-creation asked for, declined over the
+  /// caller's ceiling.
+  SurfaceDeclined(HwSurfaceTooLarge),
+  /// No hardware format on offer at a re-creation.
+  FormatNotOffered(Backend),
+}
+
+impl RoadLoss {
+  /// What the backend said, as the error it was reported as.
+  fn cause(self) -> Error {
+    match self {
+      Self::Signal(e) => Error::Ffmpeg(e),
+      Self::SurfaceDeclined(p) => Error::HwSurfaceTooLarge(p),
+      Self::FormatNotOffered(backend) => Error::HwFormatNotOffered(backend),
+    }
+  }
+
+  /// The error a lost road answers with.
+  fn refusal(self, backend: Backend) -> Error {
+    Error::HardwareRoadLost(HardwareRoadLost::new(
+      backend,
+      FallbackOrigin::PostCommit,
+      Box::new(self.cause()),
+    ))
+  }
+}
+
+/// **A committed hardware session's road: what a failure on it means,
+/// and whether it is still there.**
+///
+/// The one reading of a committed backend's failures, kept apart from
+/// [`VideoDecoder`] so the wrapper's tests can drive it behind a seam
+/// that decodes in software. It never funnels: the verdict it is handed
+/// is the one the road's first funnel minted.
+#[derive(Debug, Default)]
+pub(crate) struct CommittedRoad {
+  /// The backend that lost its road and why, once it has.
+  lost: Option<(Backend, RoadLoss)>,
+}
+
+impl CommittedRoad {
+  /// Reads a committed backend's failure: [`Error::HardwareRoadLost`]
+  /// when it loses the road — recorded, so every later call is refused
+  /// the same — and `reason` itself, the picture's own error, otherwise.
+  ///
+  /// `raw` is the errno libavcodec reported, consulted only where
+  /// `reason` names nothing (see [`VideoDecoder::verdict_routing`]).
+  pub(crate) fn verdict(
+    &mut self,
+    backend: Backend,
+    reason: Error,
+    raw: ffmpeg_next::Error,
+  ) -> Error {
+    match VideoDecoder::road_loss(&reason, raw) {
+      Some(loss) => {
+        self.lost = Some((backend, loss));
+        loss.refusal(backend)
+      }
+      None => reason,
+    }
+  }
+
+  /// The error every call after a loss answers with; `None` while the
+  /// road stands.
+  pub(crate) fn refusal(&self) -> Option<Error> {
+    self.lost.map(|(backend, loss)| loss.refusal(backend))
+  }
 }
 
 /// State carried only during the probe window (before the first successful
@@ -670,6 +767,7 @@ impl VideoDecoder {
             frame_limits: limits,
             pkt_timebase,
             eof_sent: false,
+            road: CommittedRoad::default(),
             scaled_output: crate::vtscale::ScaledOutput::new(),
           });
         }
@@ -757,6 +855,7 @@ impl VideoDecoder {
       frame_limits: limits,
       pkt_timebase,
       eof_sent: false,
+      road: CommittedRoad::default(),
       scaled_output: crate::vtscale::ScaledOutput::new(),
     })
   }
@@ -824,6 +923,7 @@ impl VideoDecoder {
       frame_limits: limits,
       pkt_timebase: None,
       eof_sent: false,
+      road: CommittedRoad::default(),
       scaled_output: crate::vtscale::ScaledOutput::new(),
     })
   }
@@ -980,36 +1080,18 @@ impl VideoDecoder {
     self.state.inner.frame_rate()
   }
 
-  /// Reclassify a post-commit runtime error from the committed HW backend
-  /// into [`Error::AllBackendsFailed`] so the [`crate::FfmpegVideoStreamDecoder`]
-  /// wrapper recognises it as a HW-path exhaustion and falls back to
-  /// software. The single attempt records the committed backend
-  /// (`self.state.backend` is the live backend post-commit) paired with the
-  /// underlying FFmpeg error. `unconsumed_packets` is empty: the probe
-  /// buffer is gone after commit, so the wrapper's rolling
-  /// since-last-keyframe buffer supplies the replay set.
-  ///
-  /// # `reason` is the funnel's verdict, and this does not mint another
-  ///
-  /// It used to call [`Self::hw_exit`] itself, which was right while it
-  /// was the *first* funnel on its road and wrong the moment it was the
-  /// second. On the receive road the verdict is minted at the top of the
-  /// arm, and `hw_exit` **consumes** the latch it reads — so a second
-  /// call finds nothing and records the raw errno libavcodec reported,
-  /// throwing away the refusal that had already been collected. A
-  /// caller's attempt log then blamed `InvalidData` for a coded surface
-  /// this crate declined over a configured ceiling.
-  ///
-  /// So the verdict is minted once, by whichever funnel is first on the
-  /// road, and threaded from there. See the doors' invariant on
-  /// [`software_receive`].
   /// Mints a verdict for a road that holds none yet, then routes it.
   ///
   /// The funnel runs **exactly once** here, which is the law the doors
   /// carry: see the invariant on [`software_receive`]. Roads that have
-  /// already minted (the receive arm) call [`Self::hw_route`] straight.
-  fn hw_failure(&self, e: ffmpeg_next::Error, bare: BareVerdict) -> HwRoute {
-    self.hw_route(self.hw_exit(Error::Ffmpeg(e)), e, bare)
+  /// already minted (the receive arm) call [`Self::hw_route`] straight,
+  /// and so does nothing downstream of it: [`CommittedRoad::verdict`]
+  /// records the verdict it is handed and never funnels again — a funnel
+  /// **consumes** the latch it reads, so a second one would find nothing
+  /// and record libavcodec's errno over a refusal already collected.
+  fn hw_failure(&mut self, e: ffmpeg_next::Error, bare: BareVerdict) -> HwRoute {
+    let reason = self.hw_exit(Error::Ffmpeg(e));
+    self.hw_route(reason, e, bare)
   }
 
   /// How a funnel verdict routes, before the road's own reading of an
@@ -1017,15 +1099,22 @@ impl VideoDecoder {
   ///
   /// **Exhaustive on purpose, and with no wildcard.** A `_ => false`
   /// stood here and was a hazard rather than a convenience: a future
-  /// named verdict that *did* require a fallback would inherit the
-  /// silence and be reported plain, which is a bug that compiles. The
-  /// match is total over this crate's own error vocabulary, so adding an
-  /// arm forces whoever adds it to say how it routes.
+  /// named verdict that *did* say a backend cannot take the stream would
+  /// inherit the silence and be reported plain, which is a bug that
+  /// compiles. The match is total over this crate's own error
+  /// vocabulary, so adding an arm forces whoever adds it to say how it
+  /// routes.
   fn verdict_routing(reason: &Error) -> VerdictRouting {
     match reason {
       // The hardware pool declined the coded surface. Software is not
       // subject to that ceiling, and neither is the next backend.
-      Error::HwSurfaceTooLarge(_) => VerdictRouting::CandidateFailed,
+      Error::HwSurfaceTooLarge(p) => VerdictRouting::CandidateFailed(RoadLoss::SurfaceDeclined(*p)),
+      // No format this backend decodes into was offered, so the hardware
+      // could not be set up for these parameters. The next backend may
+      // take them, and software is offered a format of its own.
+      Error::HwFormatNotOffered(backend) => {
+        VerdictRouting::CandidateFailed(RoadLoss::FormatNotOffered(*backend))
+      }
       // Software would decode the same oversized frame and be refused
       // by the same ceiling; so would the next backend. A fallback here
       // invites an action that cannot succeed.
@@ -1033,11 +1122,11 @@ impl VideoDecoder {
       // The funnel handed its fallback straight back: nothing was named,
       // so the errno is all there is and the road decides.
       Error::Ffmpeg(_) => VerdictRouting::Unnamed,
-      // None of these can leave a funnel — `hw_exit` mints only the two
-      // refusals above or returns its argument — and each is already a
-      // decided fact that did not ask for a backend to be retried. They
-      // are listed rather than swept up so a twelfth arm cannot join
-      // them silently.
+      // None of these can leave a funnel — `hw_exit` mints only the
+      // three refusals above or returns its argument — and each is
+      // already a decided fact that did not ask for a backend to be
+      // retried. They are listed rather than swept up so a new arm
+      // cannot join them silently.
       Error::PacketBuild(_)
       | Error::ParametersTooLarge(_)
       // A malformed channel layout is a fact about the *stream*, not
@@ -1051,22 +1140,23 @@ impl VideoDecoder {
       | Error::BackendUnsupportedByCodec(_)
       | Error::HwDeviceInitFailed(_)
       | Error::AllBackendsFailed(_)
-      | Error::FallbackFailed(_) => VerdictRouting::Direct,
+      | Error::FallbackFailed(_)
+      | Error::HardwareRoadLost(_) => VerdictRouting::Direct,
     }
   }
 
-  /// Whether a post-commit failure means the hardware backend cannot
-  /// decode this content, so the wrapper must open a software decoder.
+  /// Whether a committed backend's failure loses its road, and why.
   ///
   /// A named verdict outranks the raw errno in **both** directions: a
-  /// name that says no is as binding as one that says yes, and the errno
-  /// is consulted only where nothing was named. See
-  /// [`Self::verdict_routing`].
-  fn fallback_required(reason: &Error, raw: ffmpeg_next::Error) -> bool {
+  /// name that says the backend cannot take the stream is as binding as
+  /// one that says retrying cannot help, and the errno is consulted only
+  /// where nothing was named. See [`Self::verdict_routing`] and
+  /// [`loses_the_road`].
+  fn road_loss(reason: &Error, raw: ffmpeg_next::Error) -> Option<RoadLoss> {
     match Self::verdict_routing(reason) {
-      VerdictRouting::CandidateFailed => true,
-      VerdictRouting::Direct => false,
-      VerdictRouting::Unnamed => is_hw_decode_failure(&raw),
+      VerdictRouting::CandidateFailed(loss) => Some(loss),
+      VerdictRouting::Direct => None,
+      VerdictRouting::Unnamed => loses_the_road(&raw).then_some(RoadLoss::Signal(raw)),
     }
   }
 
@@ -1076,18 +1166,21 @@ impl VideoDecoder {
   /// The send roads used to return their funnel's result the moment they
   /// had it. That was right for a flow signal and wrong for anything
   /// else: `hw_send` can mint [`Error::HwSurfaceTooLarge`], and returning
-  /// it plain meant the wrapper — which opens software only on
-  /// [`Error::AllBackendsFailed`] — simply stopped, and a probe still
-  /// auditioning never advanced past the candidate that had just
-  /// declined the surface.
+  /// it plain meant a probe still auditioning never advanced past the
+  /// candidate that had just declined the surface.
   ///
   /// So minting and routing are one move now, and the receive road's
   /// policy is the policy. What differs between roads is only what an
   /// *unnamed* verdict means, which is why [`BareVerdict`] is a
   /// parameter rather than an assumption.
-  fn hw_route(&self, reason: Error, raw: ffmpeg_next::Error, bare: BareVerdict) -> HwRoute {
+  ///
+  /// While a candidate is on trial, a failure advances the probe. Once a
+  /// backend has committed, [`CommittedRoad::verdict`] reads it: the road
+  /// lost, by name, on FFmpeg's own signals, and the picture's own error
+  /// otherwise.
+  fn hw_route(&mut self, reason: Error, raw: ffmpeg_next::Error, bare: BareVerdict) -> HwRoute {
     let candidate_failed = match Self::verdict_routing(&reason) {
-      VerdictRouting::CandidateFailed => true,
+      VerdictRouting::CandidateFailed(_) => true,
       VerdictRouting::Direct => false,
       VerdictRouting::Unnamed => matches!(bare, BareVerdict::CandidateFailure),
     };
@@ -1097,21 +1190,7 @@ impl VideoDecoder {
     if self.probe.is_some() {
       return HwRoute::Advance(reason);
     }
-    if Self::fallback_required(&reason, raw) {
-      return HwRoute::Report(self.post_commit_hw_failure(reason));
-    }
-    HwRoute::Report(reason)
-  }
-
-  fn post_commit_hw_failure(&self, reason: Error) -> Error {
-    // `new_post_commit` stamps `FallbackOrigin::PostCommit`: the wrapper
-    // routes its replay on that explicit signal, not on the (here-empty)
-    // `unconsumed_packets`, which a probe-era first-packet cap trip also
-    // leaves empty.
-    Error::AllBackendsFailed(AllBackendsFailed::new_post_commit(vec![(
-      self.state.backend,
-      Box::new(reason),
-    )]))
+    HwRoute::Report(self.road.verdict(self.state.backend, reason, raw))
   }
 
   /// Whether the probe rescue history is still being recorded.
@@ -1178,7 +1257,19 @@ impl VideoDecoder {
   /// software decoder of choice. The post-probe path (after the first
   /// frame, when `self.probe` is `None`) skips this pre-flight
   /// entirely.
+  ///
+  /// After commit a failure is this packet's own error, and the next
+  /// packet is decoded — unless the road was lost
+  /// ([`Error::HardwareRoadLost`]), after which every call answers that
+  /// error and nothing reaches libavcodec.
   pub fn send_packet(&mut self, packet: &Packet) -> Result<Sent> {
+    // **A lost road takes nothing more.** Past a failed restart FFmpeg's
+    // session holds no decoder and answers every picture with
+    // `AVERROR_INVALIDDATA` (`libavcodec/videotoolbox.c` 1071–1072) — not
+    // this packet's fault, so it is not reported as if it were.
+    if let Some(lost) = self.road.refusal() {
+      return Err(lost);
+    }
     loop {
       // Re-read each iteration: a probe advance moves this session from
       // one phase to another underneath the loop.
@@ -1335,7 +1426,13 @@ impl VideoDecoder {
   /// Answers [`Sent::MustDrain`] on `EAGAIN` — the end-of-stream was
   /// **not** recorded, so drain and signal again. A second EOF is a
   /// caller fault and stays one; see [`send_status`].
+  ///
+  /// A lost road refuses the end as it refuses a packet — see
+  /// [`Self::send_packet`].
   pub fn send_eof(&mut self) -> Result<Sent> {
+    if let Some(lost) = self.road.refusal() {
+      return Err(lost);
+    }
     loop {
       // Re-read each iteration: a probe advance moves this session from
       // one phase to another underneath the loop.
@@ -1391,6 +1488,12 @@ impl VideoDecoder {
   /// backend attempt log so the caller can branch into a software
   /// decoder of their choice.
   ///
+  /// After commit a failure is that picture's own error, and the next
+  /// call decodes on — unless the road was lost
+  /// ([`Error::HardwareRoadLost`]), after which every call answers that
+  /// error. Pictures already decoded and queued are still delivered
+  /// first.
+  ///
   /// Answers the same three states `ffmpeg::decoder::Video` does, in
   /// the shape the trait tier publishes: [`Received::NeedsInput`] where
   /// libavcodec says `EAGAIN`, [`Received::Ended`] where it says `EOF`,
@@ -1403,6 +1506,12 @@ impl VideoDecoder {
     // so we just move them into the caller's slot.
     if self.try_pop_pending(frame) {
       return Ok(Received::Frame);
+    }
+    // A lost road gives nothing more: the queued pictures above were
+    // decoded before the loss; nothing after it is asked of libavcodec.
+    // See [`Self::send_packet`].
+    if let Some(lost) = self.road.refusal() {
+      return Err(lost);
     }
 
     loop {
@@ -1482,12 +1591,12 @@ impl VideoDecoder {
           //
           // Judged out here rather than inside `transfer_hw_frame`
           // deliberately. Errors from that function are FFmpeg's, and
-          // the arms below reclassify them into "the hardware failed,
-          // fall back to software". A byte ceiling is not a hardware
+          // the arms below route them as hardware failures — a candidate
+          // failing while the probe runs, and after commit the picture's
+          // own error or a lost road. A byte ceiling is not a hardware
           // failure: software would decode the same oversized frame and
-          // be refused again, so retrying it silently is exactly the
-          // wrong answer. The named refusal returns straight to the
-          // caller.
+          // be refused again, so routing it as one is exactly the wrong
+          // answer. The named refusal returns straight to the caller.
           if let Err(e) =
             unsafe { judge_hw_transfer(self.hw_frame.as_ptr(), self.frame_limits.frame()) }
           {
@@ -1515,7 +1624,7 @@ impl VideoDecoder {
           // pixel format, a metadata copy that runs out of memory — and
           // routing that into the arms below would let an optional
           // bandwidth optimisation reject a VideoToolbox decode that
-          // was working, or degrade the session to software. So the
+          // was working, or end the session's road. So the
           // fitted attempt is made first and separately: if it fails,
           // the stage latches the key off, the destination is reset,
           // and the original full-size frame — still live in
@@ -1600,6 +1709,10 @@ impl VideoDecoder {
   /// cleared since post-seek packets do not align with the previously
   /// captured history. After a flush, the next `receive_frame` waits for new
   /// post-seek input.
+  ///
+  /// A lost road ([`Error::HardwareRoadLost`]) stays lost: a seek gives
+  /// FFmpeg no session to decode with, so the calls after the flush are
+  /// refused as the calls before it were.
   pub fn flush(&mut self) {
     self.state.inner.flush();
     // SAFETY: hw_frame is a valid AVFrame we own; av_frame_unref is a no-op
@@ -1658,6 +1771,7 @@ impl VideoDecoder {
   fn hw_exit(&self, fallback: Error) -> Error {
     self
       .take_ceiling_declination()
+      .or_else(|| format_not_offered_of(self.state.callback_state, self.state.backend))
       .or_else(|| frame_budget_declination_of(self.state.callback_state))
       .unwrap_or(fallback)
   }
@@ -1911,8 +2025,9 @@ impl VideoDecoder {
         // processing input` for a coded surface this crate refused.
         //
         // Order matters and is the whole fix — read, then drop.
-        let recorded =
-          ceiling_declination_of(candidate_state.callback_state).unwrap_or(Error::Ffmpeg(e));
+        let recorded = ceiling_declination_of(candidate_state.callback_state)
+          .or_else(|| format_not_offered_of(candidate_state.callback_state, next_backend))
+          .unwrap_or(Error::Ffmpeg(e));
         // Drop candidate explicitly so its FFI cleanup runs now. Discard any
         // frames we drained from this candidate — they're tied to a decoder
         // we're throwing away.
@@ -2186,8 +2301,7 @@ unsafe fn transfer_hw_frame(
     // unsupported formats). Surface the unsupported result as a
     // transfer failure so `receive_frame`'s probe-active path advances
     // to the next backend rather than collapsing on an unusable frame;
-    // post-probe, the caller gets an `Err` they can branch into a
-    // software fallback.
+    // post-probe, the caller gets that picture's error.
     let dst_raw_fmt: i32 = (*dst.as_inner_mut().as_ptr()).format;
     let dst_pix_fmt = crate::boundary::from_av_pixel_format(dst_raw_fmt);
     if !crate::frame::is_supported_cpu_pix_fmt(&dst_pix_fmt) {
@@ -2206,7 +2320,7 @@ unsafe fn transfer_hw_frame(
       // partial frame doesn't leak (its pixel buffers were attached
       // by `av_hwframe_transfer_data` above) and surface as a
       // backend failure — the probe path will advance to the next
-      // candidate; post-probe, the caller branches into SW fallback.
+      // candidate; post-probe, the caller gets that picture's error.
       av_frame_unref(dst.as_inner_mut().as_mut_ptr());
       return Err(e);
     }
@@ -2623,32 +2737,47 @@ fn send_status(e: Error, phase: SessionPhase) -> Result<Sent> {
   }
 }
 
-/// Post-commit, a HW-only decoder's non-transient, non-EOF error means the
-/// committed HW backend can't decode this content → fall back to SW. VT's
-/// "hardware accelerator failed" surfaces as AVERROR_EXTERNAL; some HW
-/// backends report unsupported geometry as InvalidData; context loss as
-/// Bug/Bug2/Unknown. Broad-by-design (decode-all-kinds); fixtures will let us
-/// narrow if a real backend proves a code should NOT trigger fallback.
+/// **FFmpeg's own "the hardware road is gone" signals, as they reach a
+/// caller — the only errnos that lose a committed road.**
 ///
-/// `EAGAIN`/`EOF` are deliberately excluded by the caller, which guards on
-/// them first — on the send roads through [`is_transient`] into
-/// [`send_status`], and on `receive_frame` through [`is_eagain`] into
-/// [`receive_status`], plus the probe/`hw_exit` road for `EOF`. `EAGAIN` is back pressure and `EOF` is a
-/// genuine end-of-stream that must reach the caller as
-/// [`Received::Ended`], never be trapped in an infinite fallback-retry
-/// loop. `Other { errno: EINVAL }` from the HW→CPU transfer path is also
-/// covered — an unsupported CPU output pix_fmt is a HW-output problem,
-/// never input corruption.
-fn is_hw_decode_failure(e: &ffmpeg_next::Error) -> bool {
+/// FFmpeg models a hardware decode failure per picture. In FFmpeg 9.0.1's
+/// `libavcodec/videotoolbox.c`, a picture VideoToolbox fails to decode
+/// answers `AVERROR_UNKNOWN` and the session stays (1075–1079); a
+/// malfunction or an invalidated session also marks it for a restart
+/// (1076–1077), and the next picture stops and restarts it itself
+/// (1062–1068). H.264 logs "hardware accelerator failed to decode picture"
+/// and returns that picture's error (`h264_picture.c` 206–210), and the
+/// next packet decodes as usual. So an errno a committed backend answers is
+/// that picture's own — as `AVERROR_INVALIDDATA` is the software decoder's
+/// own — except these two:
+///
+/// - `AVERROR_EXTERNAL`: the restart failed (`videotoolbox.c` 1066–1067),
+///   and no session is left to decode with.
+/// - `ENOSYS`: the hardware cannot take this content. NVDEC refuses an
+///   HEVC picture whose tiles, chroma QP offsets or references exceed its
+///   API's tables (`nvdec_hevc.c` 200–227), at frame time, and refuses the
+///   next one the same way.
+///
+/// `ENOSYS` from a session's **creation** never arrives here: VideoToolbox
+/// answers it for a format it cannot take (`videotoolbox.c` 1020–1028), but
+/// creation runs inside the hwaccel's `init`, whose error `ff_get_format`
+/// discards before asking the `get_format` callback again without the
+/// hardware format (`decode.c` 1341–1357). The codec then reports the
+/// decline as `AVERROR_INVALIDDATA` (H.264, `h264dec.c` 1061–1066) or `-1`
+/// (HEVC, `hevc/hevcdec.c` 3260–3264), which this predicate rightly leaves
+/// alone. The callback records that decline instead, and the funnels name
+/// it [`Error::HwFormatNotOffered`] — the same class, read where it can be
+/// seen.
+///
+/// `EAGAIN` and `EOF` never reach this predicate: the callers classify the
+/// two flow signals first — on the send roads through [`is_transient`] into
+/// [`send_status`], and on `receive_frame` through [`receive_status`].
+fn loses_the_road(e: &ffmpeg_next::Error) -> bool {
   matches!(
     e,
     ffmpeg_next::Error::External
-      | ffmpeg_next::Error::Bug
-      | ffmpeg_next::Error::Bug2
-      | ffmpeg_next::Error::Unknown
-      | ffmpeg_next::Error::InvalidData
       | ffmpeg_next::Error::Other {
-        errno: libc::EINVAL
+        errno: libc::ENOSYS
       }
   )
 }
@@ -2897,6 +3026,7 @@ pub(crate) fn build_codec_context(
     ceiling_declined: core::sync::atomic::AtomicBool::new(false),
     declined_pixels: core::sync::atomic::AtomicI64::new(0),
     declined_limit: core::sync::atomic::AtomicI64::new(0),
+    format_not_offered: core::sync::atomic::AtomicBool::new(false),
     max_frame_bytes: limits.frame().max_frame_bytes() as u64,
     frame_budget_declined: core::sync::atomic::AtomicBool::new(false),
     declined_frame_bytes: core::sync::atomic::AtomicU64::new(0),
@@ -3557,6 +3687,13 @@ fn ceiling_declination_of(state: *const CallbackState) -> Option<Error> {
   };
   declined.then(|| Error::HwSurfaceTooLarge(crate::error::HwSurfaceTooLarge::new(pixels, limit)))
 }
+
+/// Reads and clears a [`Error::HwFormatNotOffered`] decline the
+/// `get_format` callback left behind, naming the backend it was asked
+/// for.
+fn format_not_offered_of(state: *const CallbackState, backend: Backend) -> Option<Error> {
+  crate::ffi::take_format_not_offered(state).then_some(Error::HwFormatNotOffered(backend))
+}
 /// The software decoders' error funnel.
 ///
 /// Every road that turns a libavcodec decode failure into an `Error`
@@ -3607,8 +3744,8 @@ pub(crate) fn software_exit(state: *const CallbackState, e: ffmpeg_next::Error) 
 /// > the second call finds the latch empty and reports the errno the
 /// > substrate happened to give over the refusal this crate made.
 ///
-/// A raw errno may still be *read* after minting — `is_hw_decode_failure`
-/// does, to decide whether a fallback is required — but reading it to
+/// A raw errno may still be *read* after minting — [`loses_the_road`]
+/// does, to decide whether a committed road is lost — but reading it to
 /// decide a route is not the same as reporting it. What the caller is
 /// told is always the verdict.
 ///
