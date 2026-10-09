@@ -1134,7 +1134,7 @@ impl H264Sets for [Option<Sps>; 32] {
 
 /// **What FFmpeg's H.264 decoder keeps of a parameter set it stores, and
 /// compares** — `data` (`ff_h264_decode_seq_parameter_set`,
-/// h264_ps.c:296-305; `ff_h264_decode_picture_parameter_set`, 716-727): the
+/// h264_ps.c:296-305; `ff_h264_decode_picture_parameter_set`, 717-728): the
 /// bytes its reader starts at, through the last its payload bits reach, the
 /// stop bit put back where it filled a byte of its own. For the first and
 /// third readings of a sequence parameter set and for a picture parameter
@@ -1740,12 +1740,12 @@ pub(super) struct VpsRead {
   max_layers: u8,
   /// `nb_layers`: two where `decode_vps_ext` read the second layer, or the
   /// broken extension is kept as alpha video, one otherwise
-  /// (hevc/ps.c:507, 919-939); a sequence parameter set of the second layer
+  /// (hevc/ps.c:548, 919-939); a sequence parameter set of the second layer
   /// referring to a set of one is refused (1299-1303).
   nb_layers: u8,
   /// `rep_format` as `decode_vps_ext` left it (hevc/ps.c:705-734), what a
   /// sequence parameter set of the second layer takes for its own
-  /// (1311-1325).
+  /// (1296-1324).
   rep: RepFormat,
   /// Whether FFmpeg stored it with a warning that `AV_EF_EXPLODE` turns into
   /// its refusal: reordered pictures past the decoded picture buffer
@@ -2128,7 +2128,7 @@ pub(super) fn parse_ptl(r: &mut Reader<'_>, profile_present: bool, max_sub_layer
 /// [`parse_ptl`], answering the general `profile_idc` it stores — 0 where
 /// the profile is not present, `memset` (ps.c:343-345) — or `None` where it
 /// fails. A `profile_idc` of 0 takes the first compatibility flag set after
-/// the first (`decode_profile_tier_level`, ps.c:288-293).
+/// the first (`decode_profile_tier_level`, ps.c:285-290).
 fn parse_ptl_profile(r: &mut Reader<'_>, profile_present: bool, max_sub_layers: i32) -> Option<u8> {
   let common = |r: &mut Reader<'_>| {
     if r.left() < 88 {
@@ -2251,10 +2251,10 @@ pub(super) struct HevcSps {
   pub(super) id: u8,
   bit_depth: i32,
   /// 0 for a set of the second layer, which takes its format from the video
-  /// parameter set's and never sets this (hevc/ps.c:1311-1325).
+  /// parameter set's and never sets this (hevc/ps.c:1296-1324).
   bit_depth_chroma: i32,
   /// The general `profile_idc`, 0 for a set of the second layer, which
-  /// reads no profile (ps.c:1281-1288).
+  /// reads no profile (ps.c:1280-1288).
   profile_idc: u8,
   log2_diff_max_min_coding_block_size: u32,
   log2_ctb_size: u32,
@@ -2263,10 +2263,10 @@ pub(super) struct HevcSps {
   /// Whether FFmpeg stored it with a warning that `AV_EF_EXPLODE` turns into
   /// its refusal: reordered pictures past the decoded picture buffer
   /// (`sps_max_num_reorder_pics`, ps.c:1416-1424), or an output window that
-  /// leaves no picture (1640-1650), which the conformance window's own test
+  /// leaves no picture (1640-1654), which the conformance window's own test
   /// rules out where the default display window is not applied — FFmpeg's
   /// default, which this crate keeps (`apply_defdispwin`,
-  /// hevc/hevcdec.c:4204-4205; ps.c:76-81, 1389, 1633-1638).
+  /// hevc/hevcdec.c:4204-4205; ps.c:75-80, 1389, 1633-1638).
   pub(super) warned: bool,
 }
 
@@ -2310,7 +2310,7 @@ pub(super) fn hevc_sps(
   let mut profile_idc = 0;
   if !multi_layer {
     r.bit(); // sps_temporal_id_nesting_flag
-    // `parse_ptl`'s -1 is the set's error (ps.c:1281-1283).
+    // `parse_ptl`'s -1 is the set's error (ps.c:1283-1284).
     match parse_ptl_profile(r, true, max_sub_layers) {
       Some(idc) => profile_idc = idc,
       None => return aborts(None),
@@ -2531,7 +2531,7 @@ pub(super) fn hevc_sps(
     }
   }
   // The output window, the conformance window alone: a warning, refused
-  // only under AV_EF_EXPLODE (ps.c:1640-1650). `unsigned` arithmetic.
+  // only under AV_EF_EXPLODE (ps.c:1640-1654). `unsigned` arithmetic.
   let [left, right, top, bottom] = window;
   if left >= (i32::MAX as u32).wrapping_sub(right)
     || top >= (i32::MAX as u32).wrapping_sub(bottom)
@@ -2558,7 +2558,7 @@ pub(super) fn hevc_sps(
   {
     return invalid(at);
   }
-  // "Overread SPS": refused (ps.c:1711-1716).
+  // "Overread SPS": refused (ps.c:1711-1715).
   if r.left() < 0 {
     return invalid(at);
   }
@@ -2650,9 +2650,9 @@ fn scaling_list_data(r: &mut Reader<'_>) -> bool {
 /// information or the bitstream restriction runs short, or the VUI runs to
 /// the end of the set (1027-1036, 1051-1060, 1072-1080): the reader goes back,
 /// once. The default display window is read for its length alone
-/// (`read_window`'s answer is not looked at, 1005-1006), and a window that
+/// (`read_window`'s answer is not looked at, 1003-1004), and a window that
 /// opens on 21 bits reading 0x100000, with 68 bits or more left, is taken as
-/// absent (995-1000).
+/// absent (997-1001).
 fn hevc_vui(r: &mut Reader<'_>, max_sub_layers: i32) {
   common_vui(r);
   r.bit(); // neutral_chroma_indication_flag
@@ -2724,7 +2724,7 @@ pub(super) enum HevcPps {
 /// the set's `pps_seq_parameter_set_id`, against `sps`, the sequence
 /// parameter set the decoder holds under it, and `vps_max_layers`, the
 /// `vps_max_layers` of the video parameter set held under that one's id
-/// (2259-2260). Every field is read as FFmpeg reads it, its extensions among
+/// (2260-2261). Every field is read as FFmpeg reads it, its extensions among
 /// them; `setup_pps`, which reads nothing and fails only an allocation, is
 /// taken to pass (2069-2199). The C widths kept: `num_ref_loc_offsets`,
 /// `num_cm_ref_layers`, the colour mapping bit depths and

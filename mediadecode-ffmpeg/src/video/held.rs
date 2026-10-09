@@ -359,7 +359,7 @@ struct PictureHeld {
   /// The unit as the splitter took it.
   unit: Arc<Bytes>,
   /// `data` as FFmpeg keeps it ([`params::h264_identity`],
-  /// h264_ps.c:716-727): what tells it from another, whose raw bytes may
+  /// h264_ps.c:717-728): what tells it from another, whose raw bytes may
   /// differ by a trailing zero.
   identity: Arc<Bytes>,
   /// The id of the sequence parameter set it refers to.
@@ -1056,7 +1056,7 @@ impl Hevc {
     // after it, which a record changes: a video parameter set stored where
     // its id held nothing (hevc/ps.c:944-952), a picture parameter set
     // stored with a warning (2458-2461). FFmpeg refuses a sequence parameter
-    // set read so (1711-1716).
+    // set read so (1711-1715).
     if self.vps.iter().flatten().any(|vps| vps.past_end) {
       return Err(Unrecordable::PastEnd(ParameterSet::Video));
     }
@@ -1376,7 +1376,7 @@ impl<'a> HevcWrite<'a> {
 
   /// `ff_hevc_decode_nal_sps` (hevc/ps.c:1735-1786) on the sequence parameter
   /// set `unit`, read whole ([`params::hevc_sps`]) against the video
-  /// parameter set held under its id, which must be held (1252-1258): an
+  /// parameter set held under its id, which must be held (1253-1260): an
   /// identical set changes nothing (`compare_sps`, 1729-1733, 1774-1780),
   /// any other drops the picture parameter sets that refer to its id
   /// (`remove_sps`, 89-100). Read against a video parameter set held in
@@ -1467,7 +1467,7 @@ impl<'a> HevcWrite<'a> {
   /// `ff_hevc_decode_nal_pps` (hevc/ps.c:2201-2471) on the picture parameter
   /// set `unit`: an id under 64, an identical set changing nothing
   /// (2219-2223), a sequence parameter set id under 16 that is held
-  /// (2248-2258), then the rest read whole ([`params::hevc_pps`]) against
+  /// (2249-2258), then the rest read whole ([`params::hevc_pps`]) against
   /// that set and the video parameter set held under its id — a set read
   /// past its payload stored as such. Read against a set held in doubt, what
   /// FFmpeg does with it cannot be told: it is held in doubt. FFmpeg refuses

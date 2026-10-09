@@ -120,7 +120,8 @@ The backend-agnostic core it adapts has its own log at
   against its own), is refused by this name before any decoder sees it,
   naming the reason; the packet stays the caller's and nothing of the
   session changes (below). A packet body FFmpeg reads as an `avcC` record
-  is judged the same way.
+  is judged the same way, against the sets the decoder holds once it
+  applied the packet's own new extradata, which FFmpeg applies first.
 
 - **`Error::SetsUnrecordable`** (`SetsUnrecordable { codec, reason }`, with
   `Unrecordable`, both exported; `Unrecordable` is `#[non_exhaustive]`): a
@@ -473,15 +474,27 @@ The backend-agnostic core it adapts has its own log at
   and opens a fresh decoder on the record that gives it exactly that: the
   codec parameters' or the packet's own where either does, otherwise a
   record carrying every set held, in the framing the decoder serving reads
-  packets in, read back as FFmpeg reads it (an HEVC sequence or picture
-  parameter set vouched for by FFmpeg's own decoder opened on the record
-  strictly). Where none can, the open is refused by name
-  (`Error::SetsUnrecordable`, above), a switch declined. A probe-era
-  fallback's replay starts from what the hardware held when its history
-  began. The HEVC alpha reading judges a video parameter set against the
-  sets held across packets, as FFmpeg does: a set read past its end under
-  an id an earlier packet filled is refused, not taken as alpha video for
-  good. A set longer than a record's entry is held by a fingerprint.
+  packets in, read back as FFmpeg reads it. Every HEVC set is read whole as
+  FFmpeg 9 reads it — a set it refuses held by nothing, one it stores with a
+  warning held and recorded, one it reads past its end held so — and
+  FFmpeg's own decoder, opened on the record strictly, is a second witness
+  of a record carrying no set it stores with a warning. Where no record
+  can, the open is refused by name (`Error::SetsUnrecordable`, above), a
+  switch declined: among the reasons a set whose last fields FFmpeg read off
+  the bytes after it, which a record changes — an HEVC picture parameter
+  set it stores so, a video parameter set it stores so under an id holding
+  nothing. An H.264 set is told from another as FFmpeg tells it, by its
+  parsed form and the bytes it keeps of it, not its raw bytes: the same set
+  repeated before a three-byte start code rather than a four-byte one
+  replaces nothing. A probe-era fallback's replay starts from what the
+  hardware held when its history began, and moves what is held by the
+  packets it feeds alone, each read as the decoder serving reads it: a seek
+  that drops what the budget left unfed leaves none of their sets behind.
+  The HEVC alpha reading judges a video parameter set against the sets held
+  across packets, as FFmpeg does — a keyframe's own sets too, for whether it
+  is clean or anchors: a set read past its end under an id an earlier packet
+  filled is refused, not taken as alpha video for good. A set longer than a
+  record's entry is held by a fingerprint.
 
 - **An H.264 packet is framed as FFmpeg's decoder frames it.** A packet
   whose body FFmpeg reads as an `avcC` record — where the decoder's framing

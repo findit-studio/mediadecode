@@ -5656,7 +5656,7 @@ struct Opening {
 /// warning — a video or sequence parameter set whose reordered pictures
 /// overrun its buffering (hevc/ps.c:858-862, 1416-1424) — so it witnesses
 /// only a record carrying neither ([`held::Record::strict`]); a third,
-/// cropping that leaves no picture (1640-1650), never meets a set the
+/// cropping that leaves no picture (1640-1654), never meets a set the
 /// decoder serving stores: `read_window` refuses a conformance window that
 /// leaves none (66-87), and the output window is that window alone, the
 /// default display window applied only under `apply_defdispwin`

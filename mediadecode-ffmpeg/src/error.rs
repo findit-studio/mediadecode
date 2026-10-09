@@ -257,7 +257,8 @@ impl SetsUnrecordable {
 pub enum Unrecordable {
   /// Whether the decoder holds a set cannot be told: a packet carrying it
   /// was refused with an error that does not say whether the decoder read
-  /// it, or a flush dropped it before the decoder was seen to read it.
+  /// it, a flush dropped it before the decoder was seen to read it, or it
+  /// was read against a set held so, which decides whether FFmpeg stores it.
   Unknown,
   /// An H.264 picture parameter set the decoder holds was read under a
   /// sequence parameter set its id no longer holds, and is decoded under
