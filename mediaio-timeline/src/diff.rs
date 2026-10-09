@@ -1,23 +1,26 @@
 //! What changed between two timelines, clip by clip.
 
 use alloc::{
-  collections::{BTreeMap, VecDeque},
+  collections::{BTreeMap, btree_map::Entry},
   vec::Vec,
 };
-use core::cmp::Ordering;
+use core::{cmp::Ordering, fmt};
 
 use mediatime::{TimeRange, Timestamp};
 
-use crate::{Clip, Fade, Fades, Timeline};
+use crate::{Clip, ClipPair, Fade, Fades, Timeline};
 
 /// What changed from `before` to `after`, clip by clip, per track.
 ///
 /// Tracks are matched by index. Within a track a clip is identified by its
 /// [`name`](Clip::name) together with its medium's
-/// [`locator`](crate::MediaRef::locator); an `id` word is reserved for a
-/// later schema. A name and locator that occur more than once in a track
-/// match in order: the first occurrence before with the first after, and so
-/// on.
+/// [`locator`](crate::MediaRef::locator), and the identity must be unique in
+/// its track for a match to mean anything. A track of either side that names
+/// one identity twice is refused with [`Ambiguous`] rather than matched by
+/// occurrence, which would report a clip that stayed put as moved and one
+/// that stayed as removed; [`validate`](fn@crate::validate) refuses such a
+/// track too ([`Refusal::DuplicateClip`](crate::Refusal::DuplicateClip)). A
+/// stable `id` word is reserved for a later schema.
 ///
 /// A clip only in `after` is [`Added`](ChangeKind::Added); one only in
 /// `before` is [`Removed`](ChangeKind::Removed). A clip in both is reported
@@ -37,8 +40,8 @@ use crate::{Clip, Fade, Fades, Timeline};
 ///
 /// The changes come in a fixed order: by track, then by where the clip sits
 /// — its record in `after`, or in `before` for a removed clip — then by kind
-/// in the order above, then by index. So `diff(a, a)` is empty and every run
-/// over the same pair answers the same list.
+/// in the order above, then by index. So `diff(a, a)` is empty for every `a`
+/// it answers, and every run over the same pair answers the same list.
 ///
 /// Only clips are compared. The timeline's own words (name, rate, start,
 /// notes), a track's words (kind, name, enabled), transitions, a clip's
@@ -58,13 +61,23 @@ use crate::{Clip, Fade, Fades, Timeline};
 /// );
 /// let mut after = before.clone();
 /// after.tracks_mut()[0].clips_mut()[1].set_record(TimeRange::new(20, 30, edit));
-/// let delta = diff(&before, &after);
+/// let delta = diff(&before, &after).unwrap();
 /// assert_eq!(delta.changes().len(), 1);
 /// assert_eq!(delta.changes()[0].kind(), ChangeKind::Moved);
 /// assert_eq!(delta.changes()[0].after(), Some(1));
-/// assert!(diff(&after, &after).is_empty());
+/// assert!(diff(&after, &after).unwrap().is_empty());
 /// ```
-pub fn diff(before: &Timeline, after: &Timeline) -> Delta {
+pub fn diff(before: &Timeline, after: &Timeline) -> Result<Delta, Ambiguous> {
+  for (side, timeline) in [(Side::Before, before), (Side::After, after)] {
+    for (index, track) in timeline.tracks().iter().enumerate() {
+      if let Some((earlier, later)) = first_duplicate(track.clips()) {
+        return Err(Ambiguous {
+          side,
+          clips: ClipPair::new(index, earlier, later),
+        });
+      }
+    }
+  }
   let mut changes = Vec::new();
   let tracks = before.tracks().len().max(after.tracks().len());
   for track in 0..tracks {
@@ -87,21 +100,35 @@ pub fn diff(before: &Timeline, after: &Timeline) -> Delta {
       change.after,
     )
   });
-  Delta { changes }
+  Ok(Delta { changes })
 }
 
-fn diff_track(track: usize, before: &[Clip], after: &[Clip], out: &mut Vec<Change>) {
-  // Each identity's occurrences in `after`, in order, waiting to be matched.
-  let mut waiting: BTreeMap<(&str, &str), VecDeque<usize>> = BTreeMap::new();
-  for (index, clip) in after.iter().enumerate() {
-    waiting.entry(identity(clip)).or_default().push_back(index);
+/// The first clip of `clips` with an earlier clip's identity, and the
+/// earlier clip: `(earlier, later)`.
+fn first_duplicate(clips: &[Clip]) -> Option<(usize, usize)> {
+  let mut first = BTreeMap::new();
+  for (index, clip) in clips.iter().enumerate() {
+    match first.entry(clip.identity()) {
+      Entry::Vacant(slot) => {
+        slot.insert(index);
+      }
+      Entry::Occupied(slot) => return Some((*slot.get(), index)),
+    }
   }
+  None
+}
+
+/// Matches `before`'s clips with `after`'s by identity, unique on each side.
+fn diff_track(track: usize, before: &[Clip], after: &[Clip], out: &mut Vec<Change>) {
+  // Each identity's clip in `after`, waiting to be matched.
+  let mut waiting: BTreeMap<(&str, &str), usize> = after
+    .iter()
+    .enumerate()
+    .map(|(index, clip)| (clip.identity(), index))
+    .collect();
   let mut matched = alloc::vec![false; after.len()];
   for (index, clip) in before.iter().enumerate() {
-    let partner = waiting
-      .get_mut(&identity(clip))
-      .and_then(VecDeque::pop_front);
-    let Some(partner) = partner else {
+    let Some(partner) = waiting.remove(&clip.identity()) else {
       out.push(Change::new(track, ChangeKind::Removed, Some(index), None));
       continue;
     };
@@ -127,11 +154,6 @@ fn diff_track(track: usize, before: &[Clip], after: &[Clip], out: &mut Vec<Chang
       out.push(Change::new(track, ChangeKind::Added, None, Some(index)));
     }
   }
-}
-
-/// A clip's identity: its name and its medium's locator.
-fn identity(clip: &Clip) -> (&str, &str) {
-  (clip.name(), clip.media().locator())
 }
 
 /// Whether two ranges cover the same stretch of time, whatever they are
@@ -163,6 +185,55 @@ const fn rank(kind: ChangeKind) -> u8 {
     ChangeKind::Regained => 4,
     ChangeKind::EnabledFlipped => 5,
   }
+}
+
+/// Why [`diff`] refused: a track of one side names one clip identity — a
+/// name and a locator — twice, so a clip of the other side could be matched
+/// with either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Ambiguous {
+  side: Side,
+  clips: ClipPair,
+}
+
+impl Ambiguous {
+  /// The timeline whose track names the identity twice.
+  pub const fn side(&self) -> Side {
+    self.side
+  }
+
+  /// The track and its first two clips with the identity.
+  pub const fn clips(&self) -> ClipPair {
+    self.clips
+  }
+}
+
+/// Writes `before, track 0: clips 0 and 1 share a name and a locator`.
+impl fmt::Display for Ambiguous {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    write!(
+      f,
+      "{}, track {}: clips {} and {} share a name and a locator",
+      match self.side {
+        Side::Before => "before",
+        Side::After => "after",
+      },
+      self.clips.track(),
+      self.clips.earlier(),
+      self.clips.later()
+    )
+  }
+}
+
+impl core::error::Error for Ambiguous {}
+
+/// One of the two timelines [`diff`] compares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Side {
+  /// The timeline before the change.
+  Before,
+  /// The timeline after it.
+  After,
 }
 
 /// The changes [`diff`] found, in its fixed order.

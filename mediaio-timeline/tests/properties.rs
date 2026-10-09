@@ -233,7 +233,10 @@ fn layout_tiles_each_track_from_zero_and_its_gaps_never_overlap() {
 fn a_timeline_against_itself_has_no_change() {
   for seed in 0..SEEDS {
     let timeline = timeline(seed);
-    assert!(diff(&timeline, &timeline).is_empty(), "seed {seed}");
+    assert!(
+      diff(&timeline, &timeline).unwrap().is_empty(),
+      "seed {seed}"
+    );
   }
 }
 
@@ -249,7 +252,7 @@ fn diff_names_exactly_the_change_made() {
     let edited = &mut after.tracks_mut()[track].clips_mut()[clip];
     let enabled = edited.enabled();
     edited.set_enabled(!enabled);
-    let changes = diff(&before, &after);
+    let changes = diff(&before, &after).unwrap();
     let changes: Vec<_> = changes
       .changes()
       .iter()

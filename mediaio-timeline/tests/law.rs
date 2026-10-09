@@ -80,7 +80,7 @@ fn every_kind_of_change_to_the_law_timeline_is_reported() {
   let changed = |edit_fn: &dyn Fn(&mut Timeline)| {
     let mut after = law.clone();
     edit_fn(&mut after);
-    kinds(&diff(&law, &after))
+    kinds(&diff(&law, &after).unwrap())
   };
   assert_eq!(
     changed(&|t| {

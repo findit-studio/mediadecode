@@ -19,7 +19,7 @@ mod validate;
 mod wire;
 
 pub use clip::{Clip, Fade, FadeShape, Fades, Gain, MediaRef};
-pub use diff::{Change, ChangeKind, Delta, diff};
+pub use diff::{Ambiguous, Change, ChangeKind, Delta, Side, diff};
 pub use layout::{Item, Layout, TrackLayout, layout};
 pub use metadata::Metadata;
 pub use schema::Schema;

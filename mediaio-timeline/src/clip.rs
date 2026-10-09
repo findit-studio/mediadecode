@@ -24,9 +24,11 @@ use crate::Metadata;
 /// of edit-rate ticks and the record to exactly that length.
 ///
 /// A clip is identified by its [`name`](Self::name) together with its
-/// medium's [`locator`](MediaRef::locator); [`diff`](fn@crate::diff) matches
-/// clips that way. An `id` word is reserved for a later schema, as is
-/// `speed`: neither is part of schema 1.
+/// medium's [`locator`](MediaRef::locator), and [`diff`](fn@crate::diff)
+/// matches clips that way, so the identity is unique within a track:
+/// [`validate`](fn@crate::validate) refuses a track that names one twice. A
+/// stable `id` word is reserved for a later schema, as is `speed`: neither is
+/// part of schema 1.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Clip {
@@ -66,6 +68,11 @@ impl Clip {
   /// The clip's name — half of its identity, with the medium's locator.
   pub const fn name(&self) -> &str {
     self.name.as_str()
+  }
+
+  /// The clip's identity: its name and its medium's locator.
+  pub(crate) const fn identity(&self) -> (&str, &str) {
+    (self.name(), self.media.locator())
   }
 
   /// The medium the clip reads.

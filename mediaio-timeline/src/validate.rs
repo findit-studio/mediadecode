@@ -1,6 +1,9 @@
 //! Judging a timeline: every refusal by name, with where it is.
 
-use alloc::vec::Vec;
+use alloc::{
+  collections::{BTreeMap, btree_map::Entry},
+  vec::Vec,
+};
 use core::{cmp::Ordering, fmt};
 
 use mediatime::{Duration, ExactSeconds, Rounding, Timebase, Timestamp};
@@ -26,6 +29,9 @@ use crate::{Clip, Timeline, Track, Transition, time::span};
 ///   two of their records overlap ([`Refusal::Overlap`]) — a transition
 ///   blends across a cut with media outside the records, so it is never an
 ///   overlap;
+/// - no two clips of a track share a name and a locator
+///   ([`Refusal::DuplicateClip`]) — that pair is a clip's identity, which
+///   [`diff`](fn@crate::diff) matches by;
 /// - each source range runs a whole number of edit-rate ticks
 ///   ([`Refusal::SourceOffEditRate`]) and its record exactly as long
 ///   ([`Refusal::DurationMismatch`]) — there is no time-warp in schema 1, so
@@ -77,6 +83,8 @@ fn judge_track(track_index: usize, track: &Track, edit: Option<Timebase>, out: &
   // The record reaching furthest so far, by index and end: a later record
   // starting before that end overlaps it.
   let mut furthest: Option<(usize, Timestamp)> = None;
+  // Each identity's first clip.
+  let mut identities = BTreeMap::new();
   for (index, clip) in clips.iter().enumerate() {
     let at = ClipAt::new(track_index, index);
     let record = clip.record();
@@ -126,6 +134,18 @@ fn judge_track(track_index: usize, track: &Track, edit: Option<Timebase>, out: &
     }
     if furthest.is_none_or(|(_, end)| record.end() > end) {
       furthest = Some((index, record.end()));
+    }
+    match identities.entry(clip.identity()) {
+      Entry::Vacant(slot) => {
+        slot.insert(index);
+      }
+      Entry::Occupied(slot) => {
+        out.push(Refusal::DuplicateClip(ClipPair::new(
+          track_index,
+          *slot.get(),
+          index,
+        )));
+      }
     }
     if let Some(edit) = edit
       && media_stated
@@ -338,6 +358,10 @@ pub enum Refusal {
   OutOfOrder(ClipPair),
   /// Two records of one track overlap.
   Overlap(ClipPair),
+  /// A clip has the name and the locator of an earlier clip of its track.
+  /// That pair is a clip's identity, which [`diff`](fn@crate::diff) matches
+  /// by, so it is unique within a track.
+  DuplicateClip(ClipPair),
   /// A source range's length is no whole number of edit-rate ticks. A
   /// record runs exactly as long as its source (schema 1 has no time-warp),
   /// so a source must rescale onto the edit rate exactly.
@@ -380,6 +404,11 @@ impl fmt::Display for Refusal {
       Self::Overlap(pair) => write!(
         f,
         "track {}: clip {}'s record overlaps clip {}'s",
+        pair.track, pair.later, pair.earlier
+      ),
+      Self::DuplicateClip(pair) => write!(
+        f,
+        "track {}: clip {} has clip {}'s name and locator",
         pair.track, pair.later, pair.earlier
       ),
       Self::SourceOffEditRate(at) => write!(

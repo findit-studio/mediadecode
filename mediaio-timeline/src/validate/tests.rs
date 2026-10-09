@@ -243,6 +243,50 @@ fn an_overlap_with_a_record_further_back_than_the_last_is_refused() {
 }
 
 #[test]
+fn a_clip_identity_named_twice_in_one_track_is_refused() {
+  // `m` again later on its track: the same name and the same medium.
+  let mut timeline = baseline();
+  let again = timeline.tracks()[1].clips()[0].clone();
+  timeline.tracks_mut()[1].clips_mut().push({
+    let mut again = again;
+    again.set_record(rec(100, 148));
+    again
+  });
+  assert_eq!(
+    refusals(&timeline),
+    [Refusal::DuplicateClip(ClipPair::new(1, 0, 1))]
+  );
+  // A third use is paired with the first.
+  let third = timeline.tracks()[1].clips()[0].clone();
+  timeline.tracks_mut()[1].clips_mut().push({
+    let mut third = third;
+    third.set_record(rec(200, 248));
+    third
+  });
+  assert_eq!(
+    refusals(&timeline),
+    [
+      Refusal::DuplicateClip(ClipPair::new(1, 0, 1)),
+      Refusal::DuplicateClip(ClipPair::new(1, 0, 2)),
+    ]
+  );
+  // Another name, or another medium, is another clip; and one identity on
+  // two tracks is two clips.
+  clip_mut(&mut timeline, 1, 1).set_name("m2");
+  clip_mut(&mut timeline, 1, 2)
+    .media_mut()
+    .set_locator("file:///m2.wav");
+  assert_eq!(validate(&timeline), Ok(()));
+  let shared = timeline.tracks()[0].clips()[0].clone();
+  timeline.tracks_mut()[1].clips_mut().push({
+    let mut shared = shared;
+    shared.set_record(rec(300, 348));
+    shared
+  });
+  assert_eq!(validate(&timeline), Ok(()));
+}
+
+#[test]
 fn a_record_longer_than_its_source_is_refused() {
   let mut timeline = baseline();
   clip_mut(&mut timeline, 0, 0).set_source_range(TimeRange::new(24, 73, edit()));
@@ -513,6 +557,10 @@ fn every_refusal_comes_back_at_once_in_the_documented_order() {
 fn refusals_name_what_they_refuse() {
   let shown = |refusal: Refusal| alloc::string::ToString::to_string(&refusal);
   assert_eq!(shown(Refusal::RateUnstated), "the edit rate is zero");
+  assert_eq!(
+    shown(Refusal::DuplicateClip(ClipPair::new(1, 0, 3))),
+    "track 1: clip 3 has clip 0's name and locator"
+  );
   assert_eq!(
     shown(Refusal::RangeTooLong(RangeAt::new(
       ClipAt::new(1, 0),
