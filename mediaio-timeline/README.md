@@ -128,12 +128,13 @@ source range, an available range — is written whole in one ruler: frames of
 the medium's stated rate where its start and length both land on one, else
 ticks of its own timebase. The end OpenTimelineIO derives from a range (its
 start rescaled to its duration's rate, plus the duration) is the range's own
-end. Because a source range runs a whole number of edit-rate ticks, walking
-the exported items end to end lands every clip on its record. Where a
-medium's ruler is not the edit rate, one track's items are counted in more
-than one rate, and OpenTimelineIO sums those in floating point: a position
-derived that way is read to the nearest frame, not truncated — the export
-holds it under half a tick of the exact count (below).
+end, held within ±2^53 as every count it derives is (below). Because a
+source range runs a whole number of edit-rate ticks, walking the exported
+items end to end lands every clip on its record. Where a medium's ruler is
+not the edit rate, one track's items are counted in more than one rate, and
+OpenTimelineIO sums those in floating point: a position derived that way is
+read to the nearest frame, not truncated — the export holds it under half a
+tick of the exact count (below).
 
 **Every count OpenTimelineIO reads or derives is one it holds exactly.** A
 `RationalTime` keeps its value in an `f64`, which holds every whole number
@@ -147,20 +148,31 @@ export holds both:
   range its own rulers count past 2^53 — a medium stamped in nanoseconds
   since 1970 — is written in the coarsest ruler of a whole number of ticks a
   second that holds its start and its length, whole seconds or
-  milliseconds, when its counts there are within 2^53.
+  milliseconds, when its counts there are within 2^53. Of those rulers a
+  range is written in the first whose counts end it within ±2^53 too; where
+  none does, an available range is refused, and a source range is written
+  in the first that writes its start and its length, its end left to the
+  walk and to the search below.
 - **what OpenTimelineIO derives from it**, computed operation for operation
   and branch for branch as OpenTimelineIO computes it, beside its exact
-  value: each child's place on its track — from zero in that child's own
-  rate, every item before it added, as `range_of_child_at_index` sums it,
-  and as one walk over the whole track carries it — and in the timeline;
-  each item's visible range, its source range widened by the handles of the
-  transitions beside it; each track's duration, and the stack's, the
-  longest of them as OpenTimelineIO picks it; the global start added to
-  each place and to each track's end, as OpenTimelineIO's own tools add it;
-  and the last tick of every one of those ranges — `end_time_inclusive`,
-  which floors a range's end where the duration's double has a fraction and
-  takes a tick off it where it has none, so a duration whose double rounds
-  onto a whole number, or off one, can move the last tick by up to a tick.
+  value: the end of each clip's source range; each child's place on its
+  track — from zero in that child's own rate, every item before it added,
+  as `range_of_child_at_index` sums it, and as one walk over the whole
+  track carries it — and in the timeline; each item's visible range, its
+  source range widened by the handles of the transitions beside it; each
+  track's duration, and the stack's, the longest of them as OpenTimelineIO
+  picks it; the global start added to each place and to each track's end,
+  as OpenTimelineIO's own tools add it; each child's range from the global
+  start — the moved start and the child's own duration, as OpenTimelineIO
+  moves a child's range into its parent's, so its end rescales the moved
+  start into the duration's rate, a rounding of its own; for a timeline
+  with no track, its range from the global start, which OpenTimelineIO
+  gives no duration at rate 1, so it ends at the global start counted in
+  seconds; and the last tick of every one of those ranges —
+  `end_time_inclusive`, which floors a range's end where the duration's
+  double has a fraction and takes a tick off it where it has none, so a
+  duration whose double rounds onto a whole number, or off one, can move
+  the last tick by up to a tick.
   Each must lie within ±2^53 in the ruler OpenTimelineIO carries it in, and
   OpenTimelineIO's double less than half a tick from the exact count — read
   to the nearest tick, it is the exact count. On one ruler nothing is
@@ -198,9 +210,14 @@ What no plan the search walks holds is refused,
 `Refused::NotRepresentable`, naming where (`otio::Spot`; a child of an
 exported track is an `otio::ChildAt`), the count the last plan could not
 hold and the ruler it is counted in — and, for a count OpenTimelineIO
-derives, what the search tried: `otio::RulerSearch`, its bands
-(`otio::RulerBand`) and its walks. So a refusal says the search was
-bounded. A timeline that only a ruler outside the bands, or a plan of
+derives, a source range's end among them, what the search tried:
+`otio::RulerSearch`, its bands (`otio::RulerBand`) and its walks. So a
+refusal says the search was bounded. Refused before any walk, naming no
+search: a count written at the edit rate, which no ruler of the search
+changes; a source range none of its own rulers writes, its start or its
+length past 2^53 in each, which leaves the search no plan to start from;
+an available range none of them holds whole, which keeps its plan's
+ruler. A timeline that only a ruler outside the bands, or a plan of
 rulers the moves do not reach, would hold is refused by this contract,
 never written to be read rounded: a complete search would try every
 holding ruler of every clip together, a product space with no closed form

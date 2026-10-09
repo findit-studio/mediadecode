@@ -65,16 +65,23 @@ The crate's first release, as 0.1.0.
   applies neither gain nor reel). Every count written lies within ±2^53,
   where OpenTimelineIO's `f64` holds every whole number; a media-side range
   its own rulers count past that is written in the coarsest whole-rate
-  ruler that holds it. Every count OpenTimelineIO derives from the document
-  — each child's place on its track, from zero in the child's own rate, and
-  in the timeline; each item's visible range with its neighbouring
-  transitions' handles; each track's duration and the stack's, the longest
-  as OpenTimelineIO picks it; the global start added to each place and each
-  track's end; the last tick of every one of those ranges,
-  `end_time_inclusive`, branch for branch — is computed in OpenTimelineIO's
-  own arithmetic beside its exact value, and held within ±2^53 in the ruler
-  OpenTimelineIO carries it in, its double less than half a tick from the
-  exact count. Exact, or refused: where a derived value would round, a
+  ruler that holds it, and of its own rulers in the first that ends it
+  within ±2^53 too — a source range none ends is written in one that
+  writes its start and its length, its end left to the walk and the
+  search. Every count OpenTimelineIO derives from the document — the end
+  of each clip's source range; each child's place on its track, from zero
+  in the child's own rate, and in the timeline; each item's visible range
+  with its neighbouring transitions' handles; each track's duration and the
+  stack's, the longest as OpenTimelineIO picks it; the global start added
+  to each place and each track's end; each child's range from the global
+  start, the moved start and the child's own duration, as OpenTimelineIO
+  moves a range into its parent's; a timeline with no track's range from
+  the global start, which OpenTimelineIO gives no duration at rate 1; the
+  last tick of every one of those ranges, `end_time_inclusive`, branch for
+  branch — is computed in OpenTimelineIO's own arithmetic beside its exact
+  value, and held within ±2^53 in the ruler OpenTimelineIO carries it in,
+  its double less than half a tick from the exact count. Exact, or
+  refused: where a derived value would round, a
   search bounded by contract writes the clips it is formed from in other
   rulers that hold their source ranges — a clip's own, then every ruler the
   timeline's operands are counted in (the edit rate, 1, every clip's
@@ -84,12 +91,16 @@ The crate's first release, as 0.1.0.
   rulers. Every range ends where it is stored, and the exported items, laid
   end to end, put every clip on its record. Refuses with `otio::Refused`:
   `Validation` with `validate`'s refusals, or `NotRepresentable` — an
-  `otio::Spot` (`otio::ChildAt` for a child of an exported track), the
-  count and the rate it is counted at, and for a count OpenTimelineIO
-  derives what the search tried, `otio::RulerSearch`: its bands
-  (`otio::RulerBand`) and its walks — where no plan the search tries holds
-  a count, naming the last plan's. A timeline only a ruler outside the
-  bands would hold is refused by that contract, not misread.
+  `otio::Spot` (`otio::ChildAt` for a child of an exported track,
+  `TimelineEnd` for the end of a timeline with no track), the count and
+  the rate it is counted at, and for a count OpenTimelineIO derives, a
+  source range's end among them, what the search tried,
+  `otio::RulerSearch`: its bands (`otio::RulerBand`) and its walks — where
+  no plan the search tries holds a count, naming the last plan's. A count
+  written at the edit rate, a source range none of its own rulers writes
+  and an available range none of them holds whole are refused before any
+  walk, naming no search. A timeline only a ruler outside the bands would
+  hold is refused by that contract, not misread.
 
 - **`otio::validate_json`**: the structural self-check — a strict JSON
   reader and OpenTimelineIO's schema shape, requiring exactly the keys each
