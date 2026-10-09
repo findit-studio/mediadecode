@@ -9,7 +9,7 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 The backend-agnostic core it adapts has its own log at
 [`mediadecode/CHANGELOG.md`](../mediadecode/CHANGELOG.md).
 
-## [0.16.0] — unreleased
+## [0.16.0] - 2026-10-10
 
 A committed hardware session reports every decoder failure as that
 picture's own and changes nothing after its first picture; when to stop
