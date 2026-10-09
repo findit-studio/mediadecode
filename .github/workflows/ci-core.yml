@@ -1,15 +1,17 @@
 name: CI / mediadecode
 
-# Triggered by changes to the `mediadecode` core crate, shared
-# workspace files, or this workflow itself. The two adapter
-# workflows (`ci-ffmpeg.yml`, `ci-webcodecs.yml`) include
-# `mediadecode/**` in their own triggers, so a change to the core
-# crate fans out across all three workflows.
+# Triggered by changes to the `mediadecode` core crate, the pure
+# `mediaio-timeline` crate, shared workspace files, or this workflow
+# itself. The two adapter workflows (`ci-ffmpeg.yml`,
+# `ci-webcodecs.yml`) include `mediadecode/**` in their own triggers,
+# so a change to the core crate fans out across all three workflows.
+# The `timeline*` jobs are `mediaio-timeline`'s lanes.
 on:
   push:
     branches: [main]
     paths:
       - 'mediadecode/**'
+      - 'mediaio-timeline/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'ci/**'
@@ -17,6 +19,7 @@ on:
   pull_request:
     paths:
       - 'mediadecode/**'
+      - 'mediaio-timeline/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'ci/**'
@@ -223,6 +226,101 @@ jobs:
             ${{ runner.os }}-core-miri-
       - name: Miri
         run: bash ci/miri_sb.sh "${{ matrix.target }}"
+
+  # `mediaio-timeline`: pure Rust, `no_std` + `alloc`, no features. Its
+  # tests are the unit laws, the integration laws (the hand-predicted
+  # OTIO goldens among them), the seeded properties and the doc tests.
+  timeline:
+    name: timeline (${{ matrix.os }})
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+    - uses: actions/checkout@v7
+    - name: Cache cargo build and registry
+      uses: actions/cache@v6
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-timeline-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-timeline-
+    - name: Install Rust
+      run: rustup update stable --no-self-update && rustup default stable && rustup component add rustfmt clippy
+    - name: Check formatting
+      run: cargo fmt -p mediaio-timeline -- --check
+    - name: Apply clippy lints
+      run: cargo clippy -p mediaio-timeline --all-targets
+    - name: Run tests
+      run: cargo test -p mediaio-timeline
+    - name: Build docs
+      env:
+        RUSTDOCFLAGS: -Dwarnings
+      run: cargo doc -p mediaio-timeline --no-deps
+
+  # The crate builds where there is no operating system at all
+  # (`thumbv7em-none-eabihf`), on the wasm targets, and on a 32-bit and a
+  # big-endian one.
+  timeline-cross:
+    name: timeline-cross (${{ matrix.target }})
+    strategy:
+      matrix:
+        target:
+          - thumbv7em-none-eabihf
+          - wasm32-unknown-unknown
+          - wasm32-wasip1
+          - wasm32-wasip2
+          - i686-unknown-linux-gnu
+          - powerpc64-unknown-linux-gnu
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Cache cargo build and registry
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-timeline-cross-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-timeline-cross-
+      - name: Install Rust
+        run: rustup update stable && rustup default stable
+      - name: cargo build -p mediaio-timeline --target ${{ matrix.target }}
+        run: |
+          rustup target add ${{ matrix.target }}
+          cargo build -p mediaio-timeline --target ${{ matrix.target }}
+
+  # Each target's verdict stands alone: one lane failing cancels no other.
+  timeline-miri:
+    name: timeline-miri-${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-latest, target: i686-unknown-linux-gnu }
+          - { os: ubuntu-latest, target: powerpc64-unknown-linux-gnu }
+          - { os: macos-latest,  target: aarch64-apple-darwin }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Cache cargo build and registry
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-timeline-miri-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-timeline-miri-
+      - name: Miri
+        run: bash ci/miri_tb.sh "${{ matrix.target }}" mediaio-timeline
 
   coverage:
     name: coverage

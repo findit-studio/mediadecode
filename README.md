@@ -19,6 +19,7 @@ Generic, `no_std`-friendly type-and-trait spine for media decoders.
 | [`mediadecode`](mediadecode/README.md)                     | Backend-agnostic core — `no_std`, no FFmpeg.                  |
 | [`mediadecode-ffmpeg`](mediadecode-ffmpeg/README.md)       | FFmpeg adapter with HW-acceleration auto-probe.               |
 | [`mediadecode-webcodecs`](mediadecode-webcodecs/README.md) | WebCodecs adapter for `wasm32` targets (scaffolded).          |
+| [`mediaio-timeline`](mediaio-timeline/README.md)           | The timeline as data, with OTIO export — `no_std`, no FFmpeg. |
 
 The pixel-format and color-metadata vocabulary (`PixelFormat`,
 `ColorMatrix`, `BayerPattern`, frame primitives) is sourced from
