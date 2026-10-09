@@ -12,7 +12,7 @@
 //! hevc/hevcdec.c:3609-3625). A set replaces the one held under its id. A
 //! record replaces exactly the ids it carries and no other: FFmpeg clears
 //! nothing before it applies one (`ff_h264_decode_extradata`,
-//! h264_parse.c:466-524; `ff_hevc_decode_extradata`, hevc/parse.c:79-145).
+//! h264_parse.c:466-524; `ff_hevc_decode_extradata`, hevc/parse.c:79-146).
 //! An HEVC set that replaces another drops the sets that refer to it
 //! (`remove_vps`, `remove_sps`, hevc/ps.c:89-111); an H.264 picture parameter
 //! set keeps the sequence parameter set it was read under (`pps->sps`,
@@ -1233,7 +1233,7 @@ impl<'a> HevcWrite<'a> {
     self.next.get_or_insert_with(|| base.clone())
   }
 
-  /// **`ff_hevc_decode_extradata`** (hevc/parse.c:79-145) applying `record`:
+  /// **`ff_hevc_decode_extradata`** (hevc/parse.c:79-146) applying `record`:
   /// an `hvcC` record entry by entry, each its own buffer read as
   /// `hevc_decode_nal_units` reads one (24-77), a refusal ending its entry,
   /// the framing set to NAL length fields of two bytes while the entries are

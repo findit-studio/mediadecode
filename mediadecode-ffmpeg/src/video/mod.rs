@@ -2626,7 +2626,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
   /// **H.264 and HEVC records change the parameter sets they carry and keep
   /// every other the decoder holds** — FFmpeg clears nothing before it
   /// applies one (`ff_h264_decode_extradata`, h264_parse.c:466-524;
-  /// `ff_hevc_decode_extradata`, hevc/parse.c:79-145) — so an SPS-only
+  /// `ff_hevc_decode_extradata`, hevc/parse.c:79-146) — so an SPS-only
   /// record then a PPS-only one change both, while a packet carries one
   /// entry of a type (`av_packet_add_side_data`, packet.c:203-211). The
   /// first record waits as it is: applied to what the decoder holds, it is

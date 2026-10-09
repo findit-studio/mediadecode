@@ -13371,7 +13371,7 @@ fn with_records_between(
 /// the decoder holds: an SPS-only record, then a PPS-only one, both apply.**
 /// FFmpeg's H.264 and HEVC decoders apply the ids a record carries and keep
 /// every other they hold (`ff_h264_decode_extradata`, h264_parse.c:466-524;
-/// `ff_hevc_decode_extradata`, hevc/parse.c:79-145), while a packet carries
+/// `ff_hevc_decode_extradata`, hevc/parse.c:79-146), while a packet carries
 /// one entry of a type (packet.c:203-211). Two streams of each codec, 128x96
 /// then 160x96, every set under id 0; between them, a packet with no body
 /// carrying the second's SPS alone (HEVC: its VPS and SPS), then another

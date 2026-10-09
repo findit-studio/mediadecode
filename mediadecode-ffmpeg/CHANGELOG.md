@@ -123,8 +123,10 @@ The backend-agnostic core it adapts has its own log at
   is judged the same way, against the sets the decoder holds once it
   applied the packet's own new extradata, which FFmpeg applies first. A
   record riding a packet with no body is judged as soon as that packet is
-  handed over, as it will be judged on the packet with a body it rides
-  (below).
+  handed over — after what a fallback's replay owes the decoder is fed,
+  against what the decoder would hold once it applied the records that
+  wait — as it would be judged on the packet with a body it rides, and is
+  not judged again there (below).
 
 - **`Error::SetsUnrecordable`** (`SetsUnrecordable { codec, reason }`, with
   `Unrecordable`, both exported; `Unrecordable` is `#[non_exhaustive]`): a
@@ -138,7 +140,11 @@ The backend-agnostic core it adapts has its own log at
   than a record's entry, a record that does not read back as what is held,
   or a decoder that wraps another implementation. A switch to the session's
   threads is declined instead, the one-thread decoder serving on (below).
-  `ParameterSet` gains `Video`, an HEVC video parameter set.
+  `ParameterSet` gains `Video`, an HEVC video parameter set. Records riding
+  packets with no body that no one record can carry together are refused
+  by this name as the later is handed over, nothing more deferred, and so
+  is a packet with a body whose own record no record can carry after the
+  one that waits (below).
 
 - **`FrameBudgetExceeded::pts`** (and `with_pts`): the refused frame's
   presentation timestamp as FFmpeg set it before the allocation — the
@@ -436,18 +442,37 @@ The backend-agnostic core it adapts has its own log at
   whose length fields changed never anchored, ended in a false
   `PostCommitNeverResynced`, and never returned to the session's threads.
   A packet with no body is handed to no decoder, on the video, audio and
-  subtitle roads alike. Its side data — a new extradata, a Dolby Vision
-  configuration, any other — rides the next packet of the stream with a
-  body, ahead of that packet's own: where FFmpeg applies a packet's side
-  data anyway. Of two entries of a type the later rides, as a packet
-  carries one. A packet with no body that carries nothing is dropped.
-  What still waits at the end of the stream, or at a flush, is dropped
-  and said so; no decoder saw it, so nothing is left in doubt. What
-  waits goes where the packet it rides goes — taken, failed or refused
-  with it — and is offered again with it under back pressure. A probe's
-  rescue history records it on that packet. Rebuilt as libavformat
-  delivers it, a body of size 0 that is not null, the packet was refused
-  `AVERROR(EINVAL)` before its side data was read, so an AAC
+  subtitle roads alike. Of its side data, the state a decoder keeps from
+  the packet that brings it on — a new extradata, a parameter change, a
+  palette, a Dolby Vision configuration — waits for the next packet of the
+  stream with a body and rides it, ahead of that packet's own: where
+  FFmpeg applies a packet's side data anyway. The rest describes that
+  packet alone, or no decoder reads it from a packet — a skip of its
+  samples, its captions, a cue's settings, how to decrypt it, what
+  libavcodec copies onto the picture decoded from it, a type FFmpeg 9.0.1
+  does not name — and is dropped and said so: carried onto the next
+  packet, a skip of samples trimmed that packet's audio. A packet carries
+  one entry of a type, so what waits of a type is folded into one. H.264
+  and HEVC records fold through the parameter sets the decoder holds, as
+  FFmpeg applies one after another, each changing the sets it carries and
+  keeping every other — an SPS-only record then a PPS-only one both apply
+  — into the one record that gives the decoder all of them, a packet's own
+  record folded after them. Another codec's record folds as the later
+  whole, a parameter change field by field, a palette or a configuration
+  as the later whole. A record of no bytes folds nothing: FFmpeg's H.264,
+  HEVC and ADX decoders apply nothing for one, and its AAC decoder drops
+  its configuration for one and fails the packet. A packet with no body
+  that carries nothing is dropped. What waits goes as the session reads
+  the packet it rides: spent where a decoder took it; spent, and in doubt
+  as that packet's own record would be, where whether a decoder read it
+  cannot be told; still waiting, for the packet offered again or the one
+  after it, where no decoder saw it — back pressure, a refusal by name
+  before any decoder, a hardware probe whose history could not record the
+  packet. What still waits at the end of the stream, or at a flush, is
+  dropped and said so; no decoder saw it, so nothing is left in doubt. A
+  probe's rescue history records the packet carrying it. Rebuilt as
+  libavformat delivers it, a body of size 0 that is not null, the packet
+  was refused `AVERROR(EINVAL)` before its side data was read, so an AAC
   configuration change riding one was never applied. With no data at
   all, FFmpeg's decoders decode a packet of no bytes. Its HEVC decoder
   decodes an empty access unit, which takes an end of sequence off the

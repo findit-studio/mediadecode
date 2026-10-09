@@ -1020,12 +1020,12 @@ pub(crate) enum Fold {
 ///
 /// **Deferred** — state a decoder keeps from the packet that brings it on:
 /// - 0 `PALETTE`, the later whole: the palette the palettized decoders keep
-///   for every picture after it — `ff_copy_palette` (decode.c:2321-2333)
+///   for every picture after it — `ff_copy_palette` (decode.c:2321-2334)
 ///   into their own (8bps.c:117, msrle.c:99, cinepak.c:478-480 and twelve
 ///   more), mscc.c:182-194, bethsoftvideo.c:91-98.
 /// - 1 `NEW_EXTRADATA`, as the road folds it ([`Record`]): h264dec.c:1038-1044,
 ///   hevc/hevcdec.c:3855-3860, aac/aacdec.c:2580-2589, adxdec.c:173-190,
-///   audiotoolboxdec.c:497-511.
+///   audiotoolboxdec.c:497-512.
 /// - 2 `PARAM_CHANGE`, field by field: `apply_param_change` sets the
 ///   context's sample rate and dimensions at every packet a decoder pulls
 ///   (decode.c:117-176, 244); Interplay video drops its reference pictures
