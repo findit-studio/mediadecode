@@ -1002,11 +1002,13 @@ const M: i64 = 88_628_115_813_744;
 fn the_edit_rate_is_tried_however_many_whole_rulers_lie_below_the_plans() {
   // At 12 700 = 100 · 127 fps from 10^14, `a` runs M ticks of 1/127 s, its
   // medium stated at 12 827 = 101 · 127 fps. A hundred whole rulers lie
-  // below the plan's, 127 · m: the finest is the edit rate's, and of the
-  // 99 others, free, the search keeps the 64 coarsest — each of which
+  // below the plan's, 127 · m: the finest is the edit rate's, and the 99
+  // others, free, fill both of the search's free bands — the 64 finest,
+  // 127 · 36 … 127 · 99, and the 35 below them. Each of the 64 coarsest
   // rescales `a`'s end from the global start into the edit rate a tick
-  // short. The edit rate is an operand's ruler, never capped: written in
-  // it, `a` reads back exactly.
+  // short (127 · 65, among the finest, reads it exactly). The edit rate is
+  // an operand's ruler, never capped and tried before any free one:
+  // written in it, `a` reads back exactly.
   let global = in_the_edit_rate(100, M, 100_000_000_000_000);
   let plan = Read {
     value: (101 * M) as f64,
@@ -1142,11 +1144,11 @@ fn end_from(global: Read, ticks: i64, m: i64) -> f64 {
     .value
 }
 
-/// Asserts that OpenTimelineIO's `read`, a double of 2^52 or more and so a
-/// whole number, lies less than half a tick from `num / den` ticks: read to
-/// the nearest tick, it is the exact count.
+/// Asserts that OpenTimelineIO's `read`, a double of magnitude 2^52 or more
+/// and so a whole number, lies less than half a tick from `num / den`
+/// ticks: read to the nearest tick, it is the exact count.
 fn within_half_a_tick(read: Read, num: i128, den: i128) {
-  assert!(read.value >= 4_503_599_627_370_496.0, "{read:?}");
+  assert!(read.value.abs() >= 4_503_599_627_370_496.0, "{read:?}");
   let off = (read.value as i128 * den - num).unsigned_abs();
   assert!(2 * off < den.unsigned_abs(), "{read:?} for {num}/{den}");
 }
@@ -1298,7 +1300,7 @@ fn a_clip_only_a_ruler_between_the_free_bands_holds_is_refused_by_the_bounded_se
   };
   let global = derive::Time::written(i128::from(start), derive::Ruler::new(Rate::hz(edit)));
   let duration = derive::track(0, &[a], global).unwrap();
-  assert_eq!(derive::stack(&[duration]), Ok(()));
+  assert_eq!(derive::stack(&[duration], global), Ok(()));
   assert_eq!(exact, 9_007_015_382_593_472);
 }
 
@@ -1463,4 +1465,341 @@ fn a_clip_only_its_coarsest_free_rulers_hold_is_written_in_one() {
   }
   assert_eq!(end_from(global, COARSE, 64), exact as f64);
   assert_eq!(exact, 9_007_120_312_528_703);
+}
+
+/// Codex round 7's first case: at 2 753 fps from `start`, a gap of 942 068
+/// frames, then `a`, 6 759 seconds of a medium counted in ticks of 1/1 582 s
+/// from zero — 10 692 738 of them, 18 607 527 frames — so planned in those
+/// ticks.
+fn after_a_gap_from(start: i64) -> Timeline {
+  let edit = tb(1, 2753);
+  let a = placed(
+    "a",
+    TimeRange::new(0, 10_692_738, tb(1, 1582)),
+    TimeRange::new(942_068, 942_068 + 18_607_527, edit),
+  );
+  Timeline::new("t", Rate::hz(2753))
+    .with_start(Timestamp::new(start, edit))
+    .with_track(video([a]))
+}
+
+/// `after_a_gap_from`'s `a` ends, exactly, `(start + 942 068) · 1 582 +
+/// 10 692 738 · 2 753` 2 753ths of a tick of 1/1 582 s from zero.
+fn after_a_gap_ends(start: i64) -> i128 {
+  i128::from(start + 942_068) * 1582 + 10_692_738 * 2753
+}
+
+#[test]
+fn a_childs_range_from_the_global_start_opentimelineio_ends_more_than_half_a_tick_off_is_written_in_the_edit_rate()
+ {
+  // Codex round 7's case. Planned in 1 582ths, `a`'s place from the global
+  // start by `operator+` is exact at both ends. But OpenTimelineIO moves a
+  // child's range with its own duration kept (`composition.cpp` 357–359),
+  // and ends it at that duration plus the moved start rescaled to 1 582ths
+  // (`timeRange.h` 105–108): a product past 2^63, rounded, then divided —
+  // 2 109/2 753 of a tick off. The edit rate, a ruler the timeline counts
+  // in, holds `a`: written in it, nothing is rescaled, and the range reads
+  // back exactly.
+  let start = -9_007_199_254_444_572;
+  let text = to_otio(&after_a_gap_from(start), OtioTarget::V0_15Plus).unwrap();
+  assert_eq!(validate_json(&text, OtioTarget::V0_15Plus), Ok(()));
+  let frames = |value: i64| Read {
+    value: value as f64,
+    rate: 2753.0,
+  };
+  let kids = kids(&text, 0);
+  let Kid::Item {
+    start: from,
+    duration,
+  } = kids[1]
+  else {
+    panic!("{kids:?}");
+  };
+  assert_eq!((from, duration), (frames(0), frames(18_607_527)));
+  let global = read(&member(&json::parse(&text).unwrap(), "global_start_time"));
+  let moved = global.plus(place(&kids, 1).0);
+  let end = start + 942_068 + 18_607_527;
+  assert_eq!(moved, frames(start + 942_068));
+  assert_eq!(Read::end(moved, duration), frames(end));
+  assert_eq!(Read::end_inclusive(moved, duration), frames(end - 1));
+  // In OpenTimelineIO's arithmetic, planned in 1 582ths: the global start
+  // added to either end of the place, exact; the range from the moved start
+  // ending at -5 175 949 578 497 585 ticks, where exactly it ends at
+  // -5 175 949 578 497 586 + 644/2 753, and its last tick a tick before, as
+  // far off.
+  let ticks = Read {
+    value: 10_692_738.0,
+    rate: 1582.0,
+  };
+  let place = Read {
+    value: 0.0,
+    rate: 1582.0,
+  }
+  .plus(frames(942_068));
+  assert_eq!(global.plus(place), frames(start + 942_068));
+  assert_eq!(global.plus(Read::end(place, ticks)), frames(end));
+  let moved = global.plus(place);
+  let exact = after_a_gap_ends(start);
+  assert_eq!(exact, -14_249_389_189_603_853_614);
+  assert_eq!(
+    Read::end(moved, ticks),
+    Read {
+      value: -5_175_949_578_497_585.0,
+      rate: 1582.0
+    }
+  );
+  assert_eq!(Read::end(moved, ticks).value as i128 * 2753 - exact, 2109);
+  assert_eq!(
+    Read::end_inclusive(moved, ticks).value as i128 * 2753 - (exact - 2753),
+    2109
+  );
+}
+
+#[test]
+fn a_childs_range_from_the_global_start_a_frame_later_is_written_in_its_own_ruler() {
+  // A frame later the moved start rescales to the same double, and the
+  // exact end moves on 1 582/2 753 of a tick: OpenTimelineIO ends the range
+  // 527/2 753 of a tick from it, inside half a tick. `a` keeps its own
+  // 1 582ths, and the range reads back to the nearest tick exactly.
+  let start = -9_007_199_254_444_571;
+  let text = to_otio(&after_a_gap_from(start), OtioTarget::V0_15Plus).unwrap();
+  assert_eq!(validate_json(&text, OtioTarget::V0_15Plus), Ok(()));
+  let ticks = |value: i64| Read {
+    value: value as f64,
+    rate: 1582.0,
+  };
+  let kids = kids(&text, 0);
+  let Kid::Item {
+    start: from,
+    duration,
+  } = kids[1]
+  else {
+    panic!("{kids:?}");
+  };
+  assert_eq!((from, duration), (ticks(0), ticks(10_692_738)));
+  let global = read(&member(&json::parse(&text).unwrap(), "global_start_time"));
+  let moved = global.plus(place(&kids, 1).0);
+  let exact = after_a_gap_ends(start);
+  within_half_a_tick(Read::end(moved, duration), exact, 2753);
+  within_half_a_tick(Read::end_inclusive(moved, duration), exact - 2753, 2753);
+  assert_eq!(Read::end(moved, duration).value as i128 * 2753 - exact, 527);
+}
+
+/// One frame every two seconds: the edit rate of Codex round 7's second and
+/// third cases.
+fn every_two_seconds() -> Rate {
+  Rate::fps(1, NonZeroI32::new(2).unwrap())
+}
+
+/// At one frame every two seconds, `a` plays `seconds` from `from` of a
+/// medium counted in whole seconds, from the timeline's zero.
+fn seconds_from(from: i64, seconds: i64) -> Timeline {
+  Timeline::new("t", every_two_seconds()).with_track(video([placed(
+    "a",
+    TimeRange::new(from, from + seconds, second()),
+    TimeRange::new(0, seconds / 2, tb(2, 1)),
+  )]))
+}
+
+#[test]
+fn a_source_range_its_own_ruler_cannot_end_is_written_in_the_edit_rate() {
+  // Codex round 7's second case: `a` plays [2^53, 2^53 + 2) seconds. In
+  // seconds, its own ruler and its coarsest, its start and its length are
+  // written within 2^53, but the end OpenTimelineIO derives from them
+  // (`timeRange.h` 105–108) is 2^53 + 2, past it. The plan leaves that end
+  // to the walk, which refuses it, and the search writes `a` in the edit
+  // rate's frames — from 2^52, one long — whose end it holds: [2^53,
+  // 2^53 + 2) seconds, read back exactly.
+  let text = to_otio(&seconds_from(TWO_53, 2), OtioTarget::V0_15Plus).unwrap();
+  assert_eq!(validate_json(&text, OtioTarget::V0_15Plus), Ok(()));
+  let frames = |value: i64| Read {
+    value: value as f64,
+    rate: 0.5,
+  };
+  let kids = kids(&text, 0);
+  let Kid::Item { start, duration } = kids[0] else {
+    panic!("{kids:?}");
+  };
+  assert_eq!((start, duration), (frames(TWO_53 / 2), frames(1)));
+  let end = Read::end(start, duration);
+  assert_eq!(end, frames(TWO_53 / 2 + 1));
+  assert_eq!(
+    (start.at(1.0), end.at(1.0)),
+    (TWO_53 as f64, (TWO_53 + 2) as f64)
+  );
+}
+
+#[test]
+fn a_source_range_no_ruler_ends_is_refused_after_the_search() {
+  // [2^53 - 1, 2^53 + 3) seconds: in seconds it ends at 2^53 + 3, and no
+  // other ruler holds it — the edit rate's frames do not land on its odd
+  // start, and no whole rate is coarser than a second. A count
+  // OpenTimelineIO derives: refused after the search, which says so.
+  let refusal = match to_otio(&seconds_from(TWO_53 - 1, 4), OtioTarget::V0_15Plus) {
+    Err(Refused::NotRepresentable(refusal)) => refusal,
+    other => panic!("{other:?}"),
+  };
+  assert_eq!(
+    (refusal.at(), refusal.value(), refusal.rate()),
+    (
+      Spot::Source(ClipAt::new(0, 0)),
+      i128::from(TWO_53) + 3,
+      Rate::hz(1)
+    )
+  );
+  assert_eq!(refusal.searched().map(|searched| searched.walks()), Some(1));
+  assert!(
+    refusal
+      .to_string()
+      .contains(", in the one plan the bounded search walked, "),
+    "{refusal}"
+  );
+}
+
+#[test]
+fn a_source_range_its_own_ruler_cannot_end_moves_its_own_clip_alone() {
+  // At one frame every two seconds: `a`, two seconds counted in
+  // milliseconds, then `b`, Codex's [2^53, 2^53 + 2) seconds. The walk
+  // refuses `b`'s end in seconds; `a`'s ruler, finer, plays no part in it,
+  // so `a` keeps its own milliseconds while `b` is written in the edit
+  // rate's frames.
+  let edit = tb(2, 1);
+  let timeline = Timeline::new("t", every_two_seconds()).with_track(video([
+    placed(
+      "a",
+      TimeRange::new(0, 2000, Timebase::MILLIS),
+      TimeRange::new(0, 1, edit),
+    ),
+    placed(
+      "b",
+      TimeRange::new(TWO_53, TWO_53 + 2, second()),
+      TimeRange::new(1, 2, edit),
+    ),
+  ]));
+  let text = to_otio(&timeline, OtioTarget::V0_15Plus).unwrap();
+  assert_eq!(validate_json(&text, OtioTarget::V0_15Plus), Ok(()));
+  let at = |value: i64, rate: f64| Read {
+    value: value as f64,
+    rate,
+  };
+  let written: Vec<(Read, Read)> = kids(&text, 0)
+    .iter()
+    .map(|kid| match *kid {
+      Kid::Item { start, duration } => (start, duration),
+      Kid::Transition { .. } => panic!("{kid:?}"),
+    })
+    .collect();
+  assert_eq!(
+    written,
+    [
+      (at(0, 1000.0), at(2000, 1000.0)),
+      (at(TWO_53 / 2, 0.5), at(1, 0.5))
+    ]
+  );
+}
+
+/// A timeline with no track at one frame every two seconds, from `frames`.
+fn no_track_from(frames: i64) -> Timeline {
+  Timeline::new("t", every_two_seconds()).with_start(Timestamp::new(frames, tb(2, 1)))
+}
+
+#[test]
+fn a_timeline_with_no_track_whose_end_from_the_global_start_is_past_2_53_is_refused() {
+  // Codex round 7's third case: from 2^53 frames, no track. OpenTimelineIO
+  // gives the empty stack the range `TimeRange()` (`stack.cpp` 121–123),
+  // no duration at rate 1, and the timeline its duration (`timeline.h`
+  // 63–66): the timeline's range from the global start ends at that start
+  // rescaled to rate 1, 2^54 seconds.
+  let refusal = match to_otio(&no_track_from(TWO_53), OtioTarget::V0_15Plus) {
+    Err(Refused::NotRepresentable(refusal)) => refusal,
+    other => panic!("{other:?}"),
+  };
+  assert_eq!(
+    (refusal.at(), refusal.value(), refusal.rate()),
+    (Spot::TimelineEnd, 1 << 54, Rate::hz(1))
+  );
+  assert_eq!(refusal.searched().map(|searched| searched.walks()), Some(1));
+  let global = Read {
+    value: TWO_53 as f64,
+    rate: 0.5,
+  };
+  let none = Read {
+    value: 0.0,
+    rate: 1.0,
+  };
+  assert_eq!(
+    Read::end(global, none),
+    Read {
+      value: (1_i64 << 54) as f64,
+      rate: 1.0
+    }
+  );
+}
+
+#[test]
+fn a_timeline_with_no_track_whose_end_from_the_global_start_is_held_is_written() {
+  // From 2^52 frames the range ends at 2^53 seconds: written, and read back
+  // exactly. A frame later it ends at 2^53 + 2: refused.
+  let text = to_otio(&no_track_from(TWO_53 / 2), OtioTarget::V0_15Plus).unwrap();
+  assert_eq!(validate_json(&text, OtioTarget::V0_15Plus), Ok(()));
+  let global = read(&member(&json::parse(&text).unwrap(), "global_start_time"));
+  assert_eq!(
+    global,
+    Read {
+      value: (TWO_53 / 2) as f64,
+      rate: 0.5
+    }
+  );
+  let none = Read {
+    value: 0.0,
+    rate: 1.0,
+  };
+  assert_eq!(
+    Read::end(global, none),
+    Read {
+      value: TWO_53 as f64,
+      rate: 1.0
+    }
+  );
+  assert_eq!(
+    refused(&no_track_from(TWO_53 / 2 + 1)),
+    (Spot::TimelineEnd, i128::from(TWO_53) + 2, Rate::hz(1))
+  );
+}
+
+#[test]
+fn a_whole_rate_that_cannot_end_a_source_range_is_never_tried() {
+  // At 29.97 fps, `a` plays `b` frames from frame `a` of a medium counted
+  // in them, `a` = 1 500 · 4 499 100 526 843 and `b` = 1 500 ·
+  // 4 499 100 526 847: each within 2^53, their sum — the end
+  // OpenTimelineIO derives — past it. The coarsest whole rate that lands
+  // on the range, 20 a second, counts it in 1 001/1 500 of the frames: the
+  // start and the length within 2^53, the end 2 698 past. Every whole rate
+  // that lands on it is a multiple of 20 and ends it further on, so none is
+  // among the clip's rulers: refused in its own frames, in the one plan the
+  // search walked.
+  let (k1, k2) = (4_499_100_526_843_i64, 4_499_100_526_847_i64);
+  let (a, b) = (1500 * k1, 1500 * k2);
+  let frames = tb(1001, 30_000);
+  let timeline = Timeline::new("t", Rate::FPS_29_97).with_track(video([placed(
+    "a",
+    TimeRange::new(a, a + b, frames),
+    TimeRange::new(0, b, frames),
+  )]));
+  let refusal = match to_otio(&timeline, OtioTarget::V0_15Plus) {
+    Err(Refused::NotRepresentable(refusal)) => refusal,
+    other => panic!("{other:?}"),
+  };
+  assert_eq!(
+    (refusal.at(), refusal.value(), refusal.rate()),
+    (
+      Spot::Source(ClipAt::new(0, 0)),
+      i128::from(a) + i128::from(b),
+      Rate::FPS_29_97
+    )
+  );
+  assert_eq!(refusal.searched().map(|searched| searched.walks()), Some(1));
+  let twentieths = |frames: i64| i128::from(frames) * 1001 / 1500;
+  assert!(twentieths(a) <= i128::from(TWO_53) && twentieths(b) <= i128::from(TWO_53));
+  assert_eq!(twentieths(a) + twentieths(b) - i128::from(TWO_53), 2698);
 }

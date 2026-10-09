@@ -34,22 +34,30 @@
 //!   media-side range whose counts are past 2^53 in both rulers above is
 //!   written in the coarsest ruler of a whole number of ticks a second that
 //!   holds its start and its length exactly, when its counts there are
-//!   within 2^53;
-//! - every count OpenTimelineIO derives from the document — each child's
-//!   place on its track, from zero in the child's own rate with every item
-//!   before it added, and in the timeline; the running end of one walk over
-//!   a whole track; each item's visible range, widened by the handles of
-//!   the transitions beside it; each track's duration and the stack's, the
+//!   within 2^53. Of those three rulers, a range is written in the first
+//!   whose counts end it within ±2^53 too, where one does; where none does,
+//!   an available range is refused, and a source range is written in the
+//!   first that writes its start and its length, its end left to the walk
+//!   below and to the search;
+//! - every count OpenTimelineIO derives from the document — the end of each
+//!   clip's source range, its start plus its length; each child's place on
+//!   its track, from zero in the child's own rate with every item before it
+//!   added, and in the timeline; the running end of one walk over a whole
+//!   track; each item's visible range, widened by the handles of the
+//!   transitions beside it; each track's duration and the stack's, the
 //!   longest of them as OpenTimelineIO picks it; the global start added to
-//!   each place and each track's end; and the last tick of every range among
-//!   them, `end_time_inclusive`, which floors the range's end or takes a
-//!   tick off it by a branch OpenTimelineIO takes on its own doubles — is
-//!   computed as OpenTimelineIO computes it, operation for operation and
-//!   branch for branch, beside its exact value, and must lie within ±2^53
-//!   in the ruler OpenTimelineIO carries it in, with OpenTimelineIO's
-//!   double less than half a tick from the exact count. A range written in
-//!   one ruler ends inclusively where it exactly does: its counts whole,
-//!   OpenTimelineIO's arithmetic on them is exact.
+//!   each place and each track's end; each child's range from the global
+//!   start, the moved start and the child's own duration, and its end; for
+//!   a timeline with no track, the global start counted at rate 1, where
+//!   the empty stack's duration of zero carries it; and the last tick of
+//!   every range among them, `end_time_inclusive`, which floors the range's
+//!   end or takes a tick off it by a branch OpenTimelineIO takes on its own
+//!   doubles — is computed as OpenTimelineIO computes it, operation for
+//!   operation and branch for branch, beside its exact value, and must lie
+//!   within ±2^53 in the ruler OpenTimelineIO carries it in, with
+//!   OpenTimelineIO's double less than half a tick from the exact count. A
+//!   range written in one ruler ends inclusively where it exactly does: its
+//!   counts whole, OpenTimelineIO's arithmetic on them is exact.
 //!
 //! **Exact, or refused.** Where OpenTimelineIO's arithmetic would round a
 //! value, the export writes the clips the value is formed from in other
@@ -201,9 +209,13 @@ impl core::error::Error for Refused {}
 ///
 /// A count OpenTimelineIO derives is refused after the export's search, in
 /// the last plan of rulers it walked, and the refusal says what the search
-/// tried ([`searched`](Self::searched)). A count the export would write is
-/// refused as the timeline holds it, before any walk: a record-side count
-/// at the edit rate, or a media range none of its own rulers holds.
+/// tried ([`searched`](Self::searched)) — a clip's source range's end
+/// among them. Refused as the timeline holds it, before any walk: a count
+/// the export would write at the edit rate, which no ruler the search tries
+/// changes; a source range's start or length, where none of the clip's own
+/// rulers writes both within 2^53, so the search has no plan to start
+/// from; and an available range none of those rulers holds whole, its end
+/// with its start and its length, as it keeps the ruler its plan gives it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NotRepresentable {
   at: Spot,
@@ -220,10 +232,10 @@ impl NotRepresentable {
 
   /// The count, in ticks of [`rate`](Self::rate).
   ///
-  /// A count the export would write is the count as the timeline holds it:
+  /// A count refused before any walk is the count as the timeline holds it:
   /// on the record side ticks of the edit rate; on the media side ticks of
-  /// the range's own timebase — its start, its length or its end, the first
-  /// past 2^53 — for a range no ruler the export may write it in holds.
+  /// the range's own timebase, the first past 2^53 — a source range's start
+  /// or its length, an available range's start, its length or its end.
   /// A count OpenTimelineIO derives is counted, exactly and to the nearest
   /// tick, in the ruler OpenTimelineIO derives it in: the highest rate among
   /// the times it adds up. A last tick is the exact one — the range's exact
@@ -239,8 +251,9 @@ impl NotRepresentable {
   }
 
   /// What the export's search tried before it refused the count — its
-  /// bands and its walks — where OpenTimelineIO derives the count; `None`
-  /// where the export would write it, which no search is made for.
+  /// bands and its walks — where OpenTimelineIO derives the count, a
+  /// source range's end among them; `None` for a count refused before any
+  /// walk, which no search is made for.
   pub const fn searched(&self) -> Option<RulerSearch> {
     self.searched
   }
@@ -343,8 +356,8 @@ impl fmt::Display for RulerSearch {
 
 /// A band of the rulers the export's search may write a clip's source range
 /// in, besides its plan's ([`RulerSearch`]). Every ruler of a band holds the
-/// range exactly: its start and its length whole ticks of it, each within
-/// ±2^53.
+/// range exactly: its start and its length whole ticks of it, and those and
+/// the end they make each within ±2^53.
 ///
 /// Marked `#[non_exhaustive]`: a later band joins as a variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -397,7 +410,9 @@ pub enum Spot {
   Start,
   /// The gap before a clip: its length, written at the edit rate.
   Record(ClipAt),
-  /// A clip's source range: its start, its length or its end.
+  /// A clip's source range: its start or its length, which the export
+  /// writes, or its end or its last tick, which OpenTimelineIO derives from
+  /// them.
   Source(ClipAt),
   /// The available range of a clip's medium: its start, its length or its
   /// end.
@@ -423,11 +438,21 @@ pub enum Spot {
   /// the transitions beside it — its start, its duration, its end or its
   /// last tick.
   Visible(ChildAt),
-  /// A child's start or end in the timeline, counted from the global start.
+  /// A child's place in the timeline counted from the global start: its
+  /// start, its end, or the end or the last tick of its range from there —
+  /// the moved start and the child's own duration, as OpenTimelineIO moves
+  /// a child's range into its parent's.
   Absolute(ChildAt),
   /// A track's end counted from the global start — exclusively or at its
   /// last tick; the timeline's end, for the longest track.
   AbsoluteEnd(usize),
+  /// The end of a timeline with no track, counted from the global start —
+  /// exclusively or at its last tick. OpenTimelineIO gives a stack with no
+  /// track, and the timeline with it, a duration of zero at rate 1, so the
+  /// timeline's range from the global start ends at the global start
+  /// counted at rate 1. A timeline with a track ends with its longest
+  /// track ([`AbsoluteEnd`](Self::AbsoluteEnd)).
+  TimelineEnd,
 }
 
 /// Writes `the start`, `the place of track 0, child 2`, and so on.
@@ -446,6 +471,9 @@ impl fmt::Display for Spot {
       Self::Visible(at) => write!(f, "the visible range of {at}"),
       Self::Absolute(at) => write!(f, "the place of {at} from the global start"),
       Self::AbsoluteEnd(track) => write!(f, "the end of track {track} from the global start"),
+      Self::TimelineEnd => {
+        f.write_str("the end of the timeline, which has no track, from the global start")
+      }
     }
   }
 }

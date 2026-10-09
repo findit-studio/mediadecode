@@ -1,4 +1,5 @@
 use alloc::vec::Vec;
+use core::num::NonZeroI32;
 
 use super::*;
 use crate::otio::ChildAt;
@@ -143,15 +144,35 @@ fn the_stack_keeps_the_first_of_two_durations_that_compare_equal() {
   // compare equal in `f64` seconds is kept.
   let j = 1_i128 << 51;
   let (shorter, longer) = (at(3, 3 * j + 1), at(3, 3 * j + 2));
+  let start = at(3, 0);
   assert!(!shorter.otio_lt(longer));
   assert_eq!(
-    stack(&[shorter, longer]).map_err(|refused| (refused.at(), refused.value())),
+    stack(&[shorter, longer], start).map_err(|refused| (refused.at(), refused.value())),
     Err((Spot::StackDuration, 3 * j + 2))
   );
-  assert_eq!(stack(&[longer, shorter]), Ok(()));
+  assert_eq!(stack(&[longer, shorter], start), Ok(()));
   // Tracks of one length in two rulers are one duration, whichever is kept.
-  assert_eq!(stack(&[at(1, 2), at(3, 6), at(2, 4)]), Ok(()));
-  assert_eq!(stack(&Vec::new()), Ok(()));
+  assert_eq!(stack(&[at(1, 2), at(3, 6), at(2, 4)], start), Ok(()));
+}
+
+#[test]
+fn a_stack_with_no_track_ends_at_the_global_start_counted_at_rate_1() {
+  // `TimeRange()` (`stack.cpp` 121–123): no duration, at rate 1, so the
+  // range from the global start ends at the global start rescaled to rate 1
+  // (`timeRange.h` 105–108). At one frame every two seconds, from 2^52
+  // frames it ends at 2^53 seconds, held; from a frame later at 2^53 + 2,
+  // and from Codex round 7's 2^53 frames at 2^54 — past the bound, refused.
+  let frames =
+    |count: i128| Time::written(count, Ruler::new(Rate::fps(1, NonZeroI32::new(2).unwrap())));
+  assert_eq!(stack(&[], frames(1 << 52)), Ok(()));
+  for (start, end) in [((1 << 52) + 1, (1 << 53) + 2), (1 << 53, 1 << 54)] {
+    assert_eq!(
+      stack(&[], frames(start)).map_err(|refused| (refused.at(), refused.value(), refused.rate())),
+      Err((Spot::TimelineEnd, end, Rate::hz(1)))
+    );
+  }
+  // From zero, the empty timeline's start, nothing is rescaled past it.
+  assert_eq!(stack(&Vec::new(), at(25, 0)), Ok(()));
 }
 
 #[test]

@@ -36,7 +36,19 @@
 //!   319–324), raven (`app.cpp` 1315–1318), the FCP XML adapter
 //!   (`fcp_xml.py` 2029–2032) and the Unreal plugin (`util.py` 93–106).
 //!   OpenTimelineIO's core adds the global start to nothing itself
-//!   (`timeline.h` 50–66).
+//!   (`timeline.h` 50–66);
+//! - a child's range from the global start is its range in the timeline
+//!   moved by the global start, its own duration kept — as OpenTimelineIO
+//!   moves a child's range into its parent's, the parent's start added to
+//!   the child's and the child's duration unchanged (`composition.cpp`
+//!   357–359) — so it ends at that duration plus the moved start rescaled
+//!   to the duration's rate, a rescale that neither `operator+` of the
+//!   global start to an end of the child's place makes;
+//! - a stack with no track has the range `TimeRange()` (`stack.cpp`
+//!   121–123), its duration `RationalTime()` (`timeRange.h` 34–37), zero at
+//!   rate 1 (`rationalTime.h` 28), and so the timeline (`timeline.h`
+//!   63–66): its range from the global start ends at the global start
+//!   rescaled to rate 1.
 //!
 //! [`Time`] is a `RationalTime` computed operation for operation as
 //! OpenTimelineIO computes it, beside the time it stands for, exactly
@@ -49,8 +61,11 @@
 //! document writes in one ruler, its start and duration whole and its end
 //! within ±2^53, also ends inclusively where it exactly does: its duration is
 //! whole, it takes the less-one branch exactly when it is longer than one
-//! tick, and every sum on the way is exact. The source, available and gap
-//! ranges the export writes are such ranges.
+//! tick, and every sum on the way is exact. The available and gap ranges the
+//! export writes are such ranges, held whole as they are planned; a clip's
+//! source range is planned with its start and its length within ±2^53, and
+//! its end and last tick are held by the walk ([`range`]), so the search can
+//! write the clip in a ruler that holds them.
 //!
 //! The lines cited are OpenTimelineIO's `main` at `00c22fa` (2026-10-09),
 //! and the tools' heads of the same day.
@@ -404,9 +419,10 @@ impl Child {
 /// place in the stack, `start` the global start — holding every value
 /// OpenTimelineIO derives from it: each child's place on the track and in
 /// the timeline, the running end of a walk over the whole track, each
-/// item's visible range, the place of each from the global start, the
-/// track's duration and its end from the global start — and the last tick
-/// of every range among them ([`Time::end_inclusive`]). Answers the track's
+/// item's visible range, the place of each from the global start and its
+/// range from there — the moved start, the child's own duration — the
+/// track's duration and its end from the global start, and the last tick of
+/// every range among them ([`Time::end_inclusive`]). Answers the track's
 /// duration.
 pub(super) fn track(
   index: usize,
@@ -466,9 +482,15 @@ pub(super) fn track(
     begins.hold(spot)?;
     ends.hold(spot)?;
     Time::end_inclusive(begins, length).hold(spot)?;
-    for absolute in [start.add(begins), start.add(ends)] {
-      absolute.hold(Spot::Absolute(at(k)))?;
-    }
+    let absolute = Spot::Absolute(at(k));
+    let from = start.add(begins);
+    from.hold(absolute)?;
+    start.add(ends).hold(absolute)?;
+    // The child's range from the global start: the moved start and the
+    // child's own duration (`composition.cpp` 357–359), its end the
+    // duration plus that start rescaled to the duration's rate.
+    Time::end(from, length).hold(absolute)?;
+    Time::end_inclusive(from, length).hold(absolute)?;
     // `range_of_all_children` (`track.cpp` 221–271).
     match child {
       Child::Transition {
@@ -513,18 +535,35 @@ pub(super) fn track(
   // The track's range, from zero in its duration's rate (`track.cpp`
   // 147): the stack's range of the track too (`stack.cpp` 61).
   Time::end_inclusive(placed, duration).hold(spot)?;
-  // The track's end from the global start: a range from it of the
-  // track's duration, and the global start added.
-  let spot = Spot::AbsoluteEnd(index);
+  from_the_global_start(start, duration, Spot::AbsoluteEnd(index))?;
+  Ok(duration)
+}
+
+/// The end of a range `duration` long from the global start `start` — a
+/// track's, or a timeline's with no track — each value held at `spot`: the
+/// start rescaled to the duration's rate, the range's end and its last
+/// tick; the same of the range from the stack's start of it, zero in the
+/// duration's rate, with the global start added; and the global start plus
+/// the duration, by `operator+`.
+fn from_the_global_start(start: Time, duration: Time, spot: Spot) -> Result<(), NotRepresentable> {
   start.rescaled_to(duration.ruler).hold(spot)?;
   Time::end(start, duration).hold(spot)?;
   Time::end_inclusive(start, duration).hold(spot)?;
-  let from = placed.add(start);
+  let from = Time::zero(duration.ruler).add(start);
   from.hold(spot)?;
   Time::end(from, duration).hold(spot)?;
   Time::end_inclusive(from, duration).hold(spot)?;
-  start.add(duration).hold(spot)?;
-  Ok(duration)
+  start.add(duration).hold(spot)
+}
+
+/// A range the document writes in one ruler — a clip's source range, its
+/// start and its duration whole counts within ±2^53 — held at `spot` where
+/// OpenTimelineIO derives from it: its end, the duration plus the start
+/// (`timeRange.h` 105–108), and its last tick (88–102). In one ruler each
+/// is the exact count wherever it lies within ±2^53.
+pub(super) fn range(start: Time, duration: Time, spot: Spot) -> Result<(), NotRepresentable> {
+  Time::end(start, duration).hold(spot)?;
+  Time::end_inclusive(start, duration).hold(spot)
 }
 
 /// `Track::available_range` (`track.cpp` 117–148): from zero at rate 1,
@@ -582,10 +621,16 @@ fn visible(
 /// where that pick is shorter than the longest track, exactly: the stack,
 /// and the timeline with it, would end early. The stack's range runs the
 /// picked duration from zero in its rate: the picked track's own range,
-/// whose ends [`track`] has held.
-pub(super) fn stack(durations: &[Time]) -> Result<(), NotRepresentable> {
+/// whose ends [`track`] has held, from zero and from the global start.
+///
+/// A stack with no track has the range `TimeRange()` (`stack.cpp`
+/// 121–123): no duration, at rate 1. Its range from the global start
+/// `start` — the timeline's — is held as a track's end is, at
+/// [`Spot::TimelineEnd`].
+pub(super) fn stack(durations: &[Time], start: Time) -> Result<(), NotRepresentable> {
   let Some((&first, rest)) = durations.split_first() else {
-    return Ok(());
+    let none = Time::zero(Ruler::new(Rate::hz(1)));
+    return from_the_global_start(start, none, Spot::TimelineEnd);
   };
   let (mut picked, mut longest) = (first, first);
   for &duration in rest {

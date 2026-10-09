@@ -407,8 +407,13 @@ fn a_count_the_export_writes_is_refused_before_any_search() {
 fn a_media_range_whose_end_is_past_2_53_is_refused() {
   // The source range [2^53 - 1, 2^53 + 1): its start and its length are
   // held, the end OpenTimelineIO adds up from them is not, and in whole
-  // seconds no coarser whole ruler holds it.
+  // seconds no coarser whole ruler holds it. The end is derived: the walk
+  // refuses it, after a search with no other ruler to try.
   let second = tb(1, 1);
+  let searched = |timeline: &Timeline| match to_otio(timeline, OtioTarget::V0_15Plus) {
+    Err(Refused::NotRepresentable(count)) => count.searched().map(|search| search.walks()),
+    other => panic!("{other:?}"),
+  };
   let mut timeline = at_one_fps(0, 2);
   timeline.tracks_mut()[0].clips_mut()[0].set_source_range(TimeRange::new(
     TWO_53 - 1,
@@ -419,7 +424,9 @@ fn a_media_range_whose_end_is_past_2_53_is_refused() {
     not_representable(&timeline),
     (Spot::Source(ClipAt::new(0, 0)), i128::from(TWO_53) + 1)
   );
-  // An available range 2^53 + 1 seconds long.
+  assert_eq!(searched(&timeline), Some(1));
+  // An available range 2^53 + 1 seconds long: it keeps the ruler its plan
+  // gives it, so no search could change it — refused before any walk.
   let mut timeline = at_one_fps(0, 2);
   timeline.tracks_mut()[0].clips_mut()[0]
     .media_mut()
@@ -428,6 +435,21 @@ fn a_media_range_whose_end_is_past_2_53_is_refused() {
     not_representable(&timeline),
     (Spot::Available(ClipAt::new(0, 0)), i128::from(TWO_53) + 1)
   );
+  assert_eq!(searched(&timeline), None);
+  // The available range [2^53 - 3, 2^53 + 1), around a source range that
+  // ends within 2^53: its start and its length are held, its end is not —
+  // held with them as it is planned, so refused before any walk too.
+  let mut timeline = at_one_fps(0, 2);
+  let clip = &mut timeline.tracks_mut()[0].clips_mut()[0];
+  clip.set_source_range(TimeRange::new(TWO_53 - 3, TWO_53 - 1, second));
+  clip
+    .media_mut()
+    .set_available_range(Some(TimeRange::new(TWO_53 - 3, TWO_53 + 1, second)));
+  assert_eq!(
+    not_representable(&timeline),
+    (Spot::Available(ClipAt::new(0, 0)), i128::from(TWO_53) + 1)
+  );
+  assert_eq!(searched(&timeline), None);
 }
 
 #[test]
@@ -628,6 +650,10 @@ fn a_refusal_to_export_says_why() {
   assert_eq!(
     spot(Spot::Transition(TransitionAt::new(0, 1))),
     "track 0, transition 1"
+  );
+  assert_eq!(
+    spot(Spot::TimelineEnd),
+    "the end of the timeline, which has no track, from the global start"
   );
 }
 
