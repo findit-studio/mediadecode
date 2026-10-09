@@ -188,9 +188,9 @@ pub enum Error {
   ExtradataUnknown(#[from] ExtradataUnknown),
 
   /// A packet's `AV_PKT_DATA_NEW_EXTRADATA` is a record FFmpeg's decoder
-  /// would reject, or apply only in part, without saying so — so the packet
-  /// was refused before any decoder saw it, still the caller's; see
-  /// [`ExtradataRejected`].
+  /// would reject, apply only in part, or not read at all, without saying
+  /// so — so the packet was refused before any decoder saw it, still the
+  /// caller's; see [`ExtradataRejected`].
   #[error(transparent)]
   ExtradataRejected(#[from] ExtradataRejected),
 
@@ -317,12 +317,14 @@ impl core::fmt::Display for Unrecordable {
 /// h264dec.c): a record it rejects — an `avcC` record shorter than seven
 /// bytes, one whose parameter set runs past its end — leaves the decoder on
 /// its old NAL length size and parameter sets, and a parameter set it
-/// cannot parse is skipped while the rest of the record applies. A session
-/// that took such a record as the stream's would read every later packet,
-/// and open every later decoder, on parameters the decoder serving never
-/// adopted. So the packet is refused before any decoder sees it: nothing of
-/// the session changes, and the packet is still the caller's — to send
-/// again without the record, or to drop.
+/// cannot parse is skipped while the rest of the record applies; a record
+/// riding a packet with no body is not read at all
+/// ([`ExtradataRejection::Bodiless`]). A session that took such a record as
+/// the stream's would read every later packet, and open every later
+/// decoder, on parameters the decoder serving never adopted. So the packet
+/// is refused before any decoder sees it: nothing of the session changes,
+/// and the packet is still the caller's — to send again without the record,
+/// or to drop.
 ///
 /// The record is read as FFmpeg 9 reads it, its bit reader and parameter
 /// set parsers mirrored, against the sequence parameter sets the decoder
@@ -383,6 +385,15 @@ pub enum ExtradataRejection {
   /// the record carries nor the decoder holds — or holds for certain:
   /// FFmpeg fails it, and the rest of the record applies.
   Unresolved,
+  /// The record rides a packet with no body. FFmpeg's H.264 decoder reads a
+  /// packet with no body as the end of the stream — it hands out a picture
+  /// it was holding back — and returns before it reads the packet's
+  /// `AV_PKT_DATA_NEW_EXTRADATA` (`h264_decode_frame`, FFmpeg 9's
+  /// h264dec.c), so it applies none of the record; libavcodec refuses the
+  /// packet outright where its empty body is not null. The record applies
+  /// on a packet that carries a picture, or in the codec parameters of a
+  /// decoder opened on it.
+  Bodiless,
 }
 
 impl core::fmt::Display for ExtradataRejection {
@@ -401,6 +412,10 @@ impl core::fmt::Display for ExtradataRejection {
       Self::Unresolved => f.write_str(
         "a picture parameter set referring to a sequence parameter set neither the record nor \
          the decoder holds",
+      ),
+      Self::Bodiless => f.write_str(
+        "a record on a packet with no body, which FFmpeg's decoder reads as the end of the \
+         stream before it reads the record",
       ),
     }
   }

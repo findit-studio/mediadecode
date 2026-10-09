@@ -16,7 +16,8 @@ use ffmpeg_next::{
   ffi::{
     AVBufferRef, AVCodec, AVFrame, AVHWFramesContext, AVMediaType, av_buffer_ref, av_buffer_unref,
     av_frame_move_ref, av_frame_unref, av_hwdevice_ctx_create, av_hwframe_transfer_data,
-    av_packet_ref, avcodec_alloc_context3, avcodec_free_context, avcodec_parameters_to_context,
+    av_packet_copy_props, av_packet_ref, avcodec_alloc_context3, avcodec_free_context,
+    avcodec_parameters_to_context,
   },
   frame,
 };
@@ -3057,12 +3058,27 @@ pub(crate) fn try_clone_parameters(
 /// buffer is shared with `src` rather than deep-copied; the probe replay
 /// only sends packets through `avcodec_send_packet`, which does not
 /// require a writable buffer.
+///
+/// **A packet with no data — side data alone — is cloned with none.**
+/// `av_packet_ref` gives a source without a buffer one of its own, `data`
+/// pointing into it (packet.c:452-460), and `avcodec_send_packet` refuses a
+/// body of size 0 that is not null (decode.c:742-743): the replay would
+/// refuse a packet the decoder took. Its properties and side data are
+/// copied alone (`av_packet_copy_props`, packet.c:397-432).
 pub(crate) fn try_clone_packet(src: &Packet) -> std::result::Result<Packet, ffmpeg_next::Error> {
   let mut dst = Packet::empty();
   // SAFETY: dst is a freshly zero-initialized Packet (av_init_packet inside
   // Packet::empty); av_packet_ref initializes its data fields from src's
-  // refcounted buffer or returns AVERROR(ENOMEM) on failure.
-  let ret = unsafe { av_packet_ref(dst.as_mut_ptr(), src.as_ptr()) };
+  // refcounted buffer, and av_packet_copy_props its properties and side
+  // data alone, leaving its data null; either returns AVERROR(ENOMEM) on
+  // failure, dst left holding nothing.
+  let ret = unsafe {
+    if (*src.as_ptr()).data.is_null() {
+      av_packet_copy_props(dst.as_mut_ptr(), src.as_ptr())
+    } else {
+      av_packet_ref(dst.as_mut_ptr(), src.as_ptr())
+    }
+  };
   if ret < 0 {
     return Err(ffmpeg_next::Error::from(ret));
   }

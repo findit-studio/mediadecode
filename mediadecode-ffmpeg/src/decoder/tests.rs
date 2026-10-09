@@ -126,6 +126,49 @@ fn packet_side_data_counts_against_probe_budget() {
   );
 }
 
+/// **A packet with no data — side data alone — is cloned with none.**
+/// `av_packet_ref` gives a source without a buffer one of its own, `data`
+/// pointing into it (packet.c:452-460), and `avcodec_send_packet` refuses a
+/// body of size 0 that is not null (decode.c:742-743): a probe history
+/// recording the packet so would hand a replay a packet the decoder refuses.
+/// A packet with a body is still shared, by reference.
+#[test]
+fn a_packet_with_no_data_is_cloned_with_none() {
+  use ffmpeg_next::ffi::{AVPacketSideDataType, av_packet_new_side_data};
+
+  let mut bodiless = Packet::empty();
+  // SAFETY: `bodiless` owns a live, zeroed AVPacket; the type is a constant of
+  // this build, and the four bytes written are the ones just allocated.
+  unsafe {
+    let side = av_packet_new_side_data(
+      bodiless.as_mut_ptr(),
+      AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA,
+      4,
+    );
+    assert!(!side.is_null(), "av_packet_new_side_data");
+    core::ptr::copy_nonoverlapping([1u8, 2, 3, 4].as_ptr(), side, 4);
+  }
+  bodiless.set_pts(Some(7));
+  let cloned = try_clone_packet(&bodiless).expect("cloned");
+  assert!(cloned.data().is_none(), "no data, as the source");
+  assert_eq!(cloned.size(), 0);
+  assert_eq!(cloned.pts(), Some(7), "its properties copied");
+  assert_eq!(packet_side_data_count(&cloned), 1, "its side data copied");
+  assert_eq!(
+    packet_side_data_bytes(&cloned, MAX_PROBE_PACKET_SIDE_DATA_ENTRIES),
+    packet_side_data_bytes(&bodiless, MAX_PROBE_PACKET_SIDE_DATA_ENTRIES),
+  );
+
+  let body = Packet::copy(&[9u8, 8, 7]);
+  let shared = try_clone_packet(&body).expect("cloned");
+  assert_eq!(shared.data(), Some(&[9u8, 8, 7][..]));
+  assert_eq!(
+    shared.data().map(<[u8]>::as_ptr),
+    body.data().map(<[u8]>::as_ptr),
+    "a body shared by reference"
+  );
+}
+
 #[test]
 fn packet_side_data_is_zero_when_no_side_data() {
   let packet = Packet::new(64);

@@ -9900,13 +9900,14 @@ enum Carried {
   After,
   /// In a packet of their own, no keyframe.
   Alone,
+  /// As `AV_PKT_DATA_NEW_EXTRADATA` on a packet of their own with no body.
+  Record,
 }
 
 /// `a`, then `b`, `b`'s timestamps after `a`'s, on `a`'s codec parameters:
 /// `b`'s parameter sets — its codec parameters' start-coded extradata —
-/// carried in band where `carried` says, by `a`'s last packet, no keyframe,
-/// or in a packet of their own between the two; no packet of `b` carries
-/// any.
+/// carried where `carried` says, by `a`'s last packet, no keyframe, or by a
+/// packet of their own between the two; no packet of `b` carries any.
 fn with_the_next_sets_in_band(
   a: &SyntheticClip,
   b: &SyntheticClip,
@@ -9923,6 +9924,7 @@ fn with_the_next_sets_in_band(
     Carried::Ahead => packets[last] = repacked(&a.packets[last], &[&sets[..], &data[..]].concat()),
     Carried::After => packets[last] = repacked(&a.packets[last], &[&data[..], &sets[..]].concat()),
     Carried::Alone => packets.push(Packet::copy(&sets)),
+    Carried::Record => packets.push(with_new_extradata(Packet::empty(), &sets)),
   }
   for packet in &b.packets {
     let mut moved = repacked(packet, packet.data().expect("a payload"));
@@ -11856,6 +11858,340 @@ fn a_keyframe_s_own_video_parameter_set_is_read_against_the_sets_held() {
   assert!(session.errors.is_empty(), "no error: {:?}", session.errors);
   assert!(
     session.pictures == reference,
+    "every picture, as the straight decode"
+  );
+}
+
+// ---------------------------------------------------------------------------
+//  R19 row 1: a packet with no body
+// ---------------------------------------------------------------------------
+
+/// LAW (R19 row 1; Codex R18 [high]): **an HEVC record riding a packet with
+/// no body reaches FFmpeg's decoder, which applies it, and nothing of the
+/// session is left in doubt.** Two `x265` streams, 128x96 then 160x96, the
+/// second's VPS, SPS and PPS 0 — replacing the record's — carried as
+/// `AV_PKT_DATA_NEW_EXTRADATA` by a packet with no body between them, 16, as
+/// libavformat hands over a sample of no bytes at a change of sample
+/// description (`mov_change_extradata`, mov.c:11573-11595, 11729-11736).
+/// FFmpeg's HEVC decoder applies the record and finds no unit
+/// (`hevc_receive_frame`, hevc/hevcdec.c:3855-3872). On the software road the
+/// packet is taken, the record known, and every picture comes out as a
+/// straight decode of the same sets carried in band gives it; on a probe-era
+/// fallback at 10 on three threads the switch fires at the second stream's
+/// IDR 17; on one at 18 the replay feeds the packet the hardware took and the
+/// switch fires at the IDR 25; the hardware failing post-commit at 17, the
+/// cold decoder holds the second stream's sets and the end is clean. On an
+/// implementation that wraps another the packet is refused `EINVAL` before it
+/// sees it, nothing left in doubt. Rebuilt with a body of size 0 that is not
+/// null, as libavformat delivers it, the packet was refused before the
+/// decoder read its side data (decode.c:742-743), the record left unknown and
+/// the second stream decoded under the first's sets; cloned for the replay
+/// with a body, the replay was refused the same way.
+#[test]
+fn an_hevc_record_riding_a_packet_with_no_body_is_applied() {
+  let params = "keyint=8:min-keyint=8:scenecut=0:bframes=0:open-gop=0:log-level=error";
+  let (a, b) = (
+    encode_hevc_global(128, 96, 16, params),
+    encode_hevc_global(160, 96, 16, params),
+  );
+  let clip = with_the_next_sets_in_band(&a, &b, Carried::Record);
+  assert!(
+    clip.packets[16].data().is_none() && clip.packets[17].is_key(),
+    "16 has no body, 17 is the second stream's IDR"
+  );
+  let reference = straight(&with_the_next_sets_in_band(&a, &b, Carried::Alone));
+  assert_eq!(reference.len(), 32, "the straight decode is whole");
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let one = DecoderLimits::default().with_threads(crate::Threads::Single);
+
+  // The software road.
+  let software =
+    FfmpegVideoStreamDecoder::open_as(clip.parameters.clone(), tb, one, DecodePath::Software)
+      .expect("the software road opens");
+  let mut unknown = None;
+  let session = session_of(software, &clip, |index, dec| {
+    if index == 17 {
+      unknown = Some(dec.extradata_unknown_for_test());
+    }
+  });
+  assert!(
+    session.errors.is_empty(),
+    "the packet with no body taken: {:?}",
+    session.errors
+  );
+  assert_eq!(unknown, Some(None), "the record known");
+  assert!(
+    session.pictures == reference,
+    "every picture, as the straight decode of the sets carried in band"
+  );
+
+  // A probe-era fallback before it, and after it.
+  let three = core::num::NonZeroU32::new(3).expect("nonzero");
+  for (fail_at, switch) in [(10, 17), (18, 25)] {
+    let session = session_of(
+      behind_a_probe(&clip, fail_at, crate::Threads::Count(three)),
+      &clip,
+      |_, _| {},
+    );
+    assert_eq!(
+      (session.threads[switch - 1], session.threads[switch]),
+      (Some(core::num::NonZeroU32::MIN), Some(three)),
+      "a probe-era fallback at {fail_at}: the switch at {switch}"
+    );
+    assert!(
+      session.errors.is_empty(),
+      "a probe-era fallback at {fail_at}: no error: {:?}",
+      session.errors
+    );
+    assert!(
+      session.pictures == reference,
+      "a probe-era fallback at {fail_at}: every picture, as the straight decode"
+    );
+  }
+
+  // The hardware failing post-commit at the second stream's IDR.
+  let session = session_of(behind_a_failure_at(&clip, 17), &clip, |_, _| {});
+  assert!(
+    session.errors.is_empty(),
+    "no error, the end clean: {:?}",
+    session.errors
+  );
+  assert!(
+    from_pts(&session.pictures, 16) == from_pts(&reference, 16),
+    "every picture from 17 on, as the straight decode"
+  );
+
+  // An implementation that wraps another: a stream whose packet with no body
+  // carries the stream's own record.
+  let whole = encode_hevc_global(128, 96, 32, params);
+  let mut packets = whole.packets.clone();
+  packets.insert(
+    16,
+    with_new_extradata(Packet::empty(), &extradata_of(&whole.parameters)),
+  );
+  let own = SyntheticClip {
+    parameters: whole.parameters.clone(),
+    packets,
+  };
+  let reference = straight(&whole);
+  super::sw_implementation::wrapped_next("cuvid");
+  let wrapped =
+    FfmpegVideoStreamDecoder::open_as(own.parameters.clone(), tb, one, DecodePath::Software)
+      .expect("the software road opens");
+  let mut unknown = None;
+  let session = session_of(wrapped, &own, |index, dec| {
+    if index == 17 {
+      unknown = Some(dec.extradata_unknown_for_test());
+    }
+  });
+  let einval = format!(
+    "{:?}",
+    ffmpeg_next::Error::Other {
+      errno: libc::EINVAL
+    }
+  );
+  assert!(
+    session.errors.len() == 1
+      && session.errors[0].starts_with("send 16:")
+      && session.errors[0].contains(&einval),
+    "wrapped: refused EINVAL before the decoder saw it, the only error: {:?}",
+    session.errors
+  );
+  assert_eq!(unknown, Some(None), "wrapped: nothing left in doubt");
+  assert!(
+    session.pictures == reference,
+    "wrapped: every picture, as the straight decode"
+  );
+}
+
+/// LAW (R19 row 1; Codex R18 [high]): **an H.264 record riding a packet with
+/// no body is refused by name before any decoder sees it, and nothing of the
+/// session changes.** FFmpeg's H.264 decoder reads an empty body as the end
+/// of the stream — it hands out a picture it was holding back — and returns
+/// before it reads the packet's `AV_PKT_DATA_NEW_EXTRADATA`
+/// (`h264_decode_frame`, h264dec.c:1034-1036, 978-1016): a packet with no
+/// body applies no record, however it is handed over. A `libx264` stream, 32
+/// frames, IDRs every 8 and two B-frames; a packet with no body ahead of its
+/// IDR 16 carrying a second stream's record (160x96, SPS and PPS 0). On the
+/// software road, on a probe-era fallback at 10 on three threads and on the
+/// hardware road the packet is refused `ExtradataRejected` with `Bodiless`,
+/// the only error; the record never the session's, the switch fires at the
+/// IDR 16 and every picture comes out as the stream's straight decode. Handed
+/// over with no data, the record was taken as the session's though the
+/// decoder never applied it, and the switch opened a decoder on it; rebuilt
+/// as libavformat delivers it, the packet was refused `EINVAL`, the record
+/// left unknown and the switch not read.
+#[test]
+fn an_h264_record_riding_a_packet_with_no_body_is_refused_by_name() {
+  let params = "keyint=8:min-keyint=8:scenecut=0:bframes=2:b-adapt=0:open-gop=0:log-level=error";
+  let a = encode_h264_global(128, 96, 32, params);
+  let b = encode_h264_global(160, 96, 8, params);
+  let mut packets = a.packets.clone();
+  packets.insert(
+    16,
+    with_new_extradata(Packet::empty(), &extradata_of(&b.parameters)),
+  );
+  let clip = SyntheticClip {
+    parameters: a.parameters.clone(),
+    packets,
+  };
+  assert!(
+    clip.packets[16].data().is_none() && clip.packets[17].is_key(),
+    "16 has no body, 17 is the IDR 16"
+  );
+  let reference = straight(&a);
+  assert_eq!(reference.len(), 32, "the straight decode is whole");
+  let refused = |errors: &[String], road: &str| {
+    assert!(
+      errors.len() == 1
+        && errors[0].starts_with("send 16:")
+        && errors[0].contains("ExtradataRejected")
+        && errors[0].contains("Bodiless"),
+      "{road}: the packet with no body refused by name, the only error: {errors:?}"
+    );
+  };
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+
+  // The software road.
+  let software = FfmpegVideoStreamDecoder::open_as(
+    clip.parameters.clone(),
+    tb,
+    DecoderLimits::default().with_threads(crate::Threads::Single),
+    DecodePath::Software,
+  )
+  .expect("the software road opens");
+  let mut unknown = None;
+  let session = session_of(software, &clip, |index, dec| {
+    if index == 17 {
+      unknown = Some(dec.extradata_unknown_for_test());
+    }
+  });
+  refused(&session.errors, "software");
+  assert_eq!(unknown, Some(None), "software: nothing left in doubt");
+  assert!(
+    session.pictures == reference,
+    "software: every picture, as the straight decode"
+  );
+
+  // A probe-era fallback at 10, on three threads.
+  let three = core::num::NonZeroU32::new(3).expect("nonzero");
+  let session = session_of(
+    behind_a_probe(&clip, 10, crate::Threads::Count(three)),
+    &clip,
+    |_, _| {},
+  );
+  refused(&session.errors, "a probe-era fallback");
+  assert_eq!(
+    (session.threads[15], session.threads[17]),
+    (Some(core::num::NonZeroU32::MIN), Some(three)),
+    "a probe-era fallback: the switch at the IDR 16"
+  );
+  assert!(
+    session.pictures == reference,
+    "a probe-era fallback: every picture, as the straight decode"
+  );
+
+  // The hardware road.
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let hardware = FfmpegVideoStreamDecoder::from_hw_inner_for_test(
+    Box::new(FakeHw::never_failing(128, 96)),
+    clip.parameters.clone(),
+    tb,
+  )
+  .expect("build test decoder");
+  let session = session_of(hardware, &clip, |_, _| {});
+  refused(&session.errors, "hardware");
+}
+
+/// LAW (R19 row 1): **a packet carrying nothing — no body, no side data — is
+/// refused before any decoder sees it, `AVERROR(EINVAL)` as libavcodec
+/// answers it, and nothing is left in doubt.** Handed over with no data it
+/// would be the end of the stream (decode.c:745-752); in the shape
+/// libavformat delivers a packet with no payload, libavcodec refuses it
+/// before it queues anything (742-743), and the session read that refusal as
+/// one a decoder that may have taken the packet gave. An `x265` stream on the
+/// software road on three threads, its packet 5 carrying the stream's own
+/// record as `AV_PKT_DATA_NEW_EXTRADATA` — provisional until the end on frame
+/// threads (R15 row 2): an empty packet sent after 5 is refused `EINVAL`, the
+/// record still provisional and not unknown, and every picture comes out as
+/// the straight decode. Read as the decoder's refusal, the record was left
+/// unknown.
+#[test]
+fn a_packet_carrying_nothing_is_refused_before_any_decoder_sees_it() {
+  let params = "keyint=8:min-keyint=8:scenecut=0:bframes=0:open-gop=0:log-level=error";
+  let a = encode_hevc_global(128, 96, 16, params);
+  let mut packets = a.packets.clone();
+  packets[5] = with_new_extradata(
+    repacked(&a.packets[5], a.packets[5].data().expect("a payload")),
+    &extradata_of(&a.parameters),
+  );
+  let clip = SyntheticClip {
+    parameters: a.parameters.clone(),
+    packets,
+  };
+  let reference = straight(&clip);
+  assert_eq!(reference.len(), 16, "the straight decode is whole");
+  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let three = core::num::NonZeroU32::new(3).expect("nonzero");
+  let mut dec = FfmpegVideoStreamDecoder::open_as(
+    clip.parameters.clone(),
+    tb,
+    DecoderLimits::default().with_threads(crate::Threads::Count(three)),
+    DecodePath::Software,
+  )
+  .expect("the software road opens");
+  let mut dst = crate::empty_owned_video_frame();
+  let mut pictures: Vec<Picture> = Vec::new();
+  let mut drain = |dec: &mut FfmpegVideoStreamDecoder, pictures: &mut Vec<Picture>| {
+    while let Received::Frame = dec.receive_frame(&mut dst).expect("receive_frame") {
+      pictures.push((
+        dst.pts().map_or(i64::MIN, |t| t.pts()),
+        dst
+          .planes()
+          .iter()
+          .map(|plane| plane.data_ref().as_ref().to_vec())
+          .collect(),
+      ));
+    }
+  };
+  let nothing =
+    mediadecode::packet::VideoPacket::new(FfmpegBytes::empty(), VideoPacketExtra::new(0));
+  for (index, av_pkt) in clip.packets.iter().enumerate() {
+    loop {
+      match dec.send_packet(&pushed(av_pkt)).expect("send_packet") {
+        Sent::Accepted => break,
+        Sent::MustDrain => drain(&mut dec, &mut pictures),
+      }
+    }
+    drain(&mut dec, &mut pictures);
+    if index == 5 {
+      assert!(
+        dec.extradata_provisional_for_test(),
+        "the premise: 5's record provisional on frame threads"
+      );
+      let answer = dec.send_packet(&nothing);
+      assert!(
+        matches!(
+          answer,
+          Err(VideoDecodeError::Decode(Error::Ffmpeg(ffmpeg_next::Error::Other { errno })))
+            if errno == libc::EINVAL
+        ),
+        "the packet carrying nothing refused EINVAL: {answer:?}"
+      );
+      assert_eq!(
+        (
+          dec.extradata_unknown_for_test(),
+          dec.extradata_provisional_for_test()
+        ),
+        (None, true),
+        "the record still provisional, not unknown"
+      );
+    }
+  }
+  crate::accepted(dec.send_eof(), "send_eof");
+  drain(&mut dec, &mut pictures);
+  assert!(
+    pictures == reference,
     "every picture, as the straight decode"
   );
 }

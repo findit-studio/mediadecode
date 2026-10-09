@@ -855,6 +855,10 @@ pub(crate) fn share_or_copy(
 /// Side data on the extras is reattached to the rebuilt packet — see
 /// [`attach_side_data`] for why that is not optional.
 ///
+/// A packet with no body is rebuilt as libavformat delivers one, a body of
+/// size 0 over a padding allocation (demux.c:681): forwarded to a decoder,
+/// it gets libavcodec's own answer to libavformat's own packet.
+///
 /// Returns [`PacketBuildError`] on:
 /// * payload larger than `c_int::MAX` (would overflow `AVPacket.size`);
 /// * `av_new_packet` allocation failure (OOM);
@@ -864,7 +868,7 @@ pub fn ffmpeg_packet_from_video_packet(
   packet: &mediadecode::packet::VideoPacket<VideoPacketExtra, crate::FfmpegBuffer>,
   limits: PacketLimits,
 ) -> std::result::Result<Packet, PacketBuildError> {
-  build_video_packet::<crate::View>(packet, limits, BodyRoute::Copy)
+  build_video_packet::<crate::View>(packet, limits, BodyRoute::Copy, Bodiless::AsDemuxed)
 }
 
 /// [`ffmpeg_packet_from_video_packet`] on the owned lane.
@@ -872,7 +876,33 @@ pub fn ffmpeg_packet_from_owned_video_packet(
   packet: &mediadecode::packet::VideoPacket<VideoPacketExtra, FfmpegBytes>,
   limits: PacketLimits,
 ) -> std::result::Result<Packet, PacketBuildError> {
-  build_video_packet::<crate::Owned>(packet, limits, BodyRoute::Copy)
+  build_video_packet::<crate::Owned>(packet, limits, BodyRoute::Copy, Bodiless::AsDemuxed)
+}
+
+/// **How a video packet with no body that carries side data is rebuilt.**
+///
+/// libavcodec takes such a packet in one shape only: `avcodec_send_packet`
+/// refuses a `size` of 0 over a `data` that is not null with
+/// `AVERROR(EINVAL)` before it reads the side data (decode.c:742-743), and
+/// queues one whose `data` is null for its side data (745-748). What a
+/// decoder then makes of it is the codec's: FFmpeg's HEVC decoder applies
+/// its `AV_PKT_DATA_NEW_EXTRADATA` and reads no unit
+/// (`hevc_receive_frame`, hevc/hevcdec.c:3855-3872), while its H.264 and
+/// MPEG decoders read an empty packet as the end of the stream, handing out
+/// a picture they were holding back (h264dec.c:1034-1036, 978-1016;
+/// mpeg12dec.c:2556-2568; h263dec.c:452-470; vc1dec.c:843-854) — so the
+/// session decides which decoder is handed one
+/// (`CarrierVideoStreamDecoder::refuse_bodiless`). A packet that carries no
+/// side data either is rebuilt as libavformat delivers it whatever this
+/// says: null, it would be the end of the stream (decode.c:745-752).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Bodiless {
+  /// A body of size 0 over a padding allocation, as libavformat delivers a
+  /// packet with no payload (`av_packet_make_refcounted`, demux.c:681;
+  /// packet.c:83-110).
+  AsDemuxed,
+  /// No data at all: `data` null, `size` 0.
+  Null,
 }
 
 /// [`ffmpeg_packet_from_video_packet`] built for **submission**, and
@@ -906,7 +936,10 @@ pub(crate) fn with_ffmpeg_video_packet<C: crate::FfmpegCarrier + crate::CarrierO
   route: BodyRoute,
   submit: impl FnOnce(&Packet) -> T,
 ) -> std::result::Result<T, PacketBuildError> {
-  let av_packet = build_video_packet::<C>(packet, limits, route)?;
+  // A packet with no body that carries side data is handed over in the one
+  // shape libavcodec takes it in; the session refuses it before any decoder
+  // that would read it as the end of the stream sees it.
+  let av_packet = build_video_packet::<C>(packet, limits, route, Bodiless::Null)?;
   let out = submit(&av_packet);
   drop(av_packet);
   Ok(out)
@@ -916,6 +949,7 @@ fn build_video_packet<C: crate::FfmpegCarrier + crate::CarrierOps>(
   packet: &mediadecode::packet::VideoPacket<VideoPacketExtra, C::Buffer>,
   limits: PacketLimits,
   route: BodyRoute,
+  bodiless: Bodiless,
 ) -> std::result::Result<Packet, PacketBuildError> {
   let body = packet.data().as_ref();
   // Before the budget and before the allocation: an uncarriable
@@ -934,8 +968,13 @@ fn build_video_packet<C: crate::FfmpegCarrier + crate::CarrierOps>(
       SendPayloadTooLarge::new(body.len(), limits.max_packet_bytes()),
     ));
   }
-  let mut out = C::packet_body(packet.data(), route)?;
-  attach_side_data(&mut out, packet.extra().side_data())?;
+  let side_data = packet.extra().side_data();
+  let mut out = if bodiless == Bodiless::Null && body.is_empty() && !side_data.is_empty() {
+    Packet::empty()
+  } else {
+    C::packet_body(packet.data(), route)?
+  };
+  attach_side_data(&mut out, side_data)?;
   if let Some(ts) = packet.pts() {
     out.set_pts(Some(ts.pts()));
   }
@@ -945,7 +984,7 @@ fn build_video_packet<C: crate::FfmpegCarrier + crate::CarrierOps>(
   if let Some(d) = packet.duration() {
     out.set_duration(d.pts());
   }
-  // SAFETY: `out` owns the `AVPacket` `try_packet_copy` just built.
+  // SAFETY: `out` owns the `AVPacket` just built.
   unsafe { write_md_flags(&mut out, packet.flags()) };
   out.set_stream(packet.extra().stream_index() as usize);
   Ok(out)
@@ -3118,6 +3157,51 @@ mod tests {
     );
     with_ffmpeg_subtitle_packet::<crate::View, _>(&subtitle, limits, BodyRoute::Submission, |av| {
       assert_eq!(av.size(), 0);
+    })
+    .expect("submitted");
+  }
+
+  #[test]
+  fn a_video_submission_with_no_body_carries_no_data() {
+    // libavcodec takes a packet with no body in one shape: `data` null, its
+    // side data read (decode.c:745-748). A body of size 0 that is not null is
+    // refused before the side data is read (742-743) — the shape libavformat
+    // delivers, which the public builder keeps — and one carrying nothing at
+    // all, null, would be the end of the stream (745-752).
+    let video = video_packet_from_borrowed::<crate::Owned>(
+      &side_data_only_packet(),
+      mediadecode::Timebase::default(),
+      PacketLimits::default(),
+      crate::buffer::PayloadProvenance::CallerSupplied,
+    )
+    .expect("wrappable")
+    .expect("a side-data-only packet is a packet");
+    let limits = PacketLimits::default();
+    let public = ffmpeg_packet_from_owned_video_packet(&video, limits).expect("built");
+    assert_eq!(public.size(), 0);
+    assert!(
+      public.data().is_some(),
+      "the public builder: as libavformat delivers it"
+    );
+    for route in [BodyRoute::Copy, BodyRoute::Submission] {
+      with_ffmpeg_video_packet::<crate::Owned, _>(&video, limits, route, |av| {
+        assert_eq!(av.size(), 0);
+        assert!(av.data().is_none(), "{route:?}: submitted with no data");
+        let carried = packet_side_data(av).expect("readable");
+        assert_eq!(carried.len(), 1, "{route:?}: its side data attached");
+        assert_eq!(carried[0].kind(), NEW_EXTRADATA);
+        assert_eq!(carried[0].data(), &[1, 2, 3, 4]);
+      })
+      .expect("submitted");
+    }
+    let nothing =
+      mediadecode::packet::VideoPacket::new(FfmpegBytes::empty(), VideoPacketExtra::new(0));
+    with_ffmpeg_video_packet::<crate::Owned, _>(&nothing, limits, BodyRoute::Submission, |av| {
+      assert_eq!(av.size(), 0);
+      assert!(
+        av.data().is_some(),
+        "a packet carrying nothing is not the end of the stream"
+      );
     })
     .expect("submitted");
   }

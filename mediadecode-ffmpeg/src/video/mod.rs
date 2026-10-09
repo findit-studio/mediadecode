@@ -2565,6 +2565,64 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     Sets { aso, alpha, held }
   }
 
+  /// **A packet with no body is handed to a decoder only where FFmpeg's
+  /// decoder applies its side data and reads no end of the stream in it**:
+  /// FFmpeg's own HEVC decoder, which applies a packet's
+  /// `AV_PKT_DATA_NEW_EXTRADATA` and `AV_PKT_DATA_DOVI_CONF` and finds no
+  /// unit in an empty body (`hevc_receive_frame`, hevc/hevcdec.c:3855-3872).
+  /// The packet comes over with no data at all, the one shape libavcodec
+  /// takes it in (decode.c:742-748), and its record is read as any packet's
+  /// is.
+  ///
+  /// Every other packet with no body is refused before any decoder sees it,
+  /// and nothing of the session changes. FFmpeg's H.264 decoder reads an
+  /// empty body as the end of the stream, handing out a picture it was
+  /// holding back, and returns before it reads the packet's new extradata
+  /// (`h264_decode_frame`, h264dec.c:1034-1036, 978-1016): a record riding
+  /// one is refused by name ([`crate::ExtradataRejection::Bodiless`]). Its
+  /// MPEG decoders read an empty packet as the end of their pictures too
+  /// (mpeg12dec.c:2556-2568, h263dec.c:452-470, vc1dec.c:843-854), and what an
+  /// implementation that wraps another makes of one is not this crate's to
+  /// read; one carrying nothing at all would be the end of the stream itself
+  /// (decode.c:745-752). Those are answered `AVERROR(EINVAL)`, what
+  /// libavcodec answers such a packet in the shape libavformat delivers it
+  /// (demux.c:681; decode.c:742-743) — answered here, so no road reads the
+  /// refusal as a decoder's that may have taken the packet.
+  fn refuse_bodiless(&self, pkt: &Packet) -> Result<(), Error> {
+    if pkt.size() > 0 {
+      return Ok(());
+    }
+    let codec = self.codec_id();
+    if codec == crate::CodecId::HEVC.raw()
+      && crate::decoder::packet_side_data_count(pkt) > 0
+      && self.decodes_natively()
+    {
+      return Ok(());
+    }
+    if codec == crate::CodecId::H264.raw() && new_extradata(pkt).is_some() {
+      return Err(Error::ExtradataRejected(crate::ExtradataRejected::new(
+        crate::CodecId::H264,
+        crate::ExtradataRejection::Bodiless,
+      )));
+    }
+    Err(Error::Ffmpeg(ffmpeg_next::Error::Other {
+      errno: libc::EINVAL,
+    }))
+  }
+
+  /// Whether the decoder that takes the session's next packet is one of
+  /// libavcodec's own: the software decoder serving's implementation
+  /// ([`SwDecoder::native`]); otherwise the one the codec parameters name
+  /// ([`crate::decoder::find_decoder`]), which the hardware road opens under
+  /// its accelerator and a software open opens.
+  fn decodes_natively(&self) -> bool {
+    match &self.state {
+      DecodeState::Sw(sw) => sw.native,
+      DecodeState::Hw(_) | DecodeState::SwClosed => crate::decoder::find_decoder(&self.parameters)
+        .is_ok_and(|codec| wrapper_name(codec).is_null()),
+    }
+  }
+
   /// **A packet's body FFmpeg's H.264 decoder reads as an `avcC` record**
   /// (h264dec.c:1045-1050; [`held::Held::h264_reading`]), or may, is applied
   /// as extradata — `ff_h264_decode_extradata`, as a new extradata is, but
@@ -3816,6 +3874,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       self.held_base = None;
     }
     boundary::with_ffmpeg_video_packet::<C, _>(packet, limits, route, |av_pkt| {
+      // A packet with no body reaches only a decoder that reads it as one.
+      self
+        .refuse_bodiless(av_pkt)
+        .map_err(VideoDecodeError::Decode)?;
       self.note_output_alpha();
       // The software road reads the packet once what a fallback's replay owes
       // the decoder is fed ([`Self::send_on_software`]).
