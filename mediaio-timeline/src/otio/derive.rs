@@ -7,8 +7,11 @@
 //! rates — the operand at the lower rate is rescaled to it, `(value ·
 //! new_rate) / rate`, two rounded operations, and the values are added
 //! (`opentime/rationalTime.h` 70–75, 286–339). A range ends at its duration
-//! plus its start rescaled to the duration's rate (`timeRange.h` 105–108).
-//! On that arithmetic:
+//! plus its start rescaled to the duration's rate (`timeRange.h` 105–108),
+//! and its last tick — `end_time_inclusive`, the time of the last frame with
+//! data — is that end floored or less one tick, by a branch OpenTimelineIO
+//! takes on its own doubles (`timeRange.h` 88–102; [`Time::end_inclusive`]).
+//! Every range below is held at both ends. On that arithmetic:
 //!
 //! - a child's place on its track starts at zero **in that child's own
 //!   rate** and adds the duration of every item before it
@@ -17,9 +20,11 @@
 //! - walking a whole track carries one running end, rescaled into each
 //!   item's rate in turn (`track.cpp` 221–271);
 //! - a track's duration starts at zero at rate 1 and adds every item
-//!   (`track.cpp` 117–148); the stack's is the longest track's, picked by
-//!   comparing `value / rate` in `f64`, the first of two that compare equal
-//!   (`stack.cpp` 118–134, `rationalTime.h` 348–371);
+//!   (`track.cpp` 117–148), and the track's range runs it from zero in its
+//!   rate — the range the stack gives the track too (`stack.cpp` 41–62); the
+//!   stack's is the longest track's, picked by comparing `value / rate` in
+//!   `f64`, the first of two that compare equal (`stack.cpp` 118–134,
+//!   `rationalTime.h` 348–371), so the stack's range is the picked track's;
 //! - a child's place in the timeline adds the stack's start of its track:
 //!   zero, in the track's duration rate (`composition.cpp` 320–368,
 //!   `stack.cpp` 41–62, `timeline.h` 69–74);
@@ -40,7 +45,12 @@
 //! where an `f64` holds every whole count, and OpenTimelineIO's own double
 //! less than half a tick from the exact count — read to the nearest tick, it
 //! is the exact count. On one ruler, where nothing is rescaled, the sums are
-//! of whole counts and the doubles are the counts themselves.
+//! of whole counts and the doubles are the counts themselves — so a range the
+//! document writes in one ruler, its start and duration whole and its end
+//! within ±2^53, also ends inclusively where it exactly does: its duration is
+//! whole, it takes the less-one branch exactly when it is longer than one
+//! tick, and every sum on the way is exact. The source, available and gap
+//! ranges the export writes are such ranges.
 //!
 //! The lines cited are OpenTimelineIO's `main` at `00c22fa` (2026-10-09),
 //! and the tools' heads of the same day.
@@ -59,6 +69,9 @@ const EXACT: i128 = 1 << 53;
 /// three roundings of its own arithmetic add up to (each under 2^-51 of a
 /// tick), so it never holds a double half a tick off.
 const MARGIN: f64 = 1.0 / 281_474_976_710_656.0;
+
+/// 2^52: from it on an `f64` has no fraction, and is its own floor.
+const WHOLE: f64 = 4_503_599_627_370_496.0;
 
 /// A ruler: the rate OpenTimelineIO reads — the `f64` nearest the exact rate
 /// — and the exact rate it stands for.
@@ -191,6 +204,63 @@ impl Time {
     duration.add(start.rescaled_to(duration.ruler))
   }
 
+  /// `TimeRange::end_time_inclusive` (`timeRange.h` 88–102) of the range
+  /// from `start` running `duration`: the range's end, in the duration's
+  /// rate, then — where the end less the start, rescaled there, is more than
+  /// one tick — the end floored if the duration's value is not whole, else
+  /// the end less one tick (`RationalTime(1, duration.rate())`); a range of
+  /// one tick or none ends inclusively at its start, in the start's rate.
+  ///
+  /// OpenTimelineIO takes each branch on its own doubles; the exact time
+  /// takes the same branches on the exact counts — a duration more than one
+  /// tick long, whole or not — which is where the range's last tick exactly
+  /// is. A double that rounds onto the other branch is held against that.
+  pub(super) fn end_inclusive(start: Self, duration: Self) -> Self {
+    let end = Self::end(start, duration);
+    let floored = end.floor();
+    let less_one = end.sub(Self::written(1, duration.ruler));
+    let otio = if end.sub(start.rescaled_to(duration.ruler)).value > 1.0 {
+      if duration.value != floor(duration.value) {
+        floored
+      } else {
+        less_one
+      }
+    } else {
+      start
+    };
+    let seconds = match duration.exact_count() {
+      Some((num, den)) if num > den => {
+        if num.rem_euclid(den) == 0 {
+          less_one.seconds
+        } else {
+          floored.seconds
+        }
+      }
+      Some(_) => start.seconds,
+      None => None,
+    };
+    Self {
+      value: otio.value,
+      ruler: otio.ruler,
+      seconds,
+    }
+  }
+
+  /// `RationalTime::floor` (`rationalTime.h` 104–107): the value floored,
+  /// in the same rate — and the exact count floored beside it.
+  fn floor(self) -> Self {
+    let seconds = self.exact_count().and_then(|(num, den)| {
+      let whole = i64::try_from(num.div_euclid(den)).ok()?;
+      let tick = self.ruler.exact.checked_to_timebase()?;
+      Some(ExactSeconds::from_timestamp(Timestamp::new(whole, tick)))
+    });
+    Self {
+      value: floor(self.value),
+      ruler: self.ruler,
+      seconds,
+    }
+  }
+
   /// `operator<` (`rationalTime.h` 353–364): `!(a >= b)`, `value / rate`
   /// compared in `f64` — so also where either is not a number.
   fn otio_lt(self, other: Self) -> bool {
@@ -273,6 +343,22 @@ fn near(value: f64, whole: i128, part: i128, den: i128) -> bool {
   off > -bound && off < bound
 }
 
+/// `std::floor`, which `core` lacks: the greatest whole `f64` not above
+/// `value`. Past ±2^52 an `f64` is whole already, and an infinity or a NaN
+/// is its own floor, as `std::floor` answers them.
+fn floor(value: f64) -> f64 {
+  if !(value > -WHOLE && value < WHOLE) {
+    return value;
+  }
+  // Within ±2^52 the cast truncates toward zero, exactly.
+  let truncated = value as i64 as f64;
+  if truncated > value {
+    truncated - 1.0
+  } else {
+    truncated
+  }
+}
+
 /// Euclid's greatest common divisor of two magnitudes, at least 1.
 fn gcd(a: i128, b: i128) -> i128 {
   let (mut a, mut b) = (a.unsigned_abs(), b.unsigned_abs());
@@ -318,8 +404,9 @@ impl Child {
 /// OpenTimelineIO derives from it: each child's place on the track and in
 /// the timeline, the running end of a walk over the whole track, each
 /// item's visible range, the place of each from the global start, the
-/// track's duration and its end from the global start. Answers the
-/// track's duration.
+/// track's duration and its end from the global start — and the last tick
+/// of every range among them ([`Time::end_inclusive`]). Answers the track's
+/// duration.
 pub(super) fn track(
   index: usize,
   children: &[Child],
@@ -371,11 +458,13 @@ pub(super) fn track(
     let ends = Time::end(begins, length);
     begins.hold(spot)?;
     ends.hold(spot)?;
+    Time::end_inclusive(begins, length).hold(spot)?;
     // The same in the timeline, and from the global start.
     let begins = begins.add(placed);
     let ends = Time::end(begins, length);
     begins.hold(spot)?;
     ends.hold(spot)?;
+    Time::end_inclusive(begins, length).hold(spot)?;
     for absolute in [start.add(begins), start.add(ends)] {
       absolute.hold(Spot::Absolute(at(k)))?;
     }
@@ -389,8 +478,10 @@ pub(super) fn track(
         begins.hold(spot)?;
         length.hold(spot)?;
         Time::end(begins, length).hold(spot)?;
+        Time::end_inclusive(begins, length).hold(spot)?;
       }
       Child::Item { .. } => {
+        Time::end_inclusive(last_end, length).hold(spot)?;
         last_end = Time::end(last_end, length);
         last_end.hold(spot)?;
       }
@@ -418,14 +509,19 @@ pub(super) fn track(
   }
   let spot = Spot::TrackDuration(index);
   let duration = track_duration(children, |sum| sum.hold(spot))?;
+  // The track's range, from zero in its duration's rate (`track.cpp`
+  // 147): the stack's range of the track too (`stack.cpp` 61).
+  Time::end_inclusive(placed, duration).hold(spot)?;
   // The track's end from the global start: a range from it of the
   // track's duration, and the global start added.
   let spot = Spot::AbsoluteEnd(index);
   start.rescaled_to(duration.ruler).hold(spot)?;
   Time::end(start, duration).hold(spot)?;
+  Time::end_inclusive(start, duration).hold(spot)?;
   let from = placed.add(start);
   from.hold(spot)?;
   Time::end(from, duration).hold(spot)?;
+  Time::end_inclusive(from, duration).hold(spot)?;
   start.add(duration).hold(spot)?;
   Ok(duration)
 }
@@ -475,14 +571,17 @@ fn visible(
     duration = duration.add(tail);
     duration.hold(spot)?;
   }
-  Time::end(start, duration).hold(spot)
+  Time::end(start, duration).hold(spot)?;
+  Time::end_inclusive(start, duration).hold(spot)
 }
 
 /// `Stack::available_range` (`stack.cpp` 118–134): the longest of the
 /// tracks' `durations`, picked as OpenTimelineIO picks it —
 /// `std::max` by `operator<`, the first of two that compare equal. Refused
 /// where that pick is shorter than the longest track, exactly: the stack,
-/// and the timeline with it, would end early.
+/// and the timeline with it, would end early. The stack's range runs the
+/// picked duration from zero in its rate: the picked track's own range,
+/// whose ends [`track`] has held.
 pub(super) fn stack(durations: &[Time]) -> Result<(), NotRepresentable> {
   let Some((&first, rest)) = durations.split_first() else {
     return Ok(());

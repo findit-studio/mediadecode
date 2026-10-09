@@ -6,7 +6,7 @@ mod common;
 use mediaio_timeline::{
   ChangeKind, Clip, ClipId, Duration, Fade, FadeShape, Fades, Gain, Item, MediaRef, Rate,
   TimeRange, Timebase, Timeline, Timestamp, Track, TrackKind, Transition, diff, layout,
-  otio::{OtioTarget, to_otio, validate_json},
+  otio::{OtioTarget, Refused, Spot, to_otio, validate_json},
   validate,
 };
 use mediatime::Rounding;
@@ -306,12 +306,39 @@ fn a_document_round_trips() {
   }
 }
 
+/// The one generated timeline the export refuses: seed 132's track 1, at
+/// 29.97 fps from frame 106 560, is 396 396 ticks of 1/90 000 s long, which
+/// OpenTimelineIO sums from frames and 48 kHz samples one ulp short — so
+/// `end_time_inclusive` of its range from the global start floors an end
+/// that rounds up to 320 396 076, a tick past its last, 320 396 075
+/// (`src/otio/tests/derived.rs` re-derives it in OpenTimelineIO's
+/// arithmetic).
+const REFUSED: u64 = 132;
+
+/// `timeline`, built from `seed`, as the export writes it for `target` —
+/// `None` for [`REFUSED`], after checking it is refused exactly there.
+fn exported(seed: u64, timeline: &Timeline, target: OtioTarget) -> Option<String> {
+  match to_otio(timeline, target) {
+    Ok(text) if seed != REFUSED => Some(text),
+    Err(Refused::NotRepresentable(count)) if seed == REFUSED => {
+      assert_eq!(
+        (count.at(), count.value(), count.rate()),
+        (Spot::AbsoluteEnd(1), 320_396_075, Rate::hz(90_000))
+      );
+      None
+    }
+    other => panic!("seed {seed}: {other:?}"),
+  }
+}
+
 #[test]
 fn the_export_passes_the_self_check_for_both_targets() {
   for seed in 0..SEEDS {
     let timeline = timeline(seed);
     for target in [OtioTarget::V0_15Plus, OtioTarget::Legacy] {
-      let text = to_otio(&timeline, target).unwrap();
+      let Some(text) = exported(seed, &timeline, target) else {
+        continue;
+      };
       assert_eq!(validate_json(&text, target), Ok(()), "seed {seed}");
     }
   }
@@ -328,7 +355,9 @@ fn the_export_places_every_clip_on_its_record() {
   for seed in 0..SEEDS {
     let timeline = timeline(seed);
     let edit = timeline.edit_timebase().unwrap();
-    let text = to_otio(&timeline, OtioTarget::V0_15Plus).unwrap();
+    let Some(text) = exported(seed, &timeline, OtioTarget::V0_15Plus) else {
+      continue;
+    };
     let root: serde_json::Value = serde_json::from_str(&text).unwrap();
     let tracks = root["tracks"]["children"].as_array().unwrap();
     for (track, exported) in timeline.tracks().iter().zip(tracks) {
@@ -402,7 +431,9 @@ fn opentimelineio_reads_every_clip_back_where_its_record_puts_it() {
   for seed in 0..SEEDS {
     let timeline = timeline(seed);
     let edit = timeline.rate();
-    let text = to_otio(&timeline, OtioTarget::V0_15Plus).unwrap();
+    let Some(text) = exported(seed, &timeline, OtioTarget::V0_15Plus) else {
+      continue;
+    };
     let root: serde_json::Value = serde_json::from_str(&text).unwrap();
     let tracks = root["tracks"]["children"].as_array().unwrap();
     for (track, exported) in timeline.tracks().iter().zip(tracks) {
@@ -447,14 +478,22 @@ fn opentimelineio_reads_every_clip_back_where_its_record_puts_it() {
 }
 
 /// The ruler a clip's range is written in: frames of its medium's stated
-/// rate where the export used them, else ticks of the source's timebase.
+/// rate where the export used them, ticks of the source's timebase where it
+/// used those, else a whole number of ticks a second the export's search
+/// chose — coarser than the timebase's, as seed 208's `c0`, written in
+/// ticks of 1/67 500 s rather than 1/90 000 s, where OpenTimelineIO derives
+/// every value of its track exactly.
 fn ruler_written(clip: &Clip, rate: f64) -> Timebase {
   match clip.media().rate() {
     Some(stated) if stated.as_f64() == rate => stated.checked_to_timebase().unwrap(),
     _ => {
       let ticks = clip.source_range().timebase();
-      assert_eq!(Rate::checked_from_timebase(ticks).unwrap().as_f64(), rate);
-      ticks
+      let own = Rate::checked_from_timebase(ticks).unwrap().as_f64();
+      if own == rate {
+        return ticks;
+      }
+      assert!(rate.fract() == 0.0 && rate < own, "{rate} against {own}");
+      common::tb(1, rate as i32)
     }
   }
 }

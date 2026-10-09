@@ -41,16 +41,25 @@
 //!   a whole track; each item's visible range, widened by the handles of
 //!   the transitions beside it; each track's duration and the stack's, the
 //!   longest of them as OpenTimelineIO picks it; the global start added to
-//!   each place and each track's end — is computed as OpenTimelineIO
-//!   computes it, operation for operation, beside its exact value, and must
-//!   lie within ±2^53 in the ruler OpenTimelineIO carries it in, with
-//!   OpenTimelineIO's double less than half a tick from the exact count.
+//!   each place and each track's end; and the last tick of every range among
+//!   them, `end_time_inclusive`, which floors the range's end or takes a
+//!   tick off it by a branch OpenTimelineIO takes on its own doubles — is
+//!   computed as OpenTimelineIO computes it, operation for operation and
+//!   branch for branch, beside its exact value, and must lie within ±2^53
+//!   in the ruler OpenTimelineIO carries it in, with OpenTimelineIO's
+//!   double less than half a tick from the exact count. A range written in
+//!   one ruler ends inclusively where it exactly does: its counts whole,
+//!   OpenTimelineIO's arithmetic on them is exact.
 //!
-//! A track whose clips' rulers carry its sums past that is written again
-//! with each clip in the coarsest whole ruler its source range allows, when
-//! that holds. What nothing holds, [`to_otio`] refuses
-//! ([`Refused::NotRepresentable`]): it never writes a document
-//! OpenTimelineIO would read rounded.
+//! Where OpenTimelineIO's arithmetic would round a value, the export
+//! searches the rulers the clips it is formed from may be written in: each
+//! whole number of ticks a second that holds a clip's source range exactly,
+//! from the ruler above down to the coarsest such, at most 64 a clip —
+//! moving one clip one ruler coarser at a time, the one with the finest
+//! ruler first, the coarsest plan last. What no plan it tries holds,
+//! [`to_otio`] refuses ([`Refused::NotRepresentable`], naming the value the
+//! last plan could not hold): it never writes a document OpenTimelineIO
+//! would read rounded.
 //!
 //! A source range's length is a whole number of edit-rate ticks (validation
 //! refuses one that is not), so laying a track's items end to end puts every
@@ -110,7 +119,7 @@ pub enum OtioTarget {
 ///   not [`validate`](fn@validate): its records could not be laid end to
 ///   end, which is how OpenTimelineIO places items.
 /// - [`Refused::NotRepresentable`] for a count OpenTimelineIO would read
-///   or derive rounded, in every ruler the export may write it in: one past
+///   or derive rounded in every plan of rulers the export tries: one past
 ///   2^53, where its `f64` no longer holds every whole number, or one its
 ///   arithmetic would land half a tick off or more (see [the module's
 ///   docs](self)).
@@ -133,10 +142,10 @@ pub enum Refused {
   /// The timeline does not [`validate`](fn@validate): its refusals, as
   /// `validate` answers them.
   Validation(Vec<Refusal>),
-  /// A count OpenTimelineIO would read or derive rounded, in every ruler the
-  /// export may write it in: past 2^53, where its `f64` no longer holds
+  /// A count OpenTimelineIO would read or derive rounded in every plan of
+  /// rulers the export tries — past 2^53, where its `f64` no longer holds
   /// every whole number, or landed half a tick off or more by its
-  /// arithmetic.
+  /// arithmetic: the count the last plan tried could not hold.
   NotRepresentable(NotRepresentable),
 }
 
@@ -164,12 +173,13 @@ impl core::error::Error for Refused {}
 /// [`Refused::NotRepresentable`] carries.
 ///
 /// The count is one the export would write, or one OpenTimelineIO derives
-/// from them in its own `f64` arithmetic — a range's end, a child's place on
-/// its track or in the timeline, a visible range, a track's or the stack's
-/// duration, a place counted from the global start. Past 2^53 an `f64` no
-/// longer holds every whole number; a derived count can also come out of
-/// OpenTimelineIO's rescaling half a tick off or more. Either way a reader
-/// would get, or add up from it, a rounded time.
+/// from them in its own `f64` arithmetic — a range's end or its last tick,
+/// a child's place on its track or in the timeline, a visible range, a
+/// track's or the stack's duration, a place counted from the global start.
+/// Past 2^53 an `f64` no longer holds every whole number; a derived count
+/// can also come out of OpenTimelineIO's rescaling, or its branch on a
+/// rescaled double, half a tick off or more. Either way a reader would get,
+/// or add up from it, a rounded time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NotRepresentable {
   at: Spot,
@@ -191,7 +201,9 @@ impl NotRepresentable {
   /// past 2^53 — for a range no ruler the export may write it in holds.
   /// A count OpenTimelineIO derives is counted, exactly and to the nearest
   /// tick, in the ruler OpenTimelineIO derives it in: the highest rate among
-  /// the times it adds up.
+  /// the times it adds up. A last tick is the exact one — the range's exact
+  /// end floored, or less one tick, as the exact duration is fractional or
+  /// whole.
   pub const fn value(&self) -> i128 {
     self.value
   }
@@ -235,24 +247,26 @@ pub enum Spot {
   /// A clip's fade at one edge.
   Fade(EdgeAt),
   /// A child's place as OpenTimelineIO derives it: where it starts or ends
-  /// on its track, a sum of the items before it on the way there, the same
-  /// in the timeline, or where it starts or ends in one walk over the whole
-  /// track.
+  /// on its track — exclusively, or at its last tick, `end_time_inclusive`
+  /// — a sum of the items before it on the way there, the same in the
+  /// timeline, or where it starts or ends in one walk over the whole track.
   TrackPosition(ChildAt),
-  /// A track's duration, as OpenTimelineIO sums it; the stack's duration is
-  /// the longest of them.
+  /// A track's duration, as OpenTimelineIO sums it, or the last tick of the
+  /// track's range, which runs that duration from zero; the stack's
+  /// duration is the longest of them, and its range the longest track's.
   TrackDuration(usize),
   /// The stack's duration, which OpenTimelineIO picks by comparing the
   /// tracks' durations in `f64`: a shorter track picked where two compare
   /// equal. [`NotRepresentable::value`] is the longest track's duration.
   StackDuration,
   /// An item's visible range: its source range widened by the handles of
-  /// the transitions beside it — its start, its duration or its end.
+  /// the transitions beside it — its start, its duration, its end or its
+  /// last tick.
   Visible(ChildAt),
   /// A child's start or end in the timeline, counted from the global start.
   Absolute(ChildAt),
-  /// A track's end counted from the global start — the timeline's end, for
-  /// the longest track.
+  /// A track's end counted from the global start — exclusively or at its
+  /// last tick; the timeline's end, for the longest track.
   AbsoluteEnd(usize),
 }
 

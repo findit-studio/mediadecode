@@ -58,6 +58,32 @@ impl Read {
       rate: duration.rate,
     })
   }
+
+  /// `TimeRange::end_time_inclusive` (`timeRange.h` 88–102): past one
+  /// tick, the end floored where the duration is not whole, else the end
+  /// less one tick; else the start.
+  fn end_inclusive(start: Self, duration: Self) -> Self {
+    let end = Self::end(start, duration);
+    let start_there = Self {
+      value: start.at(duration.rate),
+      rate: duration.rate,
+    };
+    if end.minus(start_there).value > 1.0 {
+      if duration.value != duration.value.floor() {
+        Self {
+          value: end.value.floor(),
+          rate: end.rate,
+        }
+      } else {
+        end.minus(Self {
+          value: 1.0,
+          rate: duration.rate,
+        })
+      }
+    } else {
+      start
+    }
+  }
 }
 
 /// A `RationalTime.1` object, read.
@@ -152,8 +178,8 @@ fn track_duration(kids: &[Kid]) -> Read {
 
 /// `Item::visible_range` (`item.cpp` 60–85): the source range widened by
 /// the `in_offset` of a transition before the item and the `out_offset` of
-/// one after it. Its start and end.
-fn visible(kids: &[Kid], index: usize) -> (Read, Read) {
+/// one after it. Its start and duration.
+fn visible_range(kids: &[Kid], index: usize) -> (Read, Read) {
   let Kid::Item {
     mut start,
     mut duration,
@@ -168,6 +194,12 @@ fn visible(kids: &[Kid], index: usize) -> (Read, Read) {
   if let Some(Kid::Transition { out_offset, .. }) = kids.get(index + 1) {
     duration = duration.plus(*out_offset);
   }
+  (start, duration)
+}
+
+/// The visible range's start and end.
+fn visible(kids: &[Kid], index: usize) -> (Read, Read) {
+  let (start, duration) = visible_range(kids, index);
   (start, Read::end(start, duration))
 }
 
@@ -585,5 +617,276 @@ fn a_tracks_end_from_the_global_start_past_2_53_is_refused() {
   assert_eq!(
     refused(&thirds_then_seconds(0, seconds, 1)),
     (Spot::AbsoluteEnd(0), i128::from(TWO_53) + 1, Rate::hz(3))
+  );
+}
+
+/// Codex round 4's first case: at 7 fps, `a`, then `b` — 360 287 970 189 200
+/// frames of a 25 fps medium from frame 1 099 511 627 816 — then `c`, a
+/// dissolve reaching `head` ticks into `a` before the cut into `b`, and one
+/// reaching 1 099 511 627 815 ticks into `c` after the cut out of `b`. No
+/// available range is known, so validation holds no handle; no clip has a
+/// coarser ruler.
+fn widened(head: u64) -> Timeline {
+  let seven = tb(1, 7);
+  let (a, c) = (1_125_899_906_843_277_i64, 1_099_511_627_815_i64);
+  let (from, frames) = (1_099_511_627_816_i64, 360_287_970_189_200_i64);
+  let b = frames * 7 / 25;
+  Timeline::new("t", Rate::hz(7)).with_track(
+    video([
+      placed(
+        "a",
+        TimeRange::new(1, 1 + a, seven),
+        TimeRange::new(0, a, seven),
+      ),
+      placed(
+        "b",
+        TimeRange::new(from, from + frames, tb(1, 25)),
+        TimeRange::new(a, a + b, seven),
+      ),
+      placed(
+        "c",
+        TimeRange::new(1, 1 + c, seven),
+        TimeRange::new(a + b, a + b + c, seven),
+      ),
+    ])
+    .with_transition(Transition::dissolve(
+      Timestamp::new(a, seven),
+      Duration::new(head, seven),
+      Duration::new(0, seven),
+    ))
+    .with_transition(Transition::dissolve(
+      Timestamp::new(a + b, seven),
+      Duration::new(0, seven),
+      Duration::new(c.unsigned_abs(), seven),
+    )),
+  )
+}
+
+#[test]
+fn a_last_tick_opentimelineio_derives_half_a_tick_off_is_refused() {
+  // `b`'s visible range starts the first dissolve's reach before its source
+  // and runs on through the second: OpenTimelineIO carries it in frames of
+  // 25 fps, every sum rounded, its start, duration and end each within half
+  // a frame of exact. But its duration rounds onto a whole number of frames,
+  // which exactly it is not, so `end_time_inclusive` takes the end less one
+  // frame instead of the end floored — half a frame early.
+  let head = 1_125_899_906_843_277;
+  assert_eq!(
+    refused(&widened(head)),
+    (
+      Spot::Visible(ChildAt::new(0, 2)),
+      365_314_309_059_212,
+      Rate::hz(25)
+    )
+  );
+  // OpenTimelineIO's arithmetic on the counts the export would write.
+  let frames = |value: f64| Read { value, rate: 25.0 };
+  let ticks = |value: f64| Read { value, rate: 7.0 };
+  let start = frames(1_099_511_627_816.0).minus(ticks(head as f64));
+  let duration = frames(360_287_970_189_200.0)
+    .plus(ticks(head as f64))
+    .plus(ticks(1_099_511_627_815.0));
+  assert_eq!(duration.value, 4_385_285_893_300_243.0);
+  assert_eq!(Read::end(start, duration).value, 365_314_309_059_212.5);
+  assert_eq!(
+    Read::end_inclusive(start, duration),
+    frames(365_314_309_059_211.5)
+  );
+  // Exactly, the reach before the cut cancels: the range ends at
+  // (7 · (from + frames) + 25 · out) / 7 frames, and its duration is no
+  // whole number of frames, so its last is that end floored.
+  let end = 7 * (1_099_511_627_816_i128 + 360_287_970_189_200) + 25 * 1_099_511_627_815;
+  assert_eq!(end, 2_557_200_163_414_487);
+  assert_eq!(end.div_euclid(7), 365_314_309_059_212);
+}
+
+#[test]
+fn a_last_tick_one_tick_inside_is_written_and_read_back_exactly() {
+  // A tick less reach before the cut, and OpenTimelineIO's visible duration
+  // of `b` is no whole number of frames either: it floors the end, onto the
+  // exact last frame.
+  let text = to_otio(&widened(1_125_899_906_843_276), OtioTarget::V0_15Plus).unwrap();
+  assert_eq!(validate_json(&text, OtioTarget::V0_15Plus), Ok(()));
+  let (start, duration) = visible_range(&kids(&text, 0), 2);
+  assert_eq!(duration.value, 4_385_285_893_300_239.5);
+  assert_eq!(
+    Read::end_inclusive(start, duration),
+    Read {
+      value: 365_314_309_059_212.0,
+      rate: 25.0
+    }
+  );
+}
+
+/// The generator's seed 132, its track 1, alone: at 29.97 fps from frame
+/// 106 560, an 18-frame gap, `a` in 48 kHz samples, a dissolve, then `b` in
+/// ticks of 1/90 000 s — neither with a coarser ruler.
+fn from_frame_106_560() -> Timeline {
+  let edit = tb(1001, 30_000);
+  Timeline::new("t", Rate::FPS_29_97)
+    .with_start(Timestamp::new(106_560, edit))
+    .with_track(
+      video([
+        placed(
+          "a",
+          TimeRange::new(69, 136_205, tb(1, 48_000)),
+          TimeRange::new(18, 103, edit),
+        ),
+        placed(
+          "b",
+          TimeRange::new(45_196, 132_283, tb(1, 90_000)),
+          TimeRange::new(103, 132, edit),
+        ),
+      ])
+      .with_transition(Transition::dissolve(
+        Timestamp::new(103, edit),
+        Duration::new(15, edit),
+        Duration::new(9, edit),
+      )),
+    )
+}
+
+#[test]
+fn a_tracks_last_tick_from_the_global_start_opentimelineio_reads_late_is_refused() {
+  // Exactly the track is 396 396 ticks of 1/90 000 s — a frame is 3003 of
+  // them — but OpenTimelineIO adds its frames up in samples first, where
+  // they are no whole number, and lands an ulp short of whole. So its range
+  // from the global start, as OpenTimelineIO's tools form one, ends
+  // inclusively at its end floored — and that end rounds up onto
+  // 320 396 076, a tick past the last.
+  assert_eq!(
+    refused(&from_frame_106_560()),
+    (Spot::AbsoluteEnd(0), 320_396_075, Rate::hz(90_000))
+  );
+  let frames = |value: f64| Read {
+    value,
+    rate: Rate::FPS_29_97.as_f64(),
+  };
+  let duration = [
+    frames(18.0),
+    Read {
+      value: 136_136.0,
+      rate: 48_000.0,
+    },
+    Read {
+      value: 87_087.0,
+      rate: 90_000.0,
+    },
+  ]
+  .into_iter()
+  .fold(
+    Read {
+      value: 0.0,
+      rate: 1.0,
+    },
+    Read::plus,
+  );
+  assert_eq!(duration.value, f64::from_bits(396_396.0_f64.to_bits() - 1));
+  assert_eq!(
+    Read::end_inclusive(frames(106_560.0), duration),
+    Read {
+      value: 320_396_076.0,
+      rate: 90_000.0
+    }
+  );
+  // Exactly: from 106 560 · 3003 ticks, 396 396 long, a whole number —
+  // the end less one.
+  assert_eq!(106_560 * 3003 + 396_396 - 1, 320_396_075);
+}
+
+/// Codex round 4's `v`: thirds of a second, its triple a whole number of
+/// ninths within 2^53, its ninefold past 2^54.
+const V: i64 = 2_001_599_834_386_890;
+
+/// Codex round 4's second case and its kin: at 3 fps, `a` plays `V` thirds
+/// of a second from a third of a second into a medium counted in `a_rate`
+/// ticks a second, then `b` a third of a second from a ninth into one
+/// counted in `b_rate`.
+fn shared(a_rate: i32, b_rate: i32) -> Timeline {
+  let (a, b, third) = (i64::from(a_rate), i64::from(b_rate), tb(1, 3));
+  Timeline::new("t", Rate::hz(3)).with_track(video([
+    placed(
+      "a",
+      TimeRange::new(a / 3, a / 3 + V * a / 3, tb(1, a_rate)),
+      TimeRange::new(0, V, third),
+    ),
+    placed(
+      "b",
+      TimeRange::new(b / 9, b / 9 + b / 3, tb(1, b_rate)),
+      TimeRange::new(V, V + 1, third),
+    ),
+  ]))
+}
+
+/// `shared`'s track exported and read back: both clips written in ninths
+/// of a second, and each where its record puts it, exactly.
+fn in_ninths(timeline: &Timeline) {
+  let text = to_otio(timeline, OtioTarget::V0_15Plus).unwrap();
+  assert_eq!(validate_json(&text, OtioTarget::V0_15Plus), Ok(()));
+  let kids = kids(&text, 0);
+  let ninths = |value: i64| Read {
+    value: value as f64,
+    rate: 9.0,
+  };
+  let written: Vec<(Read, Read)> = kids
+    .iter()
+    .map(|kid| match *kid {
+      Kid::Item { start, duration } => (start, duration),
+      Kid::Transition { .. } => panic!("{kids:?}"),
+    })
+    .collect();
+  assert_eq!(
+    written,
+    [(ninths(3), ninths(3 * V)), (ninths(1), ninths(3))]
+  );
+  assert_eq!(place(&kids, 1), (ninths(3 * V), ninths(3 * V + 3)));
+  assert_eq!(track_duration(&kids), ninths(3 * V + 3));
+}
+
+#[test]
+fn clips_held_only_in_a_ruler_they_share_are_written_in_it() {
+  // Codex round 4's case: `a` in twelfths, `b` in 27ths. OpenTimelineIO
+  // carries `b`'s place in 27ths, 9v, past 2^53; in their coarsest rulers,
+  // thirds and ninths, it rescales v thirds into ninths as v · 9 / 3, a
+  // product past 2^54 that rounds: a ninth short. Ninths hold both, and
+  // `a` from a third of a second is a whole number of them too.
+  in_ninths(&shared(12, 27));
+}
+
+#[test]
+fn a_clip_only_a_ruler_between_its_own_and_its_coarsest_holds_is_written_in_it() {
+  // `b` in ninths from the start: `a` in its own twelfths carries `b`'s end
+  // through 36v / 12, in sixths and in its coarsest, thirds, through 18v / 6
+  // and 9v / 3 — products past 2^54 that round. Only ninths, between its
+  // own ruler and its coarsest, hold it.
+  in_ninths(&shared(12, 9));
+}
+
+#[test]
+fn a_clip_is_written_coarser_while_its_neighbour_keeps_its_own_ruler() {
+  // `a` in ninths, `b` in 27ths: `b` in its coarsest, ninths, holds, and
+  // `a` keeps its own ninths — written in its coarsest, thirds, too, it
+  // would carry `b`'s place through 9v / 3 again.
+  in_ninths(&shared(9, 27));
+}
+
+#[test]
+fn a_track_no_ruler_holds_is_refused_with_the_last_plan_the_search_walked() {
+  // At 1 fps, a gap of 2^53 seconds, then `a`, one second of a medium
+  // counted in halves. In halves OpenTimelineIO places `a` 2^54 halves in,
+  // past 2^53; in seconds, its coarsest ruler and its last, it starts at
+  // 2^53 and ends past it — the refusal the search ends on.
+  let timeline = Timeline::new("t", Rate::hz(1)).with_track(video([placed(
+    "a",
+    TimeRange::new(0, 2, tb(1, 2)),
+    TimeRange::new(TWO_53, TWO_53 + 1, second()),
+  )]));
+  assert_eq!(
+    refused(&timeline),
+    (
+      Spot::TrackPosition(ChildAt::new(0, 1)),
+      i128::from(TWO_53) + 1,
+      Rate::hz(1)
+    )
   );
 }

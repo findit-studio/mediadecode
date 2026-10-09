@@ -4,13 +4,14 @@
 //! writer uses: `OTIO_SCHEMA` first, then each base class's fields before
 //! the derived class's.
 //!
-//! Each track is planned, walked and written. The plan counts every child
-//! — each count written within ±2^53, the whole numbers an `f64` holds
+//! Every track is planned, then walked, then written. The plan counts every
+//! child — each count written within ±2^53, the whole numbers an `f64` holds
 //! exactly — and the walk, [`mod@derive`], forms what OpenTimelineIO
-//! derives from those counts, in its own arithmetic, holding each. A track
-//! the walk refuses is walked again with its clips in the coarsest whole
-//! rulers their source ranges allow; a track neither walk holds is refused,
-//! with the first value the first walk could not hold.
+//! derives from those counts, in its own arithmetic, holding each. Where the
+//! walk refuses a value, a search ([`settle`]) writes the clips it is formed
+//! from in coarser rulers that hold their source ranges, one clip one ruler
+//! at a time, and walks again; what no ruler it tries holds is refused, with
+//! the last walk's refusal.
 
 use alloc::{
   format,
@@ -51,15 +52,19 @@ pub(crate) fn timeline(
   let edit = Ruler::new(timeline.rate());
   let start = i128::from(timeline.start().pts());
   held(start, edit, Spot::Start)?;
-  let global = Time::written(start, edit);
-  let mut tracks = Vec::with_capacity(laid.tracks().len());
-  let mut durations = Vec::with_capacity(laid.tracks().len());
-  for (index, laid) in laid.tracks().iter().enumerate() {
-    let (children, duration) = settle(index, plan(index, laid, edit)?, edit, global)?;
-    durations.push(duration);
-    tracks.push(track(laid.track(), &children, edit, target));
-  }
-  derive::stack(&durations)?;
+  let planned = laid
+    .tracks()
+    .iter()
+    .enumerate()
+    .map(|(index, laid)| plan(index, laid, edit))
+    .collect::<Result<Vec<_>, _>>()?;
+  let settled = settle(planned, edit, Time::written(start, edit))?;
+  let tracks = laid
+    .tracks()
+    .iter()
+    .zip(&settled)
+    .map(|(laid, children)| track(laid.track(), children, edit, target))
+    .collect();
   Ok(object(vec![
     ("OTIO_SCHEMA", text("Timeline.1")),
     ("metadata", metadata(Vec::new(), timeline.metadata())),
@@ -191,39 +196,164 @@ fn clip_planned(clip: &Clip, at: ClipAt) -> Result<Planned<'_>, NotRepresentable
   })
 }
 
-/// The track as planned when the walk holds it, else as planned with each
-/// clip in the coarsest whole ruler its source range allows, where that is
-/// coarser than its own — the rate OpenTimelineIO carries the track's sums
-/// in is the highest among them — when the walk holds that. Answers the
-/// children to write and the track's duration as OpenTimelineIO sums it;
-/// refuses with the first walk's refusal.
+/// The most rulers the search tries for one clip, its plan's among them.
+const RULERS: i32 = 64;
+
+/// A clip the search may write in another ruler: its track, its index among
+/// the track's planned children — which is its index among the track's
+/// OpenTimelineIO children, [`ChildAt::child`](super::ChildAt::child) — the
+/// rulers it may be written in, finest first ([`rulers`]), and the one it is
+/// written in.
+struct Choice {
+  track: usize,
+  child: usize,
+  rulers: Vec<Counted>,
+  at: usize,
+}
+
+/// The tracks as planned, each clip's source range in the ruler the search
+/// settles it in — or the refusal of the last walk the search makes.
+///
+/// The search starts with every clip in its plan's ruler and walks the
+/// tracks in order, then the stack ([`walk`]). Where a walk refuses a
+/// value, one clip is written one ruler coarser and the walk is made again:
+/// of the clips the refused value is formed from, the one whose ruler is
+/// now the finest ([`step`]) — the finest rate among the times OpenTimelineIO
+/// adds is the one it carries their sum in. A clip moves only towards its
+/// coarsest ruler and never back, and a track a walk has held is walked
+/// again only once one of its clips moves. The search ends at the first
+/// walk that holds every value, or refuses with the walk after which no
+/// clip of the refused value's track — of the timeline, for the stack's
+/// duration — can move: the last walk, every one of those clips in the last
+/// ruler of its list, its coarsest — the all-coarsest plan, tried last.
+///
+/// It ends, and within a bound. Each refused walk either moves one clip one
+/// place along its list of rulers, which is at most [`RULERS`] long, or
+/// ends the search. The clips' places, summed, start at zero, rise by one
+/// at each move and never pass `n · (RULERS − 1)` for `n` clips: at most
+/// that many moves, so at most `1 + n · (RULERS − 1)` walks. Within them a
+/// track is walked once, and once more each time one of its clips moves —
+/// at most `t + n · (RULERS − 1)` walks of a track, for `t` tracks.
 fn settle<'a>(
-  index: usize,
-  planned: Vec<Planned<'a>>,
+  mut tracks: Vec<Vec<Planned<'a>>>,
   edit: Ruler,
   global: Time,
-) -> Result<(Vec<Planned<'a>>, Time), NotRepresentable> {
-  let refusal = match derive::track(index, &walked(&planned, edit), global) {
-    Ok(duration) => return Ok((planned, duration)),
-    Err(refusal) => refusal,
-  };
-  let mut coarser = planned;
-  let mut changed = false;
-  for child in &mut coarser {
-    if let Planned::Clip { clip, source, .. } = child {
-      let range = clip.source_range();
-      if let Some(counted) = coarsest(range, length_of(range))
-        .filter(|counted| counted.held() && counted.ruler.otio() < source.ruler.otio())
-      {
-        *source = counted;
-        changed = true;
+) -> Result<Vec<Vec<Planned<'a>>>, NotRepresentable> {
+  let mut choices = Vec::new();
+  for (track, children) in tracks.iter().enumerate() {
+    for (child, planned) in children.iter().enumerate() {
+      if let Planned::Clip { clip, source, .. } = planned {
+        let rulers = rulers(clip.source_range(), *source);
+        if rulers.len() > 1 {
+          choices.push(Choice {
+            track,
+            child,
+            rulers,
+            at: 0,
+          });
+        }
       }
     }
   }
-  if changed && let Ok(duration) = derive::track(index, &walked(&coarser, edit), global) {
-    return Ok((coarser, duration));
+  let mut durations = vec![None; tracks.len()];
+  loop {
+    let refusal = match walk(&tracks, &mut durations, edit, global) {
+      Ok(()) => return Ok(tracks),
+      Err(refusal) => refusal,
+    };
+    let Some(moved) = step(&choices, refusal.at) else {
+      return Err(refusal);
+    };
+    let choice = &mut choices[moved];
+    choice.at += 1;
+    if let Planned::Clip { source, .. } = &mut tracks[choice.track][choice.child] {
+      *source = choice.rulers[choice.at];
+    }
+    durations[choice.track] = None;
   }
-  Err(refusal)
+}
+
+/// Walks each track not yet walked in its present plan, in order, keeping
+/// its duration as OpenTimelineIO sums it in `durations`, then the stack.
+fn walk(
+  tracks: &[Vec<Planned<'_>>],
+  durations: &mut [Option<Time>],
+  edit: Ruler,
+  global: Time,
+) -> Result<(), NotRepresentable> {
+  for (index, (children, duration)) in tracks.iter().zip(durations.iter_mut()).enumerate() {
+    if duration.is_none() {
+      *duration = Some(derive::track(index, &walked(children, edit), global)?);
+    }
+  }
+  let durations: Vec<Time> = durations.iter().flatten().copied().collect();
+  derive::stack(&durations)
+}
+
+/// The clip [`settle`] moves one ruler coarser after a walk refused a value
+/// at `at`, among the clips that can still move: of the clips the value is
+/// formed from, the one whose ruler is the finest, the later on a tie — for
+/// a place on a track or from the global start, the clips up to the child
+/// it names; for a visible range, the item's own; for a track's duration or
+/// its end, the track's; for the stack's duration, every clip. Where none of
+/// those can move, the finest of the track's clips (of every clip, for the
+/// stack's). `None` once none of those can move either.
+fn step(choices: &[Choice], at: Spot) -> Option<usize> {
+  match at {
+    Spot::TrackPosition(child) | Spot::Absolute(child) => finest(choices, |choice| {
+      choice.track == child.track() && choice.child <= child.child()
+    })
+    .or_else(|| finest(choices, |choice| choice.track == child.track())),
+    Spot::Visible(child) => finest(choices, |choice| {
+      choice.track == child.track() && choice.child == child.child()
+    })
+    .or_else(|| finest(choices, |choice| choice.track == child.track())),
+    Spot::TrackDuration(track) | Spot::AbsoluteEnd(track) => {
+      finest(choices, |choice| choice.track == track)
+    }
+    // The stack's pick weighs every track; the other spots are the plan's,
+    // which a walk never refuses.
+    _ => finest(choices, |_| true),
+  }
+}
+
+/// Of the `choices` that can still move and that `reaches` names, the one
+/// whose ruler is the finest, the later on a tie.
+fn finest(choices: &[Choice], reaches: impl Fn(&Choice) -> bool) -> Option<usize> {
+  choices
+    .iter()
+    .enumerate()
+    .filter(|(_, choice)| choice.at + 1 < choice.rulers.len() && reaches(choice))
+    .max_by_key(|&(index, choice)| (choice.rulers[choice.at].ruler.exact(), index))
+    .map(|(index, _)| index)
+}
+
+/// The rulers the search may write a clip's source range in, finest first:
+/// the plan's, `planned`, then every whole rate coarser than it that holds
+/// the range exactly — the multiples of the coarsest, [`coarsest_rate`] —
+/// down to the coarsest. At most [`RULERS`]: past that, the plan's and the
+/// `RULERS − 1` coarsest, which shrink its counts the most. A coarser ruler
+/// counts the range in smaller counts than the plan's, so each is held.
+///
+/// The available range keeps the ruler its plan gave it: OpenTimelineIO
+/// derives nothing from it but its own two ends.
+fn rulers(range: TimeRange, planned: Counted) -> Vec<Counted> {
+  let mut rulers = vec![planned];
+  let length = length_of(range);
+  if let Some(coarsest) = coarsest_rate(range, length) {
+    let rate = planned.ruler.exact();
+    // The multiples m · coarsest below the plan's rate, num / den: those
+    // with m · coarsest · den < num.
+    let below =
+      (i128::from(rate.num()) - 1) / (i128::from(coarsest) * i128::from(rate.den().get()));
+    let most = i32::try_from(below.min(i128::from(RULERS - 1))).unwrap_or(0);
+    rulers.extend(
+      (1..=most)
+        .rev()
+        .filter_map(|multiple| whole(range, length, multiple * coarsest)),
+    );
+  }
+  rulers
 }
 
 /// The planned children as the walk reads them.
@@ -420,7 +550,7 @@ fn transition(metadata: Value, in_offset: Value, out_offset: Value) -> Value {
 /// 1. frames of the medium's stated rate, when both land on whole frames;
 /// 2. ticks of the range's own timebase;
 /// 3. the coarsest ruler of a whole number of ticks a second in which both
-///    land on a tick ([`coarsest`]).
+///    land on a tick ([`coarsest_rate`]).
 ///
 /// A range none holds is refused with its own count past 2^53.
 fn media_range(
@@ -443,7 +573,8 @@ fn media_range(
   let Some(value) = ticks.past_exact() else {
     return Ok(ticks);
   };
-  coarsest(range, length)
+  coarsest_rate(range, length)
+    .and_then(|per_second| whole(range, length, per_second))
     .filter(Counted::held)
     .ok_or(NotRepresentable {
       at,
@@ -471,7 +602,10 @@ impl Counted {
   }
 
   /// The first of the start, the length and the end OpenTimelineIO derives
-  /// from them (the two added, in this one ruler) past ±2^53.
+  /// from them (the two added, in this one ruler) past ±2^53. Its last tick,
+  /// `end_time_inclusive` — the end less one tick, or the start for a range
+  /// of one tick or none — lies between them, and OpenTimelineIO computes it
+  /// exactly in one ruler ([`mod@derive`]): held with them.
   fn past_exact(self) -> Option<i128> {
     [self.start, self.length, self.start + self.length]
       .into_iter()
@@ -491,18 +625,17 @@ impl Counted {
 }
 
 /// The coarsest ruler of a whole number of ticks a second in which `range`
-/// starts and runs `length` on whole ticks, both recounted there by
-/// `mediatime`'s exact rescale; `None` for a range in a degenerate timebase,
-/// which a valid timeline never counts one in.
+/// starts and runs `length` on whole ticks, as its ticks a second; `None`
+/// for a range in a degenerate timebase, which a valid timeline never
+/// counts one in.
 ///
 /// `n` ticks of `num/den` seconds are a whole number of ticks of `1/r`
 /// seconds exactly when `den` divides `n·num·r`. For the start and the
 /// length together that is when `den` divides `g·num·r`, `g` their greatest
 /// common divisor, so the least `r` — the coarsest ruler — is
-/// `den / gcd(den, g·num)`. A whole rate is an exact `f64`. Choosing the
-/// ruler is the one sum here; the recount is `mediatime`'s, which answers
-/// only where the ruler holds the range exactly.
-fn coarsest(range: TimeRange, length: Duration) -> Option<Counted> {
+/// `den / gcd(den, g·num)`, and the whole rates that hold the range are its
+/// multiples. A whole rate is an exact `f64`.
+fn coarsest_rate(range: TimeRange, length: Duration) -> Option<i32> {
   let timebase = range.timebase();
   let num = u128::try_from(timebase.num())
     .ok()
@@ -512,7 +645,13 @@ fn coarsest(range: TimeRange, length: Duration) -> Option<Counted> {
     u128::from(range.start_pts().unsigned_abs()),
     u128::from(length.ticks()),
   );
-  let per_second = i32::try_from(den / gcd(den, common * num)).ok()?;
+  i32::try_from(den / gcd(den, common * num)).ok()
+}
+
+/// `range`, `length` long, recounted in ticks of `1/per_second` seconds by
+/// `mediatime`'s exact rescale, which answers only where both land on a
+/// tick.
+fn whole(range: TimeRange, length: Duration, per_second: i32) -> Option<Counted> {
   let ruler = Timebase::new(1, NonZeroI32::new(per_second)?);
   let start = range.start().checked_rescale_with(ruler, Rounding::Exact)?;
   let ticks = length.checked_rescale_with(ruler, Rounding::Exact)?;

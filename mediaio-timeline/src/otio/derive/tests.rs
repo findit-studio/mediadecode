@@ -153,3 +153,80 @@ fn the_stack_keeps_the_first_of_two_durations_that_compare_equal() {
   assert_eq!(stack(&[at(1, 2), at(3, 6), at(2, 4)]), Ok(()));
   assert_eq!(stack(&Vec::new()), Ok(()));
 }
+
+#[test]
+fn a_last_tick_takes_opentimelineio_s_branch_and_is_held_against_the_exact_ones() {
+  let spot = Spot::Visible(ChildAt::new(0, 0));
+  let two_53 = 1_i128 << 53;
+  // One ruler, whole counts, the end within 2^53 — every range the export
+  // writes: the end less one tick past one tick, else the start, exactly.
+  for start in [-two_53, 1 - two_53, -1, 0, 1, two_53 - 1000] {
+    for length in [0, 1, 2, 3, 1000] {
+      let last = Time::end_inclusive(at(3, start), at(3, length));
+      let exact = if length > 1 {
+        start + length - 1
+      } else {
+        start
+      };
+      assert_eq!(
+        (last.value, last.exact_count()),
+        (exact as f64, Some((exact, 1))),
+        "{start} {length}"
+      );
+      assert_eq!(last.hold(spot), Ok(()));
+    }
+  }
+  // A duration no whole number of ticks — ten thirds of a second in halves,
+  // 20/3 of them: the end floored, 6.
+  let thirds = at(3, 10).rescaled_to(Ruler::new(Rate::hz(2)));
+  let last = Time::end_inclusive(at(2, 0), thirds);
+  assert_eq!((last.value, last.exact_count()), (6.0, Some((6, 1))));
+  // One tick or less: the start, in its own rate.
+  let last = Time::end_inclusive(at(5, 7), at(2, 1));
+  assert_eq!(
+    (last.value, last.ruler.otio, last.exact_count()),
+    (7.0, 5.0, Some((7, 1)))
+  );
+  // Codex round 4: a duration whose double rounds onto a whole number,
+  // which exactly it is not — less one frame, not floored: half a frame
+  // early, refused with the exact last frame.
+  let start = at(25, 1_099_511_627_816).sub(at(7, 1_125_899_906_843_277));
+  let duration = at(25, 360_287_970_189_200)
+    .add(at(7, 1_125_899_906_843_277))
+    .add(at(7, 1_099_511_627_815));
+  assert_eq!(duration.value, 4_385_285_893_300_243.0);
+  let last = Time::end_inclusive(start, duration);
+  assert_eq!(last.value, 365_314_309_059_211.5);
+  assert_eq!(last.exact_count(), Some((365_314_309_059_212, 1)));
+  assert_eq!(
+    last
+      .hold(spot)
+      .map_err(|refused| (refused.value(), refused.rate())),
+    Err((365_314_309_059_212, Rate::hz(25)))
+  );
+}
+
+#[test]
+fn the_floor_is_std_s() {
+  let whole = 4_503_599_627_370_496.0;
+  for value in [
+    -2.5,
+    -1.0,
+    -0.5,
+    0.0,
+    0.5,
+    1.0,
+    2.5,
+    whole - 0.5,
+    0.5 - whole,
+    whole,
+    -whole,
+    1e300,
+    -1e300,
+  ] {
+    assert_eq!(floor(value), value.floor(), "{value}");
+  }
+  assert!(floor(f64::NAN).is_nan());
+  assert_eq!(floor(f64::INFINITY), f64::INFINITY);
+  assert_eq!(floor(f64::NEG_INFINITY), f64::NEG_INFINITY);
+}
