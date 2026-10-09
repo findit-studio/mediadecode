@@ -11,11 +11,10 @@ The backend-agnostic core it adapts has its own log at
 
 ## [0.16.0] — unreleased
 
-The hardware road a decode node can rely on: a committed hardware
-session reads its failures the way FFmpeg does, loses its road only on
-FFmpeg's own signals and says so by name, and changes nothing after its
-first picture — and `DecodePath::AnyHardware` is a session that is
-hardware or nothing.
+A committed hardware session reports every failure as that picture's
+own and changes nothing after its first picture; when to stop trusting
+it is the caller's policy. `DecodePath::AnyHardware` is a session that
+is hardware or nothing.
 
 ### Changed (BREAKING)
 
@@ -23,58 +22,52 @@ hardware or nothing.
   `Auto` probes at open — the platform's hardware backends in order,
   the packets taken before the first picture replayed across them, then
   software with the same packets replayed, losslessly — and at no other
-  time. A committed hardware session that loses its road reports
-  `Error::HardwareRoadLost` and refuses every later call with it, under
-  `Auto` as under every other path. The in-session degrade is gone: the
-  cold software decoder opened mid-stream, its one-GOP gap, and the
-  keyframe-anchored resync guard that watched over it.
+  time. The in-session degrade is gone: the cold software decoder opened
+  mid-stream, its one-GOP gap, and the keyframe-anchored resync guard
+  that watched over it.
 
-  **The recipe for a lost road.** Open a session on
-  `DecodePath::Software` from the same parameters and feed it forward:
-  the packet the loss was reported on, when it came from `send_packet`,
-  and every packet after it. libavcodec drops or conceals what comes
-  before the next keyframe and decodes normally from there, so a
-  keyframe-only reader loses nothing. A full decode that cannot afford
-  the gap keeps the packets since the last clean keyframe, replays them
-  into the software session, and drops the pictures it had already
-  delivered.
+- **After the first picture every failure is that picture's own error,
+  on every path, and nothing is classified or remembered.** A committed
+  hardware session reports each failure as it was minted — a refusal
+  this crate made by its name (`HwSurfaceTooLarge`,
+  `HwTransferTooLarge`, `FrameBudgetExceeded`), anything else as
+  `Error::Ffmpeg` with libavcodec's errno — and the next call reaches
+  libavcodec, as the software road reports a corrupt packet's
+  `AVERROR_INVALIDDATA` and decodes on. `flush` leaves the session
+  serving. Until now `AVERROR_EXTERNAL`, `AVERROR_BUG`, `AVERROR_BUG2`,
+  `AVERROR_UNKNOWN`, `AVERROR_INVALIDDATA` and `EINVAL` from a committed
+  backend, and a coded surface the `get_format` callback declined over
+  the caller's ceiling, became a post-commit `AllBackendsFailed`, which
+  `Auto` answered by degrading to software.
 
-- **A committed hardware session's failure is that picture's own
-  error.** The post-commit reading follows FFmpeg 9.0.1's own model of a
-  hardware failure. VideoToolbox answers a picture it fails to decode
-  with `AVERROR_UNKNOWN` and keeps the session
-  (`libavcodec/videotoolbox.c` 1075–1079); a malfunction or an
-  invalidated session is restarted on the next picture (1062–1068); and
-  H.264 returns the picture's error after logging "hardware accelerator
-  failed to decode picture" (`h264_picture.c` 206–210). So
-  `AVERROR_INVALIDDATA`, `AVERROR_UNKNOWN`, `AVERROR_BUG`, `EINVAL` and
-  the rest now come back as themselves — as the software road returns
-  its own — and the session decodes the next packet. Until now each of
-  `AVERROR_EXTERNAL`, `AVERROR_BUG`, `AVERROR_BUG2`, `AVERROR_UNKNOWN`,
-  `AVERROR_INVALIDDATA` and `EINVAL` from a committed backend became a
-  post-commit `AllBackendsFailed`: one corrupt packet, or one
-  invalidated session FFmpeg would have restarted on the very next
-  picture, ended the hardware road.
+  FFmpeg has no reliable signal that a hardware session is gone, which
+  is why none is read. In FFmpeg 9.0.1, `AVERROR_EXTERNAL` also answers
+  a single picture: VideoToolbox's frame post-processing and buffer
+  creation (`libavcodec/videotoolbox.c` 126–129 and 556–559), and every
+  failed CUDA call under NVDEC (`libavutil/cuda_check.h` 52), the decode
+  of one picture included (`nvdec.c` 662). `ENOSYS` is NVDEC's answer to
+  one HEVC picture its tables cannot describe (`nvdec_hevc.c` 200–227).
+  A hardware format `ff_get_format` withdraws says only that the
+  hwaccel's setup failed, not why (`decode.c` 1341–1343 and 1348–1357).
+  And FFmpeg recovers a VideoToolbox session itself: a malfunction or an
+  invalidated session marks it for a restart (`videotoolbox.c`
+  1076–1077), as does an H.264 SPS whose profile/level bytes differ
+  (446–450), and the next picture stops the session and starts a new one
+  (1062–1068); a restart that fails answers `AVERROR_EXTERNAL`
+  (1066–1067), and a later parameter set that marks the session again
+  has the next picture try once more.
 
-  The road is lost on FFmpeg's own signals only: `AVERROR_EXTERNAL` (a
-  failed restart, `videotoolbox.c` 1066–1067), `ENOSYS` on a picture
-  (NVDEC's HEVC tables, `nvdec_hevc.c` 200–227), and a re-creation the
-  hardware cannot take — `Error::HwFormatNotOffered`, or
-  `Error::HwSurfaceTooLarge` over the caller's ceiling. Before the first
-  picture every failure still advances the probe, as it did.
-
-- **A `VideoDecoder` that lost its road takes nothing more.**
-  `send_packet`, `send_eof` and `receive_frame` answer the same
-  `HardwareRoadLost` without reaching libavcodec, and `flush` does not
-  bring the road back. That is FFmpeg's own state: after a failed
-  restart the session holds no decoder (`videotoolbox.c` 518–522, with
-  `reconfig_needed` cleared at 1063) and answers every later picture
-  with `AVERROR_INVALIDDATA` (1071–1072), which would otherwise read as
-  one bad picture after another.
+  **When to stop trusting a hardware session is the caller's policy.**
+  The caller sees the errors, the packets' key flags and what it has
+  delivered. One recipe: after `N` consecutive failures, or one failure
+  on a packet flagged key, open a session on `DecodePath::Software` from
+  the same parameters and feed it forward — the packet the error
+  answered when it came from `send_packet`, otherwise the next one.
+  libavcodec conceals or drops what comes before the next keyframe and
+  decodes normally from there.
 
 - **`AllBackendsFailed` is the probe's alone.** Its `origin()` is always
-  `FallbackOrigin::Probe`; `FallbackOrigin::PostCommit` now marks a
-  `HardwareRoadLost`.
+  `FallbackOrigin::Probe`.
 
 - **`DecodePath` gains an arm,** `AnyHardware`, so an exhaustive `match`
   on it must name the new arm.
@@ -90,27 +83,17 @@ hardware or nothing.
   packets the probe took. `is_hardware()` answers `true` for the
   session's whole life.
 
-- **`Error::HardwareRoadLost`** and its payload `HardwareRoadLost`
-  (`backend()`, `origin()`, `source()`, `into_parts()`), exported at the
-  crate root together with `FallbackOrigin`. Its documentation carries
-  the signals and the recipe above.
-
-- **`Error::HwFormatNotOffered`**: the `ENOSYS` class at a (re-)creation,
-  named where it can be seen. VideoToolbox's `ENOSYS` for a format it
-  cannot take (`videotoolbox.c` 1020–1028) never reaches a caller:
-  `ff_get_format` discards the hwaccel's setup error and asks the
-  `get_format` callback again without the hardware format (`decode.c`
-  1341–1357), and the codec reports the decline as `AVERROR_INVALIDDATA`
-  (H.264, `h264dec.c` 1061–1066) or `-1` (HEVC, `hevc/hevcdec.c`
-  3260–3264) — the words of a corrupt picture. The callback now records
-  the decline and the hardware funnels name it: while the probe runs, in
-  the attempt log where the codec's errno stood; after commit, as the
-  cause of the lost road.
-
 ### Removed (BREAKING)
 
-- **`VideoDecodeError::PostCommitNeverResynced`** and its payload: the
-  post-commit degrade whose lost tail it reported is gone.
+- **`VideoDecodeError::PostCommitNeverResynced`**, its payload
+  `PostCommitNeverResynced` (`new`, `packets_lost`), and the variant's
+  generated `is_` / `unwrap_` / `try_unwrap_` accessors: the post-commit
+  degrade whose lost tail it reported is gone.
+- **`AllBackendsFailed::new_post_commit`**: no `AllBackendsFailed` is
+  raised after the first picture.
+- **`FallbackOrigin::PostCommit`** and `FallbackOrigin::is_post_commit`:
+  nothing is collected after the first picture, so no era is left for
+  it to name.
 
 ## [0.15.1] - 2026-10-05
 
