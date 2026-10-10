@@ -275,16 +275,13 @@ out reads as absent.
 
 ## Time
 
-The crate does no time arithmetic of its own: every comparison, sum and
-recount is `mediatime`'s, exact across timebases unless it names a
-rounding. Three roads `mediatime` 0.5 lacks are `mediatime` rows: a range's
-exact length as a `Duration` — meanwhile a range is measured by the checked
-difference of its ends, and one longer than `i64::MAX` ticks is refused —
-the coarsest whole-rate timebase holding a range, which the OpenTimelineIO
-export picks meanwhile from the greatest common divisor of the range's
-counts, the recount itself `mediatime`'s; and an exact number of seconds
-counted at a rate as an exact fraction, which the export forms meanwhile as
-one product of two fractions. The export also computes OpenTimelineIO's own
+The crate does no time arithmetic of its own: every comparison, sum,
+measure and recount is `mediatime`'s, exact across timebases unless it
+names a rounding. A range's exact length is `TimeRange::span` — and one
+longer than `i64::MAX` ticks is refused — the coarsest whole-rate ruler
+holding a range is `TimeRange::coarsest_whole_rate`, and an exact number
+of seconds counted at a rate, as an exact fraction, is
+`Rate::checked_count`. The export also computes OpenTimelineIO's own
 floating-point arithmetic, operation for operation, to find a count
 OpenTimelineIO would round: that arithmetic is OpenTimelineIO's, not the
 model's.

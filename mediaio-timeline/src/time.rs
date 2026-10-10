@@ -1,10 +1,10 @@
-//! Time, as `mediatime` 0.5 counts it.
+//! Time, as `mediatime` 0.5.1 counts it.
 //!
-//! The crate does no time arithmetic of its own. Every comparison, sum and
-//! recount is one of `mediatime`'s, exact across timebases unless it names a
-//! rounding:
+//! The crate does no time arithmetic of its own. Every comparison, sum,
+//! measure and recount is one of `mediatime`'s, exact across timebases
+//! unless it names a rounding:
 //!
-//! | what the crate needs | `mediatime` 0.5 |
+//! | what the crate needs | `mediatime` 0.5.1 |
 //! |---|---|
 //! | instants compared across timebases: order, overlap, a cut both records share | `Timestamp`'s `Ord` and `Eq` (`cmp_semantic`) |
 //! | a source range inside its available range | `TimeRange::contains` |
@@ -12,19 +12,11 @@
 //! | handles and blends summed across timebases | `ExactSeconds` |
 //! | a media-side range in frames only where its start and length both land on one | `checked_rescale_with(_, Rounding::Exact)` |
 //! | a media-side range recounted in another ruler that holds it: the coarsest whole-rate one, where its own rulers count past 2^53; a ruler the timeline's operands are counted in, which the export plans a source range in where none of its own rulers writes it, and an available range where none holds it whole, and which its search tries; or a coarser whole rate the search tries | `checked_rescale_with(_, Rounding::Exact)`, which answers only where the ruler holds it |
+//! | the coarsest whole-rate ruler a media-side range lands on, whose multiples are every whole rate that does | `TimeRange::coarsest_whole_rate` |
 //! | a rate as OpenTimelineIO's `f64`; a rate of zero refused | `Rate::as_f64`, `Rate::checked_to_timebase`, `Rate::checked_from_timebase` |
-//! | a range's length, or none past `i64::MAX` ticks | `Timestamp::checked_signed_duration_since` |
+//! | a range's length, or none past `i64::MAX` ticks | `TimeRange::span`, exact and total; the bound is this crate's ([`span`]) |
 //! | what OpenTimelineIO derives from an exported document, exactly: its sums, the longest track, and a range's last tick | `ExactSeconds` (`from_timestamp`, `checked_add`, `checked_sub`, `Ord`) |
-//!
-//! Three roads are missing, and are filed as `mediatime` rows rather than
-//! built here: a range's exact length as a [`Duration`] — [`span`]; the
-//! coarsest timebase of a whole number of ticks a second in which a range's
-//! ends both land on a tick, which the OpenTimelineIO export picks meanwhile
-//! from the greatest common divisor of the range's counts, handing the
-//! recount itself to `mediatime`; and an exact number of seconds counted at
-//! a rate, as an exact fraction of a tick — `ExactSeconds` recounts only to
-//! a whole tick — which the export forms meanwhile as one product of the two
-//! fractions, reduced.
+//! | a time counted in a ruler as an exact fraction of a tick, which the export holds every derived value by — `ExactSeconds` reads back only to a whole tick | `Rate::checked_count` |
 //!
 //! The export also computes OpenTimelineIO's own `f64` arithmetic, operation
 //! for operation, to find a count OpenTimelineIO would round. That is
@@ -36,22 +28,14 @@ use mediatime::{Duration, TimeRange};
 /// `range`'s length, counted in its own timebase, or `None` for a range
 /// longer than `i64::MAX` ticks.
 ///
-/// `mediatime` 0.5 measures a range as `total_pts` (an `i64` that saturates
-/// at `i64::MAX`, so two ranges of different lengths can measure alike) or
-/// `duration` (a `core::time::Duration`, truncated to the nanosecond), and
-/// has no road to its own exact [`Duration`]; that road is filed as a
-/// `mediatime` row, `TimeRange::span(&self) -> Duration`. Until it lands
-/// this takes the checked difference of the endpoints, which has no answer
-/// past `i64::MAX` ticks. No timeline needs such a range: the document's
-/// reader and [`validate`](fn@crate::validate) refuse one by name
+/// [`TimeRange::span`] measures every range exactly, up to `u64::MAX`
+/// ticks; the bound is this crate's. No timeline needs a longer range: the
+/// document's reader and [`validate`](fn@crate::validate) refuse one by name
 /// ([`Refusal::RangeTooLong`](crate::Refusal::RangeTooLong)), so a length
 /// never stands in for another.
 pub(crate) fn span(range: TimeRange) -> Option<Duration> {
-  range
-    .end()
-    .checked_signed_duration_since(&range.start())
-    .and_then(|length| u64::try_from(length.ticks()).ok())
-    .map(|ticks| Duration::new(ticks, range.timebase()))
+  let length = range.span();
+  i64::try_from(length.ticks()).is_ok().then_some(length)
 }
 
 #[cfg(test)]

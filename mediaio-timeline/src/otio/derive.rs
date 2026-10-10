@@ -287,19 +287,11 @@ impl Time {
   }
 
   /// The exact count in this ruler — the time times the exact rate — as a
-  /// numerator and a positive denominator, or `None` past `i128`.
+  /// numerator and a positive denominator in lowest terms, or `None` past
+  /// `i128`: `mediatime`'s `Rate::checked_count`.
   fn exact_count(self) -> Option<(i128, i128)> {
-    let seconds = self.seconds?;
-    let (num, den) = (seconds.num(), seconds.den().get());
-    let (rate_num, rate_den) = (
-      i128::from(self.ruler.exact.num()),
-      i128::from(self.ruler.exact.den().get()),
-    );
-    let (g1, g2) = (gcd(num, rate_den), gcd(rate_num, den));
-    Some((
-      (num / g1).checked_mul(rate_num / g2)?,
-      (den / g2).checked_mul(rate_den / g1)?,
-    ))
+    let (num, den) = self.ruler.exact.checked_count(self.seconds?)?;
+    Some((num, den.get()))
   }
 
   /// Holds the value at `at`: its exact count within ±2^53, and
@@ -373,16 +365,6 @@ fn floor(value: f64) -> f64 {
   } else {
     truncated
   }
-}
-
-/// Euclid's greatest common divisor of two magnitudes, at least 1.
-fn gcd(a: i128, b: i128) -> i128 {
-  let (mut a, mut b) = (a.unsigned_abs(), b.unsigned_abs());
-  while b != 0 {
-    (a, b) = (b, a % b);
-  }
-  // Both are counts and rates well inside `i128`; 0 only for `gcd(0, 0)`.
-  i128::try_from(a.max(1)).unwrap_or(1)
 }
 
 /// One child of a track, as the walk reads it.

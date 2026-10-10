@@ -38,7 +38,7 @@ use super::{
 };
 use crate::{
   Clip, ClipAt, Edge, EdgeAt, Fade, FadeShape, Item, Layout, MediaRef, Metadata, Timeline, Track,
-  TrackKind, TrackLayout, Transition, TransitionAt, time::span,
+  TrackKind, TrackLayout, Transition, TransitionAt,
 };
 
 /// The key under which this crate's own words ride in an object's
@@ -140,7 +140,7 @@ fn plan<'a>(
     let at = ClipAt::new(track_index, next);
     match item {
       Item::Gap(range) => {
-        let length = length_of(range).ticks();
+        let length = range.span().ticks();
         held(i128::from(length), edit, Spot::Record(at))?;
         out.push(Planned::Gap(length));
         after_gap = true;
@@ -480,22 +480,23 @@ fn operands(laid: &Layout<'_>, edit: Ruler) -> BTreeSet<Rate> {
 ///    the three of start, length and end within ±2^53 — however many there
 ///    are — finest first;
 /// 3. **free**: the whole rates below the plan's that hold it so — the
-///    multiples of the coarsest, [`coarsest_rate`] — that no operand is
-///    counted in: the [`FREE`] finest, then the [`FREE`] coarsest not among
-///    them, each band finest first ([`free_bands`]). Each counts the range
-///    in smaller counts than the plan's, so each holds it where the plan's
-///    ends it within ±2^53; a plan that cannot end it has none that can,
-///    its coarsest whole ruler being among the rulers it was planned from.
-///    A plan from the operands has none at all: it writes a range the
-///    coarsest whole ruler does not, so it is coarser than that ruler, and
-///    every whole rate that lands on the range is a multiple of it;
+///    multiples of the coarsest, [`TimeRange::coarsest_whole_rate`] — that
+///    no operand is counted in: the [`FREE`] finest, then the [`FREE`]
+///    coarsest not among them, each band finest first ([`free_bands`]).
+///    Each counts the range in smaller counts than the plan's, so each holds
+///    it where the plan's ends it within ±2^53; a plan that cannot end it
+///    has none that can, its coarsest whole ruler being among the rulers it
+///    was planned from. A plan from the operands has none at all: it writes
+///    a range the coarsest whole ruler does not, so it is coarser than that
+///    ruler, and every whole rate that lands on the range is a multiple of
+///    it;
 /// 4. the plan's again, where every other is finer: a clip with finer
 ///    rulers only ends the search in its plan's.
 ///
 /// The available range keeps the ruler its plan gave it: OpenTimelineIO
 /// derives nothing from it but its own two ends.
 fn rulers(range: TimeRange, planned: Counted, operands: &BTreeSet<Rate>) -> Vec<Counted> {
-  let length = length_of(range);
+  let length = range.span();
   let own = planned.ruler.exact();
   let mut named: Vec<Counted> = operands
     .iter()
@@ -504,9 +505,11 @@ fn rulers(range: TimeRange, planned: Counted, operands: &BTreeSet<Rate>) -> Vec<
     .filter(Counted::held)
     .collect();
   named.sort_unstable_by_key(|counted| Reverse(counted.ruler.exact()));
-  let free = coarsest_rate(range, length).map_or_else(Vec::new, |coarsest| {
-    free_bands(range, length, own, coarsest, operands)
-  });
+  let free = range
+    .coarsest_whole_rate()
+    .map_or_else(Vec::new, |coarsest| {
+      free_bands(range, length, own, coarsest.num(), operands)
+    });
   let finer = free.is_empty() && named.last().is_some_and(|last| last.ruler.exact() > own);
   let mut rulers = vec![planned];
   rulers.extend(named);
@@ -749,21 +752,22 @@ fn transition(metadata: Value, in_offset: Value, out_offset: Value) -> Value {
 /// 1. frames of the medium's stated rate, when both land on whole frames;
 /// 2. ticks of the range's own timebase ([`own_ticks`]), which always do;
 /// 3. the coarsest ruler of a whole number of ticks a second in which both
-///    land on a tick ([`coarsest_rate`]).
+///    land on a tick ([`TimeRange::coarsest_whole_rate`]).
 fn own_rulers(range: TimeRange, rate: Option<Rate>) -> [Option<Counted>; 3] {
-  let length = length_of(range);
+  let length = range.span();
   [
     rate.and_then(|rate| recount(range, length, rate)),
     Some(own_ticks(range)),
-    coarsest_rate(range, length)
-      .and_then(|per_second| recount(range, length, Rate::hz(per_second))),
+    range
+      .coarsest_whole_rate()
+      .and_then(|coarsest| recount(range, length, coarsest)),
   ]
 }
 
 /// `range` in ticks of its own timebase.
 fn own_ticks(range: TimeRange) -> Counted {
   let own = Rate::checked_from_timebase(range.timebase()).unwrap_or(Rate::hz(0));
-  Counted::new(Ruler::new(own), range.start_pts(), length_of(range).ticks())
+  Counted::new(Ruler::new(own), range.start_pts(), range.span().ticks())
 }
 
 /// A source range in the first of its own rulers ([`own_rulers`]) that holds
@@ -868,7 +872,7 @@ fn operand_plan(
   operands: &BTreeSet<Rate>,
   fits: fn(&Counted) -> bool,
 ) -> Option<Counted> {
-  let length = length_of(range);
+  let length = range.span();
   operands
     .iter()
     .rev()
@@ -948,30 +952,6 @@ impl Counted {
   }
 }
 
-/// The coarsest ruler of a whole number of ticks a second in which `range`
-/// starts and runs `length` on whole ticks, as its ticks a second; `None`
-/// for a range in a degenerate timebase, which a valid timeline never
-/// counts one in.
-///
-/// `n` ticks of `num/den` seconds are a whole number of ticks of `1/r`
-/// seconds exactly when `den` divides `n·num·r`. For the start and the
-/// length together that is when `den` divides `g·num·r`, `g` their greatest
-/// common divisor, so the least `r` — the coarsest ruler — is
-/// `den / gcd(den, g·num)`, and the whole rates that hold the range are its
-/// multiples. A whole rate is an exact `f64`.
-fn coarsest_rate(range: TimeRange, length: Duration) -> Option<i32> {
-  let timebase = range.timebase();
-  let num = u128::try_from(timebase.num())
-    .ok()
-    .filter(|&num| num != 0)?;
-  let den = u128::try_from(timebase.den().get()).ok()?;
-  let common = gcd(
-    u128::from(range.start_pts().unsigned_abs()),
-    u128::from(length.ticks()),
-  );
-  i32::try_from(den / gcd(den, common * num)).ok()
-}
-
 /// `range`, `length` long, recounted in ticks of `rate` by `mediatime`'s
 /// exact rescale, which answers only where both land on a tick.
 fn recount(range: TimeRange, length: Duration, rate: Rate) -> Option<Counted> {
@@ -979,21 +959,6 @@ fn recount(range: TimeRange, length: Duration, rate: Rate) -> Option<Counted> {
   let start = range.start().checked_rescale_with(ruler, Rounding::Exact)?;
   let ticks = length.checked_rescale_with(ruler, Rounding::Exact)?;
   Some(Counted::new(Ruler::new(rate), start.pts(), ticks.ticks()))
-}
-
-/// Euclid's greatest common divisor; `gcd(n, 0)` is `n`.
-fn gcd(mut a: u128, mut b: u128) -> u128 {
-  while b != 0 {
-    (a, b) = (b, a % b);
-  }
-  a
-}
-
-/// A range's length. Only a valid timeline is exported, and validation
-/// holds every range of it within `i64::MAX` ticks, the gaps between its
-/// records with them.
-fn length_of(range: TimeRange) -> Duration {
-  span(range).unwrap_or_default()
 }
 
 /// The metadata object: this crate's own `words` and the model's `notes`
