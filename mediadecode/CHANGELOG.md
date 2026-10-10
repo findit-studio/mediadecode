@@ -11,6 +11,28 @@ The sibling FFmpeg adapter has its own log at
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-10-10
+
+### Added
+
+- **`PacketFlags::DISPOSABLE` (`0b1_0000`)**: the demuxer states that
+  nothing references this packet (FFmpeg `AV_PKT_FLAG_DISPOSABLE`; MP4 sets
+  it from `sdtp`, Matroska from its discardable flag). Dropping such a
+  packet loses its own picture and no other, so a consumer that samples
+  pictures can skip the B pictures nothing references. The bit's ABSENCE
+  means unknown, never "referenced": many containers never mark it.
+
+### Changed (BREAKING)
+
+- **`PacketFlags` names a fourth bit.** No packet's serialized number moves:
+  `0b1_0000` is the bit FFmpeg's demuxer already set, and the set already
+  carried it as an unnamed bit (`from_bits_retain` on both serde legs), so a
+  stored 0.17 number reads back the same set, the bit now named. What changes
+  is everything that reads the named set: `PacketFlags::all()` is
+  `0b1_0111` (was `0b111`), `complement()` / `!` and the strict
+  `from_bits` include the bit, `from_bits_truncate` keeps it, and `Debug`
+  prints `DISPOSABLE` where it printed `0x10`.
+
 ## [0.17.0] - 2026-10-10
 
 Both public dependencies cross a breaking minor at once: `mediatime`

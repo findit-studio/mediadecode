@@ -1631,6 +1631,10 @@ pub(crate) fn attachment_packet_from_borrowed<C: crate::FfmpegCarrier + crate::C
 /// `PacketFlags` is a bit set whose documented lossless door is
 /// `from_bits_retain`, and every packet flag FFmpeg names lives inside
 /// the byte it carries — including the three bits nothing names yet.
+/// `AV_PKT_FLAG_DISPOSABLE` is the same bit as `PacketFlags::DISPOSABLE`,
+/// so a demuxer's "nothing references this packet" arrives under its
+/// name, and a packet the demuxer did not mark arrives without it:
+/// unknown, not referenced.
 /// A bit outside that byte cannot be carried at all, and is refused
 /// rather than dropped; the assertion below states the fact that keeps
 /// the refusal unreachable against this build.
@@ -1744,6 +1748,14 @@ const _: () = {
     "FFmpeg names a packet flag outside the byte `PacketFlags` carries",
   );
 };
+
+/// `PacketFlags::DISPOSABLE` is FFmpeg's `AV_PKT_FLAG_DISPOSABLE` bit for
+/// bit. The raw flags byte crosses the boundary unchanged on both legs,
+/// so no mapping stands between the demuxer's hint and its name.
+const _: () = assert!(
+  MdPacketFlags::DISPOSABLE.bits() as c_int == ffmpeg_next::ffi::AV_PKT_FLAG_DISPOSABLE,
+  "`PacketFlags::DISPOSABLE` is not FFmpeg's `AV_PKT_FLAG_DISPOSABLE`",
+);
 
 // ---------------------------------------------------------------------------
 //  Empty-frame placeholders for `receive_frame` destinations.
@@ -2761,6 +2773,55 @@ mod tests {
       // SAFETY: `rebuilt` owns a live `AVPacket`.
       let carried = unsafe { (*rebuilt.as_ptr()).flags };
       assert_eq!(carried, raw, "{arm} rebuilt {carried:#x} from {raw:#x}");
+    }
+  }
+
+  #[test]
+  fn the_disposable_hint_crosses_under_its_name_and_its_absence_reads_unknown() {
+    // MP4 marks a packet `AV_PKT_FLAG_DISPOSABLE` from `sdtp` and
+    // Matroska from its discardable flag; a synthesized packet stands in
+    // for either. The hint crosses on the demux road and on the copy a
+    // probe or a replay makes (`try_clone_packet`), and goes back onto
+    // the `AVPacket` a decoder is fed. A packet without it reads absent.
+    use ffmpeg_next::packet::{Mut, Ref};
+    const KEY: i32 = ffmpeg_next::ffi::AV_PKT_FLAG_KEY;
+    const DISPOSABLE: i32 = ffmpeg_next::ffi::AV_PKT_FLAG_DISPOSABLE;
+    let tb = mediadecode::Timebase::default();
+    for (raw, marked) in [
+      (DISPOSABLE, true),
+      (KEY | DISPOSABLE, true),
+      (KEY, false),
+      (0, false),
+    ] {
+      let mut packet = Packet::copy(&[1u8, 2, 3]);
+      // SAFETY: `packet` owns a live `AVPacket`; `flags` is a public
+      // field.
+      unsafe { (*packet.as_mut_ptr()).flags = raw };
+      let copy = crate::decoder::try_clone_packet(&packet).expect("a packet clones");
+      for (road, source) in [("demuxed", &packet), ("copied", &copy)] {
+        let video = video_packet_from_borrowed::<crate::Owned>(
+          source,
+          tb,
+          PacketLimits::default(),
+          crate::buffer::PayloadProvenance::CallerSupplied,
+        )
+        .expect("wrappable")
+        .expect("present");
+        assert_eq!(
+          video.flags().contains(MdPacketFlags::DISPOSABLE),
+          marked,
+          "{road} {raw:#x}"
+        );
+        let rebuilt =
+          ffmpeg_packet_from_owned_video_packet(&video, PacketLimits::default()).expect("rebuilt");
+        // SAFETY: `rebuilt` owns a live `AVPacket`.
+        let carried = unsafe { (*rebuilt.as_ptr()).flags };
+        assert_eq!(
+          carried & DISPOSABLE != 0,
+          marked,
+          "{road} {raw:#x} rebuilt as {carried:#x}"
+        );
+      }
     }
   }
 

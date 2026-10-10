@@ -16,6 +16,9 @@ bitflags! {
   ///   `AV_PKT_FLAG_CORRUPT`).
   /// - `DISCARD = 0b100` — packet should be skipped during reconstruction
   ///   (FFmpeg `AV_PKT_FLAG_DISCARD`).
+  /// - `DISPOSABLE = 0b1_0000` — the demuxer states that nothing
+  ///   references this packet (FFmpeg `AV_PKT_FLAG_DISPOSABLE`). Absent
+  ///   means unknown, never "referenced".
   ///
   /// # Text form
   ///
@@ -25,9 +28,8 @@ bitflags! {
   /// number. A flag-set grammar (`"key|discard"`) would need two shapes
   /// rather than one, because a bit this build has no constant for can
   /// only be printed as a bare literal — and there are such bits today:
-  /// FFmpeg carries `AV_PKT_FLAG_TRUSTED` (`0b0_1000`) and
-  /// `AV_PKT_FLAG_DISPOSABLE` (`0b1_0000`), which this set does not
-  /// name. Human-readable names live in `Debug` and in whatever
+  /// FFmpeg carries `AV_PKT_FLAG_TRUSTED` (`0b0_1000`), which this set
+  /// does not name. Human-readable names live in `Debug` and in whatever
   /// consumer surface wants them. This is `mediaframe::TrackDisposition`'s
   /// stance, for the same reason.
   #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
@@ -38,6 +40,13 @@ bitflags! {
     const CORRUPT = 0b010;
     /// Demuxer hint: skip this packet.
     const DISCARD = 0b100;
+    /// Demuxer hint: nothing references this packet, so dropping it
+    /// loses its own picture and no other (FFmpeg
+    /// `AV_PKT_FLAG_DISPOSABLE`; MP4 sets it from `sdtp`, Matroska from
+    /// its discardable flag). The bit's ABSENCE means unknown, never
+    /// "referenced": many containers never mark it, so a packet without
+    /// it may be disposable all the same.
+    const DISPOSABLE = 0b1_0000;
   }
 }
 
@@ -432,7 +441,7 @@ mod serde_impls {
   //! unrecognised code decode to `Unknown` — inventing a value — so the
   //! name is the only faithful shape. Here every bit pattern *is* a
   //! value, including the ones this build has no constant for
-  //! (`AV_PKT_FLAG_TRUSTED`, `AV_PKT_FLAG_DISPOSABLE`), so the number is
+  //! (`AV_PKT_FLAG_TRUSTED` among them), so the number is
   //! the only shape that carries them all. `from_bits_retain` is what
   //! keeps that round trip lossless; `from_bits` would reject the very
   //! bits the wire exists to preserve.
@@ -469,7 +478,7 @@ mod arbitrary_impls {
   //! 256 patterns is a distinct value, each named bit is set in half of
   //! them, and the unnamed bits — the ones a real FFmpeg packet does
   //! carry — appear at the same rate. Choosing from a roster of the
-  //! three named flags would generate exactly the inputs that cannot go
+  //! four named flags would generate exactly the inputs that cannot go
   //! wrong.
 
   use arbitrary::{Arbitrary, Result, Unstructured};
@@ -523,6 +532,10 @@ mod tests {
     assert_eq!(PacketFlags::KEY.bits(), 0b001);
     assert_eq!(PacketFlags::CORRUPT.bits(), 0b010);
     assert_eq!(PacketFlags::DISCARD.bits(), 0b100);
+    assert_eq!(PacketFlags::DISPOSABLE.bits(), 0b1_0000);
+    // The named census: TRUSTED (0b0_1000) and the top three bits stay
+    // unnamed, carried by `from_bits_retain`.
+    assert_eq!(PacketFlags::all().bits(), 0b1_0111);
   }
 
   #[test]
@@ -666,6 +679,24 @@ mod tests {
     }
 
     #[test]
+    fn the_disposable_bit_is_ffmpegs_number_and_its_absence_reads_unknown() {
+      // Naming the bit moved no number: `0b1_0000` is what the wire
+      // already carried for an FFmpeg packet marked
+      // `AV_PKT_FLAG_DISPOSABLE`, and now it reads back as the name.
+      let disposable = PacketFlags::KEY | PacketFlags::DISPOSABLE;
+      assert_eq!(
+        serde_json::to_string(&disposable).expect("flags always serialize"),
+        "17"
+      );
+      let read: PacketFlags = serde_json::from_str("16").expect("a number parses");
+      assert!(read.contains(PacketFlags::DISPOSABLE));
+      // A packet without the hint does not carry it; that says the demuxer
+      // stated nothing, not that the packet is referenced.
+      let unmarked: PacketFlags = serde_json::from_str("1").expect("a number parses");
+      assert!(!unmarked.contains(PacketFlags::DISPOSABLE));
+    }
+
+    #[test]
     fn a_name_is_not_a_number() {
       assert!(serde_json::from_str::<PacketFlags>(r#""KEY""#).is_err());
       assert!(serde_json::from_str::<PacketFlags>(r#""key|corrupt""#).is_err());
@@ -673,9 +704,9 @@ mod tests {
 
     #[test]
     fn every_bit_pattern_round_trips_including_the_unnamed_ones() {
-      // 0b0000_1000 and 0b0001_0000 are FFmpeg's TRUSTED / DISPOSABLE,
-      // which this set does not name. They still have to survive, which
-      // is what `from_bits_retain` buys and what `from_bits` would lose.
+      // 0b0000_1000 is FFmpeg's TRUSTED, which this set does not name.
+      // It still has to survive, which is what `from_bits_retain` buys
+      // and what `from_bits` would lose.
       for bits in 0..=u8::MAX {
         let flags = PacketFlags::from_bits_retain(bits);
         let json = serde_json::to_string(&flags).expect("flags always serialize");
