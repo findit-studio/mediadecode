@@ -30,6 +30,16 @@ what follows is only what changes here.
   checked method, which refuses an end before the start by this name. A
   consumer that moves a range's ends through this crate's re-exports can
   name the refusal without a `mediatime` dependency of its own.
+- **`mediadecode::mediatime`: the whole of `mediatime`, re-exported
+  beside the four flat names.** The re-exported primitives' own methods
+  take or answer types the flat re-exports do not name: a directed
+  rescale (`checked_rescale_with`) takes a `Rounding`, which inference
+  cannot supply; `Timestamp::parse_seconds` refuses with a
+  `ParseSecondsError`; `TimeRange::span` answers a `Duration`, and
+  `coarsest_whole_rate` a `Rate`, whose `checked_count` takes
+  `ExactSeconds`; `Timestamp`'s signed arithmetic takes and answers
+  `SignedDuration`. Each now has a path through this crate, as will
+  whatever `mediatime` adds; the four flat re-exports are unchanged.
 
 ### Changed (BREAKING)
 
@@ -50,11 +60,10 @@ what follows is only what changes here.
     `.mediatime.v1` onto `mediatime::wire` and converts at the edge.
   - The rest is additive: `TimeRange`'s comparison algebra, `span` and
     `coarsest_whole_rate`, `Timestamp::parse_seconds`, and the directed
-    and exact rescales. `Rounding`, `ParseSecondsError` and `Rate`, which
-    those take or answer, are not re-exported, as `SignedDuration` and
-    `Duration` (which `span` answers) never were: neither this crate nor
-    its two adapters names one. The serde shapes, and the message an
-    inverted range is refused with, are unchanged.
+    and exact rescales. The types those take or answer (`Rounding`,
+    `ParseSecondsError`, `Duration`, `Rate`) are reached through
+    `mediadecode::mediatime` (above). The serde shapes, and the message
+    an inverted range is refused with, are unchanged.
 
 - **`mediaframe` 0.11 → 0.12**, at the same pin as before
   (`default-features = false`, `features = ["frame"]`). Upstream 0.12.0
@@ -65,11 +74,12 @@ what follows is only what changes here.
   `mediatime`, and a `mediaframe::frame::TimestampedFrame` takes this
   crate's `Timestamp` as it is.
 
-No source line moved but the re-export: the workspace compiles clean on
+No source line moved but the re-exports: the workspace compiles clean on
 the new pins, both adapters included. `tests/time_primitives.rs` holds
-the two laws: a move that would invert a range is refused by a name this
-crate exports, and this crate's `Timestamp` is the one `mediaframe`'s
-frames carry.
+the three laws: a move that would invert a range is refused by a name
+this crate exports; every type the primitives' own methods take or
+answer has a path through this crate; and this crate's `Timestamp` is
+the one `mediaframe`'s frames carry.
 
 ### Changed
 

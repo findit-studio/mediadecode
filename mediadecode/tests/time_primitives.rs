@@ -2,9 +2,11 @@
 //!
 //! A consumer reaches `Timebase`, `Timestamp` and `TimeRange` through
 //! this crate rather than through a `mediatime` dependency of its own,
-//! so the names the range's own methods answer with have to come
-//! through here as well, and the instants have to be the ones
-//! `mediaframe`'s frames carry.
+//! so every type their own methods take or answer has to come through
+//! here as well — `InvertedRange` at the root, the rest under
+//! `mediadecode::mediatime` — and the instants have to be the ones
+//! `mediaframe`'s frames carry. Every `mediatime` path in this file is
+//! spelled through `mediadecode::`.
 
 use mediadecode::{InvertedRange, TimeRange, Timebase, Timestamp};
 use mediaframe::frame::TimestampedFrame;
@@ -61,4 +63,42 @@ fn a_timestamp_this_crate_exports_is_the_one_mediaframe_frames_carry() {
   let carried: Option<Timestamp> = frame.pts();
   assert_eq!(carried, Some(pts));
   assert_eq!(frame.duration(), Some(duration));
+}
+
+/// **Every type the primitives' own methods take or answer has a path
+/// through this crate.** The flat re-exports carry methods over
+/// `mediatime` types this crate does not re-export flat: a directed
+/// rescale takes a `Rounding`, which inference cannot supply; a decimal
+/// parse refuses with a `ParseSecondsError`; a range answers its span as a
+/// `Duration` and its coarsest whole rate as a `Rate`, whose count takes
+/// `ExactSeconds`. Each is named here through `mediadecode::mediatime`.
+#[test]
+fn every_type_the_primitives_methods_take_or_answer_has_a_path_through_this_crate() {
+  use mediadecode::mediatime::{Duration, ExactSeconds, ParseSecondsError, Rate, Rounding};
+
+  let range = TimeRange::new(100, 500, Timebase::MILLIS);
+  let span: Duration = range.span();
+  assert_eq!(span, Duration::new(400, Timebase::MILLIS));
+  let rate: Option<Rate> = range.coarsest_whole_rate();
+  assert_eq!(rate, Some(Rate::hz(10)));
+
+  let at = Timestamp::new(1_500, Timebase::MILLIS);
+  assert_eq!(
+    at.checked_rescale_with(Timebase::MPEG_90K, Rounding::Exact),
+    Some(Timestamp::new(135_000, Timebase::MPEG_90K)),
+  );
+  assert_eq!(
+    at.checked_rescale_with(Timebase::SECONDS, Rounding::Exact),
+    None,
+    "1.5 s lands on no whole second",
+  );
+
+  let refused: Result<Timestamp, ParseSecondsError> =
+    Timestamp::parse_seconds("1.0005", Timebase::MILLIS, Rounding::Exact);
+  assert_eq!(refused, Err(ParseSecondsError::BetweenTicks));
+
+  let count = Rate::hz(10)
+    .checked_count(ExactSeconds::from_timestamp(at))
+    .map(|(num, den)| (num, den.get()));
+  assert_eq!(count, Some((15, 1)), "1.5 s holds fifteen events at 10 Hz");
 }
