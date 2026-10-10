@@ -11,6 +11,28 @@ The backend-agnostic core it adapts has its own log at
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-10-10
+
+Tracks `mediadecode` 0.17.0, which crosses `mediatime` 0.4 → 0.5 and
+`mediaframe` 0.11 → 0.12 (see
+[`mediadecode` 0.17.0](../mediadecode/CHANGELOG.md#0170)). The
+workspace's three crates release in lockstep again; this crate skips
+0.16, which `mediadecode-ffmpeg` released alone.
+
+### Changed (BREAKING)
+
+- **`mediatime` 0.4 → 0.5, through `mediadecode`.** The `Timebase` and
+  `Timestamp` this adapter's API carries (`pts`, `duration`, `time_base`,
+  the caller's own pts) are `mediadecode`'s re-exports, so a consumer
+  holding a `mediatime 0.4` value no longer type-checks against this
+  release. No adapter source line moved.
+- **`mediaframe` 0.11 → 0.12**, a direct dependency here (pinned with
+  `alloc`) as well as the core's. The channel layout descriptions this
+  adapter hands out are `mediaframe`'s, so a consumer holding a
+  `mediaframe 0.11` value no longer type-checks against this release.
+  0.12's source is 0.11's but for comments, and no adapter source line
+  moved.
+
 ## [0.15.1] - 2026-10-05
 
 ### Changed

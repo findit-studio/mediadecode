@@ -11,6 +11,66 @@ The sibling FFmpeg adapter has its own log at
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-10-10
+
+Both public dependencies cross a breaking minor at once: `mediatime`
+0.4 → 0.5 and `mediaframe` 0.11 → 0.12, so a consumer holding a
+`mediatime 0.4` or `mediaframe 0.11` value no longer type-checks against
+this release. The version skips 0.16 so that the workspace's three crates
+release in lockstep again: `mediadecode-ffmpeg` 0.16.0 was released
+alone. The upstream notes are the authority
+([mediatime](https://github.com/findit-studio/mediatime/blob/main/CHANGELOG.md),
+[mediaframe](https://github.com/findit-studio/mediaframe/blob/main/CHANGELOG.md));
+what follows is only what changes here.
+
+### Added
+
+- **`InvertedRange`, re-exported beside `Timebase`, `Timestamp` and
+  `TimeRange`.** In `mediatime` 0.5 a range moves one end only by a
+  checked method, which refuses an end before the start by this name. A
+  consumer that moves a range's ends through this crate's re-exports can
+  name the refusal without a `mediatime` dependency of its own.
+
+### Changed (BREAKING)
+
+- **`mediatime` 0.4 → 0.5**, at the same pin as before
+  (`default-features = false`), resolving to 0.5.1. `Timebase`,
+  `Timestamp` and `TimeRange` are this crate's own public surface, the
+  reasoning of the 0.11.0 crossing. What reaches a consumer through the
+  re-exports:
+
+  - `TimeRange::{with_start, with_end, set_start, set_end}` are removed:
+    they assigned without checking, so a safe call could build a range
+    whose end precedes its start. `try_with_start` / `try_with_end` /
+    `try_set_start` / `try_set_end` answer `Err(InvertedRange)` and leave
+    the range as it was; `with_bounds` / `set_bounds` move both ends at
+    once and panic on an inverted pair, as `TimeRange::new` does.
+  - The three types no longer implement buffa's `Message`. This crate
+    never enables `mediatime/buffa`; a consumer that does maps
+    `.mediatime.v1` onto `mediatime::wire` and converts at the edge.
+  - The rest is additive: `TimeRange`'s comparison algebra, `span` and
+    `coarsest_whole_rate`, `Timestamp::parse_seconds`, and the directed
+    and exact rescales. `Rounding`, `ParseSecondsError` and `Rate`, which
+    those take or answer, are not re-exported, as `SignedDuration` and
+    `Duration` (which `span` answers) never were: neither this crate nor
+    its two adapters names one. The serde shapes, and the message an
+    inverted range is refused with, are unchanged.
+
+- **`mediaframe` 0.11 → 0.12**, at the same pin as before
+  (`default-features = false`, `features = ["frame"]`). Upstream 0.12.0
+  is the `mediatime` crossing above and nothing else: its source is
+  0.11.0's but for comments. The color, pixel-format and frame
+  vocabulary this crate re-exports is `mediaframe`'s, so the crossing is
+  Breaking here as well. With both crossed the graph holds one
+  `mediatime`, and a `mediaframe::frame::TimestampedFrame` takes this
+  crate's `Timestamp` as it is.
+
+No source line moved but the re-export: the workspace compiles clean on
+the new pins, both adapters included. `tests/time_primitives.rs` holds
+the two laws: a move that would invert a range is refused by a name this
+crate exports, and this crate's `Timestamp` is the one `mediaframe`'s
+frames carry.
+
 ### Changed
 
 - `adapter`'s send-direction rule now says what a decoder that hands
