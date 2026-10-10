@@ -24,7 +24,10 @@ release in lockstep.
   and the `AVPacket` rebuilt for a decoder. The hint therefore arrives
   under its name with no mapping in between, and a compile-time assertion
   pins the two bits equal. A packet the demuxer did not mark arrives
-  without it: unknown, not referenced.
+  without it: unknown, not referenced. In libavformat 9.0.1 the MP4/MOV
+  demuxer is the one that sets it, from `sdtp` (`mov.c` 11719–11723); the
+  Matroska demuxer does not map its discardable bit (`matroskadec.c`
+  4319–4320), so a Matroska packet arrives without it.
 
 ## [0.17.0] - 2026-10-10
 

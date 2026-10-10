@@ -16,11 +16,14 @@ The sibling FFmpeg adapter has its own log at
 ### Added
 
 - **`PacketFlags::DISPOSABLE` (`0b1_0000`)**: the demuxer states that
-  nothing references this packet (FFmpeg `AV_PKT_FLAG_DISPOSABLE`; MP4 sets
-  it from `sdtp`, Matroska from its discardable flag). Dropping such a
-  packet loses its own picture and no other, so a consumer that samples
-  pictures can skip the B pictures nothing references. The bit's ABSENCE
-  means unknown, never "referenced": many containers never mark it.
+  nothing references this packet (FFmpeg `AV_PKT_FLAG_DISPOSABLE`).
+  Dropping such a packet loses its own picture and no other, so a consumer
+  that samples pictures can skip the B pictures nothing references. In
+  libavformat 9.0.1 one demuxer sets it: MP4/MOV, from `sdtp`
+  (`libavformat/mov.c` 11719–11723). Matroska's discardable bit is NOT
+  mapped (`libavformat/matroskadec.c` 4319–4320 reads the keyframe bit
+  alone), so a Matroska packet reads absent. The bit's ABSENCE means
+  unknown, never "referenced": that is the rule a consumer must honour.
 
 ### Changed (BREAKING)
 

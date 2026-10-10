@@ -42,10 +42,14 @@ bitflags! {
     const DISCARD = 0b100;
     /// Demuxer hint: nothing references this packet, so dropping it
     /// loses its own picture and no other (FFmpeg
-    /// `AV_PKT_FLAG_DISPOSABLE`; MP4 sets it from `sdtp`, Matroska from
-    /// its discardable flag). The bit's ABSENCE means unknown, never
-    /// "referenced": many containers never mark it, so a packet without
-    /// it may be disposable all the same.
+    /// `AV_PKT_FLAG_DISPOSABLE`). In libavformat 9.0.1 one demuxer sets
+    /// it: MP4/MOV, from `sdtp`, for a sample nothing depends on
+    /// (`libavformat/mov.c` 11719–11723). Matroska's own discardable bit
+    /// is NOT mapped (`libavformat/matroskadec.c` reads the block's
+    /// keyframe bit alone, 4319–4320), so a Matroska packet reads absent.
+    /// The bit's ABSENCE means unknown, never "referenced": that is the
+    /// rule a consumer must honour, because most containers never mark
+    /// it, and a packet without it may be disposable all the same.
     const DISPOSABLE = 0b1_0000;
   }
 }

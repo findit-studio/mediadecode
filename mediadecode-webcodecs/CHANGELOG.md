@@ -22,7 +22,9 @@ release in lockstep.
 - **`mediadecode` 0.17 → 0.18.** WebCodecs has no counterpart to
   `PacketFlags::DISPOSABLE`: an `EncodedVideoChunk` is `key` or `delta` and
   nothing more. The flag is therefore not passed into a chunk, and this
-  backend, which demuxes nothing, never sets it.
+  backend, which demuxes nothing, never sets it. (On the FFmpeg backend,
+  libavformat 9.0.1 sets it from MP4/MOV `sdtp` alone; a Matroska packet
+  reads absent, which means unknown.)
 
 ## [0.17.0] - 2026-10-10
 

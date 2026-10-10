@@ -1634,7 +1634,10 @@ pub(crate) fn attachment_packet_from_borrowed<C: crate::FfmpegCarrier + crate::C
 /// `AV_PKT_FLAG_DISPOSABLE` is the same bit as `PacketFlags::DISPOSABLE`,
 /// so a demuxer's "nothing references this packet" arrives under its
 /// name, and a packet the demuxer did not mark arrives without it:
-/// unknown, not referenced.
+/// unknown, not referenced. In libavformat 9.0.1 the MP4/MOV demuxer is
+/// the one that sets it, from `sdtp` (`mov.c` 11719–11723); the Matroska
+/// demuxer does not map its discardable bit (`matroskadec.c` 4319–4320
+/// reads the keyframe bit alone), so a Matroska packet arrives without it.
 /// A bit outside that byte cannot be carried at all, and is refused
 /// rather than dropped; the assertion below states the fact that keeps
 /// the refusal unreachable against this build.
@@ -2778,11 +2781,14 @@ mod tests {
 
   #[test]
   fn the_disposable_hint_crosses_under_its_name_and_its_absence_reads_unknown() {
-    // MP4 marks a packet `AV_PKT_FLAG_DISPOSABLE` from `sdtp` and
-    // Matroska from its discardable flag; a synthesized packet stands in
-    // for either. The hint crosses on the demux road and on the copy a
-    // probe or a replay makes (`try_clone_packet`), and goes back onto
-    // the `AVPacket` a decoder is fed. A packet without it reads absent.
+    // libavformat 9.0.1's MP4/MOV demuxer marks a packet
+    // `AV_PKT_FLAG_DISPOSABLE` from `sdtp` (`mov.c` 11719–11723); a
+    // synthesized packet stands in for one. The Matroska demuxer never
+    // marks it (`matroskadec.c` 4319–4320), so its packets are the
+    // unmarked rows below; no Matroska fixture is at hand to demux one
+    // here. The hint crosses on the demux road and on the copy a probe
+    // or a replay makes (`try_clone_packet`), and goes back onto the
+    // `AVPacket` a decoder is fed. A packet without it reads absent.
     use ffmpeg_next::packet::{Mut, Ref};
     const KEY: i32 = ffmpeg_next::ffi::AV_PKT_FLAG_KEY;
     const DISPOSABLE: i32 = ffmpeg_next::ffi::AV_PKT_FLAG_DISPOSABLE;
