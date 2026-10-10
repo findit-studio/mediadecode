@@ -9,6 +9,26 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 The backend-agnostic core it adapts has its own log at
 [`mediadecode/CHANGELOG.md`](../mediadecode/CHANGELOG.md).
 
+## [0.18.0] - 2026-10-10
+
+Tracks `mediadecode` 0.18.0, whose `PacketFlags` names `DISPOSABLE` (see
+[`mediadecode` 0.18.0](../mediadecode/CHANGELOG.md#0180)). The three crates
+release in lockstep.
+
+### Changed (BREAKING)
+
+- **`mediadecode` 0.17 → 0.18**, and with it `AV_PKT_FLAG_DISPOSABLE`
+  arrives as `PacketFlags::DISPOSABLE`. The raw flags byte already crossed
+  the boundary bit for bit on every packet road: the demuxer's packets, the
+  copies the probe and a replay make (`try_clone_packet` keeps the flags),
+  and the `AVPacket` rebuilt for a decoder. The hint therefore arrives
+  under its name with no mapping in between, and a compile-time assertion
+  pins the two bits equal. A packet the demuxer did not mark arrives
+  without it: unknown, not referenced. In libavformat 9.0.1 the MP4/MOV
+  demuxer is the one that sets it, from `sdtp` (`mov.c` 11719–11723); the
+  Matroska demuxer does not map its discardable bit (`matroskadec.c`
+  4319–4320), so a Matroska packet arrives without it.
+
 ## [0.17.0] - 2026-10-10
 
 Tracks `mediadecode` 0.17.0, which crosses `mediatime` 0.4 → 0.5 and
