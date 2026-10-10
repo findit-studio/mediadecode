@@ -9,6 +9,32 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 The backend-agnostic core it adapts has its own log at
 [`mediadecode/CHANGELOG.md`](../mediadecode/CHANGELOG.md).
 
+## [0.17.0] - 2026-10-10
+
+Tracks `mediadecode` 0.17.0, which crosses `mediatime` 0.4 → 0.5 and
+`mediaframe` 0.11 → 0.12 (see
+[`mediadecode` 0.17.0](../mediadecode/CHANGELOG.md#0170)). The
+workspace's three crates release in lockstep again: 0.16.0 was this
+crate's alone, released ahead of the core and the WebCodecs adapter,
+which both skip 0.16.
+
+### Changed (BREAKING)
+
+- **`mediatime` 0.4 → 0.5, through `mediadecode`.** Every `Timebase`,
+  `Timestamp` and `TimeRange` in this crate's API is `mediadecode`'s
+  re-export, so a consumer holding a `mediatime 0.4` value no longer
+  type-checks against this release. No source line here moved: this
+  crate calls none of the `TimeRange` setters 0.5 removed and never
+  enables `mediatime/buffa`, and no `Timebase` or `Timestamp` method
+  changed its code.
+- **`mediaframe` 0.11 → 0.12**, a direct dependency here (pinned with
+  `alloc`) as well as the core's. This crate's API carries `mediaframe`
+  values — the channel layout descriptions, `frame::Rotation`, and the
+  pixel-format and color vocabulary — so a consumer holding a
+  `mediaframe 0.11` value no longer type-checks against this release.
+  0.12's source is 0.11's but for comments, on `mediatime` 0.5, so the
+  graph holds one `mediatime`. No source line here moved.
+
 ## [0.16.0] - 2026-10-10
 
 A committed hardware session reports every decoder failure as that

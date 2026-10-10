@@ -86,7 +86,11 @@ bytes. Adapter implementations live in sibling crates such as
   that is always the caller's options.
 - **Time primitives** — re-exported `Timebase` / `Timestamp` /
   `TimeRange` from [`mediatime`](https://crates.io/crates/mediatime),
-  so consumers don't need a separate dep.
+  with `InvertedRange`, the refusal a range's checked moves answer when
+  its end would precede its start, and the rest of `mediatime` as
+  `mediadecode::mediatime`, where every type their methods take or
+  answer (`Rounding`, `Duration`, `Rate`, …) is named — so consumers
+  don't need a separate dep.
 
 ## API style
 
@@ -136,7 +140,7 @@ parameter is generic, so this crate names no channel type at all.
 
 ```toml
 [dependencies]
-mediadecode = { version = "0.8", default-features = false, features = ["alloc"] }
+mediadecode = { version = "0.17", default-features = false, features = ["alloc"] }
 ```
 
 ## Usage

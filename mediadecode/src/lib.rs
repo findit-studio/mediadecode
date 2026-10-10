@@ -37,5 +37,13 @@ pub use pixel_format::PixelFormat;
 pub use rhythm::{Received, Sent};
 
 // Re-export the time primitives so consumers don't have to add a
-// separate `mediatime` dependency.
-pub use mediatime::{TimeRange, Timebase, Timestamp};
+// separate `mediatime` dependency. Four names sit at the root: the three
+// primitives, and `InvertedRange`, because a `TimeRange` moves one end
+// only by a checked method, which refuses an end before the start by that
+// name. The rest of `mediatime` is reachable as `mediadecode::mediatime`,
+// so every type the primitives' own methods take or answer (`Rounding`,
+// `SignedDuration`, `Duration`, `Rate`, `ParseSecondsError`, ...) has a
+// path through this crate as well.
+pub use mediatime::{InvertedRange, TimeRange, Timebase, Timestamp};
+
+pub use mediatime;
