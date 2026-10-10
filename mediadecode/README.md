@@ -86,7 +86,9 @@ bytes. Adapter implementations live in sibling crates such as
   that is always the caller's options.
 - **Time primitives** — re-exported `Timebase` / `Timestamp` /
   `TimeRange` from [`mediatime`](https://crates.io/crates/mediatime),
-  so consumers don't need a separate dep.
+  so consumers don't need a separate dep, with `InvertedRange`, the
+  refusal a range's checked moves answer when its end would precede
+  its start.
 
 ## API style
 
