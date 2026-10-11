@@ -1,10 +1,10 @@
 //! A document's own notes.
 
-use alloc::{
+use core::fmt;
+use std::{
   collections::{BTreeMap, btree_map::Entry},
   string::String,
 };
-use core::fmt;
 
 use serde::{
   Deserialize, Deserializer, Serialize, Serializer,

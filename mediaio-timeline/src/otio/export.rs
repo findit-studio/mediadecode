@@ -20,16 +20,11 @@
 //! tries holds is refused, with the last walk's refusal and what the search
 //! tried.
 
-use alloc::{
-  collections::BTreeSet,
-  format,
-  string::{String, ToString},
-  vec,
-  vec::Vec,
-};
 use core::cmp::Reverse;
+use std::{collections::BTreeSet, format, string::ToString, vec, vec::Vec};
 
 use mediatime::{Duration, Rate, Rounding, TimeRange};
+use smol_bytes::Utf8Bytes;
 
 use super::{
   NotRepresentable, OtioTarget, RulerSearch, Spot,
@@ -634,7 +629,7 @@ fn track(track: &Track, children: &[Planned<'_>], edit: Ruler, target: OtioTarge
 fn clip(clip: &Clip, source: Counted, available: Option<Counted>, target: OtioTarget) -> Value {
   let mut words = vec![("id", text(clip.id().as_str()))];
   if let Some(gain) = clip.gain() {
-    words.push(("gain_db", Value::Number(format!("{:?}", gain.db()))));
+    words.push(("gain_db", Value::Number(format!("{:?}", gain.db()).into())));
   }
   let mut members = vec![
     (
@@ -967,7 +962,7 @@ fn metadata(mut words: Vec<(&'static str, Value)>, notes: &Metadata) -> Value {
   if !notes.is_empty() {
     let notes = notes
       .iter()
-      .map(|(key, value)| (String::from(key), text(value)))
+      .map(|(key, value)| (Utf8Bytes::from(key), text(value)))
       .collect();
     words.push(("metadata", Value::Object(notes)));
   }
@@ -984,7 +979,7 @@ fn metadata(mut words: Vec<(&'static str, Value)>, notes: &Metadata) -> Value {
 fn rational_time(ruler: Ruler, count: i128) -> Value {
   object(vec![
     ("OTIO_SCHEMA", text("RationalTime.1")),
-    ("rate", Value::Number(format!("{:?}", ruler.otio()))),
+    ("rate", Value::Number(format!("{:?}", ruler.otio()).into())),
     ("value", number(count)),
   ])
 }
@@ -1019,18 +1014,18 @@ fn held(value: i128, ruler: Ruler, at: Spot) -> Result<(), NotRepresentable> {
 
 /// A whole count written as `86400.0`, from the integer's own digits.
 fn number(value: i128) -> Value {
-  Value::Number(format!("{value}.0"))
+  Value::Number(format!("{value}.0").into())
 }
 
 fn text(value: &str) -> Value {
-  Value::String(String::from(value))
+  Value::String(Utf8Bytes::from(value))
 }
 
 fn object(members: Vec<(&'static str, Value)>) -> Value {
   Value::Object(
     members
       .into_iter()
-      .map(|(key, value)| (String::from(key), value))
+      .map(|(key, value)| (Utf8Bytes::from(key), value))
       .collect(),
   )
 }

@@ -42,11 +42,13 @@
 //! on a transition, an effect's or a marker's own fields, an image bound's
 //! corners.
 
-use alloc::{format, string::String};
+use std::format;
+
+use smol_bytes::Utf8Bytes;
 
 use super::{OtioTarget, Shape, json::Value};
 
-type Members = [(String, Value)];
+type Members = [(Utf8Bytes, Value)];
 
 pub(crate) fn timeline(root: &Value, target: OtioTarget) -> Result<(), Shape> {
   let path = "$";
@@ -276,8 +278,12 @@ fn schema_name<'a>(members: &'a Members, path: &str) -> Result<&'a str, Shape> {
     .ok_or_else(|| shape(&format!("{path}.OTIO_SCHEMA"), "a schema name"))
 }
 
-fn required<'a>(members: &'a Members, path: &str, key: &str) -> Result<(&'a Value, String), Shape> {
-  let at = format!("{path}.{key}");
+fn required<'a>(
+  members: &'a Members,
+  path: &str,
+  key: &str,
+) -> Result<(&'a Value, Utf8Bytes), Shape> {
+  let at = Utf8Bytes::from(format!("{path}.{key}"));
   match member(members, key) {
     Some(value) => Ok((value, at)),
     None => Err(shape(&at, "a required key")),
@@ -332,7 +338,7 @@ fn string_value<'a>(value: &'a Value, path: &str) -> Result<&'a str, Shape> {
 
 fn shape(path: &str, expected: &'static str) -> Shape {
   Shape {
-    path: String::from(path),
+    path: Utf8Bytes::from(path),
     expected,
   }
 }

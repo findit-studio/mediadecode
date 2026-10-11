@@ -1,10 +1,11 @@
 //! A clip, the medium it reads, and the gain and fades applied to it.
 
-use alloc::string::String;
 use core::fmt;
 
 use mediatime::{Duration, Rate, TimeRange};
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+use smol_bytes::Utf8Bytes;
 
 use crate::Metadata;
 
@@ -29,11 +30,12 @@ use crate::Metadata;
 /// clip. Its name and its medium may repeat: a cut back to one shot, or a
 /// loop of it, places one medium twice, under two ids. `speed` is reserved
 /// for a later schema; it is no part of schema 1.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 pub struct Clip {
   id: ClipId,
-  name: String,
+  name: Utf8Bytes,
   media: MediaRef,
   #[serde(deserialize_with = "crate::wire::time_range")]
   source_range: TimeRange,
@@ -50,7 +52,7 @@ impl Clip {
   /// with no gain, no fades and no metadata.
   pub fn new(
     id: ClipId,
-    name: impl Into<String>,
+    name: impl Into<Utf8Bytes>,
     media: MediaRef,
     source_range: TimeRange,
     record: TimeRange,
@@ -75,7 +77,7 @@ impl Clip {
 
   /// The clip's name. Two clips may share one: the [`id`](Self::id) tells
   /// them apart.
-  pub const fn name(&self) -> &str {
+  pub fn name(&self) -> &str {
     self.name.as_str()
   }
 
@@ -133,7 +135,7 @@ impl Clip {
   }
 
   /// Renames the clip in place.
-  pub fn set_name(&mut self, name: impl Into<String>) -> &mut Self {
+  pub fn set_name(&mut self, name: impl Into<Utf8Bytes>) -> &mut Self {
     self.name = name.into();
     self
   }
@@ -217,16 +219,16 @@ impl Clip {
 /// bare string.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct ClipId(String);
+pub struct ClipId(Utf8Bytes);
 
 impl ClipId {
   /// The id `id`.
-  pub fn new(id: impl Into<String>) -> Self {
+  pub fn new(id: impl Into<Utf8Bytes>) -> Self {
     Self(id.into())
   }
 
   /// The id, as the string it is.
-  pub const fn as_str(&self) -> &str {
+  pub fn as_str(&self) -> &str {
     self.0.as_str()
   }
 }
@@ -255,17 +257,17 @@ impl fmt::Display for ClipId {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MediaRef {
-  locator: String,
+  locator: Utf8Bytes,
   #[serde(default, deserialize_with = "crate::wire::option_time_range")]
   available_range: Option<TimeRange>,
   #[serde(default, deserialize_with = "crate::wire::option_rate")]
   rate: Option<Rate>,
-  reel: Option<String>,
+  reel: Option<Utf8Bytes>,
 }
 
 impl MediaRef {
   /// A medium at `locator`, with nothing else known about it.
-  pub fn new(locator: impl Into<String>) -> Self {
+  pub fn new(locator: impl Into<Utf8Bytes>) -> Self {
     Self {
       locator: locator.into(),
       available_range: None,
@@ -275,7 +277,7 @@ impl MediaRef {
   }
 
   /// The medium's address.
-  pub const fn locator(&self) -> &str {
+  pub fn locator(&self) -> &str {
     self.locator.as_str()
   }
 
@@ -290,7 +292,7 @@ impl MediaRef {
   }
 
   /// The medium's reel name, when known.
-  pub const fn reel(&self) -> Option<&str> {
+  pub fn reel(&self) -> Option<&str> {
     match &self.reel {
       Some(reel) => Some(reel.as_str()),
       None => None,
@@ -298,7 +300,7 @@ impl MediaRef {
   }
 
   /// Sets the address in place.
-  pub fn set_locator(&mut self, locator: impl Into<String>) -> &mut Self {
+  pub fn set_locator(&mut self, locator: impl Into<Utf8Bytes>) -> &mut Self {
     self.locator = locator.into();
     self
   }
@@ -331,13 +333,13 @@ impl MediaRef {
 
   /// Sets the reel name (consuming builder).
   #[must_use]
-  pub fn with_reel(mut self, reel: Option<String>) -> Self {
+  pub fn with_reel(mut self, reel: Option<Utf8Bytes>) -> Self {
     self.reel = reel;
     self
   }
 
   /// Sets the reel name in place.
-  pub fn set_reel(&mut self, reel: Option<String>) -> &mut Self {
+  pub fn set_reel(&mut self, reel: Option<Utf8Bytes>) -> &mut Self {
     self.reel = reel;
     self
   }
@@ -350,10 +352,11 @@ impl MediaRef {
 /// [`duration`](Fade::duration), a fade-out over its last — so it needs no
 /// media beyond the source range. On the wire the two edges are `in` and
 /// `out`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 pub struct Fades {
-  #[serde(rename = "in")]
+  #[cfg_attr(feature = "serde", serde(rename = "in"))]
   in_: Option<Fade>,
   out: Option<Fade>,
 }
@@ -405,10 +408,11 @@ impl Fades {
 }
 
 /// One fade: how long it runs, counted at the edit rate, and its curve.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 pub struct Fade {
-  #[serde(deserialize_with = "crate::wire::duration")]
+  #[cfg_attr(feature = "serde", serde(deserialize_with = "crate::wire::duration"))]
   duration: Duration,
   shape: FadeShape,
 }
@@ -433,14 +437,17 @@ impl Fade {
 /// The curve a fade follows.
 ///
 /// Marked `#[non_exhaustive]`: a later curve joins as a variant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, derive_more::IsVariant, derive_more::Display)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 #[non_exhaustive]
 pub enum FadeShape {
   /// Level changes evenly with time.
+  #[display("linear")]
   Linear,
   /// Power changes evenly with time — the curve that keeps a crossfade of
   /// uncorrelated sound at a steady loudness.
+  #[display("equal_power")]
   EqualPower,
 }
 
@@ -449,7 +456,8 @@ pub enum FadeShape {
 /// `0.0` is unity. A gain that is not finite has no level to apply and no
 /// JSON number to write, so neither the constructor nor the reader admits
 /// one; silence is a disabled clip. On the wire a gain is the bare number.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+#[repr(transparent)]
 pub struct Gain(f32);
 
 // Every `Gain` is finite, so `==` is reflexive.
@@ -477,15 +485,18 @@ impl fmt::Display for Gain {
   }
 }
 
-impl Serialize for Gain {
-  fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-    serializer.serialize_f32(self.0)
+#[cfg(feature = "serde")]
+const _: () = {
+  impl Serialize for Gain {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+      serializer.serialize_f32(self.0)
+    }
   }
-}
 
-impl<'de> Deserialize<'de> for Gain {
-  fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-    let db = f32::deserialize(deserializer)?;
-    Self::from_db(db).ok_or_else(|| de::Error::custom(format_args!("gain {db} dB is not finite")))
+  impl<'de> Deserialize<'de> for Gain {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+      let db = f32::deserialize(deserializer)?;
+      Self::from_db(db).ok_or_else(|| de::Error::custom(format_args!("gain {db} dB is not finite")))
+    }
   }
-}
+};

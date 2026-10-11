@@ -64,6 +64,6 @@ fn a_timeline_that_does_not_validate_has_no_layout() {
   );
   assert_eq!(
     layout(&timeline),
-    Err(alloc::vec![Refusal::Overlap(crate::ClipPair::new(0, 0, 1))])
+    Err(std::vec![Refusal::Overlap(crate::ClipPair::new(0, 0, 1))])
   );
 }

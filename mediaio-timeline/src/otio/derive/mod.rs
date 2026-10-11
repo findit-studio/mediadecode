@@ -70,8 +70,8 @@
 //! The lines cited are OpenTimelineIO's `main` at `00c22fa` (2026-10-09),
 //! and the tools' heads of the same day.
 
-use alloc::vec::Vec;
 use core::cmp::Ordering;
+use std::vec::Vec;
 
 use mediatime::{ExactSeconds, Rate, Timestamp};
 

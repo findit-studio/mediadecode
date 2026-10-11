@@ -10,6 +10,7 @@ use mediaio_timeline::{
   validate,
 };
 use mediatime::Rounding;
+use smol_bytes::Utf8Bytes;
 
 /// Seeds checked per property; fewer under Miri, which interprets slowly.
 const SEEDS: u64 = if cfg!(miri) { 4 } else { 256 };
@@ -161,7 +162,7 @@ fn timeline(seed: u64) -> Timeline {
         media.set_rate(Some(rng.pick(&[rate, Rate::hz(48_000), Rate::FPS_25])));
       }
       if rng.one_in(3) {
-        media.set_reel(Some(format!("R{index}")));
+        media.set_reel(Some(format!("R{index}").into()));
       }
       let mut fades = Fades::new();
       if planned.entering.is_none() && rng.one_in(3) {
@@ -317,7 +318,7 @@ const REFUSED: u64 = 132;
 
 /// `timeline`, built from `seed`, as the export writes it for `target` —
 /// `None` for [`REFUSED`], after checking it is refused exactly there.
-fn exported(seed: u64, timeline: &Timeline, target: OtioTarget) -> Option<String> {
+fn exported(seed: u64, timeline: &Timeline, target: OtioTarget) -> Option<Utf8Bytes> {
   match to_otio(timeline, target) {
     Ok(text) if seed != REFUSED => Some(text),
     Err(Refused::NotRepresentable(count)) if seed == REFUSED => {
