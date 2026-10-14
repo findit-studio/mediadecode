@@ -379,10 +379,10 @@ fn the_ticket_is_send_and_sync() {
   assert_send_sync::<ChannelLayoutTicket>();
   assert_send_sync::<CustomChannel>();
   assert_send_sync::<TrackExtra>();
-  assert_send_sync::<mediadecode::demuxer::TrackInfo<crate::Ffmpeg>>();
+  assert_send_sync::<mediaspine::demuxer::TrackInfo<crate::Ffmpeg>>();
   // And the shape the failure actually reached the application as:
   // `Arc<T>: Send` needs `T: Send + Sync`, one indirection down.
-  assert_send_sync::<std::sync::Arc<mediadecode::demuxer::TrackInfo<crate::Ffmpeg>>>();
+  assert_send_sync::<std::sync::Arc<mediaspine::demuxer::TrackInfo<crate::Ffmpeg>>>();
 }
 
 /// The `Omit` policy is the synthesized-attachment road: a font's

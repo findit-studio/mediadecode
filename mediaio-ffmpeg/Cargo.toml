@@ -13,10 +13,10 @@ categories    = ["multimedia", "multimedia::video", "multimedia::audio"]
 
 [features]
 default = ["std", "resample"]
-# `std` adds `mediadecode/default` (the vocabulary's `std` feature) on
-# top of the `alloc` tier the dependency rows below pin. The crossings
-# use alloc-gated types unconditionally, so `alloc` cannot be optional.
-std     = ["mediadecode/default"]
+# `std` adds `mediaspine/std` (the vocabulary's `std` feature) on top
+# of the `alloc` tier the dependency rows below pin. The crossings use
+# alloc-gated types unconditionally, so `alloc` cannot be optional.
+std     = ["mediaspine/std"]
 alloc   = []
 
 # Gates `FfmpegResampler` (the `AudioResampler` impl over `swresample`)
@@ -33,10 +33,10 @@ resample = ["ffmpeg-next/software-resampling"]
 test-support = []
 
 [dependencies]
-mediadecode = { workspace = true, features = ["alloc"] }
+mediaspine  = { workspace = true, features = ["alloc"] }
 # The channel-layout vocabulary this crate produces lives in
 # `mediaframe::audio`, which is compiled only at the alloc-or-std tier —
-# hence the unconditional `alloc`, the same shape as the `mediadecode`
+# hence the unconditional `alloc`, the same shape as the `mediaspine`
 # pin above.
 mediaframe  = { workspace = true, features = ["alloc"] }
 ffmpeg-next = { workspace = true }

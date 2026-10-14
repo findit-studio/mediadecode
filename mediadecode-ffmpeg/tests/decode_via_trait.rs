@@ -47,13 +47,13 @@ where
     match decoder.send_packet(packet)? {
       Sent::Accepted => break,
       Sent::MustDrain => {
-        while let Received::Frame = decoder.receive_frame(dst)? {
+        while let Received::Produced = decoder.receive_frame(dst)? {
           delivered = true;
         }
       }
     }
   }
-  Ok(matches!(decoder.receive_frame(dst)?, Received::Frame) || delivered)
+  Ok(matches!(decoder.receive_frame(dst)?, Received::Produced) || delivered)
 }
 
 #[test]

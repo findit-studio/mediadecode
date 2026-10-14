@@ -708,7 +708,7 @@ fn a_resampled_view_frame_shares_the_resamplers_output_buffer() {
     resampler
       .receive_frame(&mut dst)
       .expect("no fault in the tail"),
-    Received::Frame
+    Received::Produced
   ) {
     if dst.nb_samples() == 0 || dst.plane_count() < 2 {
       continue;
@@ -857,7 +857,7 @@ fn a_side_data_only_packet_reaches_a_view_decoder_without_a_buffer_behind_it() {
     support::accepted(decoder.send_packet(p.packet()), "send a real packet");
     while matches!(
       decoder.receive_frame(&mut frame).expect("receive_frame"),
-      Received::Frame
+      Received::Produced
     ) {
       samples += u64::from(frame.nb_samples());
     }
@@ -1411,7 +1411,7 @@ fn a_failed_frame_conversion_parks_the_frame_instead_of_losing_it() {
         support::accepted(decoder.send_packet(p.packet()), "send");
         if matches!(
           decoder.receive_frame(&mut frame).expect("receive_frame"),
-          Received::Frame
+          Received::Produced
         ) {
           expected = Some((
             frame.nb_samples(),
@@ -1438,7 +1438,7 @@ fn a_failed_frame_conversion_parks_the_frame_instead_of_losing_it() {
         let got = decoder.receive_frame(&mut frame);
         cap_allocations(i32::MAX as usize);
         match got {
-          Ok(Received::Frame) => panic!("the ceiling should have refused the carrier"),
+          Ok(Received::Produced) => panic!("the ceiling should have refused the carrier"),
           // This packet produced nothing yet.
           Ok(Received::NeedsInput | Received::Ended) => {}
           Err(e) if format!("{e:?}").contains("CarrierAllocFailed") => {
@@ -1457,7 +1457,7 @@ fn a_failed_frame_conversion_parks_the_frame_instead_of_losing_it() {
       // uncapped run saw, not the one after it.
       assert_eq!(
         decoder.receive_frame(&mut frame).expect("the parked frame"),
-        Received::Frame,
+        Received::Produced,
       );
       assert_eq!(
         (
@@ -1517,7 +1517,7 @@ fn a_failed_video_frame_conversion_parks_the_frame_instead_of_losing_it() {
         support::accepted(decoder.send_packet(p.packet()), "send");
         if matches!(
           decoder.receive_frame(&mut frame).expect("receive_frame"),
-          Received::Frame
+          Received::Produced
         ) {
           expected = Some(frame.planes()[0].data_ref().as_ref().to_vec());
           break 'reference;
@@ -1541,7 +1541,7 @@ fn a_failed_video_frame_conversion_parks_the_frame_instead_of_losing_it() {
         let got = decoder.receive_frame(&mut frame);
         cap_allocations(i32::MAX as usize);
         match got {
-          Ok(Received::Frame) => panic!("the ceiling should have refused the carrier"),
+          Ok(Received::Produced) => panic!("the ceiling should have refused the carrier"),
           Ok(Received::NeedsInput | Received::Ended) => {}
           Err(e) if format!("{e:?}").contains("CarrierAllocFailed") => {
             refused = true;
@@ -1557,7 +1557,7 @@ fn a_failed_video_frame_conversion_parks_the_frame_instead_of_losing_it() {
 
       assert_eq!(
         decoder.receive_frame(&mut frame).expect("the parked frame"),
-        Received::Frame,
+        Received::Produced,
       );
       assert_eq!(
         frame.planes()[0].data_ref().as_ref().to_vec(),
@@ -1619,7 +1619,7 @@ fn a_failed_cue_conversion_parks_the_cue_instead_of_losing_it() {
       let mut frame = empty_subtitle_frame();
       assert_eq!(
         decoder.receive_frame(&mut frame).expect("the cue"),
-        Received::Frame,
+        Received::Produced,
       );
       let expected = format!("{:?}", frame.payload());
       assert!(expected.contains("Text"), "the fixture must decode to text");
@@ -1643,7 +1643,7 @@ fn a_failed_cue_conversion_parks_the_cue_instead_of_losing_it() {
       // not the next one.
       assert_eq!(
         decoder.receive_frame(&mut frame).expect("the parked cue"),
-        Received::Frame,
+        Received::Produced,
       );
       assert_eq!(
         format!("{:?}", frame.payload()),

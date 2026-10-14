@@ -599,7 +599,7 @@ fn a_decoder_opened_from_a_rebuilt_ticket_produces_frames() {
       if video_decoder.send_packet(&packet).expect("send video") != Sent::Accepted {
         continue;
       }
-      while let Received::Frame = video_decoder
+      while let Received::Produced = video_decoder
         .receive_frame(&mut video_frame)
         .expect("video")
       {
@@ -616,7 +616,7 @@ fn a_decoder_opened_from_a_rebuilt_ticket_produces_frames() {
       if audio_decoder.send_packet(&packet).expect("send audio") != Sent::Accepted {
         continue;
       }
-      while let Received::Frame = audio_decoder
+      while let Received::Produced = audio_decoder
         .receive_frame(&mut audio_frame)
         .expect("audio")
       {

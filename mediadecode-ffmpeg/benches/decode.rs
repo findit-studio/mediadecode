@@ -43,7 +43,7 @@ fn decode_all_hw(path: &PathBuf) -> Result<usize, mediadecode_ffmpeg::Error> {
     |decoder: &mut VideoDecoder, count: &mut usize| -> Result<(), mediadecode_ffmpeg::Error> {
       loop {
         match decoder.receive_frame(&mut frame) {
-          Ok(Received::Frame) => *count += 1,
+          Ok(Received::Produced) => *count += 1,
           Ok(Received::NeedsInput | Received::Ended) => return Ok(()),
           Err(e) => return Err(e),
         }
@@ -184,7 +184,7 @@ fn bench_decode(c: &mut Criterion) {
               Ok(Sent::Accepted) => break,
               Ok(Sent::MustDrain) => {
                 match dec.receive_frame(&mut frame) {
-                  Ok(Received::Frame) => break 'probe,
+                  Ok(Received::Produced) => break 'probe,
                   // Defensive: per FFmpeg's send/receive contract, a
                   // decoder that asked to be drained has something to
                   // give. Retry the send anyway rather than spinning.
@@ -197,7 +197,7 @@ fn bench_decode(c: &mut Criterion) {
             }
           }
           match dec.receive_frame(&mut frame) {
-            Ok(Received::Frame) => break 'probe,
+            Ok(Received::Produced) => break 'probe,
             Ok(Received::NeedsInput) => continue,
             Ok(Received::Ended) => break 'probe,
             Err(e) => panic!("probe receive_frame: {e}"),

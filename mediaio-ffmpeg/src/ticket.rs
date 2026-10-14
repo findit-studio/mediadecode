@@ -12,7 +12,7 @@
 //!
 //! The crate already answers that class one way: it mirrors what a
 //! consumer needs into owned Rust —
-//! [`TrackParams`](mediadecode::demuxer::TrackParams) mirrors the
+//! [`TrackParams`](mediaspine::demuxer::TrackParams) mirrors the
 //! common seats, [`SideDataEntry`] mirrors a frame's metadata,
 //! [`FfmpegBytes`] mirrors its pixels. [`CodecTicket`] walks that road
 //! its last mile: **every** seat of an `AVCodecParameters`, held as

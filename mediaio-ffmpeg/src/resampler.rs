@@ -1,4 +1,4 @@
-//! [`mediadecode::resampler::AudioResampler`] impl backed by
+//! [`mediaspine::resampler::AudioResampler`] impl backed by
 //! `libswresample`.
 //!
 //! Converts rate, sample format and channel layout between two specs
@@ -37,12 +37,12 @@ use ffmpeg_next::{
   frame,
   software::resampling,
 };
-use mediadecode::{
+use mediaframe::audio::ChannelLayoutDescription;
+use mediaspine::{
   Received, Sent, Timebase, Timestamp,
   frame::{AudioFrame, Plane},
   resampler::AudioResampler,
 };
-use mediaframe::audio::ChannelLayoutDescription;
 
 use crate::{
   Ffmpeg, error::CrossingError, extras::AudioFrameExtra, limits::FrameLimits,
@@ -352,7 +352,7 @@ impl ResampleSpec {
   }
 }
 
-/// `mediadecode::resampler::AudioResampler` impl wrapping
+/// `mediaspine::resampler::AudioResampler` impl wrapping
 /// `swresample`.
 ///
 /// Construction is [`Self::new`], off the trait, taking both specs —
@@ -854,7 +854,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierResampler<C> {
     })
   }
 
-  /// Turns a converted frame into a `mediadecode` one. **Infallible**,
+  /// Turns a converted frame into a `mediaspine` one. **Infallible**,
   /// by construction: every check it could have made was made in
   /// [`Self::prepare_output`], and everything left here is arithmetic
   /// over values this type owns plus a copy that cannot be refused.
@@ -1032,7 +1032,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierResampler<C> {
   ) -> Result<Received, ResampleError> {
     if let Some(frame) = self.ready.pop_front() {
       *dst = frame;
-      return Ok(Received::Frame);
+      return Ok(Received::Produced);
     }
     if !self.eof {
       return Ok(Received::NeedsInput);
@@ -1069,7 +1069,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierResampler<C> {
     match self.finish_output(prepared) {
       Some(frame) => {
         *dst = frame;
-        Ok(Received::Frame)
+        Ok(Received::Produced)
       }
       // The delay line reported samples and the flush produced none.
       // Another flush would report the same and produce the same — this
@@ -1438,7 +1438,7 @@ impl UnsupportedLayout {
 /// A planar spec with more channels than a decoded frame has plane
 /// slots.
 ///
-/// `mediadecode`'s `AudioFrame` carries a fixed eight planes
+/// `mediaspine`'s `AudioFrame` carries a fixed eight planes
 /// (`AV_NUM_DATA_POINTERS`); planar audio past that lives in
 /// `AVFrame.extended_data[]`, which this crate does not plumb through.
 /// As a **source** no valid frame could ever arrive; as a **target**
@@ -1484,7 +1484,7 @@ impl TooManyPlanes {
 /// Payload for [`ResampleError::UnsupportedChannelCount`].
 ///
 /// A spec declaring more channels than a frame's channel seat can
-/// carry. `mediadecode`'s `AudioFrame` states its channel count in a
+/// carry. `mediaspine`'s `AudioFrame` states its channel count in a
 /// `u8`, so 255 is the ceiling in both directions.
 ///
 /// This is the **packed** sibling of [`TooManyPlanes`], which only ever
@@ -1707,7 +1707,7 @@ impl OutputBuffer {
 /// of should take its generic-fault path. That is exactly what the
 /// wildcard arm this attribute forces is for. The two status
 /// vocabularies opposite it,
-/// [`Sent`](mediadecode::Sent) and [`Received`](mediadecode::Received),
+/// [`Sent`](mediaspine::Sent) and [`Received`](mediaspine::Received),
 /// are exhaustive for the mirror-image reason: their arms are the
 /// substrate's fixed state set, and there the wildcard would be dead
 /// weight hiding a state a consumer forgot.
@@ -1820,14 +1820,14 @@ impl core::fmt::Display for SpecEnd {
   }
 }
 
-/// Plane slots a `mediadecode::frame::AudioFrame` has — the fixed array
+/// Plane slots a `mediaspine::frame::AudioFrame` has — the fixed array
 /// matching `AV_NUM_DATA_POINTERS`. Planar audio past this many
 /// channels lives in `AVFrame.extended_data[]` / `extended_buf[]`,
 /// which this crate does not plumb through: `convert` refuses such a
 /// frame and `AudioFrame::new` will not build one.
 const MAX_AUDIO_PLANES: i32 = 8;
 
-/// Channels a `mediadecode::frame::AudioFrame` can state — its channel
+/// Channels a `mediaspine::frame::AudioFrame` can state — its channel
 /// seat is a `u8`. A spec past this is refused rather than clipped.
 const MAX_FRAME_CHANNELS: i32 = u8::MAX as i32;
 
@@ -2254,7 +2254,7 @@ const _: () = {
 mod tests {
   use super::*;
 
-  use mediadecode::resampler::AudioResampler;
+  use mediaspine::resampler::AudioResampler;
 
   // These exercise the conversion arithmetic — rates, layouts, the
   // counted timeline, the byte ceiling — which is lane-independent, so
@@ -2475,7 +2475,7 @@ mod tests {
   fn drain_ready(resampler: &mut FfmpegResampler, dst: &mut Frame) {
     loop {
       match resampler.receive_frame(dst).expect("a fault-free drain") {
-        Received::Frame => {}
+        Received::Produced => {}
         Received::NeedsInput | Received::Ended => return,
       }
     }
@@ -2554,7 +2554,7 @@ mod tests {
         crate::accepted(resampler.send_frame(&frame), "the failure cost nothing");
         assert!(matches!(
           resampler.receive_frame(&mut dst),
-          Ok(Received::Frame)
+          Ok(Received::Produced)
         ));
       },
     );
@@ -2608,7 +2608,7 @@ mod tests {
           resampler
             .receive_frame(&mut dst)
             .expect("the tail survived the failure"),
-          Received::Frame,
+          Received::Produced,
         );
       },
     );

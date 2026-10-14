@@ -100,7 +100,7 @@ fn decode_one_audio_frame_through_trait() {
       "these fixtures feed a session this loop has just drained",
     );
     match decoder.receive_frame(&mut dst) {
-      Ok(Received::Frame) => {
+      Ok(Received::Produced) => {
         eprintln!(
           "audio frame: rate={}Hz samples={} channels={} format={:?}",
           dst.sample_rate(),
@@ -172,7 +172,7 @@ fn decode_one_subtitle_through_trait() {
       Sent::Accepted,
     );
     match decoder.receive_frame(&mut dst) {
-      Ok(Received::Frame) => {
+      Ok(Received::Produced) => {
         match dst.payload() {
           SubtitlePayload::Text(p) => {
             let bytes = p.text().as_ref().to_vec();
@@ -310,7 +310,7 @@ fn a_decoded_cue_is_labelled_in_microseconds_and_names_the_right_instant() {
   let mut dst = empty_subtitle_frame();
   assert_eq!(
     decoder.receive_frame(&mut dst).expect("receive"),
-    Received::Frame,
+    Received::Produced,
   );
 
   let pts = dst
@@ -372,7 +372,7 @@ fn a_subtitle_session_answers_the_ordinary_rhythm() {
   // Draining is the escape, exactly as the old error arm's docs said.
   assert_eq!(
     decoder.receive_frame(&mut dst).expect("no fault"),
-    Received::Frame
+    Received::Produced
   );
   assert_eq!(
     decoder.receive_frame(&mut dst).expect("no fault"),
@@ -390,7 +390,7 @@ fn a_subtitle_session_answers_the_ordinary_rhythm() {
   assert_eq!(decoder.send_eof().expect("no fault"), Sent::Accepted);
   assert_eq!(
     decoder.receive_frame(&mut dst).expect("no fault"),
-    Received::Frame
+    Received::Produced
   );
   assert_eq!(
     decoder.receive_frame(&mut dst).expect("no fault"),
@@ -424,7 +424,7 @@ fn feed<D: SubtitleDecoder>(
     match decoder.send_packet(packet)? {
       Sent::Accepted => return Ok(()),
       Sent::MustDrain => {
-        while let Received::Frame = decoder.receive_frame(dst)? {
+        while let Received::Produced = decoder.receive_frame(dst)? {
           *cues += 1;
         }
       }
@@ -466,7 +466,7 @@ fn the_feeder_loop_is_writable_against_the_trait_alone() {
 ///
 /// It used to gate the *receive* side alone. A caller that observed
 /// `Received::Ended` and then sent one more packet got `Sent::Accepted`,
-/// a filled seat, and a `Received::Frame` on the next poll — the end of
+/// a filled seat, and a `Received::Produced` on the next poll — the end of
 /// a stream un-ended, with no `flush` anywhere in the story.
 #[test]
 fn a_packet_after_eof_is_refused_on_an_empty_seat() {
@@ -548,7 +548,7 @@ fn a_packet_after_eof_is_refused_under_a_held_cue() {
   // does not discard what the session already made.
   assert_eq!(
     decoder.receive_frame(&mut dst).expect("no fault"),
-    Received::Frame,
+    Received::Produced,
     "the refusal must not have cost the parked cue",
   );
   assert_eq!(

@@ -91,7 +91,7 @@ impl Session {
       if self.decoder.send_packet(&packet).expect("send packet") != Sent::Accepted {
         continue;
       }
-      if let Received::Frame = self.decoder.receive_frame(frame).expect("receive frame") {
+      if let Received::Produced = self.decoder.receive_frame(frame).expect("receive frame") {
         return Some((frame.width(), frame.height()));
       }
     }

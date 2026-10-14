@@ -1,0 +1,51 @@
+[package]
+name        = "mediaspine"
+version     = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+homepage.workspace     = true
+documentation = "https://docs.rs/mediaspine"
+description = "The shared media vocabulary of the mediaio family: frames, packets, subtitles, the push rhythm, the demuxer's types, the adapter traits, the resampler face and HDR metadata. no_std, no allocator required."
+keywords   = ["media", "video", "audio", "mediaio", "no-std"]
+categories = ["multimedia", "multimedia::video", "multimedia::audio", "no-std", "no-std::no-alloc"]
+
+[features]
+default = ["std"]
+# `serde?/alloc` and `serde?/std` keep serde's own capability tier in
+# step with this crate's, so a type that gains an owning payload at one
+# of them can still derive `Deserialize`. The `?` keeps serde out of the
+# build entirely when this crate's `serde` feature is off.
+alloc   = ["serde?/alloc"]
+std     = ["mediatime/default", "serde?/std"]
+
+# `bitflags/serde` is deliberately absent. It is opt-in per type (a
+# `Serialize` / `Deserialize` derive inside the `bitflags!` body, which
+# `PacketFlags` does not carry) and its wire shape is a flag *grammar*
+# — `"KEY | CORRUPT"` — in any human-readable format. `PacketFlags`
+# serializes as its bits instead, hand-written in `packet::serde_impls`.
+serde      = ["dep:serde", "mediatime/serde", "mediaframe/serde"]
+arbitrary  = ["dep:arbitrary", "mediatime/arbitrary"]
+quickcheck = ["dep:quickcheck", "mediatime/quickcheck"]
+
+[dependencies]
+mediatime   = { workspace = true }
+bitflags    = { workspace = true }
+derive_more = { workspace = true, features = ["display", "is_variant", "try_unwrap", "unwrap"] }
+thiserror   = { workspace = true }
+mediaframe  = { workspace = true }
+
+serde      = { workspace = true, optional = true }
+arbitrary  = { workspace = true, optional = true }
+quickcheck = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true

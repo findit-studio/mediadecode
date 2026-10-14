@@ -38,7 +38,7 @@
 //!
 //! [scoped]: crate::boundary
 //!
-//! [lanes]: mediadecode::adapter#the-two-carrier-lanes
+//! [lanes]: mediaspine::adapter#the-two-carrier-lanes
 
 use core::{fmt, slice};
 

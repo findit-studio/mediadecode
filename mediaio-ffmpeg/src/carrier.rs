@@ -78,7 +78,7 @@
 //! never inferred from a call — `Demuxer::open(path)` would have had no
 //! default to fall back on.
 //!
-//! [law]: mediadecode::adapter#the-d-seat-amputation-contract
+//! [law]: mediaspine::adapter#the-d-seat-amputation-contract
 
 use ffmpeg_next::ffi::AVBufferRef;
 
@@ -404,7 +404,7 @@ pub trait FfmpegCarrier: sealed::Sealed + Copy + Clone + core::fmt::Debug + 'sta
 /// 'static`, clone by refcount, and owe nothing to the decoder that
 /// produced them.
 ///
-/// [law]: mediadecode::adapter#the-d-seat-amputation-contract
+/// [law]: mediaspine::adapter#the-d-seat-amputation-contract
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Owned;
 
@@ -416,7 +416,7 @@ pub struct Owned;
 /// [the carrier lanes][lanes] for the tradeoff table and for why graph
 /// traffic belongs on [`Owned`].
 ///
-/// [lanes]: mediadecode::adapter#the-two-carrier-lanes
+/// [lanes]: mediaspine::adapter#the-two-carrier-lanes
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct View;
 

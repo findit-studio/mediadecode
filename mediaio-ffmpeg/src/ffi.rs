@@ -176,7 +176,7 @@ pub(crate) unsafe fn table_text(ptr: *const c_char, max_bytes: usize) -> Option<
 /// **borrowed rather than copied**.
 ///
 /// Diagnostic only. It never feeds a mapping decision: the raw integer
-/// is turned into a [`mediadecode::PixelFormat`] elsewhere, and this is
+/// is turned into a [`mediaspine::PixelFormat`] elsewhere, and this is
 /// what an error message says so a reader can recognise the format
 /// without decoding the integer themselves.
 ///

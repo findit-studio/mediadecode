@@ -64,7 +64,7 @@ use ffmpeg_next::ffi::{
   AVPixelFormat, av_image_fill_linesizes, av_image_fill_plane_sizes, av_pix_fmt_count_planes,
   av_pix_fmt_desc_get,
 };
-use mediadecode::PixelFormat;
+use mediaspine::PixelFormat;
 
 /// Maximum planes a `VideoFrame` (and libavutil's image-fill helpers)
 /// represent. `av_image_fill_linesizes` / `av_image_fill_plane_sizes`

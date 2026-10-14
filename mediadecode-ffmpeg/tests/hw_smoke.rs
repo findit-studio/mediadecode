@@ -67,7 +67,7 @@ fn auto_probe_picks_hardware_backend() {
         // guessing that a second failure means damage.
         Ok(Sent::MustDrain) => {
           match decoder.receive_frame(&mut frame) {
-            Ok(Received::Frame) => {
+            Ok(Received::Produced) => {
               got_frame = true;
               log_first(&frame, &decoder);
               break 'outer;
@@ -84,7 +84,7 @@ fn auto_probe_picks_hardware_backend() {
       }
     }
     match decoder.receive_frame(&mut frame) {
-      Ok(Received::Frame) => {
+      Ok(Received::Produced) => {
         got_frame = true;
         log_first(&frame, &decoder);
         break;

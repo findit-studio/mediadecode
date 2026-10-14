@@ -294,7 +294,7 @@ impl HwInner for FakeHw {
         // SAFETY: the slot is replaced by a whole `frame::Video`, its geometry and
         // buffers together.
         *unsafe { frame.as_inner_mut() } = av;
-        Ok(Received::Frame)
+        Ok(Received::Produced)
       }
       None => Ok(Received::NeedsInput),
     }
@@ -358,7 +358,7 @@ impl HwInner for FakeHwEofFails {
         // SAFETY: the slot is replaced by a whole `frame::Video`, its geometry and
         // buffers together.
         *unsafe { frame.as_inner_mut() } = av;
-        Ok(Received::Frame)
+        Ok(Received::Produced)
       }
       None => Ok(Received::NeedsInput),
     }
@@ -443,7 +443,7 @@ fn drive(dec: &mut FfmpegVideoStreamDecoder, clip: &SyntheticClip) -> Vec<i64> {
   let mut drain_frames = |dec: &mut FfmpegVideoStreamDecoder, out: &mut Vec<i64>| {
     loop {
       match dec.receive_frame(&mut dst) {
-        Ok(Received::Frame) => out.push(dst.pts().map(|t| t.pts()).unwrap_or(i64::MIN)),
+        Ok(Received::Produced) => out.push(dst.pts().map(|t| t.pts()).unwrap_or(i64::MIN)),
         Ok(Received::NeedsInput | Received::Ended) => break,
         Err(e) => panic!("receive_frame: {e:?}"),
       }
@@ -655,7 +655,7 @@ fn sw_replay_drain_surfaces_non_transient_decode_error() {
     }
     loop {
       match dec.receive_frame(&mut dst) {
-        Ok(Received::Frame) => {}
+        Ok(Received::Produced) => {}
         Ok(Received::NeedsInput | Received::Ended) => break,
         Err(e) => {
           err = Some(e);
@@ -757,7 +757,7 @@ fn sw_replay_deferred_error_surfaces_fallback_failed_at_commit() {
         // Drain anything available (none expected pre-fallback — doom = 0).
         loop {
           match dec.receive_frame(&mut dst) {
-            Ok(Received::Frame) => {}
+            Ok(Received::Produced) => {}
             Ok(Received::NeedsInput | Received::Ended) => break,
             Err(e) => {
               surfaced = Some(e);
@@ -1143,7 +1143,7 @@ impl Fx3Observation {
   ) -> Result<(), String> {
     loop {
       match dec.receive_frame(dst) {
-        Ok(Received::Frame) => {
+        Ok(Received::Produced) => {
           let pts = VideoFrame::pts(dst).map(|t| t.pts()).unwrap_or(i64::MIN);
           self.pts_out.push(pts);
         }
@@ -1224,7 +1224,7 @@ fn a_rescued_packet_never_aliases_a_view_carrier() {
     retained.push(vpkt);
     // Exhaustive, not `.is_ok()`: "needs input" is a success now, so a
     // predicate loop here would never leave.
-    while matches!(dec.receive_frame(&mut dst), Ok(Received::Frame)) {}
+    while matches!(dec.receive_frame(&mut dst), Ok(Received::Produced)) {}
   }
 
   assert!(
@@ -1469,7 +1469,7 @@ fn the_receive_time_fallback_queue_survives_a_failed_carrier() {
             mediaio_ffmpeg::test_support::uncap_ffmpeg_allocations();
           }
           match got {
-            Ok(Received::Frame) => {
+            Ok(Received::Produced) => {
               planes.push(frame.planes()[0].data_ref().as_ref().to_vec());
               // The next receive will come off the queue, which is the
               // road this lane is for.
@@ -1583,7 +1583,7 @@ fn eof_with_a_parked_frame(
     for index in 0..3 {
       crate::accepted(dec.send_packet(&packet(index)), "send_packet");
     }
-    while matches!(dec.receive_frame(&mut frame), Ok(Received::Frame)) {}
+    while matches!(dec.receive_frame(&mut frame), Ok(Received::Produced)) {}
     // The feeder loop this reform made writable: the software decoder
     // has real output now, so it exerts real back pressure, and the
     // answer to that is to drain and re-offer the same packet.
@@ -1592,7 +1592,9 @@ fn eof_with_a_parked_frame(
       loop {
         match dec.send_packet(&pkt).expect("no fault while feeding") {
           Sent::Accepted => break,
-          Sent::MustDrain => while matches!(dec.receive_frame(&mut frame), Ok(Received::Frame)) {},
+          Sent::MustDrain => {
+            while matches!(dec.receive_frame(&mut frame), Ok(Received::Produced)) {}
+          }
         }
       }
     }
@@ -1688,7 +1690,7 @@ fn a_post_eof_send_is_a_fault_not_backpressure(hw: bool) {
   let mut drained = 0u32;
   for _ in 0..64 {
     match dec.receive_frame(&mut frame) {
-      Ok(Received::Frame) => drained += 1,
+      Ok(Received::Produced) => drained += 1,
       Ok(Received::NeedsInput | Received::Ended) => break,
       Err(e) => panic!("the parked frame must still be deliverable: {e:?}"),
     }
@@ -1796,7 +1798,7 @@ fn a_post_eof_frame_time_fallback_never_strands_the_caller_in_needs_input() {
   let mut terminal = false;
   for _ in 0..64 {
     match dec.receive_frame(&mut frame) {
-      Ok(Received::Frame) => pictures += 1,
+      Ok(Received::Produced) => pictures += 1,
       Ok(Received::NeedsInput) => panic!(
         "stranded: the decoder asked for input on a session whose end is \
          committed, and both send gates refuse — no legal operation can \
@@ -2011,7 +2013,7 @@ fn a_parked_hardware_frame_is_delivered_before_any_fallback() {
       // The parked frame is still the hardware one, and it arrives.
       assert_eq!(
         dec.receive_frame(&mut frame).expect("the parked frame"),
-        Received::Frame,
+        Received::Produced,
       );
       assert!(
         dec.is_hardware(),
@@ -2076,12 +2078,12 @@ fn the_software_path_opens_without_probing_anything() {
       .expect("a wrappable payload")
       .expect("packet has a buffer");
     crate::accepted(dec.send_packet(&vpkt), "send_packet");
-    while let Ok(Received::Frame) = dec.receive_frame(&mut dst) {
+    while let Ok(Received::Produced) = dec.receive_frame(&mut dst) {
       delivered += 1;
     }
   }
   crate::accepted(dec.send_eof(), "send_eof");
-  while let Ok(Received::Frame) = dec.receive_frame(&mut dst) {
+  while let Ok(Received::Produced) = dec.receive_frame(&mut dst) {
     delivered += 1;
   }
   assert_eq!(
@@ -2413,7 +2415,7 @@ impl HwInner for ScriptedHw {
           .find(|(at, _)| Some(*at) == pts)
         {
           Some(&(_, raw)) => Err(Error::Ffmpeg(raw)),
-          None => Ok(Received::Frame),
+          None => Ok(Received::Produced),
         }
       }
       Err(ffmpeg_next::Error::Other { errno }) if errno == ffmpeg_next::error::EAGAIN => {
@@ -2452,7 +2454,7 @@ fn drain_pictures(dec: &mut FfmpegVideoStreamDecoder, pictures: &mut Vec<i64>) {
   let mut dst = crate::empty_owned_video_frame();
   loop {
     match dec.receive_frame(&mut dst) {
-      Ok(Received::Frame) => pictures.push(dst.pts().map_or(i64::MIN, |t| t.pts())),
+      Ok(Received::Produced) => pictures.push(dst.pts().map_or(i64::MIN, |t| t.pts())),
       Ok(Received::NeedsInput | Received::Ended) => break,
       Err(e) => panic!("receive_frame: {e:?}"),
     }
@@ -2488,7 +2490,7 @@ fn drain_answers(
   let mut dst = crate::empty_owned_video_frame();
   loop {
     match dec.receive_frame(&mut dst) {
-      Ok(Received::Frame) => answers
+      Ok(Received::Produced) => answers
         .pictures
         .push(dst.pts().map_or(i64::MIN, |t| t.pts())),
       Ok(Received::NeedsInput | Received::Ended) => break,
@@ -3032,7 +3034,7 @@ fn any_hardware_never_becomes_software_on_this_platform() {
       assert!(p.origin().is_probe(), "an exhaustion here is the probe's");
       return;
     }
-    while let Ok(Received::Frame) = dec.receive_frame(&mut dst) {}
+    while let Ok(Received::Produced) = dec.receive_frame(&mut dst) {}
     assert!(
       !dec.is_software(),
       "packet {index}: AnyHardware never becomes software"

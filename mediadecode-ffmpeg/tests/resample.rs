@@ -49,7 +49,7 @@ use support::Corpus;
 /// in this file would bury what each test is actually about.
 fn frame_ready<E: core::fmt::Debug>(status: Result<Received, E>) -> bool {
   match status.expect("a fault-free drain") {
-    Received::Frame => true,
+    Received::Produced => true,
     Received::NeedsInput | Received::Ended => false,
   }
 }
@@ -167,7 +167,7 @@ fn run(path: &std::path::Path, target: ResampleSpec) -> Converted {
       .receive_frame(&mut out)
       .expect("no fault in the tail")
     {
-      Received::Frame => {
+      Received::Produced => {
         converted.tail_frames += 1;
         collect(&mut converted, &out);
       }
@@ -470,7 +470,7 @@ fn a_drained_tail_says_ended_instead_of_asking_for_input_that_cannot_come() {
       .receive_frame(&mut out)
       .expect("a clean drain raises no fault")
     {
-      Received::Frame => tail_frames += 1,
+      Received::Produced => tail_frames += 1,
       Received::NeedsInput => panic!(
         "the resampler asked for input after being told the stream ended —          the caller has nothing left to send, so this is the hang the old          `Again` arm produced",
       ),
@@ -1187,7 +1187,7 @@ fn a_refused_frame_does_not_stamp_the_next_good_one() {
   let mut out = empty_audio_frame();
   assert_eq!(
     resampler.receive_frame(&mut out).expect("converted output"),
-    Received::Frame,
+    Received::Produced,
   );
   assert_eq!(
     out.pts().expect("stamped").pts(),
@@ -1245,7 +1245,7 @@ fn a_timestamp_that_cannot_be_rescaled_is_refused_before_anything_moves() {
   let mut out = empty_audio_frame();
   assert_eq!(
     resampler.receive_frame(&mut out).expect("converted output"),
-    Received::Frame,
+    Received::Produced,
   );
   assert_eq!(
     out.pts().expect("stamped").pts(),
@@ -1305,7 +1305,7 @@ fn the_output_timeline_refuses_to_overflow() {
     resampler
       .receive_frame(&mut dst)
       .expect("and converts the next frame"),
-    Received::Frame,
+    Received::Produced,
   );
   assert_eq!(dst.pts().expect("stamped").pts(), 0);
 }
@@ -1461,7 +1461,7 @@ fn no_submission_can_reverse_the_end_of_a_resampler() {
   let mut ended = false;
   for _ in 0..256 {
     match resampler.receive_frame(&mut out).expect("no fault") {
-      Received::Frame => {}
+      Received::Produced => {}
       Received::NeedsInput => panic!("a resampler at EOF asked for input"),
       Received::Ended => {
         ended = true;

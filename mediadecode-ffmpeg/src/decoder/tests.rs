@@ -1299,7 +1299,7 @@ fn the_raw_decoder_refuses_a_send_after_end_of_stream() {
       .receive_frame(&mut frame)
       .expect("no fault while draining")
     {
-      Received::Frame => {}
+      Received::Produced => {}
       Received::NeedsInput => panic!("a raw decoder at EOF asked for input"),
       Received::Ended => break,
     }
@@ -1404,7 +1404,7 @@ fn a_candidate_past_the_end_that_produced_nothing_fails_the_probe() {
       "credited a candidate that never decoded a frame with ending the stream, \
        stopping the probe from trying the next backend",
     ),
-    Ok(Received::Frame) => panic!("a candidate fed only the end produced a frame"),
+    Ok(Received::Produced) => panic!("a candidate fed only the end produced a frame"),
     Err(Error::AllBackendsFailed(_)) => {}
     Err(other) => panic!("expected the probe road, got {other:?}"),
   }
@@ -1543,7 +1543,7 @@ fn a_latched_refusal_outranks_the_errno_in_every_committed_phase() {
         "{name}: asked for more input over a refusal this crate made — the \
          caller would feed a decoder that already declined the frame",
       ),
-      Ok(Received::Frame) => panic!("{name}: a declined surface produced a frame"),
+      Ok(Received::Produced) => panic!("{name}: a declined surface produced a frame"),
       // **Named, and that is the point.** The refusal is this picture's
       // own error, reported as it was minted: the caller reads it to find
       // out *why*, and "a ceiling you configured" is the one answer it

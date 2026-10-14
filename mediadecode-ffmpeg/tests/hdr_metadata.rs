@@ -69,7 +69,7 @@ fn first_video_frame(path: &std::path::Path) -> OwnedVideoFrame {
     if decoder.send_packet(&packet).expect("send packet") != Sent::Accepted {
       continue;
     }
-    if let Received::Frame = decoder.receive_frame(&mut frame).expect("receive frame") {
+    if let Received::Produced = decoder.receive_frame(&mut frame).expect("receive frame") {
       return frame;
     }
     assert!(index < 64, "no frame within the first 64 packets");

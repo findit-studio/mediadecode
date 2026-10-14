@@ -96,7 +96,7 @@ async fn flush_isolates_pre_and_post_flush_streams() {
     );
     loop {
       match decoder.receive_frame(&mut frame).await {
-        Ok(Received::Frame) => {
+        Ok(Received::Produced) => {
           let observed = frame.pts().expect("pre-flush frame pts is Some").pts();
           assert!(
             pre_flush_ptses.contains(&observed),
@@ -143,7 +143,7 @@ async fn flush_isolates_pre_and_post_flush_streams() {
     );
     loop {
       match decoder.receive_frame(&mut frame).await {
-        Ok(Received::Frame) => {
+        Ok(Received::Produced) => {
           let observed = frame.pts().expect("post-flush frame pts is Some").pts();
           assert!(
             post_flush_ptses.contains(&observed),
@@ -170,7 +170,7 @@ async fn flush_isolates_pre_and_post_flush_streams() {
   );
   loop {
     match decoder.receive_frame(&mut frame).await {
-      Ok(Received::Frame) => {
+      Ok(Received::Produced) => {
         let observed = frame.pts().expect("eof-drain frame pts").pts();
         assert!(
           post_flush_ptses.contains(&observed),

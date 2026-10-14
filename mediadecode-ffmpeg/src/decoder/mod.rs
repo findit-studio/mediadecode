@@ -1329,7 +1329,7 @@ impl VideoDecoder {
   /// Answers the same three states `ffmpeg::decoder::Video` does, in
   /// the shape the trait tier publishes: [`Received::NeedsInput`] where
   /// libavcodec says `EAGAIN`, [`Received::Ended`] where it says `EOF`,
-  /// and [`Received::Frame`] when `frame` was written. **The errno
+  /// and [`Received::Produced`] when `frame` was written. **The errno
   /// stops here** — the two flow signals never leave this crate as
   /// `Error::Ffmpeg`, so a caller has nothing to decode.
   pub fn receive_frame(&mut self, frame: &mut Frame) -> Result<Received> {
@@ -1337,7 +1337,7 @@ impl VideoDecoder {
     // (transferred at drain time, when the candidate's HW context was alive)
     // so we just move them into the caller's slot.
     if self.try_pop_pending(frame) {
-      return Ok(Received::Frame);
+      return Ok(Received::Produced);
     }
 
     loop {
@@ -1394,7 +1394,7 @@ impl VideoDecoder {
               // deliver one of those before reading more from the new
               // candidate.
               if self.try_pop_pending(frame) {
-                return Ok(Received::Frame);
+                return Ok(Received::Produced);
               }
               continue;
             }
@@ -1464,7 +1464,7 @@ impl VideoDecoder {
           match scaled {
             Some(Ok(())) => {
               self.probe = None;
-              return Ok(Received::Frame);
+              return Ok(Received::Produced);
             }
             Some(Err(e)) => {
               tracing::warn!(
@@ -1485,7 +1485,7 @@ impl VideoDecoder {
           match unsafe { transfer_hw_frame(frame, &self.hw_frame) } {
             Ok(()) => {
               self.probe = None;
-              return Ok(Received::Frame);
+              return Ok(Received::Produced);
             }
             Err(e) => {
               // The same shared policy. A transfer failure is an
@@ -1500,7 +1500,7 @@ impl VideoDecoder {
                   // SAFETY: as above — the caller's slot, cleared whole.
                   unsafe { av_frame_unref(frame.as_inner_mut().as_mut_ptr()) };
                   if self.try_pop_pending(frame) {
-                    return Ok(Received::Frame);
+                    return Ok(Received::Produced);
                   }
                   continue;
                 }

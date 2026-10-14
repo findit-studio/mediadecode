@@ -1,5 +1,5 @@
 //! Boundary conversions between FFmpeg's bindgen integers and the
-//! unified [`mediadecode`] vocabulary.
+//! unified [`mediaspine`] vocabulary.
 //!
 //! Centralised so the rest of the crate never compares raw
 //! `AVPixelFormat` integers against literals or transmutes back into
@@ -13,14 +13,14 @@ use core::{
 
 use derive_more::{IsVariant, TryUnwrap, Unwrap};
 use ffmpeg_next::{Packet, ffi::AVPixelFormat};
-use mediadecode::{
+use mediaframe::audio::ChannelLayoutDescription;
+use mediaspine::{
   PixelFormat, Timestamp,
   demuxer::{AttachmentPacket, DataPacket},
   frame::{AudioFrame, Dimensions, Plane, SubtitleFrame, VideoFrame},
   packet::{AudioPacket, PacketFlags as MdPacketFlags, SubtitlePacket, VideoPacket},
   subtitle::{SubtitlePayload, Text as SubtitleText},
 };
-use mediaframe::audio::ChannelLayoutDescription;
 
 use crate::{
   // `buffer::SideDataAlloc` is aliased: this module also defines its own
@@ -45,7 +45,7 @@ use crate::{
 };
 
 /// Maps a raw `AVFrame.format` integer (i.e. the value of an
-/// `AVPixelFormat` enum variant) onto [`mediadecode::PixelFormat`].
+/// `AVPixelFormat` enum variant) onto [`mediaspine::PixelFormat`].
 ///
 /// Returns [`PixelFormat::None`] for raw integers we don't have a
 /// mapping for — including `AV_PIX_FMT_NONE` itself and the
@@ -77,7 +77,7 @@ pub const fn from_av_pixel_format(raw: i32) -> PixelFormat {
   // `pixdesc::is_deliverable` / the convert layer — this boundary is
   // identity-only.
   //
-  // BE-tagged formats map to mediadecode's distinct `*Be` variants
+  // BE-tagged formats map to mediaspine's distinct `*Be` variants
   // (never folded onto the LE canonical). Folding BE onto LE silently
   // corrupted pixel data: each >8-bit sample is byte-swapped between
   // BE and LE, and the convert path exports the AVBufferRef bytes
@@ -858,7 +858,7 @@ pub unsafe fn share_or_copy(
   Ok(out)
 }
 
-/// Builds an `ffmpeg::Packet` from a [`mediadecode::VideoPacket`]
+/// Builds an `ffmpeg::Packet` from a [`mediaspine::VideoPacket`]
 /// parameterized by [`crate::extras::VideoPacketExtra`] and
 /// `FfmpegBytes`.
 ///
@@ -877,7 +877,7 @@ pub unsafe fn share_or_copy(
 /// * a side-data entry this build of FFmpeg cannot name, or one whose
 ///   allocation failed.
 pub fn ffmpeg_packet_from_video_packet(
-  packet: &mediadecode::packet::VideoPacket<VideoPacketExtra, crate::FfmpegBuffer>,
+  packet: &mediaspine::packet::VideoPacket<VideoPacketExtra, crate::FfmpegBuffer>,
   limits: PacketLimits,
 ) -> std::result::Result<Packet, PacketBuildError> {
   // SAFETY: `BodyRoute::Copy` — the packet owns its body, so the
@@ -887,7 +887,7 @@ pub fn ffmpeg_packet_from_video_packet(
 
 /// [`ffmpeg_packet_from_video_packet`] on the owned lane.
 pub fn ffmpeg_packet_from_owned_video_packet(
-  packet: &mediadecode::packet::VideoPacket<VideoPacketExtra, FfmpegBytes>,
+  packet: &mediaspine::packet::VideoPacket<VideoPacketExtra, FfmpegBytes>,
   limits: PacketLimits,
 ) -> std::result::Result<Packet, PacketBuildError> {
   // SAFETY: `BodyRoute::Copy` — the packet owns its body, so the
@@ -936,7 +936,7 @@ pub fn ffmpeg_packet_from_owned_video_packet(
 /// there is nothing to prove.
 #[doc(hidden)]
 pub unsafe fn with_ffmpeg_video_packet<C: crate::FfmpegCarrier + crate::CarrierOps, T>(
-  packet: &mediadecode::packet::VideoPacket<VideoPacketExtra, C::Buffer>,
+  packet: &mediaspine::packet::VideoPacket<VideoPacketExtra, C::Buffer>,
   limits: PacketLimits,
   route: BodyRoute,
   submit: impl FnOnce(&Packet) -> T,
@@ -960,7 +960,7 @@ pub unsafe fn with_ffmpeg_video_packet<C: crate::FfmpegCarrier + crate::CarrierO
 /// buffer, and nothing may write through it, shallow-clone it, or hand
 /// it to a caller. With [`BodyRoute::Copy`] there is nothing to prove.
 unsafe fn build_video_packet<C: crate::FfmpegCarrier + crate::CarrierOps>(
-  packet: &mediadecode::packet::VideoPacket<VideoPacketExtra, C::Buffer>,
+  packet: &mediaspine::packet::VideoPacket<VideoPacketExtra, C::Buffer>,
   limits: PacketLimits,
   route: BodyRoute,
 ) -> std::result::Result<Packet, PacketBuildError> {
@@ -1001,12 +1001,12 @@ unsafe fn build_video_packet<C: crate::FfmpegCarrier + crate::CarrierOps>(
   Ok(out)
 }
 
-/// Builds an `ffmpeg::Packet` from a [`mediadecode::AudioPacket`].
+/// Builds an `ffmpeg::Packet` from a [`mediaspine::AudioPacket`].
 /// Same shape as [`ffmpeg_packet_from_video_packet`] — bytes are
 /// copied; pts/dts/duration/flags/stream_index and side data are
 /// forwarded. Same failure modes.
 pub fn ffmpeg_packet_from_audio_packet(
-  packet: &mediadecode::packet::AudioPacket<AudioPacketExtra, crate::FfmpegBuffer>,
+  packet: &mediaspine::packet::AudioPacket<AudioPacketExtra, crate::FfmpegBuffer>,
   limits: PacketLimits,
 ) -> std::result::Result<Packet, PacketBuildError> {
   // SAFETY: `BodyRoute::Copy` — the packet owns its body, so the
@@ -1016,7 +1016,7 @@ pub fn ffmpeg_packet_from_audio_packet(
 
 /// [`ffmpeg_packet_from_audio_packet`] on the owned lane.
 pub fn ffmpeg_packet_from_owned_audio_packet(
-  packet: &mediadecode::packet::AudioPacket<AudioPacketExtra, FfmpegBytes>,
+  packet: &mediaspine::packet::AudioPacket<AudioPacketExtra, FfmpegBytes>,
   limits: PacketLimits,
 ) -> std::result::Result<Packet, PacketBuildError> {
   // SAFETY: `BodyRoute::Copy` — the packet owns its body, so the
@@ -1052,7 +1052,7 @@ pub fn ffmpeg_packet_from_owned_audio_packet(
 /// there is nothing to prove.
 #[doc(hidden)]
 pub unsafe fn with_ffmpeg_audio_packet<C: crate::FfmpegCarrier + crate::CarrierOps, T>(
-  packet: &mediadecode::packet::AudioPacket<AudioPacketExtra, C::Buffer>,
+  packet: &mediaspine::packet::AudioPacket<AudioPacketExtra, C::Buffer>,
   limits: PacketLimits,
   route: BodyRoute,
   submit: impl FnOnce(&Packet) -> T,
@@ -1076,7 +1076,7 @@ pub unsafe fn with_ffmpeg_audio_packet<C: crate::FfmpegCarrier + crate::CarrierO
 /// buffer, and nothing may write through it, shallow-clone it, or hand
 /// it to a caller. With [`BodyRoute::Copy`] there is nothing to prove.
 unsafe fn build_audio_packet<C: crate::FfmpegCarrier + crate::CarrierOps>(
-  packet: &mediadecode::packet::AudioPacket<AudioPacketExtra, C::Buffer>,
+  packet: &mediaspine::packet::AudioPacket<AudioPacketExtra, C::Buffer>,
   limits: PacketLimits,
   route: BodyRoute,
 ) -> std::result::Result<Packet, PacketBuildError> {
@@ -1117,12 +1117,12 @@ unsafe fn build_audio_packet<C: crate::FfmpegCarrier + crate::CarrierOps>(
   Ok(out)
 }
 
-/// Builds an `ffmpeg::Packet` from a [`mediadecode::SubtitlePacket`].
+/// Builds an `ffmpeg::Packet` from a [`mediaspine::SubtitlePacket`].
 /// Bytes copied; pts/duration/flags/stream_index and side data
-/// forwarded. Subtitle packets have no `dts` in the mediadecode model.
+/// forwarded. Subtitle packets have no `dts` in the mediaspine model.
 /// Same failure modes as [`ffmpeg_packet_from_video_packet`].
 pub fn ffmpeg_packet_from_subtitle_packet(
-  packet: &mediadecode::packet::SubtitlePacket<SubtitlePacketExtra, crate::FfmpegBuffer>,
+  packet: &mediaspine::packet::SubtitlePacket<SubtitlePacketExtra, crate::FfmpegBuffer>,
   limits: PacketLimits,
 ) -> std::result::Result<Packet, PacketBuildError> {
   // SAFETY: `BodyRoute::Copy` — the packet owns its body, so the
@@ -1132,7 +1132,7 @@ pub fn ffmpeg_packet_from_subtitle_packet(
 
 /// [`ffmpeg_packet_from_subtitle_packet`] on the owned lane.
 pub fn ffmpeg_packet_from_owned_subtitle_packet(
-  packet: &mediadecode::packet::SubtitlePacket<SubtitlePacketExtra, FfmpegBytes>,
+  packet: &mediaspine::packet::SubtitlePacket<SubtitlePacketExtra, FfmpegBytes>,
   limits: PacketLimits,
 ) -> std::result::Result<Packet, PacketBuildError> {
   // SAFETY: `BodyRoute::Copy` — the packet owns its body, so the
@@ -1168,7 +1168,7 @@ pub fn ffmpeg_packet_from_owned_subtitle_packet(
 /// there is nothing to prove.
 #[doc(hidden)]
 pub unsafe fn with_ffmpeg_subtitle_packet<C: crate::FfmpegCarrier + crate::CarrierOps, T>(
-  packet: &mediadecode::packet::SubtitlePacket<SubtitlePacketExtra, C::Buffer>,
+  packet: &mediaspine::packet::SubtitlePacket<SubtitlePacketExtra, C::Buffer>,
   limits: PacketLimits,
   route: BodyRoute,
   submit: impl FnOnce(&Packet) -> T,
@@ -1192,7 +1192,7 @@ pub unsafe fn with_ffmpeg_subtitle_packet<C: crate::FfmpegCarrier + crate::Carri
 /// buffer, and nothing may write through it, shallow-clone it, or hand
 /// it to a caller. With [`BodyRoute::Copy`] there is nothing to prove.
 unsafe fn build_subtitle_packet<C: crate::FfmpegCarrier + crate::CarrierOps>(
-  packet: &mediadecode::packet::SubtitlePacket<SubtitlePacketExtra, C::Buffer>,
+  packet: &mediaspine::packet::SubtitlePacket<SubtitlePacketExtra, C::Buffer>,
   limits: PacketLimits,
   route: BodyRoute,
 ) -> std::result::Result<Packet, PacketBuildError> {
@@ -1231,11 +1231,11 @@ unsafe fn build_subtitle_packet<C: crate::FfmpegCarrier + crate::CarrierOps>(
 }
 
 // ---------------------------------------------------------------------------
-//  Safe wrappers — `&ffmpeg::Packet` → `mediadecode::*Packet`.
+//  Safe wrappers — `&ffmpeg::Packet` → `mediaspine::*Packet`.
 // ---------------------------------------------------------------------------
 
 /// Carries a borrowed [`ffmpeg::Packet`] out as a
-/// [`mediadecode::packet::VideoPacket`] on the **view** lane: the
+/// [`mediaspine::packet::VideoPacket`] on the **view** lane: the
 /// payload is a refcounted window onto the source `AVPacket`'s own
 /// buffer, which is why the delivered packet's lifetime is answerable
 /// to libavformat's — see [the two carrier lanes][lanes]. For a packet
@@ -1249,7 +1249,7 @@ unsafe fn build_subtitle_packet<C: crate::FfmpegCarrier + crate::CarrierOps>(
 /// Uses the default [`PacketLimits`]; the `_in` sibling takes them
 /// explicitly, alongside the stream's timebase.
 ///
-/// [lanes]: mediadecode::adapter#the-two-carrier-lanes
+/// [lanes]: mediaspine::adapter#the-two-carrier-lanes
 ///
 /// Returns `Ok(None)` when the source packet has no payload at all
 /// (an empty packet — typical after EOF), and [`PacketBufferError`]
@@ -1258,10 +1258,10 @@ unsafe fn build_subtitle_packet<C: crate::FfmpegCarrier + crate::CarrierOps>(
 /// answer. Caller can also fill in [`VideoPacketExtra::byte_pos`] /
 /// `side_data` post-construction if they need those.
 ///
-/// [law]: mediadecode::adapter#the-d-seat-amputation-contract
+/// [law]: mediaspine::adapter#the-d-seat-amputation-contract
 pub fn video_packet_from_ffmpeg(
   packet: &Packet,
-  time_base: mediadecode::Timebase,
+  time_base: mediaspine::Timebase,
 ) -> Result<Option<VideoPacket<VideoPacketExtra, FfmpegBytes>>, PacketBufferError> {
   // SAFETY: `CallerSupplied` is true of every packet, and the owned lane
   // copies, so nothing about `packet` outlives this borrow.
@@ -1276,12 +1276,12 @@ pub fn video_packet_from_ffmpeg(
 }
 
 /// Carries a borrowed [`ffmpeg::Packet`] out as a
-/// [`mediadecode::packet::AudioPacket`]. Same shape as
+/// [`mediaspine::packet::AudioPacket`]. Same shape as
 /// [`video_packet_from_ffmpeg`] — shared payload, forwarded metadata,
 /// default budgets.
 pub fn audio_packet_from_ffmpeg(
   packet: &Packet,
-  time_base: mediadecode::Timebase,
+  time_base: mediaspine::Timebase,
 ) -> Result<Option<AudioPacket<AudioPacketExtra, FfmpegBytes>>, PacketBufferError> {
   // SAFETY: `CallerSupplied` is true of every packet, and the owned lane
   // copies, so nothing about `packet` outlives this borrow.
@@ -1296,12 +1296,12 @@ pub fn audio_packet_from_ffmpeg(
 }
 
 /// Carries a borrowed [`ffmpeg::Packet`] out as a
-/// [`mediadecode::packet::SubtitlePacket`]. Subtitle packets have no
-/// `dts` in the mediadecode model; everything else mirrors
+/// [`mediaspine::packet::SubtitlePacket`]. Subtitle packets have no
+/// `dts` in the mediaspine model; everything else mirrors
 /// [`video_packet_from_ffmpeg`], shared payload included.
 pub fn subtitle_packet_from_ffmpeg(
   packet: &Packet,
-  time_base: mediadecode::Timebase,
+  time_base: mediaspine::Timebase,
 ) -> Result<Option<SubtitlePacket<SubtitlePacketExtra, FfmpegBytes>>, PacketBufferError> {
   // SAFETY: `CallerSupplied` is true of every packet, and the owned lane
   // copies, so nothing about `packet` outlives this borrow.
@@ -1499,7 +1499,7 @@ unsafe fn delivered_payload<C: crate::FfmpegCarrier + crate::CarrierOps>(
 /// writer is left behind on a view-lane window.
 pub(crate) unsafe fn video_packet_from_ffmpeg_as<C: crate::FfmpegCarrier + crate::CarrierOps>(
   source: Packet,
-  time_base: mediadecode::Timebase,
+  time_base: mediaspine::Timebase,
   limits: PacketLimits,
   provenance: crate::buffer::PayloadProvenance,
 ) -> Result<Option<VideoPacket<VideoPacketExtra, C::Buffer>>, PacketBufferError> {
@@ -1548,7 +1548,7 @@ pub(crate) unsafe fn video_packet_from_ffmpeg_as<C: crate::FfmpegCarrier + crate
 #[doc(hidden)]
 pub unsafe fn video_packet_from_borrowed<C: crate::FfmpegCarrier + crate::CarrierOps>(
   packet: &Packet,
-  time_base: mediadecode::Timebase,
+  time_base: mediaspine::Timebase,
   limits: PacketLimits,
   provenance: crate::buffer::PayloadProvenance,
 ) -> Result<Option<VideoPacket<VideoPacketExtra, C::Buffer>>, PacketBufferError> {
@@ -1580,7 +1580,7 @@ pub unsafe fn video_packet_from_borrowed<C: crate::FfmpegCarrier + crate::Carrie
 /// writer is left behind on a view-lane window.
 pub(crate) unsafe fn audio_packet_from_ffmpeg_as<C: crate::FfmpegCarrier + crate::CarrierOps>(
   source: Packet,
-  time_base: mediadecode::Timebase,
+  time_base: mediaspine::Timebase,
   limits: PacketLimits,
   provenance: crate::buffer::PayloadProvenance,
 ) -> Result<Option<AudioPacket<AudioPacketExtra, C::Buffer>>, PacketBufferError> {
@@ -1629,7 +1629,7 @@ pub(crate) unsafe fn audio_packet_from_ffmpeg_as<C: crate::FfmpegCarrier + crate
 #[doc(hidden)]
 pub unsafe fn audio_packet_from_borrowed<C: crate::FfmpegCarrier + crate::CarrierOps>(
   packet: &Packet,
-  time_base: mediadecode::Timebase,
+  time_base: mediaspine::Timebase,
   limits: PacketLimits,
   provenance: crate::buffer::PayloadProvenance,
 ) -> Result<Option<AudioPacket<AudioPacketExtra, C::Buffer>>, PacketBufferError> {
@@ -1661,7 +1661,7 @@ pub unsafe fn audio_packet_from_borrowed<C: crate::FfmpegCarrier + crate::Carrie
 /// writer is left behind on a view-lane window.
 pub(crate) unsafe fn subtitle_packet_from_ffmpeg_as<C: crate::FfmpegCarrier + crate::CarrierOps>(
   source: Packet,
-  time_base: mediadecode::Timebase,
+  time_base: mediaspine::Timebase,
   limits: PacketLimits,
   provenance: crate::buffer::PayloadProvenance,
 ) -> Result<Option<SubtitlePacket<SubtitlePacketExtra, C::Buffer>>, PacketBufferError> {
@@ -1710,7 +1710,7 @@ pub(crate) unsafe fn subtitle_packet_from_ffmpeg_as<C: crate::FfmpegCarrier + cr
 #[doc(hidden)]
 pub unsafe fn subtitle_packet_from_borrowed<C: crate::FfmpegCarrier + crate::CarrierOps>(
   packet: &Packet,
-  time_base: mediadecode::Timebase,
+  time_base: mediaspine::Timebase,
   limits: PacketLimits,
   provenance: crate::buffer::PayloadProvenance,
 ) -> Result<Option<SubtitlePacket<SubtitlePacketExtra, C::Buffer>>, PacketBufferError> {
@@ -1732,10 +1732,10 @@ pub unsafe fn subtitle_packet_from_borrowed<C: crate::FfmpegCarrier + crate::Car
 }
 
 /// Wraps a borrowed [`ffmpeg::Packet`] from a **data** track — timecode,
-/// KLV, timed ID3 — as a [`mediadecode::demuxer::DataPacket`], with the
+/// KLV, timed ID3 — as a [`mediaspine::demuxer::DataPacket`], with the
 /// stream's timebase stamped onto every timestamp.
 ///
-/// Data packets are never reordered, so the mediadecode model gives
+/// Data packets are never reordered, so the mediaspine model gives
 /// them no `dts` seat; everything else mirrors
 /// [`video_packet_from_ffmpeg_in`]. `byte_pos` is forwarded from
 /// `AVPacket.pos`, which data consumers use to correlate a payload with
@@ -1748,7 +1748,7 @@ pub unsafe fn subtitle_packet_from_borrowed<C: crate::FfmpegCarrier + crate::Car
 /// writer is left behind on a view-lane window.
 pub(crate) unsafe fn data_packet_from_ffmpeg_as<C: crate::FfmpegCarrier + crate::CarrierOps>(
   source: Packet,
-  time_base: mediadecode::Timebase,
+  time_base: mediaspine::Timebase,
   limits: PacketLimits,
   provenance: crate::buffer::PayloadProvenance,
 ) -> Result<Option<DataPacket<DataPacketExtra, C::Buffer>>, PacketBufferError> {
@@ -1797,7 +1797,7 @@ pub(crate) unsafe fn data_packet_from_ffmpeg_as<C: crate::FfmpegCarrier + crate:
 #[doc(hidden)]
 pub unsafe fn data_packet_from_borrowed<C: crate::FfmpegCarrier + crate::CarrierOps>(
   packet: &Packet,
-  time_base: mediadecode::Timebase,
+  time_base: mediaspine::Timebase,
   limits: PacketLimits,
   provenance: crate::buffer::PayloadProvenance,
 ) -> Result<Option<DataPacket<DataPacketExtra, C::Buffer>>, PacketBufferError> {
@@ -1823,7 +1823,7 @@ pub unsafe fn data_packet_from_borrowed<C: crate::FfmpegCarrier + crate::Carrier
 
 /// Wraps a borrowed [`ffmpeg::Packet`] from an **attachment** track —
 /// cover art that the container really does store as a packet — as a
-/// [`mediadecode::demuxer::AttachmentPacket`].
+/// [`mediaspine::demuxer::AttachmentPacket`].
 ///
 /// No timestamps are forwarded, and there is nowhere to put them: an
 /// attachment is not on the timeline. `synthesized` is `false`, because
@@ -2062,9 +2062,9 @@ const _: () = assert!(
 //  Empty-frame placeholders for `receive_frame` destinations.
 // ---------------------------------------------------------------------------
 
-/// Constructs an empty [`mediadecode::frame::VideoFrame`] suitable as
+/// Constructs an empty [`mediaspine::frame::VideoFrame`] suitable as
 /// the destination argument to
-/// [`mediadecode::decoder::VideoStreamDecoder::receive_frame`]. The
+/// `VideoStreamDecoder::receive_frame` (the read face in `mediadecode`). The
 /// decoder overwrites the frame on success; this just provides a
 /// well-formed slot.
 ///
@@ -2097,9 +2097,9 @@ pub(crate) fn empty_video_frame_as<C: crate::FfmpegCarrier + crate::CarrierOps>(
   )
 }
 
-/// Constructs an empty [`mediadecode::frame::AudioFrame`] suitable as
+/// Constructs an empty [`mediaspine::frame::AudioFrame`] suitable as
 /// the destination argument to
-/// [`mediadecode::decoder::AudioStreamDecoder::receive_frame`]. Same
+/// `AudioStreamDecoder::receive_frame` (the read face in `mediadecode`). Same
 /// behaviour as [`empty_video_frame`] — eight shared empty plane
 /// carriers, `plane_count = 0`, and no way to fail.
 pub(crate) fn empty_audio_frame_as<C: crate::FfmpegCarrier + crate::CarrierOps>()
@@ -2116,9 +2116,9 @@ pub(crate) fn empty_audio_frame_as<C: crate::FfmpegCarrier + crate::CarrierOps>(
   )
 }
 
-/// Constructs an empty [`mediadecode::frame::SubtitleFrame`] suitable
+/// Constructs an empty [`mediaspine::frame::SubtitleFrame`] suitable
 /// as the destination argument to
-/// [`mediadecode::decoder::SubtitleDecoder::receive_frame`]. The
+/// `SubtitleDecoder::receive_frame` (the read face in `mediadecode`). The
 /// payload is an empty `Text` placeholder; the decoder overwrites it
 /// on success. Infallible, as its two siblings are.
 pub(crate) fn empty_subtitle_frame_as<C: crate::FfmpegCarrier + crate::CarrierOps>()
@@ -2161,7 +2161,7 @@ pub(crate) fn empty_subtitle_frame_as<C: crate::FfmpegCarrier + crate::CarrierOp
 ///
 /// ```compile_fail,E0382
 /// use ffmpeg_next::packet::Mut;
-/// use mediadecode::Timebase;
+/// use mediaspine::Timebase;
 /// use mediaio_ffmpeg::{PacketLimits, video_packet_from_ffmpeg_in};
 ///
 /// let mut packet = ffmpeg_next::Packet::copy(&[0u8; 64]);
@@ -2175,7 +2175,7 @@ pub(crate) fn empty_subtitle_frame_as<C: crate::FfmpegCarrier + crate::CarrierOp
 /// [`owned_video_packet_from_ffmpeg_in`].
 pub fn video_packet_from_ffmpeg_in(
   packet: Packet,
-  time_base: mediadecode::Timebase,
+  time_base: mediaspine::Timebase,
   limits: PacketLimits,
 ) -> Result<Option<VideoPacket<VideoPacketExtra, crate::FfmpegBuffer>>, PacketBufferError> {
   // SAFETY: `CallerSupplied` is true of every packet; the packet is
@@ -2193,7 +2193,7 @@ pub fn video_packet_from_ffmpeg_in(
 /// [`audio_packet_from_ffmpeg_as`] on the view lane.
 pub fn audio_packet_from_ffmpeg_in(
   packet: Packet,
-  time_base: mediadecode::Timebase,
+  time_base: mediaspine::Timebase,
   limits: PacketLimits,
 ) -> Result<Option<AudioPacket<AudioPacketExtra, crate::FfmpegBuffer>>, PacketBufferError> {
   // SAFETY: `CallerSupplied` is true of every packet; the packet is
@@ -2211,7 +2211,7 @@ pub fn audio_packet_from_ffmpeg_in(
 /// [`subtitle_packet_from_ffmpeg_as`] on the view lane.
 pub fn subtitle_packet_from_ffmpeg_in(
   packet: Packet,
-  time_base: mediadecode::Timebase,
+  time_base: mediaspine::Timebase,
   limits: PacketLimits,
 ) -> Result<Option<SubtitlePacket<SubtitlePacketExtra, crate::FfmpegBuffer>>, PacketBufferError> {
   // SAFETY: `CallerSupplied` is true of every packet; the packet is
@@ -2229,7 +2229,7 @@ pub fn subtitle_packet_from_ffmpeg_in(
 /// [`data_packet_from_ffmpeg_as`] on the view lane.
 pub fn data_packet_from_ffmpeg_in(
   packet: Packet,
-  time_base: mediadecode::Timebase,
+  time_base: mediaspine::Timebase,
   limits: PacketLimits,
 ) -> Result<Option<DataPacket<DataPacketExtra, crate::FfmpegBuffer>>, PacketBufferError> {
   // SAFETY: `CallerSupplied` is true of every packet; the packet is
@@ -2256,7 +2256,7 @@ pub fn data_packet_from_ffmpeg_in(
 /// budgets.
 pub fn owned_video_packet_from_ffmpeg_in(
   packet: &Packet,
-  time_base: mediadecode::Timebase,
+  time_base: mediaspine::Timebase,
   limits: PacketLimits,
 ) -> Result<Option<VideoPacket<VideoPacketExtra, FfmpegBytes>>, PacketBufferError> {
   // SAFETY: `CallerSupplied` is true of every packet, and the owned lane
@@ -2275,7 +2275,7 @@ pub fn owned_video_packet_from_ffmpeg_in(
 /// budgets.
 pub fn owned_audio_packet_from_ffmpeg_in(
   packet: &Packet,
-  time_base: mediadecode::Timebase,
+  time_base: mediaspine::Timebase,
   limits: PacketLimits,
 ) -> Result<Option<AudioPacket<AudioPacketExtra, FfmpegBytes>>, PacketBufferError> {
   // SAFETY: `CallerSupplied` is true of every packet, and the owned lane
@@ -2294,7 +2294,7 @@ pub fn owned_audio_packet_from_ffmpeg_in(
 /// explicit budgets.
 pub fn owned_subtitle_packet_from_ffmpeg_in(
   packet: &Packet,
-  time_base: mediadecode::Timebase,
+  time_base: mediaspine::Timebase,
   limits: PacketLimits,
 ) -> Result<Option<SubtitlePacket<SubtitlePacketExtra, FfmpegBytes>>, PacketBufferError> {
   // SAFETY: `CallerSupplied` is true of every packet, and the owned lane
@@ -2313,7 +2313,7 @@ pub fn owned_subtitle_packet_from_ffmpeg_in(
 /// source.
 pub fn owned_data_packet_from_ffmpeg_in(
   packet: &Packet,
-  time_base: mediadecode::Timebase,
+  time_base: mediaspine::Timebase,
   limits: PacketLimits,
 ) -> Result<Option<DataPacket<DataPacketExtra, FfmpegBytes>>, PacketBufferError> {
   // SAFETY: `CallerSupplied` is true of every packet, and the owned lane
@@ -2474,7 +2474,7 @@ mod tests {
     // same wrapper. If one of them still folded the failure into
     // `None`, the demuxer would drop that kind of packet in silence.
     let forged = out_of_bounds_packet();
-    let tb = mediadecode::Timebase::default();
+    let tb = mediaspine::Timebase::default();
     assert!(matches!(
       // SAFETY: `CallerSupplied` is true of every packet, and the owned lane copies.
       unsafe {
@@ -2716,7 +2716,7 @@ mod tests {
   /// each answered — the arms share a collector, and a fix that misses
   /// one of them is a fix that misses.
   fn every_timed_arm(packet: &Packet) -> [(&'static str, Result<bool, PacketBufferError>); 4] {
-    let tb = mediadecode::Timebase::default();
+    let tb = mediaspine::Timebase::default();
     [
       (
         "video",
@@ -2831,7 +2831,7 @@ mod tests {
     let packet = unsafe {
       video_packet_from_borrowed::<crate::Owned>(
         &marker.packet,
-        mediadecode::Timebase::default(),
+        mediaspine::Timebase::default(),
         PacketLimits::default(),
         crate::buffer::PayloadProvenance::CallerSupplied,
       )
@@ -2844,7 +2844,7 @@ mod tests {
 
   #[test]
   fn side_data_that_cannot_be_carried_whole_refuses_the_packet() {
-    let tb = mediadecode::Timebase::default();
+    let tb = mediaspine::Timebase::default();
 
     // A body-bearing packet whose side data is over the byte cap. The
     // caps used to truncate and warn, which handed the codec a packet
@@ -2935,7 +2935,7 @@ mod tests {
 
   #[test]
   fn the_side_data_caps_are_refusals_at_the_boundary_not_before_it() {
-    let tb = mediadecode::Timebase::default();
+    let tb = mediaspine::Timebase::default();
 
     // Exactly at the byte cap: carried, whole.
     let at_cap = packet_with_side_data(SIDE_DATA_MAX_TOTAL_BYTES, true);
@@ -3025,7 +3025,7 @@ mod tests {
   #[test]
   fn a_trusted_packet_is_refused_on_both_legs() {
     use ffmpeg_next::packet::Mut;
-    let tb = mediadecode::Timebase::default();
+    let tb = mediaspine::Timebase::default();
 
     // Copy-out: the leg such a packet would enter the graph on.
     let mut packet = Packet::copy(&[1u8, 2, 3]);
@@ -3169,7 +3169,7 @@ mod tests {
       "the wrapper's own accessor is what loses them",
     );
 
-    let tb = mediadecode::Timebase::default();
+    let tb = mediaspine::Timebase::default();
     let expected = MdPacketFlags::from_bits_retain(raw as u8);
 
     // SAFETY: `CallerSupplied` is true of every packet, and the owned lane copies.
@@ -3268,7 +3268,7 @@ mod tests {
     use ffmpeg_next::packet::{Mut, Ref};
     const KEY: i32 = ffmpeg_next::ffi::AV_PKT_FLAG_KEY;
     const DISPOSABLE: i32 = ffmpeg_next::ffi::AV_PKT_FLAG_DISPOSABLE;
-    let tb = mediadecode::Timebase::default();
+    let tb = mediaspine::Timebase::default();
     for (raw, marked) in [
       (DISPOSABLE, true),
       (KEY | DISPOSABLE, true),
@@ -3320,7 +3320,7 @@ mod tests {
     let mut packet = Packet::copy(&[1u8]);
     // SAFETY: `packet` owns a live `AVPacket`.
     unsafe { (*packet.as_mut_ptr()).flags = 0x1_00 };
-    let tb = mediadecode::Timebase::default();
+    let tb = mediaspine::Timebase::default();
     for (arm, result) in every_timed_arm(&packet) {
       assert!(
         matches!(
@@ -3422,7 +3422,7 @@ mod tests {
     match unsafe {
       video_packet_from_ffmpeg_as::<crate::View>(
         shared,
-        mediadecode::Timebase::default(),
+        mediaspine::Timebase::default(),
         PacketLimits::default(),
         crate::buffer::PayloadProvenance::CallerSupplied,
       )
@@ -3459,7 +3459,7 @@ mod tests {
     assert!(matches!(
       owned_video_packet_from_ffmpeg_in(
         &shared_again,
-        mediadecode::Timebase::default(),
+        mediaspine::Timebase::default(),
         PacketLimits::default(),
       ),
       Err(PacketBufferError::SharedPayload(_)),
@@ -3505,7 +3505,7 @@ mod tests {
         match unsafe {
           video_packet_from_ffmpeg_as::<crate::View>(
             clone,
-            mediadecode::Timebase::default(),
+            mediaspine::Timebase::default(),
             PacketLimits::default(),
             crate::buffer::PayloadProvenance::CallerSupplied,
           )
@@ -3627,7 +3627,7 @@ mod tests {
     // Every family, both roads: the public builder a caller can call,
     // and the scoped submission a decoder goes through. Neither may
     // touch the empty carrier's absent buffer.
-    let tb = mediadecode::Timebase::default();
+    let tb = mediaspine::Timebase::default();
     let source = side_data_only_packet();
     let limits = PacketLimits::default();
 
@@ -3724,7 +3724,7 @@ mod tests {
     // is what a decoder is actually handed. Capturing without
     // reattaching is theatre: `NEW_EXTRADATA` never reaches the codec,
     // `SKIP_SAMPLES` never trims, and nothing says so.
-    let tb = mediadecode::Timebase::default();
+    let tb = mediaspine::Timebase::default();
     let mut with_body = Packet::copy(&[4u8, 5, 6]);
     {
       use ffmpeg_next::{
@@ -3816,7 +3816,7 @@ mod tests {
     // attach a type nothing downstream reads — and dropping it quietly
     // is the very defect this whole seam exists to close.
     let limit = crate::ffi::side_data_type_count();
-    let packet = mediadecode::packet::VideoPacket::new(
+    let packet = mediaspine::packet::VideoPacket::new(
       FfmpegBytes::copy_from_slice(&[1u8]),
       VideoPacketExtra::new(0).with_side_data(vec![SideDataEntry::new(
         limit,
@@ -3831,7 +3831,7 @@ mod tests {
       other => panic!("expected UnknownSideData, got {other:?}"),
     }
     assert!(matches!(
-      ffmpeg_packet_from_owned_video_packet(&mediadecode::packet::VideoPacket::new(
+      ffmpeg_packet_from_owned_video_packet(&mediaspine::packet::VideoPacket::new(
         FfmpegBytes::copy_from_slice(&[1u8]),
         VideoPacketExtra::new(0).with_side_data(vec![SideDataEntry::new(-1, FfmpegBytes::copy_from_slice(&[9u8]))]),
       ), PacketLimits::default())
@@ -3846,7 +3846,7 @@ mod tests {
     // "empty marker", it leaves a decoder running on parameters the
     // container has already replaced — and says nothing about it.
     let packet = side_data_only_packet();
-    let tb = mediadecode::Timebase::default();
+    let tb = mediaspine::Timebase::default();
 
     // SAFETY: `CallerSupplied` is true of every packet, and the owned lane copies.
     let video = unsafe {
@@ -3945,7 +3945,7 @@ mod tests {
     let video = unsafe {
       video_packet_from_borrowed::<crate::Owned>(
         &packet,
-        mediadecode::Timebase::default(),
+        mediaspine::Timebase::default(),
         PacketLimits::default(),
         crate::buffer::PayloadProvenance::CallerSupplied,
       )
@@ -3958,7 +3958,7 @@ mod tests {
 
   #[test]
   fn an_empty_packet_is_absent_and_a_real_one_is_present() {
-    let tb = mediadecode::Timebase::default();
+    let tb = mediaspine::Timebase::default();
     // No payload at all: the marker some demuxers emit. Absent, not an
     // error — this is the only thing a pull loop may skip.
     let empty = Packet::empty();
@@ -4057,7 +4057,7 @@ mod tests {
 
   #[test]
   fn hw_formats_map_to_none_in_pixel_format() {
-    // HW sentinels intentionally don't have a mediadecode::PixelFormat
+    // HW sentinels intentionally don't have a mediaspine::PixelFormat
     // representation — they're not CPU pixel data.
     assert_eq!(
       from_av_pixel_format(AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX as i32),

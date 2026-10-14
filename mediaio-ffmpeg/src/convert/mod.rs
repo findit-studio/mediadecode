@@ -1,5 +1,5 @@
 //! Conversion helpers from FFmpeg `AVFrame` / `AVPacket` to the
-//! `mediadecode` types parameterized by [`crate::Ffmpeg`] and
+//! `mediaspine` types parameterized by [`crate::Ffmpeg`] and
 //! `FfmpegBytes`.
 //!
 //! Every plane is **copied once**, here, out of FFmpeg's
@@ -140,7 +140,7 @@
 //! maps everything unknown onto a named "not stated" leaves nothing for
 //! an order to get wrong.
 //!
-//! [law]: mediadecode::adapter#the-d-seat-amputation-contract
+//! [law]: mediaspine::adapter#the-d-seat-amputation-contract
 use core::ptr::{addr_of, read_unaligned};
 
 use derive_more::{IsVariant, TryUnwrap, Unwrap};
@@ -148,13 +148,13 @@ use ffmpeg_next::ffi::{
   AV_NOPTS_VALUE, AVChromaLocation, AVColorPrimaries, AVColorRange, AVColorSpace,
   AVColorTransferCharacteristic, AVFrame, AVFrameSideDataType, AVPictureType, AVSubtitleType,
 };
-use mediadecode::{
+use mediaframe::audio::ChannelLayoutDescription;
+use mediaspine::{
   PixelFormat, Timebase, Timestamp,
   color::{ChromaLocation, ColorInfo, ColorMatrix, ColorPrimaries, ColorRange, ColorTransfer},
   frame::{AudioFrame, Dimensions, ImageFrame, Plane, Rect, SubtitleFrame, VideoFrame},
   subtitle::{Bitmap as SubtitleBitmap, SubtitlePayload, Text as SubtitleText},
 };
-use mediaframe::audio::ChannelLayoutDescription;
 
 use crate::{
   boundary,
@@ -822,13 +822,13 @@ fn unsupported_pixel_format(raw: i32) -> ConvertError {
 /// ```compile_fail,E0107
 /// use mediaio_ffmpeg::{FrameLimits, View, convert::video_frame_from};
 /// let frame = ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::GRAY8, 64, 4);
-/// let _ = video_frame_from::<View>(&frame, mediadecode::Timebase::default(), FrameLimits::default());
+/// let _ = video_frame_from::<View>(&frame, mediaspine::Timebase::default(), FrameLimits::default());
 /// ```
 pub fn video_frame_from(
   frame: &ffmpeg_next::Frame,
   time_base: Timebase,
   limits: FrameLimits,
-) -> Result<VideoFrame<mediadecode::PixelFormat, VideoFrameExtra, FfmpegBytes>, ConvertError> {
+) -> Result<VideoFrame<mediaspine::PixelFormat, VideoFrameExtra, FfmpegBytes>, ConvertError> {
   // SAFETY: `&frame` keeps the AVFrame alive for the duration of this
   // call; the unsafe convert just reads through the pointer, and the
   // owned lane copies every byte it reads, so nothing outlives the
@@ -880,7 +880,7 @@ pub fn subtitle_frame_from(
 }
 
 /// Converts an FFmpeg `AVFrame` (CPU-side, post-`av_hwframe_transfer_data`
-/// or from a software decoder) into a `mediadecode::VideoFrame`
+/// or from a software decoder) into a `mediaspine::VideoFrame`
 /// parameterized by [`crate::Ffmpeg`] / `FfmpegBytes`.
 ///
 /// `time_base` is the source stream's time base, used to label
@@ -906,7 +906,7 @@ pub unsafe fn av_frame_to_video_frame_as<C: crate::FfmpegCarrier + crate::Carrie
   av_frame: *const AVFrame,
   time_base: Timebase,
   limits: FrameLimits,
-) -> Result<VideoFrame<mediadecode::PixelFormat, VideoFrameExtra, C::Buffer>, ConvertError> {
+) -> Result<VideoFrame<mediaspine::PixelFormat, VideoFrameExtra, C::Buffer>, ConvertError> {
   if av_frame.is_null() {
     return Err(ConvertError::NullFrame);
   }
@@ -999,7 +999,7 @@ pub unsafe fn av_frame_to_video_frame_as<C: crate::FfmpegCarrier + crate::Carrie
   // Backend-specific extras.
   let extra = unsafe { build_video_frame_extra(av_frame) }?;
 
-  // pix_fmt is already mediadecode::PixelFormat thanks to the boundary
+  // pix_fmt is already mediaspine::PixelFormat thanks to the boundary
   // function above, so we just pass it through.
   let mut out = VideoFrame::new(
     Dimensions::new(width, height),
@@ -1025,14 +1025,14 @@ pub unsafe fn av_frame_to_video_frame_as<C: crate::FfmpegCarrier + crate::Carrie
 pub fn image_frame_from(
   frame: &ffmpeg_next::Frame,
   limits: FrameLimits,
-) -> Result<ImageFrame<mediadecode::PixelFormat, ImageFrameExtra, FfmpegBytes>, ConvertError> {
+) -> Result<ImageFrame<mediaspine::PixelFormat, ImageFrameExtra, FfmpegBytes>, ConvertError> {
   // SAFETY: `&frame` keeps the AVFrame alive for the duration of this
   // call, and the owned lane copies what it reads.
   unsafe { av_frame_to_image_frame_as::<crate::Owned>(frame.as_ptr(), limits) }
 }
 
 /// Converts an FFmpeg `AVFrame` holding a decoded **still** into a
-/// [`mediadecode::frame::ImageFrame`].
+/// [`mediaspine::frame::ImageFrame`].
 ///
 /// The same picture geometry as [`av_frame_to_video_frame`] — one
 /// plane-extraction rule, shared — and none of its timeline. There is
@@ -1066,7 +1066,7 @@ pub fn image_frame_from(
 pub unsafe fn av_frame_to_image_frame_as<C: crate::FfmpegCarrier + crate::CarrierOps>(
   av_frame: *const AVFrame,
   limits: FrameLimits,
-) -> Result<ImageFrame<mediadecode::PixelFormat, ImageFrameExtra, C::Buffer>, ConvertError> {
+) -> Result<ImageFrame<mediaspine::PixelFormat, ImageFrameExtra, C::Buffer>, ConvertError> {
   if av_frame.is_null() {
     return Err(ConvertError::NullFrame);
   }
@@ -2329,7 +2329,7 @@ fn map_chroma_loc(raw: i32) -> ChromaLocation {
   }
 }
 
-/// Converts an FFmpeg audio `AVFrame` into a `mediadecode::AudioFrame`.
+/// Converts an FFmpeg audio `AVFrame` into a `mediaspine::AudioFrame`.
 ///
 /// Each plane is copied out of the source frame's `AVBufferRef`
 /// entries into an `FfmpegBytes` (the corresponding `data[i]` is always
@@ -2516,7 +2516,7 @@ pub unsafe fn av_frame_to_audio_frame_as<C: crate::FfmpegCarrier + crate::Carrie
   // Plane count: 1 for packed, channel_count for planar.
   let is_planar = sample_format.is_planar();
   let plane_count_full = if is_planar { channel_count as usize } else { 1 };
-  // mediadecode's `AudioFrame` carries up to 8 plane slots
+  // mediaspine's `AudioFrame` carries up to 8 plane slots
   // (matching `AV_NUM_DATA_POINTERS`). Planar audio with more than
   // 8 channels uses `AVFrame.extended_data[]` / `extended_buf[]`,
   // which we don't yet plumb through. Refuse the frame rather than
@@ -2765,14 +2765,14 @@ pub(crate) unsafe fn find_audio_backing_buffer(
   None
 }
 
-/// Converts an FFmpeg `AVSubtitle` into a `mediadecode::SubtitleFrame`.
+/// Converts an FFmpeg `AVSubtitle` into a `mediaspine::SubtitleFrame`.
 ///
 /// Strategy:
 /// - If the subtitle contains any text/ASS rects, produce a
 ///   [`SubtitlePayload::Text`] whose buffer is the concatenation of
 ///   their UTF-8 contents (newline-separated).
 /// - Otherwise, if the subtitle contains bitmap rects, produce a
-///   [`SubtitlePayload::Bitmap`] with one [`mediadecode::subtitle::BitmapRegion`]
+///   [`SubtitlePayload::Bitmap`] with one [`mediaspine::subtitle::BitmapRegion`]
 ///   per rect (paletted indices and RGBA palette copied into fresh
 ///   owned `FfmpegBytes` carriers, since `AVSubtitleRect` data is not
 ///   refcounted and does not outlive the `AVSubtitle`).
@@ -2815,7 +2815,7 @@ pub unsafe fn av_subtitle_to_subtitle_frame_as<C: crate::FfmpegCarrier + crate::
   // refusal keeps the pending cue for another attempt, and an
   // allocator that aborts takes the cue and the process with it.
   let mut text_chunks: std::vec::Vec<u8> = std::vec::Vec::new();
-  let mut bitmap_regions: std::vec::Vec<mediadecode::subtitle::BitmapRegion<C::Buffer>> =
+  let mut bitmap_regions: std::vec::Vec<mediaspine::subtitle::BitmapRegion<C::Buffer>> =
     std::vec::Vec::new();
 
   let count_raw = unsafe { (*av_subtitle).num_rects } as usize;
@@ -2988,7 +2988,7 @@ pub unsafe fn av_subtitle_to_subtitle_frame_as<C: crate::FfmpegCarrier + crate::
           let p = unsafe { core::slice::from_raw_parts(rect_data1_ptr, palette_len) };
           C::from_bytes(p).ok_or(ConvertError::CarrierAllocFailed(CarrierAllocFailed::new(1)))?
         };
-        bitmap_regions.push(mediadecode::subtitle::BitmapRegion::new(
+        bitmap_regions.push(mediaspine::subtitle::BitmapRegion::new(
           rect_x.max(0) as u32,
           rect_y.max(0) as u32,
           w,
@@ -3074,7 +3074,7 @@ pub unsafe fn av_frame_to_video_frame(
   av_frame: *const AVFrame,
   time_base: Timebase,
   limits: FrameLimits,
-) -> Result<VideoFrame<mediadecode::PixelFormat, VideoFrameExtra, crate::FfmpegBuffer>, ConvertError>
+) -> Result<VideoFrame<mediaspine::PixelFormat, VideoFrameExtra, crate::FfmpegBuffer>, ConvertError>
 {
   // SAFETY: forwarded verbatim; the caller's obligations are the
   // worker's.
@@ -3091,7 +3091,7 @@ pub unsafe fn av_frame_to_owned_video_frame(
   av_frame: *const AVFrame,
   time_base: Timebase,
   limits: FrameLimits,
-) -> Result<VideoFrame<mediadecode::PixelFormat, VideoFrameExtra, FfmpegBytes>, ConvertError> {
+) -> Result<VideoFrame<mediaspine::PixelFormat, VideoFrameExtra, FfmpegBytes>, ConvertError> {
   // SAFETY: forwarded verbatim.
   unsafe { av_frame_to_video_frame_as::<crate::Owned>(av_frame, time_base, limits) }
 }
@@ -3106,7 +3106,7 @@ pub unsafe fn av_frame_to_owned_video_frame(
 pub unsafe fn av_frame_to_image_frame(
   av_frame: *const AVFrame,
   limits: FrameLimits,
-) -> Result<ImageFrame<mediadecode::PixelFormat, ImageFrameExtra, crate::FfmpegBuffer>, ConvertError>
+) -> Result<ImageFrame<mediaspine::PixelFormat, ImageFrameExtra, crate::FfmpegBuffer>, ConvertError>
 {
   // SAFETY: forwarded verbatim; the caller's obligations are the
   // worker's.
@@ -3122,7 +3122,7 @@ pub unsafe fn av_frame_to_image_frame(
 pub unsafe fn av_frame_to_owned_image_frame(
   av_frame: *const AVFrame,
   limits: FrameLimits,
-) -> Result<ImageFrame<mediadecode::PixelFormat, ImageFrameExtra, FfmpegBytes>, ConvertError> {
+) -> Result<ImageFrame<mediaspine::PixelFormat, ImageFrameExtra, FfmpegBytes>, ConvertError> {
   // SAFETY: forwarded verbatim.
   unsafe { av_frame_to_image_frame_as::<crate::Owned>(av_frame, limits) }
 }

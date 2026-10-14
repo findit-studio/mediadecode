@@ -191,7 +191,7 @@
 //! this. This crate is not a hypervisor for FFmpeg, and its seats
 //! compose with that instrument rather than replacing it.
 //!
-//! [gov]: mediadecode::adapter#the-resource-governance-contract
+//! [gov]: mediaspine::adapter#the-resource-governance-contract
 //!
 //! And the capstone, which is what every seat in this table is finally
 //! for: **a judge must dominate the allocator's arithmetic, not the
@@ -222,7 +222,7 @@
 //! lossy clamp; the one floor left, `sample_rate`, is censused at its
 //! site with the reason it is metadata and sizes nothing.
 //!
-//! [law]: mediadecode::adapter#the-d-seat-amputation-contract
+//! [law]: mediaspine::adapter#the-d-seat-amputation-contract
 
 use std::fmt;
 
@@ -263,7 +263,7 @@ use derive_more::{IsVariant, TryUnwrap, Unwrap};
 /// pool is built and not before — this codebase does not carry members
 /// nothing can produce.
 ///
-/// [law]: mediadecode::adapter#the-d-seat-amputation-contract
+/// [law]: mediaspine::adapter#the-d-seat-amputation-contract
 #[derive(Clone, Default)]
 pub struct FfmpegBytes(Inner);
 
@@ -840,7 +840,7 @@ impl SideDataBytes {
 ///
 /// A packet carries flag bits the portable vocabulary cannot hold.
 ///
-/// `mediadecode`'s `PacketFlags` is a `u8` bit set, and every packet
+/// `mediaspine`'s `PacketFlags` is a `u8` bit set, and every packet
 /// flag FFmpeg names today lives in that byte — so this cannot fire
 /// against this build. It exists so that the day one does not, the
 /// packet is refused by name instead of arriving with a bit quietly

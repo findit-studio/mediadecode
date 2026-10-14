@@ -1023,7 +1023,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     match converted {
       Ok(new_frame) => {
         self.commit_delivery(new_frame, dst);
-        Ok(Received::Frame)
+        Ok(Received::Produced)
       }
       Err(e) => {
         // Park only what another attempt could survive.
@@ -1267,7 +1267,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       };
       self.sw_replay_frames.pop_front();
       self.commit_delivery(new_frame, dst);
-      return Ok(Received::Frame);
+      return Ok(Received::Produced);
     }
     // A frame whose conversion did not commit is converted again before
     // the decoder is asked for another — see [`Self::scratch_pending`].
@@ -1280,7 +1280,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     loop {
       match &mut self.state {
         DecodeState::Hw(hw) => match hw.receive_frame(&mut self.hw_scratch) {
-          Ok(Received::Frame) => {
+          Ok(Received::Produced) => {
             // The frame is out of the decoder's queue from here; the
             // seat is what keeps it if the conversion cannot commit.
             self.scratch_pending = true;
@@ -1337,7 +1337,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
               };
               self.sw_replay_frames.pop_front();
               self.commit_delivery(new_frame, dst);
-              return Ok(Received::Frame);
+              return Ok(Received::Produced);
             }
             // Fall through to the loop; next iteration takes the Sw arm.
           }
@@ -1371,7 +1371,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
                 }
               };
               self.commit_delivery(new_frame, dst);
-              return Ok(Received::Frame);
+              return Ok(Received::Produced);
             }
             // Funnel first — so a recorded budget refusal is named
             // rather than laundered — and read as a status second:

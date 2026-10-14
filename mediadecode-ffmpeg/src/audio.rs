@@ -238,7 +238,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierAudioStreamDecoder<C> {
       Ok(new_frame) => {
         self.scratch_pending = false;
         *dst = new_frame;
-        Ok(Received::Frame)
+        Ok(Received::Produced)
       }
       Err(e) => {
         // Park only what another attempt could survive; a frame nothing

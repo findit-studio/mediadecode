@@ -7,15 +7,14 @@
 //! at. The decoder produces whatever the file holds. [`AudioResampler`]
 //! is the seam between them.
 //!
-//! The face is the [`AudioStreamDecoder`] push pair, one tier along:
+//! The face is the `AudioStreamDecoder` push pair (the read face in
+//! `mediadecode`), one tier along:
 //! `send_frame` / `receive_frame` / `send_eof` / `flush`, answering the
 //! same [`Sent`] and [`Received`] the decoders answer. One rhythm for
 //! the whole chain: the caller pushes, drains, and schedules.
 //!
 //! No FFmpeg in the shape. `swresample` is merely the first
 //! implementation; a pure-Rust polyphase resampler fits the same face.
-//!
-//! [`AudioStreamDecoder`]: crate::decoder::AudioStreamDecoder
 
 use crate::{Received, Sent, adapter::AudioAdapter, frame::AudioFrame};
 
@@ -110,9 +109,7 @@ pub trait AudioResampler {
   ) -> Result<Sent, Self::Error>;
 
   /// Drains one converted frame into `dst`, answering the same
-  /// [`Received`] that
-  /// [`AudioStreamDecoder::receive_frame`](crate::decoder::AudioStreamDecoder::receive_frame)
-  /// answers.
+  /// [`Received`] that `AudioStreamDecoder::receive_frame` answers.
   fn receive_frame(
     &mut self,
     dst: &mut AdapterAudioFrame<Self::Adapter, Self::Buffer>,
@@ -209,14 +206,14 @@ mod tests {
     ) -> Result<Received, LoopError> {
       if self.pending {
         self.pending = false;
-        return Ok(Received::Frame);
+        return Ok(Received::Produced);
       }
       if !self.eof {
         return Ok(Received::NeedsInput);
       }
       if self.tail > 0 {
         self.tail -= 1;
-        return Ok(Received::Frame);
+        return Ok(Received::Produced);
       }
       Ok(Received::Ended)
     }
@@ -257,7 +254,7 @@ mod tests {
     let mut dst = frame(48_000);
     assert_eq!(r.receive_frame(&mut dst), Ok(Received::NeedsInput));
     assert_eq!(r.send_frame(&frame(48_000)), Ok(Sent::Accepted));
-    assert_eq!(r.receive_frame(&mut dst), Ok(Received::Frame));
+    assert_eq!(r.receive_frame(&mut dst), Ok(Received::Produced));
     assert_eq!(r.receive_frame(&mut dst), Ok(Received::NeedsInput));
   }
 
@@ -308,7 +305,7 @@ mod tests {
         .receive_frame(&mut dst)
         .expect("no fault in a clean drain")
       {
-        Received::Frame => frames += 1,
+        Received::Produced => frames += 1,
         Received::NeedsInput => panic!(
           "a resampler that has been told the stream is over asked for input it \
            can never get — the caller has nothing left to send, so this is the hang",

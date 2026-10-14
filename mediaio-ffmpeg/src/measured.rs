@@ -3,7 +3,7 @@
 //! the file.
 //!
 //! [`Measured`] is the state behind
-//! [`Demuxer::measured_end`](mediadecode::demuxer::Demuxer::measured_end).
+//! `Demuxer::measured_end` (the read face in `mediadecode`).
 //! It is fed by the pulls the caller already makes — one
 //! [`observe`](Measured::observe) per timed packet read — and reads
 //! nothing of its own, so there is no seek-to-end probe and no second
@@ -32,7 +32,7 @@
 
 use std::collections::TryReserveError;
 
-use mediadecode::{Timebase, Timestamp, demuxer::MeasuredEnd};
+use mediaspine::{Timebase, Timestamp, demuxer::MeasuredEnd};
 
 /// One track's running figure.
 #[derive(Clone, Copy)]

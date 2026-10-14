@@ -636,7 +636,7 @@ impl AudioStreamDecoder for WebCodecsAudioStreamDecoder {
     )
     .with_pts(pts)
     .with_duration(duration);
-    Ok(Received::Frame)
+    Ok(Received::Produced)
   }
 
   async fn send_eof(&mut self) -> Result<Sent, Self::Error> {

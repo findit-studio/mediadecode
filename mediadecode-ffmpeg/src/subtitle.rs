@@ -280,7 +280,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierSubtitleStreamDecoder<C
         self.scratch.clear();
         self.scratch_pending = false;
         *dst = frame;
-        Ok(Received::Frame)
+        Ok(Received::Produced)
       }
       Err(e) if crate::decoder::parks_in_decode(&e) => {
         // Kept: another attempt could carry this cue, and there is no

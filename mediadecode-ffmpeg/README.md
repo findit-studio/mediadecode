@@ -266,7 +266,7 @@ impl Track {
   fn drain(&mut self) -> Result<(), BoxError> {
     loop {
       match self.decoder.receive_frame(&mut self.frame) {
-        Ok(Received::Frame) => self.deliver(),
+        Ok(Received::Produced) => self.deliver(),
         Ok(Received::NeedsInput | Received::Ended) => return Ok(()),
         // A failure here may concern a packet accepted earlier: FFmpeg
         // decouples input from output and may hold several pictures. No

@@ -51,7 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
   let drain = |decoder: &mut VideoDecoder, frame: &mut Frame, count: &mut u64| loop {
     match decoder.receive_frame(frame) {
-      Ok(Received::Frame) => {
+      Ok(Received::Produced) => {
         *count += 1;
         println!(
           "frame#{count} pts={:?} {}x{} pix_fmt={:?}",

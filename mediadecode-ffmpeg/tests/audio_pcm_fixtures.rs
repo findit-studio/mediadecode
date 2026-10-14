@@ -178,7 +178,7 @@ fn decode_clip(path: &std::path::Path, expected: (u32, u8, u64)) {
       decoder
         .receive_frame(&mut frame)
         .expect("audio receive_frame"),
-      Received::Frame
+      Received::Produced
     ) {
       total_samples = total_samples.saturating_add(frame.nb_samples() as u64);
       frame_count = frame_count.saturating_add(1);
@@ -193,7 +193,7 @@ fn decode_clip(path: &std::path::Path, expected: (u32, u8, u64)) {
       .receive_frame(&mut frame)
       .expect("audio receive_frame")
     {
-      Received::Frame => {
+      Received::Produced => {
         total_samples = total_samples.saturating_add(frame.nb_samples() as u64);
         frame_count = frame_count.saturating_add(1);
       }
@@ -352,7 +352,7 @@ fn the_audio_face_answers_the_same_vocabulary_without_a_park_refusal() {
   let mut delivered = 0u32;
   while matches!(
     decoder.receive_frame(&mut frame).expect("no fault"),
-    Received::Frame
+    Received::Produced
   ) {
     delivered += 1;
   }
@@ -361,7 +361,7 @@ fn the_audio_face_answers_the_same_vocabulary_without_a_park_refusal() {
   assert_eq!(decoder.send_eof().expect("no fault"), Sent::Accepted);
   loop {
     match decoder.receive_frame(&mut frame).expect("no fault") {
-      Received::Frame => {}
+      Received::Produced => {}
       Received::NeedsInput => panic!("a decoder at EOF asked for input"),
       Received::Ended => break,
     }
@@ -424,7 +424,7 @@ fn a_packet_after_eof_is_refused_by_the_audio_substrate() {
   let mut frame = empty_audio_frame();
   loop {
     match decoder.receive_frame(&mut frame).expect("no fault") {
-      Received::Frame => {}
+      Received::Produced => {}
       Received::NeedsInput => panic!("a decoder at EOF asked for input"),
       Received::Ended => break,
     }

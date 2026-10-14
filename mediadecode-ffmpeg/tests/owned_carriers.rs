@@ -888,7 +888,7 @@ fn an_amplifying_conversion_is_refused_before_the_output_frame_exists() {
   assert_eq!(
     up.receive_frame(&mut converted)
       .expect("the conversion produced a frame"),
-    Received::Frame,
+    Received::Produced,
   );
   assert_eq!(converted.sample_rate(), 48_000);
   assert!(converted.nb_samples() > 0);
@@ -1316,7 +1316,7 @@ fn an_audio_plane_exports_valid_samples_not_alignment_padding() {
     let mut frame = mediadecode_ffmpeg::empty_owned_audio_frame();
     while matches!(
       decoder.receive_frame(&mut frame).expect("receive_frame"),
-      Received::Frame
+      Received::Produced
     ) {
       let samples = frame.nb_samples() as usize;
       if samples == 0 {
@@ -2422,7 +2422,7 @@ fn audio_gets_a_pre_allocation_ceiling_too() {
       // un-consumed packet is simply not re-offered, and there are more.
       let _ = decoder.send_packet(&audio)?;
       match decoder.receive_frame(&mut frame) {
-        Ok(Received::Frame) => return Ok(()),
+        Ok(Received::Produced) => return Ok(()),
         // Not enough input yet: feed the next packet.
         Ok(Received::NeedsInput) => continue,
         Ok(Received::Ended) => break,
@@ -2505,7 +2505,7 @@ fn decode_first_audio(
         // Answer dropped: see the note on the first ceiling probe above.
         let _ = decoder.send_packet(&audio)?;
         match decoder.receive_frame(&mut frame) {
-          Ok(Received::Frame) => return Ok(frame),
+          Ok(Received::Produced) => return Ok(frame),
           Ok(Received::NeedsInput | Received::Ended) => continue,
           Err(e) => return Err(e),
         }
@@ -2553,7 +2553,7 @@ fn the_hardware_road_still_delivers_frames_through_its_new_seat() {
         if decoder.send_packet(&packet).is_err() {
           continue;
         }
-        if matches!(decoder.receive_frame(&mut frame), Ok(Received::Frame)) {
+        if matches!(decoder.receive_frame(&mut frame), Ok(Received::Produced)) {
           delivered = true;
           break 'outer;
         }
@@ -2616,7 +2616,7 @@ fn a_cropped_stream_is_judged_on_what_it_allocates_not_what_it_displays() {
           // Answer dropped: see the note on the first ceiling probe above.
           let _ = decoder.send_packet(&packet)?;
           match decoder.receive_frame(&mut frame) {
-            Ok(Received::Frame) => return Ok(()),
+            Ok(Received::Produced) => return Ok(()),
             Ok(Received::NeedsInput | Received::Ended) => continue,
             Err(e) => return Err(e),
           }
@@ -2809,7 +2809,7 @@ fn every_hardware_exit_names_the_coded_surface_refusal() {
           .send_packet(&packet)
           .and_then(|_| decoder.receive_frame(&mut frame));
         match outcome {
-          Ok(Received::Frame) => panic!("a 2 Mpx coded surface passed a 1 Mpx ceiling"),
+          Ok(Received::Produced) => panic!("a 2 Mpx coded surface passed a 1 Mpx ceiling"),
           Ok(Received::NeedsInput | Received::Ended) => continue,
           Err(e) => {
             refusal = named(&e);
@@ -2876,7 +2876,7 @@ fn a_cheap_format_is_not_charged_the_worst_formats_price() {
           // Answer dropped: see the note on the first ceiling probe above.
           let _ = decoder.send_packet(&packet)?;
           match decoder.receive_frame(&mut frame) {
-            Ok(Received::Frame) => return Ok(()),
+            Ok(Received::Produced) => return Ok(()),
             Ok(Received::NeedsInput | Received::Ended) => continue,
             Err(e) => return Err(e),
           }
@@ -2986,7 +2986,7 @@ fn a_byte_refused_frame_is_named_on_every_software_road() {
           .send_packet(&packet)
           .and_then(|_| decoder.receive_frame(&mut frame));
         match outcome {
-          Ok(Received::Frame) => panic!("a 3.1 MB frame passed a 1 MiB ceiling"),
+          Ok(Received::Produced) => panic!("a 3.1 MB frame passed a 1 MiB ceiling"),
           Ok(Received::NeedsInput | Received::Ended) => continue,
           Err(e) => {
             video_named = named(&e);
@@ -3091,7 +3091,7 @@ fn the_software_video_road_names_its_budget_refusals() {
           // Answer dropped: see the note on the first ceiling probe above.
           let _ = decoder.send_packet(&video)?;
           match decoder.receive_frame(&mut frame) {
-            Ok(Received::Frame) => return Ok(()),
+            Ok(Received::Produced) => return Ok(()),
             Ok(Received::NeedsInput | Received::Ended) => continue,
             Err(e) => return Err(e),
           }

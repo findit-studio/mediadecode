@@ -155,36 +155,36 @@ pub mod test_support {
 /// Compressed video packet pre-parameterized with this crate's extras
 /// and view carrier — the type `mediadecode-ffmpeg`'s
 /// `FfmpegVideoStreamDecoder` consumes via
-/// [`mediadecode::decoder::VideoStreamDecoder::send_packet`].
-pub type VideoPacket = mediadecode::packet::VideoPacket<extras::VideoPacketExtra, FfmpegBuffer>;
+/// `VideoStreamDecoder::send_packet` (the read face in `mediadecode`).
+pub type VideoPacket = mediaspine::packet::VideoPacket<extras::VideoPacketExtra, FfmpegBuffer>;
 
 /// Compressed audio packet pre-parameterized with this crate's extras
 /// and view carrier.
-pub type AudioPacket = mediadecode::packet::AudioPacket<extras::AudioPacketExtra, FfmpegBuffer>;
+pub type AudioPacket = mediaspine::packet::AudioPacket<extras::AudioPacketExtra, FfmpegBuffer>;
 
 /// Compressed subtitle packet pre-parameterized with this crate's
 /// extras and view carrier.
 pub type SubtitlePacket =
-  mediadecode::packet::SubtitlePacket<extras::SubtitlePacketExtra, FfmpegBuffer>;
+  mediaspine::packet::SubtitlePacket<extras::SubtitlePacketExtra, FfmpegBuffer>;
 
 /// Decoded video frame pre-parameterized with this crate's pixel
 /// format / extras / view carrier.
 ///
 /// Its planes are windows into the decoder's own frame buffer wherever
 /// the geometry proves they may be — see the frame row of the lane
-/// table in [`mediadecode::adapter`]. **A frame held is a pool slot
+/// table in [`mediaspine::adapter`]. **A frame held is a pool slot
 /// held**: on a hardware or fixed-pool decoder, retaining these past
 /// the next `receive_frame` starves the decoder. Use [`OwnedVideoFrame`]
 /// when a frame has to outlive the decode loop.
 pub type VideoFrame =
-  mediadecode::frame::VideoFrame<mediadecode::PixelFormat, extras::VideoFrameExtra, FfmpegBuffer>;
+  mediaspine::frame::VideoFrame<mediaspine::PixelFormat, extras::VideoFrameExtra, FfmpegBuffer>;
 
 /// Decoded audio frame pre-parameterized with this crate's sample
 /// format / channel layout / extras / view carrier.
 ///
 /// Each plane is a window over exactly the samples the decoder wrote —
 /// never the allocator's alignment padding past them.
-pub type AudioFrame = mediadecode::frame::AudioFrame<
+pub type AudioFrame = mediaspine::frame::AudioFrame<
   SampleFormat,
   mediaframe::audio::ChannelLayoutDescription,
   extras::AudioFrameExtra,
@@ -193,28 +193,27 @@ pub type AudioFrame = mediadecode::frame::AudioFrame<
 
 /// Decoded subtitle frame pre-parameterized with this crate's
 /// extras / view carrier.
-pub type SubtitleFrame =
-  mediadecode::frame::SubtitleFrame<extras::SubtitleFrameExtra, FfmpegBuffer>;
+pub type SubtitleFrame = mediaspine::frame::SubtitleFrame<extras::SubtitleFrameExtra, FfmpegBuffer>;
 
 /// Decoded still image pre-parameterized with this crate's pixel
 /// format / extras / view carrier — what `mediadecode-ffmpeg`'s
 /// `FfmpegImageDecoder` produces.
 pub type ImageFrame =
-  mediadecode::frame::ImageFrame<mediadecode::PixelFormat, extras::ImageFrameExtra, FfmpegBuffer>;
+  mediaspine::frame::ImageFrame<mediaspine::PixelFormat, extras::ImageFrameExtra, FfmpegBuffer>;
 
 /// Timed opaque-data packet pre-parameterized with this crate's extras
 /// and view carrier.
-pub type DataPacket = mediadecode::demuxer::DataPacket<extras::DataPacketExtra, FfmpegBuffer>;
+pub type DataPacket = mediaspine::demuxer::DataPacket<extras::DataPacketExtra, FfmpegBuffer>;
 
 /// Attachment payload pre-parameterized with this crate's extras and
 /// view carrier — a font, or the cover art `mediadecode-ffmpeg`'s
 /// `FfmpegImageDecoder` decodes.
 pub type AttachmentPacket =
-  mediadecode::demuxer::AttachmentPacket<extras::AttachmentPacketExtra, FfmpegBuffer>;
+  mediaspine::demuxer::AttachmentPacket<extras::AttachmentPacketExtra, FfmpegBuffer>;
 
 /// The five-arm demux envelope `mediadecode-ffmpeg`'s `FfmpegDemuxer`
 /// delivers.
-pub type DemuxedPacket = mediadecode::demuxer::DemuxedPacket<Ffmpeg, FfmpegBuffer>;
+pub type DemuxedPacket = mediaspine::demuxer::DemuxedPacket<Ffmpeg, FfmpegBuffer>;
 
 // --- The owned lane's alias family -----------------------------------
 //
@@ -230,33 +229,33 @@ pub type DemuxedPacket = mediadecode::demuxer::DemuxedPacket<Ffmpeg, FfmpegBuffe
 // parameter reaches the **payload**, not the annotations.
 
 /// [`VideoPacket`] on the owned lane.
-pub type OwnedVideoPacket = mediadecode::packet::VideoPacket<extras::VideoPacketExtra, FfmpegBytes>;
+pub type OwnedVideoPacket = mediaspine::packet::VideoPacket<extras::VideoPacketExtra, FfmpegBytes>;
 
 /// [`AudioPacket`] on the owned lane.
-pub type OwnedAudioPacket = mediadecode::packet::AudioPacket<extras::AudioPacketExtra, FfmpegBytes>;
+pub type OwnedAudioPacket = mediaspine::packet::AudioPacket<extras::AudioPacketExtra, FfmpegBytes>;
 
 /// [`SubtitlePacket`] on the owned lane.
 pub type OwnedSubtitlePacket =
-  mediadecode::packet::SubtitlePacket<extras::SubtitlePacketExtra, FfmpegBytes>;
+  mediaspine::packet::SubtitlePacket<extras::SubtitlePacketExtra, FfmpegBytes>;
 
 /// [`DataPacket`] on the owned lane.
-pub type OwnedDataPacket = mediadecode::demuxer::DataPacket<extras::DataPacketExtra, FfmpegBytes>;
+pub type OwnedDataPacket = mediaspine::demuxer::DataPacket<extras::DataPacketExtra, FfmpegBytes>;
 
 /// [`AttachmentPacket`] on the owned lane.
 pub type OwnedAttachmentPacket =
-  mediadecode::demuxer::AttachmentPacket<extras::AttachmentPacketExtra, FfmpegBytes>;
+  mediaspine::demuxer::AttachmentPacket<extras::AttachmentPacketExtra, FfmpegBytes>;
 
 /// [`DemuxedPacket`] on the owned lane.
-pub type OwnedDemuxedPacket = mediadecode::demuxer::DemuxedPacket<Ffmpeg, FfmpegBytes>;
+pub type OwnedDemuxedPacket = mediaspine::demuxer::DemuxedPacket<Ffmpeg, FfmpegBytes>;
 
 /// [`VideoFrame`] on the owned lane — planes copied out of the
 /// decoder's buffer, so the frame outlives it and the pool slot goes
 /// straight back.
 pub type OwnedVideoFrame =
-  mediadecode::frame::VideoFrame<mediadecode::PixelFormat, extras::VideoFrameExtra, FfmpegBytes>;
+  mediaspine::frame::VideoFrame<mediaspine::PixelFormat, extras::VideoFrameExtra, FfmpegBytes>;
 
 /// [`AudioFrame`] on the owned lane.
-pub type OwnedAudioFrame = mediadecode::frame::AudioFrame<
+pub type OwnedAudioFrame = mediaspine::frame::AudioFrame<
   SampleFormat,
   mediaframe::audio::ChannelLayoutDescription,
   extras::AudioFrameExtra,
@@ -265,36 +264,36 @@ pub type OwnedAudioFrame = mediadecode::frame::AudioFrame<
 
 /// [`SubtitleFrame`] on the owned lane.
 pub type OwnedSubtitleFrame =
-  mediadecode::frame::SubtitleFrame<extras::SubtitleFrameExtra, FfmpegBytes>;
+  mediaspine::frame::SubtitleFrame<extras::SubtitleFrameExtra, FfmpegBytes>;
 
 /// [`ImageFrame`] on the owned lane — what `mediadecode-ffmpeg`'s
 /// `FfmpegOwnedImageDecoder` produces.
 pub type OwnedImageFrame =
-  mediadecode::frame::ImageFrame<mediadecode::PixelFormat, extras::ImageFrameExtra, FfmpegBytes>;
+  mediaspine::frame::ImageFrame<mediaspine::PixelFormat, extras::ImageFrameExtra, FfmpegBytes>;
 
 /// One row of the track table a demuxer's `tracks` returns.
-pub type TrackInfo = mediadecode::demuxer::TrackInfo<Ffmpeg>;
+pub type TrackInfo = mediaspine::demuxer::TrackInfo<Ffmpeg>;
 
 /// A track's per-kind codec parameters, as [`TrackInfo`] carries them.
-pub type TrackParams = mediadecode::demuxer::TrackParams<Ffmpeg>;
+pub type TrackParams = mediaspine::demuxer::TrackParams<Ffmpeg>;
 
 /// One row of the chapter table a demuxer's `chapters` returns.
-pub type Chapter = mediadecode::demuxer::Chapter<Ffmpeg>;
+pub type Chapter = mediaspine::demuxer::Chapter<Ffmpeg>;
 
 /// Asserts a submission was taken, and answers nothing.
 ///
-/// The `#[must_use]` on [`mediadecode::Sent`] is deliberate teeth: a
+/// The `#[must_use]` on [`mediaspine::Sent`] is deliberate teeth: a
 /// test that submits and ignores the answer is a test that would not
 /// notice a session quietly asking to be drained.
 #[cfg(test)]
 #[track_caller]
 pub(crate) fn accepted<E: core::fmt::Debug>(
-  status: core::result::Result<mediadecode::Sent, E>,
+  status: core::result::Result<mediaspine::Sent, E>,
   what: &str,
 ) {
   assert_eq!(
     status.unwrap_or_else(|e| panic!("{what}: {e:?}")),
-    mediadecode::Sent::Accepted,
+    mediaspine::Sent::Accepted,
     "{what}: the session asked to be drained where the test expected room",
   );
 }

@@ -58,7 +58,7 @@ use crate::Timestamp;
 
 /// A compressed video packet.
 ///
-/// Generic over the [`VideoAdapter`] (which contributes
+/// Generic over the [`VideoAdapter`](crate::adapter::VideoAdapter) (which contributes
 /// `A::PacketExtra`) and the buffer type `B: AsRef<[u8]>`.
 ///
 /// `pts` / `dts` / `duration` are `Option<Timestamp>` because not

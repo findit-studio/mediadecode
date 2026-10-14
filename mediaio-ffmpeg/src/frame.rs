@@ -28,12 +28,12 @@
 //! themselves under their own `unsafe` contract.
 //!
 //! Compare formats against the variants of
-//! [`mediadecode::PixelFormat`].
+//! [`mediaspine::PixelFormat`].
 
 use std::slice;
 
 use ffmpeg_next::frame;
-use mediadecode::PixelFormat;
+use mediaspine::PixelFormat;
 
 use crate::{boundary, error::CrossingError};
 
@@ -123,7 +123,7 @@ impl Frame {
   }
 
   /// Pixel format, returned as a [`PixelFormat`] (the unified
-  /// mediadecode enum). The mapping is via [`boundary::from_av_pixel_format`]
+  /// mediaspine enum). The mapping is via [`boundary::from_av_pixel_format`]
   /// — sound regardless of the linked FFmpeg version, no
   /// `AVPixelFormat` enum is constructed from a runtime integer.
   pub fn pix_fmt(&self) -> PixelFormat {

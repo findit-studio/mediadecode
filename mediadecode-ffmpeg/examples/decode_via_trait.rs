@@ -112,7 +112,7 @@ where
   {
     loop {
       match decoder.receive_frame(dst)? {
-        Received::Frame => {
+        Received::Produced => {
           *count += 1;
           println!(
             "frame#{count} pts={:?} {}x{} pix_fmt={}",

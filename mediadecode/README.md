@@ -184,7 +184,7 @@ fn decode_one<D: VideoStreamDecoder>(
     match decoder.send_packet(packet)? {
       Sent::Accepted => break,
       Sent::MustDrain => {
-        while let Received::Frame = decoder.receive_frame(dst)? {
+        while let Received::Produced = decoder.receive_frame(dst)? {
           on_frame(dst);
         }
       }
@@ -192,7 +192,7 @@ fn decode_one<D: VideoStreamDecoder>(
   }
   loop {
     match decoder.receive_frame(dst)? {
-      Received::Frame => on_frame(dst),
+      Received::Produced => on_frame(dst),
       Received::NeedsInput => return Ok(false),
       Received::Ended => return Ok(true),
     }

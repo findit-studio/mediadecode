@@ -75,7 +75,7 @@
 //! an object id) has the same duty.
 //!
 //! **This crate does not name the carrier.** No signature here or in
-//! [`crate::decoder`] mentions a concrete buffer type; `D` and
+//! the faces built on it mentions a concrete buffer type; `D` and
 //! `Buffer` stay generic and their bounds stay minimal
 //! (`AsRef<[u8]>`), so a consumer states what it spends. What
 //! satisfies the contract is the backend's use-site choice —

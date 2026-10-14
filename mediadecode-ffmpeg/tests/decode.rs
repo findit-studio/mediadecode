@@ -61,7 +61,7 @@ fn auto_open_decodes_at_least_one_frame() {
         // guessing that a second failure means damage.
         Ok(Sent::MustDrain) => loop {
           match decoder.receive_frame(&mut frame) {
-            Ok(Received::Frame) => {
+            Ok(Received::Produced) => {
               assert_eq!(frame.width(), expected_w);
               assert_eq!(frame.height(), expected_h);
               count += 1;
@@ -78,7 +78,7 @@ fn auto_open_decodes_at_least_one_frame() {
     }
     loop {
       match decoder.receive_frame(&mut frame) {
-        Ok(Received::Frame) => {
+        Ok(Received::Produced) => {
           assert_eq!(frame.width(), expected_w);
           assert_eq!(frame.height(), expected_h);
           count += 1;

@@ -17,24 +17,24 @@ extern crate alloc as std;
 #[cfg(feature = "std")]
 extern crate std;
 
-pub mod adapter;
-pub mod cfa;
-pub mod color;
 pub mod decoder;
 pub mod demuxer;
-pub mod frame;
-pub mod packet;
-pub mod pixel_format;
-pub mod resampler;
-pub mod rhythm;
-pub mod subtitle;
 
 #[cfg(feature = "future")]
 #[cfg_attr(docsrs, doc(cfg(feature = "future")))]
 pub mod future;
 
-pub use pixel_format::PixelFormat;
-pub use rhythm::{Received, Sent};
+// The vocabulary — frames, packets, subtitles, the push rhythm, the
+// adapter traits, the resampler face and the `mediaframe` re-exports —
+// is `mediaspine`'s. Each module is re-exported under the name it had
+// here, so every `mediadecode::` path still resolves, to the same item
+// a `mediaspine::` path names. (`demuxer` is this crate's own module: it
+// re-exports the vocabulary's demux types beside the `Demuxer` face.)
+pub use mediaspine::{
+  adapter, cfa, color, frame, packet, pixel_format, resampler, rhythm, subtitle,
+};
+
+pub use mediaspine::{PixelFormat, Received, Sent};
 
 // Re-export the time primitives so consumers don't have to add a
 // separate `mediatime` dependency. Four names sit at the root: the three
@@ -44,6 +44,8 @@ pub use rhythm::{Received, Sent};
 // so every type the primitives' own methods take or answer (`Rounding`,
 // `SignedDuration`, `Duration`, `Rate`, `ParseSecondsError`, ...) has a
 // path through this crate as well.
-pub use mediatime::{InvertedRange, TimeRange, Timebase, Timestamp};
+pub use mediaspine::{InvertedRange, TimeRange, Timebase, Timestamp};
 
-pub use mediatime;
+pub use mediaspine::mediatime;
+
+pub use mediaspine;

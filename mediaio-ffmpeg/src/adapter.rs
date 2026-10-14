@@ -1,7 +1,7 @@
-//! `Ffmpeg` adapter — implements [`mediadecode::VideoAdapter`],
-//! [`mediadecode::AudioAdapter`], [`mediadecode::SubtitleAdapter`],
-//! [`mediadecode::adapter::ImageAdapter`] and
-//! [`mediadecode::demuxer::DemuxAdapter`] for this crate.
+//! `Ffmpeg` adapter — implements [`mediaspine::VideoAdapter`],
+//! [`mediaspine::AudioAdapter`], [`mediaspine::SubtitleAdapter`],
+//! [`mediaspine::adapter::ImageAdapter`] and
+//! [`mediaspine::demuxer::DemuxAdapter`] for this crate.
 //!
 //! The adapter is a zero-sized type whose sole purpose is to bind the
 //! associated types together so the rest of the API (Packet / Frame /
@@ -13,12 +13,12 @@
 //! trivially satisfied when every family already binds
 //! [`crate::CodecId`].
 
-use mediadecode::{
+use mediaframe::audio::ChannelLayoutDescription;
+use mediaspine::{
   PixelFormat,
   adapter::{AudioAdapter, ImageAdapter, SubtitleAdapter, VideoAdapter},
   demuxer::DemuxAdapter,
 };
-use mediaframe::audio::ChannelLayoutDescription;
 use smol_bytes::Utf8Bytes;
 
 use crate::{
@@ -32,7 +32,7 @@ use crate::{
 
 /// Zero-sized type carrying the FFmpeg adapter's vocabulary.
 ///
-/// Used as the `A` parameter on `mediadecode::VideoPacket<A, B>` /
+/// Used as the `A` parameter on `mediaspine::VideoPacket<A, B>` /
 /// `Frame<A, B>` (and audio / subtitle counterparts) when this crate's
 /// decoders are in play. Construction is `Ffmpeg` (unit struct);
 /// nothing about the adapter is stateful.
@@ -115,12 +115,12 @@ mod tests {
 
   /// Compile-time proof that the three trait impls' associated types
   /// resolve correctly when the `Ffmpeg` adapter parameterizes
-  /// mediadecode's generic types.
+  /// mediaspine's generic types.
   #[test]
   fn adapter_parameterizes_mediadecode_types() {
     use crate::FfmpegBytes;
 
-    use mediadecode::{
+    use mediaspine::{
       adapter::{AudioAdapter, SubtitleAdapter, VideoAdapter},
       packet::{AudioPacket, SubtitlePacket, VideoPacket},
     };
