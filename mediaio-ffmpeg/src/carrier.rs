@@ -30,7 +30,7 @@
 //! what makes that a change to one file rather than a change to a
 //! contract.
 //!
-//! # Why the operations are not public either
+//! # Why the operations are `unsafe` where it matters
 //!
 //! Sealing stopped outsiders *implementing* the seam. It did not stop
 //! them *calling* it, and for a while that was a hole with teeth: the
@@ -39,29 +39,31 @@
 //! `View::from_rows(1, 64, |_| &[0])` was safe code, compiled, and
 //! copied sixty-four bytes out of a one-byte slice.
 //!
-//! Two answers, applied together:
+//! The operations live on [`CarrierOps`], which is **not** a supertrait
+//! of [`FfmpegCarrier`]: a bound on the lane alone reaches none of them.
+//! The machines that drive the lanes live in another crate
+//! (`mediadecode-ffmpeg`), so `CarrierOps` is public — hidden from the
+//! documentation, because a consumer has no use for it — and the wall
+//! that kept callers out is now in the signatures:
 //!
-//! * every operation moved onto the private supertrait in
-//!   [`sealed`], which no path outside this crate can name and
-//!   therefore no call outside this crate can reach. What stays public
-//!   is the *name* of a lane and the ability to bound on it — which is
-//!   all a consumer ever needed;
+//! * every operation whose invariant lives in its caller — an extent
+//!   inside a live buffer, initialised bytes, a packet-payload
+//!   provenance claim, a packet body that may share the carrier's
+//!   buffer — is an `unsafe fn` whose `# Safety` section says what the
+//!   caller proves;
 //! * and where a length still arrives from a caller, it is **checked**
-//!   rather than asserted. A `debug_assert` is a note to the author; it
-//!   is not a bounds check, and it is not there at all in the profile
-//!   that matters.
-//!
-//! The rule the two share: an invariant that lives in the caller is an
-//! invariant the caller must be inside this crate to be trusted with.
+//!   rather than asserted, which is why `from_rows` stays safe. A
+//!   `debug_assert` is a note to the author; it is not a bounds check,
+//!   and it is not there at all in the profile that matters.
 //!
 //! # Where the bound sits
 //!
 //! At the narrowest site each one can be written at, and no wider:
 //!
 //! * **Structural** on the types whose *fields* name `C::Buffer` —
-//!   [`CarrierDemuxer`](crate::demuxer::CarrierDemuxer) holds built
-//!   tracks, [`CarrierResampler`](crate::resampler::CarrierResampler)
-//!   holds a queue of frames. A struct whose field type is a projection
+//!   `mediadecode-ffmpeg`'s `CarrierDemuxer` holds built tracks,
+//!   `CarrierResampler` holds a queue of frames. A struct whose field
+//!   type is a projection
 //!   cannot be well-formed without the bound that gives the projection
 //!   meaning, so writing it there is not a choice.
 //! * **Behavioural** on the decoders, which carry `C` only as a
@@ -82,7 +84,7 @@ use ffmpeg_next::ffi::AVBufferRef;
 
 use crate::{FfmpegBytes, view::FfmpegBuffer};
 
-pub(crate) use ops::{BodyRoute, CarrierOps};
+pub use ops::{BodyRoute, CarrierOps};
 
 pub(crate) mod sealed {
   /// Closes [`super::FfmpegCarrier`] to outside implementations, and
@@ -96,12 +98,13 @@ pub(crate) mod sealed {
   /// `C::from_rows(..)` perfectly well — the seal stopped
   /// implementations and nothing else. The operations now live on
   /// [`CarrierOps`](super::CarrierOps), which is **not** a supertrait
-  /// of anything public, so no bound a downstream crate can write
-  /// reaches them.
+  /// of [`super::FfmpegCarrier`], so a bound on the lane alone reaches
+  /// none of them — and the ones whose invariants live in the caller are
+  /// `unsafe fn`.
   pub trait Sealed {}
 }
 
-pub(crate) mod ops {
+pub mod ops {
   use ffmpeg_next::ffi::AVBufferRef;
 
   /// Which body a rebuilt `AVPacket` gets.
@@ -111,11 +114,13 @@ pub(crate) mod ops {
   /// `ffmpeg_next::Packet`, and that type can lend `&mut [u8]` — so its
   /// body must be storage nobody else can read, which means a copy on
   /// either lane. A packet built to be **submitted and dropped** inside
-  /// one crate-private call never escapes to anywhere a `&mut` can be
-  /// taken from it, so the view lane may share there. The one decoder
-  /// that hands back what it is sent, the video decoder's hardware
-  /// probe, keeps copies of its own (`decoder::try_clone_packet`), so
-  /// nothing it hands back shares the carrier's buffer either.
+  /// one scoped call never escapes to anywhere a `&mut` can be taken
+  /// from it, so the view lane may share there — which is why every
+  /// road that takes `Submission` is an `unsafe fn` whose contract
+  /// forbids the escape. The one decoder that hands back what it is
+  /// sent, the video decoder's hardware probe, keeps copies of its own
+  /// ([`crate::boundary::try_clone_packet`]), so nothing it hands back
+  /// shares the carrier's buffer either.
   #[derive(Debug, Clone, Copy, PartialEq, Eq)]
   pub enum BodyRoute {
     /// The body is copied into storage the packet alone owns. For a
@@ -127,21 +132,18 @@ pub(crate) mod ops {
     Submission,
   }
 
-  /// Every operation a lane performs — and the reason none of them is
-  /// reachable from outside this crate.
+  /// Every operation a lane performs.
   ///
   /// This trait is deliberately **not** a supertrait of
   /// [`FfmpegCarrier`](super::FfmpegCarrier). A supertrait would put
-  /// its items in scope for any bound that names the subtrait, and
-  /// `fn f<C: FfmpegCarrier>()` written in a downstream crate would
-  /// then type-check `C::from_rows(1, 64, |_| &[0])` — safe code, an
-  /// out-of-bounds read, in somebody else's crate. Sealing prevents
-  /// implementing; only an unreachable *bound* prevents calling.
-  ///
-  /// So the two are joined nowhere: `FfmpegCarrier` names a lane and
-  /// says what it carries, this says what it can do, and the functions
-  /// in this crate that need the second ask for it by a name no
-  /// downstream crate can write.
+  /// its items in scope for any bound that names the subtrait, so a
+  /// consumer that only names a lane reaches none of them. It is
+  /// public — hidden from the documentation — because the machines that
+  /// drive the lanes live in another crate (`mediadecode-ffmpeg`), and
+  /// what keeps a caller honest is in the signatures: every operation
+  /// whose invariant lives in its caller is an `unsafe fn` with a
+  /// `# Safety` section, and the safe ones check what they are given.
+  /// Implementing it stays closed: its supertrait is sealed.
   pub trait CarrierOps: super::FfmpegCarrier {
     /// A carrier over no bytes.
     ///
@@ -312,16 +314,16 @@ pub(crate) mod ops {
 /// How a lane turns FFmpeg's bytes into a carrier.
 ///
 /// **Sealed, and almost empty by design.** Naming a lane, bounding on
-/// one, and asking what it carries are public; performing a capture is
-/// not. Every operation lives on a private trait that is *not* a
-/// supertrait of this one — see the [module docs](self) for why that
-/// distinction is the whole of the wall.
+/// one, and asking what it carries are public; a bound on the lane
+/// alone performs nothing. Every operation lives on `CarrierOps`, which
+/// is *not* a supertrait of this one, and every operation whose
+/// invariant lives in its caller is an `unsafe fn` — see the
+/// [module docs](self).
 ///
-/// What a downstream crate can do — name a lane, hold the types
-/// parameterized by one, be generic over it, and drive either:
+/// What a downstream crate can do — name a lane and be generic over it:
 ///
 /// ```
-/// use mediadecode_ffmpeg::{FfmpegBuffer, FfmpegBytes, FfmpegCarrier, Owned, View};
+/// use mediaio_ffmpeg::{FfmpegBuffer, FfmpegBytes, FfmpegCarrier, Owned, View};
 ///
 /// // Name what a lane carries, and be generic over the lane.
 /// fn carried<C: FfmpegCarrier>(buffer: &C::Buffer) -> usize {
@@ -331,86 +333,26 @@ pub(crate) mod ops {
 /// let _: fn(&FfmpegBuffer) -> usize = carried::<View>;
 /// ```
 ///
-/// Holding a lane-parameterized type generically — the public structs
-/// carry **only** this bound, so a consumer's own generic code can pass
-/// them around:
-///
-/// ```
-/// use mediadecode::demuxer::TrackInfo;
-/// use mediadecode_ffmpeg::{
-///   CarrierAudioStreamDecoder, CarrierDemuxer, CarrierVideoStreamDecoder, Ffmpeg,
-///   FfmpegCarrier, Owned, View,
-/// };
-///
-/// fn tracks_of<C: FfmpegCarrier>(demuxer: &CarrierDemuxer<C>) -> usize {
-///   // A field read is not an operation on the lane, so this is
-///   // exactly as generic as it looks.
-///   core::mem::size_of_val(demuxer)
-/// }
-///
-/// fn hold<C: FfmpegCarrier>(
-///   _demuxer: &CarrierDemuxer<C>,
-///   _audio: &CarrierAudioStreamDecoder<C>,
-///   _video: &CarrierVideoStreamDecoder<C>,
-/// ) {
-/// }
-///
-/// let _: fn(&CarrierDemuxer<View>) -> usize = tracks_of::<View>;
-/// let _: fn(&CarrierDemuxer<Owned>) -> usize = tracks_of::<Owned>;
-/// let _ = hold::<View>;
-/// let _ = hold::<Owned>;
-/// let _: fn() -> Vec<TrackInfo<Ffmpeg>> = || Vec::new();
-/// ```
-///
-/// And calling at either concrete lane, through the aliases or through
-/// the `Carrier*` names directly:
-///
-/// ```no_run
-/// use mediadecode::demuxer::Demuxer;
-/// use mediadecode_ffmpeg::{
-///   CarrierDemuxer, FfmpegDemuxer, FfmpegOwnedDemuxer, Owned, View,
-/// };
-///
-/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-/// let mut viewed = FfmpegDemuxer::open("clip.mkv")?;
-/// let mut owned = CarrierDemuxer::<Owned>::open("clip.mkv")?;
-/// let _ = viewed.tracks().len();
-/// let _ = owned.next_packet()?;
-/// let _: fn(&std::path::Path) -> _ = CarrierDemuxer::<View>::open::<std::path::Path>;
-/// let _: fn(&std::path::Path) -> _ = FfmpegOwnedDemuxer::open::<std::path::Path>;
-/// # Ok(())
-/// # }
-/// ```
-///
-/// What no bound reaches is the **operations** — see below. Being
-/// generic over the lane and *driving* it are different asks: the
-/// second needs the operations, so a consumer writes lane-generic
-/// helpers over `C::Buffer` and instantiates the doors at the two
-/// concrete lanes. That is the trade the wall costs, and it is
-/// deliberate.
-///
-/// What it cannot, and must not be able to: every one of these takes an
-/// extent, a geometry or a provenance claim that only this crate is in
-/// a position to establish. `from_rows` is the sharpest — it is
-/// **safe**, and a caller who could reach it could ask for sixty-four
-/// bytes out of a one-byte row.
+/// What no bound on the lane reaches is the **operations**: every one of
+/// them takes an extent, a geometry or a provenance claim that only the
+/// code driving the lane is in a position to establish.
 ///
 /// ```compile_fail,E0599
-/// use mediadecode_ffmpeg::FfmpegCarrier;
+/// use mediaio_ffmpeg::FfmpegCarrier;
 /// fn downstream<C: FfmpegCarrier>() -> C::Buffer {
 ///   C::empty()
 /// }
 /// ```
 ///
 /// ```compile_fail,E0599
-/// use mediadecode_ffmpeg::FfmpegCarrier;
+/// use mediaio_ffmpeg::FfmpegCarrier;
 /// fn downstream<C: FfmpegCarrier>(row: &[u8]) -> Option<C::Buffer> {
 ///   C::from_rows(1, 64, |_| row)
 /// }
 /// ```
 ///
 /// ```compile_fail,E0599
-/// use mediadecode_ffmpeg::FfmpegCarrier;
+/// use mediaio_ffmpeg::FfmpegCarrier;
 /// unsafe fn downstream<C: FfmpegCarrier>(
 ///   buf: *mut ffmpeg_next::ffi::AVBufferRef,
 /// ) -> Option<C::Buffer> {
@@ -419,7 +361,7 @@ pub(crate) mod ops {
 /// ```
 ///
 /// ```compile_fail,E0599
-/// use mediadecode_ffmpeg::FfmpegCarrier;
+/// use mediaio_ffmpeg::FfmpegCarrier;
 /// unsafe fn downstream<C: FfmpegCarrier>(
 ///   buf: *mut ffmpeg_next::ffi::AVBufferRef,
 /// ) -> Option<C::Buffer> {
@@ -430,38 +372,16 @@ pub(crate) mod ops {
 /// ```
 ///
 /// ```compile_fail,E0599
-/// use mediadecode_ffmpeg::FfmpegCarrier;
+/// use mediaio_ffmpeg::FfmpegCarrier;
 /// unsafe fn downstream<C: FfmpegCarrier>(buf: *mut ffmpeg_next::ffi::AVBufferRef) {
 ///   let reserved = unsafe { C::reserve(buf, 0, 64) };
 /// }
 /// ```
 ///
 /// ```compile_fail,E0599
-/// use mediadecode_ffmpeg::FfmpegCarrier;
+/// use mediaio_ffmpeg::FfmpegCarrier;
 /// unsafe fn downstream<C: FfmpegCarrier>(reserved: ()) -> C::Buffer {
 ///   unsafe { C::commit(reserved, 64) }
-/// }
-/// ```
-///
-/// The generic bodies behind the per-lane faces are equally out of
-/// reach. They carry the operations' bound, so reaching one at a
-/// concrete lane would be a way around the wall that never names it:
-///
-/// ```compile_fail,E0624
-/// use mediadecode_ffmpeg::{CarrierAudioStreamDecoder, DecoderLimits, Owned};
-/// fn downstream(parameters: ffmpeg_next::codec::Parameters) {
-///   let _ = CarrierAudioStreamDecoder::<Owned>::open_impl(
-///     parameters,
-///     mediadecode::Timebase::default(),
-///     DecoderLimits::default(),
-///   );
-/// }
-/// ```
-///
-/// ```compile_fail,E0624
-/// use mediadecode_ffmpeg::{CarrierDemuxer, View};
-/// fn downstream() {
-///   let _ = CarrierDemuxer::<View>::open_impl("clip.mkv");
 /// }
 /// ```
 pub trait FfmpegCarrier: sealed::Sealed + Copy + Clone + core::fmt::Debug + 'static {

@@ -59,7 +59,7 @@ struct Slot {
 }
 
 /// What a walk has measured so far.
-pub(crate) struct Measured {
+pub struct Measured {
   /// One slot per track.
   ends: Vec<Slot>,
   /// `true` while the walk has skipped nothing since the session opened:
@@ -74,7 +74,7 @@ pub(crate) struct Measured {
 impl Measured {
   /// One slot per track, reserved fallibly — the count is the
   /// container's.
-  pub(crate) fn new(tracks: usize) -> Result<Self, TryReserveError> {
+  pub fn new(tracks: usize) -> Result<Self, TryReserveError> {
     let mut ends = Vec::new();
     ends.try_reserve_exact(tracks)?;
     // Inside the capacity just reserved, so this cannot allocate.
@@ -119,7 +119,7 @@ impl Measured {
   /// complete while one track's end is missing.
   ///
   /// A completed walk is frozen and ignores the packet.
-  pub(crate) fn observe(&mut self, track: usize, pts: Option<i64>, duration: i64) {
+  pub fn observe(&mut self, track: usize, pts: Option<i64>, duration: i64) {
     if self.walk_complete {
       return;
     }
@@ -152,7 +152,7 @@ impl Measured {
 
   /// The session answered end of file. The walk is complete only if it
   /// skipped nothing, and a completed walk is frozen from here on.
-  pub(crate) fn end_of_file(&mut self) {
+  pub fn end_of_file(&mut self) {
     if self.unbroken {
       self.walk_complete = true;
     }
@@ -162,7 +162,7 @@ impl Measured {
   /// read and not observed. Completion can never be reached in this
   /// session from here, and measurement carries on as a "so far"
   /// maximum. A walk that was already complete is frozen and stays so.
-  pub(crate) fn break_walk(&mut self) {
+  pub fn break_walk(&mut self) {
     if self.walk_complete {
       return;
     }
@@ -172,7 +172,7 @@ impl Measured {
   /// The figure for `track`, expressed in that track's own `timebase`,
   /// or `None` where nothing has been measured on it or its end cannot
   /// be represented.
-  pub(crate) fn get(&self, track: usize, timebase: Timebase) -> Option<MeasuredEnd> {
+  pub fn get(&self, track: usize, timebase: Timebase) -> Option<MeasuredEnd> {
     let slot = self.ends.get(track)?;
     match slot.figure {
       Figure::End(ticks) => Some(MeasuredEnd::new(

@@ -38,7 +38,7 @@
 //! # The funnel's accounting
 //!
 //! Every [`FfmpegBytes`] in this crate is built by
-//! [`FfmpegBytes::copy_from_slice`], [`FfmpegBytes::from_rows`] or
+//! `FfmpegBytes::copy_from_slice`, `FfmpegBytes::from_rows` or
 //! [`FfmpegBytes::empty`], and **every one of those call sites is
 //! bounded before it allocates**. The table is kept here, beside the
 //! constructors, so that a new exit has to answer the question the
@@ -70,7 +70,7 @@
 //! |---|---|---|
 //! | [`payload_of`] | any packet's payload | its `budget` argument — [`PacketLimits::max_packet_bytes`](crate::PacketLimits::max_packet_bytes) for timed packets, [`DemuxLimits::max_attachment_bytes`](crate::DemuxLimits::max_attachment_bytes) for attachments — judged against the declared `size` before a byte is read |
 //! | `convert::copy_out_planes`, tight stride | one video or image plane | [`FrameLimits::max_pixels`](crate::FrameLimits::max_pixels) and [`FrameLimits::max_frame_bytes`](crate::FrameLimits::max_frame_bytes), both in a judge-pass that runs before any plane is allocated; `max_pixels` also reaches libavcodec |
-//! | `convert::copy_out_planes`, padded stride | one compacted plane, via [`FfmpegBytes::from_rows`] | the same pre-pass |
+//! | `convert::copy_out_planes`, padded stride | one compacted plane, via `FfmpegBytes::from_rows` | the same pre-pass |
 //! | `convert::av_frame_to_audio_frame` | one audio plane | `max_frame_bytes`, checked over `plane_bytes × plane_count` before the loop |
 //! | `convert::collect_side_data` | one frame side-data entry | `SIDE_DATA_MAX_ENTRIES` (64) and `SIDE_DATA_MAX_TOTAL_BYTES` (256 KiB), plus `try_reserve_exact` |
 //! | `boundary::packet_side_data` | one packet side-data entry | the same two caps, as refusals rather than truncation |
@@ -951,37 +951,6 @@ pub enum PacketBufferError {
   SideDataAlloc(#[from] SideDataAlloc),
 }
 
-impl PacketBufferError {
-  /// Whether the demux session should **park** the packet this refusal
-  /// came from and re-attempt it on the next pull.
-  ///
-  /// Deliberately not public, and deliberately named for the decision
-  /// rather than for a property of the error. It was briefly public as
-  /// `is_transient`, which promised more than an error enum can know:
-  /// whether retrying helps depends on *what was retried*.
-  /// `SharedPayload` is permanent for a caller who keeps their other
-  /// reference and retryable the moment they drop it;
-  /// `CaptureFailed` is worth another attempt only if the packet still
-  /// exists to attempt, which on a **consuming** conversion it does
-  /// not. Only the demux loop knows both halves — it still holds the
-  /// packet, and it knows nobody else does.
-  ///
-  /// So this answers one question for one caller. An allocation that
-  /// failed says nothing about the packet, and the demux loop is
-  /// holding the bytes; everything else is a fact about the packet
-  /// itself, and parking it would answer every later pull with the same
-  /// error instead of letting the session make progress.
-  ///
-  /// **The door left open:** a public retry signal would have to know
-  /// which operation produced the error and what the caller still
-  /// holds — an operation-aware answer, not a property of this enum.
-  /// If one is ever wanted it is designed then, not approximated now.
-  #[inline]
-  pub(crate) const fn parks_in_demux(&self) -> bool {
-    matches!(self, Self::CaptureFailed(_) | Self::SideDataAlloc(_))
-  }
-}
-
 /// `AV_PKT_FLAG_TRUSTED` as the bit the portable `PacketFlags` byte
 /// carries it in.
 ///
@@ -989,7 +958,7 @@ impl PacketBufferError {
 /// FFmpeg's, not a portable fact about packets — but `from_bits_retain`
 /// keeps the bit, so this crate can recognise its own flag coming back
 /// without the core growing a constant for it.
-pub(crate) const TRUSTED_BIT: u8 = ffmpeg_next::ffi::AV_PKT_FLAG_TRUSTED as u8;
+pub const TRUSTED_BIT: u8 = ffmpeg_next::ffi::AV_PKT_FLAG_TRUSTED as u8;
 
 /// Compile-time proof that the flag really does fit the byte, so the
 /// cast above cannot silently become a different bit.
@@ -1095,7 +1064,7 @@ impl std::error::Error for TrustedPayload {}
 /// `pkt` must be a live `*const AVPacket` for the duration of this
 /// call, and `provenance` must be true of it — it decides whether a
 /// buffer somebody else also references is refused, copied or windowed
-/// ([`PayloadProvenance::route`]):
+/// (`PayloadProvenance::route`):
 ///
 /// * [`PayloadProvenance::CallerSupplied`] is true of every packet;
 /// * [`PayloadProvenance::DemuxDelivered`] claims that no other
@@ -1107,7 +1076,7 @@ impl std::error::Error for TrustedPayload {}
 /// On the view lane the carrier may be a window onto the packet's own
 /// buffer, so the packet's owner must not write through it while the
 /// carrier lives. The owned lane copies and owes nothing here.
-pub(crate) unsafe fn payload_of<C: crate::FfmpegCarrier + crate::CarrierOps>(
+pub unsafe fn payload_of<C: crate::FfmpegCarrier + crate::CarrierOps>(
   pkt: *const ffmpeg_next::ffi::AVPacket,
   budget: usize,
   provenance: PayloadProvenance,
@@ -1127,7 +1096,7 @@ pub(crate) unsafe fn payload_of<C: crate::FfmpegCarrier + crate::CarrierOps>(
 /// to act on it — so the judging and the paying share one reading of
 /// the packet rather than each performing their own.
 #[derive(Clone, Copy)]
-pub(crate) struct PayloadPlan {
+pub struct PayloadPlan {
   buf: *mut ffmpeg_next::ffi::AVBufferRef,
   buf_data: *const u8,
   offset: usize,
@@ -1163,7 +1132,7 @@ pub(crate) struct PayloadPlan {
 /// and — if a plan comes back — for as long as that plan is used; and
 /// `provenance` must be true of it, as [`payload_of`] states, because
 /// the plan's route is decided by it.
-pub(crate) unsafe fn preflight_payload(
+pub unsafe fn preflight_payload(
   pkt: *const ffmpeg_next::ffi::AVPacket,
   budget: usize,
   provenance: PayloadProvenance,
@@ -1520,7 +1489,7 @@ mod tests {
 /// packet from a queue-backed subtitle demuxer, which delivers
 /// `av_packet_ref`s of originals it keeps in its own queue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PayloadProvenance {
+pub enum PayloadProvenance {
   /// A packet a caller handed to a public conversion. A second
   /// reference may be a `Packet` with a safe `data_mut`; shared is
   /// refused by name.

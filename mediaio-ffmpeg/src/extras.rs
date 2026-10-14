@@ -30,7 +30,9 @@ use derive_more::IsVariant;
 use ffmpeg_next::codec::Parameters;
 
 use crate::{
-  demuxer::{DemuxError, ParametersAlloc, ParametersCopy, ParametersMissing, ParametersTooLarge},
+  error::{
+    ParametersAlloc, ParametersCopy, ParametersError, ParametersMissing, ParametersTooLarge,
+  },
   ticket::CodecTicket,
 };
 
@@ -1521,7 +1523,8 @@ const _: () = {
 ///
 /// `par` must be a live `*const AVCodecParameters` for the duration of
 /// this call.
-pub(crate) unsafe fn measure_parameters(
+#[doc(hidden)]
+pub unsafe fn measure_parameters(
   par: *const ffmpeg_next::ffi::AVCodecParameters,
 ) -> Option<ParameterFootprint> {
   // SAFETY: `par` is live per the contract; `extradata` and
@@ -1628,7 +1631,8 @@ pub(crate) unsafe fn measure_parameters(
 /// open. Omitting from the outset makes the clone's accounting the
 /// same accounting the admission did.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
-pub(crate) enum ExtradataPolicy {
+#[doc(hidden)]
+pub enum ExtradataPolicy {
   /// Copy `extradata` across — every road but one.
   #[default]
   Copy,
@@ -1638,13 +1642,13 @@ pub(crate) enum ExtradataPolicy {
 
 /// The `ENOMEM` a heap seat's copy reports when its allocation fails.
 ///
-/// [`DemuxError::ParametersAlloc`] names the *destination struct*
+/// [`ParametersError::Alloc`] names the *destination struct*
 /// failing to allocate; a seat that fails after that is the copy
 /// failing part way, which is what
-/// [`DemuxError::ParametersCopy`] was minted for and what
+/// [`ParametersError::Copy`] was minted for and what
 /// `avcodec_parameters_copy` itself would have returned here.
-fn seat_copy_failed(stream_index: usize) -> DemuxError {
-  DemuxError::ParametersCopy(ParametersCopy::new(
+fn seat_copy_failed(stream_index: usize) -> ParametersError {
+  ParametersError::Copy(ParametersCopy::new(
     stream_index,
     ffmpeg_next::Error::Other {
       errno: libc::ENOMEM,
@@ -1696,11 +1700,12 @@ fn seat_copy_failed(stream_index: usize) -> DemuxError {
 /// the side data codecs read, and the channel layout all survive, which
 /// is what the decode, resample and image suites prove by continuing to
 /// pass unchanged.
-pub(crate) fn bounded_clone_parameters(
+#[doc(hidden)]
+pub fn bounded_clone_parameters(
   source: &Parameters,
   stream_index: usize,
   budget: usize,
-) -> Result<Parameters, DemuxError> {
+) -> Result<Parameters, ParametersError> {
   bounded_clone_parameters_with(source, stream_index, budget, ExtradataPolicy::Copy)
 }
 
@@ -1710,7 +1715,7 @@ pub(crate) fn bounded_clone_parameters_with(
   stream_index: usize,
   budget: usize,
   extradata_policy: ExtradataPolicy,
-) -> Result<Parameters, DemuxError> {
+) -> Result<Parameters, ParametersError> {
   // The *source* first. `Parameters::new()` and `Parameters::default()`
   // hand back a value whose pointer is null when
   // `avcodec_parameters_alloc` failed — safe code, no error, no way to
@@ -1718,7 +1723,7 @@ pub(crate) fn bounded_clone_parameters_with(
   // SAFETY: reading the pointer without dereferencing it.
   let src = unsafe { source.as_ptr() };
   if src.is_null() {
-    return Err(DemuxError::ParametersMissing(ParametersMissing::new(
+    return Err(ParametersError::Missing(ParametersMissing::new(
       stream_index,
     )));
   }
@@ -1739,12 +1744,12 @@ pub(crate) fn bounded_clone_parameters_with(
   // the duration of this call, and for a custom order its map is
   // FFmpeg's own allocation of `nb_channels` entries.
   unsafe { crate::channel_layout::layout_preflight(core::ptr::addr_of!((*src).ch_layout)) }
-    .map_err(|fault| crate::demuxer::layout_fault_to_demux(stream_index, fault))?;
+    .map_err(|fault| ParametersError::from_layout_fault(stream_index, fault))?;
 
   // SAFETY: `src` is a live `AVCodecParameters` owned by `source` for
   // the duration of this call.
   let footprint = unsafe { measure_parameters(src) }.ok_or_else(|| {
-    DemuxError::ParametersTooLarge(ParametersTooLarge::new(stream_index, usize::MAX, budget))
+    ParametersError::TooLarge(ParametersTooLarge::new(stream_index, usize::MAX, budget))
   })?;
   // Charged for what this clone will actually retain, which is what
   // the session's admission pass charged for too — see
@@ -1755,10 +1760,10 @@ pub(crate) fn bounded_clone_parameters_with(
     ExtradataPolicy::Omit => footprint.total_without_extradata(),
   }
   .ok_or_else(|| {
-    DemuxError::ParametersTooLarge(ParametersTooLarge::new(stream_index, usize::MAX, budget))
+    ParametersError::TooLarge(ParametersTooLarge::new(stream_index, usize::MAX, budget))
   })?;
   if total > budget {
-    return Err(DemuxError::ParametersTooLarge(ParametersTooLarge::new(
+    return Err(ParametersError::TooLarge(ParametersTooLarge::new(
       stream_index,
       total,
       budget,
@@ -1770,9 +1775,7 @@ pub(crate) fn bounded_clone_parameters_with(
   // dereferencing it — which is exactly what the check is for.
   let dst = unsafe { out.as_mut_ptr() };
   if dst.is_null() {
-    return Err(DemuxError::ParametersAlloc(ParametersAlloc::new(
-      stream_index,
-    )));
+    return Err(ParametersError::Alloc(ParametersAlloc::new(stream_index)));
   }
 
   // SAFETY: `src` and `dst` are both live, non-null, distinct
@@ -1882,7 +1885,7 @@ pub(crate) fn bounded_clone_parameters_with(
     )
   };
   if rc < 0 {
-    return Err(DemuxError::ParametersCopy(ParametersCopy::new(
+    return Err(ParametersError::Copy(ParametersCopy::new(
       stream_index,
       ffmpeg_next::Error::from(rc),
     )));
@@ -2025,7 +2028,7 @@ impl TrackExtra {
   /// receives is what the demuxer read — proved field by field, per
   /// codec, by `tests/codec_ticket_parity.rs`.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn clone_parameters(&self) -> Result<Parameters, DemuxError> {
+  pub fn clone_parameters(&self) -> Result<Parameters, ParametersError> {
     self.ticket.rebuild()
   }
 
@@ -2228,7 +2231,7 @@ mod tests {
     let declared = footprint_of(&parameters).total().expect("measurable");
 
     match bounded_clone_parameters(&parameters, 3, 64 * 1024) {
-      Err(DemuxError::ParametersTooLarge(p)) => {
+      Err(ParametersError::TooLarge(p)) => {
         assert_eq!(p.stream_index(), 3);
         assert_eq!(p.bytes(), declared);
         assert_eq!(p.limit(), 64 * 1024);

@@ -62,7 +62,7 @@ use mediadecode::{
 use mediadecode_ffmpeg::{
   CodecTicket, DecoderLimits, DemuxError, DemuxLimits, FfmpegOwnedAudioStreamDecoder,
   FfmpegOwnedDemuxer, FfmpegOwnedVideoStreamDecoder, OwnedAudioFrame, OwnedVideoFrame,
-  PacketLimits, empty_owned_audio_frame, empty_owned_video_frame,
+  PacketLimits, ParametersError, empty_owned_audio_frame, empty_owned_video_frame,
   owned_audio_packet_from_ffmpeg_in, owned_video_packet_from_ffmpeg_in,
 };
 
@@ -731,7 +731,7 @@ fn a_custom_layout_without_a_map_is_refused() {
     (*par).ch_layout.nb_channels = 3;
   }
   match CodecTicket::mirror(&parameters, 4, usize::MAX) {
-    Err(DemuxError::ParametersChannelMap(ref p)) => {
+    Err(ParametersError::ChannelMap(ref p)) => {
       assert_eq!(p.stream_index(), 4);
       assert_eq!(p.channels(), 3);
     }
@@ -753,7 +753,7 @@ fn a_custom_layout_without_a_map_is_refused() {
   }
   assert!(matches!(
     CodecTicket::mirror(&empty, 0, usize::MAX),
-    Err(DemuxError::ParametersChannelMap(_)),
+    Err(ParametersError::ChannelMap(_)),
   ));
 
   // A *negative* count is the same refusal, and it did not used to be.
@@ -784,7 +784,7 @@ fn a_custom_layout_without_a_map_is_refused() {
     (*par).ch_layout.nb_channels = -1;
   }
   match CodecTicket::mirror(&negative, 7, usize::MAX) {
-    Err(DemuxError::ParametersChannelMap(ref p)) => {
+    Err(ParametersError::ChannelMap(ref p)) => {
       assert_eq!(p.stream_index(), 7);
       assert_eq!(p.channels(), -1, "the count is reported as declared");
     }
@@ -907,7 +907,7 @@ fn a_layout_carrying_user_private_data_is_refused() {
 
   let refused = CodecTicket::mirror(&parameters, 5, usize::MAX);
   match refused {
-    Err(DemuxError::ParametersOpaque(ref p)) => {
+    Err(ParametersError::Opaque(ref p)) => {
       assert_eq!(p.stream_index(), 5);
       assert_eq!(p.channel(), None, "the pointer was on the layout itself");
     }
@@ -951,7 +951,7 @@ fn a_custom_channel_carrying_user_private_data_is_refused() {
   }
 
   match CodecTicket::mirror(&parameters, 2, usize::MAX) {
-    Err(DemuxError::ParametersOpaque(ref p)) => {
+    Err(ParametersError::Opaque(ref p)) => {
       assert_eq!(p.stream_index(), 2);
       assert_eq!(p.channel(), Some(1), "the entry the pointer was on");
     }

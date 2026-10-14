@@ -6,7 +6,7 @@
 //! These live as **free functions** (not `From` trait impls) because of
 //! Rust's orphan rule: this crate owns neither `From` nor
 //! `mediaframe::audio::*`, so we can't write the `impl` here. Calling
-//! `mediadecode_ffmpeg::channel_layout_description_from_ffmpeg(layout)`
+//! `mediaio_ffmpeg::channel_layout_description_from_ffmpeg(layout)`
 //! is the ergonomic boundary instead.
 //!
 //! FFmpeg's own type is imported as [`AvChannelLayout`] so the name
@@ -375,9 +375,8 @@ const MAX_DECLARED_CHANNELS: i32 = 65_535;
 /// with a non-null `u.map`, that map must hold `nb_channels` live
 /// `AVChannelCustom` entries — FFmpeg's own contract for a layout it
 /// filled, and [`custom_map_fault`]'s.
-pub(crate) unsafe fn layout_preflight(
-  ptr: *const ffi::AVChannelLayout,
-) -> Result<(), ChannelLayoutFault> {
+#[doc(hidden)]
+pub unsafe fn layout_preflight(ptr: *const ffi::AVChannelLayout) -> Result<(), ChannelLayoutFault> {
   use core::ptr::{addr_of, read_unaligned};
 
   // SAFETY: `ptr` is live per the contract; `addr_of!` reaches `order`
@@ -837,13 +836,13 @@ unsafe fn custom_channels_raw(
 /// dropped; a label is either carried in full or the open is refused by
 /// name.
 ///
-/// The measuring and building halves are [`crate::demuxer::lossy_len`]
-/// and [`crate::demuxer::lossy_text`] — the same two the metadata road
+/// The measuring and building halves are [`crate::text::lossy_len`]
+/// and [`crate::text::lossy_text`] — the same two the metadata road
 /// uses, shared rather than restated, because a second copy of a
 /// lossy-decoding rule is a second rule.
 fn decode_text(bytes: &[u8]) -> Result<Utf8Bytes, ChannelLayoutFault> {
-  let decoded = crate::demuxer::lossy_len(bytes);
-  crate::demuxer::lossy_text(bytes, decoded).map_err(|_| ChannelLayoutFault::Alloc)
+  let decoded = crate::text::lossy_len(bytes);
+  crate::text::lossy_text(bytes, decoded).map_err(|_| ChannelLayoutFault::Alloc)
 }
 
 unsafe fn custom_channel_label_raw(

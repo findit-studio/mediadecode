@@ -35,10 +35,7 @@ use std::slice;
 use ffmpeg_next::frame;
 use mediadecode::PixelFormat;
 
-use crate::{
-  boundary,
-  error::{Error, Result},
-};
+use crate::{boundary, error::CrossingError};
 
 /// Checked allocator for `ffmpeg_next::frame::Video`. ffmpeg-next's
 /// `Video::empty` is built on `av_frame_alloc()` and ignores its
@@ -46,11 +43,11 @@ use crate::{
 /// `*mut AVFrame` and the next FFmpeg call against it would be UB.
 /// Use this helper anywhere a SW video scratch frame is constructed
 /// in production code.
-pub(crate) fn alloc_av_video_frame() -> Result<frame::Video> {
+pub fn alloc_av_video_frame() -> Result<frame::Video, CrossingError> {
   let f = frame::Video::empty();
   // SAFETY: `as_ptr()` reads the inner pointer without dereferencing.
   if unsafe { f.as_ptr() }.is_null() {
-    return Err(Error::Ffmpeg(ffmpeg_next::Error::Other {
+    return Err(CrossingError::Ffmpeg(ffmpeg_next::Error::Other {
       errno: libc::ENOMEM,
     }));
   }
@@ -59,18 +56,19 @@ pub(crate) fn alloc_av_video_frame() -> Result<frame::Video> {
 
 /// Checked allocator for `ffmpeg_next::frame::Audio`. Same rationale
 /// as [`alloc_av_video_frame`].
-pub(crate) fn alloc_av_audio_frame() -> Result<frame::Audio> {
+pub fn alloc_av_audio_frame() -> Result<frame::Audio, CrossingError> {
   let f = frame::Audio::empty();
   // SAFETY: `as_ptr()` reads the inner pointer without dereferencing.
   if unsafe { f.as_ptr() }.is_null() {
-    return Err(Error::Ffmpeg(ffmpeg_next::Error::Other {
+    return Err(CrossingError::Ffmpeg(ffmpeg_next::Error::Other {
       errno: libc::ENOMEM,
     }));
   }
   Ok(f)
 }
 
-/// CPU-side decoded video frame produced by [`crate::VideoDecoder`].
+/// CPU-side decoded video frame produced by `mediadecode-ffmpeg`'s
+/// `VideoDecoder`.
 pub struct Frame {
   inner: frame::Video,
 }
@@ -94,17 +92,18 @@ impl core::fmt::Debug for Frame {
 
 impl Frame {
   /// Construct an empty frame, suitable as the destination passed to
-  /// [`crate::VideoDecoder::receive_frame`].
+  /// `mediadecode-ffmpeg`'s `VideoDecoder::receive_frame`.
   ///
-  /// Returns `Err(Error::Ffmpeg(Other { errno: ENOMEM }))` when the
-  /// underlying `av_frame_alloc()` returns NULL — `ffmpeg_next` does not
-  /// surface that failure, so we check it here rather than letting a null
-  /// pointer flow into the safe accessors and become UB on first read.
-  pub fn empty() -> Result<Self> {
+  /// Returns `Err(CrossingError::Ffmpeg(Other { errno: ENOMEM }))` when
+  /// the underlying `av_frame_alloc()` returns NULL — `ffmpeg_next` does
+  /// not surface that failure, so we check it here rather than letting a
+  /// null pointer flow into the safe accessors and become UB on first
+  /// read.
+  pub fn empty() -> Result<Self, CrossingError> {
     // SAFETY: as_ptr() is safe; we just inspect the value (potentially null).
     let inner = frame::Video::empty();
     if unsafe { inner.as_ptr() }.is_null() {
-      return Err(Error::Ffmpeg(ffmpeg_next::Error::Other {
+      return Err(CrossingError::Ffmpeg(ffmpeg_next::Error::Other {
         errno: libc::ENOMEM,
       }));
     }
@@ -358,7 +357,7 @@ impl Frame {
   /// `ffmpeg_next::frame::Video` offers as safe (`set_width`,
   /// `set_height`, `set_format`, ...), which move the geometry and leave
   /// the buffers where they were.
-  pub(crate) unsafe fn as_inner_mut(&mut self) -> &mut frame::Video {
+  pub unsafe fn as_inner_mut(&mut self) -> &mut frame::Video {
     &mut self.inner
   }
 }
@@ -385,13 +384,13 @@ struct PlaneInfo {
 /// - the safe `Frame::*` row accessors (via `plane_row_bytes_for` /
 ///   `plane_height_for`, which agree with this helper — every format
 ///   that returns `Some` from those functions is also accepted here).
-/// - [`crate::decoder::transfer_hw_frame`] post-transfer validation —
-///   if FFmpeg's auto-pick produces a format outside this set, treat
-///   as a backend failure so probe advances rather than collapsing on
-///   an unusable frame.
-/// - the probe-replay drain path in `drain_into_pending`, which
-///   refuses to queue an unusable candidate frame.
-pub(crate) fn is_supported_cpu_pix_fmt(pix_fmt: &PixelFormat) -> bool {
+/// - `mediadecode-ffmpeg`'s `transfer_hw_frame` post-transfer
+///   validation — if FFmpeg's auto-pick produces a format outside this
+///   set, treat as a backend failure so probe advances rather than
+///   collapsing on an unusable frame.
+/// - that decoder's probe-replay drain path, `drain_into_pending`,
+///   which refuses to queue an unusable candidate frame.
+pub fn is_supported_cpu_pix_fmt(pix_fmt: &PixelFormat) -> bool {
   matches!(
     pix_fmt,
     // --- HW download outputs (NV* + P0xx/P2xx/P4xx) ---

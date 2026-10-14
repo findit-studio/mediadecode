@@ -59,7 +59,7 @@ use ffmpeg_next::ffi::{AVBufferRef, av_buffer_ref, av_buffer_unref};
 /// than inferred later from a size comparison that cannot tell padding
 /// from a neighbour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Origin {
+pub enum Origin {
   /// A packet payload captured out of an `AVPacket`'s own buffer, whose
   /// trailing padding is libavformat's contract.
   PacketPayload,
@@ -171,7 +171,8 @@ impl FfmpegBuffer {
 
   /// What may be assumed about the bytes after this view.
   #[inline]
-  pub(crate) const fn origin(&self) -> Origin {
+  #[doc(hidden)]
+  pub const fn origin(&self) -> Origin {
     self.origin
   }
 

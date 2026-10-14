@@ -1027,7 +1027,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       }
       Err(e) => {
         // Park only what another attempt could survive.
-        self.scratch_pending = e.parks_in_decode();
+        self.scratch_pending = crate::decoder::parks_in_decode(&e);
         Err(VideoDecodeError::Convert(e))
       }
     }
@@ -1163,7 +1163,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     // (`AllBackendsFailed::into_unconsumed_packets`); it records copies
     // of its own (`decoder::try_clone_packet`), so nothing it hands back
     // addresses a carrier.
-    let route = crate::carrier::BodyRoute::Submission;
+    let route = crate::BodyRoute::Submission;
     let submit = |av_pkt: &Packet| {
       match &mut self.state {
         DecodeState::Hw(hw) => match hw.send_packet(av_pkt) {
@@ -1257,7 +1257,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       };
       let new_frame = match converted {
         Ok(new_frame) => new_frame,
-        Err(e) if e.parks_in_decode() => return Err(VideoDecodeError::Convert(e)),
+        Err(e) if crate::decoder::parks_in_decode(&e) => return Err(VideoDecodeError::Convert(e)),
         // A frame nothing can carry is dropped rather than re-offered
         // forever — the same rule the scratch seat follows.
         Err(e) => {
@@ -1325,7 +1325,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
               };
               let new_frame = match converted {
                 Ok(new_frame) => new_frame,
-                Err(e) if e.parks_in_decode() => return Err(VideoDecodeError::Convert(e)),
+                Err(e) if crate::decoder::parks_in_decode(&e) => {
+                  return Err(VideoDecodeError::Convert(e));
+                }
                 // A frame nothing can carry is dropped rather than
                 // re-offered forever.
                 Err(e) => {
@@ -1364,7 +1366,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
               let new_frame = match converted {
                 Ok(new_frame) => new_frame,
                 Err(e) => {
-                  self.scratch_pending = e.parks_in_decode();
+                  self.scratch_pending = crate::decoder::parks_in_decode(&e);
                   return Err(VideoDecodeError::Convert(e));
                 }
               };

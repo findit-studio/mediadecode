@@ -270,7 +270,7 @@ impl HwInner for FakeHw {
     }
     // Accept the packet. Track it as probe-era history, and deliver a frame for
     // it only before the doomed span.
-    if let Ok(cloned) = crate::decoder::try_clone_packet(packet) {
+    if let Ok(cloned) = crate::boundary::try_clone_packet(packet) {
       self.history.push(cloned);
     }
     if idx < self.doom_from_send {
@@ -1410,7 +1410,7 @@ fn the_receive_time_fallback_queue_survives_a_failed_carrier() {
   // the entry at the top of `receive_frame`.
   //
   // The ceiling is process-global, so this runs alone.
-  crate::fault_subprocess::in_subprocess(
+  mediaio_ffmpeg::test_support::in_subprocess(
     "video::tests::the_receive_time_fallback_queue_survives_a_failed_carrier",
     || {
       let (w, h) = (64u32, 48u32);
@@ -1462,11 +1462,11 @@ fn the_receive_time_fallback_queue_survives_a_failed_carrier() {
             // SAFETY: in `in_subprocess`'s child, alone. The capped window runs one
             // receive off the replay queue: this crate's conversion, which checks
             // every allocation it makes.
-            unsafe { crate::fault_subprocess::cap_ffmpeg_allocations(16) };
+            unsafe { mediaio_ffmpeg::test_support::cap_ffmpeg_allocations(16) };
           }
           let got = dec.receive_frame(&mut frame);
           if capped {
-            crate::fault_subprocess::uncap_ffmpeg_allocations();
+            mediaio_ffmpeg::test_support::uncap_ffmpeg_allocations();
           }
           match got {
             Ok(Received::Frame) => {
@@ -1482,7 +1482,7 @@ fn the_receive_time_fallback_queue_survives_a_failed_carrier() {
             Err(VideoDecodeError::Convert(e)) => {
               assert!(capped, "no refusal was asked for here, got {e:?}");
               assert!(
-                e.parks_in_decode(),
+                crate::decoder::parks_in_decode(&e),
                 "the ceiling must produce a parkable refusal, got {e:?}",
               );
               // Retry immediately, uncapped: the same frame must come
@@ -1617,12 +1617,12 @@ fn eof_with_a_parked_frame(
   // helper run under it — alone. The capped window runs one receive:
   // libavcodec and this crate's conversion, which check what they
   // allocate.
-  unsafe { crate::fault_subprocess::cap_ffmpeg_allocations(16) };
+  unsafe { mediaio_ffmpeg::test_support::cap_ffmpeg_allocations(16) };
   let refused = dec.receive_frame(&mut frame);
-  crate::fault_subprocess::uncap_ffmpeg_allocations();
+  mediaio_ffmpeg::test_support::uncap_ffmpeg_allocations();
   match refused {
     Err(VideoDecodeError::Convert(e)) => assert!(
-      e.parks_in_decode(),
+      crate::decoder::parks_in_decode(&e),
       "the ceiling must produce a parkable refusal, got {e:?}",
     ),
     other => panic!("expected a parkable refusal after EOF, got {other:?}"),
@@ -1719,7 +1719,7 @@ fn a_post_eof_send_is_a_fault_not_backpressure(hw: bool) {
 /// The hardware scratch holds the parked frame.
 #[test]
 fn a_post_eof_send_is_a_fault_not_backpressure_on_the_hardware_road() {
-  crate::fault_subprocess::in_subprocess(
+  mediaio_ffmpeg::test_support::in_subprocess(
     "video::tests::a_post_eof_send_is_a_fault_not_backpressure_on_the_hardware_road",
     || a_post_eof_send_is_a_fault_not_backpressure(true),
   );
@@ -1730,7 +1730,7 @@ fn a_post_eof_send_is_a_fault_not_backpressure_on_the_hardware_road() {
 /// so the ordering is proved against both.
 #[test]
 fn a_post_eof_send_is_a_fault_not_backpressure_on_the_software_road() {
-  crate::fault_subprocess::in_subprocess(
+  mediaio_ffmpeg::test_support::in_subprocess(
     "video::tests::a_post_eof_send_is_a_fault_not_backpressure_on_the_software_road",
     || a_post_eof_send_is_a_fault_not_backpressure(false),
   );
@@ -1949,7 +1949,7 @@ fn a_parked_hardware_frame_is_delivered_before_any_fallback() {
   // stale frame, or refusing permanently and stranding a decoded one.
   // Both send roads can commit that fallback, so both refuse while the
   // seat is taken.
-  crate::fault_subprocess::in_subprocess(
+  mediaio_ffmpeg::test_support::in_subprocess(
     "video::tests::a_parked_hardware_frame_is_delivered_before_any_fallback",
     || {
       let (w, h) = (64u32, 48u32);
@@ -1983,12 +1983,12 @@ fn a_parked_hardware_frame_is_delivered_before_any_fallback() {
       // SAFETY: in `in_subprocess`'s child, alone. The capped window runs one
       // receive: libavcodec and this crate's conversion, which check what
       // they allocate.
-      unsafe { crate::fault_subprocess::cap_ffmpeg_allocations(16) };
+      unsafe { mediaio_ffmpeg::test_support::cap_ffmpeg_allocations(16) };
       let refused = dec.receive_frame(&mut frame);
-      crate::fault_subprocess::uncap_ffmpeg_allocations();
+      mediaio_ffmpeg::test_support::uncap_ffmpeg_allocations();
       match refused {
         Err(VideoDecodeError::Convert(e)) => assert!(
-          e.parks_in_decode(),
+          crate::decoder::parks_in_decode(&e),
           "the ceiling must produce a parkable refusal, got {e:?}",
         ),
         other => panic!("expected a parkable refusal, got {other:?}"),

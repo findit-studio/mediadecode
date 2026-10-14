@@ -113,9 +113,8 @@ impl ContainerFormat {
   /// # Safety
   ///
   /// `context` must be a live `*const AVFormatContext`.
-  pub(crate) unsafe fn from_context(
-    context: *const ffmpeg_next::ffi::AVFormatContext,
-  ) -> Option<Self> {
+  #[doc(hidden)]
+  pub unsafe fn from_context(context: *const ffmpeg_next::ffi::AVFormatContext) -> Option<Self> {
     if context.is_null() {
       return None;
     }

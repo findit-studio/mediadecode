@@ -761,23 +761,6 @@ pub enum ConvertError {
   MalformedChannelLayout(MalformedChannelLayout),
 }
 
-impl ConvertError {
-  /// Whether a decode session should **park** the frame this refusal
-  /// came from and re-attempt it before receiving another.
-  ///
-  /// The same shape as the demux seat, for the same reason: a decoder's
-  /// `receive_frame` advances libavcodec, so a conversion that then
-  /// fails on an allocation would lose a frame nothing can ask for
-  /// again. Only an allocation qualifies — every other arm here is a
-  /// fact about the frame (a format nothing can carry, a layout that
-  /// does not add up, a plane outside its own buffers), and re-offering
-  /// one of those would answer every later receive with the same error.
-  #[inline]
-  pub(crate) const fn parks_in_decode(&self) -> bool {
-    matches!(self, Self::CarrierAllocFailed(_))
-  }
-}
-
 impl core::fmt::Display for ConvertError {
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
     match self {
@@ -837,7 +820,7 @@ fn unsupported_pixel_format(raw: i32) -> ConvertError {
 /// compile:
 ///
 /// ```compile_fail,E0107
-/// use mediadecode_ffmpeg::{FrameLimits, View, convert::video_frame_from};
+/// use mediaio_ffmpeg::{FrameLimits, View, convert::video_frame_from};
 /// let frame = ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::GRAY8, 64, 4);
 /// let _ = video_frame_from::<View>(&frame, mediadecode::Timebase::default(), FrameLimits::default());
 /// ```
@@ -918,7 +901,8 @@ pub fn subtitle_frame_from(
 ///   it would race a carrier a consumer is reading. Consume the
 ///   frame, or use the owned lane, or use the safe borrowed wrapper
 ///   (which is the owned lane for exactly this reason).
-pub(crate) unsafe fn av_frame_to_video_frame_as<C: crate::FfmpegCarrier + crate::CarrierOps>(
+#[doc(hidden)]
+pub unsafe fn av_frame_to_video_frame_as<C: crate::FfmpegCarrier + crate::CarrierOps>(
   av_frame: *const AVFrame,
   time_base: Timebase,
   limits: FrameLimits,
@@ -1078,7 +1062,8 @@ pub fn image_frame_from(
 ///   it would race a carrier a consumer is reading. Consume the
 ///   frame, or use the owned lane, or use the safe borrowed wrapper
 ///   (which is the owned lane for exactly this reason).
-pub(crate) unsafe fn av_frame_to_image_frame_as<C: crate::FfmpegCarrier + crate::CarrierOps>(
+#[doc(hidden)]
+pub unsafe fn av_frame_to_image_frame_as<C: crate::FfmpegCarrier + crate::CarrierOps>(
   av_frame: *const AVFrame,
   limits: FrameLimits,
 ) -> Result<ImageFrame<mediadecode::PixelFormat, ImageFrameExtra, C::Buffer>, ConvertError> {
@@ -1939,7 +1924,7 @@ unsafe fn collect_side_data(
     tracing::warn!(
       cap = SIDE_DATA_MAX_ENTRIES,
       requested = count_raw,
-      "mediadecode-ffmpeg: AVFrame.nb_side_data exceeds entry cap; truncating",
+      "mediaio-ffmpeg: AVFrame.nb_side_data exceeds entry cap; truncating",
     );
   }
   let mut out: Vec<SideDataEntry> = Vec::new();
@@ -1972,7 +1957,7 @@ unsafe fn collect_side_data(
         tracing::warn!(
           cap = SIDE_DATA_MAX_TOTAL_BYTES,
           projected,
-          "mediadecode-ffmpeg: AVFrame side-data byte cap reached; dropping remaining entries",
+          "mediaio-ffmpeg: AVFrame side-data byte cap reached; dropping remaining entries",
         );
         break;
       }
@@ -2368,7 +2353,8 @@ fn map_chroma_loc(raw: i32) -> ChromaLocation {
 ///   it would race a carrier a consumer is reading. Consume the
 ///   frame, or use the owned lane, or use the safe borrowed wrapper
 ///   (which is the owned lane for exactly this reason).
-pub(crate) unsafe fn av_frame_to_audio_frame_as<C: crate::FfmpegCarrier + crate::CarrierOps>(
+#[doc(hidden)]
+pub unsafe fn av_frame_to_audio_frame_as<C: crate::FfmpegCarrier + crate::CarrierOps>(
   av_frame: *const AVFrame,
   time_base: Timebase,
   limits: FrameLimits,
@@ -2810,9 +2796,8 @@ pub(crate) unsafe fn find_audio_backing_buffer(
 ///   it would race a carrier a consumer is reading. Consume the
 ///   frame, or use the owned lane, or use the safe borrowed wrapper
 ///   (which is the owned lane for exactly this reason).
-pub(crate) unsafe fn av_subtitle_to_subtitle_frame_as<
-  C: crate::FfmpegCarrier + crate::CarrierOps,
->(
+#[doc(hidden)]
+pub unsafe fn av_subtitle_to_subtitle_frame_as<C: crate::FfmpegCarrier + crate::CarrierOps>(
   av_subtitle: *const ffmpeg_next::ffi::AVSubtitle,
 ) -> Result<SubtitleFrame<SubtitleFrameExtra, C::Buffer>, ConvertError> {
   if av_subtitle.is_null() {
@@ -2859,7 +2844,7 @@ pub(crate) unsafe fn av_subtitle_to_subtitle_frame_as<
     tracing::warn!(
       cap = SUBTITLE_MAX_RECTS,
       requested = count_raw,
-      "mediadecode-ffmpeg: AVSubtitle.num_rects exceeds rect cap; truncating",
+      "mediaio-ffmpeg: AVSubtitle.num_rects exceeds rect cap; truncating",
     );
   }
   let mut text_total_bytes: usize = 0;

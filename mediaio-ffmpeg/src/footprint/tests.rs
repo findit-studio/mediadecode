@@ -104,7 +104,7 @@ fn the_audio_pricer_dominates_every_format_the_build_names() {
   for format_raw in 0..64i32 {
     // SAFETY: the width query takes the format as an integer and
     // answers 0 for anything it does not name.
-    let width = unsafe { crate::decoder::c_shims::av_get_bytes_per_sample(format_raw) };
+    let width = unsafe { crate::ffi::c_shims::av_get_bytes_per_sample(format_raw) };
     if width <= 0 {
       continue;
     }
@@ -172,7 +172,7 @@ fn the_video_pricer_dominates_every_format_the_build_names() {
     if desc.is_null() {
       break;
     }
-    let format_raw = unsafe { crate::decoder::c_shims::av_pix_fmt_desc_get_id(desc) };
+    let format_raw = unsafe { crate::ffi::c_shims::av_pix_fmt_desc_get_id(desc) };
     for (w, h) in VIDEO_SHAPES {
       let actual = actual_video(format_raw, w, h);
       if actual == 0 {
@@ -248,7 +248,7 @@ fn the_unpriceable_bound_dominates_the_priceable_estimate() {
       if desc.is_null() {
         break;
       }
-      let id = unsafe { crate::decoder::c_shims::av_pix_fmt_desc_get_id(desc) };
+      let id = unsafe { crate::ffi::c_shims::av_pix_fmt_desc_get_id(desc) };
       if let Some(priced) = video_frame_bytes(id, w, h) {
         assert!(
           bound >= priced,
@@ -259,4 +259,36 @@ fn the_unpriceable_bound_dominates_the_priceable_estimate() {
   }
 
   assert!(video_frame_bytes_upper_bound(0, 16).is_none());
+}
+
+/// The two rulers the pre-allocation ceilings are built on, pinned.
+///
+/// Both are censuses of this build rather than constants, so a change
+/// in FFmpeg moves them silently. This lane is what makes such a move
+/// visible: the numbers are quoted in `mediadecode-ffmpeg`'s
+/// `build_codec_context` comments,
+/// in `worst_bytes_per_probe`'s docs and in the CHANGELOG, and a
+/// ceiling whose documented derivation no longer matches its arithmetic
+/// is worse than one with no documentation at all.
+#[test]
+fn the_pre_allocation_rulers_are_what_the_docs_say() {
+  use super::{PROBE_PIXELS, worst_bytes_per_probe};
+
+  // 16 bytes per pixel: `gbrapf32`, `rgbaf32`, `rgba128`, `gbrap32`,
+  // big- and little-endian — eight formats, measured across the whole
+  // descriptor table through the `c_int` shims.
+  assert_eq!(
+    worst_bytes_per_probe(),
+    16 * PROBE_PIXELS,
+    "the worst pixel format is no longer 16 bytes per pixel",
+  );
+
+  // And the derivations the docs quote, so the prose cannot drift from
+  // the arithmetic.
+  let effective_pixels = crate::DEFAULT_MAX_FRAME_BYTES / 16;
+  assert_eq!(effective_pixels, 33_554_432);
+  assert!(
+    effective_pixels > 7680 * 4320,
+    "8K must fit the byte-derived pixel ceiling",
+  );
 }

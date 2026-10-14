@@ -244,7 +244,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierSubtitleStreamDecoder<C
         self.limits.packet_limits(),
         // Nothing on this road records what it is sent, so the packet
         // really does die inside the call and its body may be shared.
-        crate::carrier::BodyRoute::Submission,
+        crate::BodyRoute::Submission,
         submit,
       )
     }
@@ -282,7 +282,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierSubtitleStreamDecoder<C
         *dst = frame;
         Ok(Received::Frame)
       }
-      Err(e) if e.parks_in_decode() => {
+      Err(e) if crate::decoder::parks_in_decode(&e) => {
         // Kept: another attempt could carry this cue, and there is no
         // other copy of it anywhere.
         Err(SubtitleDecodeError::Convert(e))

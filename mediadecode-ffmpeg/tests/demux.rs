@@ -1742,7 +1742,7 @@ fn the_demux_to_decoder_handoff_survives_an_allocation_fault() {
       unsafe { ffmpeg_next::ffi::av_max_alloc(i32::MAX as usize) };
 
       assert!(
-        matches!(refused, Err(DemuxError::ParametersAlloc(_))),
+        matches!(refused, Err(mediadecode_ffmpeg::ParametersError::Alloc(_))),
         "expected a named refusal, got {refused:?}",
       );
 

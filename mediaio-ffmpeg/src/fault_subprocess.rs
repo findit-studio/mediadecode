@@ -20,7 +20,7 @@
 /// module path inside the crate, e.g. `demuxer::tests::the_lane` — so
 /// that `--exact` selects exactly this test in the child.
 pub fn in_subprocess(test_path: &str, body: impl FnOnce()) {
-  const CHILD: &str = "MEDIADECODE_FFMPEG_FAULT_CHILD";
+  const CHILD: &str = "MEDIAIO_FFMPEG_FAULT_CHILD";
 
   if std::env::var(CHILD).as_deref() == Ok(test_path) {
     body();

@@ -1,0 +1,55 @@
+[package]
+name        = "mediaio-ffmpeg"
+version     = "0.19.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+description = "The FFmpeg base of the mediaio family: the link to libavcodec and libavformat, and the crossings between FFmpeg's memory and the shared media vocabulary — carriers, packet and frame conversion, codec tickets, limits, and the FFmpeg resampler."
+repository.workspace   = true
+homepage.workspace     = true
+documentation = "https://docs.rs/mediaio-ffmpeg"
+keywords      = ["ffmpeg", "media", "video", "audio", "mediaio"]
+categories    = ["multimedia", "multimedia::video", "multimedia::audio"]
+
+[features]
+default = ["std", "resample"]
+# `std` adds `mediadecode/default` (the vocabulary's `std` feature) on
+# top of the `alloc` tier the dependency rows below pin. The crossings
+# use alloc-gated types unconditionally, so `alloc` cannot be optional.
+std     = ["mediadecode/default"]
+alloc   = []
+
+# Gates `FfmpegResampler` (the `AudioResampler` impl over `swresample`)
+# and, with it, `ffmpeg-next/software-resampling` — `swresample` is a
+# separate FFmpeg library, so linking it is a separate feature.
+resample = ["ffmpeg-next/software-resampling"]
+
+# Test machinery, compiled only on request: the subprocess harness for
+# faults that cannot be injected in a shared process (`av_max_alloc` is
+# process-global), and the hooks that latch the callback state's
+# refusals without a hardware backend to decline a real surface. Off by
+# default and never needed to decode; it exists so this crate's lanes,
+# and the lanes of a crate built on it, can drive those roads.
+test-support = []
+
+[dependencies]
+mediadecode = { workspace = true, features = ["alloc"] }
+# The channel-layout vocabulary this crate produces lives in
+# `mediaframe::audio`, which is compiled only at the alloc-or-std tier —
+# hence the unconditional `alloc`, the same shape as the `mediadecode`
+# pin above.
+mediaframe  = { workspace = true, features = ["alloc"] }
+ffmpeg-next = { workspace = true }
+derive_more = { workspace = true, features = ["is_variant", "try_unwrap", "unwrap"] }
+smol-bytes  = { workspace = true }
+triomphe    = { workspace = true }
+thiserror   = { workspace = true }
+tracing     = { workspace = true }
+libc        = { workspace = true }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true

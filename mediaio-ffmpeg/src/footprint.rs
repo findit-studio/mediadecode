@@ -74,7 +74,7 @@ const fn align_up(value: usize, align: usize) -> usize {
 ///
 /// `None` when libavutil cannot size the format at those dimensions, so
 /// callers can fail closed rather than guess.
-pub(crate) fn video_frame_bytes(format_raw: c_int, width: c_int, height: c_int) -> Option<usize> {
+pub fn video_frame_bytes(format_raw: c_int, width: c_int, height: c_int) -> Option<usize> {
   if width <= 0 || height <= 0 {
     return None;
   }
@@ -84,7 +84,7 @@ pub(crate) fn video_frame_bytes(format_raw: c_int, width: c_int, height: c_int) 
   // `c_int` shim; libavutil answers a negative AVERROR for anything it
   // cannot size.
   let size = unsafe {
-    crate::decoder::c_shims::av_image_get_buffer_size(
+    crate::ffi::c_shims::av_image_get_buffer_size(
       format_raw,
       aligned_w as c_int,
       aligned_h as c_int,
@@ -115,7 +115,7 @@ pub(crate) fn video_frame_bytes(format_raw: c_int, width: c_int, height: c_int) 
 /// dominates [`video_frame_bytes`] for the same extent by construction.
 ///
 /// `None` only when the dimensions are not a picture.
-pub(crate) fn video_frame_bytes_upper_bound(width: c_int, height: c_int) -> Option<usize> {
+pub fn video_frame_bytes_upper_bound(width: c_int, height: c_int) -> Option<usize> {
   if width <= 0 || height <= 0 {
     return None;
   }
@@ -128,8 +128,8 @@ pub(crate) fn video_frame_bytes_upper_bound(width: c_int, height: c_int) -> Opti
   // that census exists.
   aligned_w
     .checked_mul(aligned_h)?
-    .checked_mul(crate::decoder::worst_bytes_per_probe())?
-    .checked_div(crate::decoder::PROBE_PIXELS)?
+    .checked_mul(worst_bytes_per_probe())?
+    .checked_div(PROBE_PIXELS)?
     .checked_add(PLANE_SLACK.saturating_mul(4))
 }
 
@@ -158,30 +158,20 @@ pub(crate) fn video_frame_bytes_upper_bound(width: c_int, height: c_int) -> Opti
 ///           + 32 * planes          (planes = channels if planar, else 1)
 /// ```
 ///
-/// The per-plane term is charged at [`PLANE_SLACK`] rather than the
+/// The per-plane term is charged at `PLANE_SLACK` rather than the
 /// measured 32, which costs nothing and leaves room for a build whose
 /// buffer header is larger.
 ///
 /// `None` when libavutil will not size the request — an unnamed format,
 /// a count it rejects — so callers fail closed rather than guess.
-pub(crate) fn audio_frame_bytes(
-  format_raw: c_int,
-  nb_samples: usize,
-  channels: usize,
-) -> Option<usize> {
+pub fn audio_frame_bytes(format_raw: c_int, nb_samples: usize, channels: usize) -> Option<usize> {
   let nb = c_int::try_from(nb_samples).ok()?;
   let ch = c_int::try_from(channels.max(1)).ok()?;
   // SAFETY: every argument is passed as the integer it is, through the
   // `c_int` shim; libavutil answers a negative AVERROR for anything it
   // will not size.
   let base = unsafe {
-    crate::decoder::c_shims::av_samples_get_buffer_size(
-      core::ptr::null_mut(),
-      ch,
-      nb,
-      format_raw,
-      0,
-    )
+    crate::ffi::c_shims::av_samples_get_buffer_size(core::ptr::null_mut(), ch, nb, format_raw, 0)
   };
   if base < 0 {
     return None;
@@ -189,6 +179,112 @@ pub(crate) fn audio_frame_bytes(
   let planar = crate::sample_format::SampleFormat::from_raw(format_raw).is_planar();
   let planes = if planar { channels.max(1) } else { 1 };
   (base as usize).checked_add(PLANE_SLACK.checked_mul(planes)?)
+}
+
+/// The probe square the per-pixel cost is measured on.
+///
+/// 256 divides every chroma subsampling FFmpeg has **and** every
+/// alignment libavcodec uses, so the measurement is exact: no plane is
+/// rounded up to cover a half-sized dimension, and no row is padded to
+/// an alignment boundary. Measured at 257 the same census reads 16.934
+/// bytes per pixel instead of 16.000 — that 5.8% is per-*row* padding,
+/// a term linear in height rather than in pixels, and it is not part of
+/// the per-pixel rate.
+pub(crate) const PROBE_PIXELS: usize = 256 * 256;
+
+/// Bytes a [`PROBE_PIXELS`]-pixel picture costs in the **most expensive
+/// pixel format this build of libavcodec can describe**.
+///
+/// # Why the worst case and not the declared one
+///
+/// The first cut of this ceiling charged the format the *container*
+/// declared, and a container's declaration is not an upper bound on
+/// anything. It may be unset, it may be wrong, and it may be narrower
+/// than what the decoder actually emits — a stream declaring `yuv420p`
+/// at 1.5 bytes per pixel whose decoder outputs `rgbaf32` at 16 got a
+/// ceiling more than ten times too generous, which is the same hole one
+/// layer down from the one it was added to close.
+///
+/// So the rate is not negotiated with the file at all. Every stream is
+/// charged the worst case, and the worst case is **measured**, not
+/// tabulated: this build's descriptor list is walked once and each
+/// format priced through `av_image_get_buffer_size`, the same function
+/// `avcodec_default_get_buffer2` sizes from. A future FFmpeg that adds
+/// a wider format is priced correctly without this crate learning its
+/// name.
+///
+/// # The census, at the time of writing
+///
+/// 267 descriptors, 251 of them CPU formats that price (the rest are
+/// hardware surfaces, which carry no CPU bytes and return no size). The
+/// maximum is **16.000 bytes per pixel**, reached by eight formats —
+/// `gbrapf32be/le`, `rgbaf32be/le`, `rgba128be/le`, `gbrap32be/le`.
+/// Next below are the 12-byte `gbrpf32`/`rgbf32` family.
+///
+/// # What this trades
+///
+/// Over-refusal for cheap formats, and it is deliberate. At the 512 MiB
+/// default the effective ceiling becomes ~33.55 Mpx, so 8K (33.18 Mpx)
+/// still decodes in *any* format — including the 16-byte ones, where it
+/// really does cost 506 MiB — but a 16K `yuv420p` frame, which would
+/// only have cost 199 MB, is refused too. That is the honest shape of a
+/// bound that has to hold before the format is known: the deployment
+/// answer is to raise `max_frame_bytes`, which is exactly the knob that
+/// says how much memory one frame may cost.
+///
+/// # The residual, stated
+///
+/// Row alignment adds at most `align x planes x height` bytes on top of
+/// this rate — about 1 MB on an 8K frame, 0.2%, and covered by the fact
+/// that `max_frame_bytes` is a policy number rather than a hardware
+/// limit. It is only significant for degenerate aspect ratios (a
+/// one-pixel-wide frame is all padding), which the *pixel* ceiling has
+/// always been the wrong shape to bound and which this change neither
+/// introduces nor worsens.
+pub(crate) fn worst_bytes_per_probe() -> usize {
+  /// The census result, taken once. `av_pix_fmt_desc_next` walks a
+  /// static table that cannot change during the process.
+  static WORST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+  *WORST.get_or_init(|| {
+    /// The measured maximum at the time of writing, and the floor this
+    /// census may not fall below. A build whose census comes back
+    /// *smaller* than the eight 16-byte formats has failed to walk the
+    /// table, not discovered a cheaper world — take the known number
+    /// rather than a ceiling built on a failed measurement.
+    const KNOWN_WORST_BYTES_PER_PIXEL: usize = 16;
+
+    let mut worst = 0usize;
+    let mut desc: *const ffmpeg_next::ffi::AVPixFmtDescriptor = core::ptr::null();
+    loop {
+      // SAFETY: `av_pix_fmt_desc_next` walks libavutil's own static
+      // descriptor table, taking the previous entry (or null to start)
+      // and returning null at the end. It traffics in descriptor
+      // pointers, not enums, so it needs no shim.
+      desc = unsafe { ffmpeg_next::ffi::av_pix_fmt_desc_next(desc) };
+      if desc.is_null() {
+        break;
+      }
+      // **Both of these go through the `c_int` shims**, and this is the
+      // place it matters most: the whole point of walking the table is
+      // to price formats this build's bindings may not name, and the
+      // generated `av_pix_fmt_desc_get_id` hands those ids back as a
+      // closed `AVPixelFormat`. Every future format would have become
+      // an invalid enum value on the way into the pricing meant to
+      // handle it — the census would have been UB on exactly its reason
+      // for existing.
+      //
+      // SAFETY: `desc` is a live entry from libavutil's static table;
+      // the id is passed straight back to libavutil as the integer it
+      // is, and `av_image_get_buffer_size` returns a negative AVERROR
+      // for ids it cannot size rather than misbehaving.
+      let id = unsafe { crate::ffi::c_shims::av_pix_fmt_desc_get_id(desc) };
+      let size = unsafe { crate::ffi::c_shims::av_image_get_buffer_size(id, 256, 256, 1) };
+      if size > 0 {
+        worst = worst.max(size as usize);
+      }
+    }
+    worst.max(KNOWN_WORST_BYTES_PER_PIXEL * PROBE_PIXELS)
+  })
 }
 
 #[cfg(test)]

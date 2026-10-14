@@ -23,12 +23,11 @@ use mediadecode::{
 use mediaframe::audio::ChannelLayoutDescription;
 
 use crate::{
-  DecoderLimits, Error, Ffmpeg, boundary,
+  DecoderLimits, Error, Ffmpeg, SampleFormat, boundary,
   convert::{self, ConvertError},
   decoder::build_codec_context,
   extras::{AudioFrameExtra, AudioPacketExtra},
   frame::alloc_av_audio_frame,
-  sample_format::SampleFormat,
 };
 
 /// `mediadecode::AudioStreamDecoder` impl wrapping `ffmpeg::decoder::Audio`.
@@ -103,7 +102,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierAudioStreamDecoder<C> {
     crate::decoder::ensure_codec_type(&opened, ffmpeg_next::ffi::AVMediaType::AVMEDIA_TYPE_AUDIO)
       .map_err(AudioDecodeError::Decode)?;
     let decoder = ffmpeg_next::decoder::Audio(opened);
-    let scratch = alloc_av_audio_frame().map_err(AudioDecodeError::Decode)?;
+    let scratch = alloc_av_audio_frame().map_err(|e| AudioDecodeError::Decode(e.into()))?;
     Ok(Self {
       decoder,
       scratch,
@@ -196,7 +195,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierAudioStreamDecoder<C> {
         // Nothing on this road records what it is sent, so the
         // packet really does die inside the call and its body may
         // be shared.
-        crate::carrier::BodyRoute::Submission,
+        crate::BodyRoute::Submission,
         submit,
       )
     }
@@ -245,7 +244,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierAudioStreamDecoder<C> {
         // Park only what another attempt could survive; a frame nothing
         // can carry is let go, or every later receive answers with the
         // same error.
-        self.scratch_pending = e.parks_in_decode();
+        self.scratch_pending = crate::decoder::parks_in_decode(&e);
         Err(AudioDecodeError::Convert(e))
       }
     }

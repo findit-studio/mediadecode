@@ -69,8 +69,8 @@ use ffmpeg_next::{
 
 use crate::{
   FfmpegBytes,
-  demuxer::{
-    DemuxError, ParametersAlloc, ParametersChannelMap, ParametersCopy, ParametersMissing,
+  error::{
+    ParametersAlloc, ParametersChannelMap, ParametersCopy, ParametersError, ParametersMissing,
     ParametersOpaque, ParametersTooLarge,
   },
   extras::{ExtradataPolicy, SideDataEntry, measure_parameters},
@@ -304,7 +304,7 @@ impl ChannelLayoutTicket {
 /// that must outlive the pointer's owner. libavformat never sets
 /// either, so no demuxed stream reaches this type carrying one. If one
 /// ever did, [`CodecTicket::mirror`] refuses with
-/// [`DemuxError::ParametersOpaque`] rather than dropping it in
+/// [`ParametersError::Opaque`] rather than dropping it in
 /// silence — the same fail-closed answer
 /// [`measure_parameters`](crate::extras) gives a channel order it has
 /// never heard of.
@@ -360,9 +360,9 @@ impl CodecTicket {
   /// [`crate::extras::bounded_clone_parameters`] performs and the same
   /// number `admit_streams` charges against the session's total. A set
   /// of parameters over the ceiling is refused with
-  /// [`DemuxError::ParametersTooLarge`], never truncated.
+  /// [`ParametersError::TooLarge`], never truncated.
   ///
-  /// Fails with [`DemuxError::ParametersMissing`] when `source` is
+  /// Fails with [`ParametersError::Missing`] when `source` is
   /// null-backed — `Parameters::new()` and `Parameters::default()` are
   /// safe constructors over an unchecked `avcodec_parameters_alloc`,
   /// so a caller can hold one without ever having been told.
@@ -370,22 +370,23 @@ impl CodecTicket {
     source: &Parameters,
     stream_index: usize,
     budget: usize,
-  ) -> Result<Self, DemuxError> {
+  ) -> Result<Self, ParametersError> {
     Self::mirror_with(source, stream_index, budget, ExtradataPolicy::Copy)
   }
 
   /// [`Self::mirror`], with the `extradata` policy named.
-  pub(crate) fn mirror_with(
+  #[doc(hidden)]
+  pub fn mirror_with(
     source: &Parameters,
     stream_index: usize,
     budget: usize,
     extradata_policy: ExtradataPolicy,
-  ) -> Result<Self, DemuxError> {
+  ) -> Result<Self, ParametersError> {
     // SAFETY: reading the pointer without dereferencing it — which is
     // what the null check exists for.
     let par = unsafe { source.as_ptr() };
     if par.is_null() {
-      return Err(DemuxError::ParametersMissing(ParametersMissing::new(
+      return Err(ParametersError::Missing(ParametersMissing::new(
         stream_index,
       )));
     }
@@ -405,9 +406,9 @@ impl CodecTicket {
     stream_index: usize,
     budget: usize,
     extradata_policy: ExtradataPolicy,
-  ) -> Result<Self, DemuxError> {
+  ) -> Result<Self, ParametersError> {
     let too_large = |bytes: usize| {
-      DemuxError::ParametersTooLarge(ParametersTooLarge::new(stream_index, bytes, budget))
+      ParametersError::TooLarge(ParametersTooLarge::new(stream_index, bytes, budget))
     };
 
     // **Structure first, before the measurement and long before the
@@ -542,7 +543,7 @@ impl CodecTicket {
   /// budget — the bytes are already resident and were admitted at
   /// [`Self::mirror`]; what this allocates is exactly
   /// [`Self::footprint_bytes`].
-  pub fn rebuild(&self) -> Result<Parameters, DemuxError> {
+  pub fn rebuild(&self) -> Result<Parameters, ParametersError> {
     let stream_index = self.stream_index;
     let mut out = Parameters::new();
     // SAFETY: reading the pointer the constructor stored without
@@ -550,9 +551,7 @@ impl CodecTicket {
     // `avcodec_parameters_alloc` and hands back a null on failure.
     let dst = unsafe { out.as_mut_ptr() };
     if dst.is_null() {
-      return Err(DemuxError::ParametersAlloc(ParametersAlloc::new(
-        stream_index,
-      )));
+      return Err(ParametersError::Alloc(ParametersAlloc::new(stream_index)));
     }
 
     // SAFETY: `dst` is a live, freshly allocated `AVCodecParameters`
@@ -896,7 +895,7 @@ unsafe fn extradata_of(
   par: *const AVCodecParameters,
   policy: ExtradataPolicy,
   stream_index: usize,
-) -> Result<FfmpegBytes, DemuxError> {
+) -> Result<FfmpegBytes, ParametersError> {
   if matches!(policy, ExtradataPolicy::Omit) {
     return Ok(FfmpegBytes::empty());
   }
@@ -917,7 +916,7 @@ unsafe fn extradata_of(
   // size that then aborts the process is a budget that did not do its
   // job.
   FfmpegBytes::try_copy_from_slice(unsafe { core::slice::from_raw_parts(ptr, len) })
-    .ok_or_else(|| DemuxError::ParametersAlloc(ParametersAlloc::new(stream_index)))
+    .ok_or_else(|| ParametersError::Alloc(ParametersAlloc::new(stream_index)))
 }
 
 /// Copies every `coded_side_data` entry into owned entries.
@@ -928,10 +927,10 @@ unsafe fn extradata_of(
 unsafe fn side_data_of(
   par: *const AVCodecParameters,
   stream_index: usize,
-) -> Result<Vec<SideDataEntry>, DemuxError> {
+) -> Result<Vec<SideDataEntry>, ParametersError> {
   // SAFETY: `par` is live per the contract.
   let (array, count) = unsafe { ((*par).coded_side_data, (*par).nb_coded_side_data) };
-  let alloc = || DemuxError::ParametersAlloc(ParametersAlloc::new(stream_index));
+  let alloc = || ParametersError::Alloc(ParametersAlloc::new(stream_index));
   let Ok(count) = usize::try_from(count) else {
     return Ok(Vec::new());
   };
@@ -1013,10 +1012,11 @@ unsafe fn side_data_of(
 /// order with a non-null `u.map` that map must hold `nb_channels` live
 /// `AVChannelCustom` entries — FFmpeg's own contract for a layout it
 /// filled, which is the only kind this crate hands in.
-pub(crate) unsafe fn validate_channel_layout(
+#[doc(hidden)]
+pub unsafe fn validate_channel_layout(
   par: *const AVCodecParameters,
   stream_index: usize,
-) -> Result<(), DemuxError> {
+) -> Result<(), ParametersError> {
   // SAFETY: `ch_layout` is embedded by value; `addr_of!` reaches each
   // field without forming a reference to the layout, and `order` has
   // the layout of a `c_int`.
@@ -1028,7 +1028,7 @@ pub(crate) unsafe fn validate_channel_layout(
     )
   };
   if !opaque.is_null() {
-    return Err(DemuxError::ParametersOpaque(ParametersOpaque::new(
+    return Err(ParametersError::Opaque(ParametersOpaque::new(
       stream_index,
       None,
     )));
@@ -1053,7 +1053,7 @@ pub(crate) unsafe fn validate_channel_layout(
   // `c_int` it is, and for a custom order its map holds `nb_channels`
   // entries.
   unsafe { crate::channel_layout::layout_preflight(addr_of!((*par).ch_layout)) }
-    .map_err(|fault| crate::demuxer::layout_fault_to_demux(stream_index, fault))?;
+    .map_err(|fault| ParametersError::from_layout_fault(stream_index, fault))?;
 
   if order != AVChannelOrder::AV_CHANNEL_ORDER_CUSTOM as i32 {
     return Ok(());
@@ -1074,7 +1074,7 @@ pub(crate) unsafe fn validate_channel_layout(
     // `addr_of!`.
     let opaque = unsafe { read_unaligned(addr_of!((*map.add(index)).opaque)) };
     if !opaque.is_null() {
-      return Err(DemuxError::ParametersOpaque(ParametersOpaque::new(
+      return Err(ParametersError::Opaque(ParametersOpaque::new(
         stream_index,
         Some(index),
       )));
@@ -1097,7 +1097,7 @@ pub(crate) unsafe fn validate_channel_layout(
 unsafe fn channel_layout_of(
   par: *const AVCodecParameters,
   stream_index: usize,
-) -> Result<ChannelLayoutTicket, DemuxError> {
+) -> Result<ChannelLayoutTicket, ParametersError> {
   // SAFETY: the caller's contract, forwarded unchanged.
   unsafe { validate_channel_layout(par, stream_index) }?;
 
@@ -1142,7 +1142,7 @@ unsafe fn channel_layout_of(
   layout
     .map
     .try_reserve_exact(count)
-    .map_err(|_| DemuxError::ParametersAlloc(ParametersAlloc::new(stream_index)))?;
+    .map_err(|_| ParametersError::Alloc(ParametersAlloc::new(stream_index)))?;
   for index in 0..count {
     // SAFETY: FFmpeg's contract makes the map `count` entries long,
     // `index` is below that count, and every read goes through
@@ -1164,8 +1164,8 @@ unsafe fn channel_layout_of(
 // ---------------------------------------------------------------------------
 
 /// The `ENOMEM` a heap seat's allocation reports when it fails.
-fn seat_alloc_failed(stream_index: usize) -> DemuxError {
-  DemuxError::ParametersCopy(ParametersCopy::new(
+fn seat_alloc_failed(stream_index: usize) -> ParametersError {
+  ParametersError::Copy(ParametersCopy::new(
     stream_index,
     ffmpeg_next::Error::Other {
       errno: libc::ENOMEM,
@@ -1183,7 +1183,7 @@ unsafe fn write_extradata(
   dst: *mut AVCodecParameters,
   payload: &[u8],
   stream_index: usize,
-) -> Result<(), DemuxError> {
+) -> Result<(), ParametersError> {
   if payload.is_empty() {
     return Ok(());
   }
@@ -1218,7 +1218,7 @@ unsafe fn write_side_data(
   dst: *mut AVCodecParameters,
   entries: &[SideDataEntry],
   stream_index: usize,
-) -> Result<(), DemuxError> {
+) -> Result<(), ParametersError> {
   if entries.is_empty() {
     return Ok(());
   }
@@ -1281,7 +1281,7 @@ unsafe fn write_channel_layout(
   dst: *mut AVCodecParameters,
   layout: &ChannelLayoutTicket,
   stream_index: usize,
-) -> Result<(), DemuxError> {
+) -> Result<(), ParametersError> {
   // SAFETY: `dst` is live and its layout owns nothing yet; `order` is
   // written as the same 32-bit pattern the mirror read.
   unsafe {
@@ -1333,7 +1333,7 @@ unsafe fn write_channel_layout(
   if count == 0 {
     // Unreachable through `mirror`, and fail-closed if a future
     // constructor ever makes it reachable.
-    return Err(DemuxError::ParametersChannelMap(ParametersChannelMap::new(
+    return Err(ParametersError::ChannelMap(ParametersChannelMap::new(
       stream_index,
       layout.channels(),
     )));

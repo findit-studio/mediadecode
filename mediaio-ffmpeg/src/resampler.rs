@@ -45,7 +45,8 @@ use mediadecode::{
 use mediaframe::audio::ChannelLayoutDescription;
 
 use crate::{
-  Error, Ffmpeg, extras::AudioFrameExtra, limits::FrameLimits, sample_format::SampleFormat,
+  Ffmpeg, error::CrossingError, extras::AudioFrameExtra, limits::FrameLimits,
+  sample_format::SampleFormat,
 };
 
 /// The frame type a resampler accepts and produces, on lane `C`.
@@ -196,7 +197,7 @@ impl ResampleSpec {
   }
 
   /// The spec a track *declares*, read off the owned codec ticket a
-  /// [`crate::FfmpegDemuxer`] track row carries
+  /// `mediadecode-ffmpeg` `FfmpegDemuxer` track row carries
   /// (`track.extra().ticket()`) — the "source from `TrackInfo`" path.
   ///
   /// Reads the ticket directly rather than rebuilding an
@@ -266,7 +267,7 @@ impl ResampleSpec {
   /// sample format and channel layout, straight off the codec context.
   ///
   /// Reach it through
-  /// [`FfmpegAudioStreamDecoder::inner`](crate::FfmpegAudioStreamDecoder::inner).
+  /// `mediadecode-ffmpeg`'s `FfmpegAudioStreamDecoder::inner`.
   /// `None` on a custom or ambisonic layout, and on a context whose
   /// sample format is still unset (a decoder that has not been opened).
   pub fn from_decoder(decoder: &ffmpeg_next::decoder::Audio) -> Option<Self> {
@@ -1001,7 +1002,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierResampler<C> {
     self
       .ctx
       .run(&input, &mut prepared.frame)
-      .map_err(|e| ResampleError::Resample(Error::Ffmpeg(e)))?;
+      .map_err(|e| ResampleError::Resample(CrossingError::Ffmpeg(e)))?;
 
     // The frame is inside the filter now, so the timeline may be
     // anchored on it. Anchored on *input* rather than on the first
@@ -1064,7 +1065,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierResampler<C> {
     self
       .ctx
       .flush(&mut prepared.frame)
-      .map_err(|e| ResampleError::Resample(Error::Ffmpeg(e)))?;
+      .map_err(|e| ResampleError::Resample(CrossingError::Ffmpeg(e)))?;
     match self.finish_output(prepared) {
       Some(frame) => {
         *dst = frame;
@@ -1789,7 +1790,7 @@ pub enum ResampleError {
 
   /// The wrapped `swresample` call reported an error.
   #[error(transparent)]
-  Resample(#[from] Error),
+  Resample(#[from] CrossingError),
 
   /// A reference to one of the output frame's planes could not be
   /// taken.
@@ -2075,7 +2076,7 @@ fn open_context(
     staged_target_layout,
     target.rate,
   )
-  .map_err(|e| ResampleError::Resample(Error::Ffmpeg(e)))
+  .map_err(|e| ResampleError::Resample(CrossingError::Ffmpeg(e)))
 }
 
 /// Allocates an audio `AVFrame`, checking every step the dependency's
@@ -2111,7 +2112,7 @@ fn new_audio_frame(
   // and reports failure in its return value, which is checked.
   let rc = unsafe { av_frame_get_buffer(out.as_mut_ptr(), 0) };
   if rc < 0 {
-    return Err(ResampleError::Resample(Error::Ffmpeg(
+    return Err(ResampleError::Resample(CrossingError::Ffmpeg(
       ffmpeg_next::Error::from(rc),
     )));
   }

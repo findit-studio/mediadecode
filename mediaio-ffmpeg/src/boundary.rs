@@ -400,7 +400,8 @@ pub const fn is_hardware_pix_fmt(raw: i32) -> bool {
 /// * `av_new_packet` allocation failure (signalled by `data_mut()`
 ///   returning `None`) → `ffmpeg_next::Error::Other { errno:
 ///   libc::ENOMEM }`.
-pub(crate) fn try_packet_copy(data: &[u8]) -> std::result::Result<Packet, ffmpeg_next::Error> {
+#[doc(hidden)]
+pub fn try_packet_copy(data: &[u8]) -> std::result::Result<Packet, ffmpeg_next::Error> {
   // FFmpeg's `AVPacket.size` is `c_int`. A payload larger than that
   // can't fit in a single packet — refuse rather than truncate via
   // `as c_int` inside `Packet::new`.
@@ -453,7 +454,8 @@ pub(crate) fn try_packet_copy(data: &[u8]) -> std::result::Result<Packet, ffmpeg
 /// # Safety
 ///
 /// `packet` must own a live `AVPacket`.
-pub(crate) unsafe fn write_md_flags(packet: &mut Packet, flags: MdPacketFlags) {
+#[doc(hidden)]
+pub unsafe fn write_md_flags(packet: &mut Packet, flags: MdPacketFlags) {
   use ffmpeg_next::packet::Mut;
   unsafe {
     (*packet.as_mut_ptr()).flags = c_int::from(flags.bits());
@@ -792,7 +794,8 @@ fn attach_side_data(out: &mut Packet, entries: &[SideDataEntry]) -> Result<(), P
 /// decoder — `avcodec_send_packet` may keep a reference and never writes
 /// through it — and drop it; a copy kept past that must own its bytes,
 /// as `decoder::try_clone_packet` makes.
-pub(crate) unsafe fn share_or_copy(
+#[doc(hidden)]
+pub unsafe fn share_or_copy(
   body: &crate::FfmpegBuffer,
 ) -> std::result::Result<Packet, ffmpeg_next::Error> {
   use ffmpeg_next::packet::Mut;
@@ -931,7 +934,8 @@ pub fn ffmpeg_packet_from_owned_video_packet(
 /// to `avcodec_send_packet`, which may keep a reference and never
 /// writes through it, is what a submission is. With [`BodyRoute::Copy`]
 /// there is nothing to prove.
-pub(crate) unsafe fn with_ffmpeg_video_packet<C: crate::FfmpegCarrier + crate::CarrierOps, T>(
+#[doc(hidden)]
+pub unsafe fn with_ffmpeg_video_packet<C: crate::FfmpegCarrier + crate::CarrierOps, T>(
   packet: &mediadecode::packet::VideoPacket<VideoPacketExtra, C::Buffer>,
   limits: PacketLimits,
   route: BodyRoute,
@@ -1046,7 +1050,8 @@ pub fn ffmpeg_packet_from_owned_audio_packet(
 /// to `avcodec_send_packet`, which may keep a reference and never
 /// writes through it, is what a submission is. With [`BodyRoute::Copy`]
 /// there is nothing to prove.
-pub(crate) unsafe fn with_ffmpeg_audio_packet<C: crate::FfmpegCarrier + crate::CarrierOps, T>(
+#[doc(hidden)]
+pub unsafe fn with_ffmpeg_audio_packet<C: crate::FfmpegCarrier + crate::CarrierOps, T>(
   packet: &mediadecode::packet::AudioPacket<AudioPacketExtra, C::Buffer>,
   limits: PacketLimits,
   route: BodyRoute,
@@ -1161,7 +1166,8 @@ pub fn ffmpeg_packet_from_owned_subtitle_packet(
 /// to `avcodec_send_packet`, which may keep a reference and never
 /// writes through it, is what a submission is. With [`BodyRoute::Copy`]
 /// there is nothing to prove.
-pub(crate) unsafe fn with_ffmpeg_subtitle_packet<C: crate::FfmpegCarrier + crate::CarrierOps, T>(
+#[doc(hidden)]
+pub unsafe fn with_ffmpeg_subtitle_packet<C: crate::FfmpegCarrier + crate::CarrierOps, T>(
   packet: &mediadecode::packet::SubtitlePacket<SubtitlePacketExtra, C::Buffer>,
   limits: PacketLimits,
   route: BodyRoute,
@@ -1539,7 +1545,8 @@ pub(crate) unsafe fn video_packet_from_ffmpeg_as<C: crate::FfmpegCarrier + crate
 /// in-place FFmpeg write) while the carrier lives; dropping `packet`, or
 /// only ever reading it, discharges this. The owned lane copies and
 /// owes nothing here.
-pub(crate) unsafe fn video_packet_from_borrowed<C: crate::FfmpegCarrier + crate::CarrierOps>(
+#[doc(hidden)]
+pub unsafe fn video_packet_from_borrowed<C: crate::FfmpegCarrier + crate::CarrierOps>(
   packet: &Packet,
   time_base: mediadecode::Timebase,
   limits: PacketLimits,
@@ -1619,7 +1626,8 @@ pub(crate) unsafe fn audio_packet_from_ffmpeg_as<C: crate::FfmpegCarrier + crate
 /// in-place FFmpeg write) while the carrier lives; dropping `packet`, or
 /// only ever reading it, discharges this. The owned lane copies and
 /// owes nothing here.
-pub(crate) unsafe fn audio_packet_from_borrowed<C: crate::FfmpegCarrier + crate::CarrierOps>(
+#[doc(hidden)]
+pub unsafe fn audio_packet_from_borrowed<C: crate::FfmpegCarrier + crate::CarrierOps>(
   packet: &Packet,
   time_base: mediadecode::Timebase,
   limits: PacketLimits,
@@ -1699,7 +1707,8 @@ pub(crate) unsafe fn subtitle_packet_from_ffmpeg_as<C: crate::FfmpegCarrier + cr
 /// in-place FFmpeg write) while the carrier lives; dropping `packet`, or
 /// only ever reading it, discharges this. The owned lane copies and
 /// owes nothing here.
-pub(crate) unsafe fn subtitle_packet_from_borrowed<C: crate::FfmpegCarrier + crate::CarrierOps>(
+#[doc(hidden)]
+pub unsafe fn subtitle_packet_from_borrowed<C: crate::FfmpegCarrier + crate::CarrierOps>(
   packet: &Packet,
   time_base: mediadecode::Timebase,
   limits: PacketLimits,
@@ -1785,7 +1794,8 @@ pub(crate) unsafe fn data_packet_from_ffmpeg_as<C: crate::FfmpegCarrier + crate:
 /// in-place FFmpeg write) while the carrier lives; dropping `packet`, or
 /// only ever reading it, discharges this. The owned lane copies and
 /// owes nothing here.
-pub(crate) unsafe fn data_packet_from_borrowed<C: crate::FfmpegCarrier + crate::CarrierOps>(
+#[doc(hidden)]
+pub unsafe fn data_packet_from_borrowed<C: crate::FfmpegCarrier + crate::CarrierOps>(
   packet: &Packet,
   time_base: mediadecode::Timebase,
   limits: PacketLimits,
@@ -1947,7 +1957,8 @@ fn md_flags_from_packet(packet: &Packet) -> Result<MdPacketFlags, PacketBufferEr
 ///
 /// `pkt` must be a live `*const AVPacket` for the duration of this
 /// call.
-pub(crate) unsafe fn md_flags_from_av_packet(
+#[doc(hidden)]
+pub unsafe fn md_flags_from_av_packet(
   pkt: *const ffmpeg_next::ffi::AVPacket,
 ) -> Result<MdPacketFlags, PacketBufferError> {
   // SAFETY: `pkt` is live per the contract above; `flags` is a public
@@ -2009,7 +2020,8 @@ pub(crate) fn media_kind_from_raw(raw: i32) -> MediaKind {
 /// The medium a set of codec parameters declares, without forming an
 /// `AVMediaType`. Replaces every `Parameters::medium()` call in this
 /// crate — see [`MediaKind`].
-pub(crate) fn media_kind_of(parameters: &ffmpeg_next::codec::Parameters) -> MediaKind {
+#[doc(hidden)]
+pub fn media_kind_of(parameters: &ffmpeg_next::codec::Parameters) -> MediaKind {
   // SAFETY: `as_ptr` is `unsafe` only because the pointer must not
   // outlive `parameters`; it is used and discarded inside this call.
   let ptr = unsafe { parameters.as_ptr() };
@@ -2150,7 +2162,7 @@ pub(crate) fn empty_subtitle_frame_as<C: crate::FfmpegCarrier + crate::CarrierOp
 /// ```compile_fail,E0382
 /// use ffmpeg_next::packet::Mut;
 /// use mediadecode::Timebase;
-/// use mediadecode_ffmpeg::{PacketLimits, video_packet_from_ffmpeg_in};
+/// use mediaio_ffmpeg::{PacketLimits, video_packet_from_ffmpeg_in};
 ///
 /// let mut packet = ffmpeg_next::Packet::copy(&[0u8; 64]);
 /// let viewed = video_packet_from_ffmpeg_in(packet, Timebase::default(), PacketLimits::default());
@@ -2333,8 +2345,8 @@ pub fn owned_attachment_packet_from_ffmpeg(
   }
 }
 
-/// [`empty_video_frame_as`] on the view lane — the destination a
-/// [`FfmpegVideoStreamDecoder`](crate::FfmpegVideoStreamDecoder) fills.
+/// [`empty_video_frame_as`] on the view lane — the destination
+/// `mediadecode-ffmpeg`'s `FfmpegVideoStreamDecoder` fills.
 #[must_use]
 pub fn empty_video_frame() -> VideoFrame<PixelFormat, VideoFrameExtra, crate::FfmpegBuffer> {
   empty_video_frame_as::<crate::View>()
@@ -2387,6 +2399,53 @@ pub fn attachment_packet_from_ffmpeg(
       crate::buffer::PayloadProvenance::CallerSupplied,
     )
   }
+}
+
+/// Checked counterpart to `Packet::clone()`: a copy of `src` whose payload
+/// nothing else references.
+///
+/// ffmpeg-next's `clone_from` makes the same two calls, `av_packet_ref`
+/// then `av_packet_make_writable`, and ignores both return codes
+/// (`src/codec/packet/packet.rs` 287–297 in ffmpeg-next 9.0.0). Under
+/// `ENOMEM` its clone is left empty, or still sharing `src`'s buffer,
+/// while the caller assumes a copy. Both are checked here.
+///
+/// **Why both calls.** `av_packet_ref` alone shares `src`'s payload
+/// buffer (`libavcodec/packet.c` 461–468 in FFmpeg 9.0.1), and a `Packet`
+/// lends `&mut [u8]` through `data_mut` without consulting writability.
+/// A shallow clone kept past the call is a second owner of the caller's
+/// bytes: the caller's later writes reach it, and `data_mut` on the two
+/// hands out aliasing `&mut [u8]` from safe code, on two threads once
+/// the packets are sent apart. `av_packet_make_writable` copies a buffer
+/// that is not writable — referenced more than once, or read-only
+/// (`libavutil/buffer.c` 147–153) — into one of the packet's own
+/// (`packet.c` 516–536). Side data is the copy's own already:
+/// `av_packet_copy_props` copies each entry (417–429). `opaque_ref` stays
+/// shared (413), and ffmpeg-next's safe API does not reach it.
+///
+/// The copy's payload and side data are `src`'s sizes, so a budget that
+/// charged `src` charges the copy the same bytes. On failure the partial
+/// clone is dropped, which releases the reference it took.
+pub fn try_clone_packet(src: &Packet) -> std::result::Result<Packet, ffmpeg_next::Error> {
+  use ffmpeg_next::packet::{Mut, Ref};
+
+  let mut dst = Packet::empty();
+  // SAFETY: dst is a freshly zero-initialized Packet (av_init_packet inside
+  // Packet::empty); av_packet_ref initializes its data fields from src's
+  // refcounted buffer, or returns AVERROR(ENOMEM) and leaves dst blank
+  // (`packet.h` 861–862).
+  let ret = unsafe { ffmpeg_next::ffi::av_packet_ref(dst.as_mut_ptr(), src.as_ptr()) };
+  if ret < 0 {
+    return Err(ffmpeg_next::Error::from(ret));
+  }
+  // SAFETY: dst is the live packet av_packet_ref just filled. On failure
+  // av_packet_make_writable leaves it unchanged (`packet.h` 921–922), and
+  // dropping it releases the reference it holds.
+  let ret = unsafe { ffmpeg_next::ffi::av_packet_make_writable(dst.as_mut_ptr()) };
+  if ret < 0 {
+    return Err(ffmpeg_next::Error::from(ret));
+  }
+  Ok(dst)
 }
 
 #[cfg(test)]
@@ -3220,7 +3279,7 @@ mod tests {
       // SAFETY: `packet` owns a live `AVPacket`; `flags` is a public
       // field.
       unsafe { (*packet.as_mut_ptr()).flags = raw };
-      let copy = crate::decoder::try_clone_packet(&packet).expect("a packet clones");
+      let copy = try_clone_packet(&packet).expect("a packet clones");
       for (road, source) in [("demuxed", &packet), ("copied", &copy)] {
         // SAFETY: `CallerSupplied` is true of every packet, and the owned lane copies.
         let video = unsafe {

@@ -146,7 +146,7 @@ impl CodecId {
     // SAFETY: the redeclared shim takes a plain `c_int`, so no bindgen
     // enum is formed from `self.0`, and libavcodec answers null for an
     // id it cannot place.
-    unsafe { crate::decoder::c_shims::avcodec_descriptor_get(self.0) }
+    unsafe { crate::ffi::c_shims::avcodec_descriptor_get(self.0) }
   }
 
   // --- Sentinels -------------------------------------------------------

@@ -5,114 +5,19 @@ use ffmpeg_next::{
   codec::{
     self,
     Context,
-    // Bring the `Mut` / `Ref` traits into scope so `Packet::as_ptr` /
-    // `Packet::as_mut_ptr` resolve. They are aliased to avoid shadowing
-    // any future `Mut`/`Ref` types we might add — `cargo clippy` would
-    // otherwise flag them as "unused" without the alias and the import
-    // can mistakenly look unused. Confirmed in use by all `packet.as_ptr()`
-    // / `packet.as_mut_ptr()` call sites in this module.
-    packet::{Mut as PacketMut, Ref as PacketRef},
+    // Bring the `Ref` trait into scope so `Packet::as_ptr` resolves. It
+    // is aliased to avoid shadowing any future `Ref` type we might add.
+    // The `Mut` twin left with the packet copier, which now lives in
+    // `mediaio-ffmpeg`'s `boundary`.
+    packet::Ref as PacketRef,
   },
   ffi::{
-    AVBufferRef, AVCodec, AVFrame, AVHWFramesContext, AVMediaType, av_buffer_ref, av_buffer_unref,
+    AVBufferRef, AVFrame, AVHWFramesContext, AVMediaType, av_buffer_ref, av_buffer_unref,
     av_frame_move_ref, av_frame_unref, av_hwdevice_ctx_create, av_hwframe_transfer_data,
-    av_packet_make_writable, av_packet_ref, avcodec_alloc_context3, avcodec_free_context,
-    avcodec_parameters_to_context,
+    avcodec_alloc_context3, avcodec_free_context, avcodec_parameters_to_context,
   },
   frame,
 };
-
-/// Local FFI shims: FFmpeg entry points re-declared with `c_int` where
-/// the generated bindings use a closed Rust enum.
-///
-/// Constructing `AVCodecID` / `AVPixelFormat` / `AVSampleFormat` from a
-/// runtime integer that is not in this build's discriminant set is UB —
-/// and these are open C enums that FFmpeg extends in ABI-compatible
-/// releases. Declaring the same C symbol with `c_int` sidesteps the
-/// boundary entirely: both Rust declarations resolve to the same symbol
-/// at link time, and the integer never becomes an enum on the Rust
-/// side.
-///
-/// **This is the enum class inside this crate's own code.** The
-/// dependency-API sweep closed every place *ffmpeg-next* formed an enum
-/// out of FFmpeg memory; these three are places the crate's own new
-/// code did the same thing. The census that walks the pixel-format
-/// table to price the worst format is the sharpest instance: it exists
-/// precisely to be correct about formats this build does not name, and
-/// the binding it called returned those very ids as a closed
-/// `AVPixelFormat`. Every id would have become an invalid enum value on
-/// the way *into* the pricing that was supposed to handle it.
-pub(crate) mod c_shims {
-  use libc::c_int;
-
-  use super::AVCodec;
-
-  unsafe extern "C" {
-    /// `AVCodecID` as `c_int`.
-    pub fn avcodec_find_decoder(id: c_int) -> *const AVCodec;
-
-    /// `AVCodecID` as `c_int`, answering the descriptor libavcodec keeps
-    /// for that id — or null where this build names no codec for it.
-    ///
-    /// The pointer is into `codec_descriptors[]`, a `static const` table
-    /// compiled into libavcodec, so the strings it names are live and
-    /// unwritten for the process — the contract `crate::ffi`'s bounded
-    /// reader is given. It is left **raw** at every call site: the
-    /// struct embeds an `AVCodecID` and an `AVMediaType`, and forming a
-    /// reference to it would assert two bindgen enums valid on a table
-    /// that belongs to the linked library rather than to the bindings.
-    /// See `crate::CodecId::descriptor`.
-    ///
-    /// Preferred over `avcodec_get_name`, which never answers null: for
-    /// an id it cannot place it returns the string `"unknown_codec"`,
-    /// a sentinel wearing a name's clothes. A descriptor that is absent
-    /// is `None` here, and a consumer can tell the two apart.
-    pub fn avcodec_descriptor_get(id: c_int) -> *const ffmpeg_next::ffi::AVCodecDescriptor;
-
-    /// Returns `AVPixelFormat` as `c_int` — the id of a descriptor that
-    /// may well name a format this build's bindings do not.
-    pub fn av_pix_fmt_desc_get_id(desc: *const ffmpeg_next::ffi::AVPixFmtDescriptor) -> c_int;
-
-    /// Takes `AVPixelFormat` as `c_int`, so an id straight out of
-    /// [`av_pix_fmt_desc_get_id`] can be priced without ever being an
-    /// enum.
-    pub fn av_image_get_buffer_size(
-      pix_fmt: c_int,
-      width: c_int,
-      height: c_int,
-      align: c_int,
-    ) -> c_int;
-
-    /// Takes `AVSampleFormat` as `c_int`. Kept for the footprint
-    /// sweep, which walks the format table to decide which cells
-    /// exist; production pricing goes through
-    /// `av_samples_get_buffer_size`, the allocator's own ruler.
-    #[cfg(test)]
-    pub fn av_get_bytes_per_sample(sample_fmt: c_int) -> c_int;
-
-    /// The allocator's own audio ruler, with `AVSampleFormat` as
-    /// `c_int`. `align = 0` asks for the alignment
-    /// `av_frame_get_buffer` itself uses.
-    pub fn av_samples_get_buffer_size(
-      linesize: *mut c_int,
-      nb_channels: c_int,
-      nb_samples: c_int,
-      sample_fmt: c_int,
-      align: c_int,
-    ) -> c_int;
-
-    /// Writes an `AV_PIX_FMT_NONE`-terminated list of destination
-    /// formats a transfer may produce. Declared `*mut *mut c_int` so
-    /// the list is walked as integers — a driver may well offer a
-    /// format this build's bindings do not name.
-    pub fn av_hwframe_transfer_get_formats(
-      hwframe_ctx: *mut ffmpeg_next::ffi::AVBufferRef,
-      dir: c_int,
-      formats: *mut *mut c_int,
-      flags: c_int,
-    ) -> c_int;
-  }
-}
 
 use mediadecode::{Received, Sent, decoder::ScaledOutputCapability};
 
@@ -273,7 +178,7 @@ const MAX_PROBE_PACKETS: usize = 256;
 
 /// Maximum total compressed-byte size of buffered probe packets. Each
 /// buffered packet holds its own copy of the payload (see
-/// [`try_clone_packet`]), so this bounds bytes the probe itself holds.
+/// [`try_clone_packet`](crate::boundary::try_clone_packet)), so this bounds bytes the probe itself holds.
 /// 64 MiB is generous for normal video and gives untrusted media a hard
 /// ceiling.
 const MAX_PROBE_PACKET_BYTES: usize = 64 * 1024 * 1024;
@@ -1184,7 +1089,7 @@ impl VideoDecoder {
   /// entry count exceeds [`MAX_PROBE_PACKET_SIDE_DATA_ENTRIES`], its
   /// bytes would push the probe past [`MAX_PROBE_PACKETS`] or
   /// [`MAX_PROBE_PACKET_BYTES`], or the probe's copy of it cannot be
-  /// made ([`av_packet_ref`] or `av_packet_make_writable` failing) —
+  /// made (`av_packet_ref` or `av_packet_make_writable` failing) —
   /// `send_packet` returns [`Error::AllBackendsFailed`] **without
   /// invoking** `state.inner.send_packet` on this packet. The caller's
   /// packet stays in their hand and `unconsumed_packets` carries the
@@ -1261,7 +1166,7 @@ impl VideoDecoder {
         // `new_bytes` stands. If it cannot be made we bail rather than
         // consuming a packet we can't track; the packet stays the
         // caller's, unsent.
-        match try_clone_packet(packet) {
+        match crate::boundary::try_clone_packet(packet) {
           Ok(c) => Some((c, new_bytes)),
           Err(e) => {
             let probe = self.probe.take().expect("probe present");
@@ -1904,7 +1809,7 @@ impl VideoDecoder {
           // committed here stays the session's when the history later
           // goes to the caller as owned, mutable `Packet`s. A copy that
           // cannot be made fails this candidate's replay.
-          let pkt = match try_clone_packet(kept) {
+          let pkt = match crate::boundary::try_clone_packet(kept) {
             Ok(pkt) => pkt,
             Err(e) => {
               r = Err(e);
@@ -2078,8 +1983,7 @@ impl VideoDecoder {
     // are the same object, and `Box::into_raw` hands its ownership to
     // the guard below without moving it — so the pointer the context
     // holds stays the one that is freed.
-    state.wanted = hw_pix_fmt;
-    state.wanted_int = hw_pix_fmt as i32;
+    state.set_wanted(hw_pix_fmt);
     let callback_state = Box::into_raw(state);
     // RAII guard: from now until the end-of-function `into_owned()`, every
     // early return — `av_buffer_ref` failure, `open_as` failure, codec_type
@@ -2788,11 +2692,9 @@ pub(crate) fn build_codec_context(
     crate::channel_layout::layout_preflight(ptr::addr_of!((*parameters.as_ptr()).ch_layout))
   }
   .map_err(
-    |fault| match crate::demuxer::layout_fault_to_demux(0, fault) {
-      crate::demuxer::DemuxError::ParametersLayoutShape(shape) => {
-        Error::MalformedChannelLayout(shape)
-      }
-      crate::demuxer::DemuxError::ParametersChannelMap(map) => Error::ChannelMapMissing(map),
+    |fault| match mediaio_ffmpeg::ParametersError::from_layout_fault(0, fault) {
+      mediaio_ffmpeg::ParametersError::LayoutShape(shape) => Error::MalformedChannelLayout(shape),
+      mediaio_ffmpeg::ParametersError::ChannelMap(map) => Error::ChannelMapMissing(map),
       // The preflight allocates nothing, so no other arm is reachable;
       // reporting the allocator keeps the match total without an
       // `unreachable!`.
@@ -2808,7 +2710,7 @@ pub(crate) fn build_codec_context(
   let declared = footprint.and_then(|f| f.total()).unwrap_or(usize::MAX);
   if declared > limits.max_codec_parameter_bytes() {
     return Err(Error::ParametersTooLarge(
-      crate::demuxer::ParametersTooLarge::new(0, declared, limits.max_codec_parameter_bytes()),
+      mediaio_ffmpeg::ParametersTooLarge::new(0, declared, limits.max_codec_parameter_bytes()),
     ));
   }
   // SAFETY: avcodec_alloc_context3(NULL) returns a fresh AVCodecContext
@@ -2860,7 +2762,7 @@ pub(crate) fn build_codec_context(
   // it is a broken decoder.
   //
   // The translation is gone because it is no longer needed: the byte
-  // ceiling is enforced by [`judge_buffer`], which is *also* a
+  // ceiling is enforced by `judge_buffer`, which is *also* a
   // pre-allocation seat — `get_buffer2` is the allocator, so it runs
   // before the allocation and prices the frame's real format at its
   // real aligned dimensions. Nothing is lost on the software road by
@@ -2881,14 +2783,14 @@ pub(crate) fn build_codec_context(
   // in `get_buffer2`, which *is* the allocation, against the caller's
   // own `max_frame_bytes`.
   //
-  // See [`judge_buffer`] for why this hook rather than `get_format`
+  // See `judge_buffer` for why this hook rather than `get_format`
   // (measured: `get_format` never fires for a one-shot `png` decode).
   //
   // SAFETY: `ctx_ptr` is the non-null context; `get_buffer2` is a
   // public function-pointer field, and `judge_buffer` delegates every
   // frame it accepts to the allocator libavcodec would have used.
   unsafe {
-    (*ctx_ptr).get_buffer2 = Some(judge_buffer);
+    (*ctx_ptr).get_buffer2 = Some(crate::ffi::judge_buffer);
   }
 
   // **The packet timebase, for every decoder opened against a stream.**
@@ -2927,7 +2829,7 @@ pub(crate) fn build_codec_context(
   // priced it at four times its real cost.
   //
   // The audio pre-allocation story is now the same as the video one,
-  // and it is stronger than the translation was: [`judge_buffer`] runs
+  // and it is stronger than the translation was: `judge_buffer` runs
   // in `get_buffer2`, before the planes are allocated, and prices the
   // frame's real sample format at its real channel count through
   // [`crate::footprint`] — which asks `av_samples_get_buffer_size`, the
@@ -2936,8 +2838,8 @@ pub(crate) fn build_codec_context(
 
   // **The judge's budget seat.** `judge_buffer` runs as a C callback
   // with nothing but the context to read, and the byte ceiling is not
-  // recoverable from any field on it — see
-  // [`CallbackState::max_frame_bytes`]. So the state that already
+  // recoverable from any field on it — see `CallbackState`'s
+  // `max_frame_bytes` in `mediaio-ffmpeg`. So the state that already
   // carries the `get_format` declination carries the budget too, and
   // every road gets one: this is the single point every decoder in the
   // crate is built through.
@@ -2945,17 +2847,7 @@ pub(crate) fn build_codec_context(
   // Ownership stays with the caller, which keeps the box alive for as
   // long as the context. `Box` contents do not move when the box does,
   // so the pointer installed here stays valid across the return.
-  let mut state = Box::new(CallbackState {
-    wanted: ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_NONE,
-    wanted_int: ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_NONE as i32,
-    ceiling_declined: core::sync::atomic::AtomicBool::new(false),
-    declined_pixels: core::sync::atomic::AtomicI64::new(0),
-    declined_limit: core::sync::atomic::AtomicI64::new(0),
-    max_frame_bytes: limits.frame().max_frame_bytes() as u64,
-    frame_budget_declined: core::sync::atomic::AtomicBool::new(false),
-    declined_frame_bytes: core::sync::atomic::AtomicU64::new(0),
-    declined_frame_audio: core::sync::atomic::AtomicBool::new(false),
-  });
+  let mut state = Box::new(CallbackState::new(limits.frame().max_frame_bytes() as u64));
   // SAFETY: `ctx_ptr` is the non-null context; `opaque` is a public
   // field FFmpeg never reads or frees.
   unsafe {
@@ -3001,59 +2893,14 @@ pub(crate) fn try_clone_parameters(
   // parameters, not a stream, and inventing a coordinate it cannot
   // know would be worse than admitting it has none.
   crate::extras::bounded_clone_parameters(src, 0, budget).map_err(|e| match e {
-    crate::demuxer::DemuxError::ParametersTooLarge(p) => Error::ParametersTooLarge(p),
-    crate::demuxer::DemuxError::ParametersCopy(p) => Error::Ffmpeg(*p.source()),
+    mediaio_ffmpeg::ParametersError::TooLarge(p) => Error::ParametersTooLarge(p),
+    mediaio_ffmpeg::ParametersError::Copy(p) => Error::Ffmpeg(*p.source()),
     // A missing or unallocatable destination is the out-of-memory this
     // helper has always reported.
     _ => Error::Ffmpeg(ffmpeg_next::Error::Other {
       errno: libc::ENOMEM,
     }),
   })
-}
-
-/// Checked counterpart to `Packet::clone()`: a copy of `src` whose payload
-/// nothing else references.
-///
-/// ffmpeg-next's `clone_from` makes the same two calls, `av_packet_ref`
-/// then `av_packet_make_writable`, and ignores both return codes
-/// (`src/codec/packet/packet.rs` 287–297 in ffmpeg-next 9.0.0). Under
-/// `ENOMEM` its clone is left empty, or still sharing `src`'s buffer,
-/// while the caller assumes a copy. Both are checked here.
-///
-/// **Why both calls.** `av_packet_ref` alone shares `src`'s payload
-/// buffer (`libavcodec/packet.c` 461–468 in FFmpeg 9.0.1), and a `Packet`
-/// lends `&mut [u8]` through `data_mut` without consulting writability.
-/// A shallow clone kept past the call is a second owner of the caller's
-/// bytes: the caller's later writes reach it, and `data_mut` on the two
-/// hands out aliasing `&mut [u8]` from safe code, on two threads once
-/// the packets are sent apart. `av_packet_make_writable` copies a buffer
-/// that is not writable — referenced more than once, or read-only
-/// (`libavutil/buffer.c` 147–153) — into one of the packet's own
-/// (`packet.c` 516–536). Side data is the copy's own already:
-/// `av_packet_copy_props` copies each entry (417–429). `opaque_ref` stays
-/// shared (413), and ffmpeg-next's safe API does not reach it.
-///
-/// The copy's payload and side data are `src`'s sizes, so a budget that
-/// charged `src` charges the copy the same bytes. On failure the partial
-/// clone is dropped, which releases the reference it took.
-pub(crate) fn try_clone_packet(src: &Packet) -> std::result::Result<Packet, ffmpeg_next::Error> {
-  let mut dst = Packet::empty();
-  // SAFETY: dst is a freshly zero-initialized Packet (av_init_packet inside
-  // Packet::empty); av_packet_ref initializes its data fields from src's
-  // refcounted buffer, or returns AVERROR(ENOMEM) and leaves dst blank
-  // (`packet.h` 861–862).
-  let ret = unsafe { av_packet_ref(dst.as_mut_ptr(), src.as_ptr()) };
-  if ret < 0 {
-    return Err(ffmpeg_next::Error::from(ret));
-  }
-  // SAFETY: dst is the live packet av_packet_ref just filled. On failure
-  // av_packet_make_writable leaves it unchanged (`packet.h` 921–922), and
-  // dropping it releases the reference it holds.
-  let ret = unsafe { av_packet_make_writable(dst.as_mut_ptr()) };
-  if ret < 0 {
-    return Err(ffmpeg_next::Error::from(ret));
-  }
-  Ok(dst)
 }
 
 /// Sum of `AVPacket.side_data[i].size` across every entry, plus
@@ -3108,334 +2955,28 @@ pub(crate) fn packet_side_data_count(packet: &Packet) -> usize {
   if nel <= 0 { 0 } else { nel as usize }
 }
 
+/// Whether a decode session should **park** the frame a conversion
+/// refusal came from and re-attempt it before receiving another.
+///
+/// The same shape as the demuxer's parking, for the same reason: a
+/// decoder's `receive_frame` advances libavcodec, so a conversion that
+/// then fails on an allocation would lose a frame nothing can ask for
+/// again. Only an allocation qualifies — every other arm is a fact about
+/// the frame (a format nothing can carry, a layout that does not add up,
+/// a plane outside its own buffers), and re-offering one of those would
+/// answer every later receive with the same error.
+///
+/// Decided here, by the sessions that hold the frame, rather than on
+/// `ConvertError`: whether to retry depends on what the caller still
+/// holds, which the error cannot know.
+pub(crate) fn parks_in_decode(e: &crate::convert::ConvertError) -> bool {
+  matches!(e, crate::convert::ConvertError::CarrierAllocFailed(_))
+}
+
 /// Just `EAGAIN` (separate from EOF — the FFmpeg send/receive state machine
 /// distinguishes "drain output and retry" from "stream over").
 fn is_eagain(e: &ffmpeg_next::Error) -> bool {
   matches!(e, ffmpeg_next::Error::Other { errno } if *errno == ffmpeg_next::error::EAGAIN)
-}
-
-/// The probe square the per-pixel cost is measured on.
-///
-/// 256 divides every chroma subsampling FFmpeg has **and** every
-/// alignment libavcodec uses, so the measurement is exact: no plane is
-/// rounded up to cover a half-sized dimension, and no row is padded to
-/// an alignment boundary. Measured at 257 the same census reads 16.934
-/// bytes per pixel instead of 16.000 — that 5.8% is per-*row* padding,
-/// a term linear in height rather than in pixels, and it is not part of
-/// the per-pixel rate.
-pub(crate) const PROBE_PIXELS: usize = 256 * 256;
-
-/// Bytes a [`PROBE_PIXELS`]-pixel picture costs in the **most expensive
-/// pixel format this build of libavcodec can describe**.
-///
-/// # Why the worst case and not the declared one
-///
-/// The first cut of this ceiling charged the format the *container*
-/// declared, and a container's declaration is not an upper bound on
-/// anything. It may be unset, it may be wrong, and it may be narrower
-/// than what the decoder actually emits — a stream declaring `yuv420p`
-/// at 1.5 bytes per pixel whose decoder outputs `rgbaf32` at 16 got a
-/// ceiling more than ten times too generous, which is the same hole one
-/// layer down from the one it was added to close.
-///
-/// So the rate is not negotiated with the file at all. Every stream is
-/// charged the worst case, and the worst case is **measured**, not
-/// tabulated: this build's descriptor list is walked once and each
-/// format priced through `av_image_get_buffer_size`, the same function
-/// `avcodec_default_get_buffer2` sizes from. A future FFmpeg that adds
-/// a wider format is priced correctly without this crate learning its
-/// name.
-///
-/// # The census, at the time of writing
-///
-/// 267 descriptors, 251 of them CPU formats that price (the rest are
-/// hardware surfaces, which carry no CPU bytes and return no size). The
-/// maximum is **16.000 bytes per pixel**, reached by eight formats —
-/// `gbrapf32be/le`, `rgbaf32be/le`, `rgba128be/le`, `gbrap32be/le`.
-/// Next below are the 12-byte `gbrpf32`/`rgbf32` family.
-///
-/// # What this trades
-///
-/// Over-refusal for cheap formats, and it is deliberate. At the 512 MiB
-/// default the effective ceiling becomes ~33.55 Mpx, so 8K (33.18 Mpx)
-/// still decodes in *any* format — including the 16-byte ones, where it
-/// really does cost 506 MiB — but a 16K `yuv420p` frame, which would
-/// only have cost 199 MB, is refused too. That is the honest shape of a
-/// bound that has to hold before the format is known: the deployment
-/// answer is to raise `max_frame_bytes`, which is exactly the knob that
-/// says how much memory one frame may cost.
-///
-/// # The residual, stated
-///
-/// Row alignment adds at most `align x planes x height` bytes on top of
-/// this rate — about 1 MB on an 8K frame, 0.2%, and covered by the fact
-/// that `max_frame_bytes` is a policy number rather than a hardware
-/// limit. It is only significant for degenerate aspect ratios (a
-/// one-pixel-wide frame is all padding), which the *pixel* ceiling has
-/// always been the wrong shape to bound and which this change neither
-/// introduces nor worsens.
-pub(crate) fn worst_bytes_per_probe() -> usize {
-  /// The census result, taken once. `av_pix_fmt_desc_next` walks a
-  /// static table that cannot change during the process.
-  static WORST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-  *WORST.get_or_init(|| {
-    /// The measured maximum at the time of writing, and the floor this
-    /// census may not fall below. A build whose census comes back
-    /// *smaller* than the eight 16-byte formats has failed to walk the
-    /// table, not discovered a cheaper world — take the known number
-    /// rather than a ceiling built on a failed measurement.
-    const KNOWN_WORST_BYTES_PER_PIXEL: usize = 16;
-
-    let mut worst = 0usize;
-    let mut desc: *const ffmpeg_next::ffi::AVPixFmtDescriptor = ptr::null();
-    loop {
-      // SAFETY: `av_pix_fmt_desc_next` walks libavutil's own static
-      // descriptor table, taking the previous entry (or null to start)
-      // and returning null at the end. It traffics in descriptor
-      // pointers, not enums, so it needs no shim.
-      desc = unsafe { ffmpeg_next::ffi::av_pix_fmt_desc_next(desc) };
-      if desc.is_null() {
-        break;
-      }
-      // **Both of these go through the `c_int` shims**, and this is the
-      // place it matters most: the whole point of walking the table is
-      // to price formats this build's bindings may not name, and the
-      // generated `av_pix_fmt_desc_get_id` hands those ids back as a
-      // closed `AVPixelFormat`. Every future format would have become
-      // an invalid enum value on the way into the pricing meant to
-      // handle it — the census would have been UB on exactly its reason
-      // for existing.
-      //
-      // SAFETY: `desc` is a live entry from libavutil's static table;
-      // the id is passed straight back to libavutil as the integer it
-      // is, and `av_image_get_buffer_size` returns a negative AVERROR
-      // for ids it cannot size rather than misbehaving.
-      let id = unsafe { c_shims::av_pix_fmt_desc_get_id(desc) };
-      let size = unsafe { c_shims::av_image_get_buffer_size(id, 256, 256, 1) };
-      if size > 0 {
-        worst = worst.max(size as usize);
-      }
-    }
-    worst.max(KNOWN_WORST_BYTES_PER_PIXEL * PROBE_PIXELS)
-  })
-}
-/// `AVCodecContext.get_buffer2`: the same pixel ceiling, applied where
-/// the **aligned** dimensions are knowable.
-///
-/// # The hole this closes
-///
-/// `max_pixels` is checked by libavcodec against the frame's *raw*
-/// `width * height`. What it then allocates is the **aligned** shape —
-/// `avcodec_align_dimensions2` rounds both dimensions up to whatever
-/// the codec and the CPU want — and for degenerate aspect ratios those
-/// are not the same number at all. Measured on this build:
-///
-/// | shape | raw | aligned | inflation |
-/// |---|---|---|---|
-/// | `gray8` 65536x1 | 65,536 px / 64 KiB | 65536x32 = 2,097,152 px / 2 MiB | **32x** |
-/// | `gray8` 1x65536 | 65,536 px / 64 KiB | 16x65536 = 1,048,576 px / 2 MiB | 16x |
-/// | `yuv420p` 7680x4320 | 33,177,600 px | 7680x4320 | 1.00x |
-/// | `gray8` 1024x1024 | 1,048,576 px | 1024x1024 | 1.00x |
-///
-/// So a one-pixel-tall frame slips 32 times its declared cost past a
-/// scalar compared against `w * h`, and no value of that scalar can fix
-/// it: bounding the product cannot bound a product whose factors are
-/// then rounded up independently. Real pictures inflate by nothing at
-/// all, which is why the ceiling looked sound.
-///
-/// # Why this hook and not `get_format`
-///
-/// `get_format` was measured first, because it needs no allocation
-/// decision and receives the context. It **does not fire on every
-/// road**: on this build a one-shot `mjpeg` decode calls it once and a
-/// `png` decode calls it *zero* times. Cover art is overwhelmingly
-/// mjpeg or png, so half the road this ceiling exists to guard would
-/// have been unguarded.
-///
-/// `get_buffer2` fired on both — it is the allocator, so every frame
-/// libavcodec hands back comes through it, and it sees the frame's
-/// *real* format rather than a negotiated candidate.
-///
-/// # No state, so no lifetime to prove
-///
-/// The composed-`opaque` design was not needed. This callback reads the
-/// ceiling from `AVCodecContext.max_pixels` — the field this crate set
-/// itself, one number, already carrying the byte ceiling converted at
-/// the worst per-pixel rate — and applies it to the aligned dimensions.
-/// Same scalar, same meaning, applied where alignment is knowable.
-/// `opaque` is untouched, so the hardware path keeps it and there is no
-/// allocation whose lifetime has to outlive a C callback.
-///
-/// Panic discipline is likewise structural rather than asserted: the
-/// body allocates nothing, indexes nothing, unwraps nothing, and calls
-/// exactly three FFmpeg functions. There is no Rust operation in it
-/// that can panic, and an `extern "C"` function aborts rather than
-/// unwinding into C in any case.
-///
-/// # Safety
-///
-/// Called by libavcodec with a live context and a frame whose `format`,
-/// `width` and `height` are set. Delegates every accepted frame to
-/// `avcodec_default_get_buffer2`, which is what libavcodec would have
-/// called had this hook not been installed.
-unsafe extern "C" fn judge_buffer(
-  ctx: *mut ffmpeg_next::ffi::AVCodecContext,
-  frame: *mut ffmpeg_next::ffi::AVFrame,
-  flags: libc::c_int,
-) -> libc::c_int {
-  // SAFETY: libavcodec passes a live context and frame; both fields are
-  // plain integers.
-  let (width, height) = unsafe { ((*frame).width, (*frame).height) };
-
-  // **This seat judges cost, and only cost.**
-  //
-  // `max_pixels` is a *logical* limit on a picture's extent, and
-  // libavcodec already enforces it — against the **raw** dimensions, in
-  // `ff_set_dimensions` via `av_image_check_size2`, before any frame
-  // exists. That is the semantics the caller asked for and the
-  // semantics FFmpeg documents, and this callback does not restate it.
-  //
-  // It used to. R11 added an *aligned*-dimension comparison here
-  // against `max_pixels`, because at the time the callback had no
-  // accurate byte check and a degenerate shape could slip its real cost
-  // past a raw-pixel gate — 65536x1 aligns to 65536x32, thirty-two
-  // times the pixels. That instrument is now both **redundant** and
-  // **wrong**:
-  //
-  // * redundant, because since the byte ceiling was threaded in the
-  //   footprint below prices the aligned dimensions itself, so the
-  //   degenerate shape is refused on its actual cost; and
-  // * wrong, because `max_pixels` is `min(the caller's pixel limit,
-  //   byte ceiling / worst-bytes-per-pixel)` — so when the caller's
-  //   pixel limit was the tighter seat, alignment inflation alone
-  //   refused frames satisfying *both* requested limits. A 65536x1
-  //   `gray8` frame under `max_pixels = 65536` and a generous byte
-  //   budget fits the pixel limit exactly and costs 2 MiB, and was
-  //   refused anyway — for arithmetic the caller never asked about.
-  //
-  // Logical extent is libavcodec's gate on raw dimensions; allocation
-  // cost is this one, against the caller's own `max_frame_bytes`. One
-  // question each.
-  //
-  // Audio reaches here too, and used to pass unpriced entirely:
-  // `max_samples` bounds the sample *count*, so one sample across eight
-  // packed `f64` channels is 64 valid bytes under a 64-byte ceiling and
-  // a 2,080-byte allocation — delivered, because the copy-out only ever
-  // rechecks the valid bytes.
-  //
-  // SAFETY: `ctx` and `frame` are live; every field read is a plain
-  // integer, and `format` stays an integer throughout.
-  // SAFETY: `frame` is live; the field is a plain pointer.
-  let hw_frames = unsafe { (*frame).hw_frames_ctx };
-
-  // A hardware frame carries no CPU bytes for this seat to price — its
-  // pool is judged where it is declared, in the `get_format` callback —
-  // so it is delegated rather than failed closed on an unpriceable
-  // format.
-  if hw_frames.is_null() {
-    // **The caller's own number, read from the seat that carries it.**
-    // This used to recover a byte ceiling from `AVCodecContext.max_pixels`,
-    // and the recovery was wrong in both directions:
-    //
-    // * `max_pixels` is `min(pixel ceiling, byte ceiling / worst)`, so
-    //   when the *pixel* seat was the tighter of the two it stopped
-    //   encoding the byte ceiling at all — and the recovery invented a
-    //   smaller one. A 256x256 frame at 16 bytes a pixel under
-    //   `max_pixels = 65536` with a 2 MiB byte budget satisfies both of
-    //   the caller's limits, costs 1,050,624 bytes, and was judged
-    //   against 1,048,576 and refused. The claim that the conflation
-    //   was harmless in one direction was simply wrong: it omitted the
-    //   footprint's own alignment and slack, which is exactly where
-    //   those extra 2,048 bytes live.
-    // * and for audio a pixel ceiling has no business being consulted
-    //   at all.
-    //
-    // The audio road briefly recovered from `max_samples` instead,
-    // which *is* exact — but two sources of truth for one number is how
-    // the first one went wrong. Both media read the seat now.
-    //
-    // SAFETY: `opaque` holds the `CallbackState` that
-    // `build_codec_context` installed and whose owner outlives the
-    // context. A null one means a context this crate did not build, and
-    // is refused rather than assumed generous.
-    let state = unsafe { (*ctx).opaque } as *const CallbackState;
-    if state.is_null() {
-      return -(libc::EINVAL);
-    }
-    // SAFETY: non-null per the check above; the field is a plain `u64`.
-    let byte_ceiling = u128::from(unsafe { (*state).max_frame_bytes });
-
-    // SAFETY: `frame` is live; both are plain integer fields.
-    let (format_raw, nb_samples) = unsafe { ((*frame).format, (*frame).nb_samples) };
-    let priced = if width > 0 && height > 0 {
-      crate::footprint::video_frame_bytes(format_raw, width, height)
-    } else if nb_samples > 0 {
-      // **The frame's layout, not the context's.** FFmpeg's
-      // `get_buffer2` contract says the callback reads the values on
-      // the *frame*, and `avcodec_default_get_buffer2` sizes from them
-      // — the context's layout is whatever was last negotiated and can
-      // differ outright. A context claiming mono against a frame
-      // carrying 255 `dblp` channels at 130,000 samples prices about a
-      // megabyte and allocates about 265 MB.
-      //
-      // Read raw and signed, per the house discipline, and refused
-      // rather than floored: a negative count is malformed, and
-      // flooring it to zero would price an allocation that is about to
-      // happen at nothing.
-      // SAFETY: `frame` is live; `ch_layout.nb_channels` is a plain
-      // `c_int`.
-      let channels = unsafe { (*frame).ch_layout.nb_channels };
-      if channels <= 0 {
-        return -(libc::EINVAL);
-      }
-      crate::footprint::audio_frame_bytes(format_raw, nb_samples as usize, channels as usize)
-    } else {
-      // Neither geometry nor samples: nothing is being allocated that
-      // this seat can price, and nothing is claimed.
-      Some(0)
-    };
-
-    // **The refusal leaves its reason behind.** A `get_buffer2`
-    // callback can only answer libavcodec with an errno, and
-    // `AVERROR(EINVAL)` is also what libavcodec reports for corrupt
-    // input — so a bare refusal here was indistinguishable from a
-    // broken file, and only one of those is worth retrying with a
-    // larger ceiling. The decoder funnels collect this the same way
-    // they collect the `get_format` declination.
-    let record = |bytes: u64| {
-      use core::sync::atomic::Ordering;
-      // SAFETY: `state` was proved non-null above.
-      unsafe {
-        (*state)
-          .declined_frame_bytes
-          .store(bytes, Ordering::Relaxed);
-        (*state)
-          .declined_frame_audio
-          .store(width <= 0 && height <= 0, Ordering::Relaxed);
-        (*state)
-          .frame_budget_declined
-          .store(true, Ordering::Release);
-      }
-      -(libc::EINVAL)
-    };
-    match priced {
-      // Fail closed. An allocation whose size cannot be established is
-      // not a small one — the same stance every other judge here takes.
-      // Reported as an unbounded cost, which is what an unprovable one
-      // is.
-      None => return record(u64::MAX),
-      // Nothing to buy, so nothing to refuse.
-      Some(0) => {}
-      // A budget of zero admits nothing, and this is the arm that used
-      // to be a skipped guard.
-      Some(bytes) if byte_ceiling == 0 => return record(bytes as u64),
-      Some(bytes) if bytes as u128 > byte_ceiling => return record(bytes as u64),
-      Some(_) => {}
-    }
-  }
-
-  // SAFETY: delegating to the allocator libavcodec would have used.
-  unsafe { ffmpeg_next::ffi::avcodec_default_get_buffer2(ctx, frame, flags) }
 }
 
 /// Prices the CPU frame `av_hwframe_transfer_data` would allocate, and
@@ -3443,7 +2984,7 @@ unsafe extern "C" fn judge_buffer(
 ///
 /// # Why the hardware road needs its own seat
 ///
-/// [`judge_buffer`] is not a universal choke point, and the census says
+/// `judge_buffer` is not a universal choke point, and the census says
 /// so on this machine. `ff_get_buffer` calls `hwaccel->alloc_frame`
 /// directly and never reaches `get_buffer2` at all: a VideoToolbox
 /// h264 decode of a 160x120 clip records **zero** `get_buffer2` calls
@@ -3463,7 +3004,7 @@ unsafe extern "C" fn judge_buffer(
 /// seat `max_pixels` already occupies covers the hardware surface too.
 ///
 /// The residual on that road is the aligned-dimensions gap
-/// [`judge_buffer`] closes for software frames, and it applies to
+/// `judge_buffer` closes for software frames, and it applies to
 /// **driver-owned GPU memory** rather than to anything this crate
 /// carries. What this crate does carry off the hardware road is the CPU
 /// frame downloaded here, and that is bounded exactly, by this
@@ -3551,7 +3092,8 @@ unsafe fn judge_hw_transfer(
     // SAFETY: `frames_ctx` is the frame's live `AVHWFramesContext`
     // reference; on success FFmpeg allocates a NONE-terminated list
     // that the caller frees.
-    let rc = unsafe { c_shims::av_hwframe_transfer_get_formats(frames_ctx, 0, &mut list, 0) };
+    let rc =
+      unsafe { crate::ffi::c_shims::av_hwframe_transfer_get_formats(frames_ctx, 0, &mut list, 0) };
     if rc >= 0 && !list.is_null() {
       let none = ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_NONE as libc::c_int;
       let mut p = list;
@@ -3627,20 +3169,10 @@ unsafe fn judge_hw_transfer(
 /// for the duration of the call — in practice the one a decoder owns and
 /// frees only after the codec context that points at it.
 unsafe fn ceiling_declination_of(state: *const CallbackState) -> Option<Error> {
-  use core::sync::atomic::Ordering;
-  if state.is_null() {
-    return None;
-  }
-  // SAFETY: `state` is non-null, so by the contract above it points at a
-  // `CallbackState` live for this call; every field read is an atomic.
-  let (declined, pixels, limit) = unsafe {
-    (
-      (*state).ceiling_declined.swap(false, Ordering::Acquire),
-      (*state).declined_pixels.load(Ordering::Relaxed),
-      (*state).declined_limit.load(Ordering::Relaxed),
-    )
-  };
-  declined.then(|| Error::HwSurfaceTooLarge(crate::error::HwSurfaceTooLarge::new(pixels, limit)))
+  // SAFETY: this function's own contract, forwarded.
+  unsafe { crate::ffi::take_ceiling_declination(state) }.map(|(pixels, limit)| {
+    Error::HwSurfaceTooLarge(crate::error::HwSurfaceTooLarge::new(pixels, limit))
+  })
 }
 /// The software decoders' error funnel.
 ///
@@ -3727,7 +3259,7 @@ pub(crate) unsafe fn software_send(
 }
 
 /// Reads and clears a software frame-budget refusal left by
-/// [`judge_buffer`], as the named error it deserves.
+/// `judge_buffer`, as the named error it deserves.
 ///
 /// The software twin of [`ceiling_declination_of`]: the allocator judge
 /// can only answer libavcodec with an errno, so the reason lives in the
@@ -3810,7 +3342,7 @@ pub(crate) fn find_decoder(parameters: &codec::Parameters) -> Result<Codec> {
   // returns NULL for unknown ids, which we surface as `Error::NoCodec`.
   // SAFETY: avcodec_find_decoder is a pure FFmpeg lookup; passing any
   // c_int is sound (returns NULL for unknown).
-  let codec_ptr = unsafe { c_shims::avcodec_find_decoder(raw_id as libc::c_int) };
+  let codec_ptr = unsafe { crate::ffi::c_shims::avcodec_find_decoder(raw_id as libc::c_int) };
   if codec_ptr.is_null() {
     return Err(Error::NoCodec(raw_id));
   }

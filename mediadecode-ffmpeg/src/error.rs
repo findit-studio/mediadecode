@@ -51,7 +51,7 @@ pub enum Error {
   /// opens the parameters through the demux tier, where
   /// [`DemuxLimits`](crate::DemuxLimits) carries the seat.
   #[error(transparent)]
-  ParametersTooLarge(#[from] crate::demuxer::ParametersTooLarge),
+  ParametersTooLarge(#[from] mediaio_ffmpeg::ParametersTooLarge),
 
   /// A stream's channel layout is not a shape FFmpeg's own helpers can
   /// be given, so the decoder was not opened over it.
@@ -70,13 +70,13 @@ pub enum Error {
   /// the rule, which the demux admission pass and the outbound clone
   /// apply too.
   #[error(transparent)]
-  MalformedChannelLayout(#[from] crate::demuxer::ParametersLayoutShape),
+  MalformedChannelLayout(#[from] mediaio_ffmpeg::ParametersLayoutShape),
 
   /// A stream's channel layout declares a custom order without the map
   /// that order requires — the shape `av_channel_layout_copy` would
   /// `memcpy` from null. Structural and permanent, as above.
   #[error(transparent)]
-  ChannelMapMissing(#[from] crate::demuxer::ParametersChannelMap),
+  ChannelMapMissing(#[from] mediaio_ffmpeg::ParametersChannelMap),
 
   /// `avcodec_find_decoder` returned null for the input codec id. The id
   /// is reported as the raw integer (`AVCodecID` discriminant) — we do not
@@ -146,6 +146,20 @@ pub enum Error {
   /// gives a free `impl From<FallbackFailed> for Error`.
   #[error(transparent)]
   FallbackFailed(#[from] FallbackFailed),
+}
+
+/// The crossing's own failure, reported as this error has always
+/// reported it: an FFmpeg error in the `Ffmpeg` arm.
+///
+/// `mediaio-ffmpeg`'s frame allocators and `Frame::empty` answer with a
+/// [`CrossingError`](mediaio_ffmpeg::CrossingError); the decoders built
+/// here pass it on unchanged in meaning.
+impl From<mediaio_ffmpeg::CrossingError> for Error {
+  fn from(e: mediaio_ffmpeg::CrossingError) -> Self {
+    match e {
+      mediaio_ffmpeg::CrossingError::Ffmpeg(e) => Self::Ffmpeg(e),
+    }
+  }
 }
 
 /// Payload for [`Error::HwDeviceInitFailed`].

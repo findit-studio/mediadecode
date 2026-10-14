@@ -153,7 +153,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierImageDecoder<C> {
       .map_err(|e| ImageDecodeError::Decode(Error::Ffmpeg(e)))?;
     ensure_video_codec_type(&opened).map_err(ImageDecodeError::Decode)?;
     let decoder = ffmpeg_next::decoder::Video(opened);
-    let scratch = alloc_av_video_frame().map_err(ImageDecodeError::Decode)?;
+    let scratch = alloc_av_video_frame().map_err(|e| ImageDecodeError::Decode(e.into()))?;
     Ok(Self {
       decoder,
       scratch,

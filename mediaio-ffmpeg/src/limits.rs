@@ -38,9 +38,9 @@
 //!
 //! `DEFAULT_*` consts, `Copy` options structs with `new` / getters /
 //! `with_*` / `set_*`, and a `with_*` seat on each session — the same
-//! shape [`crate::VideoDecoder::with_max_probe_pending_bytes`] and its
-//! [`DEFAULT_MAX_PROBE_PENDING_BYTES`](crate::decoder::DEFAULT_MAX_PROBE_PENDING_BYTES)
-//! already established for the probe-replay budget.
+//! shape `mediadecode-ffmpeg`'s `VideoDecoder::with_max_probe_pending_bytes`
+//! and its `DEFAULT_MAX_PROBE_PENDING_BYTES` already established for the
+//! probe-replay budget.
 //!
 //! [law]: mediadecode::adapter#the-d-seat-amputation-contract
 //! [gov]: mediadecode::adapter#the-resource-governance-contract
@@ -413,7 +413,8 @@ pub const DEFAULT_MAX_IMAGE_SIDE_DATA_BYTES: usize = DEFAULT_MAX_CODEC_PARAMETER
 /// handed — 64 MiB, the attachment family.
 ///
 /// **Why the attachment family and not the packet one.** What
-/// [`crate::FfmpegImageDecoder`] decodes *is* an attachment: a whole
+/// `mediadecode-ffmpeg`'s `FfmpegImageDecoder` decodes *is* an
+/// attachment: a whole
 /// file a container handed over eagerly. When it arrives through the
 /// demuxer it has already been charged against
 /// [`DEFAULT_MAX_ATTACHMENT_BYTES`], and this seat is what keeps the
@@ -603,7 +604,7 @@ impl DecoderLimits {
 /// single attachment, on every attachment in the file together, and on
 /// the container's chapter table.
 ///
-/// Handed to [`FfmpegDemuxer::open_with`](crate::FfmpegDemuxer::open_with)
+/// Handed to `mediadecode-ffmpeg`'s `FfmpegDemuxer::open_with`
 /// rather than set afterwards, because the attachment budget is spent
 /// *during* the open — every attachment payload is captured before the
 /// first timed packet is read, which is what makes the demux tier's
@@ -712,7 +713,7 @@ impl DemuxLimits {
   /// the probe budget does not reach the count either.
   ///
   /// A file over the ceiling **fails to open**, with
-  /// [`TooManyChapters`](crate::TooManyChapters) naming the declared
+  /// `mediadecode-ffmpeg`'s `TooManyChapters` naming the declared
   /// count.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn max_chapters(&self) -> u32 {
@@ -723,7 +724,7 @@ impl DemuxLimits {
   ///
   /// Charged title by title as the table is mirrored, and the open
   /// fails with
-  /// [`ChapterTitleBudgetExhausted`](crate::ChapterTitleBudgetExhausted)
+  /// `mediadecode-ffmpeg`'s `ChapterTitleBudgetExhausted`
   /// at the title that crosses it. The charge is made **after** that
   /// one title is read rather than before, the same way
   /// [`Self::max_total_attachment_bytes`] is charged: what bounds the
@@ -766,7 +767,7 @@ impl DemuxLimits {
   ///
   /// Charged value by value as the track table is built, and the open
   /// fails with
-  /// [`TrackMetadataBudgetExhausted`](crate::TrackMetadataBudgetExhausted)
+  /// `mediadecode-ffmpeg`'s `TrackMetadataBudgetExhausted`
   /// at the value that crosses it — **before** that value is copied.
   /// The charge is the *decoded* size, because lossy decoding expands
   /// bytes that are not UTF-8 threefold, so the raw length would

@@ -239,7 +239,7 @@ fn parameters_with_native_layout() -> Parameters {
 fn a_custom_name_without_a_terminator_is_refused_at_the_mirror() {
   let parameters = parameters_with_unterminated_last_name(4, 0);
   match CodecTicket::mirror(&parameters, 5, usize::MAX) {
-    Err(DemuxError::ParametersChannelMap(p)) => {
+    Err(ParametersError::ChannelMap(p)) => {
       assert_eq!(p.stream_index(), 5);
       assert_eq!(p.channels(), 4);
     }
@@ -281,7 +281,7 @@ fn a_malformed_layout_is_refused_before_the_footprint_is_measured() {
   assert!(declared > 1024, "the extradata must outgrow the ceiling");
 
   match CodecTicket::mirror(&parameters, 5, 1024) {
-    Err(DemuxError::ParametersChannelMap(p)) => assert_eq!(p.channels(), 4),
+    Err(ParametersError::ChannelMap(p)) => assert_eq!(p.channels(), 4),
     Err(other) => panic!("structure must be judged before size, got {other:?}"),
     Ok(_) => panic!("a malformed map must be refused"),
   }
@@ -341,7 +341,7 @@ fn every_rebuild_allocation_that_fails_is_named() {
         crate::fault_subprocess::uncap_ffmpeg_allocations();
 
         match refused {
-          Err(DemuxError::ParametersCopy(ref p)) => assert_eq!(
+          Err(ParametersError::Copy(ref p)) => assert_eq!(
             p.stream_index(),
             index,
             "{seat}: the refusal named the wrong stream",
@@ -452,7 +452,7 @@ fn an_oversized_mirror_is_refused_before_the_copy() {
     .expect("measurable");
 
   match CodecTicket::mirror(&parameters, 3, 64 * 1024) {
-    Err(DemuxError::ParametersTooLarge(p)) => {
+    Err(ParametersError::TooLarge(p)) => {
       assert_eq!(p.stream_index(), 3);
       assert_eq!(p.bytes(), declared);
       assert_eq!(p.limit(), 64 * 1024);
@@ -478,7 +478,7 @@ fn null_backed_parameters_are_refused_at_the_mirror() {
   if unsafe { parameters.as_ptr() }.is_null() {
     assert!(matches!(
       CodecTicket::mirror(&parameters, 9, usize::MAX),
-      Err(DemuxError::ParametersMissing(_)),
+      Err(ParametersError::Missing(_)),
     ));
   }
 }

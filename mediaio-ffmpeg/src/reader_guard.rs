@@ -1,7 +1,7 @@
 //! The panic guard on the custom-reader boundary.
 //!
-//! [`FfmpegDemuxer::open_reader`](crate::FfmpegDemuxer::open_reader)
-//! accepts any safe `Read + Seek`, and libavformat drives it through
+//! `mediadecode-ffmpeg`'s `FfmpegDemuxer::open_reader` accepts any safe
+//! `Read + Seek`, and libavformat drives it through
 //! `AVIOContext` callbacks that are `extern "C"` functions:
 //! `ffmpeg_next::format::context::StreamIo`'s `read` and `seek` call
 //! the stream directly, with no `catch_unwind` anywhere between the
@@ -14,7 +14,7 @@
 //! [`catch_unwind`](std::panic::catch_unwind), a panic is latched in
 //! shared state and reported to C as an ordinary I/O error, and the
 //! demuxer turns the latch into
-//! [`DemuxError::ReaderPanic`](crate::DemuxError::ReaderPanic) once
+//! its `DemuxError::ReaderPanic` once
 //! control comes back to Rust. The panic never reaches the `extern "C"`
 //! frame at all.
 //!
@@ -40,7 +40,7 @@ use smol_bytes::Utf8Bytes;
 /// pull — and the message is behind the lock only a latched panic ever
 /// takes.
 #[derive(Debug, Default)]
-pub(crate) struct PanicLatch {
+pub struct PanicLatch {
   latched: AtomicBool,
   message: Mutex<Option<Utf8Bytes>>,
 }
@@ -66,7 +66,7 @@ impl PanicLatch {
   /// The latched panic's message, or `None` when no reader has
   /// panicked. Reading it does not clear it: a poisoned `AVIOContext`
   /// stays poisoned, so every later call must report the same cause.
-  pub(crate) fn message(&self) -> Option<Utf8Bytes> {
+  pub fn message(&self) -> Option<Utf8Bytes> {
     if !self.latched.load(Ordering::Acquire) {
       return None;
     }
@@ -104,7 +104,7 @@ const UNNAMED: &str = "panicked with a payload of an unknown type";
 /// `Read::read_exact`: their default implementations are written in
 /// terms of [`Seek::seek`] / [`Read::read`], which are guarded, so
 /// forwarding them would only add unguarded paths.
-pub(crate) struct GuardedReader<R> {
+pub struct GuardedReader<R> {
   inner: R,
   latch: Arc<PanicLatch>,
   /// Bytes handed to libavformat so far, and the ceiling on them.
@@ -125,7 +125,7 @@ pub(crate) struct GuardedReader<R> {
 
 /// The byte meter behind [`GuardedReader`], readable after the fact.
 #[derive(Debug, Default)]
-pub(crate) struct ReadMeter {
+pub struct ReadMeter {
   read: AtomicU64,
   budget: AtomicU64,
   tripped: AtomicBool,
@@ -133,7 +133,7 @@ pub(crate) struct ReadMeter {
 
 impl ReadMeter {
   /// A meter with `budget` bytes to spend.
-  pub(crate) fn new(budget: u64) -> Self {
+  pub fn new(budget: u64) -> Self {
     Self {
       read: AtomicU64::new(0),
       budget: AtomicU64::new(budget),
@@ -141,15 +141,15 @@ impl ReadMeter {
     }
   }
   /// Whether the budget was reached.
-  pub(crate) fn tripped(&self) -> bool {
+  pub fn tripped(&self) -> bool {
     self.tripped.load(Ordering::Acquire)
   }
   /// Bytes handed over.
-  pub(crate) fn read(&self) -> u64 {
+  pub fn read(&self) -> u64 {
     self.read.load(Ordering::Relaxed)
   }
   /// The ceiling in force.
-  pub(crate) fn budget(&self) -> u64 {
+  pub fn budget(&self) -> u64 {
     self.budget.load(Ordering::Relaxed)
   }
   /// Lifts the ceiling once the container is open and analysed.
@@ -157,7 +157,7 @@ impl ReadMeter {
   /// The seat bounds *probing*: reading the media itself afterwards is
   /// the caller's own business, packet by packet, and already bounded
   /// by the packet seats.
-  pub(crate) fn release(&self) {
+  pub fn release(&self) {
     self.budget.store(u64::MAX, Ordering::Relaxed);
   }
   /// Bytes still available to hand over.
@@ -185,7 +185,7 @@ impl ReadMeter {
 impl<R> GuardedReader<R> {
   /// Wraps `inner`, returning the guard and a handle on the latch the
   /// demuxer keeps to name a panic after the fact.
-  pub(crate) fn new(inner: R, budget: u64) -> (Self, Arc<PanicLatch>, Arc<ReadMeter>) {
+  pub fn new(inner: R, budget: u64) -> (Self, Arc<PanicLatch>, Arc<ReadMeter>) {
     let latch = Arc::new(PanicLatch::default());
     let meter = Arc::new(ReadMeter::new(budget));
     (
