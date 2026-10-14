@@ -179,8 +179,12 @@ pub(crate) mod ops {
     ///
     /// # Safety
     ///
-    /// `buf` must be a live `AVBufferRef`, and `offset + len` must be
-    /// within its `size`.
+    /// `buf` must be a live `AVBufferRef`, `offset + len` must be within
+    /// its `size`, and those `len` bytes must be initialised: the owned
+    /// lane reads them to copy, and the view lane lends them as `&[u8]`.
+    /// On the view lane the carrier is a window onto the buffer itself,
+    /// so nothing may write through those bytes while it — or a clone of
+    /// it — lives.
     unsafe fn capture(buf: *mut AVBufferRef, offset: usize, len: usize) -> Option<Self::Buffer>;
 
     /// [`Self::capture`] for a payload taken out of an `AVPacket`'s own
@@ -281,7 +285,24 @@ pub(crate) mod ops {
     /// side-data caps, the send budget — is about sizes and shapes,
     /// which are the same on both lanes. Only the body differs, and
     /// only here.
-    fn packet_body(
+    ///
+    /// # Safety
+    ///
+    /// With [`BodyRoute::Submission`] the packet returned may be a second
+    /// reference to `body`'s buffer — on the view lane, wherever
+    /// `boundary::share_or_copy` can prove the padding behind it — while
+    /// `body` still lends those bytes as `&[u8]`. Nothing may then write
+    /// through the packet: it must not reach `ffmpeg_next::Packet::data_mut`
+    /// or an in-place FFmpeg write, must not be shallow-cloned
+    /// (`ffmpeg_next::Packet::clone` ignores a failed
+    /// `av_packet_make_writable`, so its clone can keep sharing and then
+    /// lend `&mut [u8]`), and must not be handed to a caller. It is for a
+    /// scoped submission to a decoder — `avcodec_send_packet` may keep a
+    /// reference and never writes through it — dropped inside the call
+    /// that built it; a copy kept past that call must own its bytes, as
+    /// `decoder::try_clone_packet` makes. With [`BodyRoute::Copy`] the
+    /// packet owns its body and there is nothing to prove.
+    unsafe fn packet_body(
       body: &Self::Buffer,
       route: BodyRoute,
     ) -> std::result::Result<ffmpeg_next::Packet, ffmpeg_next::Error>;
@@ -548,8 +569,9 @@ impl ops::CarrierOps for Owned {
 
   /// Both routes copy. This lane's carrier is Rust-owned memory with no
   /// `AVBufferRef` behind it to hand back, so there is nothing to share
-  /// on either road and no distinction to draw.
-  fn packet_body(
+  /// on either road and no distinction to draw — the contract has nothing
+  /// to ask of a caller here.
+  unsafe fn packet_body(
     body: &Self::Buffer,
     _route: BodyRoute,
   ) -> std::result::Result<ffmpeg_next::Packet, ffmpeg_next::Error> {
@@ -561,7 +583,8 @@ impl ops::CarrierOps for Owned {
       return Some(FfmpegBytes::empty());
     }
     // SAFETY: the caller proved `offset + len <= (*buf).size` against a
-    // live buffer, so the range is inside an allocation FFmpeg holds.
+    // live buffer, so the range is inside an allocation FFmpeg holds, and
+    // its contract makes those bytes initialised.
     let bytes = unsafe {
       let data = (*buf).data;
       if data.is_null() {
@@ -625,7 +648,7 @@ impl ops::CarrierOps for View {
     reserved
   }
 
-  fn packet_body(
+  unsafe fn packet_body(
     body: &Self::Buffer,
     route: BodyRoute,
   ) -> std::result::Result<ffmpeg_next::Packet, ffmpeg_next::Error> {
@@ -640,7 +663,10 @@ impl ops::CarrierOps for View {
       // dropped inside the call, and the one decoder that hands back
       // what it is sent — the video decoder's hardware probe — keeps
       // copies.
-      BodyRoute::Submission => crate::boundary::share_or_copy(body),
+      //
+      // SAFETY: `share_or_copy`'s contract is this function's own for
+      // `BodyRoute::Submission`, forwarded unchanged to the caller.
+      BodyRoute::Submission => unsafe { crate::boundary::share_or_copy(body) },
     }
   }
 
@@ -648,7 +674,9 @@ impl ops::CarrierOps for View {
     // SAFETY: the caller proved the extent; `view_of` proves it again
     // against the buffer's own `size`, because a constructor that
     // trusts its arguments is one bad caller away from a view over
-    // somebody else's memory.
+    // somebody else's memory. The bytes the view will lend are
+    // initialised and unwritten for its life by this function's own
+    // contract.
     unsafe { FfmpegBuffer::view_of(buf, offset, len, crate::view::Origin::Foreign) }
   }
 
@@ -657,11 +685,13 @@ impl ops::CarrierOps for View {
     offset: usize,
     len: usize,
   ) -> Option<Self::Buffer> {
-    // SAFETY: as `capture`, with the caller additionally promising this
-    // range is an `AVPacket`'s payload — which is what entitles the
-    // carrier to claim the padding behind it. The caller has also
-    // already refused any buffer with more than one reference
-    // (`buffer::payload_of`), so nothing else can be writing here.
+    // SAFETY: as `capture` — the bytes are initialised and nothing
+    // writes through them while the view lives — with the caller
+    // additionally promising this range is an `AVPacket`'s payload, which
+    // is what entitles the carrier to claim the padding behind it.
+    // `buffer::payload_of`, the one caller, reaches this only for a
+    // buffer that is unshared or whose other holders cannot write
+    // (`PayloadProvenance::route`).
     unsafe { FfmpegBuffer::view_of(buf, offset, len, crate::view::Origin::PacketPayload) }
   }
 }

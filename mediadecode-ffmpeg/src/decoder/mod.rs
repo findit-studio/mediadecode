@@ -1570,7 +1570,9 @@ impl VideoDecoder {
               self.scaled_output.latch_failure();
               // SAFETY: `frame` is the caller's slot; unreferencing it
               // discards whatever the failed transfer left behind
-              // before the retry writes it again.
+              // before the retry writes it again, and leaves an empty
+              // frame whose geometry describes no buffer — the shape
+              // `as_inner_mut`'s contract allows.
               unsafe { av_frame_unref(frame.as_inner_mut().as_mut_ptr()) };
             }
             None => {}
@@ -1590,6 +1592,7 @@ impl VideoDecoder {
                 HwRoute::Report(err) => return Err(err),
                 HwRoute::Advance(err) => {
                   self.advance_probe(err)?;
+                  // SAFETY: as above — the caller's slot, cleared whole.
                   unsafe { av_frame_unref(frame.as_inner_mut().as_mut_ptr()) };
                   if self.try_pop_pending(frame) {
                     return Ok(Received::Frame);
@@ -1612,7 +1615,9 @@ impl VideoDecoder {
       return false;
     };
     // SAFETY: `buffered` is a CPU-side AVFrame we previously transferred
-    // and pushed into the queue; both pointers are valid.
+    // and pushed into the queue; both pointers are valid. The slot is
+    // cleared whole and then takes `buffered` whole, so its geometry and
+    // its buffers arrive together, as `as_inner_mut`'s contract asks.
     unsafe {
       av_frame_unref(frame.as_inner_mut().as_mut_ptr());
       av_frame_move_ref(frame.as_inner_mut().as_mut_ptr(), buffered.as_mut_ptr());
@@ -1652,7 +1657,9 @@ impl VideoDecoder {
   /// Takes the coded-surface refusal the `get_format` callback left
   /// behind, if it left one, clearing it for the next candidate.
   fn take_ceiling_declination(&self) -> Option<Error> {
-    ceiling_declination_of(self.state.callback_state)
+    // SAFETY: the state is this decoder's own, freed by `DecoderState`'s
+    // drop only after the codec context that points at it.
+    unsafe { ceiling_declination_of(self.state.callback_state) }
   }
 
   /// **The single hardware-exit funnel.** Every road that turns a
@@ -1693,7 +1700,9 @@ impl VideoDecoder {
   fn hw_exit(&self, fallback: Error) -> Error {
     self
       .take_ceiling_declination()
-      .or_else(|| frame_budget_declination_of(self.state.callback_state))
+      // SAFETY: as `take_ceiling_declination` — this decoder's own state,
+      // live while `self` is.
+      .or_else(|| unsafe { frame_budget_declination_of(self.state.callback_state) })
       .unwrap_or(fallback)
   }
 
@@ -1970,8 +1979,11 @@ impl VideoDecoder {
         // processing input` for a coded surface this crate refused.
         //
         // Order matters and is the whole fix — read, then drop.
-        let recorded =
-          ceiling_declination_of(candidate_state.callback_state).unwrap_or(Error::Ffmpeg(e));
+        //
+        // SAFETY: `candidate_state` owns this state and is dropped only
+        // below, after the read.
+        let recorded = unsafe { ceiling_declination_of(candidate_state.callback_state) }
+          .unwrap_or(Error::Ffmpeg(e));
         // Drop candidate explicitly so its FFI cleanup runs now. Discard any
         // frames we drained from this candidate — they're tied to a decoder
         // we're throwing away.
@@ -2041,7 +2053,9 @@ impl VideoDecoder {
     // probe/decode loop. Matching the exact pix_fmt keeps the strict
     // `get_format` honest and gives `open_with` a clean rejection.
     let hw_pix_fmt = backend.hw_pixel_format();
-    if !codec_supports_hwaccel(unsafe { codec.as_ptr() }, av_type, hw_pix_fmt as i32) {
+    // SAFETY: `codec` is the decoder `find_decoder` answered — an entry
+    // in libavcodec's static codec table, live for the process.
+    if !unsafe { codec_supports_hwaccel(codec.as_ptr(), av_type, hw_pix_fmt as i32) } {
       return Err(Error::BackendUnsupportedByCodec(backend));
     }
 
@@ -2122,7 +2136,11 @@ impl VideoDecoder {
     // the reason has to be collected here or not at all.
     let opened = match ctx.decoder().open_as(codec) {
       Ok(opened) => opened,
-      Err(e) => return Err(ceiling_declination_of(callback_state).unwrap_or(Error::Ffmpeg(e))),
+      // SAFETY: `callback_state` is the guard's live box, freed only when
+      // the guard drops on this return, after the read.
+      Err(e) => {
+        return Err(unsafe { ceiling_declination_of(callback_state) }.unwrap_or(Error::Ffmpeg(e)));
+      }
     };
 
     // Validate codec_type as a raw integer — never construct AVMediaType
@@ -2132,7 +2150,9 @@ impl VideoDecoder {
     if let Err(e) = ensure_video_codec_type(&opened) {
       // Same exit, same collection: a declined format can leave the
       // context looking like the wrong medium.
-      return Err(ceiling_declination_of(callback_state).unwrap_or(e));
+      //
+      // SAFETY: as above — the guard's live box, read before it drops.
+      return Err(unsafe { ceiling_declination_of(callback_state) }.unwrap_or(e));
     }
     // SAFETY of construction: `decoder::Video` is `pub struct Video(pub Opened)`.
     // We construct via the public field; this is the same wrapping
@@ -2228,6 +2248,12 @@ unsafe fn transfer_hw_frame(
   dst: &mut Frame,
   src: &frame::Video,
 ) -> std::result::Result<(), ffmpeg_next::Error> {
+  // SAFETY (`as_inner_mut`, every use below): `dst` is only cleared
+  // whole (`av_frame_unref`), filled whole by `av_hwframe_transfer_data`
+  // (which sets its format, dimensions, line sizes and buffers together),
+  // read, or given `src`'s timing, colour and crop properties by
+  // `copy_frame_props_minimal` — none of them a field `Frame`'s
+  // accessors trust.
   unsafe {
     av_frame_unref(dst.as_inner_mut().as_mut_ptr());
     let ret = av_hwframe_transfer_data(dst.as_inner_mut().as_mut_ptr(), src.as_ptr(), 0);
@@ -3594,13 +3620,19 @@ unsafe fn judge_hw_transfer(
 /// Free-standing rather than a method because the reason has to survive
 /// on **every** hardware exit, and one of them — the open-time failure
 /// path — runs before a decoder exists to ask.
-fn ceiling_declination_of(state: *const CallbackState) -> Option<Error> {
+///
+/// # Safety
+///
+/// `state` must be null or point at a [`CallbackState`] that stays live
+/// for the duration of the call — in practice the one a decoder owns and
+/// frees only after the codec context that points at it.
+unsafe fn ceiling_declination_of(state: *const CallbackState) -> Option<Error> {
   use core::sync::atomic::Ordering;
   if state.is_null() {
     return None;
   }
-  // SAFETY: `state` is the live `CallbackState` the caller owns; it is
-  // freed only after the codec context it belongs to.
+  // SAFETY: `state` is non-null, so by the contract above it points at a
+  // `CallbackState` live for this call; every field read is an atomic.
   let (declined, pixels, limit) = unsafe {
     (
       (*state).ceiling_declined.swap(false, Ordering::Acquire),
@@ -3622,9 +3654,11 @@ fn ceiling_declination_of(state: *const CallbackState) -> Option<Error> {
 ///
 /// # Safety
 ///
-/// `state` must be null or a live `CallbackState` the caller owns.
-pub(crate) fn software_exit(state: *const CallbackState, e: ffmpeg_next::Error) -> Error {
-  frame_budget_declination_of(state).unwrap_or(Error::Ffmpeg(e))
+/// `state` must be null or point at a [`CallbackState`] that stays live
+/// for the duration of the call.
+pub(crate) unsafe fn software_exit(state: *const CallbackState, e: ffmpeg_next::Error) -> Error {
+  // SAFETY: this function's own contract, forwarded.
+  unsafe { frame_budget_declination_of(state) }.unwrap_or(Error::Ffmpeg(e))
 }
 
 /// **The software road's only way to read an errno — funnel and
@@ -3666,26 +3700,30 @@ pub(crate) fn software_exit(state: *const CallbackState, e: ffmpeg_next::Error) 
 ///
 /// # Safety
 ///
-/// `state` must be null or a live [`CallbackState`] the caller owns.
-pub(crate) fn software_receive(
+/// `state` must be null or point at a [`CallbackState`] that stays live
+/// for the duration of the call.
+pub(crate) unsafe fn software_receive(
   state: *const CallbackState,
   e: ffmpeg_next::Error,
   phase: SessionPhase,
 ) -> Result<Received> {
-  receive_status(software_exit(state, e), phase)
+  // SAFETY: this function's own contract, forwarded.
+  receive_status(unsafe { software_exit(state, e) }, phase)
 }
 
 /// The send road's half of [`software_receive`]. Same law, same door.
 ///
 /// # Safety
 ///
-/// `state` must be null or a live [`CallbackState`] the caller owns.
-pub(crate) fn software_send(
+/// `state` must be null or point at a [`CallbackState`] that stays live
+/// for the duration of the call.
+pub(crate) unsafe fn software_send(
   state: *const CallbackState,
   e: ffmpeg_next::Error,
   phase: SessionPhase,
 ) -> Result<Sent> {
-  send_status(software_exit(state, e), phase)
+  // SAFETY: this function's own contract, forwarded.
+  send_status(unsafe { software_exit(state, e) }, phase)
 }
 
 /// Reads and clears a software frame-budget refusal left by
@@ -3694,8 +3732,15 @@ pub(crate) fn software_send(
 /// The software twin of [`ceiling_declination_of`]: the allocator judge
 /// can only answer libavcodec with an errno, so the reason lives in the
 /// callback state and every decoder funnel collects it.
-pub(crate) fn frame_budget_declination_of(state: *const CallbackState) -> Option<Error> {
-  crate::ffi::take_frame_budget_declination(state).map(|(bytes, limit, audio)| {
+///
+/// # Safety
+///
+/// `state` must be null or point at a [`CallbackState`] that stays live
+/// for the duration of the call — in practice the one a decoder owns and
+/// frees only after the codec context that points at it.
+pub(crate) unsafe fn frame_budget_declination_of(state: *const CallbackState) -> Option<Error> {
+  // SAFETY: this function's own contract, forwarded.
+  unsafe { crate::ffi::take_frame_budget_declination(state) }.map(|(bytes, limit, audio)| {
     Error::FrameBudgetExceeded(crate::error::FrameBudgetExceeded::new(
       bytes,
       limit,

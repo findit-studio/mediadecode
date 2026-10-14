@@ -1074,34 +1074,53 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
       // consumed it. Nothing outside this loop ever sees the packet, so
       // the borrow cannot become the aliasing shape the public faces
       // refuse.
+      //
+      // SAFETY (each of the four arms): `provenance` is this loop's own
+      // reading of `packet` — `DemuxDelivered` for what `av_read_frame`
+      // just handed a session that holds its `AVFormatContext` through
+      // `&mut self`, so every other reference to the buffer is
+      // libavformat's and none is written while the conversion reads;
+      // `AttachedPicture` only where `is_streams_attached_pic` proved the
+      // identity; a parked packet keeps the reading made when it was
+      // delivered. `packet` is this loop's own value and is never written
+      // through: it drops at the end of the iteration, or waits in
+      // `self.unconverted` to be read again.
       let converted = match info.kind() {
-        TrackKind::Video => boundary::video_packet_from_borrowed::<C>(
-          &packet,
-          time_base,
-          self.limits.packet(),
-          provenance,
-        )
+        TrackKind::Video => unsafe {
+          boundary::video_packet_from_borrowed::<C>(
+            &packet,
+            time_base,
+            self.limits.packet(),
+            provenance,
+          )
+        }
         .map(|built| built.map(|p| DemuxedPacket::Video(VideoTrackPacket::new(track, p)))),
-        TrackKind::Audio => boundary::audio_packet_from_borrowed::<C>(
-          &packet,
-          time_base,
-          self.limits.packet(),
-          provenance,
-        )
+        TrackKind::Audio => unsafe {
+          boundary::audio_packet_from_borrowed::<C>(
+            &packet,
+            time_base,
+            self.limits.packet(),
+            provenance,
+          )
+        }
         .map(|built| built.map(|p| DemuxedPacket::Audio(AudioTrackPacket::new(track, p)))),
-        TrackKind::Subtitle => boundary::subtitle_packet_from_borrowed::<C>(
-          &packet,
-          time_base,
-          self.limits.packet(),
-          provenance,
-        )
+        TrackKind::Subtitle => unsafe {
+          boundary::subtitle_packet_from_borrowed::<C>(
+            &packet,
+            time_base,
+            self.limits.packet(),
+            provenance,
+          )
+        }
         .map(|built| built.map(|p| DemuxedPacket::Subtitle(SubtitleTrackPacket::new(track, p)))),
-        TrackKind::Data => boundary::data_packet_from_borrowed::<C>(
-          &packet,
-          time_base,
-          self.limits.packet(),
-          provenance,
-        )
+        TrackKind::Data => unsafe {
+          boundary::data_packet_from_borrowed::<C>(
+            &packet,
+            time_base,
+            self.limits.packet(),
+            provenance,
+          )
+        }
         .map(|built| built.map(|p| DemuxedPacket::Data(DataTrackPacket::new(track, p)))),
         // Every attachment track's one packet was queued at open time,
         // so anything arriving on one now is the duplicate some
@@ -2788,6 +2807,9 @@ fn build_tracks<C: crate::FfmpegCarrier + crate::CarrierOps>(
         // value, and `addr_of!` reaches it without forming a reference
         // to the stream.
         let pkt = unsafe { std::ptr::addr_of!((*stream.as_ptr()).attached_pic) };
+        // SAFETY: `pkt` is this stream's own parked picture, live with the
+        // format context `stream` borrows, and written only while the
+        // container opened — which is over.
         unsafe { attached_pic_payload::<C>(pkt, index, limits) }?
       } else {
         extradata_payload::<C>(&stream, limits)?
@@ -3508,9 +3530,13 @@ const RETAINED_STREAM_METADATA: [&CStr; 3] = [c"filename", c"mimetype", c"langua
 ///
 /// # Safety
 ///
-/// `pkt` must be a live `*const AVPacket` — in practice the
-/// `attached_pic` embedded in the `AVStream` at `index` — for the
-/// duration of this call.
+/// `pkt` must be a live `*const AVPacket` for the duration of this call,
+/// and it must be the container's parked picture — the `attached_pic`
+/// embedded in the `AVStream` at `index`, written once while the
+/// container opened — or a packet nothing writes through for as long as
+/// the returned carrier lives: the capture is made under
+/// `PayloadProvenance::AttachedPicture`, which may window a buffer
+/// libavformat also holds.
 unsafe fn attached_pic_payload<C: crate::FfmpegCarrier + crate::CarrierOps>(
   pkt: *const ffmpeg_next::ffi::AVPacket,
   index: usize,
@@ -3522,7 +3548,9 @@ unsafe fn attached_pic_payload<C: crate::FfmpegCarrier + crate::CarrierOps>(
   // this packet's own ceiling anyway, so the funnel is guarded even if
   // a future caller reaches it without the admission pass.
   //
-  // SAFETY: `pkt` is live per the contract above.
+  // SAFETY: `pkt` is live per the contract above, and the
+  // `AttachedPicture` claim is the contract's own: nothing writes through
+  // the buffer while the carrier lives.
   // **The container's own cover art**, whose buffer libavformat also
   // holds — see [`crate::buffer::PayloadProvenance`] for why that
   // second reference is not the hazard a caller's second `Packet` is.
@@ -3822,7 +3850,9 @@ fn admit_streams(input: &Input, limits: DemuxLimits) -> Result<(), DemuxError> {
       //
       // SAFETY: `pkt` points at the live embedded `AVPacket` for the
       // whole of this call, and no plan outlives it — it is discarded
-      // here, the capture happens later against the same packet.
+      // here, the capture happens later against the same packet. It is
+      // the stream's parked picture, which is what `AttachedPicture`
+      // claims.
       let _plan = unsafe {
         crate::buffer::preflight_payload(
           pkt,
@@ -4530,7 +4560,9 @@ mod tests {
           !unsafe { source.as_ptr() }.is_null(),
           "the source allocates before the cap goes on",
         );
-        crate::fault_subprocess::cap_ffmpeg_allocations(1);
+        // SAFETY: in `in_subprocess`'s child, alone. The capped window runs only
+        // `bounded_clone_parameters`, which checks the allocation it makes.
+        unsafe { crate::fault_subprocess::cap_ffmpeg_allocations(1) };
         let refused = crate::extras::bounded_clone_parameters(&source, 4, usize::MAX);
         crate::fault_subprocess::uncap_ffmpeg_allocations();
         assert!(
@@ -4574,7 +4606,10 @@ mod tests {
           crate::ticket::CodecTicket::mirror(&source, 6, usize::MAX).expect("uncapped"),
         );
 
-        crate::fault_subprocess::cap_ffmpeg_allocations(1);
+        // SAFETY: in `in_subprocess`'s child, alone. The capped window holds a
+        // `TrackExtra` clone, which allocates nothing from FFmpeg, and
+        // `clone_parameters`, which checks the allocation it makes.
+        unsafe { crate::fault_subprocess::cap_ffmpeg_allocations(1) };
         let cloned = extra.clone();
         let handed = extra.clone_parameters().map(|_| ());
         crate::fault_subprocess::uncap_ffmpeg_allocations();
@@ -4609,7 +4644,10 @@ mod tests {
       || {
         // The cap is on *while the source is built* — that is the whole
         // difference from the destination lane.
-        crate::fault_subprocess::cap_ffmpeg_allocations(1);
+        // SAFETY: in `in_subprocess`'s child, alone. `Parameters::new` hands back a
+        // null-backed value here, and the lane below only inspects it and hands
+        // it to doors that refuse a null.
+        unsafe { crate::fault_subprocess::cap_ffmpeg_allocations(1) };
         let never_allocated = Parameters::new();
         crate::fault_subprocess::uncap_ffmpeg_allocations();
         assert!(
@@ -4631,7 +4669,9 @@ mod tests {
         // And the copier refuses it too, so the invariant is not the
         // only thing standing between this and a null dereference.
         let never_allocated = {
-          crate::fault_subprocess::cap_ffmpeg_allocations(1);
+          // SAFETY: as above — the null-backed value is only handed to a door that
+          // refuses it.
+          unsafe { crate::fault_subprocess::cap_ffmpeg_allocations(1) };
           let p = Parameters::new();
           crate::fault_subprocess::uncap_ffmpeg_allocations();
           p
@@ -4664,7 +4704,10 @@ mod tests {
     crate::fault_subprocess::in_subprocess(
       "demuxer::tests::a_spec_read_from_parameters_that_never_allocated_is_absent",
       || {
-        crate::fault_subprocess::cap_ffmpeg_allocations(1);
+        // SAFETY: in `in_subprocess`'s child, alone. `Parameters::new` hands back a
+        // null-backed value, which the lane only inspects and hands to
+        // `ResampleSpec::from_parameters`, which refuses a null.
+        unsafe { crate::fault_subprocess::cap_ffmpeg_allocations(1) };
         let never_allocated = Parameters::new();
         crate::fault_subprocess::uncap_ffmpeg_allocations();
         assert!(unsafe { never_allocated.as_ptr() }.is_null());
@@ -4701,7 +4744,9 @@ mod tests {
 
         // Big enough for the destination `AVCodecParameters`, far too
         // small for its extradata.
-        crate::fault_subprocess::cap_ffmpeg_allocations(64 * 1024);
+        // SAFETY: in `in_subprocess`'s child, alone. The capped window runs only
+        // `bounded_clone_parameters`, which checks every allocation it makes.
+        unsafe { crate::fault_subprocess::cap_ffmpeg_allocations(64 * 1024) };
         let refused = crate::extras::bounded_clone_parameters(&source, 2, usize::MAX);
         crate::fault_subprocess::uncap_ffmpeg_allocations();
         match refused {
@@ -4804,7 +4849,10 @@ mod tests {
     // **The first pull.** Two references, one of them the container's.
     // From a *caller* that shape is refused, because a caller's second
     // reference may be a `Packet` with a safe `data_mut`.
-    // SAFETY: `queued` is live for every call in this test.
+    // SAFETY: `queued` is live for every call in this test, and nothing in
+    // it writes through either packet that shares its buffer, so every
+    // provenance claim below holds: no write while a call reads, and none
+    // while a carrier lives.
     assert!(matches!(
       unsafe {
         payload_of::<crate::View>(
@@ -4878,7 +4926,8 @@ mod tests {
     // so it stays on the `Delivered` road, is unique, and the view lane
     // shares it.
     let later = Packet::copy(&[4u8; 1024]);
-    // SAFETY: `later` is live.
+    // SAFETY: `later` is live, its buffer unshared, and nothing writes
+    // through it while the view lives.
     let shared = unsafe {
       payload_of::<crate::View>(
         later.as_ptr(),
@@ -4942,7 +4991,12 @@ mod tests {
     // packet, because `ff_add_attached_pic` sets the disposition and
     // fills it in the same call. A zeroed `AVPacket` is exactly what
     // `attached_pic` would hold if one ever did not.
+    // SAFETY: an all-zero `AVPacket` is a valid empty packet — null
+    // buffer and data, zero size.
     let empty: ffmpeg_next::ffi::AVPacket = unsafe { std::mem::zeroed() };
+    // SAFETY: `empty` is a live local, and it has no buffer at all, so
+    // nothing can write through one while the (owned, empty) carrier
+    // lives — the contract's "or a packet nothing writes through".
     let packet = unsafe { attached_pic_payload::<crate::Owned>(&empty, 7, DemuxLimits::default()) }
       .expect("an unparked cover is a degenerate track, not an unreadable file");
     assert!(packet.data().as_ref().is_empty());

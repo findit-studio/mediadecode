@@ -253,18 +253,22 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierImageDecoder<C> {
     // Through the software funnel: a frame the allocator judge refused
     // surfaces named, not as the `EINVAL` a corrupt file also produces.
     let state: *const crate::ffi::CallbackState = &*self._callback_state;
+    // SAFETY: `state` points into `self._callback_state`, the box this
+    // decoder keeps for as long as its codec context.
     self
       .decoder
       .send_packet(&av_pkt)
-      .map_err(|e| ImageDecodeError::Decode(crate::decoder::software_exit(state, e)))?;
+      .map_err(|e| ImageDecodeError::Decode(unsafe { crate::decoder::software_exit(state, e) }))?;
     // Every still codec answers its one packet with its one frame, but
     // it is entitled to want the end of the stream first — so the EOF
     // goes in before the drain rather than after a speculative
     // `receive_frame` that would have to interpret `EAGAIN`.
+    //
+    // SAFETY: as above.
     self
       .decoder
       .send_eof()
-      .map_err(|e| ImageDecodeError::Decode(crate::decoder::software_exit(state, e)))?;
+      .map_err(|e| ImageDecodeError::Decode(unsafe { crate::decoder::software_exit(state, e) }))?;
     if let Err(e) = self.decoder.receive_frame(&mut self.scratch) {
       self.decoder.flush();
       // Funnelled, then classified — the same two steps every receive
@@ -287,7 +291,11 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierImageDecoder<C> {
         // three lines up, and a one-shot decoder has no probe. Both
         // flow signals therefore read as the end — which is exactly the
         // collapse this road has always made by hand.
-        match crate::decoder::software_receive(state, e, crate::decoder::SessionPhase::Draining) {
+        //
+        // SAFETY: as above — this decoder's own callback state.
+        match unsafe {
+          crate::decoder::software_receive(state, e, crate::decoder::SessionPhase::Draining)
+        } {
           Ok(_) => ImageDecodeError::NoImage,
           Err(fault) => ImageDecodeError::Decode(fault),
         },

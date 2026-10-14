@@ -227,19 +227,27 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierSubtitleStreamDecoder<C
     let state: *const crate::ffi::CallbackState = &*self._callback_state;
     let decoder = &mut self.decoder;
     let scratch = &mut self.scratch.inner;
-    let got = boundary::with_ffmpeg_subtitle_packet::<C, _>(
-      packet,
-      self.limits.packet_limits(),
-      // Nothing on this road records what it is sent, so the packet
-      // really does die inside the call and its body may be shared.
-      crate::carrier::BodyRoute::Submission,
-      |av_pkt| {
-        decoder.decode(av_pkt, scratch).map_err(|e| {
-          // SAFETY: the callback state outlives this decoder.
-          SubtitleDecodeError::Decode(crate::decoder::software_exit(unsafe { &*state }, e))
-        })
-      },
-    )
+    let submit = |av_pkt: &ffmpeg_next::Packet| {
+      decoder.decode(av_pkt, scratch).map_err(|e| {
+        // SAFETY: `state` points into `self._callback_state`, the box this
+        // decoder keeps for as long as its codec context.
+        SubtitleDecodeError::Decode(unsafe { crate::decoder::software_exit(state, e) })
+      })
+    };
+    // SAFETY: `submit` hands the packet to `avcodec_decode_subtitle2`
+    // (through `decode`), which reads it and does not write through it;
+    // the closure neither clones nor keeps it, so a shared body never
+    // outlives this call.
+    let got = unsafe {
+      boundary::with_ffmpeg_subtitle_packet::<C, _>(
+        packet,
+        self.limits.packet_limits(),
+        // Nothing on this road records what it is sent, so the packet
+        // really does die inside the call and its body may be shared.
+        crate::carrier::BodyRoute::Submission,
+        submit,
+      )
+    }
     .map_err(|e| SubtitleDecodeError::Decode(Error::PacketBuild(e)))??;
     // The cue stays in the scratch until a carrier exists for it — see
     // [`Self::scratch_pending`]. Nothing is converted here.

@@ -345,7 +345,20 @@ impl Frame {
   }
 
   /// Crate-internal: hand the wrapped frame to FFmpeg / our decoder code.
-  pub(crate) fn as_inner_mut(&mut self) -> &mut frame::Video {
+  ///
+  /// # Safety
+  ///
+  /// [`Self::row`], [`Self::rows`] and [`Self::as_ptr`] trust the wrapped
+  /// `AVFrame`'s `format`, `width`, `height`, `linesize` and `data` to
+  /// describe the buffers it holds, and form slices from them. The caller
+  /// must leave those fields describing each other: change the frame only
+  /// as a whole — `av_frame_unref`, `av_frame_move_ref`, a decoder's
+  /// `receive_frame`, `av_hwframe_transfer_data`, or replacing it with a
+  /// whole `frame::Video` — and never through the setters
+  /// `ffmpeg_next::frame::Video` offers as safe (`set_width`,
+  /// `set_height`, `set_format`, ...), which move the geometry and leave
+  /// the buffers where they were.
+  pub(crate) unsafe fn as_inner_mut(&mut self) -> &mut frame::Video {
     &mut self.inner
   }
 }

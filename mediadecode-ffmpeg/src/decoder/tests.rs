@@ -960,8 +960,11 @@ fn a_side_data_allocation_failure_is_reported_not_absorbed() {
       // has to reach the caller — which unrefs the partial destination
       // and advances the backend.
       let mut starved = ffmpeg_next::frame::Video::empty();
-      cap_ffmpeg_allocations(1);
-      // SAFETY: as above.
+      // SAFETY: in `in_subprocess`'s child, alone. The capped window runs only
+      // `copy_frame_props_minimal`, which checks the side-data allocation it
+      // makes.
+      unsafe { cap_ffmpeg_allocations(1) };
+      // SAFETY: both pointers are live for the call.
       let refused = unsafe { super::copy_frame_props_minimal(starved.as_mut_ptr(), src.as_ptr()) };
       uncap_ffmpeg_allocations();
       assert!(
@@ -1022,7 +1025,8 @@ fn the_declination_reader_reports_then_clears() {
     declined_frame_bytes: core::sync::atomic::AtomicU64::new(0),
     declined_frame_audio: core::sync::atomic::AtomicBool::new(false),
   };
-  assert!(ceiling_declination_of(&quiet).is_none());
+  // SAFETY: a reference to a live local `CallbackState`.
+  assert!(unsafe { ceiling_declination_of(&quiet) }.is_none());
 
   // A recorded refusal comes back named, carrying the pool's extent and
   // the ceiling it was refused against.
@@ -1037,7 +1041,8 @@ fn the_declination_reader_reports_then_clears() {
     declined_frame_bytes: core::sync::atomic::AtomicU64::new(0),
     declined_frame_audio: core::sync::atomic::AtomicBool::new(false),
   };
-  match ceiling_declination_of(&declined) {
+  // SAFETY: a reference to a live local `CallbackState`.
+  match unsafe { ceiling_declination_of(&declined) } {
     Some(Error::HwSurfaceTooLarge(p)) => {
       assert_eq!(p.bytes(), 1920 * 1088);
       assert_eq!(p.limit(), 1_048_576);
@@ -1049,7 +1054,8 @@ fn the_declination_reader_reports_then_clears() {
   // left set would be reported again against the next backend — which
   // would be a lie about a decoder that never declined anything.
   assert!(
-    ceiling_declination_of(&declined).is_none(),
+    // SAFETY: a reference to a live local `CallbackState`.
+    unsafe { ceiling_declination_of(&declined) }.is_none(),
     "the refusal must be consumed, not latched",
   );
   assert!(!declined.ceiling_declined.load(Ordering::Relaxed));
@@ -1777,7 +1783,11 @@ fn a_latched_refusal_reaches_the_probe_instead_of_dying_unread() {
 
   // Latch a coded-surface refusal, exactly as the `get_format` callback
   // does when it declines a surface over the ceiling.
-  crate::ffi::declare_ceiling_declined_for_test(dec.state.callback_state, 8_294_400, 2_073_600);
+  // SAFETY: `dec` owns this state and frees it only when it drops, after this
+  // call.
+  unsafe {
+    crate::ffi::declare_ceiling_declined_for_test(dec.state.callback_state, 8_294_400, 2_073_600)
+  };
 
   let mut frame = crate::Frame::empty().expect("frame slot");
   let Err(Error::AllBackendsFailed(p)) = dec.receive_frame(&mut frame) else {
@@ -1853,7 +1863,11 @@ fn a_latched_refusal_outranks_the_errno_in_every_committed_phase() {
 
     // The refusal the callback could not return, latched exactly as
     // `get_format` leaves it when it declines a coded surface.
-    crate::ffi::declare_ceiling_declined_for_test(dec.state.callback_state, 8_294_400, 2_073_600);
+    // SAFETY: `dec` owns this state and frees it only when it drops, after this
+    // call.
+    unsafe {
+      crate::ffi::declare_ceiling_declined_for_test(dec.state.callback_state, 8_294_400, 2_073_600)
+    };
 
     let mut frame = crate::Frame::empty().expect("frame slot");
     match dec.receive_frame(&mut frame) {
@@ -1925,7 +1939,11 @@ fn a_latched_refusal_outranks_the_errno_on_the_send_road_too() {
   let mut dec = committed_decoder();
   assert_eq!(dec.send_eof().expect("no fault"), Sent::Accepted);
 
-  crate::ffi::declare_ceiling_declined_for_test(dec.state.callback_state, 8_294_400, 2_073_600);
+  // SAFETY: `dec` owns this state and frees it only when it drops, after this
+  // call.
+  unsafe {
+    crate::ffi::declare_ceiling_declined_for_test(dec.state.callback_state, 8_294_400, 2_073_600)
+  };
 
   match dec.send_eof() {
     Ok(Sent::Accepted) => panic!("a repeated end silently accepted over a refusal"),
@@ -1962,7 +1980,11 @@ fn a_latched_refusal_outranks_the_errno_on_the_send_road_too() {
 #[test]
 fn the_committed_route_reports_the_verdict_it_was_given() {
   let dec = committed_decoder();
-  crate::ffi::declare_ceiling_declined_for_test(dec.state.callback_state, 8_294_400, 2_073_600);
+  // SAFETY: `dec` owns this state and frees it only when it drops, after this
+  // call.
+  unsafe {
+    crate::ffi::declare_ceiling_declined_for_test(dec.state.callback_state, 8_294_400, 2_073_600)
+  };
 
   // Handed a raw failure while a refusal sits latched: the route must
   // report the raw one. Reaching for the latch here is precisely the bug.
@@ -2007,7 +2029,9 @@ fn the_committed_route_reports_the_verdict_it_was_given() {
 #[test]
 fn a_funnel_consumes_what_it_collects() {
   let dec = committed_decoder();
-  crate::ffi::declare_ceiling_declined_for_test(dec.state.callback_state, 4_096, 1_024);
+  // SAFETY: `dec` owns this state and frees it only when it drops, after this
+  // call.
+  unsafe { crate::ffi::declare_ceiling_declined_for_test(dec.state.callback_state, 4_096, 1_024) };
 
   let first = dec.hw_exit(Error::Ffmpeg(ffmpeg_next::Error::InvalidData));
   assert!(
@@ -2046,7 +2070,11 @@ fn a_declined_surface_reaches_the_caller_whatever_errno_the_codec_wrapped_it_in(
   let hevc = ffmpeg_next::Error::Other { errno: 1 };
 
   let dec = committed_decoder();
-  crate::ffi::declare_ceiling_declined_for_test(dec.state.callback_state, 8_294_400, 2_073_600);
+  // SAFETY: `dec` owns this state and frees it only when it drops, after this
+  // call.
+  unsafe {
+    crate::ffi::declare_ceiling_declined_for_test(dec.state.callback_state, 8_294_400, 2_073_600)
+  };
 
   let out = reported(dec.hw_failure(hevc, BareVerdict::CandidateFailure));
   assert!(
@@ -2083,7 +2111,11 @@ fn a_budget_refusal_travels_unwrapped_whatever_errno_rides_with_it() {
     ("a failed restart's EXTERNAL", ffmpeg_next::Error::External),
   ] {
     let dec = committed_decoder();
-    crate::ffi::declare_frame_budget_declined_for_test(dec.state.callback_state, 12_582_912);
+    // SAFETY: `dec` owns this state and frees it only when it drops, after this
+    // call.
+    unsafe {
+      crate::ffi::declare_frame_budget_declined_for_test(dec.state.callback_state, 12_582_912)
+    };
 
     let out = reported(dec.hw_failure(raw, BareVerdict::CandidateFailure));
     assert!(
@@ -2104,7 +2136,11 @@ fn a_budget_refusal_travels_unwrapped_whatever_errno_rides_with_it() {
 #[test]
 fn the_committed_receive_route_lets_a_budget_refusal_travel_unwrapped() {
   let mut dec = committed_decoder();
-  crate::ffi::declare_frame_budget_declined_for_test(dec.state.callback_state, 12_582_912);
+  // SAFETY: `dec` owns this state and frees it only when it drops, after this
+  // call.
+  unsafe {
+    crate::ffi::declare_frame_budget_declined_for_test(dec.state.callback_state, 12_582_912)
+  };
 
   let mut frame = crate::Frame::empty().expect("frame slot");
   match dec.receive_frame(&mut frame) {
@@ -2315,13 +2351,24 @@ fn the_send_roads_route_a_surface_refusal_and_report_a_budget_one() {
         assert_eq!(dec.send_eof().expect("no fault"), Sent::Accepted);
 
         match latch {
-          Latch::Surface => crate::ffi::declare_ceiling_declined_for_test(
-            dec.state.callback_state,
-            8_294_400,
-            2_073_600,
-          ),
+          // SAFETY: `dec` owns this state and frees it only when it drops, after this
+          // call.
+          Latch::Surface => unsafe {
+            crate::ffi::declare_ceiling_declined_for_test(
+              dec.state.callback_state,
+              8_294_400,
+              2_073_600,
+            )
+          },
           Latch::Budget => {
-            crate::ffi::declare_frame_budget_declined_for_test(dec.state.callback_state, 12_582_912)
+            // SAFETY: `dec` owns this state and frees it only when it drops, after this
+            // call.
+            unsafe {
+              crate::ffi::declare_frame_budget_declined_for_test(
+                dec.state.callback_state,
+                12_582_912,
+              )
+            }
           }
         }
 
@@ -2708,7 +2755,10 @@ fn a_copy_the_probe_cannot_make_refuses_the_send_by_name() {
       assert_eq!(dec.send_packet(&first).expect("taken"), Sent::Accepted);
 
       let mut refused = crate::boundary::try_packet_copy(&[0x77; 8192]).expect("a packet");
-      cap_ffmpeg_allocations(512);
+      // SAFETY: in `in_subprocess`'s child, alone. The capped window runs one send:
+      // the probe's copy goes through `try_clone_packet`, which checks both of
+      // its calls, and libavcodec checks its own allocations.
+      unsafe { cap_ffmpeg_allocations(512) };
       let answer = dec.send_packet(&refused);
       uncap_ffmpeg_allocations();
 

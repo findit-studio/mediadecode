@@ -717,7 +717,10 @@ impl ScaledOutput {
     }
     match cache_plan(self.cache.built_key(), key) {
       CachePlan::Reuse => {}
-      CachePlan::Build => match Built::create(key, source.device_ref) {
+      // SAFETY: `source.device_ref` was read a few lines up out of `src`'s
+      // own frames context, and `src` — which holds that context — is
+      // borrowed for the whole of this call.
+      CachePlan::Build => match unsafe { Built::create(key, source.device_ref) } {
         Some(built) => self.cache = Cache::Built(built),
         None => {
           self.stand_down();
@@ -763,7 +766,13 @@ impl Built {
   /// Build the fitted frames context and the transfer session for
   /// `key`. `None` on any failure, with the reason logged — the caller
   /// latches it so the failure is reported once, not per frame.
-  fn create(key: StageKey, device_ref: *mut AVBufferRef) -> Option<Self> {
+  ///
+  /// # Safety
+  ///
+  /// `device_ref` must be null or a live `AVBufferRef` to an
+  /// `AVHWDeviceContext` for the duration of the call;
+  /// `av_hwframe_ctx_alloc` takes a reference of its own.
+  unsafe fn create(key: StageKey, device_ref: *mut AVBufferRef) -> Option<Self> {
     if device_ref.is_null() {
       return None;
     }
@@ -775,9 +784,10 @@ impl Built {
       return None;
     }
 
-    // SAFETY: `device_ref` is the decode session's live VideoToolbox
-    // device reference, read out of the source frame's frames context;
-    // `av_hwframe_ctx_alloc` takes its own reference to it.
+    // SAFETY: `device_ref` is non-null, so by the contract above it is a
+    // live device reference for this call — in practice the decode
+    // session's VideoToolbox device, read out of the source frame's frames
+    // context; `av_hwframe_ctx_alloc` takes its own reference to it.
     let pool = FittedPool(unsafe { av_hwframe_ctx_alloc(device_ref) });
     if pool.0.is_null() {
       tracing::warn!("mediadecode-ffmpeg: scaled output could not allocate a frames context");

@@ -291,7 +291,9 @@ impl HwInner for FakeHw {
     }
     match self.queued.pop_front() {
       Some(av) => {
-        *frame.as_inner_mut() = av;
+        // SAFETY: the slot is replaced by a whole `frame::Video`, its geometry and
+        // buffers together.
+        *unsafe { frame.as_inner_mut() } = av;
         Ok(Received::Frame)
       }
       None => Ok(Received::NeedsInput),
@@ -353,7 +355,9 @@ impl HwInner for FakeHwEofFails {
         let mut av =
           frame::Video::new(ffmpeg_next::format::Pixel::YUV420P, self.width, self.height);
         av.set_pts(Some(pts));
-        *frame.as_inner_mut() = av;
+        // SAFETY: the slot is replaced by a whole `frame::Video`, its geometry and
+        // buffers together.
+        *unsafe { frame.as_inner_mut() } = av;
         Ok(Received::Frame)
       }
       None => Ok(Received::NeedsInput),
@@ -1455,7 +1459,10 @@ fn the_receive_time_fallback_queue_survives_a_failed_carrier() {
           if capped {
             armed = false;
             queue_was_hit = true;
-            crate::fault_subprocess::cap_ffmpeg_allocations(16);
+            // SAFETY: in `in_subprocess`'s child, alone. The capped window runs one
+            // receive off the replay queue: this crate's conversion, which checks
+            // every allocation it makes.
+            unsafe { crate::fault_subprocess::cap_ffmpeg_allocations(16) };
           }
           let got = dec.receive_frame(&mut frame);
           if capped {
@@ -1606,7 +1613,11 @@ fn eof_with_a_parked_frame(
 
   // Now park a tail frame: the ceiling refuses the carrier, and the
   // refusal is one another attempt could survive, so the seat keeps it.
-  crate::fault_subprocess::cap_ffmpeg_allocations(16);
+  // SAFETY: only reached inside `in_subprocess`'s child — both callers of this
+  // helper run under it — alone. The capped window runs one receive:
+  // libavcodec and this crate's conversion, which check what they
+  // allocate.
+  unsafe { crate::fault_subprocess::cap_ffmpeg_allocations(16) };
   let refused = dec.receive_frame(&mut frame);
   crate::fault_subprocess::uncap_ffmpeg_allocations();
   match refused {
@@ -1908,7 +1919,8 @@ fn the_post_eof_fault_is_the_one_the_substrate_gives() {
   // output makes the hardware claim a checked identity rather than an
   // assertion: it is the same `Error::Ffmpeg` construction, on a value
   // the line above proved is what the substrate gives.
-  let wrapped = crate::decoder::software_exit(core::ptr::null(), substrate);
+  // SAFETY: a null state is allowed, and nothing is read through it.
+  let wrapped = unsafe { crate::decoder::software_exit(core::ptr::null(), substrate) };
   assert!(
     matches!(wrapped, Error::Ffmpeg(ffmpeg_next::Error::Eof)),
     "the funnel changed how a post-EOF refusal is wrapped: got {wrapped:?}",
@@ -1968,7 +1980,10 @@ fn a_parked_hardware_frame_is_delivered_before_any_fallback() {
 
       // Park the hardware frame.
       let mut frame = crate::boundary::empty_video_frame();
-      crate::fault_subprocess::cap_ffmpeg_allocations(16);
+      // SAFETY: in `in_subprocess`'s child, alone. The capped window runs one
+      // receive: libavcodec and this crate's conversion, which check what
+      // they allocate.
+      unsafe { crate::fault_subprocess::cap_ffmpeg_allocations(16) };
       let refused = dec.receive_frame(&mut frame);
       crate::fault_subprocess::uncap_ffmpeg_allocations();
       match refused {
@@ -2387,9 +2402,11 @@ impl HwInner for ScriptedHw {
   }
 
   fn receive_frame(&mut self, frame: &mut Frame) -> Result<Received, Error> {
-    match self.sw.receive_frame(frame.as_inner_mut()) {
+    // SAFETY: the software decoder fills the slot whole.
+    match self.sw.receive_frame(unsafe { frame.as_inner_mut() }) {
       Ok(()) => {
-        let pts = frame.as_inner_mut().pts();
+        // SAFETY: the frame is only read.
+        let pts = unsafe { frame.as_inner_mut() }.pts();
         match self
           .failing_pictures
           .iter()

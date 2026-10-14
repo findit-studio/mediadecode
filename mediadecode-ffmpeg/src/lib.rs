@@ -26,7 +26,7 @@ mod decoder;
 mod demuxer;
 mod error;
 pub mod extras;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 mod fault_subprocess;
 mod ffi;
 mod footprint;
@@ -66,6 +66,31 @@ pub use buffer::{FfmpegBytes, PacketBufferError, TrustedPayload};
 pub(crate) use carrier::CarrierOps;
 pub use carrier::{FfmpegCarrier, Owned, View};
 pub use view::FfmpegBuffer;
+
+/// Test machinery — compiled only with the `test-support` feature.
+///
+/// Nothing here decodes anything. It is the harness this crate's own
+/// lanes drive their hardest roads with, exported so that a crate built
+/// on this one can drive the same roads in its lanes: a child process
+/// for faults that cannot be injected beside other tests, the global
+/// FFmpeg allocation cap such a child may set, and the hooks that latch
+/// the callback state's refusals exactly as the `get_format` and
+/// `get_buffer2` callbacks do.
+///
+/// The cap and the hooks are `unsafe fn`: one breaks every unchecked
+/// allocation in the process, the other writes through a raw pointer.
+/// Their `# Safety` sections say what a caller proves.
+#[cfg(feature = "test-support")]
+#[cfg_attr(docsrs, doc(cfg(feature = "test-support")))]
+#[doc(hidden)]
+pub mod test_support {
+  pub use crate::{
+    fault_subprocess::{cap_ffmpeg_allocations, in_subprocess, uncap_ffmpeg_allocations},
+    ffi::{
+      CallbackState, declare_ceiling_declined_for_test, declare_frame_budget_declined_for_test,
+    },
+  };
+}
 
 /// The demuxer, on the **view** lane — the ordinary road.
 ///

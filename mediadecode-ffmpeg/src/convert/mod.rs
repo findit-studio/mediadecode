@@ -1406,7 +1406,10 @@ unsafe fn copy_out_planes<C: crate::FfmpegCarrier + crate::CarrierOps>(
       // The palette is a flat `AVPALETTE_SIZE` run whose length is the
       // format's, not the file's — fully written, so shareable whole.
       //
-      // SAFETY: non-null and addressing this plane.
+      // SAFETY: non-null and addressing this plane; the run is the
+      // palette libavcodec wrote whole, and libavcodec writes a frame
+      // buffer that is referenced elsewhere only after its writability
+      // check has copied it.
       let carried =
         unsafe { capture_from_backing::<C>(av_frame, data_ptr as *const u8, bytes, plane_idx) }?;
       planes_out[plane_idx] = Plane::new(carried, bytes as u32);
@@ -1473,7 +1476,10 @@ unsafe fn copy_out_planes<C: crate::FfmpegCarrier + crate::CarrierOps>(
       // exposes no byte that was not written. The owned lane copies it;
       // the view lane takes a reference to exactly this range.
       //
-      // SAFETY: `data_ptr` is non-null and addresses this plane.
+      // SAFETY: `data_ptr` is non-null and addresses this plane; the run
+      // is the decoder's own output, as above, and libavcodec writes a
+      // frame buffer that is referenced elsewhere only after its
+      // writability check has copied it.
       let carried = unsafe {
         capture_from_backing::<C>(av_frame, data_ptr as *const u8, plane_bytes, plane_idx)
       }?;
@@ -2156,8 +2162,11 @@ unsafe fn collect_image_side_data(
 ///
 /// # Safety
 ///
-/// `av_frame` must be a live `*const AVFrame` and `data_ptr` must point
-/// into one of its planes.
+/// `av_frame` must be a live `*const AVFrame`, `data_ptr` must point
+/// into one of its planes, and the `len` bytes from `data_ptr` must be
+/// initialised — what the frame's producer wrote — and must not be
+/// written through while the carrier lives: the view lane lends them as
+/// `&[u8]`, the owned lane reads them to copy.
 unsafe fn capture_from_backing<C: crate::FfmpegCarrier + crate::CarrierOps>(
   av_frame: *const AVFrame,
   data_ptr: *const u8,
@@ -2172,7 +2181,9 @@ unsafe fn capture_from_backing<C: crate::FfmpegCarrier + crate::CarrierOps>(
   // SAFETY: `backing` is one of the frame's live buffers and was just
   // proved to cover `len` bytes from `data_ptr`.
   let offset = unsafe { (data_ptr as usize).wrapping_sub((*backing).data as usize) };
-  // SAFETY: the offset and length were proved to lie inside `backing`.
+  // SAFETY: the offset and length were proved to lie inside `backing`;
+  // the bytes are initialised and unwritten for the carrier's life by
+  // this function's own contract.
   unsafe { C::capture(backing, offset, len) }.ok_or(ConvertError::CarrierAllocFailed(
     CarrierAllocFailed::new(plane_idx),
   ))
@@ -2682,7 +2693,10 @@ pub(crate) unsafe fn av_frame_to_audio_frame_as<C: crate::FfmpegCarrier + crate:
     // `valid_per_plane <= allocated_per_plane`.
     let offset = unsafe { (data_ptr as usize).wrapping_sub((*backing).data as usize) };
     // SAFETY: the offset and length lie inside `backing` by the proof
-    // above.
+    // above, and the prefix is exactly what the decoder wrote
+    // (`nb_samples` times the sample's bytes, per plane); libavcodec
+    // writes a frame buffer that is referenced elsewhere only after its
+    // writability check has copied it.
     let carried = unsafe { C::capture(backing, offset, valid_per_plane) }.ok_or(
       ConvertError::CarrierAllocFailed(CarrierAllocFailed::new(plane_idx)),
     )?;

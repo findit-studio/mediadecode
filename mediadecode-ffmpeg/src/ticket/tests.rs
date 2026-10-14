@@ -334,7 +334,9 @@ fn every_rebuild_allocation_that_fails_is_named() {
         (&array, 1024, "the side-data descriptor array", 4),
         (&layout, 1024, "the custom channel map", 5),
       ] {
-        crate::fault_subprocess::cap_ffmpeg_allocations(cap);
+        // SAFETY: in `in_subprocess`'s child, alone. The capped window runs only
+        // `rebuild`, which checks every allocation it makes.
+        unsafe { crate::fault_subprocess::cap_ffmpeg_allocations(cap) };
         let refused = ticket.rebuild().map(|_| ());
         crate::fault_subprocess::uncap_ffmpeg_allocations();
 

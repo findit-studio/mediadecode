@@ -19,7 +19,7 @@
 /// `test_path` must be the test's name as libtest spells it — the
 /// module path inside the crate, e.g. `demuxer::tests::the_lane` — so
 /// that `--exact` selects exactly this test in the child.
-pub(crate) fn in_subprocess(test_path: &str, body: impl FnOnce()) {
+pub fn in_subprocess(test_path: &str, body: impl FnOnce()) {
   const CHILD: &str = "MEDIADECODE_FFMPEG_FAULT_CHILD";
 
   if std::env::var(CHILD).as_deref() == Ok(test_path) {
@@ -54,13 +54,30 @@ pub(crate) fn in_subprocess(test_path: &str, body: impl FnOnce()) {
 /// Makes every FFmpeg allocation larger than `max` fail, returning
 /// `NULL` the way an out-of-memory allocator would.
 ///
-/// Process-global — only ever called from inside [`in_subprocess`].
-pub(crate) fn cap_ffmpeg_allocations(max: usize) {
-  // SAFETY: `av_max_alloc` stores an atomic and returns nothing.
+/// # Safety
+///
+/// The cap is process-global: from this call until
+/// [`uncap_ffmpeg_allocations`], every FFmpeg allocation larger than
+/// `max` returns null, on every thread. ffmpeg-next's own safe
+/// constructors do not check for that — `frame::Video::empty` and
+/// `codec::Parameters::new` wrap the null they are handed, and the next
+/// call through one dereferences it — so the caller must ensure that no
+/// allocation made while the cap stands hands a null to code that will
+/// dereference it. In practice: only inside [`in_subprocess`]'s child,
+/// which runs one test alone, and only around code that checks what it
+/// allocates or never uses what it did not get.
+pub unsafe fn cap_ffmpeg_allocations(max: usize) {
+  // SAFETY: `av_max_alloc` stores an atomic and returns nothing; what the
+  // cap does to other allocations is this function's own contract.
   unsafe { ffmpeg_next::ffi::av_max_alloc(max) };
 }
 
 /// Lifts the cap [`cap_ffmpeg_allocations`] set.
-pub(crate) fn uncap_ffmpeg_allocations() {
-  cap_ffmpeg_allocations(i32::MAX as usize);
+pub fn uncap_ffmpeg_allocations() {
+  // SAFETY: `av_max_alloc` stores an atomic and returns nothing, and
+  // `INT_MAX` is libavutil's own default cap ("By default, the max value
+  // is defined as `INT_MAX`", `libavutil/mem.h` 593 in FFmpeg 9.0.1).
+  // Raising the cap cannot make an allocation fail, so nothing
+  // [`cap_ffmpeg_allocations`] guards against can follow from it.
+  unsafe { ffmpeg_next::ffi::av_max_alloc(i32::MAX as usize) };
 }

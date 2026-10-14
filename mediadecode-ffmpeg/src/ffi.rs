@@ -216,17 +216,17 @@ pub(crate) fn pix_fmt_name_static(raw: i32) -> Option<&'static str> {
   None
 }
 
-/// State pointed to by `AVCodecContext::opaque` so [`get_hw_format`] can pick
-/// the correct hardware pixel format without globals. One instance per
-/// decoder; freed by [`crate::VideoDecoder`] after the codec context is
-/// dropped.
+/// State pointed to by `AVCodecContext::opaque` so the `get_format`
+/// callback can pick the correct hardware pixel format without globals.
+/// One instance per decoder; freed by [`crate::VideoDecoder`] after the
+/// codec context is dropped.
 ///
 /// `wanted` is set from a hardcoded `AVPixelFormat` constant in our bindings
 /// (via `Backend::hw_pixel_format`), so it is always a valid enum value. We
 /// also store its raw `i32` so the callback can compare against the offered
 /// list without going through enum reads.
 #[repr(C)]
-pub(crate) struct CallbackState {
+pub struct CallbackState {
   /// Hardware pixel format we want the decoder to produce. Constructed
   /// from a known constant; safe to use as the callback's return value.
   pub(crate) wanted: AVPixelFormat,
@@ -286,15 +286,22 @@ pub(crate) struct CallbackState {
 /// Clear-on-read for the same reason the `get_format` declination is: a
 /// refusal that latched would be reported again against the next frame,
 /// which never declined anything.
-pub(crate) fn take_frame_budget_declination(
+///
+/// # Safety
+///
+/// `state` must be null or point at a [`CallbackState`] that stays live
+/// for the duration of the call — in practice the one a decoder owns and
+/// frees only after the codec context that points at it.
+pub(crate) unsafe fn take_frame_budget_declination(
   state: *const CallbackState,
 ) -> Option<(u64, u64, bool)> {
   use core::sync::atomic::Ordering;
   if state.is_null() {
     return None;
   }
-  // SAFETY: `state` is the live `CallbackState` the caller owns; it is
-  // freed only after the codec context it belongs to.
+  // SAFETY: `state` is non-null, so by the contract above it points at a
+  // `CallbackState` live for this call; every field read is an atomic or
+  // a plain integer.
   let (declined, bytes, limit, audio) = unsafe {
     (
       (*state)
@@ -313,14 +320,16 @@ pub(crate) fn take_frame_budget_declination(
 ///
 /// # Safety
 ///
-/// `state` must be null or a live [`CallbackState`] the caller owns.
-#[cfg(test)]
-pub(crate) fn declare_frame_budget_declined_for_test(state: *mut CallbackState, bytes: u64) {
+/// `state` must be null or point at a [`CallbackState`] that stays live
+/// for the duration of the call.
+#[cfg(any(test, feature = "test-support"))]
+pub unsafe fn declare_frame_budget_declined_for_test(state: *mut CallbackState, bytes: u64) {
   use core::sync::atomic::Ordering;
   if state.is_null() {
     return;
   }
-  // SAFETY: the caller guarantees `state` is live for the call.
+  // SAFETY: `state` is non-null, so by the contract above it is live for
+  // the call; only its atomics are written.
   unsafe {
     (*state)
       .declined_frame_bytes
@@ -586,7 +595,13 @@ fn pool_bytes(sw_format: libc::c_int, w: libc::c_int, h: libc::c_int) -> Option<
 /// raw integers via `addr_of!` + `ptr::read::<i32>` to avoid copying or
 /// interpreting enum-typed fields whose runtime values might not match
 /// our build's discriminant set.
-pub(crate) fn codec_supports_hwaccel(
+///
+/// # Safety
+///
+/// `codec` must point at a live `AVCodec` — one libavcodec handed out,
+/// such as `avcodec_find_decoder`'s answer, which names an entry in its
+/// static codec table and stays valid for the process.
+pub(crate) unsafe fn codec_supports_hwaccel(
   codec: *const AVCodec,
   device_type: AVHWDeviceType,
   wanted_pix_fmt: i32,
@@ -595,7 +610,9 @@ pub(crate) fn codec_supports_hwaccel(
   let device_type_int = device_type as i32;
   let mut i = 0;
   loop {
-    // SAFETY: `avcodec_get_hw_config` returns null past the end; we stop then.
+    // SAFETY: `codec` is a live `AVCodec` per the contract above, and
+    // `avcodec_get_hw_config` returns null past the end of its table; we
+    // stop then.
     let cfg = unsafe { avcodec_get_hw_config(codec, i) };
     if cfg.is_null() {
       return false;
@@ -629,9 +646,10 @@ pub(crate) fn codec_supports_hwaccel(
 ///
 /// # Safety
 ///
-/// `state` must be null or a live [`CallbackState`] the caller owns.
-#[cfg(test)]
-pub(crate) fn declare_ceiling_declined_for_test(
+/// `state` must be null or point at a [`CallbackState`] that stays live
+/// for the duration of the call.
+#[cfg(any(test, feature = "test-support"))]
+pub unsafe fn declare_ceiling_declined_for_test(
   state: *mut CallbackState,
   pixels: i64,
   limit: i64,
@@ -640,7 +658,8 @@ pub(crate) fn declare_ceiling_declined_for_test(
   if state.is_null() {
     return;
   }
-  // SAFETY: the caller guarantees `state` is live for the call.
+  // SAFETY: `state` is non-null, so by the contract above it is live for
+  // the call; only its atomics are written.
   unsafe {
     (*state).declined_pixels.store(pixels, Ordering::Relaxed);
     (*state).declined_limit.store(limit, Ordering::Relaxed);
@@ -814,12 +833,15 @@ mod tests {
     let videotoolbox = AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX as i32;
     let nv12 = AVPixelFormat::AV_PIX_FMT_NV12 as i32;
 
+    // SAFETY: `codec_ptr` is libavcodec's own H.264 decoder entry, just
+    // checked non-null; its static codec table lives for the process.
     assert!(
-      codec_supports_hwaccel(codec_ptr, device, videotoolbox),
+      unsafe { codec_supports_hwaccel(codec_ptr, device, videotoolbox) },
       "VideoToolbox + AV_PIX_FMT_VIDEOTOOLBOX must be advertised by FFmpeg's H.264 decoder"
     );
+    // SAFETY: as above.
     assert!(
-      !codec_supports_hwaccel(codec_ptr, device, nv12),
+      !unsafe { codec_supports_hwaccel(codec_ptr, device, nv12) },
       "VideoToolbox + AV_PIX_FMT_NV12 must NOT match the codec's HW config — \
        the strict get_format would have no offered HW format to return"
     );

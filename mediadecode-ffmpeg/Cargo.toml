@@ -31,6 +31,14 @@ alloc   = []
 # with it.
 resample = ["ffmpeg-next/software-resampling"]
 
+# Test machinery, compiled only on request: the subprocess harness for
+# faults that cannot be injected in a shared process (`av_max_alloc` is
+# process-global), and the hooks that latch the callback state's
+# refusals without a hardware backend to decline a real surface. Off by
+# default and never needed to decode; it exists so this crate's lanes,
+# and the lanes of a crate built on it, can drive those roads.
+test-support = []
+
 [dependencies]
 mediadecode = { workspace = true, features = ["alloc"] }
 # The channel-layout vocabulary this adapter produces lives in

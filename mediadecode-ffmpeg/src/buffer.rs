@@ -1093,7 +1093,20 @@ impl std::error::Error for TrustedPayload {}
 /// # Safety
 ///
 /// `pkt` must be a live `*const AVPacket` for the duration of this
-/// call.
+/// call, and `provenance` must be true of it — it decides whether a
+/// buffer somebody else also references is refused, copied or windowed
+/// ([`PayloadProvenance::route`]):
+///
+/// * [`PayloadProvenance::CallerSupplied`] is true of every packet;
+/// * [`PayloadProvenance::DemuxDelivered`] claims that no other
+///   reference to the payload's buffer is written through while this
+///   call reads it;
+/// * [`PayloadProvenance::AttachedPicture`] claims that nothing writes
+///   through that buffer for as long as the returned carrier lives.
+///
+/// On the view lane the carrier may be a window onto the packet's own
+/// buffer, so the packet's owner must not write through it while the
+/// carrier lives. The owned lane copies and owes nothing here.
 pub(crate) unsafe fn payload_of<C: crate::FfmpegCarrier + crate::CarrierOps>(
   pkt: *const ffmpeg_next::ffi::AVPacket,
   budget: usize,
@@ -1104,7 +1117,9 @@ pub(crate) unsafe fn payload_of<C: crate::FfmpegCarrier + crate::CarrierOps>(
     return Ok(None);
   };
   // SAFETY: the plan's extent was proved inside the preflight against
-  // this same live packet, which the caller keeps alive for the call.
+  // this same live packet, which the caller keeps alive for the call,
+  // under the caller's provenance claim; the view-lane writer clause is
+  // the caller's contract, forwarded.
   unsafe { capture_payload::<C>(plan) }.map(Some)
 }
 
@@ -1145,7 +1160,9 @@ pub(crate) struct PayloadPlan {
 /// # Safety
 ///
 /// `pkt` must be a live `*const AVPacket` for the duration of the call,
-/// and — if a plan comes back — for as long as that plan is used.
+/// and — if a plan comes back — for as long as that plan is used; and
+/// `provenance` must be true of it, as [`payload_of`] states, because
+/// the plan's route is decided by it.
 pub(crate) unsafe fn preflight_payload(
   pkt: *const ffmpeg_next::ffi::AVPacket,
   budget: usize,
@@ -1260,7 +1277,9 @@ pub(crate) unsafe fn preflight_payload(
 /// # Safety
 ///
 /// `plan` must come from [`preflight_payload`] over a packet still live
-/// for this call.
+/// for this call, whose provenance claim stands; and on the view lane
+/// the packet's owner must not write through its buffer while the
+/// returned carrier lives.
 unsafe fn capture_payload<C: crate::FfmpegCarrier + crate::CarrierOps>(
   plan: PayloadPlan,
 ) -> Result<C::Buffer, PacketBufferError> {
@@ -1272,6 +1291,15 @@ unsafe fn capture_payload<C: crate::FfmpegCarrier + crate::CarrierOps>(
     route,
   } = plan;
   let carried = match route {
+    // SAFETY: the preflight proved `offset + len` inside `buf_ptr`'s own
+    // `size`, against a buffer the live packet holds. The range is the
+    // packet's payload: written wherever FFmpeg or this crate built the
+    // packet — a demuxer's read, `try_packet_copy`, `Packet::copy` — and
+    // otherwise exactly as initialised as ffmpeg-next's own safe
+    // `Packet::data` already lends it. Nothing writes through it while a
+    // view lives: this route is taken only for a buffer that is unshared
+    // or whose other holders cannot write (`PayloadProvenance::route`),
+    // and this function's contract binds the packet's own owner.
     CaptureRoute::Capture => unsafe { C::capture_packet_payload(buf_ptr, offset, len) },
     CaptureRoute::Copy => {
       // A demux-delivered packet whose buffer libavformat also holds.
@@ -1301,7 +1329,8 @@ mod tests {
   #[test]
   fn a_real_payload_is_copied_out_whole() {
     let packet = Packet::copy(&[1u8, 2, 3, 4]);
-    // SAFETY: `packet` owns a live `AVPacket` for the call.
+    // SAFETY: `packet` owns a live `AVPacket` for the call; `CallerSupplied` is
+    // true of every packet, and the owned lane copies.
     let payload = unsafe {
       payload_of::<crate::Owned>(
         packet.as_ptr(),
@@ -1319,7 +1348,8 @@ mod tests {
     // The whole point of the amputation: FFmpeg's allocation is gone
     // and the bytes are still here.
     let packet = Packet::copy(&[9u8, 8, 7]);
-    // SAFETY: `packet` owns a live `AVPacket` for the call.
+    // SAFETY: `packet` owns a live `AVPacket` for the call; `CallerSupplied` is
+    // true of every packet, and the owned lane copies.
     let payload = unsafe {
       payload_of::<crate::Owned>(
         packet.as_ptr(),
@@ -1339,7 +1369,8 @@ mod tests {
   #[test]
   fn an_empty_packet_has_no_payload_rather_than_a_failure() {
     let packet = Packet::empty();
-    // SAFETY: `packet` owns a live `AVPacket` for the call.
+    // SAFETY: `packet` owns a live `AVPacket` for the call; `CallerSupplied` is
+    // true of every packet, and the owned lane copies.
     assert!(
       unsafe {
         payload_of::<crate::Owned>(
@@ -1362,7 +1393,8 @@ mod tests {
     unsafe {
       (*packet.as_mut_ptr()).size = 1 << 20;
     }
-    // SAFETY: `packet` owns a live `AVPacket` for the call.
+    // SAFETY: `packet` owns a live `AVPacket` for the call; `CallerSupplied` is
+    // true of every packet, and the owned lane copies.
     assert!(matches!(
       unsafe {
         payload_of::<crate::Owned>(

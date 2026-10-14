@@ -2528,7 +2528,10 @@ mod tests {
         let delay = resampler.delay();
         assert!(delay > 0, "the filter has to be holding something");
 
-        crate::fault_subprocess::cap_ffmpeg_allocations(1);
+        // SAFETY: in `in_subprocess`'s child, alone. The capped window runs one
+        // `send_frame`: libswresample and this crate's checked frame
+        // allocation.
+        unsafe { crate::fault_subprocess::cap_ffmpeg_allocations(1) };
         let refused = resampler.send_frame(&frame);
         crate::fault_subprocess::uncap_ffmpeg_allocations();
 
@@ -2575,7 +2578,10 @@ mod tests {
         let tail = resampler.delay();
         assert!(tail > 0, "there has to be a tail to lose");
 
-        crate::fault_subprocess::cap_ffmpeg_allocations(1);
+        // SAFETY: in `in_subprocess`'s child, alone. The capped window runs one
+        // `receive_frame`: libswresample and this crate's checked frame
+        // allocation.
+        unsafe { crate::fault_subprocess::cap_ffmpeg_allocations(1) };
         let refused = resampler.receive_frame(&mut dst);
         crate::fault_subprocess::uncap_ffmpeg_allocations();
 

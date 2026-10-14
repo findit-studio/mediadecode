@@ -174,26 +174,32 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierAudioStreamDecoder<C> {
     let state: *const crate::ffi::CallbackState = &*self._callback_state;
     let phase = self.phase();
     let decoder = &mut self.decoder;
-    boundary::with_ffmpeg_audio_packet::<C, _>(
-      packet,
-      self.limits.packet_limits(),
-      // Nothing on this road records what it is sent, so the
-      // packet really does die inside the call and its body may
-      // be shared.
-      crate::carrier::BodyRoute::Submission,
-      |av_pkt| {
-        // Funnel, then gate — the same two steps the receive road
-        // takes. A frame the allocator judge refused surfaces named,
-        // not as the `EINVAL` a corrupt file also produces; whatever
-        // survives the funnel is read for back pressure.
-        match decoder.send_packet(av_pkt) {
-          Ok(()) => Ok(Sent::Accepted),
-          Err(e) => {
-            crate::decoder::software_send(state, e, phase).map_err(AudioDecodeError::Decode)
-          }
-        }
-      },
-    )
+    // Funnel, then gate — the same two steps the receive road takes. A
+    // frame the allocator judge refused surfaces named, not as the
+    // `EINVAL` a corrupt file also produces; whatever survives the
+    // funnel is read for back pressure.
+    let submit = |av_pkt: &ffmpeg_next::Packet| match decoder.send_packet(av_pkt) {
+      Ok(()) => Ok(Sent::Accepted),
+      // SAFETY: `state` points into `self._callback_state`, the box this
+      // decoder keeps for as long as its codec context.
+      Err(e) => {
+        unsafe { crate::decoder::software_send(state, e, phase) }.map_err(AudioDecodeError::Decode)
+      }
+    };
+    // SAFETY: `submit` hands the packet to `avcodec_send_packet` (through
+    // `send_packet`) and returns; it neither clones nor keeps it, so a
+    // shared body never outlives this call.
+    unsafe {
+      boundary::with_ffmpeg_audio_packet::<C, _>(
+        packet,
+        self.limits.packet_limits(),
+        // Nothing on this road records what it is sent, so the
+        // packet really does die inside the call and its body may
+        // be shared.
+        crate::carrier::BodyRoute::Submission,
+        submit,
+      )
+    }
     .map_err(|e| AudioDecodeError::Decode(Error::PacketBuild(e)))?
   }
 
@@ -212,7 +218,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierAudioStreamDecoder<C> {
       // the protocol talking, so they leave through the `Ok` arm and
       // the errno never reaches the caller.
       if let Err(e) = self.decoder.receive_frame(&mut self.scratch) {
-        return crate::decoder::software_receive(state, e, phase).map_err(AudioDecodeError::Decode);
+        // SAFETY: `state` points into `self._callback_state`, the box this
+        // decoder keeps for as long as its codec context.
+        return unsafe { crate::decoder::software_receive(state, e, phase) }
+          .map_err(AudioDecodeError::Decode);
       }
     }
     // SAFETY: the scratch holds a frame — either one `receive_frame`
@@ -250,7 +259,11 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierAudioStreamDecoder<C> {
         self.eof = true;
         Ok(Sent::Accepted)
       }
-      Err(e) => crate::decoder::software_send(state, e, phase).map_err(AudioDecodeError::Decode),
+      // SAFETY: `state` points into `self._callback_state`, the box this
+      // decoder keeps for as long as its codec context.
+      Err(e) => {
+        unsafe { crate::decoder::software_send(state, e, phase) }.map_err(AudioDecodeError::Decode)
+      }
     }
   }
 

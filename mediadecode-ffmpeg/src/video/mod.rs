@@ -860,7 +860,12 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     // so a non-recoverable error surfaces as `FallbackFailed` (carrying the
     // replay packets) instead of being silently swallowed and the fallback
     // committed over corruption.
-    fn drain_into(
+    //
+    // # Safety
+    //
+    // `state` must be null or point at a `CallbackState` that stays live
+    // for the duration of the call — in practice `sw`'s own.
+    unsafe fn drain_into(
       sw: &mut ffmpeg_next::decoder::Video,
       state: *const crate::ffi::CallbackState,
       local_replay: &mut VecDeque<frame::Video>,
@@ -890,7 +895,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
           Err(ffmpeg_next::Error::Eof) => break,
           // Any other error is a genuine decode failure on a replayed
           // packet — surface it so it is not masked as a clean fallback.
-          Err(other) => return Err(crate::decoder::software_exit(state, other)),
+          //
+          // SAFETY: this function's own contract, forwarded.
+          Err(other) => return Err(unsafe { crate::decoder::software_exit(state, other) }),
         }
       }
       Ok(())
@@ -902,7 +909,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
         match sw.send_packet(pkt) {
           Ok(()) => break,
           Err(ffmpeg_next::Error::Other { errno }) if errno == ffmpeg_next::error::EAGAIN => {
-            drain_into(&mut sw, sw_state, &mut local_replay)?;
+            // SAFETY: `sw_state` is `sw`'s own callback state, and `sw`
+            // lives until the commit at the end of this function.
+            unsafe { drain_into(&mut sw, sw_state, &mut local_replay) }?;
             attempts += 1;
             if attempts > 16 {
               return Err(Error::Ffmpeg(ffmpeg_next::Error::Other {
@@ -910,7 +919,8 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
               }));
             }
           }
-          Err(other) => return Err(crate::decoder::software_exit(sw_state, other)),
+          // SAFETY: `sw_state` is `sw`'s own callback state, live here.
+          Err(other) => return Err(unsafe { crate::decoder::software_exit(sw_state, other) }),
         }
       }
     }
@@ -923,7 +933,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
         match sw.send_eof() {
           Ok(()) => break,
           Err(ffmpeg_next::Error::Other { errno }) if errno == ffmpeg_next::error::EAGAIN => {
-            drain_into(&mut sw, sw_state, &mut local_replay)?;
+            // SAFETY: `sw_state` is `sw`'s own callback state, and `sw`
+            // lives until the commit at the end of this function.
+            unsafe { drain_into(&mut sw, sw_state, &mut local_replay) }?;
             attempts += 1;
             if attempts > 16 {
               return Err(Error::Ffmpeg(ffmpeg_next::Error::Other {
@@ -931,7 +943,8 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
               }));
             }
           }
-          Err(other) => return Err(crate::decoder::software_exit(sw_state, other)),
+          // SAFETY: `sw_state` is `sw`'s own callback state, live here.
+          Err(other) => return Err(unsafe { crate::decoder::software_exit(sw_state, other) }),
         }
       }
     }
@@ -947,7 +960,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     // Draining to EAGAIN/EOF here forces any such error to surface now, so it is
     // wrapped as `FallbackFailed` (retaining the rescued packets) and the
     // decoder stays on HW — nothing is committed.
-    drain_into(&mut sw, sw_state, &mut local_replay)?;
+    // SAFETY: `sw_state` is `sw`'s own callback state, and `sw` is still
+    // here — it moves into `self.state` only below.
+    unsafe { drain_into(&mut sw, sw_state, &mut local_replay) }?;
     // Commit: only after replay, any EOF forwarding, AND the final drain
     // succeeded do we move the new SW decoder and queue into `self`.
     self.sw_replay_frames.append(&mut local_replay);
@@ -993,6 +1008,8 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     dst: &mut VideoFrame<mediadecode::PixelFormat, VideoFrameExtra, C::Buffer>,
   ) -> Result<Received, VideoDecodeError> {
     let av_frame = match &mut self.state {
+      // SAFETY: only a const pointer is read out of the frame; nothing
+      // `as_inner_mut`'s contract guards is touched.
       DecodeState::Hw(_) => unsafe { self.hw_scratch.as_inner_mut().as_ptr() },
       DecodeState::Sw(_) => unsafe { self.sw_scratch.as_ptr() },
     };
@@ -1147,7 +1164,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     // of its own (`decoder::try_clone_packet`), so nothing it hands back
     // addresses a carrier.
     let route = crate::carrier::BodyRoute::Submission;
-    boundary::with_ffmpeg_video_packet::<C, _>(packet, limits, route, |av_pkt| {
+    let submit = |av_pkt: &Packet| {
       match &mut self.state {
         DecodeState::Hw(hw) => match hw.send_packet(av_pkt) {
           // The seam already classified libavcodec's back pressure, so
@@ -1182,7 +1199,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
             if let DecodeState::Sw(sw) = &mut self.state {
               let st = sw.state();
               if let Err(e) = sw.send_packet(av_pkt) {
-                return crate::decoder::software_send(st, e, phase)
+                // SAFETY: `st` is `sw`'s own callback state, live while
+                // `sw` is.
+                return unsafe { crate::decoder::software_send(st, e, phase) }
                   .map_err(VideoDecodeError::Decode);
               }
             }
@@ -1196,12 +1215,22 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
             Ok(()) => Ok(Sent::Accepted),
             // Funnel, then gate: a refusal the allocator judge latched
             // comes back named, and back pressure is `MustDrain`.
-            Err(e) => crate::decoder::software_send(st, e, phase).map_err(VideoDecodeError::Decode),
+            //
+            // SAFETY: `st` is `sw`'s own callback state, live while `sw`
+            // is.
+            Err(e) => unsafe { crate::decoder::software_send(st, e, phase) }
+              .map_err(VideoDecodeError::Decode),
           }
         }
       }
-    })
-    .map_err(|e| VideoDecodeError::Decode(Error::PacketBuild(e)))?
+    };
+    // SAFETY: `submit` hands the packet to libavcodec's send (software, or
+    // the hardware session's) and to the hardware probe, whose history
+    // keeps deep copies (`decoder::try_clone_packet`); it neither clones
+    // the packet shallowly nor keeps it, so a shared body never outlives
+    // this call.
+    unsafe { boundary::with_ffmpeg_video_packet::<C, _>(packet, limits, route, submit) }
+      .map_err(|e| VideoDecodeError::Decode(Error::PacketBuild(e)))?
   }
 
   pub(crate) fn receive_frame_impl(
@@ -1347,7 +1376,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
             // `EAGAIN` is `NeedsInput`, `Eof` is `Ended`, and the errno
             // stops inside this crate either way.
             Err(e) => {
-              return crate::decoder::software_receive(st, e, phase)
+              // SAFETY: `st` is `sw`'s own callback state, live while
+              // `sw` is.
+              return unsafe { crate::decoder::software_receive(st, e, phase) }
                 .map_err(VideoDecodeError::Decode);
             }
           }
@@ -1405,7 +1436,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
         let st = sw.state();
         match sw.send_eof() {
           Ok(()) => Ok(Sent::Accepted),
-          Err(e) => crate::decoder::software_send(st, e, phase).map_err(VideoDecodeError::Decode),
+          // SAFETY: `st` is `sw`'s own callback state, live while `sw` is.
+          Err(e) => {
+            unsafe { crate::decoder::software_send(st, e, phase) }.map_err(VideoDecodeError::Decode)
+          }
         }
       }
     };
