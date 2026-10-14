@@ -11,6 +11,21 @@ The backend-agnostic core it adapts has its own log at
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-10-10
+
+Tracks `mediadecode` 0.18.0, whose `PacketFlags` names `DISPOSABLE` (see
+[`mediadecode` 0.18.0](../mediadecode/CHANGELOG.md#0180)). The three crates
+release in lockstep.
+
+### Changed (BREAKING)
+
+- **`mediadecode` 0.17 → 0.18.** WebCodecs has no counterpart to
+  `PacketFlags::DISPOSABLE`: an `EncodedVideoChunk` is `key` or `delta` and
+  nothing more. The flag is therefore not passed into a chunk, and this
+  backend, which demuxes nothing, never sets it. (On the FFmpeg backend,
+  libavformat 9.0.1 sets it from MP4/MOV `sdtp` alone; a Matroska packet
+  reads absent, which means unknown.)
+
 ## [0.17.0] - 2026-10-10
 
 Tracks `mediadecode` 0.17.0, which crosses `mediatime` 0.4 → 0.5 and

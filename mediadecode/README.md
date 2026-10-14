@@ -140,7 +140,7 @@ parameter is generic, so this crate names no channel type at all.
 
 ```toml
 [dependencies]
-mediadecode = { version = "0.17", default-features = false, features = ["alloc"] }
+mediadecode = { version = "0.18", default-features = false, features = ["alloc"] }
 ```
 
 ## Usage
