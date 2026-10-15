@@ -46,7 +46,17 @@ fi
 
 case "$VARIANT" in
   full)
-    ./configure "${common[@]}" \
+    # x264, x265 and libvpx are found through pkg-config; configure finds
+    # libmp3lame by its header and its library instead, and Apple's
+    # compiler does not search Homebrew's prefix on its own.
+    extra=()
+    if command -v brew > /dev/null; then
+      brew_prefix="$(brew --prefix)"
+      extra+=(--extra-cflags="-I$brew_prefix/include" --extra-ldflags="-L$brew_prefix/lib")
+    fi
+    # `${extra[@]+...}`: an empty array under `set -u` is an error in the
+    # bash 3.2 macOS ships as /bin/bash.
+    ./configure "${common[@]}" ${extra[@]+"${extra[@]}"} \
       --enable-gpl \
       --enable-libx264 \
       --enable-libx265 \
