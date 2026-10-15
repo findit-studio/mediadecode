@@ -1,5 +1,7 @@
-use alloc::{format, string::String, vec::Vec};
 use core::num::NonZeroI32;
+use std::{format, vec::Vec};
+
+use smol_bytes::{Utf8Bytes, Utf8BytesMut, format_utf8bytes};
 
 use super::{json::Value, *};
 use crate::{
@@ -20,7 +22,7 @@ fn clip(name: &str, start: i64, end: i64) -> Clip {
   Clip::new(
     ClipId::new(name),
     name,
-    MediaRef::new(format!("file:///{name}.mov")),
+    MediaRef::new(format_utf8bytes!("file:///{name}.mov")),
     TimeRange::new(0, end - start, edit()),
     TimeRange::new(start, end, edit()),
   )
@@ -138,7 +140,7 @@ fn a_dissolve_sits_between_the_two_clips_it_joins() {
   );
   assert_eq!(
     to_otio(&timeline, OtioTarget::V0_15Plus),
-    Err(Refused::Validation(alloc::vec![Refusal::HandleMissing(
+    Err(Refused::Validation(std::vec![Refusal::HandleMissing(
       crate::EdgeAt::new(crate::ClipAt::new(0, 1), crate::Edge::In)
     )]))
   );
@@ -189,7 +191,7 @@ fn a_timeline_that_does_not_validate_is_refused_with_its_refusals() {
   );
   assert_eq!(
     to_otio(&timeline, OtioTarget::Legacy),
-    Err(Refused::Validation(alloc::vec![Refusal::Overlap(
+    Err(Refused::Validation(std::vec![Refusal::Overlap(
       crate::ClipPair::new(0, 0, 1)
     )]))
   );
@@ -317,9 +319,9 @@ fn a_source_off_the_edit_rate_is_not_exported() {
   let half = one_source(Rate::FPS_24, 1, TimeRange::new(0, 1, tb(1, 48)), None);
   assert_eq!(
     to_otio(&half, OtioTarget::V0_15Plus),
-    Err(Refused::Validation(alloc::vec![
-      Refusal::SourceOffEditRate(crate::ClipAt::new(0, 0))
-    ]))
+    Err(Refused::Validation(std::vec![Refusal::SourceOffEditRate(
+      crate::ClipAt::new(0, 0)
+    )]))
   );
 }
 
@@ -398,7 +400,7 @@ fn a_count_the_export_writes_is_refused_before_any_search() {
   };
   assert_eq!(refusal.searched(), None);
   assert!(
-    alloc::string::ToString::to_string(&refusal).ends_with("does not hold exactly"),
+    std::string::ToString::to_string(&refusal).ends_with("does not hold exactly"),
     "{refusal}"
   );
 }
@@ -528,7 +530,7 @@ fn a_media_range_no_ruler_holds_is_refused() {
 }
 
 /// Every object inside `value` naming `schema`.
-fn named<'a>(value: &'a Value, schema: &str, out: &mut Vec<&'a [(String, Value)]>) {
+fn named<'a>(value: &'a Value, schema: &str, out: &mut Vec<&'a [(Utf8Bytes, Value)]>) {
   match value {
     Value::Object(members) => {
       if members
@@ -547,7 +549,7 @@ fn named<'a>(value: &'a Value, schema: &str, out: &mut Vec<&'a [(String, Value)]
 }
 
 /// The text a JSON number was written as.
-fn spelled<'a>(members: &'a [(String, Value)], key: &str) -> &'a str {
+fn spelled<'a>(members: &'a [(Utf8Bytes, Value)], key: &str) -> &'a str {
   match members.iter().find(|(k, _)| k == key) {
     Some((_, Value::Number(text))) => text,
     other => panic!("{key}: {other:?}"),
@@ -557,8 +559,8 @@ fn spelled<'a>(members: &'a [(String, Value)], key: &str) -> &'a str {
 #[test]
 fn every_count_in_the_goldens_is_one_an_f64_holds_exactly() {
   for golden in [
-    include_str!("../../tests/golden/law.v0_15.otio"),
-    include_str!("../../tests/golden/law.legacy.otio"),
+    include_str!("../../../tests/golden/law.v0_15.otio"),
+    include_str!("../../../tests/golden/law.legacy.otio"),
   ] {
     let root = json::parse(golden).unwrap();
     let mut times = Vec::new();
@@ -606,7 +608,7 @@ fn every_count_in_the_goldens_is_one_an_f64_holds_exactly() {
 
 #[test]
 fn a_refusal_to_export_says_why() {
-  let shown = |refused: Refused| alloc::string::ToString::to_string(&refused);
+  let shown = |refused: Refused| std::string::ToString::to_string(&refused);
   // A count the export would write: refused before any walk, no search
   // made for it.
   assert_eq!(
@@ -635,7 +637,7 @@ fn a_refusal_to_export_says_why() {
      64 coarsest whole rates below its plan's that hold it"
   );
   assert_eq!(
-    alloc::string::ToString::to_string(&RulerSearch { walks: 1 }),
+    std::string::ToString::to_string(&RulerSearch { walks: 1 }),
     "the one plan the bounded search walked, trying each clip in its plan's ruler, every ruler \
      the timeline's operands are counted in that holds it, the 64 finest whole rates below its \
      plan's that hold it, and the 64 coarsest whole rates below its plan's that hold it"
@@ -666,14 +668,14 @@ fn a_refusal_to_export_says_why() {
      bounded search's bands, so the search walked no plan"
   );
   assert_eq!(
-    shown(Refused::Validation(alloc::vec![
+    shown(Refused::Validation(std::vec![
       Refusal::RateUnstated,
       Refusal::EmptyRecord(ClipAt::new(0, 1)),
     ])),
     "the timeline does not validate: the edit rate is zero; track 0, clip 1: the record covers \
      no time"
   );
-  let spot = |at: Spot| alloc::string::ToString::to_string(&at);
+  let spot = |at: Spot| std::string::ToString::to_string(&at);
   assert_eq!(spot(Spot::Start), "the start");
   assert_eq!(
     spot(Spot::Available(ClipAt::new(1, 2))),
@@ -854,7 +856,7 @@ fn required_by_readers(schema: &str, target: OtioTarget) -> &'static [&'static s
 /// One step from a value to one inside it.
 #[derive(Clone)]
 enum Step {
-  Key(String),
+  Key(Utf8Bytes),
   At(usize),
 }
 
@@ -864,7 +866,7 @@ fn schema_objects(
   value: &Value,
   path: &str,
   steps: &[Step],
-  out: &mut Vec<(String, Vec<Step>, String, Vec<String>)>,
+  out: &mut Vec<(Utf8Bytes, Vec<Step>, Utf8Bytes, Vec<Utf8Bytes>)>,
 ) {
   match value {
     Value::Object(members) => {
@@ -879,9 +881,9 @@ fn schema_objects(
           .filter(|key| key != "OTIO_SCHEMA")
           .collect();
         out.push((
-          String::from(path),
+          Utf8Bytes::from(path),
           steps.to_vec(),
-          String::from(schema),
+          Utf8Bytes::from(schema),
           keys,
         ));
       }
@@ -903,7 +905,7 @@ fn schema_objects(
 }
 
 /// `root` with `key` taken out of the object `steps` lead to, written out.
-fn without(root: &Value, steps: &[Step], key: &str) -> String {
+fn without(root: &Value, steps: &[Step], key: &str) -> Utf8Bytes {
   let mut root = root.clone();
   let mut at = &mut root;
   for step in steps {
@@ -923,9 +925,9 @@ fn without(root: &Value, steps: &[Step], key: &str) -> String {
     unreachable!()
   };
   members.retain(|(member, _)| member != key);
-  let mut text = String::new();
+  let mut text = Utf8BytesMut::new();
   json::write_pretty(&root, &mut text);
-  text
+  text.freeze_shared()
 }
 
 #[test]
@@ -937,11 +939,11 @@ fn the_self_check_requires_exactly_what_the_targets_readers_require() {
   for (target, golden) in [
     (
       OtioTarget::V0_15Plus,
-      include_str!("../../tests/golden/law.v0_15.otio"),
+      include_str!("../../../tests/golden/law.v0_15.otio"),
     ),
     (
       OtioTarget::Legacy,
-      include_str!("../../tests/golden/law.legacy.otio"),
+      include_str!("../../../tests/golden/law.legacy.otio"),
     ),
   ] {
     let root = json::parse(golden).unwrap();
@@ -957,7 +959,7 @@ fn the_self_check_requires_exactly_what_the_targets_readers_require() {
         assert_eq!(
           verdict,
           Err(Invalid::Shape(Shape {
-            path: format!("{path}.{key}"),
+            path: format_utf8bytes!("{path}.{key}"),
             expected: "a required key",
           })),
           "{target:?}: {schema} at {path} without {key}"
@@ -1041,7 +1043,7 @@ fn a_document_that_is_not_json_is_refused_as_syntax() {
     }))
   );
   assert_eq!(
-    alloc::string::ToString::to_string(&validate_json("[", OtioTarget::Legacy).unwrap_err()),
+    std::string::ToString::to_string(&validate_json("[", OtioTarget::Legacy).unwrap_err()),
     "byte 1: expected a value"
   );
 }

@@ -1,5 +1,6 @@
 //! The law timeline's OpenTimelineIO, against goldens predicted by hand
 //! before the export existed.
+#![cfg(any(feature = "std", feature = "alloc"))]
 
 mod common;
 

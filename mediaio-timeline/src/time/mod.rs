@@ -1,12 +1,13 @@
-//! Time, as `mediatime` 0.5.1 counts it.
+//! Time, as `mediatime` 0.5 counts it.
 //!
 //! The crate does no time arithmetic of its own. Every comparison, sum,
 //! measure and recount is one of `mediatime`'s, exact across timebases
 //! unless it names a rounding:
 //!
-//! | what the crate needs | `mediatime` 0.5.1 |
+//! | what the crate needs | `mediatime` 0.5 |
 //! |---|---|
 //! | instants compared across timebases: order, overlap, a cut both records share | `Timestamp`'s `Ord` and `Eq` (`cmp_semantic`) |
+//! | lengths compared across timebases: a fade's in a diff, the longer of two blends | `Duration::cmp_semantic` |
 //! | a source range inside its available range | `TimeRange::contains` |
 //! | a source's length at the edit rate, exactly, or refused | `Duration::checked_rescale_with(_, Rounding::Exact)`, and `checked_rescale_to` to tell a length between ticks from one too long to count |
 //! | handles and blends summed across timebases | `ExactSeconds` |
@@ -17,6 +18,10 @@
 //! | a range's length, or none past `i64::MAX` ticks | `TimeRange::span`, exact and total; the bound is this crate's ([`span`]) |
 //! | what OpenTimelineIO derives from an exported document, exactly: its sums, the longest track, and a range's last tick | `ExactSeconds` (`from_timestamp`, `checked_add`, `checked_sub`, `Ord`) |
 //! | a time counted in a ruler as an exact fraction of a tick, which the export holds every derived value by — `ExactSeconds` reads back only to a whole tick | `Rate::checked_count` |
+//!
+//! `TimeRange::span`, `TimeRange::coarsest_whole_rate` and
+//! `Rate::checked_count` arrived in `mediatime` 0.5.1, so the crate builds on
+//! 0.5.1 and later.
 //!
 //! The export also computes OpenTimelineIO's own `f64` arithmetic, operation
 //! for operation, to find a count OpenTimelineIO would round. That is

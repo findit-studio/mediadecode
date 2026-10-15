@@ -76,8 +76,8 @@
 //! bookkeeping — an attachment already handed out is never handed out
 //! again, and one not yet handed out is still owed.
 
-use std::collections::{TryReserveError, VecDeque};
 use std::{
+  collections::{TryReserveError, VecDeque},
   ffi::{CStr, CString, c_int},
   io::{Read, Seek},
   num::NonZeroI32,

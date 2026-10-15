@@ -1,8 +1,11 @@
 //! The timeline and its tracks.
 
-use alloc::{string::String, vec::Vec};
+use std::vec::Vec;
 
 use mediatime::{Rate, Timebase, Timestamp};
+use smol_bytes::Utf8Bytes;
+
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
 use crate::{Clip, Metadata, Schema, Transition};
@@ -21,14 +24,15 @@ use crate::{Clip, Metadata, Schema, Transition};
 ///
 /// On the wire the document's first field is [`schema`](Self::schema), and
 /// a field this reader does not know is refused by name.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 pub struct Timeline {
   schema: Schema,
-  name: String,
-  #[serde(deserialize_with = "crate::wire::rate")]
+  name: Utf8Bytes,
+  #[cfg_attr(feature = "serde", serde(deserialize_with = "crate::wire::rate"))]
   rate: Rate,
-  #[serde(deserialize_with = "crate::wire::timestamp")]
+  #[cfg_attr(feature = "serde", serde(deserialize_with = "crate::wire::timestamp"))]
   start: Timestamp,
   metadata: Metadata,
   tracks: Vec<Track>,
@@ -40,7 +44,7 @@ impl Timeline {
   ///
   /// The start is counted at `rate`; for a rate of zero, which
   /// [`validate`](fn@crate::validate) refuses, it is counted in `1/1`.
-  pub fn new(name: impl Into<String>, rate: Rate) -> Self {
+  pub fn new(name: impl Into<Utf8Bytes>, rate: Rate) -> Self {
     let ruler = rate.checked_to_timebase().unwrap_or_default();
     Self {
       schema: Schema::V1,
@@ -58,7 +62,7 @@ impl Timeline {
   }
 
   /// The timeline's name.
-  pub const fn name(&self) -> &str {
+  pub fn name(&self) -> &str {
     self.name.as_str()
   }
 
@@ -94,12 +98,17 @@ impl Timeline {
   }
 
   /// The tracks, for editing in place.
+  pub const fn tracks_mut_slice(&mut self) -> &mut [Track] {
+    self.tracks.as_mut_slice()
+  }
+
+  /// The tracks, for editing in place as a `Vec<Track>`.
   pub const fn tracks_mut(&mut self) -> &mut Vec<Track> {
     &mut self.tracks
   }
 
   /// Renames the timeline in place.
-  pub fn set_name(&mut self, name: impl Into<String>) -> &mut Self {
+  pub fn set_name(&mut self, name: impl Into<Utf8Bytes>) -> &mut Self {
     self.name = name.into();
     self
   }
@@ -138,15 +147,29 @@ impl Timeline {
     self.tracks.push(track);
     self
   }
+
+  /// Replaces the tracks, replacing any existing ones (consuming builder).
+  #[must_use]
+  pub fn with_tracks(mut self, tracks: impl Into<Vec<Track>>) -> Self {
+    self.tracks = tracks.into();
+    self
+  }
+
+  /// Sets the tracks, replacing any existing ones, in place.
+  pub fn set_tracks(&mut self, tracks: impl Into<Vec<Track>>) -> &mut Self {
+    self.tracks = tracks.into();
+    self
+  }
 }
 
 /// One layer of a timeline: clips of one kind of medium, in record order,
 /// and the transitions between them.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 pub struct Track {
   kind: TrackKind,
-  name: String,
+  name: Utf8Bytes,
   enabled: bool,
   clips: Vec<Clip>,
   transitions: Vec<Transition>,
@@ -154,7 +177,7 @@ pub struct Track {
 
 impl Track {
   /// An empty, enabled track of `kind`.
-  pub fn new(kind: TrackKind, name: impl Into<String>) -> Self {
+  pub fn new(kind: TrackKind, name: impl Into<Utf8Bytes>) -> Self {
     Self {
       kind,
       name: name.into(),
@@ -170,7 +193,7 @@ impl Track {
   }
 
   /// The track's name.
-  pub const fn name(&self) -> &str {
+  pub fn name(&self) -> &str {
     self.name.as_str()
   }
 
@@ -201,7 +224,7 @@ impl Track {
   }
 
   /// Renames the track in place.
-  pub fn set_name(&mut self, name: impl Into<String>) -> &mut Self {
+  pub fn set_name(&mut self, name: impl Into<Utf8Bytes>) -> &mut Self {
     self.name = name.into();
     self
   }
@@ -237,12 +260,15 @@ impl Track {
 /// The kind of medium a track carries.
 ///
 /// Marked `#[non_exhaustive]`: a later kind joins as a variant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, derive_more::IsVariant, derive_more::Display)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 #[non_exhaustive]
 pub enum TrackKind {
   /// Pictures.
+  #[display("video")]
   Video,
   /// Sound.
+  #[display("audio")]
   Audio,
 }

@@ -7,6 +7,44 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Its versions are its own: they do not move with `mediadecode`'s.
 
+## [0.2.0] - unreleased
+
+### Changed
+
+- **BREAKING: text is `smol_bytes::Utf8Bytes`, not `String`, in every
+  public signature.** `Timeline::new`, `Track::new`, `Clip::new`,
+  `ClipId::new` and `MediaRef::new`, and the `set_name` and `set_locator`
+  setters, take `impl Into<Utf8Bytes>` — a `&str` or a `String` still
+  converts; `MediaRef::with_reel` and `MediaRef::set_reel` take an
+  `Option<Utf8Bytes>`; `Metadata::insert`, `Metadata::with` and
+  `Metadata`'s `FromIterator` take `impl Into<Utf8Bytes>` keys and values,
+  and `Metadata::insert` and `Metadata::remove` return the
+  `Option<Utf8Bytes>` they displaced; `otio::to_otio` returns the document
+  as a `Utf8Bytes`. The getters still lend a `&str`, but `Timeline::name`,
+  `Track::name`, `Clip::name`, `ClipId::as_str`, `MediaRef::locator` and
+  `MediaRef::reel` are no longer `const fn`.
+- **BREAKING: `serde` is an opt-in feature.** Without it the model has no
+  `Serialize` or `Deserialize`. With it the document is 0.1.1's, byte for
+  byte: the same timeline writes the same JSON, and each version reads the
+  other's documents.
+- **BREAKING: the crate has features** — `std` (the default), `alloc` and
+  `serde` — where 0.1 had none and was always `no_std` + `alloc`. It is
+  `#![no_std]` in every tier: `default-features = false, features =
+  ["alloc"]` is 0.1's build, and on `core` alone (neither `std` nor
+  `alloc`) it exports only the time words it re-exports from `mediatime`.
+  `std` gives what `alloc` gives, on the `std` builds of its dependencies.
+
+### Added
+
+- `Display` and `IsVariant` (`is_*` predicates), through `derive_more`, on
+  `FadeShape` (`linear`, `equal_power`), `TrackKind` (`video`, `audio`),
+  `ChangeKind` (`added`, `removed`, `moved`, `retimed`, `regained`,
+  `enabled_flipped`, `renamed`, `relinked`) and `Edge` (`in`, `out`).
+- `Gain: PartialOrd`; `Gain` is `#[repr(transparent)]` over its `f32`.
+- `Timeline::tracks_mut_slice`, `Timeline::with_tracks` and
+  `Timeline::set_tracks`; `Delta::changes` and `Delta::is_empty` are
+  `const fn`.
+
 ## [0.1.1] - 2026-10-10
 
 ### Changed

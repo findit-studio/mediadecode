@@ -1,7 +1,7 @@
 //! A valid timeline laid out: each track's clips at their records, and the
 //! gaps between them.
 
-use alloc::vec::Vec;
+use std::vec::Vec;
 
 use mediatime::TimeRange;
 

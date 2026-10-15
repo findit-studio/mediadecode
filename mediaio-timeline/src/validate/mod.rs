@@ -1,10 +1,10 @@
 //! Judging a timeline: every refusal by name, with where it is.
 
-use alloc::{
+use core::{cmp::Ordering, fmt};
+use std::{
   collections::{BTreeMap, btree_map::Entry},
   vec::Vec,
 };
-use core::{cmp::Ordering, fmt};
 
 use mediatime::{Duration, ExactSeconds, Rounding, Timebase, Timestamp};
 
@@ -595,13 +595,26 @@ impl fmt::Display for TransitionAt {
 }
 
 /// One of a clip's two edges.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+  Debug,
+  Clone,
+  Copy,
+  PartialEq,
+  Eq,
+  Hash,
+  PartialOrd,
+  Ord,
+  derive_more::Display,
+  derive_more::IsVariant,
+)]
 pub enum Edge {
   /// The clip's start: where a fade-in runs, and where a transition into the
   /// clip plays the media before its source range.
+  #[display("in")]
   In,
   /// The clip's end: where a fade-out runs, and where a transition out of
   /// the clip plays the media after its source range.
+  #[display("out")]
   Out,
 }
 
