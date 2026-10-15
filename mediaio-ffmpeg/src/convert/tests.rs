@@ -581,3 +581,96 @@ fn hdr_seats_are_found_by_kind_among_unrelated_side_data() {
   assert_eq!(cll.max_cll(), 500);
   assert_eq!(cll.max_fall(), 100);
 }
+
+/// **A custom channel map reaching the safe conversion is refused
+/// unread.** Safe `ffmpeg_next` code can give a frame a `CUSTOM` layout
+/// whose map points at nothing; walking it would read out of bounds
+/// through a safe call. The refusal is by name, and the worker — the
+/// only code that walks a map — is never entered: the probe's tripwire
+/// would stop it at the door before it touched the frame.
+#[test]
+fn a_dangling_custom_map_is_refused_by_the_safe_conversion_unread() {
+  use ffmpeg_next::ffi::{AVChannelCustom, AVChannelOrder};
+
+  let mut frame = ffmpeg_next::frame::Audio::empty();
+  // SAFETY: reading the pointer of a live frame.
+  let raw = unsafe { frame.as_mut_ptr() };
+  // SAFETY: `raw` is the live frame. Its empty layout owns nothing, so
+  // overwriting the fields leaks nothing; the map is a dangling,
+  // well-aligned address that nothing here reads.
+  unsafe {
+    (*raw).ch_layout.order = AVChannelOrder::AV_CHANNEL_ORDER_CUSTOM;
+    (*raw).ch_layout.nb_channels = 1;
+    (*raw).ch_layout.u.map = core::ptr::NonNull::<AVChannelCustom>::dangling().as_ptr();
+  }
+
+  let before = worker_probe::entries();
+  worker_probe::arm(true);
+  let result = audio_frame_from(&frame, Timebase::default(), FrameLimits::default());
+  worker_probe::arm(false);
+  let entered = worker_probe::entries() - before;
+
+  // SAFETY: as above. The frame goes back to an empty layout before it
+  // drops, or `av_frame_free` would free the dangling map.
+  unsafe {
+    (*raw).ch_layout.order = AVChannelOrder::AV_CHANNEL_ORDER_UNSPEC;
+    (*raw).ch_layout.nb_channels = 0;
+    (*raw).ch_layout.u.mask = 0;
+  }
+
+  assert_eq!(entered, 0, "the safe road must not enter the worker");
+  assert!(
+    matches!(result, Err(ConvertError::UnverifiableChannelMap(p)) if p.channels() == 1),
+    "a custom map is refused by name, got {:?}",
+    result.as_ref().err(),
+  );
+}
+
+/// **A custom map libavcodec allocated still converts — on the road
+/// whose caller vouches for it.** `av_channel_layout_custom_init` sizes
+/// the map for `nb_channels` entries, which is the shape every
+/// decoder's frame carries. The safe road refuses this frame too: it
+/// cannot tell an honest map from a forged one.
+#[test]
+fn a_libavcodec_owned_custom_layout_converts_through_the_unsafe_entry() {
+  use ffmpeg_next::{
+    ChannelLayout,
+    ffi::{AVChannel, av_channel_layout_custom_init, av_channel_layout_uninit},
+    format::{Sample, sample::Type},
+  };
+
+  let mut frame =
+    ffmpeg_next::frame::Audio::new(Sample::F32(Type::Planar), 64, ChannelLayout::STEREO);
+  // SAFETY: reading the pointer of a live frame.
+  let raw = unsafe { frame.as_mut_ptr() };
+  // SAFETY: `raw` is the live frame. Its stereo layout is released by
+  // FFmpeg's own uninit, and the custom one is allocated by FFmpeg for
+  // exactly two entries, both written in bounds.
+  unsafe {
+    av_channel_layout_uninit(&raw mut (*raw).ch_layout);
+    assert_eq!(
+      av_channel_layout_custom_init(&raw mut (*raw).ch_layout, 2),
+      0
+    );
+    (*(*raw).ch_layout.u.map).id = AVChannel::AV_CHAN_FRONT_LEFT;
+    (*(*raw).ch_layout.u.map.add(1)).id = AVChannel::AV_CHAN_FRONT_RIGHT;
+  }
+
+  assert!(matches!(
+    audio_frame_from(&frame, Timebase::default(), FrameLimits::default()),
+    Err(ConvertError::UnverifiableChannelMap(p)) if p.channels() == 2
+  ));
+
+  // SAFETY: the frame is live for the call, its custom map holds the
+  // two entries FFmpeg allocated for it, and the owned lane copies.
+  let converted = unsafe {
+    av_frame_to_audio_frame_as::<crate::Owned>(
+      frame.as_ptr(),
+      Timebase::default(),
+      FrameLimits::default(),
+    )
+  }
+  .expect("a custom map FFmpeg sized converts");
+  assert_eq!(converted.channel_count(), 2);
+  assert_eq!(converted.channel_layout().channels(), 2);
+}

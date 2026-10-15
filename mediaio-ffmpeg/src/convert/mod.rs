@@ -336,6 +336,47 @@ impl core::fmt::Display for MalformedChannelLayout {
   }
 }
 
+/// Payload for [`ConvertError::UnverifiableChannelMap`].
+///
+/// A frame reached the **safe** conversion, [`audio_frame_from`], with a
+/// custom channel layout. `ffmpeg_next`'s safe frame and channel-layout
+/// types let safe code point `u.map` at fewer entries than `nb_channels`,
+/// at a dangling address, or at something misaligned, and neither the
+/// map's provenance nor its extent can be observed from the pointer — the
+/// walk that would check it is itself the out-of-bounds read. So the safe
+/// road refuses the layout without reading the map, and the map is walked
+/// only on the `unsafe` road, whose caller vouches for it (a frame
+/// libavcodec filled, as the decoders' frames are). Structural, and
+/// therefore permanent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnverifiableChannelMap {
+  channels: i32,
+}
+
+impl UnverifiableChannelMap {
+  /// Constructs an `UnverifiableChannelMap` payload.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn new(channels: i32) -> Self {
+    Self { channels }
+  }
+  /// `nb_channels`, as the layout declared it.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn channels(&self) -> i32 {
+    self.channels
+  }
+}
+
+impl core::fmt::Display for UnverifiableChannelMap {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    write!(
+      f,
+      "convert: a custom channel layout declaring {} channels reached the safe conversion, \
+       which cannot verify that its map has that many entries",
+      self.channels,
+    )
+  }
+}
+
 /// Payload for [`ConvertError::CarrierAllocFailed`].
 ///
 /// The plane's extent was proved and the carrier still could not be
@@ -759,6 +800,10 @@ pub enum ConvertError {
   /// A frame's custom channel layout cannot be described — structural,
   /// and therefore permanent. See [`MalformedChannelLayout`].
   MalformedChannelLayout(MalformedChannelLayout),
+  /// A custom channel layout reached the safe conversion, which cannot
+  /// verify its map and so refuses it unread. See
+  /// [`UnverifiableChannelMap`].
+  UnverifiableChannelMap(UnverifiableChannelMap),
 }
 
 impl core::fmt::Display for ConvertError {
@@ -778,6 +823,7 @@ impl core::fmt::Display for ConvertError {
       Self::BufferAcquireFailed(p) => core::fmt::Display::fmt(p, f),
       Self::CarrierAllocFailed(p) => core::fmt::Display::fmt(p, f),
       Self::MalformedChannelLayout(p) => core::fmt::Display::fmt(p, f),
+      Self::UnverifiableChannelMap(p) => core::fmt::Display::fmt(p, f),
     }
   }
 }
@@ -852,6 +898,13 @@ pub fn video_frame_from(
 /// out. A caller holding an `AVFrame` of their own can use the `unsafe`
 /// entry point below, whose contract names the obligation this
 /// signature cannot express.
+///
+/// **A custom channel layout is refused, unread**, as
+/// [`ConvertError::UnverifiableChannelMap`]. `ffmpeg_next` lets safe code
+/// point a layout's `u.map` at fewer entries than it declares, or at
+/// nothing, so walking the map from here could read out of bounds
+/// through a safe call. The map is walked only on the `unsafe` entry,
+/// whose caller vouches for it.
 pub fn audio_frame_from(
   frame: &ffmpeg_next::frame::Audio,
   time_base: Timebase,
@@ -860,9 +913,33 @@ pub fn audio_frame_from(
   AudioFrame<SampleFormat, ChannelLayoutDescription, AudioFrameExtra, FfmpegBytes>,
   ConvertError,
 > {
+  // SAFETY: reading the pointer, not dereferencing it.
+  let av_frame = unsafe { frame.as_ptr() };
+  // SAFETY: `frame` is a live borrow, so `av_frame` is a live
+  // `*const AVFrame`. `addr_of!` reaches `ch_layout.order` without
+  // forming a reference, and it is read as the `i32` its bindgen enum is
+  // stored as — the field may hold a value no variant names.
+  // `nb_channels` is a plain `c_int`. Nothing else is read, and the map
+  // is not touched.
+  let (order, channels) = unsafe {
+    (
+      core::ptr::read_unaligned(core::ptr::addr_of!((*av_frame).ch_layout.order).cast::<i32>()),
+      (*av_frame).ch_layout.nb_channels,
+    )
+  };
+  if matches!(
+    crate::channel_layout::channel_order_from_raw(order),
+    mediaframe::audio::ChannelOrder::Custom
+  ) {
+    return Err(ConvertError::UnverifiableChannelMap(
+      UnverifiableChannelMap::new(channels),
+    ));
+  }
   // SAFETY: `&frame` keeps the AVFrame alive for the duration of this
-  // call, and the owned lane copies what it reads.
-  unsafe { av_frame_to_audio_frame_as::<crate::Owned>(frame.as_ptr(), time_base, limits) }
+  // call, and the owned lane copies what it reads. The layout is not a
+  // custom one (refused above), so the worker reads no channel map and
+  // its map clause has nothing to ask.
+  unsafe { av_frame_to_audio_frame_as::<crate::Owned>(av_frame, time_base, limits) }
 }
 
 /// Safe wrapper around [`av_subtitle_to_subtitle_frame`] taking a
@@ -2345,6 +2422,13 @@ fn map_chroma_loc(raw: i32) -> ChromaLocation {
 /// `AVSampleFormat`, `nb_samples > 0`, and `data[]` / `buf[]`
 /// populated). The frame's buffers are neither consumed nor
 /// referenced; every byte the produced `AudioFrame` carries is a copy.
+/// * **if `ch_layout.order` is `AV_CHANNEL_ORDER_CUSTOM`, `ch_layout.u.map`
+///   must point at `nb_channels` initialised `AVChannelCustom` entries**,
+///   which this function walks. That is true of a frame libavcodec
+///   filled — it copies the codec's layout with `av_channel_layout_copy`,
+///   which allocates and sizes the map — and it is not something a safe
+///   caller can promise, which is why the safe [`audio_frame_from`]
+///   refuses a custom layout instead of calling this.
 /// * no handle capable of **mutating** the frame's buffers may
 ///   outlive this call while the returned carriers do. On the view
 ///   lane a plane is a window into `frame`'s own allocation, and
@@ -2362,6 +2446,12 @@ pub unsafe fn av_frame_to_audio_frame_as<C: crate::FfmpegCarrier + crate::Carrie
   AudioFrame<SampleFormat, ChannelLayoutDescription, AudioFrameExtra, C::Buffer>,
   ConvertError,
 > {
+  #[cfg(test)]
+  if worker_probe::enter() {
+    // A law armed the tripwire to prove this worker is never entered on
+    // its road; a run that gets here leaves before touching the frame.
+    return Err(ConvertError::NullFrame);
+  }
   if av_frame.is_null() {
     return Err(ConvertError::NullFrame);
   }
@@ -3060,6 +3150,36 @@ fn map_picture_type_raw(raw: i32) -> PictureType {
   }
 }
 
+/// Counts entries into the audio worker on the current thread, and
+/// stops the worker at its door when a law arms it — so a law can prove
+/// a road never enters the worker without letting a broken road execute
+/// the read the law is about.
+#[cfg(test)]
+pub(crate) mod worker_probe {
+  use core::cell::Cell;
+
+  std::thread_local! {
+    static ENTRIES: Cell<u32> = const { Cell::new(0) };
+    static ARMED: Cell<bool> = const { Cell::new(false) };
+  }
+
+  /// Entries into the worker on this thread so far.
+  pub(crate) fn entries() -> u32 {
+    ENTRIES.with(Cell::get)
+  }
+
+  /// Arms or disarms the tripwire on this thread.
+  pub(crate) fn arm(on: bool) {
+    ARMED.with(|armed| armed.set(on));
+  }
+
+  /// Counts an entry and answers whether the worker must stop here.
+  pub(crate) fn enter() -> bool {
+    ENTRIES.with(|entries| entries.set(entries.get() + 1));
+    ARMED.with(Cell::get)
+  }
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -3131,9 +3251,10 @@ pub unsafe fn av_frame_to_owned_image_frame(
 ///
 /// # Safety
 ///
-/// As the crate-private worker: a live source for the duration of the
-/// call, and — on this lane — no handle capable of mutating its buffers
-/// may outlive the returned carriers.
+/// As the worker: a live source for the duration of the call, a custom
+/// channel map of `nb_channels` initialised entries if the layout is a
+/// custom one, and — on this lane — no handle capable of mutating its
+/// buffers may outlive the returned carriers.
 pub unsafe fn av_frame_to_audio_frame(
   av_frame: *const AVFrame,
   time_base: Timebase,
@@ -3152,7 +3273,9 @@ pub unsafe fn av_frame_to_audio_frame(
 ///
 /// # Safety
 ///
-/// The source must be live for the duration of the call.
+/// The source must be live for the duration of the call, and a custom
+/// channel layout's map must hold `nb_channels` initialised entries, as
+/// the worker states.
 pub unsafe fn av_frame_to_owned_audio_frame(
   av_frame: *const AVFrame,
   time_base: Timebase,
