@@ -7,7 +7,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Its versions are its own: they do not move with `mediadecode`'s.
 
-## [0.2.1] - unreleased
+## [0.3.0] - unreleased
+
+### Changed
+
+- **BREAKING: the OpenTimelineIO export now carries the exact-readback
+  metadata.** Beside OpenTimelineIO's fields, every document `to_otio`
+  writes carries under `metadata.mediaio` the words `from_otio` reads the
+  timeline back by: the edit rate (`rate`), each media-side range's exact
+  ruler and timebase (`source`, `available`, `range`), and a dissolve's
+  place among its track's transitions where the track keeps them out of
+  their cuts' order (`order`). They are always written, as the read-back
+  needs them: no document is 0.2.0's byte for byte, with markers or
+  without. OpenTimelineIO's readers keep them as metadata.
 
 ### Added
 
@@ -26,21 +38,16 @@ Its versions are its own: they do not move with `mediadecode`'s.
   every count, timebase and rate as the model held it. What the timeline
   does not model is refused by name with where it sits — `Unreadable`, with
   `UnmodelledSchema`, `UnmodelledFeature` and its `Feature`, `Inexact`, and
-  the self-check's `Shape` and `Syntax` — never dropped.
+  the self-check's `Shape` and `Syntax` — never dropped: a gap of some
+  length after a track's last clip, which OpenTimelineIO counts in the
+  track's duration, among them (`Feature::TrailingGap`). What
+  OpenTimelineIO derives from the document in its own `f64` arithmetic —
+  both ends of every range, and each track's walk and the stack's — is held
+  as `to_otio` holds it, and refused as `Inexact` where it rounds.
 - The export writes markers as `Marker.2`, refusing one no ruler holds
-  whole as `Spot::Marker`, and writes beside OpenTimelineIO's fields the
-  exact words a reader needs, under `metadata.mediaio`: the edit rate
-  (`rate`), each media-side range's exact ruler and timebase (`source`,
-  `available`, `range`), and a dissolve's place among its track's
-  transitions where the track keeps them out of their cuts' order
-  (`order`). OpenTimelineIO's readers keep them as metadata.
+  whole as `Spot::Marker`.
 - `validate_json` holds every marker to `Marker.2`, with the
   `marked_range` every reader requires.
-
-### Changed
-
-- `to_otio`'s documents carry those words: for a timeline with no markers,
-  they differ from 0.2.0's by the words alone.
 
 ## [0.2.0] - 2026-10-15
 
