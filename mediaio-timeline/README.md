@@ -4,8 +4,9 @@
 <div align="center">
 
 The editing timeline as data: tracks, clips at explicit record ranges, gain,
-fades and dissolves — with validation that refuses by name, a diff, and
-OpenTimelineIO export. Pure Rust, `no_std` + `alloc`, no FFmpeg.
+fades, dissolves and markers — with validation that refuses by name, a diff,
+and OpenTimelineIO export with its exact read-back. Pure Rust, `no_std` +
+`alloc`, no FFmpeg.
 
 [<img alt="github" src="https://img.shields.io/badge/github-findit--studio/mediadecode-8da0cb?style=for-the-badge&logo=Github" height="22">][Github-url]
 <img alt="LoC" src="https://img.shields.io/endpoint?url=https%3A%2F%2Fgist.githubusercontent.com%2Fal8n%2F327b2a8aef9003246e45c6e47fe63937%2Fraw%2Fmediaio-timeline" height="22">
@@ -21,13 +22,14 @@ OpenTimelineIO export. Pure Rust, `no_std` + `alloc`, no FFmpeg.
 | type | what it is |
 |---|---|
 | `Timeline` | an edit: `name`, the edit `rate`, the timecode `start` its zero carries, `metadata`, and `tracks` stacked bottom first — a `schema 1` document |
-| `Track` | one layer: `kind` (`Video` or `Audio`), `name`, `enabled`, `clips` in record order, and the `transitions` between them |
-| `Clip` | a stretch of one medium at an explicit position: its `id`, `name`, `media`, `source_range` (in the medium's timebase), `record` (at the edit rate), `enabled`, `gain`, `fades`, `metadata` |
+| `Track` | one layer: `kind` (`Video` or `Audio`), `name`, `enabled`, `clips` in record order, the `transitions` between them, and its `markers` |
+| `Clip` | a stretch of one medium at an explicit position: its `id`, `name`, `media`, `source_range` (in the medium's timebase), `record` (at the edit rate), `enabled`, `gain`, `fades`, `metadata`, `markers` |
 | `ClipId` | a clip's identity: a string its creator mints, once per placement, unique in the timeline |
 | `MediaRef` | the medium: its `locator`, and when known its `available_range`, `rate` and `reel` |
 | `Transition` | a `Dissolve` across the cut `at`, reaching `in_offset` before it and `out_offset` after it — OpenTimelineIO's offsets |
 | `Fades`, `Fade` | a fade at a clip's start (`in`) and end (`out`): a `duration` at the edit rate and a `shape`, `Linear` or `EqualPower` |
 | `Gain` | decibels, finite by construction |
+| `Marker`, `MarkerColor` | a named point or stretch of time: a `name`, the `range` it marks, a `color` (OpenTimelineIO's eleven, green by default) and a `comment` — on a track at the edit rate from the timeline's zero, on a clip in its medium's time |
 | `Metadata` | an ordered map of strings — notes the model carries and never reads |
 
 The time words — `Rate`, `Timebase`, `Timestamp`, `Duration`, `TimeRange` —
@@ -59,9 +61,10 @@ id, so a clip renamed or pointed at another medium is still the same clip.
 
 ### Text is `Utf8Bytes`
 
-Every text the model holds — a timeline's, a track's and a clip's name, a
-clip's id, a medium's locator and reel, a note's key and value — and the
-OpenTimelineIO document `to_otio` writes is a
+Every text the model holds — a timeline's, a track's, a clip's and a
+marker's name, a clip's id, a medium's locator and reel, a marker's comment,
+a note's key and value — and the OpenTimelineIO document `to_otio` writes is
+a
 [`smol_bytes::Utf8Bytes`](https://docs.rs/smol-bytes): immutable UTF-8, held
 inline when short and shared by reference count when long, so a clone is
 cheap. Constructors and setters take `impl Into<Utf8Bytes>` — a `&str`, a
@@ -78,7 +81,7 @@ transition it is about:
 | refusal | the defect |
 |---|---|
 | `RateUnstated` | the edit rate is zero |
-| `OffEditRate` | the start, a record, a fade or a transition not counted at the edit rate |
+| `OffEditRate` | the start, a record, a fade, a transition or a track's marker not counted at the edit rate |
 | `MediaRateUnstated` | a stated media rate of zero, or a source or available range in a degenerate timebase |
 | `RangeTooLong` | a record, source range or available range longer than `i64::MAX` ticks — no timeline needs one, and its length has no exact count |
 | `RecordBeforeZero` | a record starting before the timeline's zero |
@@ -95,6 +98,12 @@ transition it is about:
 | `HandleMissing` | the outgoing clip's medium lacks `out_offset` after its source range, or the incoming clip's lacks `in_offset` before it |
 | `FadeMeetsTransition` | a fade where a transition already blends |
 | `BlendsOverrunClip` | a clip's fades and the parts of transitions inside it running longer than the clip — a fade longer than its clip among them |
+| `MarkerRateUnstated` | a clip's marker in a degenerate timebase |
+| `MarkerTooLong` | a marker's range longer than `i64::MAX` ticks |
+
+Nothing holds a marker inside its owner's time: a point past a track's last
+record, or a stretch of a medium its clip does not play, is a note the
+timeline may carry.
 
 Building a timeline checks nothing: the value is plain data, and `validate`
 is where it is judged.
@@ -111,8 +120,8 @@ one id on two clips — a timeline `validate` would refuse — is refused as
 `Ambiguous`, naming the side and the two clips, rather than matched by
 occurrence. Ranges compare by the time they cover. The order is fixed, so
 `diff(a, a)` is empty for every `a` it answers. Only clips are compared: the
-timeline's and a track's own words, transitions, and a clip's notes are
-not.
+timeline's and a track's own words, transitions, markers, and a clip's
+notes are not.
 
 ## OpenTimelineIO
 
@@ -133,6 +142,7 @@ is refused by name (`Refused::NotRepresentable`, below).
 | a gap between records | `Gap.1`, derived by `layout` |
 | `Transition` | `Transition.1`, `SMPTE_Dissolve`, offsets at the edit rate |
 | a fade | `Transition.1`, `SMPTE_Dissolve` against a gap — of no length where the clip abuts a clip or the track's end |
+| `Marker` | `Marker.2` in its track's or clip's `markers`: `name`, `color` in OpenTimelineIO's capitals, `marked_range`, `comment` — a track's at the edit rate, a clip's in its medium's time |
 | a clip's `id`, gain, reel, the medium's rate, a fade's curve, `Metadata` | `metadata.mediaio`: `id`, `gain_db`, `reel`, `rate`, `fade` and `shape`, `metadata` |
 
 Record-side times are whole counts at the edit rate. A media-side range — a
@@ -261,7 +271,15 @@ refused by name where it does not.
 OpenTimelineIO has no word for a clip's id, its gain or a reel: all three
 ride in `metadata` — the id so a reader can tell each clip again — and an
 application that does not read it — DaVinci Resolve among them — applies
-neither gain nor reel. Available ranges and the start are written as the timeline holds
+neither gain nor reel. Beside them ride the exact words a reader needs to
+rebuild the timeline exactly, since OpenTimelineIO keeps a rate as an `f64`
+that names many rationals and a range as two counts that say nothing of the
+model's timebase: the edit rate (`rate`, as `num/den`); for each media-side
+range — a source range, an available range, a clip's marker — the exact
+ruler its counts are written in and the timebase the model counts it in
+(`source`, `available`, `range`); and for a track that keeps its
+transitions out of their cuts' order, each dissolve's place among them
+(`order`). Available ranges and the start are written as the timeline holds
 them: a medium read through `mediadecode` starts at zero until the read side
 exposes the container's timecode, so its available range does not yet carry
 the camera's.
@@ -270,10 +288,33 @@ the camera's.
 export is held to: the crate's own strict JSON reader, then OpenTimelineIO's
 schema shape — exactly the keys the target's readers require (audited
 against each schema's `read_from`, per target: `Track.1` needs its `kind`,
-and a reader before 0.15 a `Clip.1`'s `media_reference`), the types of the
-keys the export writes, media references, the target's clip schema, every
+a `Marker.2` its `marked_range`, and a reader before 0.15 a `Clip.1`'s
+`media_reference`), the types of the keys the export writes, media
+references, the target's clip schema, every marker a `Marker.2`, every
 transition between two items. No Python and no OpenTimelineIO install; CI
 runs it on the goldens.
+
+### Reading back
+
+`otio::from_otio(&str) -> Result<Timeline, otio::Unreadable>` is the exact
+inverse of `to_otio`: for every timeline `to_otio` writes, for either
+target, it reads that very timeline back — every count, timebase and rate
+as the model held it. It holds each `RationalTime` to the exact words: its
+rate the `f64` of its exact ruler, bit for bit, and its value a whole count
+within ±2^53, read from its digits. It lays each track's items end to end
+from zero, as OpenTimelineIO places them, and validates what it read.
+
+A document from another writer is read where it uses only what the
+timeline models and carries those words. Nothing is dropped: everything
+else is refused by name, with where it sits — a schema the timeline does
+not model there (`Unreadable::Schema`: an effect, a time warp, a nested
+stack, a reference other than an `ExternalReference.1`, a marker on a gap),
+a key, value or note it has no word for (`Unreadable::Feature`: another
+writer's metadata, a track kind or transition type it does not know, a
+trim on a track, a marker color outside the eleven, …), and a count or rate
+that does not land exactly (`Unreadable::Inexact`). A key is read only
+where it carries nothing — `null`, an empty list, `enabled` as `true` — or
+what the timeline keeps.
 
 ## The stored document
 
@@ -284,7 +325,9 @@ a time value too, a record's or a rate's — a required field left out (a
 clip's `id` among them), a metadata key named twice, a gain that is not
 finite and a range longer than `i64::MAX` ticks. Time values are written under `mediatime`'s own field names
 and read through the crate's strict shapes of them. An optional word left
-out reads as absent.
+out reads as absent. A track's and a clip's `markers` are written only
+where there are some, so a timeline without markers writes the document
+0.2.0 wrote, and a reader before markers refuses one with them by name.
 
 ## Time
 
@@ -303,8 +346,6 @@ model's.
 
 - **Time-warp.** `speed` is reserved for a later schema, and a schema 1
   reader refuses it by name.
-- **Reading OpenTimelineIO back** (`from_otio`) — a later row; the `otio`
-  module is its home.
 - **Rendering.** The compositor and the contact sheet are `mediaio-render`'s,
   the mixer `mediaencode`'s.
 - **The container's timecode** in available ranges — a `mediadecode` row.
@@ -317,7 +358,7 @@ use core::num::NonZeroI32;
 use mediaio_timeline::{
   Clip, ClipId, ClipPair, Duration, Fade, FadeShape, Fades, MediaRef, Rate, Refusal, TimeRange,
   Timebase, Timeline, Timestamp, Track, TrackKind, Transition, TransitionAt,
-  otio::{OtioTarget, to_otio, validate_json},
+  otio::{OtioTarget, from_otio, to_otio, validate_json},
   validate,
 };
 use smol_bytes::format_utf8bytes;
@@ -352,6 +393,8 @@ assert_eq!(validate(&timeline), Ok(()));
 
 let otio = to_otio(&timeline, OtioTarget::V0_15Plus).unwrap();
 assert_eq!(validate_json(&otio, OtioTarget::V0_15Plus), Ok(()));
+// And read back, exactly.
+assert_eq!(from_otio(&otio), Ok(timeline.clone()));
 
 // Pulled ten frames early, `b` overlaps `a` and leaves the dissolve off
 // any cut: both refused, by name.
