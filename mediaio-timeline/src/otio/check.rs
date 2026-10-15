@@ -44,7 +44,7 @@
 
 use std::format;
 
-use smol_bytes::Utf8Bytes;
+use smol_bytes::{Utf8Bytes, format_utf8bytes};
 
 use super::{OtioTarget, Shape, json::Value};
 
@@ -283,7 +283,7 @@ fn required<'a>(
   path: &str,
   key: &str,
 ) -> Result<(&'a Value, Utf8Bytes), Shape> {
-  let at = Utf8Bytes::from(format!("{path}.{key}"));
+  let at = format_utf8bytes!("{path}.{key}");
   match member(members, key) {
     Some(value) => Ok((value, at)),
     None => Err(shape(&at, "a required key")),

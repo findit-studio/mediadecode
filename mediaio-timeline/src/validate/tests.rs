@@ -3,6 +3,8 @@
 
 use core::num::NonZeroI32;
 
+use smol_bytes::format_utf8bytes;
+
 use super::*;
 use crate::{
   Clip, ClipId, Fade, FadeShape, Fades, MediaRef, Rate, TimeRange, Timeline, Track, TrackKind,
@@ -39,7 +41,7 @@ fn fade(n: u64) -> Option<Fade> {
 /// clip's id is its name.
 fn baseline() -> Timeline {
   let video = |name: &str| {
-    MediaRef::new(std::format!("file:///{name}.mov"))
+    MediaRef::new(format_utf8bytes!("file:///{name}.mov"))
       .with_available_range(Some(TimeRange::new(0, 240, edit())))
       .with_rate(Some(Rate::FPS_24))
   };

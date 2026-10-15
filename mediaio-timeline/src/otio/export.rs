@@ -21,10 +21,10 @@
 //! tried.
 
 use core::cmp::Reverse;
-use std::{collections::BTreeSet, format, string::ToString, vec, vec::Vec};
+use std::{collections::BTreeSet, vec, vec::Vec};
 
 use mediatime::{Duration, Rate, Rounding, TimeRange};
-use smol_bytes::Utf8Bytes;
+use smol_bytes::{Utf8Bytes, format_utf8bytes};
 
 use super::{
   NotRepresentable, OtioTarget, RulerSearch, Spot,
@@ -629,7 +629,10 @@ fn track(track: &Track, children: &[Planned<'_>], edit: Ruler, target: OtioTarge
 fn clip(clip: &Clip, source: Counted, available: Option<Counted>, target: OtioTarget) -> Value {
   let mut words = vec![("id", text(clip.id().as_str()))];
   if let Some(gain) = clip.gain() {
-    words.push(("gain_db", Value::Number(format!("{:?}", gain.db()).into())));
+    words.push((
+      "gain_db",
+      Value::Number(format_utf8bytes!("{:?}", gain.db())),
+    ));
   }
   let mut members = vec![
     (
@@ -660,7 +663,7 @@ fn clip(clip: &Clip, source: Counted, available: Option<Counted>, target: OtioTa
 fn external_reference(media: &MediaRef, available: Option<Counted>, target: OtioTarget) -> Value {
   let mut words = Vec::new();
   if let Some(rate) = media.rate() {
-    words.push(("rate", text(&rate.to_string())));
+    words.push(("rate", Value::String(format_utf8bytes!("{rate}"))));
   }
   if let Some(reel) = media.reel() {
     words.push(("reel", text(reel)));
@@ -979,7 +982,10 @@ fn metadata(mut words: Vec<(&'static str, Value)>, notes: &Metadata) -> Value {
 fn rational_time(ruler: Ruler, count: i128) -> Value {
   object(vec![
     ("OTIO_SCHEMA", text("RationalTime.1")),
-    ("rate", Value::Number(format!("{:?}", ruler.otio()).into())),
+    (
+      "rate",
+      Value::Number(format_utf8bytes!("{:?}", ruler.otio())),
+    ),
     ("value", number(count)),
   ])
 }
@@ -1014,7 +1020,7 @@ fn held(value: i128, ruler: Ruler, at: Spot) -> Result<(), NotRepresentable> {
 
 /// A whole count written as `86400.0`, from the integer's own digits.
 fn number(value: i128) -> Value {
-  Value::Number(format!("{value}.0").into())
+  Value::Number(format_utf8bytes!("{value}.0"))
 }
 
 fn text(value: &str) -> Value {

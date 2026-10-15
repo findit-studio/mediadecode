@@ -307,14 +307,15 @@ use mediaio_timeline::{
   otio::{OtioTarget, to_otio, validate_json},
   validate,
 };
+use smol_bytes::format_utf8bytes;
 
 let edit = Timebase::new(1, NonZeroI32::new(25).unwrap());
 let frames = |n| Duration::new(n, edit);
 let shot = |name: &str, start: i64| {
   Clip::new(
-    ClipId::new(format!("{name}-1")),
+    ClipId::new(format_utf8bytes!("{name}-1")),
     name,
-    MediaRef::new(format!("file:///media/{name}.mov"))
+    MediaRef::new(format_utf8bytes!("file:///media/{name}.mov"))
       .with_available_range(Some(TimeRange::new(0, 250, edit))),
     TimeRange::new(50, 100, edit),
     TimeRange::new(start, start + 50, edit),

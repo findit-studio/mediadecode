@@ -1,7 +1,7 @@
 use core::num::NonZeroI32;
 use std::{format, vec::Vec};
 
-use smol_bytes::{Utf8Bytes, Utf8BytesMut};
+use smol_bytes::{Utf8Bytes, Utf8BytesMut, format_utf8bytes};
 
 use super::{json::Value, *};
 use crate::{
@@ -22,7 +22,7 @@ fn clip(name: &str, start: i64, end: i64) -> Clip {
   Clip::new(
     ClipId::new(name),
     name,
-    MediaRef::new(format!("file:///{name}.mov")),
+    MediaRef::new(format_utf8bytes!("file:///{name}.mov")),
     TimeRange::new(0, end - start, edit()),
     TimeRange::new(start, end, edit()),
   )
@@ -959,7 +959,7 @@ fn the_self_check_requires_exactly_what_the_targets_readers_require() {
         assert_eq!(
           verdict,
           Err(Invalid::Shape(Shape {
-            path: format!("{path}.{key}").into(),
+            path: format_utf8bytes!("{path}.{key}"),
             expected: "a required key",
           })),
           "{target:?}: {schema} at {path} without {key}"
