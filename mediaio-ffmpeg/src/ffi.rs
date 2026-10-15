@@ -1536,6 +1536,22 @@ mod tests {
     }
   }
 
+  /// **The raw decoder door answers every integer.** A codec id this
+  /// build names finds its decoder; an integer libavcodec has no decoder
+  /// for — negative, or far past every id — answers `None`, and none of
+  /// them ever becomes an `AVCodecID`.
+  #[test]
+  fn the_raw_decoder_door_answers_every_integer() {
+    let h264 = ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_H264 as c_int;
+    assert!(
+      find_decoder_raw(h264).is_some(),
+      "H.264 is decodable in this build"
+    );
+    for id in [-1, i32::MAX, i32::MIN] {
+      assert!(find_decoder_raw(id).is_none(), "no decoder for {id}");
+    }
+  }
+
   /// **The door installs the judge and its state together.** Afterwards
   /// the context's `get_buffer2` is the judge and its `opaque` the state
   /// — the only pairing the judge can run on.
