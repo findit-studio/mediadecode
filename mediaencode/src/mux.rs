@@ -15,8 +15,8 @@
 //!
 //! /// Copies one demuxed packet into the output. A refused packet is
 //! /// handed back as the demuxer delivered it, to be retried, rerouted
-//! /// or dropped. Attachments travel with the track table the muxer was
-//! /// opened with, not as packets.
+//! /// or dropped. A demuxer delivers its attachments before any timed
+//! /// packet, which is when a muxer takes them.
 //! fn remux<M: Muxer>(
 //!   muxer: &mut M,
 //!   packet: DemuxedPacket<M::Adapter, M::Buffer>,
@@ -34,7 +34,9 @@
 //!     DemuxedPacket::Data(p) => muxer
 //!       .write_data(p)
 //!       .map_err(|e| e.map_packet(DemuxedPacket::Data)),
-//!     DemuxedPacket::Attachment(_) => Ok(()),
+//!     DemuxedPacket::Attachment(p) => muxer
+//!       .write_attachment(p)
+//!       .map_err(|e| e.map_packet(DemuxedPacket::Attachment)),
 //!   }
 //! }
 //! ```
@@ -70,8 +72,8 @@
 use mediaspine::{
   Timestamp,
   demuxer::{
-    AudioTrackPacket, DataTrackPacket, DemuxAdapter, SubtitleTrackPacket, TrackIndex, TrackKind,
-    VideoTrackPacket,
+    AttachmentTrackPacket, AudioTrackPacket, DataTrackPacket, DemuxAdapter, SubtitleTrackPacket,
+    TrackIndex, TrackKind, VideoTrackPacket,
   },
 };
 
@@ -117,6 +119,18 @@ pub enum MuxRefusal {
     last: Timestamp,
     /// The decode timestamp the packet carries.
     offered: Timestamp,
+  },
+  /// An attachment was offered after the session's first write of
+  /// another kind. A container writes its attachments with its header,
+  /// and the header goes out with that first write.
+  #[error(
+    "the attachment on track {} comes after the first packet of another kind; \
+     a container writes its attachments with its header",
+    .track.get()
+  )]
+  LateAttachment {
+    /// The track the packet named.
+    track: TrackIndex,
   },
 }
 
@@ -167,13 +181,22 @@ impl<E, P> MuxError<E, P> {
 /// is the muxer's job. Within one track, decode timestamps must
 /// increase ([`MuxRefusal::NonMonotonicDts`]).
 ///
+/// # Attachments
+///
+/// A container writes its attachments — fonts, cover art, any file it
+/// carries whole — with its header, and a muxer defers its header to its
+/// first write of another kind. So
+/// [`write_attachment`](Self::write_attachment) is admitted only before
+/// that first write, and refused by name after it
+/// ([`MuxRefusal::LateAttachment`]).
+///
 /// # The refusals
 ///
 /// A packet for a track the muxer does not have, of the wrong kind for
-/// its track, or without the timestamp its track is ordered by is
-/// refused by name — [`MuxRefusal`], inside [`MuxError::Refused`] — and
-/// nothing is written. The refusal hands the packet back untouched, so
-/// the caller still owns it.
+/// its track, without the timestamp its track is ordered by, or an
+/// attachment that comes too late is refused by name — [`MuxRefusal`],
+/// inside [`MuxError::Refused`] — and nothing is written. The refusal
+/// hands the packet back untouched, so the caller still owns it.
 pub trait Muxer {
   /// Backend-specific vocabulary — the container tier's, as the
   /// `Demuxer`'s is.
@@ -207,6 +230,29 @@ pub trait Muxer {
     packet: DataTrackPacket<Self::Adapter, Self::Buffer>,
   ) -> Result<(), MuxError<Self::Error, DataTrackPacket<Self::Adapter, Self::Buffer>>>;
 
+  /// Writes one attachment — a whole file the container carries, such
+  /// as a font or cover art — to the track it names.
+  ///
+  /// Admitted only before the session's first write of another kind,
+  /// because a container writes its attachments with its header; one
+  /// offered after it is refused by name
+  /// ([`MuxRefusal::LateAttachment`]) and handed back. A refused write
+  /// is not a write, so it does not close the window.
+  ///
+  /// A demuxer hands its attachments out first — the `Demuxer` face in
+  /// `mediadecode` promises each attachment track's one packet before
+  /// any timed packet — so a remux that writes packets in the order it
+  /// reads them never meets the refusal. `mediadecode-ffmpeg`'s demuxer
+  /// keeps that promise by construction: it queues every attachment at
+  /// open, and each pull drains the queue before it reads the
+  /// container, after a seek as well. A demuxer that delivered one late
+  /// would break its own contract, and the refusal is the answer it gets
+  /// here.
+  fn write_attachment(
+    &mut self,
+    packet: AttachmentTrackPacket<Self::Adapter, Self::Buffer>,
+  ) -> Result<(), MuxError<Self::Error, AttachmentTrackPacket<Self::Adapter, Self::Buffer>>>;
+
   /// Completes the container — the packets still held for
   /// interleaving, then whatever the format writes last — and ends the
   /// session. It takes no packet and refuses nothing; an error is the
@@ -221,7 +267,7 @@ mod tests {
   use mediaspine::{
     Timebase,
     adapter::{AudioAdapter, SubtitleAdapter, VideoAdapter},
-    demuxer::{DataPacket, DemuxedPacket},
+    demuxer::{AttachmentPacket, DataPacket, DemuxedPacket},
     packet::{AudioPacket, PacketFlags, SubtitlePacket, VideoPacket},
   };
 
@@ -275,32 +321,34 @@ mod tests {
     )
   }
 
-  /// A two-track muxer (video, then audio) that checks what every muxer
-  /// checks and writes nothing anywhere.
+  /// A four-track muxer (video, audio, then two attachments) that checks
+  /// what every muxer checks and writes nothing anywhere.
   struct Table {
-    kinds: [TrackKind; 2],
-    last: [Option<Timestamp>; 2],
+    kinds: [TrackKind; 4],
+    last: [Option<Timestamp>; 4],
     written: u32,
+    /// Whether a packet of a kind other than attachment has been
+    /// written — the point a real muxer writes its header.
+    started: bool,
   }
 
   impl Table {
     fn new() -> Self {
       Self {
-        kinds: [TrackKind::Video, TrackKind::Audio],
-        last: [None, None],
+        kinds: [
+          TrackKind::Video,
+          TrackKind::Audio,
+          TrackKind::Attachment,
+          TrackKind::Attachment,
+        ],
+        last: [None; 4],
         written: 0,
+        started: false,
       }
     }
 
-    /// What every write checks, from the packet's track, kind and decode
-    /// timestamp alone — the packet itself is not touched — answering
-    /// the timestamp to record.
-    fn check(
-      &self,
-      track: TrackIndex,
-      offered: TrackKind,
-      dts: Option<Timestamp>,
-    ) -> Result<Timestamp, MuxRefusal> {
+    /// That `track` is in the table and carries `offered` packets.
+    fn kind_of(&self, track: TrackIndex, offered: TrackKind) -> Result<(), MuxRefusal> {
       let expected = *self
         .kinds
         .get(track.get())
@@ -312,6 +360,19 @@ mod tests {
           offered,
         });
       }
+      Ok(())
+    }
+
+    /// What every timed write checks, from the packet's track, kind and
+    /// decode timestamp alone — the packet itself is not touched —
+    /// answering the timestamp to record.
+    fn check(
+      &self,
+      track: TrackIndex,
+      offered: TrackKind,
+      dts: Option<Timestamp>,
+    ) -> Result<Timestamp, MuxRefusal> {
+      self.kind_of(track, offered)?;
       let dts = dts.ok_or(MuxRefusal::MissingDts { track })?;
       if let Some(last) = self.last[track.get()]
         && dts.pts() <= last.pts()
@@ -337,6 +398,33 @@ mod tests {
         Ok(dts) => {
           self.last[track.get()] = Some(dts);
           self.written += 1;
+          self.started = true;
+          Ok(())
+        }
+        Err(refusal) => Err(MuxError::Refused { refusal, packet }),
+      }
+    }
+
+    /// What an attachment write checks: its track and kind, then whether
+    /// the header is still open — one that comes after the first write of
+    /// another kind is late.
+    fn check_attachment(&self, track: TrackIndex) -> Result<(), MuxRefusal> {
+      self.kind_of(track, TrackKind::Attachment)?;
+      if self.started {
+        return Err(MuxRefusal::LateAttachment { track });
+      }
+      Ok(())
+    }
+
+    /// Writes an attachment, or hands it back with the refusal.
+    fn admit_attachment<P>(
+      &mut self,
+      track: TrackIndex,
+      packet: P,
+    ) -> Result<(), MuxError<Fault, P>> {
+      match self.check_attachment(track) {
+        Ok(()) => {
+          self.written += 1;
           Ok(())
         }
         Err(refusal) => Err(MuxError::Refused { refusal, packet }),
@@ -348,6 +436,7 @@ mod tests {
   type ATrack = AudioTrackPacket<Loopback, Bytes>;
   type STrack = SubtitleTrackPacket<Loopback, Bytes>;
   type DTrack = DataTrackPacket<Loopback, Bytes>;
+  type AtTrack = AttachmentTrackPacket<Loopback, Bytes>;
 
   impl Muxer for Table {
     type Adapter = Loopback;
@@ -372,6 +461,11 @@ mod tests {
     fn write_data(&mut self, p: DTrack) -> Result<(), MuxError<Fault, DTrack>> {
       let (track, pts) = (p.track(), p.packet().pts());
       self.admit(track, TrackKind::Data, pts, p)
+    }
+
+    fn write_attachment(&mut self, p: AtTrack) -> Result<(), MuxError<Fault, AtTrack>> {
+      let track = p.track();
+      self.admit_attachment(track, p)
     }
 
     fn finish(self) -> Result<(), Fault> {
@@ -411,6 +505,13 @@ mod tests {
     DataTrackPacket::new(
       TrackIndex::new(track),
       DataPacket::new(PAYLOAD, ()).with_pts(Some(ms(pts))),
+    )
+  }
+
+  fn attachment(track: usize) -> AtTrack {
+    AttachmentTrackPacket::new(
+      TrackIndex::new(track),
+      AttachmentPacket::new(PAYLOAD, ()).with_flags(PacketFlags::KEY),
     )
   }
 
@@ -516,11 +617,24 @@ mod tests {
   }
 
   /// **Every write hands a refused packet back untouched** — the
-  /// subtitle and data writes as well as the two above, here refused for
-  /// the kind of the track they name.
+  /// subtitle, data and attachment writes as well as the two above, here
+  /// refused for the kind of the track they name.
   #[test]
   fn every_write_hands_a_refused_packet_back_untouched() {
     let mut muxer = Table::new();
+
+    let offered = attachment(0);
+    let kept = offered.clone();
+    let (refusal, back) = refused(muxer.write_attachment(offered));
+    assert!(matches!(
+      refusal,
+      MuxRefusal::KindMismatch {
+        expected: TrackKind::Video,
+        offered: TrackKind::Attachment,
+        ..
+      }
+    ));
+    assert_handed_back!(back, kept; flags);
 
     let offered = subtitle(0, 10);
     let kept = offered.clone();
@@ -567,5 +681,32 @@ mod tests {
       }
       other => panic!("expected the video envelope, got {other:?}"),
     }
+  }
+
+  /// **Attachments go before the first write of another kind.** Two are
+  /// written while the header is still open — a refused timed write in
+  /// between does not close it — and the first timed packet written
+  /// closes it: an attachment after that is refused by name and handed
+  /// back.
+  #[test]
+  fn an_attachment_after_the_first_timed_packet_is_refused_by_name() {
+    let mut muxer = Table::new();
+    muxer
+      .write_attachment(attachment(2))
+      .expect("an attachment before anything else");
+    let (refusal, _) = refused(muxer.write_video(video(5, Some(0))));
+    assert!(matches!(refusal, MuxRefusal::UnknownTrack { .. }));
+    muxer
+      .write_attachment(attachment(3))
+      .expect("a refused write is not a write: the header is still open");
+    muxer
+      .write_video(video(0, Some(0)))
+      .expect("the first timed packet");
+    let offered = attachment(3);
+    let kept = offered.clone();
+    let (refusal, back) = refused(muxer.write_attachment(offered));
+    assert!(matches!(refusal, MuxRefusal::LateAttachment { track } if track.get() == 3));
+    assert_handed_back!(back, kept; flags);
+    assert_eq!(muxer.written, 3, "two attachments and one video packet");
   }
 }
