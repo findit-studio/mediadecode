@@ -21,6 +21,7 @@ mod carrier;
 pub mod channel_layout;
 mod codec_id;
 mod container;
+pub mod contracts;
 pub mod convert;
 pub mod error;
 pub mod extras;

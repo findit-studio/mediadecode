@@ -181,12 +181,13 @@ pub mod ops {
     ///
     /// # Safety
     ///
-    /// `buf` must be a live `AVBufferRef`, `offset + len` must be within
-    /// its `size`, and those `len` bytes must be initialised: the owned
-    /// lane reads them to copy, and the view lane lends them as `&[u8]`.
-    /// On the view lane the carrier is a window onto the buffer itself,
-    /// so nothing may write through those bytes while it — or a clone of
-    /// it — lives.
+    /// `buf` must point at an [`AVBufferRef`](crate::contracts#avbufferref)
+    /// — live, aligned, its `buffer` live — with `offset + len` within its
+    /// `size`, and those `len` bytes at `data + offset` initialised: the
+    /// owned lane reads them to copy, and the view lane lends them as
+    /// `&[u8]` while holding a reference of its own (`av_buffer_ref`). On the
+    /// view lane the carrier is a window onto the buffer itself, so nothing
+    /// may write through those bytes while it — or a clone of it — lives.
     unsafe fn capture(buf: *mut AVBufferRef, offset: usize, len: usize) -> Option<Self::Buffer>;
 
     /// [`Self::capture`] for a payload taken out of an `AVPacket`'s own
@@ -253,9 +254,11 @@ pub mod ops {
     ///
     /// # Safety
     ///
-    /// `buf` must be a live `AVBufferRef`, `offset + cap` must be
-    /// within its `size`, and the buffer must stay alive until the
-    /// matching [`Self::commit`].
+    /// `buf` must point at an [`AVBufferRef`](crate::contracts#avbufferref)
+    /// — live, aligned, its `buffer` live — with `offset + cap` within its
+    /// `size`, and the buffer must stay alive until the matching
+    /// [`Self::commit`]. No byte is read here; the view lane takes its
+    /// reference (`av_buffer_ref`) now.
     unsafe fn reserve(buf: *mut AVBufferRef, offset: usize, cap: usize) -> Option<Self::Reserved>;
 
     /// Settles a [`Self::reserve`] at its true length. Infallible.
@@ -290,8 +293,12 @@ pub mod ops {
     ///
     /// # Safety
     ///
-    /// With [`BodyRoute::Submission`] the packet returned may be a second
-    /// reference to `body`'s buffer — on the view lane, wherever
+    /// It reads no pointer of its caller's: `body` is a carrier, whose buffer
+    /// is live by its construction. What it asks is about the packet it
+    /// hands back.
+    ///
+    /// With [`BodyRoute::Submission`] that packet may be a second reference
+    /// to `body`'s buffer — on the view lane, wherever
     /// `boundary::share_or_copy` can prove the padding behind it — while
     /// `body` still lends those bytes as `&[u8]`. Nothing may then write
     /// through the packet: it must not reach `ffmpeg_next::Packet::data_mut`

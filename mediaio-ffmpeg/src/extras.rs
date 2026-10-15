@@ -1360,8 +1360,15 @@ const _: () = {
 ///
 /// # Safety
 ///
-/// `par` must be a live `*const AVCodecParameters` for the duration of
-/// this call.
+/// For the duration of the call, `par` must point at a live, aligned
+/// `AVCodecParameters` that meets [the `AVCodecParameters`
+/// contract](crate::contracts#avcodecparameters) for a reader that
+/// measures. `extradata` is read as a pointer value and `extradata_size`
+/// as an integer; `coded_side_data`, when it is not null and
+/// `nb_coded_side_data > 0`, must be valid for `nb_coded_side_data`
+/// `AVPacketSideData` entries, each of whose `size` is read — no entry's
+/// `data` is touched; `ch_layout`'s `order` and `nb_channels` are read as
+/// plain integers, and its map is not read.
 #[doc(hidden)]
 pub unsafe fn measure_parameters(
   par: *const ffmpeg_next::ffi::AVCodecParameters,

@@ -3200,24 +3200,11 @@ unsafe fn judge_hw_transfer(
   let mut worst: usize = 0;
   let mut judged_any = false;
   if !frames_ctx.is_null() {
-    let mut list: *mut libc::c_int = ptr::null_mut();
-    // `AV_HWFRAME_TRANSFER_DIRECTION_FROM` is 0 — passed as the integer
-    // it is, like every other open C enum on this road.
     // SAFETY: `frames_ctx` is the frame's live `AVHWFramesContext`
-    // reference; on success FFmpeg allocates a NONE-terminated list
-    // that the caller frees.
-    let rc =
-      unsafe { crate::ffi::c_shims::av_hwframe_transfer_get_formats(frames_ctx, 0, &mut list, 0) };
-    if rc >= 0 && !list.is_null() {
-      let none = ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_NONE as libc::c_int;
-      let mut p = list;
-      loop {
-        // SAFETY: FFmpeg guarantees the list is NONE-terminated; reads
-        // up to and including the sentinel are in bounds.
-        let candidate = unsafe { ptr::read(p) };
-        if candidate == none {
-          break;
-        }
+    // reference, held for this whole call. The base walks the list
+    // libavutil allocates and frees it on every road out.
+    let walked = unsafe {
+      crate::ffi::visit_hwframe_download_formats(frames_ctx, |candidate| {
         // **The allocator's arithmetic, not the payload's.** Pricing
         // `av_image_get_buffer_size` at a fixed alignment is what the
         // pixels weigh laid out tightly — for a 16x16 NV12 destination
@@ -3229,23 +3216,21 @@ unsafe fn judge_hw_transfer(
           Some(size) => {
             worst = worst.max(size);
             judged_any = true;
+            std::ops::ControlFlow::Continue(())
           }
           // Not even the dimension-only bound could be formed, so the
           // extent itself is not a picture. Nothing here will guess.
-          None => {
-            // SAFETY: `list` is freed exactly once, on every road out.
-            unsafe { ffmpeg_next::ffi::av_freep(ptr::addr_of_mut!(list).cast()) };
-            return Err(crate::error::HwTransferTooLarge::new(
-              usize::MAX,
-              limits.max_frame_bytes(),
-            ));
-          }
+          None => std::ops::ControlFlow::Break(()),
         }
-        p = unsafe { p.add(1) };
-      }
-      // SAFETY: `list` was allocated by `av_hwframe_transfer_get_formats`
-      // and is freed exactly once here.
-      unsafe { ffmpeg_next::ffi::av_freep(ptr::addr_of_mut!(list).cast()) };
+      })
+    };
+    // libavutil declining to list (`Err`) leaves `judged_any` false, and
+    // the fallback below prices the frame — as before.
+    if let Ok(Some(())) = walked {
+      return Err(crate::error::HwTransferTooLarge::new(
+        usize::MAX,
+        limits.max_frame_bytes(),
+      ));
     }
   }
 
@@ -3451,18 +3436,15 @@ pub(crate) fn find_decoder(parameters: &codec::Parameters) -> Result<Codec> {
   let raw_id: u32 =
     unsafe { ptr::read(ptr::addr_of!((*parameters.as_ptr()).codec_id) as *const u32) };
 
-  // Call C `avcodec_find_decoder` via our local `c_int`-typed shim — we
-  // never construct an `AVCodecID` enum from `raw_id`. The C function
-  // returns NULL for unknown ids, which we surface as `Error::NoCodec`.
-  // SAFETY: avcodec_find_decoder is a pure FFmpeg lookup; passing any
-  // c_int is sound (returns NULL for unknown).
-  let codec_ptr = unsafe { crate::ffi::c_shims::avcodec_find_decoder(raw_id as libc::c_int) };
-  if codec_ptr.is_null() {
+  // Through the base's `c_int`-typed door — no `AVCodecID` enum is ever
+  // formed from `raw_id`. An id libavcodec names no decoder for is
+  // `Error::NoCodec`.
+  let Some(codec_ptr) = crate::ffi::find_decoder_raw(raw_id as libc::c_int) else {
     return Err(Error::NoCodec(raw_id));
-  }
-  // SAFETY: codec_ptr is a non-null *const AVCodec into FFmpeg's static
-  // codec table; it lives for the duration of the program.
-  Ok(unsafe { Codec::wrap(codec_ptr) })
+  };
+  // SAFETY: the pointer names an entry of libavcodec's static codec
+  // table, live for the duration of the program.
+  Ok(unsafe { Codec::wrap(codec_ptr.as_ptr().cast_const()) })
 }
 
 /// Drain output frames from a candidate decoder during probe replay,

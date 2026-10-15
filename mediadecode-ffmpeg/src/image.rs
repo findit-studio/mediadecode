@@ -247,10 +247,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierImageDecoder<C> {
     // decoded anyway. The three stream families have always gone
     // through `write_md_flags`; the image road now does too rather than
     // growing a second copy of the same three lines.
-    //
-    // SAFETY: `av_pkt` owns a live `AVPacket` returned by
-    // `try_packet_copy`.
-    unsafe { boundary::write_md_flags(&mut av_pkt, packet.flags()) };
+    boundary::write_md_flags(&mut av_pkt, packet.flags());
     // Through the software funnel: a frame the allocator judge refused
     // surfaces named, not as the `EINVAL` a corrupt file also produces.
     let state: *const crate::ffi::CallbackState = self._callback_state.as_ptr();

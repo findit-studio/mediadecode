@@ -327,9 +327,12 @@ impl CallbackState {
 ///
 /// # Safety
 ///
-/// `state` must be null or point at a [`CallbackState`] that stays live
-/// for the duration of the call — in practice the one a decoder owns and
-/// frees only after the codec context that points at it.
+/// `state` must be null — answered `None` — or point at a live, aligned
+/// [`CallbackState`](crate::contracts#callbackstate) for the duration of
+/// the call. Its frame-budget atomics are read and the latch cleared
+/// through shared access, and its `max_frame_bytes` is read. In practice
+/// it is the state a decoder owns and frees only after the codec context
+/// that points at it.
 pub unsafe fn take_frame_budget_declination(
   state: *const CallbackState,
 ) -> Option<(u64, u64, bool)> {
@@ -363,9 +366,11 @@ pub unsafe fn take_frame_budget_declination(
 ///
 /// # Safety
 ///
-/// `state` must be null or point at a [`CallbackState`] that stays live
-/// for the duration of the call — in practice the one a decoder owns and
-/// frees only after the codec context that points at it.
+/// `state` must be null — answered `None` — or point at a live, aligned
+/// [`CallbackState`](crate::contracts#callbackstate) for the duration of
+/// the call. Its ceiling atomics are read and the latch cleared through
+/// shared access. In practice it is the state a decoder owns and frees
+/// only after the codec context that points at it.
 pub unsafe fn take_ceiling_declination(state: *const CallbackState) -> Option<(i64, i64)> {
   use core::sync::atomic::Ordering;
   if state.is_null() {
@@ -388,8 +393,10 @@ pub unsafe fn take_ceiling_declination(state: *const CallbackState) -> Option<(i
 ///
 /// # Safety
 ///
-/// `state` must be null or point at a [`CallbackState`] that stays live
-/// for the duration of the call.
+/// `state` must be null — ignored — or point at a live, aligned
+/// [`CallbackState`](crate::contracts#callbackstate) for the duration of
+/// the call. Only its atomics are written, through shared access, exactly
+/// as the callback writes them.
 #[cfg(any(test, feature = "test-support"))]
 pub unsafe fn declare_frame_budget_declined_for_test(state: *mut CallbackState, bytes: u64) {
   use core::sync::atomic::Ordering;
@@ -435,13 +442,19 @@ pub unsafe fn declare_frame_budget_declined_for_test(state: *mut CallbackState, 
 ///
 /// # Safety
 ///
-/// This is libavcodec's to call, installed as a context's `get_format`.
-/// `ctx` must be a live `AVCodecContext` whose `opaque` is null or the
-/// [`CallbackState`] [`install_allocator_judge`] installed there, live
-/// for the call, and
-/// `pix_fmts` must point at a list terminated by `AV_PIX_FMT_NONE` —
-/// what libavcodec passes. A caller other than libavcodec owes the
-/// same.
+/// This is libavcodec's to call, installed as a context's `get_format`. For
+/// the duration of the call, `ctx` must point at a live, aligned
+/// `AVCodecContext` that meets [the callbacks' `AVCodecContext`
+/// contract](crate::contracts#avcodeccontext-for-the-callbacks): its
+/// `opaque` is null or the [`CallbackState`](crate::contracts#callbackstate)
+/// [`install_allocator_judge`] installed — `wanted`, `wanted_int` and
+/// `max_frame_bytes` read, the ceiling atomics written — and its
+/// `hw_device_ctx` is null or a live device reference, handed to
+/// `avcodec_get_hw_frames_parameters`, whose frames context is read
+/// (`width`, `height`, `sw_format`) and released inside the call.
+/// `pix_fmts` must point at a list of `AVPixelFormat` values, read as
+/// integers, terminated by `AV_PIX_FMT_NONE` — what libavcodec passes.
+/// A caller other than libavcodec owes the same.
 pub unsafe extern "C" fn get_hw_format(
   ctx: *mut AVCodecContext,
   pix_fmts: *const AVPixelFormat,
@@ -678,7 +691,10 @@ fn pool_bytes(sw_format: libc::c_int, w: libc::c_int, h: libc::c_int) -> Option<
 ///
 /// `codec` must point at a live `AVCodec` — one libavcodec handed out,
 /// such as `avcodec_find_decoder`'s answer, which names an entry in its
-/// static codec table and stays valid for the process.
+/// static codec table and stays valid for the process ([the `AVCodec`
+/// contract](crate::contracts#avcodec)). Its hardware configurations are
+/// read through `avcodec_get_hw_config`, each one's `methods`,
+/// `device_type` and `pix_fmt` as integers.
 pub unsafe fn codec_supports_hwaccel(
   codec: *const AVCodec,
   device_type: AVHWDeviceType,
@@ -724,8 +740,10 @@ pub unsafe fn codec_supports_hwaccel(
 ///
 /// # Safety
 ///
-/// `state` must be null or point at a [`CallbackState`] that stays live
-/// for the duration of the call.
+/// `state` must be null — ignored — or point at a live, aligned
+/// [`CallbackState`](crate::contracts#callbackstate) for the duration of
+/// the call. Only its atomics are written, through shared access, exactly
+/// as the callback writes them.
 #[cfg(any(test, feature = "test-support"))]
 pub unsafe fn declare_ceiling_declined_for_test(
   state: *mut CallbackState,
@@ -765,14 +783,19 @@ pub unsafe fn declare_ceiling_declined_for_test(
 /// the binding it called returned those very ids as a closed
 /// `AVPixelFormat`. Every id would have become an invalid enum value on
 /// the way *into* the pricing that was supposed to handle it.
-pub mod c_shims {
+///
+/// **Crate-private.** A raw declaration has no contract a caller could
+/// meet by reading it; what `mediadecode-ffmpeg` needs from here goes
+/// through the documented doors below — [`find_decoder_raw`] and
+/// [`visit_hwframe_download_formats`].
+pub(crate) mod c_shims {
   use libc::c_int;
 
   use super::AVCodec;
 
   unsafe extern "C" {
     /// `AVCodecID` as `c_int`.
-    pub fn avcodec_find_decoder(id: c_int) -> *const AVCodec;
+    pub(crate) fn avcodec_find_decoder(id: c_int) -> *const AVCodec;
 
     /// `AVCodecID` as `c_int`, answering the descriptor libavcodec keeps
     /// for that id — or null where this build names no codec for it.
@@ -790,16 +813,18 @@ pub mod c_shims {
     /// an id it cannot place it returns the string `"unknown_codec"`,
     /// a sentinel wearing a name's clothes. A descriptor that is absent
     /// is `None` here, and a consumer can tell the two apart.
-    pub fn avcodec_descriptor_get(id: c_int) -> *const ffmpeg_next::ffi::AVCodecDescriptor;
+    pub(crate) fn avcodec_descriptor_get(id: c_int) -> *const ffmpeg_next::ffi::AVCodecDescriptor;
 
     /// Returns `AVPixelFormat` as `c_int` — the id of a descriptor that
     /// may well name a format this build's bindings do not.
-    pub fn av_pix_fmt_desc_get_id(desc: *const ffmpeg_next::ffi::AVPixFmtDescriptor) -> c_int;
+    pub(crate) fn av_pix_fmt_desc_get_id(
+      desc: *const ffmpeg_next::ffi::AVPixFmtDescriptor,
+    ) -> c_int;
 
     /// Takes `AVPixelFormat` as `c_int`, so an id straight out of
     /// [`av_pix_fmt_desc_get_id`] can be priced without ever being an
     /// enum.
-    pub fn av_image_get_buffer_size(
+    pub(crate) fn av_image_get_buffer_size(
       pix_fmt: c_int,
       width: c_int,
       height: c_int,
@@ -811,12 +836,12 @@ pub mod c_shims {
     /// exist; production pricing goes through
     /// `av_samples_get_buffer_size`, the allocator's own ruler.
     #[cfg(test)]
-    pub fn av_get_bytes_per_sample(sample_fmt: c_int) -> c_int;
+    pub(crate) fn av_get_bytes_per_sample(sample_fmt: c_int) -> c_int;
 
     /// The allocator's own audio ruler, with `AVSampleFormat` as
     /// `c_int`. `align = 0` asks for the alignment
     /// `av_frame_get_buffer` itself uses.
-    pub fn av_samples_get_buffer_size(
+    pub(crate) fn av_samples_get_buffer_size(
       linesize: *mut c_int,
       nb_channels: c_int,
       nb_samples: c_int,
@@ -828,13 +853,90 @@ pub mod c_shims {
     /// formats a transfer may produce. Declared `*mut *mut c_int` so
     /// the list is walked as integers — a driver may well offer a
     /// format this build's bindings do not name.
-    pub fn av_hwframe_transfer_get_formats(
+    pub(crate) fn av_hwframe_transfer_get_formats(
       hwframe_ctx: *mut ffmpeg_next::ffi::AVBufferRef,
       dir: c_int,
       formats: *mut *mut c_int,
       flags: c_int,
     ) -> c_int;
   }
+}
+
+/// The decoder libavcodec registers for a codec id, asked as the
+/// integer the id is on the wire — never formed into `AVCodecID`, whose
+/// discriminant set is this build's and may not name it.
+///
+/// `None` where libavcodec names no decoder for the id. Any integer is
+/// a valid question: `avcodec_find_decoder` compares ids against its own
+/// codec table and reads nothing else. A pointer that comes back names
+/// an entry of that static table, live and unwritten for the process —
+/// what [`codec_supports_hwaccel`] and `ffmpeg_next::Codec::wrap` ask
+/// for.
+pub fn find_decoder_raw(id: c_int) -> Option<ptr::NonNull<AVCodec>> {
+  // SAFETY: `avcodec_find_decoder` takes any integer and answers null or
+  // a pointer into libavcodec's static codec table.
+  ptr::NonNull::new(unsafe { c_shims::avcodec_find_decoder(id) }.cast_mut())
+}
+
+/// Visits the formats a hardware frame can be downloaded to — the
+/// `AV_HWFRAME_TRANSFER_DIRECTION_FROM` list of its frames context —
+/// each as the integer it is, since a driver may offer a format this
+/// build's bindings do not name, until `visit` breaks.
+///
+/// `Ok(Some(_))` carries what `visit` broke with, `Ok(None)` means the
+/// list was walked to its end (or libavutil listed nothing), and `Err`
+/// carries libavutil's own error code. The list libavutil allocates is
+/// freed here on every road out, `visit` panicking aside, which leaks
+/// it.
+///
+/// # Safety
+///
+/// For the duration of the call, `frames_ctx` must point at a live
+/// `AVBufferRef` whose `data` is an `AVHWFramesContext` — the reference
+/// a hardware frame's `hw_frames_ctx` holds. libavutil reads the frames
+/// context, and the device behind it, to build the list; the list is
+/// `AV_PIX_FMT_NONE`-terminated by libavutil's contract, and this reads
+/// it up to and including the terminator.
+pub unsafe fn visit_hwframe_download_formats<B>(
+  frames_ctx: *mut ffmpeg_next::ffi::AVBufferRef,
+  mut visit: impl FnMut(c_int) -> core::ops::ControlFlow<B>,
+) -> Result<Option<B>, c_int> {
+  let mut list: *mut c_int = ptr::null_mut();
+  // `AV_HWFRAME_TRANSFER_DIRECTION_FROM` is 0 — passed as the integer it
+  // is, like every other open C enum on this road.
+  //
+  // SAFETY: `frames_ctx` per the contract above; on success libavutil
+  // stores a freshly allocated, terminated list in `list`.
+  let rc = unsafe { c_shims::av_hwframe_transfer_get_formats(frames_ctx, 0, &mut list, 0) };
+  if rc < 0 {
+    return Err(rc);
+  }
+  if list.is_null() {
+    return Ok(None);
+  }
+  let none = AVPixelFormat::AV_PIX_FMT_NONE as c_int;
+  let mut broke = None;
+  let mut cursor = list.cast_const();
+  loop {
+    // SAFETY: the list is terminated by `AV_PIX_FMT_NONE`, and `cursor`
+    // has not moved past the terminator: it advances only after a
+    // non-terminator element.
+    let candidate = unsafe { cursor.read() };
+    if candidate == none {
+      break;
+    }
+    if let core::ops::ControlFlow::Break(value) = visit(candidate) {
+      broke = Some(value);
+      break;
+    }
+    // SAFETY: `candidate` was not the terminator, so the list holds at
+    // least one more element.
+    cursor = unsafe { cursor.add(1) };
+  }
+  // SAFETY: allocated by `av_hwframe_transfer_get_formats` and freed
+  // exactly once, here.
+  unsafe { ffmpeg_next::ffi::av_freep(ptr::addr_of_mut!(list).cast()) };
+  Ok(broke)
 }
 
 /// `AVCodecContext.get_buffer2`: the same pixel ceiling, applied where
@@ -1080,8 +1182,9 @@ pub(crate) unsafe extern "C" fn judge_buffer(
 ///   not been opened. No callback runs on a context before
 ///   `avcodec_open2`, so none is running while the two fields are
 ///   written.
-/// * `state` must point at a live, aligned [`CallbackState`] and stay
-///   valid for the callbacks' accesses — reads of its plain fields,
+/// * `state` must point at a live, aligned [`CallbackState`] ([its
+///   contract](crate::contracts#callbackstate)) and stay valid for the
+///   callbacks' accesses — reads of its plain fields,
 ///   atomic reads and writes of the rest — **until the context has been
 ///   freed**, the free included. That is one address kept live, and it
 ///   is also provenance kept intact: nothing may invalidate `state` in

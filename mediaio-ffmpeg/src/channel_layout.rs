@@ -371,10 +371,12 @@ const MAX_DECLARED_CHANNELS: i32 = 65_535;
 ///
 /// # Safety
 ///
-/// `ptr` must be a live `*const AVChannelLayout`. For a `CUSTOM` order
-/// with a non-null `u.map`, that map must hold `nb_channels` live
-/// `AVChannelCustom` entries — FFmpeg's own contract for a layout it
-/// filled, and [`custom_map_fault`]'s.
+/// For the duration of the call, `ptr` must point at a live, aligned
+/// `AVChannelLayout` that meets [the `AVChannelLayout`
+/// contract](crate::contracts#avchannellayout): its `order`,
+/// `nb_channels` and `u.mask` are read as plain values, and for a
+/// `CUSTOM` order with a count in `1..=65_535` and a non-null map, each
+/// of the `nb_channels` map entries' `name` (sixteen bytes) and `id`.
 #[doc(hidden)]
 pub unsafe fn layout_preflight(ptr: *const ffi::AVChannelLayout) -> Result<(), ChannelLayoutFault> {
   use core::ptr::{addr_of, read_unaligned};
@@ -553,27 +555,14 @@ pub fn channel_layout_description_from_ffmpeg(
 ///
 /// # Safety
 ///
-/// 1. `ptr` must be a live, aligned `*const AVChannelLayout` for the
-///    duration of this call.
-/// 2. **If `(*ptr).order` is `AV_CHANNEL_ORDER_CUSTOM` and `u.map` is
-///    non-null, `u.map` must point at a live, aligned, initialised
-///    array of exactly `nb_channels` `AVChannelCustom` entries** — the
-///    invariant `av_channel_layout_copy` and every libavcodec road that
-///    fills a layout maintain, and the one this function's own walk and
-///    FFmpeg's helpers both index against. A shorter array, a dangling
-///    pointer, or a negative-but-nonzero count is undefined behaviour,
-///    and no check inside can recover it.
-///
-/// What the function *does* check, because those are content faults
-/// rather than extent ones: a null `u.map` beside a positive count, a
-/// non-positive count, and a sixteen-byte name with no NUL inside it
-/// (which `av_channel_layout_describe` would hand to `%s`). Each is
-/// refused as [`ChannelLayoutFault::MalformedCustomMap`] *before* any
-/// FFmpeg helper sees the layout.
-///
-/// `order` is read raw and folded before anything else, and no
-/// `&AVChannelLayout` is formed until it is known to be a discriminant
-/// this build names.
+/// For the duration of the call, `ptr` must point at a live, aligned
+/// `AVChannelLayout` that meets [the `AVChannelLayout`
+/// contract](crate::contracts#avchannellayout). Its plain fields are read
+/// first and the layout is preflighted ([`layout_preflight`]); for a
+/// `CUSTOM` order with a count the preflight accepts and a non-null map,
+/// each of the `nb_channels` map entries' `id` and `name` is then read
+/// again — directly, and by `av_channel_layout_describe`, which renders
+/// the layout's text from the same entries.
 pub unsafe fn channel_layout_description_from_raw_ptr(
   ptr: *const ffi::AVChannelLayout,
 ) -> Result<ChannelLayoutDescription, ChannelLayoutFault> {

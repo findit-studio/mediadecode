@@ -451,12 +451,14 @@ pub fn try_packet_copy(data: &[u8]) -> std::result::Result<Packet, ffmpeg_next::
 /// it. `PacketFlags` is a `u8` bit set and the field is a `c_int`, so
 /// the widening is total and nothing needs deciding here.
 ///
-/// # Safety
-///
-/// `packet` must own a live `AVPacket`.
+/// It writes one field of the `AVPacket` an `ffmpeg_next::Packet` keeps
+/// inline, so it asks nothing of its caller.
 #[doc(hidden)]
-pub unsafe fn write_md_flags(packet: &mut Packet, flags: MdPacketFlags) {
+pub fn write_md_flags(packet: &mut Packet, flags: MdPacketFlags) {
   use ffmpeg_next::packet::Mut;
+  // SAFETY: `Packet` keeps its `AVPacket` inline, so the pointer is the
+  // packet's own, live and exclusive behind `&mut`; `flags` is a plain
+  // integer field.
   unsafe {
     (*packet.as_mut_ptr()).flags = c_int::from(flags.bits());
   }
@@ -784,16 +786,20 @@ fn attach_side_data(out: &mut Packet, entries: &[SideDataEntry]) -> Result<(), P
 ///
 /// # Safety
 ///
-/// The packet this returns may be a second reference to `body`'s buffer
-/// while `body` still lends those bytes as `&[u8]`. Nothing may write
-/// through it: it must not reach `ffmpeg_next::Packet::data_mut` or an
-/// in-place FFmpeg write, must not be shallow-cloned
-/// (`ffmpeg_next::Packet::clone` ignores a failed
-/// `av_packet_make_writable`, so its clone can keep sharing and then
-/// lend `&mut [u8]`), and must not be handed to a caller. Submit it to a
-/// decoder — `avcodec_send_packet` may keep a reference and never writes
-/// through it — and drop it; a copy kept past that must own its bytes,
-/// as `boundary::try_clone_packet` makes.
+/// It reads no pointer of its caller's: only `body`'s own `AVBufferRef`,
+/// live by the carrier's construction. What it asks is about the packet
+/// it hands back, which owns a reference of its own to that buffer when
+/// it shares one.
+///
+/// That packet may be a second reference to `body`'s buffer while `body`
+/// still lends those bytes as `&[u8]`. Nothing may write through it: it
+/// must not reach `ffmpeg_next::Packet::data_mut` or an in-place FFmpeg
+/// write, must not be shallow-cloned (`ffmpeg_next::Packet::clone`
+/// ignores a failed `av_packet_make_writable`, so its clone can keep
+/// sharing and then lend `&mut [u8]`), and must not be handed to a
+/// caller. Submit it to a decoder — `avcodec_send_packet` may keep a
+/// reference and never writes through it — and drop it; a copy kept past
+/// that must own its bytes, as `boundary::try_clone_packet` makes.
 #[doc(hidden)]
 pub unsafe fn share_or_copy(
   body: &crate::FfmpegBuffer,
@@ -924,16 +930,20 @@ pub fn ffmpeg_packet_from_owned_video_packet(
 ///
 /// # Safety
 ///
-/// With [`BodyRoute::Submission`] the `&Packet` lent to `submit` may be
-/// a second reference to the carrier's buffer. `submit` must not write
-/// through it and must not let it — or a packet still sharing its
-/// buffer — outlive the call: no shallow `ffmpeg_next::Packet::clone`
-/// kept past it (`clone` ignores a failed `av_packet_make_writable`, so
-/// the clone can keep sharing and lend `&mut [u8]`), and any copy kept
-/// must own its bytes, as `boundary::try_clone_packet` makes. Handing it
-/// to `avcodec_send_packet`, which may keep a reference and never
-/// writes through it, is what a submission is. With [`BodyRoute::Copy`]
-/// there is nothing to prove.
+/// It reads no pointer of its caller's: the packet it builds comes from
+/// `packet`'s own carriers and extras, live by their construction. What
+/// it asks is about the `&Packet` it lends to `submit`.
+///
+/// With [`BodyRoute::Submission`] that packet may be a second reference
+/// to the carrier's buffer. `submit` must not write through it and must
+/// not let it — or a packet still sharing its buffer — outlive the call:
+/// no shallow `ffmpeg_next::Packet::clone` kept past it (`clone` ignores
+/// a failed `av_packet_make_writable`, so the clone can keep sharing and
+/// lend `&mut [u8]`), and any copy kept must own its bytes, as
+/// `boundary::try_clone_packet` makes. Handing it to
+/// `avcodec_send_packet`, which may keep a reference and never writes
+/// through it, is what a submission is. With [`BodyRoute::Copy`] there is
+/// nothing to prove.
 #[doc(hidden)]
 pub unsafe fn with_ffmpeg_video_packet<C: crate::FfmpegCarrier + crate::CarrierOps, T>(
   packet: &mediaspine::packet::VideoPacket<VideoPacketExtra, C::Buffer>,
@@ -995,8 +1005,7 @@ unsafe fn build_video_packet<C: crate::FfmpegCarrier + crate::CarrierOps>(
   if let Some(d) = packet.duration() {
     out.set_duration(d.pts());
   }
-  // SAFETY: `out` owns the `AVPacket` `try_packet_copy` just built.
-  unsafe { write_md_flags(&mut out, packet.flags()) };
+  write_md_flags(&mut out, packet.flags());
   out.set_stream(packet.extra().stream_index() as usize);
   Ok(out)
 }
@@ -1040,16 +1049,20 @@ pub fn ffmpeg_packet_from_owned_audio_packet(
 ///
 /// # Safety
 ///
-/// With [`BodyRoute::Submission`] the `&Packet` lent to `submit` may be
-/// a second reference to the carrier's buffer. `submit` must not write
-/// through it and must not let it — or a packet still sharing its
-/// buffer — outlive the call: no shallow `ffmpeg_next::Packet::clone`
-/// kept past it (`clone` ignores a failed `av_packet_make_writable`, so
-/// the clone can keep sharing and lend `&mut [u8]`), and any copy kept
-/// must own its bytes, as `boundary::try_clone_packet` makes. Handing it
-/// to `avcodec_send_packet`, which may keep a reference and never
-/// writes through it, is what a submission is. With [`BodyRoute::Copy`]
-/// there is nothing to prove.
+/// It reads no pointer of its caller's: the packet it builds comes from
+/// `packet`'s own carriers and extras, live by their construction. What
+/// it asks is about the `&Packet` it lends to `submit`.
+///
+/// With [`BodyRoute::Submission`] that packet may be a second reference
+/// to the carrier's buffer. `submit` must not write through it and must
+/// not let it — or a packet still sharing its buffer — outlive the call:
+/// no shallow `ffmpeg_next::Packet::clone` kept past it (`clone` ignores
+/// a failed `av_packet_make_writable`, so the clone can keep sharing and
+/// lend `&mut [u8]`), and any copy kept must own its bytes, as
+/// `boundary::try_clone_packet` makes. Handing it to
+/// `avcodec_send_packet`, which may keep a reference and never writes
+/// through it, is what a submission is. With [`BodyRoute::Copy`] there is
+/// nothing to prove.
 #[doc(hidden)]
 pub unsafe fn with_ffmpeg_audio_packet<C: crate::FfmpegCarrier + crate::CarrierOps, T>(
   packet: &mediaspine::packet::AudioPacket<AudioPacketExtra, C::Buffer>,
@@ -1111,8 +1124,7 @@ unsafe fn build_audio_packet<C: crate::FfmpegCarrier + crate::CarrierOps>(
   if let Some(d) = packet.duration() {
     out.set_duration(d.pts());
   }
-  // SAFETY: `out` owns the `AVPacket` `try_packet_copy` just built.
-  unsafe { write_md_flags(&mut out, packet.flags()) };
+  write_md_flags(&mut out, packet.flags());
   out.set_stream(packet.extra().stream_index() as usize);
   Ok(out)
 }
@@ -1156,16 +1168,20 @@ pub fn ffmpeg_packet_from_owned_subtitle_packet(
 ///
 /// # Safety
 ///
-/// With [`BodyRoute::Submission`] the `&Packet` lent to `submit` may be
-/// a second reference to the carrier's buffer. `submit` must not write
-/// through it and must not let it — or a packet still sharing its
-/// buffer — outlive the call: no shallow `ffmpeg_next::Packet::clone`
-/// kept past it (`clone` ignores a failed `av_packet_make_writable`, so
-/// the clone can keep sharing and lend `&mut [u8]`), and any copy kept
-/// must own its bytes, as `boundary::try_clone_packet` makes. Handing it
-/// to `avcodec_send_packet`, which may keep a reference and never
-/// writes through it, is what a submission is. With [`BodyRoute::Copy`]
-/// there is nothing to prove.
+/// It reads no pointer of its caller's: the packet it builds comes from
+/// `packet`'s own carriers and extras, live by their construction. What
+/// it asks is about the `&Packet` it lends to `submit`.
+///
+/// With [`BodyRoute::Submission`] that packet may be a second reference
+/// to the carrier's buffer. `submit` must not write through it and must
+/// not let it — or a packet still sharing its buffer — outlive the call:
+/// no shallow `ffmpeg_next::Packet::clone` kept past it (`clone` ignores
+/// a failed `av_packet_make_writable`, so the clone can keep sharing and
+/// lend `&mut [u8]`), and any copy kept must own its bytes, as
+/// `boundary::try_clone_packet` makes. Handing it to
+/// `avcodec_send_packet`, which may keep a reference and never writes
+/// through it, is what a submission is. With [`BodyRoute::Copy`] there is
+/// nothing to prove.
 #[doc(hidden)]
 pub unsafe fn with_ffmpeg_subtitle_packet<C: crate::FfmpegCarrier + crate::CarrierOps, T>(
   packet: &mediaspine::packet::SubtitlePacket<SubtitlePacketExtra, C::Buffer>,
@@ -1224,8 +1240,7 @@ unsafe fn build_subtitle_packet<C: crate::FfmpegCarrier + crate::CarrierOps>(
   if let Some(d) = packet.duration() {
     out.set_duration(d.pts());
   }
-  // SAFETY: `out` owns the `AVPacket` `try_packet_copy` just built.
-  unsafe { write_md_flags(&mut out, packet.flags()) };
+  write_md_flags(&mut out, packet.flags());
   out.set_stream(packet.extra().stream_index() as usize);
   Ok(out)
 }
@@ -1265,6 +1280,8 @@ pub fn video_packet_from_ffmpeg(
 ) -> Result<Option<VideoPacket<VideoPacketExtra, FfmpegBytes>>, PacketBufferError> {
   // SAFETY: `CallerSupplied` is true of every packet, and the owned lane
   // copies, so nothing about `packet` outlives this borrow.
+  // The packet, an `ffmpeg_next::Packet`, meets the `AVPacket`
+  // contract (`crate::contracts`), as every one does.
   unsafe {
     video_packet_from_borrowed::<crate::Owned>(
       packet,
@@ -1285,6 +1302,8 @@ pub fn audio_packet_from_ffmpeg(
 ) -> Result<Option<AudioPacket<AudioPacketExtra, FfmpegBytes>>, PacketBufferError> {
   // SAFETY: `CallerSupplied` is true of every packet, and the owned lane
   // copies, so nothing about `packet` outlives this borrow.
+  // The packet, an `ffmpeg_next::Packet`, meets the `AVPacket`
+  // contract (`crate::contracts`), as every one does.
   unsafe {
     audio_packet_from_borrowed::<crate::Owned>(
       packet,
@@ -1305,6 +1324,8 @@ pub fn subtitle_packet_from_ffmpeg(
 ) -> Result<Option<SubtitlePacket<SubtitlePacketExtra, FfmpegBytes>>, PacketBufferError> {
   // SAFETY: `CallerSupplied` is true of every packet, and the owned lane
   // copies, so nothing about `packet` outlives this borrow.
+  // The packet, an `ffmpeg_next::Packet`, meets the `AVPacket`
+  // contract (`crate::contracts`), as every one does.
   unsafe {
     subtitle_packet_from_borrowed::<crate::Owned>(
       packet,
@@ -1494,9 +1515,11 @@ unsafe fn delivered_payload<C: crate::FfmpegCarrier + crate::CarrierOps>(
 ///
 /// # Safety
 ///
-/// `provenance` must be true of `source`, as the borrowed sibling's
-/// contract states it. Nothing more is owed: `source` is consumed, so no
-/// writer is left behind on a view-lane window.
+/// `source`'s `AVPacket` must meet [the `AVPacket`
+/// contract](crate::contracts#avpacket) and `provenance` must be true of
+/// it, as the borrowed sibling's contract states them. Nothing more is
+/// owed: `source` is consumed, so no writer is left behind on a
+/// view-lane window.
 pub(crate) unsafe fn video_packet_from_ffmpeg_as<C: crate::FfmpegCarrier + crate::CarrierOps>(
   source: Packet,
   time_base: mediaspine::Timebase,
@@ -1529,6 +1552,15 @@ pub(crate) unsafe fn video_packet_from_ffmpeg_as<C: crate::FfmpegCarrier + crate
 ///
 /// # Safety
 ///
+/// For the duration of the call, `packet`'s `AVPacket` must meet [the
+/// `AVPacket` contract](crate::contracts#avpacket). This reads its `buf`
+/// (an [`AVBufferRef`](crate::contracts#avbufferref), its reference count
+/// included), the `size` payload bytes at `data`, and its `side_data`
+/// entries with their bytes; `flags`, `pts`, `dts`, `duration` and
+/// `stream_index` are read as plain values. `Packet` keeps the
+/// `AVPacket` itself inline, so the borrow vouches for that much and no
+/// more.
+///
 /// `provenance` must be true of `packet`. It decides whether a payload
 /// buffer somebody else also references is refused, copied or windowed
 /// (`PayloadProvenance::route`): `CallerSupplied` is true of every
@@ -1540,11 +1572,11 @@ pub(crate) unsafe fn video_packet_from_ffmpeg_as<C: crate::FfmpegCarrier + crate
 /// true of `AVStream.attached_pic`, written once while the container
 /// opened.
 ///
-/// On the view lane the returned carrier may be a window onto `packet`'s
-/// own buffer, so nothing may write through `packet` (`data_mut`, an
-/// in-place FFmpeg write) while the carrier lives; dropping `packet`, or
-/// only ever reading it, discharges this. The owned lane copies and
-/// owes nothing here.
+/// On the view lane the returned carrier holds a reference of its own to
+/// `packet`'s buffer and may be a window onto it, so nothing may write
+/// through `packet` (`data_mut`, an in-place FFmpeg write) while the
+/// carrier lives; dropping `packet`, or only ever reading it, discharges
+/// this. The owned lane copies and owes nothing here.
 #[doc(hidden)]
 pub unsafe fn video_packet_from_borrowed<C: crate::FfmpegCarrier + crate::CarrierOps>(
   packet: &Packet,
@@ -1575,9 +1607,11 @@ pub unsafe fn video_packet_from_borrowed<C: crate::FfmpegCarrier + crate::Carrie
 ///
 /// # Safety
 ///
-/// `provenance` must be true of `source`, as the borrowed sibling's
-/// contract states it. Nothing more is owed: `source` is consumed, so no
-/// writer is left behind on a view-lane window.
+/// `source`'s `AVPacket` must meet [the `AVPacket`
+/// contract](crate::contracts#avpacket) and `provenance` must be true of
+/// it, as the borrowed sibling's contract states them. Nothing more is
+/// owed: `source` is consumed, so no writer is left behind on a
+/// view-lane window.
 pub(crate) unsafe fn audio_packet_from_ffmpeg_as<C: crate::FfmpegCarrier + crate::CarrierOps>(
   source: Packet,
   time_base: mediaspine::Timebase,
@@ -1610,6 +1644,15 @@ pub(crate) unsafe fn audio_packet_from_ffmpeg_as<C: crate::FfmpegCarrier + crate
 ///
 /// # Safety
 ///
+/// For the duration of the call, `packet`'s `AVPacket` must meet [the
+/// `AVPacket` contract](crate::contracts#avpacket). This reads its `buf`
+/// (an [`AVBufferRef`](crate::contracts#avbufferref), its reference count
+/// included), the `size` payload bytes at `data`, and its `side_data`
+/// entries with their bytes; `flags`, `pts`, `dts`, `duration` and
+/// `stream_index` are read as plain values. `Packet` keeps the
+/// `AVPacket` itself inline, so the borrow vouches for that much and no
+/// more.
+///
 /// `provenance` must be true of `packet`. It decides whether a payload
 /// buffer somebody else also references is refused, copied or windowed
 /// (`PayloadProvenance::route`): `CallerSupplied` is true of every
@@ -1621,11 +1664,11 @@ pub(crate) unsafe fn audio_packet_from_ffmpeg_as<C: crate::FfmpegCarrier + crate
 /// true of `AVStream.attached_pic`, written once while the container
 /// opened.
 ///
-/// On the view lane the returned carrier may be a window onto `packet`'s
-/// own buffer, so nothing may write through `packet` (`data_mut`, an
-/// in-place FFmpeg write) while the carrier lives; dropping `packet`, or
-/// only ever reading it, discharges this. The owned lane copies and
-/// owes nothing here.
+/// On the view lane the returned carrier holds a reference of its own to
+/// `packet`'s buffer and may be a window onto it, so nothing may write
+/// through `packet` (`data_mut`, an in-place FFmpeg write) while the
+/// carrier lives; dropping `packet`, or only ever reading it, discharges
+/// this. The owned lane copies and owes nothing here.
 #[doc(hidden)]
 pub unsafe fn audio_packet_from_borrowed<C: crate::FfmpegCarrier + crate::CarrierOps>(
   packet: &Packet,
@@ -1656,9 +1699,11 @@ pub unsafe fn audio_packet_from_borrowed<C: crate::FfmpegCarrier + crate::Carrie
 ///
 /// # Safety
 ///
-/// `provenance` must be true of `source`, as the borrowed sibling's
-/// contract states it. Nothing more is owed: `source` is consumed, so no
-/// writer is left behind on a view-lane window.
+/// `source`'s `AVPacket` must meet [the `AVPacket`
+/// contract](crate::contracts#avpacket) and `provenance` must be true of
+/// it, as the borrowed sibling's contract states them. Nothing more is
+/// owed: `source` is consumed, so no writer is left behind on a
+/// view-lane window.
 pub(crate) unsafe fn subtitle_packet_from_ffmpeg_as<C: crate::FfmpegCarrier + crate::CarrierOps>(
   source: Packet,
   time_base: mediaspine::Timebase,
@@ -1691,6 +1736,15 @@ pub(crate) unsafe fn subtitle_packet_from_ffmpeg_as<C: crate::FfmpegCarrier + cr
 ///
 /// # Safety
 ///
+/// For the duration of the call, `packet`'s `AVPacket` must meet [the
+/// `AVPacket` contract](crate::contracts#avpacket). This reads its `buf`
+/// (an [`AVBufferRef`](crate::contracts#avbufferref), its reference count
+/// included), the `size` payload bytes at `data`, and its `side_data`
+/// entries with their bytes; `flags`, `pts`, `dts`, `duration` and
+/// `stream_index` are read as plain values. `Packet` keeps the
+/// `AVPacket` itself inline, so the borrow vouches for that much and no
+/// more.
+///
 /// `provenance` must be true of `packet`. It decides whether a payload
 /// buffer somebody else also references is refused, copied or windowed
 /// (`PayloadProvenance::route`): `CallerSupplied` is true of every
@@ -1702,11 +1756,11 @@ pub(crate) unsafe fn subtitle_packet_from_ffmpeg_as<C: crate::FfmpegCarrier + cr
 /// true of `AVStream.attached_pic`, written once while the container
 /// opened.
 ///
-/// On the view lane the returned carrier may be a window onto `packet`'s
-/// own buffer, so nothing may write through `packet` (`data_mut`, an
-/// in-place FFmpeg write) while the carrier lives; dropping `packet`, or
-/// only ever reading it, discharges this. The owned lane copies and
-/// owes nothing here.
+/// On the view lane the returned carrier holds a reference of its own to
+/// `packet`'s buffer and may be a window onto it, so nothing may write
+/// through `packet` (`data_mut`, an in-place FFmpeg write) while the
+/// carrier lives; dropping `packet`, or only ever reading it, discharges
+/// this. The owned lane copies and owes nothing here.
 #[doc(hidden)]
 pub unsafe fn subtitle_packet_from_borrowed<C: crate::FfmpegCarrier + crate::CarrierOps>(
   packet: &Packet,
@@ -1743,9 +1797,11 @@ pub unsafe fn subtitle_packet_from_borrowed<C: crate::FfmpegCarrier + crate::Car
 ///
 /// # Safety
 ///
-/// `provenance` must be true of `source`, as the borrowed sibling's
-/// contract states it. Nothing more is owed: `source` is consumed, so no
-/// writer is left behind on a view-lane window.
+/// `source`'s `AVPacket` must meet [the `AVPacket`
+/// contract](crate::contracts#avpacket) and `provenance` must be true of
+/// it, as the borrowed sibling's contract states them. Nothing more is
+/// owed: `source` is consumed, so no writer is left behind on a
+/// view-lane window.
 pub(crate) unsafe fn data_packet_from_ffmpeg_as<C: crate::FfmpegCarrier + crate::CarrierOps>(
   source: Packet,
   time_base: mediaspine::Timebase,
@@ -1778,6 +1834,15 @@ pub(crate) unsafe fn data_packet_from_ffmpeg_as<C: crate::FfmpegCarrier + crate:
 ///
 /// # Safety
 ///
+/// For the duration of the call, `packet`'s `AVPacket` must meet [the
+/// `AVPacket` contract](crate::contracts#avpacket). This reads its `buf`
+/// (an [`AVBufferRef`](crate::contracts#avbufferref), its reference count
+/// included), the `size` payload bytes at `data`, and its `side_data`
+/// entries with their bytes; `flags`, `pts`, `dts`, `duration` and
+/// `stream_index` are read as plain values. `Packet` keeps the
+/// `AVPacket` itself inline, so the borrow vouches for that much and no
+/// more.
+///
 /// `provenance` must be true of `packet`. It decides whether a payload
 /// buffer somebody else also references is refused, copied or windowed
 /// (`PayloadProvenance::route`): `CallerSupplied` is true of every
@@ -1789,11 +1854,11 @@ pub(crate) unsafe fn data_packet_from_ffmpeg_as<C: crate::FfmpegCarrier + crate:
 /// true of `AVStream.attached_pic`, written once while the container
 /// opened.
 ///
-/// On the view lane the returned carrier may be a window onto `packet`'s
-/// own buffer, so nothing may write through `packet` (`data_mut`, an
-/// in-place FFmpeg write) while the carrier lives; dropping `packet`, or
-/// only ever reading it, discharges this. The owned lane copies and
-/// owes nothing here.
+/// On the view lane the returned carrier holds a reference of its own to
+/// `packet`'s buffer and may be a window onto it, so nothing may write
+/// through `packet` (`data_mut`, an in-place FFmpeg write) while the
+/// carrier lives; dropping `packet`, or only ever reading it, discharges
+/// this. The owned lane copies and owes nothing here.
 #[doc(hidden)]
 pub unsafe fn data_packet_from_borrowed<C: crate::FfmpegCarrier + crate::CarrierOps>(
   packet: &Packet,
@@ -1840,9 +1905,11 @@ pub unsafe fn data_packet_from_borrowed<C: crate::FfmpegCarrier + crate::Carrier
 ///
 /// # Safety
 ///
-/// `provenance` must be true of `source`, as the borrowed sibling's
-/// contract states it. Nothing more is owed: `source` is consumed, so no
-/// writer is left behind on a view-lane window.
+/// `source`'s `AVPacket` must meet [the `AVPacket`
+/// contract](crate::contracts#avpacket) and `provenance` must be true of
+/// it, as the borrowed sibling's contract states them. Nothing more is
+/// owed: `source` is consumed, so no writer is left behind on a
+/// view-lane window.
 pub(crate) unsafe fn attachment_packet_from_ffmpeg_as<
   C: crate::FfmpegCarrier + crate::CarrierOps,
 >(
@@ -1876,6 +1943,15 @@ pub(crate) unsafe fn attachment_packet_from_ffmpeg_as<
 ///
 /// # Safety
 ///
+/// For the duration of the call, `packet`'s `AVPacket` must meet [the
+/// `AVPacket` contract](crate::contracts#avpacket). This reads its `buf`
+/// (an [`AVBufferRef`](crate::contracts#avbufferref), its reference count
+/// included), the `size` payload bytes at `data`, and its `side_data`
+/// entries with their bytes; `flags`, `pts`, `dts`, `duration` and
+/// `stream_index` are read as plain values. `Packet` keeps the
+/// `AVPacket` itself inline, so the borrow vouches for that much and no
+/// more.
+///
 /// `provenance` must be true of `packet`. It decides whether a payload
 /// buffer somebody else also references is refused, copied or windowed
 /// (`PayloadProvenance::route`): `CallerSupplied` is true of every
@@ -1887,11 +1963,11 @@ pub(crate) unsafe fn attachment_packet_from_ffmpeg_as<
 /// true of `AVStream.attached_pic`, written once while the container
 /// opened.
 ///
-/// On the view lane the returned carrier may be a window onto `packet`'s
-/// own buffer, so nothing may write through `packet` (`data_mut`, an
-/// in-place FFmpeg write) while the carrier lives; dropping `packet`, or
-/// only ever reading it, discharges this. The owned lane copies and
-/// owes nothing here.
+/// On the view lane the returned carrier holds a reference of its own to
+/// `packet`'s buffer and may be a window onto it, so nothing may write
+/// through `packet` (`data_mut`, an in-place FFmpeg write) while the
+/// carrier lives; dropping `packet`, or only ever reading it, discharges
+/// this. The owned lane copies and owes nothing here.
 pub(crate) unsafe fn attachment_packet_from_borrowed<
   C: crate::FfmpegCarrier + crate::CarrierOps,
 >(
@@ -1955,8 +2031,8 @@ fn md_flags_from_packet(packet: &Packet) -> Result<MdPacketFlags, PacketBufferEr
 ///
 /// # Safety
 ///
-/// `pkt` must be a live `*const AVPacket` for the duration of this
-/// call.
+/// `pkt` must point at a live, aligned `AVPacket` for the duration of
+/// the call. Only its `flags`, a plain integer, is read.
 #[doc(hidden)]
 pub unsafe fn md_flags_from_av_packet(
   pkt: *const ffmpeg_next::ffi::AVPacket,
@@ -2180,6 +2256,8 @@ pub fn video_packet_from_ffmpeg_in(
 ) -> Result<Option<VideoPacket<VideoPacketExtra, crate::FfmpegBuffer>>, PacketBufferError> {
   // SAFETY: `CallerSupplied` is true of every packet; the packet is
   // consumed, so nothing is left to write through the view lane's window.
+  // The packet, an `ffmpeg_next::Packet`, meets the `AVPacket`
+  // contract (`crate::contracts`), as every one does.
   unsafe {
     video_packet_from_ffmpeg_as::<crate::View>(
       packet,
@@ -2198,6 +2276,8 @@ pub fn audio_packet_from_ffmpeg_in(
 ) -> Result<Option<AudioPacket<AudioPacketExtra, crate::FfmpegBuffer>>, PacketBufferError> {
   // SAFETY: `CallerSupplied` is true of every packet; the packet is
   // consumed, so nothing is left to write through the view lane's window.
+  // The packet, an `ffmpeg_next::Packet`, meets the `AVPacket`
+  // contract (`crate::contracts`), as every one does.
   unsafe {
     audio_packet_from_ffmpeg_as::<crate::View>(
       packet,
@@ -2216,6 +2296,8 @@ pub fn subtitle_packet_from_ffmpeg_in(
 ) -> Result<Option<SubtitlePacket<SubtitlePacketExtra, crate::FfmpegBuffer>>, PacketBufferError> {
   // SAFETY: `CallerSupplied` is true of every packet; the packet is
   // consumed, so nothing is left to write through the view lane's window.
+  // The packet, an `ffmpeg_next::Packet`, meets the `AVPacket`
+  // contract (`crate::contracts`), as every one does.
   unsafe {
     subtitle_packet_from_ffmpeg_as::<crate::View>(
       packet,
@@ -2234,6 +2316,8 @@ pub fn data_packet_from_ffmpeg_in(
 ) -> Result<Option<DataPacket<DataPacketExtra, crate::FfmpegBuffer>>, PacketBufferError> {
   // SAFETY: `CallerSupplied` is true of every packet; the packet is
   // consumed, so nothing is left to write through the view lane's window.
+  // The packet, an `ffmpeg_next::Packet`, meets the `AVPacket`
+  // contract (`crate::contracts`), as every one does.
   unsafe {
     data_packet_from_ffmpeg_as::<crate::View>(
       packet,
@@ -2261,6 +2345,8 @@ pub fn owned_video_packet_from_ffmpeg_in(
 ) -> Result<Option<VideoPacket<VideoPacketExtra, FfmpegBytes>>, PacketBufferError> {
   // SAFETY: `CallerSupplied` is true of every packet, and the owned lane
   // copies, so nothing about `packet` outlives this borrow.
+  // The packet, an `ffmpeg_next::Packet`, meets the `AVPacket`
+  // contract (`crate::contracts`), as every one does.
   unsafe {
     video_packet_from_borrowed::<crate::Owned>(
       packet,
@@ -2280,6 +2366,8 @@ pub fn owned_audio_packet_from_ffmpeg_in(
 ) -> Result<Option<AudioPacket<AudioPacketExtra, FfmpegBytes>>, PacketBufferError> {
   // SAFETY: `CallerSupplied` is true of every packet, and the owned lane
   // copies, so nothing about `packet` outlives this borrow.
+  // The packet, an `ffmpeg_next::Packet`, meets the `AVPacket`
+  // contract (`crate::contracts`), as every one does.
   unsafe {
     audio_packet_from_borrowed::<crate::Owned>(
       packet,
@@ -2299,6 +2387,8 @@ pub fn owned_subtitle_packet_from_ffmpeg_in(
 ) -> Result<Option<SubtitlePacket<SubtitlePacketExtra, FfmpegBytes>>, PacketBufferError> {
   // SAFETY: `CallerSupplied` is true of every packet, and the owned lane
   // copies, so nothing about `packet` outlives this borrow.
+  // The packet, an `ffmpeg_next::Packet`, meets the `AVPacket`
+  // contract (`crate::contracts`), as every one does.
   unsafe {
     subtitle_packet_from_borrowed::<crate::Owned>(
       packet,
@@ -2318,6 +2408,8 @@ pub fn owned_data_packet_from_ffmpeg_in(
 ) -> Result<Option<DataPacket<DataPacketExtra, FfmpegBytes>>, PacketBufferError> {
   // SAFETY: `CallerSupplied` is true of every packet, and the owned lane
   // copies, so nothing about `packet` outlives this borrow.
+  // The packet, an `ffmpeg_next::Packet`, meets the `AVPacket`
+  // contract (`crate::contracts`), as every one does.
   unsafe {
     data_packet_from_borrowed::<crate::Owned>(
       packet,
@@ -2336,6 +2428,8 @@ pub fn owned_attachment_packet_from_ffmpeg(
 ) -> Result<Option<AttachmentPacket<AttachmentPacketExtra, FfmpegBytes>>, PacketBufferError> {
   // SAFETY: `CallerSupplied` is true of every packet, and the owned lane
   // copies, so nothing about `packet` outlives this borrow.
+  // The packet, an `ffmpeg_next::Packet`, meets the `AVPacket`
+  // contract (`crate::contracts`), as every one does.
   unsafe {
     attachment_packet_from_borrowed::<crate::Owned>(
       packet,
@@ -2392,6 +2486,8 @@ pub fn attachment_packet_from_ffmpeg(
 {
   // SAFETY: `CallerSupplied` is true of every packet; the packet is
   // consumed, so nothing is left to write through the view lane's window.
+  // The packet, an `ffmpeg_next::Packet`, meets the `AVPacket`
+  // contract (`crate::contracts`), as every one does.
   unsafe {
     attachment_packet_from_ffmpeg_as::<crate::View>(
       packet,

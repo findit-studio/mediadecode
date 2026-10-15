@@ -750,3 +750,74 @@ fn a_libavcodec_owned_custom_layout_converts_through_the_unsafe_entry() {
   assert_eq!(converted.channel_count(), 2);
   assert_eq!(converted.channel_layout().channels(), 2);
 }
+
+/// **A bitmap rect is refused by the safe conversion, unread.** A
+/// decoded bitmap rect owns a plane of `linesize[0] × h` bytes, and
+/// `ffmpeg_next`'s safe `BitmapMut::set_height` moves `h` alone — here
+/// to a million rows over a four-byte plane. The safe road refuses the
+/// rect by name, and the worker, the only code that reads a plane, is
+/// never entered: the probe's tripwire would stop it at the door.
+#[test]
+fn a_bitmap_rect_is_refused_by_the_safe_subtitle_conversion_unread() {
+  use ffmpeg_next::subtitle::{RectMut, Type};
+
+  let mut subtitle = ffmpeg_next::Subtitle::new();
+  // A text rect first: the refusal names the bitmap's own index.
+  if let RectMut::Text(mut text) = subtitle.add_rect(Type::Text) {
+    text.set("before the bitmap");
+  }
+  let RectMut::Bitmap(mut bitmap) = subtitle.add_rect(Type::Bitmap) else {
+    panic!("a bitmap rect was asked for");
+  };
+  // SAFETY: `bitmap` is the rect `add_rect` just allocated. The plane is
+  // a four-byte `av_malloc` allocation, freed with the subtitle by
+  // `avsubtitle_free`; two rows of two bytes is its honest shape.
+  unsafe {
+    let rect = bitmap.as_mut_ptr();
+    let plane = ffmpeg_next::ffi::av_malloc(4).cast::<u8>();
+    assert!(!plane.is_null());
+    core::ptr::write_bytes(plane, 0, 4);
+    (*rect).data[0] = plane;
+    (*rect).linesize[0] = 2;
+    (*rect).w = 2;
+    (*rect).h = 2;
+  }
+  // The safe setter that makes the plane's extent a lie.
+  bitmap.set_height(1_000_000);
+
+  let before = worker_probe::entries();
+  worker_probe::arm(true);
+  let result = subtitle_frame_from(&subtitle);
+  worker_probe::arm(false);
+
+  assert_eq!(
+    worker_probe::entries() - before,
+    0,
+    "the safe road must not enter the worker"
+  );
+  assert!(
+    matches!(result, Err(ConvertError::UnverifiableBitmap(p)) if p.rect() == 1),
+    "a bitmap rect is refused by name, got {:?}",
+    result.as_ref().err(),
+  );
+}
+
+/// **Text still converts on the safe road.** The refusal is the
+/// bitmap's alone: a subtitle of text rects, whose strings `ffmpeg_next`
+/// duplicates NUL-terminated, comes through the safe conversion.
+#[test]
+fn a_text_subtitle_converts_on_the_safe_road() {
+  use ffmpeg_next::subtitle::{RectMut, Type};
+
+  let mut subtitle = ffmpeg_next::Subtitle::new();
+  if let RectMut::Text(mut text) = subtitle.add_rect(Type::Text) {
+    text.set("hello");
+  }
+  let frame = subtitle_frame_from(&subtitle).expect("a text subtitle converts");
+  match frame.payload() {
+    mediaspine::subtitle::SubtitlePayload::Text(text) => {
+      assert_eq!(text.text().as_ref(), b"hello");
+    }
+    _ => panic!("a text payload was expected"),
+  }
+}

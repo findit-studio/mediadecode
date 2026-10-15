@@ -1008,10 +1008,16 @@ unsafe fn side_data_of(
 ///
 /// # Safety
 ///
-/// `par` must be a live `*const AVCodecParameters`, and for a `CUSTOM`
-/// order with a non-null `u.map` that map must hold `nb_channels` live
-/// `AVChannelCustom` entries — FFmpeg's own contract for a layout it
-/// filled, which is the only kind this crate hands in.
+/// For the duration of the call, `par` must point at a live, aligned
+/// `AVCodecParameters` whose `ch_layout` meets [the `AVChannelLayout`
+/// contract](crate::contracts#avchannellayout): `order`, `nb_channels`
+/// and `opaque` are read as plain values, the layout is preflighted
+/// ([`layout_preflight`](crate::channel_layout::layout_preflight)), and
+/// for a `CUSTOM` order with a count the preflight accepts and a non-null
+/// map, each of the `nb_channels` entries' `name`, `id` and `opaque` is
+/// read — `opaque` as a pointer value, never dereferenced. That is
+/// FFmpeg's own contract for a layout it filled, which is the only kind
+/// this crate hands in.
 #[doc(hidden)]
 pub unsafe fn validate_channel_layout(
   par: *const AVCodecParameters,

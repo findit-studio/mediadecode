@@ -1061,9 +1061,15 @@ impl std::error::Error for TrustedPayload {}
 ///
 /// # Safety
 ///
-/// `pkt` must be a live `*const AVPacket` for the duration of this
-/// call, and `provenance` must be true of it — it decides whether a
-/// buffer somebody else also references is refused, copied or windowed
+/// For the duration of the call, `pkt` must point at a live, aligned
+/// `AVPacket` that meets [the `AVPacket` contract](crate::contracts#avpacket)
+/// for what this reads: its `buf` (an
+/// [`AVBufferRef`](crate::contracts#avbufferref), its reference count
+/// included) and the `size` payload bytes at `data`, which the owned lane
+/// copies and the view lane lends; `flags` is read as a plain integer.
+///
+/// `provenance` must be true of it — it decides whether a buffer
+/// somebody else also references is refused, copied or windowed
 /// (`PayloadProvenance::route`):
 ///
 /// * [`PayloadProvenance::CallerSupplied`] is true of every packet;
@@ -1073,9 +1079,10 @@ impl std::error::Error for TrustedPayload {}
 /// * [`PayloadProvenance::AttachedPicture`] claims that nothing writes
 ///   through that buffer for as long as the returned carrier lives.
 ///
-/// On the view lane the carrier may be a window onto the packet's own
-/// buffer, so the packet's owner must not write through it while the
-/// carrier lives. The owned lane copies and owes nothing here.
+/// On the view lane the returned carrier holds a reference of its own to
+/// the packet's buffer and may be a window onto it, so the packet's
+/// owner must not write through it while the carrier lives. The owned
+/// lane copies and owes nothing here.
 pub unsafe fn payload_of<C: crate::FfmpegCarrier + crate::CarrierOps>(
   pkt: *const ffmpeg_next::ffi::AVPacket,
   budget: usize,
@@ -1128,10 +1135,16 @@ pub struct PayloadPlan {
 ///
 /// # Safety
 ///
-/// `pkt` must be a live `*const AVPacket` for the duration of the call,
-/// and — if a plan comes back — for as long as that plan is used; and
+/// For the duration of the call, `pkt` must point at a live, aligned
+/// `AVPacket` whose `buf` is null or an
+/// [`AVBufferRef`](crate::contracts#avbufferref): this reads `buf`'s
+/// `data`, `size` and reference count, and the packet's `data`, `size`
+/// and `flags` as plain values. It reads no payload byte.
+///
 /// `provenance` must be true of it, as [`payload_of`] states, because
-/// the plan's route is decided by it.
+/// the plan's route is decided by it. A plan that comes back carries raw
+/// pointers into that packet's buffer; only this crate's capture acts on
+/// one, so it is inert in anyone else's hands.
 pub unsafe fn preflight_payload(
   pkt: *const ffmpeg_next::ffi::AVPacket,
   budget: usize,

@@ -112,7 +112,13 @@ impl ContainerFormat {
   ///
   /// # Safety
   ///
-  /// `context` must be a live `*const AVFormatContext`.
+  /// `context` must be null — answered `None` — or point at a live,
+  /// aligned `AVFormatContext` that meets [the `AVFormatContext`
+  /// contract](crate::contracts#avformatcontext) for the duration of the
+  /// call: its `iformat` is read, and through it the `name` and `long_name`
+  /// strings, each up to its NUL or for 1,024 bytes. Those strings are
+  /// libavformat's static tables, so the text returned borrows memory that
+  /// lives for the process.
   #[doc(hidden)]
   pub unsafe fn from_context(context: *const ffmpeg_next::ffi::AVFormatContext) -> Option<Self> {
     if context.is_null() {
