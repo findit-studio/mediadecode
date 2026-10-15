@@ -683,8 +683,7 @@ mod tests {
   #[test]
   fn an_attachment_track_without_its_file_is_refused_by_name() {
     let refused = TrackDescription::<Loopback, &[u8], ()>::from_track_info(font_row(), None, ())
-      .err()
-      .expect("no file, no attachment track");
+      .expect_err("no file, no attachment track");
     assert_eq!(refused.reason(), MismatchReason::MissingFile);
     let (row, payload, ()) = refused.into_parts();
     assert_eq!(
@@ -699,8 +698,7 @@ mod tests {
       TrackParams::Attachment(AttachmentTrackParams::new(98_307)),
       (),
     )
-    .err()
-    .expect("an attachment's parameters alone describe no track");
+    .expect_err("an attachment's parameters alone describe no track");
     let (timebase, params, ()) = refused.into_parts();
     assert_eq!((timebase, params.kind()), (ms_tb(), TrackKind::Attachment));
   }
@@ -719,8 +717,7 @@ mod tests {
     };
     let refused =
       TrackDescription::<Loopback, &[u8], ()>::from_track_info(video(), Some(font_payload()), ())
-        .err()
-        .expect("a video track takes no file");
+        .expect_err("a video track takes no file");
     assert_eq!(refused.reason(), MismatchReason::StrayFile);
     let (_, payload, ()) = refused.into_parts();
     assert!(
@@ -733,8 +730,7 @@ mod tests {
       None,
       (),
     )
-    .err()
-    .expect("a video track carries no attachment identity");
+    .expect_err("a video track carries no attachment identity");
     assert_eq!(refused.reason(), MismatchReason::StrayIdentity);
   }
 }
