@@ -11,7 +11,7 @@ The backend-agnostic core it adapts has its own log at
 
 ## [Unreleased]
 
-## [0.19.0] - 2026-10-15
+## [0.19.0] - 2026-10-16
 
 Tracks `mediadecode` 0.19.0 (see
 [its entry](../mediadecode/CHANGELOG.md#0190)). The family releases in

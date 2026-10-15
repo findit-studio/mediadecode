@@ -8,7 +8,7 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 The family — `mediadecode`, `mediadecode-ffmpeg`, `mediadecode-webcodecs`,
 `mediaencode`, `mediaencode-ffmpeg` and `mediaio` — releases in lockstep.
 
-## [0.19.0] - 2026-10-15
+## [0.19.0] - 2026-10-16
 
 ### Added
 
