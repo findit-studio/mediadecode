@@ -1114,8 +1114,9 @@ pub unsafe fn subtitle_frame_from(
 ///
 /// `av_subtitle` must point at a live, aligned `AVSubtitle` whose
 /// `rects`, when not null and `num_rects > 0`, is valid for `num_rects`
-/// pointers, each null or a live `AVSubtitleRect`. Only the rects' `type`
-/// and `data[0]` are read, as plain values.
+/// pointers, each null or a live `AVSubtitleRect`. Each rect's `type` is
+/// read, and then only a bitmap rect's `data[0]` — its own kind's field —
+/// as a pointer value; nothing of another kind is read.
 unsafe fn first_bitmap_with_plane(
   av_subtitle: *const ffmpeg_next::ffi::AVSubtitle,
 ) -> Option<usize> {
@@ -1129,7 +1130,9 @@ unsafe fn first_bitmap_with_plane(
   (0..count_raw.min(SUBTITLE_MAX_RECTS)).find(|&index| {
     // SAFETY: `index` is below `num_rects`, so the entry is in the array;
     // a null rect is skipped, and the two fields are read through the
-    // raw pointer as the integer and pointer they are.
+    // raw pointer as the integer and pointer they are — `data[0]` only
+    // once `type` has said the rect is a bitmap, which owns it (`&&`
+    // reads it on no other kind).
     unsafe {
       let rect = *rects.add(index);
       !rect.is_null()
@@ -3118,9 +3121,11 @@ pub(crate) unsafe fn find_audio_backing_buffer(
 /// contract](crate::contracts#avsubtitle). This reads, through it: the
 /// `rects` array, valid for `num_rects` pointers, of which the first 64
 /// are read (a null array is refused when `num_rects > 0`); each non-null
-/// rect; each rect's `text` and `ass`, up to their NUL or for 65,537
-/// bytes; each bitmap rect's plane, `linesize[0] × h` bytes when that is
-/// within the caps; and its palette, 1,024 bytes.
+/// rect's `type`, and then only that kind's own fields — a text rect's
+/// `text` or an ASS rect's `ass`, up to its NUL or for 65,537 bytes; a
+/// bitmap rect's plane, `linesize[0] × h` bytes when that is within the
+/// caps, its palette, 1,024 bytes, and its geometry. A field of another
+/// kind is never read.
 ///
 /// The extent of a bitmap rect's plane is recorded nowhere: an
 /// `AVSubtitleRect` holds plain allocations, not buffers that know their
@@ -3210,140 +3215,136 @@ pub unsafe fn av_subtitle_to_subtitle_frame_as<C: crate::FfmpegCarrier + crate::
     // computes the field address without forming a reference;
     // reading as `i32` matches the bindgen enum's `c_int` storage.
     let rect_type_raw = unsafe { read_unaligned(addr_of!((*rect_ptr).type_) as *const i32) };
-    // Pre-read primitive fields we'll use later (no `&AVSubtitleRect`
-    // ever formed).
-    let rect_text_ptr = unsafe { (*rect_ptr).text };
-    let rect_ass_ptr = unsafe { (*rect_ptr).ass };
-    let rect_data0_ptr = unsafe { (*rect_ptr).data[0] };
-    let rect_data1_ptr = unsafe { (*rect_ptr).data[1] };
-    let rect_linesize0 = unsafe { (*rect_ptr).linesize[0] };
-    let rect_w = unsafe { (*rect_ptr).w };
-    let rect_h = unsafe { (*rect_ptr).h };
-    let rect_x = unsafe { (*rect_ptr).x };
-    let rect_y = unsafe { (*rect_ptr).y };
 
-    match rect_type_raw {
-      x if x == text_kind && !rect_text_ptr.is_null() => {
-        // SAFETY: `text` is documented as a 0-terminated UTF-8
-        // string, owned by FFmpeg for the lifetime of the AVSubtitle.
-        // We use a *bounded* NUL search instead of `CStr::from_ptr`
-        // — the latter walks until it finds a NUL, which a valid-
-        // but-pathological string makes unbounded, and a missing
-        // NUL violates the `CStr::from_ptr` precondition outright.
-        // `bounded_cstr_bytes` searches at most
-        // `SUBTITLE_MAX_TEXT_BYTES_PER_RECT + 1` bytes; if no NUL
-        // is found inside that window the rect is rejected.
-        let bytes = unsafe { bounded_cstr_bytes(rect_text_ptr, SUBTITLE_MAX_TEXT_BYTES_PER_RECT) }
-          .ok_or(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(0)))?;
-        // The cap is now enforced inside `bounded_cstr_bytes` (no
-        // NUL within `cap + 1` ⇒ rejection); a redundant length
-        // check is unnecessary but kept as documentation.
-        if bytes.len() > SUBTITLE_MAX_TEXT_BYTES_PER_RECT {
-          return Err(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(0)));
-        }
-        let separator = if text_chunks.is_empty() { 0 } else { 1 };
-        let projected = text_total_bytes
-          .saturating_add(bytes.len())
-          .saturating_add(separator);
-        if projected > SUBTITLE_MAX_TEXT_TOTAL_BYTES {
-          return Err(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(0)));
-        }
-        if separator == 1 {
-          text_chunks
-            .try_reserve(1)
-            .map_err(|_| ConvertError::CarrierAllocFailed(CarrierAllocFailed::new(0)))?;
-          text_chunks.push(b'\n');
-        }
-        text_chunks
-          .try_reserve(bytes.len())
-          .map_err(|_| ConvertError::CarrierAllocFailed(CarrierAllocFailed::new(0)))?;
-        text_chunks.extend_from_slice(bytes);
-        text_total_bytes = projected;
-      }
-      x if x == ass_kind && !rect_ass_ptr.is_null() => {
-        // SAFETY: `ass` is documented as 0-terminated UTF-8.
-        // Same bounded-scan rationale as the TEXT branch above.
-        let bytes = unsafe { bounded_cstr_bytes(rect_ass_ptr, SUBTITLE_MAX_TEXT_BYTES_PER_RECT) }
-          .ok_or(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(0)))?;
-        if bytes.len() > SUBTITLE_MAX_TEXT_BYTES_PER_RECT {
-          return Err(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(0)));
-        }
-        let separator = if text_chunks.is_empty() { 0 } else { 1 };
-        let projected = text_total_bytes
-          .saturating_add(bytes.len())
-          .saturating_add(separator);
-        if projected > SUBTITLE_MAX_TEXT_TOTAL_BYTES {
-          return Err(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(0)));
-        }
-        if separator == 1 {
-          text_chunks
-            .try_reserve(1)
-            .map_err(|_| ConvertError::CarrierAllocFailed(CarrierAllocFailed::new(0)))?;
-          text_chunks.push(b'\n');
-        }
-        text_chunks
-          .try_reserve(bytes.len())
-          .map_err(|_| ConvertError::CarrierAllocFailed(CarrierAllocFailed::new(0)))?;
-        text_chunks.extend_from_slice(bytes);
-        text_total_bytes = projected;
-      }
-      x if x == bitmap_kind => {
-        // Bitmap region. data[0] = paletted indices, data[1] = RGBA
-        // palette (256 entries × 4 bytes = 1024 bytes). Both are
-        // owned by FFmpeg and not refcounted; copy into fresh buffers.
-        let w = rect_w.max(0) as u32;
-        let h = rect_h.max(0) as u32;
-        let stride = rect_linesize0.max(0) as u32;
-        if rect_data0_ptr.is_null() || stride == 0 || h == 0 {
-          continue;
-        }
-        // `checked_mul` so a corrupt rect can't drive
-        // `from_raw_parts` to an address-space-spanning length (UB
-        // even before any deref).
-        let data_len = (stride as usize)
-          .checked_mul(h as usize)
-          .ok_or(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(0)))?;
-        // Per-rect bitmap byte cap (defends against a single
-        // attacker rect larger than realistic DVB / PGS subtitles
-        // by a wide margin).
-        if data_len > SUBTITLE_MAX_BITMAP_BYTES_PER_RECT {
-          return Err(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(0)));
-        }
-        let projected_total = bitmap_total_bytes.saturating_add(data_len);
-        if projected_total > SUBTITLE_MAX_BITMAP_TOTAL_BYTES {
-          return Err(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(0)));
-        }
-        // SAFETY: data[0] is valid for `linesize[0] * h` bytes per
-        // FFmpeg's contract; the multiplication is checked above.
-        let data_slice = unsafe { core::slice::from_raw_parts(rect_data0_ptr, data_len) };
-        // **A rect is copied on both lanes.** `AVSubtitleRect` has no
-        // `buf[]`: its `data[]` are plain `av_malloc` allocations owned
-        // by the `AVSubtitle`, which `avsubtitle_free` releases when
-        // this call returns. There is no refcount to take, so the view
-        // lane has nothing to view and says so.
-        let data_buf = C::from_bytes(data_slice)
-          .ok_or(ConvertError::CarrierAllocFailed(CarrierAllocFailed::new(0)))?;
-        let palette_len = 256 * 4;
-        let palette_buf = if rect_data1_ptr.is_null() {
-          C::empty()
+    // **Each kind's fields are read in its own branch, and only there.**
+    // The contract asks of a rect only its own kind's fields — a text
+    // rect's `text`, an ASS rect's `ass`, a bitmap rect's plane, palette
+    // and geometry — and a producer need not write the rest: a decoder
+    // that allocates a rect without zeroing it leaves a text rect's
+    // `data[]` and `linesize[]` as they were. Reading a field the
+    // contract never vouched for, even only to look at it, would read
+    // what may never have been written. So `type_` comes first and
+    // alone, and every other field is read under the arm that owns it.
+    if rect_type_raw == text_kind || rect_type_raw == ass_kind {
+      // SAFETY: the rect is live; this reads the one string field its
+      // kind owns, as the pointer value it is.
+      let string = unsafe {
+        if rect_type_raw == text_kind {
+          (*rect_ptr).text
         } else {
-          // SAFETY: palette buffer is 256*4 bytes per FFmpeg's contract.
-          let p = unsafe { core::slice::from_raw_parts(rect_data1_ptr, palette_len) };
-          C::from_bytes(p).ok_or(ConvertError::CarrierAllocFailed(CarrierAllocFailed::new(1)))?
-        };
-        bitmap_regions.push(mediaspine::subtitle::BitmapRegion::new(
-          rect_x.max(0) as u32,
-          rect_y.max(0) as u32,
-          w,
-          h,
-          stride,
-          data_buf,
-          palette_buf,
-        ));
-        bitmap_total_bytes = projected_total;
+          (*rect_ptr).ass
+        }
+      };
+      if string.is_null() {
+        continue;
       }
-      _ => {}
+      // SAFETY: `text` and `ass` are each documented as a 0-terminated
+      // UTF-8 string, owned by FFmpeg for the lifetime of the AVSubtitle
+      // (the contract's string clause). We use a *bounded* NUL search
+      // instead of `CStr::from_ptr` — the latter walks until it finds a
+      // NUL, which a valid-but-pathological string makes unbounded, and a
+      // missing NUL violates the `CStr::from_ptr` precondition outright.
+      // `bounded_cstr_bytes` searches at most
+      // `SUBTITLE_MAX_TEXT_BYTES_PER_RECT + 1` bytes; if no NUL is found
+      // inside that window the rect is rejected.
+      let bytes = unsafe { bounded_cstr_bytes(string, SUBTITLE_MAX_TEXT_BYTES_PER_RECT) }
+        .ok_or(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(0)))?;
+      // The cap is now enforced inside `bounded_cstr_bytes` (no NUL
+      // within `cap + 1` ⇒ rejection); a redundant length check is
+      // unnecessary but kept as documentation.
+      if bytes.len() > SUBTITLE_MAX_TEXT_BYTES_PER_RECT {
+        return Err(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(0)));
+      }
+      let separator = if text_chunks.is_empty() { 0 } else { 1 };
+      let projected = text_total_bytes
+        .saturating_add(bytes.len())
+        .saturating_add(separator);
+      if projected > SUBTITLE_MAX_TEXT_TOTAL_BYTES {
+        return Err(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(0)));
+      }
+      if separator == 1 {
+        text_chunks
+          .try_reserve(1)
+          .map_err(|_| ConvertError::CarrierAllocFailed(CarrierAllocFailed::new(0)))?;
+        text_chunks.push(b'\n');
+      }
+      text_chunks
+        .try_reserve(bytes.len())
+        .map_err(|_| ConvertError::CarrierAllocFailed(CarrierAllocFailed::new(0)))?;
+      text_chunks.extend_from_slice(bytes);
+      text_total_bytes = projected;
+    } else if rect_type_raw == bitmap_kind {
+      // Bitmap region. data[0] = paletted indices, data[1] = RGBA
+      // palette (256 entries × 4 bytes = 1024 bytes). Both are
+      // owned by FFmpeg and not refcounted; copy into fresh buffers.
+      //
+      // SAFETY: the rect is live and a bitmap: these are its kind's own
+      // fields — two pointer values, the plane's stride, and the
+      // geometry — read as the plain values they are.
+      let (rect_data0_ptr, rect_data1_ptr, rect_linesize0, rect_w, rect_h, rect_x, rect_y) = unsafe {
+        (
+          (*rect_ptr).data[0],
+          (*rect_ptr).data[1],
+          (*rect_ptr).linesize[0],
+          (*rect_ptr).w,
+          (*rect_ptr).h,
+          (*rect_ptr).x,
+          (*rect_ptr).y,
+        )
+      };
+      let w = rect_w.max(0) as u32;
+      let h = rect_h.max(0) as u32;
+      let stride = rect_linesize0.max(0) as u32;
+      if rect_data0_ptr.is_null() || stride == 0 || h == 0 {
+        continue;
+      }
+      // `checked_mul` so a corrupt rect can't drive
+      // `from_raw_parts` to an address-space-spanning length (UB
+      // even before any deref).
+      let data_len = (stride as usize)
+        .checked_mul(h as usize)
+        .ok_or(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(0)))?;
+      // Per-rect bitmap byte cap (defends against a single
+      // attacker rect larger than realistic DVB / PGS subtitles
+      // by a wide margin).
+      if data_len > SUBTITLE_MAX_BITMAP_BYTES_PER_RECT {
+        return Err(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(0)));
+      }
+      let projected_total = bitmap_total_bytes.saturating_add(data_len);
+      if projected_total > SUBTITLE_MAX_BITMAP_TOTAL_BYTES {
+        return Err(ConvertError::InvalidPlaneLayout(InvalidPlaneLayout::new(0)));
+      }
+      // SAFETY: data[0] is valid for `linesize[0] * h` bytes per
+      // FFmpeg's contract; the multiplication is checked above.
+      let data_slice = unsafe { core::slice::from_raw_parts(rect_data0_ptr, data_len) };
+      // **A rect is copied on both lanes.** `AVSubtitleRect` has no
+      // `buf[]`: its `data[]` are plain `av_malloc` allocations owned
+      // by the `AVSubtitle`, which `avsubtitle_free` releases when
+      // this call returns. There is no refcount to take, so the view
+      // lane has nothing to view and says so.
+      let data_buf = C::from_bytes(data_slice)
+        .ok_or(ConvertError::CarrierAllocFailed(CarrierAllocFailed::new(0)))?;
+      let palette_len = 256 * 4;
+      let palette_buf = if rect_data1_ptr.is_null() {
+        C::empty()
+      } else {
+        // SAFETY: palette buffer is 256*4 bytes per FFmpeg's contract.
+        let p = unsafe { core::slice::from_raw_parts(rect_data1_ptr, palette_len) };
+        C::from_bytes(p).ok_or(ConvertError::CarrierAllocFailed(CarrierAllocFailed::new(1)))?
+      };
+      bitmap_regions.push(mediaspine::subtitle::BitmapRegion::new(
+        rect_x.max(0) as u32,
+        rect_y.max(0) as u32,
+        w,
+        h,
+        stride,
+        data_buf,
+        palette_buf,
+      ));
+      bitmap_total_bytes = projected_total;
     }
+    // Any other kind — `SUBTITLE_NONE`, or a value no variant names —
+    // carries nothing this conversion reads, and nothing of it is read.
   }
 
   let payload = if !text_chunks.is_empty() {

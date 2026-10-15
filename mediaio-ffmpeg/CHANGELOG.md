@@ -69,6 +69,11 @@ The family — `mediadecode`, `mediadecode-ffmpeg`, `mediadecode-webcodecs`,
   plane size, and `ffmpeg_next`'s safe `BitmapMut::set_height` moves
   the height alone. Bitmaps convert through the raw entries, whose
   caller vouches for the extent.
+- **A subtitle rect's fields are read only under its own kind.** The
+  subtitle worker reads a rect's `type` first and alone, then a text
+  rect's `text`, an ASS rect's `ass`, or a bitmap rect's plane, palette
+  and geometry — never a field of another kind, which a producer need
+  not have written. The `AVSubtitle` contract says so.
 - `boundary::write_md_flags` is a safe fn: it writes one field of the
   `AVPacket` an `ffmpeg_next::Packet` keeps inline.
 - A `test-support` feature (off by default): the fault-subprocess

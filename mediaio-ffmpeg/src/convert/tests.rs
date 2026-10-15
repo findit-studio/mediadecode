@@ -872,3 +872,92 @@ fn a_text_subtitle_converts_on_the_borrowed_road() {
     _ => panic!("a text payload was expected"),
   }
 }
+
+/// The text a converted subtitle carries, on either lane.
+fn subtitle_text<B: AsRef<[u8]>>(frame: &SubtitleFrame<SubtitleFrameExtra, B>) -> Vec<u8> {
+  match frame.payload() {
+    mediaspine::subtitle::SubtitlePayload::Text(text) => {
+      let bytes: &[u8] = text.text().as_ref();
+      bytes.to_vec()
+    }
+    _ => panic!("a text payload was expected"),
+  }
+}
+
+/// **A rect's fields are read only under its own kind.** A text rect and
+/// an ASS rect whose bitmap fields hold garbage — plane and palette
+/// pointers that point at nothing, a stride and height whose product the
+/// bitmap arm would refuse, a negative width, positions out of range —
+/// convert to their text, on the borrowed road and on both raw lanes.
+///
+/// The garbage is stored, never read. It is ordinary written data, so
+/// the law itself stays defined whatever the conversion does; a
+/// conversion that dereferenced the planes would fault, and one that
+/// judged their geometry before dispatching on `type` would refuse. A
+/// decoder that allocates a rect without zeroing it leaves exactly these
+/// fields unwritten on a text rect, which is why the worker reads `type`
+/// first and every other field only under the arm that owns it.
+#[test]
+fn a_text_rect_converts_whatever_its_bitmap_fields_hold() {
+  use ffmpeg_next::subtitle::{RectMut, Type};
+
+  let mut subtitle = ffmpeg_next::Subtitle::new();
+  let mut rects = Vec::new();
+  if let RectMut::Text(mut text) = subtitle.add_rect(Type::Text) {
+    text.set("the text");
+    // SAFETY: reading the pointer of the rect `add_rect` just allocated.
+    rects.push(unsafe { text.as_mut_ptr() });
+  }
+  if let RectMut::Ass(mut ass) = subtitle.add_rect(Type::Ass) {
+    ass.set("the ass");
+    // SAFETY: as above.
+    rects.push(unsafe { ass.as_mut_ptr() });
+  }
+  assert_eq!(rects.len(), 2, "a text rect and an ASS rect were asked for");
+  let nowhere = core::ptr::NonNull::<u8>::dangling().as_ptr();
+  for &rect in &rects {
+    // SAFETY: each rect is live, owned by `subtitle`, and nothing else
+    // holds it; these are plain stores of initialised values, and the
+    // two pointers go back to null below.
+    unsafe {
+      (*rect).data[0] = nowhere;
+      (*rect).data[1] = nowhere;
+      (*rect).linesize[0] = i32::MAX;
+      (*rect).w = -7;
+      (*rect).h = i32::MAX;
+      (*rect).x = i32::MIN;
+      (*rect).y = -1;
+    }
+  }
+
+  // SAFETY (all three): the subtitle is live for each call; its two
+  // strings are `ffmpeg_next`'s NUL-terminated copies, and the garbage
+  // sits in fields of a kind neither rect is — fields the contract does
+  // not ask for, and the conversion does not read.
+  let borrowed = unsafe { subtitle_frame_from(&subtitle) };
+  let viewed = unsafe { av_subtitle_to_subtitle_frame(subtitle.as_ptr()) };
+  let owned = unsafe { av_subtitle_to_owned_subtitle_frame(subtitle.as_ptr()) };
+
+  for &rect in &rects {
+    // SAFETY: as above; the planes go back to the null `add_rect` left,
+    // so nothing that frees the subtitle's rects is handed the garbage.
+    unsafe {
+      (*rect).data[0] = core::ptr::null_mut();
+      (*rect).data[1] = core::ptr::null_mut();
+    }
+  }
+
+  let expected: &[u8] = b"the text\nthe ass";
+  assert_eq!(
+    subtitle_text(&borrowed.expect("the borrowed road converts text rects")),
+    expected
+  );
+  assert_eq!(
+    subtitle_text(&viewed.expect("the view lane converts text rects")),
+    expected
+  );
+  assert_eq!(
+    subtitle_text(&owned.expect("the owned lane converts text rects")),
+    expected
+  );
+}

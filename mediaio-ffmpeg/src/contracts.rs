@@ -169,17 +169,21 @@
 //! - `rects`, when `num_rects > 0`: valid for `num_rects` pointers (null
 //!   is *checked*; at most the first 64 are read), each null or a live
 //!   `AVSubtitleRect`;
-//! - each rect's `text` and `ass`: null, or readable byte by byte up to
-//!   and including their NUL terminator or for 65,537 bytes, whichever
-//!   comes first — the reader stops at whichever it meets;
-//! - each bitmap rect's `data[0]`: null, or valid for and initialised in
-//!   `linesize[0] × h` bytes, when that product is within the reader's
-//!   caps (16 MiB a rect; a larger one is refused before it is read);
-//! - each bitmap rect's `data[1]`: null, or valid for and initialised in
-//!   1,024 bytes — the 256-entry RGBA palette, read whole;
+//! - each rect's `type` (*plain*), read first and alone. **Every other
+//!   field is read only under its own kind**, so a field of another kind
+//!   is never read and need not be initialised:
+//!   - a text rect's `text` and an ASS rect's `ass`: null, or readable
+//!     byte by byte up to and including the NUL terminator or for 65,537
+//!     bytes, whichever comes first — the reader stops at whichever it
+//!     meets;
+//!   - a bitmap rect's `data[0]`: null, or valid for and initialised in
+//!     `linesize[0] × h` bytes, when that product is within the reader's
+//!     caps (16 MiB a rect; a larger one is refused before it is read);
+//!     its `data[1]`: null, or valid for and initialised in 1,024 bytes —
+//!     the 256-entry RGBA palette, read whole; and *plain*, its `x`, `y`,
+//!     `w`, `h`, `linesize[0]`;
 //! - *plain*: `num_rects`, `pts`, `start_display_time`,
-//!   `end_display_time`, each rect's `type`, `x`, `y`, `w`, `h`,
-//!   `linesize[0]`.
+//!   `end_display_time`.
 //!
 //! An `ffmpeg_next::Subtitle` keeps its `AVSubtitle` inline, so the
 //! top-level struct is live behind a borrow of one; the rects and what
