@@ -2681,14 +2681,38 @@ pub unsafe fn attachment_packet_from_ffmpeg(
 /// The copy's payload and side data are `src`'s sizes, so a budget that
 /// charged `src` charges the copy the same bytes. On failure the partial
 /// clone is dropped, which releases the reference it took.
-pub fn try_clone_packet(src: &Packet) -> std::result::Result<Packet, ffmpeg_next::Error> {
+///
+/// **`unsafe`, as every crossing that reads a foreign `ffmpeg_next`
+/// packet's storage is.** `av_packet_make_writable` copies a shared or
+/// read-only payload byte for byte, and `av_packet_ref` copies one that
+/// is not refcounted: the clone is a read of every payload byte, which
+/// `ffmpeg_next`'s safe `Packet::new` leaves unwritten. A call without
+/// `unsafe` does not compile:
+///
+/// ```compile_fail,E0133
+/// let packet = ffmpeg_next::Packet::copy(&[0u8; 16]);
+/// let _ = mediaio_ffmpeg::try_clone_packet(&packet);
+/// ```
+///
+/// # Safety
+///
+/// `src` must meet [the `AVPacket` contract](crate::contracts#avpacket)
+/// and, with it, [every exported byte
+/// initialised](crate::contracts#every-exported-byte-initialised): its
+/// payload and each side-data entry's bytes were written. A packet
+/// `av_read_frame`, an encoder, `Packet::copy` or this crate's builders
+/// filled meets both; a `Packet::new` or `Packet::grow` its caller has
+/// not written over does not.
+pub unsafe fn try_clone_packet(src: &Packet) -> std::result::Result<Packet, ffmpeg_next::Error> {
   use ffmpeg_next::packet::{Mut, Ref};
 
   let mut dst = Packet::empty();
   // SAFETY: dst is a freshly zero-initialized Packet (av_init_packet inside
   // Packet::empty); av_packet_ref initializes its data fields from src's
   // refcounted buffer, or returns AVERROR(ENOMEM) and leaves dst blank
-  // (`packet.h` 861–862).
+  // (`packet.h` 861–862). `src` meets the `AVPacket` contract with every
+  // byte written (this function's own `# Safety`), which is what the
+  // copy — here or in `av_packet_make_writable` below — reads.
   let ret = unsafe { ffmpeg_next::ffi::av_packet_ref(dst.as_mut_ptr(), src.as_ptr()) };
   if ret < 0 {
     return Err(ffmpeg_next::Error::from(ret));
@@ -3534,7 +3558,9 @@ mod tests {
       // SAFETY: `packet` owns a live `AVPacket`; `flags` is a public
       // field.
       unsafe { (*packet.as_mut_ptr()).flags = raw };
-      let copy = try_clone_packet(&packet).expect("a packet clones");
+      // SAFETY: `Packet::copy` wrote every byte of the payload, and the
+      // flags are a plain field.
+      let copy = unsafe { try_clone_packet(&packet) }.expect("a packet clones");
       for (road, source) in [("demuxed", &packet), ("copied", &copy)] {
         // SAFETY: `CallerSupplied` is true of every packet, and the owned lane copies.
         let video = unsafe {

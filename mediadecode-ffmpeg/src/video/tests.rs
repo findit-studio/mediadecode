@@ -280,7 +280,7 @@ impl FakeHw {
 }
 
 impl HwInner for FakeHw {
-  fn send_packet(&mut self, packet: &Packet) -> Result<Sent, Error> {
+  unsafe fn send_packet(&mut self, packet: &Packet) -> Result<Sent, Error> {
     self
       .submitted
       .lock()
@@ -297,7 +297,9 @@ impl HwInner for FakeHw {
     }
     // Accept the packet. Track it as probe-era history, and deliver a frame for
     // it only before the doomed span.
-    if let Ok(cloned) = crate::boundary::try_clone_packet(packet) {
+    // SAFETY: the seam's contract: `packet` meets the `AVPacket`
+    // contract with every byte written.
+    if let Ok(cloned) = unsafe { crate::boundary::try_clone_packet(packet) } {
       self.history.push(cloned);
     }
     if idx < self.doom_from_send {
@@ -371,7 +373,7 @@ impl FakeHwEofFails {
 }
 
 impl HwInner for FakeHwEofFails {
-  fn send_packet(&mut self, packet: &Packet) -> Result<Sent, Error> {
+  unsafe fn send_packet(&mut self, packet: &Packet) -> Result<Sent, Error> {
     self.queued.push_back(packet.pts().unwrap_or(0));
     Ok(Sent::Accepted)
   }
@@ -411,7 +413,7 @@ impl HwInner for FakeHwEofFails {
 struct FakeHwEofBackpressures;
 
 impl HwInner for FakeHwEofBackpressures {
-  fn send_packet(&mut self, _: &Packet) -> Result<Sent, Error> {
+  unsafe fn send_packet(&mut self, _: &Packet) -> Result<Sent, Error> {
     Ok(Sent::Accepted)
   }
   fn receive_frame(&mut self, _: &mut Frame) -> Result<Received, Error> {
@@ -2451,7 +2453,7 @@ impl ScriptedHw {
 }
 
 impl HwInner for ScriptedHw {
-  fn send_packet(&mut self, packet: &Packet) -> Result<Sent, Error> {
+  unsafe fn send_packet(&mut self, packet: &Packet) -> Result<Sent, Error> {
     let index = self.sent;
     if let Some(&(_, raw)) = self.failing_sends.iter().find(|(at, _)| *at == index) {
       self.sent += 1;

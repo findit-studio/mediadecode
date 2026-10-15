@@ -554,7 +554,9 @@ fn cap_overflow_does_not_consume_packet_and_preserves_pending() {
     if s.index() != stream_index {
       continue;
     }
-    match decoder.send_packet(&packet) {
+    // SAFETY: `packets()` reads each packet with `av_read_frame`, so libavformat wrote it, and
+    // nothing writes through it afterwards.
+    match unsafe { decoder.send_av_packet(&packet) } {
       Err(Error::AllBackendsFailed(p)) => {
         let attempts = p.attempts();
         let unconsumed_packets = p.unconsumed_packets();
@@ -1309,7 +1311,9 @@ fn the_raw_decoder_refuses_a_send_after_end_of_stream() {
   // answer is a state of the session, not a one-shot complaint.
   for _ in 0..2 {
     let packet = crate::boundary::try_packet_copy(&[0u8; 16]).expect("a submittable packet");
-    let sent = dec.send_packet(&packet);
+    // SAFETY: `try_packet_copy` wrote every byte of the payload, and nothing writes through the
+    // packet afterwards.
+    let sent = unsafe { dec.send_av_packet(&packet) };
     assert!(
       matches!(sent, Err(Error::Ffmpeg(ffmpeg_next::Error::Eof))),
       "a packet after end-of-stream must be libavcodec's refusal, not back \
@@ -1891,7 +1895,9 @@ fn a_committed_failure_is_its_pictures_own_and_the_next_packet_reaches_libavcode
     );
 
     let packet = crate::boundary::try_packet_copy(&[0u8; 16]).expect("a submittable packet");
-    let sent = dec.send_packet(&packet);
+    // SAFETY: `try_packet_copy` wrote every byte of the payload, and nothing writes through the
+    // packet afterwards.
+    let sent = unsafe { dec.send_av_packet(&packet) };
     assert!(
       matches!(sent, Err(Error::Ffmpeg(ffmpeg_next::Error::Eof))),
       "{raw:?}: the next packet reaches libavcodec, which answers with the end it \
@@ -2038,7 +2044,9 @@ fn the_send_roads_route_a_surface_refusal_and_report_a_budget_one() {
 
         let packet = crate::boundary::try_packet_copy(&[0u8; 16]).expect("packet");
         let out = match face {
-          Face::Packet => dec.send_packet(&packet),
+          // SAFETY: `try_packet_copy` wrote every byte of the payload, and nothing writes
+          // through the packet afterwards.
+          Face::Packet => unsafe { dec.send_av_packet(&packet) },
           Face::Eof => dec.send_eof(),
         };
         let name = format!(
@@ -2306,7 +2314,9 @@ fn the_probes_copy_shares_nothing_with_its_source() {
     core::ptr::write_bytes(entry, 0xC3, 16);
   }
 
-  let copy = crate::boundary::try_clone_packet(&source).expect("an uncapped copy");
+  // SAFETY: `source` is `try_packet_copy`'s, every byte of its payload written, and its side
+  // data is `av_packet_new_side_data`'s, written above.
+  let copy = unsafe { crate::boundary::try_clone_packet(&source) }.expect("an uncapped copy");
   let (source_at, source_refs) = payload_of(&source);
   let (copy_at, copy_refs) = payload_of(&copy);
   assert_eq!(copy.data(), source.data(), "the same bytes");
@@ -2349,8 +2359,8 @@ fn the_probes_copy_shares_nothing_with_its_source() {
 }
 
 /// LAW: **a rescued packet keeps the bytes it was sent with, whatever
-/// the caller writes to its own packet afterwards, and a write to it
-/// reaches nothing the caller holds.**
+/// the caller writes to its own packet once the session is over, and a
+/// write to it reaches nothing the caller holds.**
 ///
 /// `Packet::data_mut` lends `&mut [u8]` without consulting writability,
 /// and [`Error::AllBackendsFailed`] hands the probe's history to the
@@ -2373,7 +2383,12 @@ fn a_rescued_packet_keeps_the_bytes_it_was_sent_with() {
   let fills = [0x11u8, 0x22];
   let mut sent: Vec<Packet> = fills.iter().map(|&fill| raw_packet(fill)).collect();
   for packet in &sent {
-    assert_eq!(dec.send_packet(packet).expect("taken"), Sent::Accepted);
+    // SAFETY: `raw_packet` is `try_packet_copy`'s, every byte written; the caller's writes
+    // below wait until the decoder is dropped.
+    assert_eq!(
+      unsafe { dec.send_av_packet(packet) }.expect("taken"),
+      Sent::Accepted
+    );
   }
   assert_eq!(
     dec.probe.as_ref().expect("still on trial").buffered_bytes,
@@ -2381,17 +2396,22 @@ fn a_rescued_packet_keeps_the_bytes_it_was_sent_with() {
     "each copy is charged its payload",
   );
 
-  // The caller writes to its own packets after the send, through safe
-  // code.
-  for packet in &mut sent {
-    packet.data_mut().expect("a payload").fill(0xEE);
-  }
-
   let mut frame = crate::Frame::empty().expect("frame slot");
   let Err(Error::AllBackendsFailed(p)) = dec.receive_frame(&mut frame) else {
     panic!("a CPU frame on trial fails the only backend, and the probe exhausts");
   };
   let mut rescued = p.into_unconsumed_packets();
+  // The session ends here, and libavcodec's own references to what it
+  // was sent go with it: only now may the caller write through its
+  // packets (`send_av_packet`'s contract). The rescued copies are the
+  // caller's to keep past it.
+  drop(dec);
+
+  // The caller writes to its own packets after the send, through safe
+  // code.
+  for packet in &mut sent {
+    packet.data_mut().expect("a payload").fill(0xEE);
+  }
   assert_eq!(
     rescued.len(),
     fills.len(),
@@ -2448,14 +2468,21 @@ fn a_copy_the_probe_cannot_make_refuses_the_send_by_name() {
     || {
       let mut dec = raw_auditioning_decoder();
       let first = raw_packet(0x11);
-      assert_eq!(dec.send_packet(&first).expect("taken"), Sent::Accepted);
+      // SAFETY: `raw_packet` is `try_packet_copy`'s, every byte written, and nothing writes
+      // through it while the decoder may still read it.
+      assert_eq!(
+        unsafe { dec.send_av_packet(&first) }.expect("taken"),
+        Sent::Accepted
+      );
 
       let mut refused = crate::boundary::try_packet_copy(&[0x77; 8192]).expect("a packet");
       // SAFETY: in `in_subprocess`'s child, alone. The capped window runs one send:
       // the probe's copy goes through `try_clone_packet`, which checks both of
       // its calls, and libavcodec checks its own allocations.
       unsafe { cap_ffmpeg_allocations(512) };
-      let answer = dec.send_packet(&refused);
+      // SAFETY: `try_packet_copy` wrote every byte; the probe refuses the packet before
+      // libavcodec sees it.
+      let answer = unsafe { dec.send_av_packet(&refused) };
       uncap_ffmpeg_allocations();
 
       let Err(Error::AllBackendsFailed(p)) = answer else {
@@ -2488,7 +2515,9 @@ fn a_copy_the_probe_cannot_make_refuses_the_send_by_name() {
       // pressure (`decode.c` 746–747).
       assert_eq!(dec.phase(), SessionPhase::Streaming);
       assert_eq!(
-        dec.send_packet(&refused).expect("offered again"),
+        // SAFETY: every byte written; the caller wrote it while no decoder held it — the probe
+        // refused it and libavcodec never saw it — and nothing writes it again.
+        unsafe { dec.send_av_packet(&refused) }.expect("offered again"),
         Sent::Accepted,
         "libavcodec never saw the refused packet",
       );
@@ -2526,7 +2555,12 @@ fn a_candidate_is_replayed_copies_and_the_history_stays_the_probes_own() {
   let fills = [0x11u8, 0x22];
   let sent: Vec<Packet> = fills.iter().map(|&fill| raw_packet(fill)).collect();
   for packet in &sent {
-    assert_eq!(dec.send_packet(packet).expect("taken"), Sent::Accepted);
+    // SAFETY: `raw_packet` is `try_packet_copy`'s, every byte written, and nothing writes
+    // through it while the decoder may still read it.
+    assert_eq!(
+      unsafe { dec.send_av_packet(packet) }.expect("taken"),
+      Sent::Accepted
+    );
   }
 
   dec

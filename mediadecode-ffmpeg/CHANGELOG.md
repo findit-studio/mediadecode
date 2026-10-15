@@ -71,6 +71,14 @@ in lockstep.
   is an `unsafe fn` (see `mediaio-ffmpeg`). This crate's decoders and
   demuxer state where their bytes were written — `avcodec_receive_frame`,
   `av_hwframe_transfer_data`, `av_read_frame` — beside each conversion.
+- **`VideoDecoder::send_packet` takes the crate's own packet carrier.**
+  The hardware-probe decoder's safe input is an `OwnedVideoPacket`, built
+  into an `AVPacket` on the scoped submission road; an `ffmpeg_next`
+  packet goes through `VideoDecoder::send_av_packet`, which is `unsafe`:
+  its caller vouches that the payload was written and that nothing
+  writes through it while the decoder may still read it (libavcodec keeps
+  a reference past the call). The stream decoders' hardware seam takes
+  the same raw road only for the packets they build themselves.
 - **A custom channel map is not walked on the borrowed road.**
   `convert::audio_frame_from` refuses it by name
   (`ConvertError::UnverifiableChannelMap`); this crate's audio decoder

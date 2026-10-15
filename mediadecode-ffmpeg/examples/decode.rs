@@ -75,7 +75,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
       continue;
     }
     loop {
-      match decoder.send_packet(&packet) {
+      // SAFETY: `packets()` reads each packet with `av_read_frame`, so libavformat wrote it,
+      // and nothing writes through it while the decoder may still read it.
+      match unsafe { decoder.send_av_packet(&packet) } {
         Ok(Sent::Accepted) => break,
         // Back pressure, named: drain and offer again. No errno
         // to decode, and no second offer needed to find out.

@@ -302,8 +302,14 @@ pub struct CarrierVideoStreamDecoder<C: crate::FfmpegCarrier> {
 /// the subset of `VideoDecoder`'s surface the wrapper drives on the HW
 /// path.
 pub(crate) trait HwInner: Send {
-  /// See [`VideoDecoder::send_packet`].
-  fn send_packet(&mut self, packet: &Packet) -> Result<Sent, Error>;
+  /// See [`VideoDecoder::send_av_packet`].
+  ///
+  /// # Safety
+  ///
+  /// [`VideoDecoder::send_av_packet`]'s contract: `packet` meets the
+  /// `AVPacket` contract with every exported byte written, and nothing
+  /// writes through its payload while the decoder may still read it.
+  unsafe fn send_packet(&mut self, packet: &Packet) -> Result<Sent, Error>;
   /// See [`VideoDecoder::receive_frame`].
   fn receive_frame(&mut self, frame: &mut Frame) -> Result<Received, Error>;
   /// See [`VideoDecoder::send_eof`].
@@ -339,8 +345,9 @@ pub(crate) trait HwInner: Send {
 
 impl HwInner for VideoDecoder {
   #[inline]
-  fn send_packet(&mut self, packet: &Packet) -> Result<Sent, Error> {
-    VideoDecoder::send_packet(self, packet)
+  unsafe fn send_packet(&mut self, packet: &Packet) -> Result<Sent, Error> {
+    // SAFETY: the seam's contract is `send_av_packet`'s, forwarded.
+    unsafe { VideoDecoder::send_av_packet(self, packet) }
   }
   #[inline]
   fn receive_frame(&mut self, frame: &mut Frame) -> Result<Received, Error> {
@@ -1170,7 +1177,13 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     let route = crate::BodyRoute::Submission;
     let submit = |av_pkt: &Packet| {
       match &mut self.state {
-        DecodeState::Hw(hw) => match hw.send_packet(av_pkt) {
+        // SAFETY: `av_pkt` is the submission `with_ffmpeg_video_packet`
+        // built from this call's carrier — its payload and side data are
+        // this crate's writes — lent for this call only, and a shared
+        // body is reachable by no caller, so nothing writes through it
+        // while the hardware session, which never writes through what it
+        // is sent, may hold a reference; the probe keeps deep copies.
+        DecodeState::Hw(hw) => match unsafe { hw.send_packet(av_pkt) } {
           // The seam already classified libavcodec's back pressure, so
           // both states travel on unchanged.
           Ok(status) => Ok(status),

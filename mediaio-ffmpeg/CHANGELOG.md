@@ -40,6 +40,9 @@ The family — `mediadecode`, `mediadecode-ffmpeg`, `mediadecode-webcodecs`,
   `boundary` packet conversions (`*_packet_from_ffmpeg`, `*_in`,
   `owned_*`, `attachment_packet_from_ffmpeg`). Their named refusals stay.
   A call without `unsafe` does not compile (`compile_fail,E0133`).
+  `try_clone_packet` joins them: its `av_packet_ref` and
+  `av_packet_make_writable` copy every payload byte of the packet they
+  are given.
 - **A custom channel map is refused unread on the borrowed road.**
   `convert::audio_frame_from` answers
   `ConvertError::UnverifiableChannelMap` for a frame whose layout is a

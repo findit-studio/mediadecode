@@ -1070,7 +1070,62 @@ impl VideoDecoder {
     }
   }
 
-  /// Submit a packet to the decoder.
+  /// Submits a packet to the decoder — the **safe** road, over the
+  /// crate's own owned packet carrier.
+  ///
+  /// The packet's bytes are this crate's: they reach libavcodec as an
+  /// `AVPacket` built from the carrier on the scoped submission road
+  /// ([`boundary::with_ffmpeg_video_packet`](crate::boundary::with_ffmpeg_video_packet)),
+  /// lent for this call alone, so nothing a caller holds can write
+  /// through what the decoder reads. Everything else — back pressure,
+  /// the probe's rescue history, the verdicts — is
+  /// [`Self::send_av_packet`]'s, which this hands the built packet to.
+  ///
+  /// A packet of `ffmpeg_next`'s goes through [`Self::send_av_packet`],
+  /// which is `unsafe`: a borrow of one cannot vouch that its payload
+  /// was ever written.
+  ///
+  /// A packet whose payload cannot be built — over the packet limit, or
+  /// side data that cannot be attached — is refused as
+  /// [`Error::PacketBuild`] before anything is sent.
+  pub fn send_packet(&mut self, packet: &crate::OwnedVideoPacket) -> Result<Sent> {
+    let limits = self.frame_limits.packet_limits();
+    let send = |av_packet: &Packet| {
+      // SAFETY: `av_packet` was built by this crate's own builder from
+      // `packet`'s owned carrier, so its payload and side data are
+      // written; it is lent for this call only, and the shared body —
+      // where the submission road shares one — is reachable by no
+      // caller, so nothing writes through it while libavcodec, which
+      // never writes through a packet it is sent, may hold a reference.
+      unsafe { self.send_av_packet(av_packet) }
+    };
+    // SAFETY: `send` hands the packet to `send_av_packet`, which gives it
+    // to libavcodec and to the probe, whose history keeps deep copies
+    // (`boundary::try_clone_packet`); neither clones it shallowly nor
+    // keeps it, so a shared body never outlives this call.
+    unsafe {
+      crate::boundary::with_ffmpeg_video_packet::<crate::Owned, _>(
+        packet,
+        limits,
+        crate::BodyRoute::Submission,
+        send,
+      )
+    }
+    .map_err(Error::PacketBuild)?
+  }
+
+  /// Submits an `ffmpeg_next` packet to the decoder — the raw road.
+  ///
+  /// **`unsafe`, because a borrow of an `ffmpeg_next` packet cannot vouch
+  /// for its bytes**: `Packet::new` leaves the payload unwritten, and
+  /// both libavcodec and the probe's copy read every byte of it. A call
+  /// without `unsafe` does not compile:
+  ///
+  /// ```compile_fail,E0133
+  /// fn send(decoder: &mut mediadecode_ffmpeg::VideoDecoder, packet: &ffmpeg_next::Packet) {
+  ///   let _ = decoder.send_av_packet(packet);
+  /// }
+  /// ```
   ///
   /// On success — and only on success — the packet is buffered for potential
   /// replay through a fallback backend while the probe is active. `EAGAIN`
@@ -1096,7 +1151,7 @@ impl VideoDecoder {
   /// bytes would push the probe past [`MAX_PROBE_PACKETS`] or
   /// [`MAX_PROBE_PACKET_BYTES`], or the probe's copy of it cannot be
   /// made (`av_packet_ref` or `av_packet_make_writable` failing) —
-  /// `send_packet` returns [`Error::AllBackendsFailed`] **without
+  /// `send_av_packet` returns [`Error::AllBackendsFailed`] **without
   /// invoking** `state.inner.send_packet` on this packet. The caller's
   /// packet stays in their hand and `unconsumed_packets` carries the
   /// pre-existing buffered history, so they can replay
@@ -1108,7 +1163,25 @@ impl VideoDecoder {
   /// After commit a failure is this packet's own error, reported as it
   /// was minted, and the next packet reaches libavcodec — nothing is
   /// remembered from one call to the next. See the type's documentation.
-  pub fn send_packet(&mut self, packet: &Packet) -> Result<Sent> {
+  ///
+  /// # Safety
+  ///
+  /// `packet` must meet [the `AVPacket`
+  /// contract](crate::contracts#avpacket) and, with it, [every exported
+  /// byte initialised](crate::contracts#every-exported-byte-initialised):
+  /// its payload and each side-data entry's bytes were written — true of
+  /// a packet `av_read_frame`, an encoder or `Packet::copy` filled, and
+  /// not of a `Packet::new` or `Packet::grow` its caller has not written
+  /// over.
+  ///
+  /// And nothing may write through its payload while this decoder may
+  /// still read it: `avcodec_send_packet` keeps a reference to a
+  /// refcounted packet's buffer past the call (`libavcodec/avcodec.h`
+  /// 2333–2335 in FFmpeg 9.0.1), and a frame-threaded decoder reads it
+  /// on another thread. A caller that keeps the packet does not write
+  /// through it — no `Packet::data_mut`, no in-place write — until this
+  /// decoder is flushed or dropped.
+  pub unsafe fn send_av_packet(&mut self, packet: &Packet) -> Result<Sent> {
     loop {
       // Re-read each iteration: a probe advance moves this session from
       // one phase to another underneath the loop.
@@ -1172,7 +1245,9 @@ impl VideoDecoder {
         // `new_bytes` stands. If it cannot be made we bail rather than
         // consuming a packet we can't track; the packet stays the
         // caller's, unsent.
-        match crate::boundary::try_clone_packet(packet) {
+        // SAFETY: `packet` meets the `AVPacket` contract with every byte
+        // written — this function's own contract, forwarded.
+        match unsafe { crate::boundary::try_clone_packet(packet) } {
           Ok(c) => Some((c, new_bytes)),
           Err(e) => {
             let probe = self.probe.take().expect("probe present");
@@ -1815,7 +1890,13 @@ impl VideoDecoder {
           // committed here stays the session's when the history later
           // goes to the caller as owned, mutable `Packet`s. A copy that
           // cannot be made fails this candidate's replay.
-          let pkt = match crate::boundary::try_clone_packet(kept) {
+          //
+          // SAFETY: `kept` is one of this probe's own copies, made by
+          // `try_clone_packet` from a packet whose sender vouched for
+          // the `AVPacket` contract and its written bytes
+          // (`send_av_packet`'s contract) — a copy owns its bytes, and
+          // nothing writes them.
+          let pkt = match unsafe { crate::boundary::try_clone_packet(kept) } {
             Ok(pkt) => pkt,
             Err(e) => {
               r = Err(e);
