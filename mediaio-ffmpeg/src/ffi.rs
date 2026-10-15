@@ -431,6 +431,15 @@ pub unsafe fn declare_frame_budget_declined_for_test(state: *mut CallbackState, 
 /// words, and that error is routed as any other — a failed candidate
 /// while the probe runs, the picture's own error after the first
 /// picture.
+///
+/// # Safety
+///
+/// This is libavcodec's to call, installed as a context's `get_format`.
+/// `ctx` must be a live `AVCodecContext` whose `opaque` is null or the
+/// [`CallbackState`] this crate installed there, live for the call, and
+/// `pix_fmts` must point at a list terminated by `AV_PIX_FMT_NONE` —
+/// what libavcodec passes. A caller other than libavcodec owes the
+/// same.
 pub unsafe extern "C" fn get_hw_format(
   ctx: *mut AVCodecContext,
   pix_fmts: *const AVPixelFormat,
@@ -894,7 +903,7 @@ pub unsafe extern "C" fn judge_buffer(
   // plain integers.
   let (width, height) = unsafe { ((*frame).width, (*frame).height) };
 
-  // **This seat judges cost, and only cost.**
+  // **This callback judges cost, and only cost.**
   //
   // `max_pixels` is a *logical* limit on a picture's extent, and
   // libavcodec already enforces it — against the **raw** dimensions, in
@@ -914,7 +923,7 @@ pub unsafe extern "C" fn judge_buffer(
   //   degenerate shape is refused on its actual cost; and
   // * wrong, because `max_pixels` is `min(the caller's pixel limit,
   //   byte ceiling / worst-bytes-per-pixel)` — so when the caller's
-  //   pixel limit was the tighter seat, alignment inflation alone
+  //   pixel limit was the tighter of the two, alignment inflation alone
   //   refused frames satisfying *both* requested limits. A 65536x1
   //   `gray8` frame under `max_pixels = 65536` and a generous byte
   //   budget fits the pixel limit exactly and costs 2 MiB, and was
@@ -935,17 +944,17 @@ pub unsafe extern "C" fn judge_buffer(
   // SAFETY: `frame` is live; the field is a plain pointer.
   let hw_frames = unsafe { (*frame).hw_frames_ctx };
 
-  // A hardware frame carries no CPU bytes for this seat to price — its
+  // A hardware frame carries no CPU bytes for this callback to price — its
   // pool is judged where it is declared, in the `get_format` callback —
   // so it is delegated rather than failed closed on an unpriceable
   // format.
   if hw_frames.is_null() {
-    // **The caller's own number, read from the seat that carries it.**
+    // **The caller's own number, read from the field that carries it.**
     // This used to recover a byte ceiling from `AVCodecContext.max_pixels`,
     // and the recovery was wrong in both directions:
     //
     // * `max_pixels` is `min(pixel ceiling, byte ceiling / worst)`, so
-    //   when the *pixel* seat was the tighter of the two it stopped
+    //   when the *pixel* ceiling was the tighter of the two it stopped
     //   encoding the byte ceiling at all — and the recovery invented a
     //   smaller one. A 256x256 frame at 16 bytes a pixel under
     //   `max_pixels = 65536` with a 2 MiB byte budget satisfies both of
@@ -959,7 +968,7 @@ pub unsafe extern "C" fn judge_buffer(
     //
     // The audio road briefly recovered from `max_samples` instead,
     // which *is* exact — but two sources of truth for one number is how
-    // the first one went wrong. Both media read the seat now.
+    // the first one went wrong. Both media read the field now.
     //
     // SAFETY: `opaque` holds the `CallbackState` that
     // `build_codec_context` installed and whose owner outlives the
@@ -998,7 +1007,7 @@ pub unsafe extern "C" fn judge_buffer(
       crate::footprint::audio_frame_bytes(format_raw, nb_samples as usize, channels as usize)
     } else {
       // Neither geometry nor samples: nothing is being allocated that
-      // this seat can price, and nothing is claimed.
+      // this callback can price, and nothing is claimed.
       Some(0)
     };
 
@@ -1323,8 +1332,8 @@ mod tests {
           "the harness codec must open",
         );
         // Set after the open, so nothing resets them — including the
-        // callback state, which is the seat the judge reads its budget
-        // from. A context this crate did not build has no seat and is
+        // callback state, which is where the judge reads its budget
+        // from. A context this crate did not build has none and is
         // refused, so the harness installs one exactly as
         // `build_codec_context` does.
         (*ctx).max_pixels = self.max_pixels;
@@ -1383,7 +1392,7 @@ mod tests {
     );
 
     // And the same frame under a ceiling that genuinely covers it is
-    // delegated — the seat refuses cost, not multichannel audio.
+    // delegated — the judge refuses cost, not multichannel audio.
     JudgeCase::audio(DBLP, 130_000, 255)
       .with_max_frame_bytes(u64::MAX)
       .run()
@@ -1430,7 +1439,7 @@ mod tests {
       "a zero byte budget admitted an audio frame",
     );
 
-    // A generous pixel seat does not rescue a starved byte seat.
+    // A generous pixel limit does not rescue a starved byte budget.
     assert!(
       JudgeCase::audio(S16, 65_535, 8)
         .with_max_pixels(i64::MAX)
@@ -1440,8 +1449,8 @@ mod tests {
     );
 
     // **The shape that disproved the old recovery.** A 256x256 frame at
-    // 16 bytes a pixel under a tight *pixel* seat and a generous *byte*
-    // seat satisfies both of the caller's limits — 65,536 pixels, and
+    // 16 bytes a pixel under a tight *pixel* limit and a generous *byte*
+    // budget satisfies both of the caller's limits — 65,536 pixels, and
     // 1,050,624 bytes against 2 MiB — while the recovered ceiling was
     // `max_pixels * 16 = 1,048,576`. It was refused by exactly the 2,048
     // bytes of alignment and slack the recovery could not see, which is
@@ -1453,8 +1462,8 @@ mod tests {
       .run()
       .expect("a frame inside both of the caller's limits must be allocated");
 
-    // And the other direction still refuses: a generous pixel seat buys
-    // nothing past the byte seat.
+    // And the other direction still refuses: a generous pixel limit buys
+    // nothing past the byte budget.
     assert!(
       JudgeCase::video(RGBAF32, 256, 256)
         .with_max_pixels(i64::MAX)
@@ -1482,7 +1491,7 @@ mod tests {
     // This is what the removed gate got wrong: it compared the *aligned*
     // dimensions against `max_pixels`, which is
     // `min(pixel limit, byte ceiling / worst)` — so when the pixel limit
-    // was the tighter seat, alignment inflation alone refused a frame
+    // was the tighter of the two, alignment inflation alone refused a frame
     // that was inside both requested limits, for arithmetic the caller
     // never asked about.
     JudgeCase::video(GRAY8, 65_536, 1)

@@ -121,7 +121,7 @@
 //! Every trait here carries a `Buffer` associated type bounded only by
 //! `AsRef<[u8]>`, and none of them names a concrete carrier. What a
 //! backend may bind there is the
-//! [D-seat amputation contract](crate::adapter#the-d-seat-amputation-contract):
+//! [carrier amputation contract](crate::adapter#the-carrier-amputation-contract):
 //! owned, `Send + Sync`, clone-is-a-refcount-bump, with no
 //! backend-internal lifetime crossing the seam.
 //!
@@ -807,7 +807,7 @@ mod tests {
       }
 
       fn send_eof(&mut self) -> Result<Sent, Fault> {
-        // A held frame is output too: the seat has to clear before the
+        // A held frame is output too: the queue has to clear before the
         // end can be recorded, and saying so is the same back pressure.
         if self.queued {
           return Ok(Sent::MustDrain);
@@ -884,7 +884,7 @@ mod tests {
       feed(&mut decoder, &packet, &mut dst, &mut frames, &mut offers).expect("no fault");
       assert_eq!((offers, frames), (1, 0));
 
-      // Second packet: the seat is occupied. The loop is told so, drains
+      // Second packet: the queue is occupied. The loop is told so, drains
       // the one frame, and re-offers the SAME packet — which is only
       // sound because `MustDrain` promises nothing was consumed.
       feed(&mut decoder, &packet, &mut dst, &mut frames, &mut offers).expect("no fault");
@@ -912,9 +912,9 @@ mod tests {
         .expect("no fault")
         .is_accepted()
         .then_some(())
-        .expect("the empty seat takes it");
+        .expect("the empty queue takes it");
 
-      // The seat is full, so the end cannot be recorded yet — and the
+      // The queue is full, so the end cannot be recorded yet — and the
       // caller is told which of the two it is.
       assert_eq!(decoder.send_eof(), Ok(Sent::MustDrain));
       assert_eq!(decoder.receive_frame(&mut dst), Ok(Received::Produced));

@@ -7,13 +7,13 @@
 //! same adapter can be used with different buffer types at different
 //! call sites.
 //!
-//! # The D-seat amputation contract
+//! # The carrier amputation contract
 //!
 //! Every packet and frame in this crate carries a `D` — the buffer
 //! type its bytes live in — and every backend chooses what to put
 //! there. This is the one law that choice has to obey:
 //!
-//! > **A backend's `D`-seat carrier must be owned, `Send + Sync`, and
+//! > **A backend's `D` carrier must be owned, `Send + Sync`, and
 //! > cheap to clone (a refcount bump), with its lifetime fully
 //! > decoupled from the backend's internal buffers at the exit. No
 //! > backend-internal lifetime — an FFI pointer, a pooled buffer, a

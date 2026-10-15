@@ -60,7 +60,7 @@ fn every_path_mediagraph_names_still_resolves() {
   let _ = mediadecode_ffmpeg::ticket::CodecTicket::extradata;
   let _: Option<mediadecode_ffmpeg::VideoDecoder> = None;
 
-  // The resampler's four, behind the feature that links `swresample`.
+  // The resampler's five paths, behind the feature that links `swresample`.
   #[cfg(feature = "resample")]
   {
     let _: Option<mediadecode_ffmpeg::FfmpegOwnedResampler> = None;

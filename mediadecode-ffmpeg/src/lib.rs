@@ -6,7 +6,7 @@
 // is where this crate joined it: a signature here reads
 // `VideoPacket<VideoPacketExtra, FfmpegBytes>` because every one of those
 // three names is load-bearing — the household, the backend's extras,
-// and the owned carrier the D-seat amputation contract requires.
+// and the owned carrier the carrier amputation contract requires.
 // `clippy::type_complexity` counts nesting, and the fix it asks for is
 // an alias that hides exactly the word this release exists to make
 // visible. 0.8 had that alias; it was called `FfmpegBuffer`.

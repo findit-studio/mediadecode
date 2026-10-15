@@ -7,7 +7,7 @@ license.workspace      = true
 repository.workspace   = true
 homepage.workspace     = true
 documentation = "https://docs.rs/mediadecode"
-description = "Generic, no_std-friendly type-and-trait spine for media decoders (FFmpeg, WebCodecs, R3D, BRAW, ARRIRAW, X-OCN, ProRes RAW, Canon Cinema RAW Light)."
+description = "The read faces of the mediaio family: the decoder traits, the frame sources and the Demuxer session, over the mediaspine vocabulary. no_std-friendly; backends for FFmpeg, WebCodecs, R3D, BRAW, ARRIRAW, X-OCN, ProRes RAW, Canon Cinema RAW Light."
 keywords   = ["media", "decoder", "video", "audio", "no-std"]
 categories = ["multimedia", "multimedia::video", "multimedia::audio", "no-std", "no-std::no-alloc"]
 
@@ -37,8 +37,6 @@ trait-variant = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion  = { workspace = true }
-tempfile   = { workspace = true }
-serde_json = { workspace = true }
 # `tests/time_primitives.rs` reads the instants `mediaframe`'s frames
 # carry, so it names `mediaframe` itself.
 mediaframe = { workspace = true }

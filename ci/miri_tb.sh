@@ -7,9 +7,16 @@ if [ -z "$1" ]; then
 fi
 
 TARGET="$1"
-# The package to run; the core crate unless the caller names another
-# pure-Rust one.
-PKG="${2:-mediadecode}"
+shift
+# The packages to run: the ones the caller names, all pure Rust, or the
+# read faces when it names none.
+if [ "$#" -eq 0 ]; then
+  set -- mediadecode
+fi
+PKGS=()
+for pkg in "$@"; do
+  PKGS+=("-p" "$pkg")
+done
 
 # Install cross-compilation toolchain on Linux
 if [ "$(uname)" = "Linux" ]; then
@@ -38,7 +45,6 @@ cargo miri setup
 
 export MIRIFLAGS="-Zmiri-strict-provenance -Zmiri-disable-isolation -Zmiri-symbolic-alignment-check -Zmiri-tree-borrows"
 
-# `mediadecode-ffmpeg` calls FFmpeg's C library through FFI, which
-# Miri can't interpret. Run Miri only against the pure-Rust crates:
-# `mediadecode`, or the one the caller names.
-cargo miri test -p "$PKG" --all-targets --target "$TARGET"
+# The FFmpeg crates call FFmpeg's C library through FFI, which Miri
+# can't interpret. Run Miri only against the pure-Rust crates.
+cargo miri test "${PKGS[@]}" --all-targets --target "$TARGET"

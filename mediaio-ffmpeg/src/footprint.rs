@@ -229,7 +229,7 @@ pub(crate) const PROBE_PIXELS: usize = 256 * 256;
 /// really does cost 506 MiB — but a 16K `yuv420p` frame, which would
 /// only have cost 199 MB, is refused too. That is the honest shape of a
 /// bound that has to hold before the format is known: the deployment
-/// answer is to raise `max_frame_bytes`, which is exactly the knob that
+/// answer is to raise `max_frame_bytes`, which is exactly the setting that
 /// says how much memory one frame may cost.
 ///
 /// # The residual, stated

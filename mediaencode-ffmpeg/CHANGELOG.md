@@ -1,0 +1,23 @@
+# Changelog
+
+All notable changes to the [`mediaencode-ffmpeg`](https://crates.io/crates/mediaencode-ffmpeg)
+crate are documented in this file.
+
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+The family releases in lockstep.
+
+## [0.19.0] - 2026-10-15
+
+### Added
+
+- **The encoder-by-name catalogue**, the gate every FFmpeg encoder will
+  be opened through: `lookup` checks a closed catalogue and the license
+  gate without asking FFmpeg anything, and `encoder_by_name` then asks
+  the linked libavcodec, answering an `Admitted` encoder or an
+  `EncoderRefusal` by name.
+- **The `gpl` feature, off by default.** Without it the GPL encoders
+  (`libx264`, `libx264rgb`, `libx265`) are refused by name before
+  libavcodec is asked for them. Linking a GPL FFmpeg makes a binary GPL
+  whatever this feature says; the README states it.
+- The muxer and the encoders arrive in the following releases.

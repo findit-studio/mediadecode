@@ -90,7 +90,7 @@ impl ParametersError {
 /// [`DemuxLimits::max_codec_parameter_bytes`](crate::limits::DemuxLimits::max_codec_parameter_bytes) allows.
 ///
 /// The bytes are `extradata` plus every `coded_side_data` entry plus a
-/// custom channel map — the three seats `AVCodecParameters` reaches the
+/// custom channel map — the three fields `AVCodecParameters` reaches the
 /// heap through. A MOV `prof` atom lands in the second of those as an
 /// ICC profile, which is where the honest large values live and where
 /// the forged ones do too.

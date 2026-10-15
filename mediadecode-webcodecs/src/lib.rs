@@ -70,13 +70,13 @@
 //! # The carrier
 //!
 //! [`WebCodecsBuffer`] satisfies `mediadecode` 0.9's
-//! [D-seat amputation contract][law], and always did: it is an
+//! [carrier amputation contract][law], and always did: it is an
 //! `Arc<Vec<u8>>` view over bytes `copyTo` has already handed to Rust,
 //! so nothing in a delivered frame reaches back into a JS handle. The
 //! FFmpeg adapter had to be rebuilt for that release; this one had to
 //! be checked, and it passed unchanged.
 //!
-//! [law]: mediadecode::adapter#the-d-seat-amputation-contract
+//! [law]: mediadecode::adapter#the-carrier-amputation-contract
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(docsrs, allow(unused_attributes))]

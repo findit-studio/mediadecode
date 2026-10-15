@@ -4,7 +4,7 @@
 //!
 //! Every plane is **copied once**, here, out of FFmpeg's
 //! `AVBufferRef` and into Rust-owned memory — the
-//! [D-seat amputation contract][law]. Through 0.8 the video path
+//! [carrier amputation contract][law]. Through 0.8 the video path
 //! exported a refcounted *view* into libavcodec's own allocation
 //! whenever the stride happened to be tight, and copied only when it
 //! was padded; a consumer therefore inherited an FFmpeg lifetime it
@@ -140,7 +140,7 @@
 //! maps everything unknown onto a named "not stated" leaves nothing for
 //! an order to get wrong.
 //!
-//! [law]: mediaspine::adapter#the-d-seat-amputation-contract
+//! [law]: mediaspine::adapter#the-carrier-amputation-contract
 use core::ptr::{addr_of, read_unaligned};
 
 use derive_more::{IsVariant, TryUnwrap, Unwrap};

@@ -42,7 +42,7 @@
 //! and its `DEFAULT_MAX_PROBE_PENDING_BYTES` already established for the
 //! probe-replay budget.
 //!
-//! [law]: mediaspine::adapter#the-d-seat-amputation-contract
+//! [law]: mediaspine::adapter#the-carrier-amputation-contract
 //! [gov]: mediaspine::adapter#the-resource-governance-contract
 
 /// Default ceiling on a decoded frame's pixel count — 256 mebipixels.

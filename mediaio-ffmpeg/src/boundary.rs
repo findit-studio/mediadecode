@@ -793,7 +793,7 @@ fn attach_side_data(out: &mut Packet, entries: &[SideDataEntry]) -> Result<(), P
 /// lend `&mut [u8]`), and must not be handed to a caller. Submit it to a
 /// decoder — `avcodec_send_packet` may keep a reference and never writes
 /// through it — and drop it; a copy kept past that must own its bytes,
-/// as `decoder::try_clone_packet` makes.
+/// as `boundary::try_clone_packet` makes.
 #[doc(hidden)]
 pub unsafe fn share_or_copy(
   body: &crate::FfmpegBuffer,
@@ -916,7 +916,7 @@ pub fn ffmpeg_packet_from_owned_video_packet(
 /// accepted packet in a rescue history, which `AllBackendsFailed` — or
 /// a failed fallback's `FallbackFailed` — hands to the caller as owned,
 /// **mutable** `Packet`s. It records copies of its own
-/// (`decoder::try_clone_packet`), so nothing in that history addresses
+/// (`boundary::try_clone_packet`), so nothing in that history addresses
 /// the carrier, and every video send passes [`BodyRoute::Submission`],
 /// in the probe window as after it. [`BodyRoute::Copy`] is for a packet
 /// handed to a caller — [`ffmpeg_packet_from_video_packet`] and its
@@ -930,7 +930,7 @@ pub fn ffmpeg_packet_from_owned_video_packet(
 /// buffer — outlive the call: no shallow `ffmpeg_next::Packet::clone`
 /// kept past it (`clone` ignores a failed `av_packet_make_writable`, so
 /// the clone can keep sharing and lend `&mut [u8]`), and any copy kept
-/// must own its bytes, as `decoder::try_clone_packet` makes. Handing it
+/// must own its bytes, as `boundary::try_clone_packet` makes. Handing it
 /// to `avcodec_send_packet`, which may keep a reference and never
 /// writes through it, is what a submission is. With [`BodyRoute::Copy`]
 /// there is nothing to prove.
@@ -1046,7 +1046,7 @@ pub fn ffmpeg_packet_from_owned_audio_packet(
 /// buffer — outlive the call: no shallow `ffmpeg_next::Packet::clone`
 /// kept past it (`clone` ignores a failed `av_packet_make_writable`, so
 /// the clone can keep sharing and lend `&mut [u8]`), and any copy kept
-/// must own its bytes, as `decoder::try_clone_packet` makes. Handing it
+/// must own its bytes, as `boundary::try_clone_packet` makes. Handing it
 /// to `avcodec_send_packet`, which may keep a reference and never
 /// writes through it, is what a submission is. With [`BodyRoute::Copy`]
 /// there is nothing to prove.
@@ -1162,7 +1162,7 @@ pub fn ffmpeg_packet_from_owned_subtitle_packet(
 /// buffer — outlive the call: no shallow `ffmpeg_next::Packet::clone`
 /// kept past it (`clone` ignores a failed `av_packet_make_writable`, so
 /// the clone can keep sharing and lend `&mut [u8]`), and any copy kept
-/// must own its bytes, as `decoder::try_clone_packet` makes. Handing it
+/// must own its bytes, as `boundary::try_clone_packet` makes. Handing it
 /// to `avcodec_send_packet`, which may keep a reference and never
 /// writes through it, is what a submission is. With [`BodyRoute::Copy`]
 /// there is nothing to prove.
@@ -1241,7 +1241,7 @@ unsafe fn build_subtitle_packet<C: crate::FfmpegCarrier + crate::CarrierOps>(
 /// to libavformat's — see [the two carrier lanes][lanes]. For a packet
 /// that must outlive the demuxer, ask for the owned lane by name:
 /// `video_packet_from_ffmpeg_as::<Owned>`, whose payload is copied and
-/// which the [D-seat amputation contract][law] governs.
+/// which the [carrier amputation contract][law] governs.
 ///
 /// Timestamps, duration, key/corrupt flags, and the source stream index
 /// are forwarded to the produced packet.
@@ -1258,7 +1258,7 @@ unsafe fn build_subtitle_packet<C: crate::FfmpegCarrier + crate::CarrierOps>(
 /// answer. Caller can also fill in [`VideoPacketExtra::byte_pos`] /
 /// `side_data` post-construction if they need those.
 ///
-/// [law]: mediaspine::adapter#the-d-seat-amputation-contract
+/// [law]: mediaspine::adapter#the-carrier-amputation-contract
 pub fn video_packet_from_ffmpeg(
   packet: &Packet,
   time_base: mediaspine::Timebase,

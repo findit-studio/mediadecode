@@ -1,28 +1,46 @@
-name: CI / mediadecode-ffmpeg
+name: CI / ffmpeg
 
-# Triggered by changes to either the FFmpeg adapter, the core
-# crate it adapts (since core changes can break the adapter), or
-# shared workspace files. macOS-only — Homebrew ships FFmpeg 9
-# with `pkg-config` files included, which `ffmpeg-next` 9 needs to
-# enable its `ffmpeg_9_0` code path. Ubuntu's archive FFmpeg
-# is 6.1.1 and Windows would need a vcpkg build.
+# The FFmpeg crates: the base (`mediaio-ffmpeg`), the read adapter
+# (`mediadecode-ffmpeg`), the write adapter (`mediaencode-ffmpeg`), and the
+# umbrella's `ffmpeg` feature. Triggered by changes to any of them, to the
+# vocabulary and faces they implement, to shared workspace files, or to
+# this workflow.
+#
+# FFmpeg is pinned: there is no versioned Homebrew formula for FFmpeg 9,
+# so every job restores (or, on a cache miss, builds) FFmpeg 9.0.1 through
+# `.github/actions/ffmpeg`, in one of two variants — `full` (GPL, with the
+# codec libraries and the `ffmpeg` program the integration tests' fixtures
+# are made with) and `lgpl` (no GPL code). macOS only: the hardware lanes
+# need VideoToolbox.
 on:
   push:
     branches: [main]
     paths:
+      - 'mediaspine/**'
       - 'mediadecode/**'
+      - 'mediaencode/**'
+      - 'mediaio-ffmpeg/**'
       - 'mediadecode-ffmpeg/**'
+      - 'mediaencode-ffmpeg/**'
+      - 'mediaio/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'ci/**'
+      - '.github/actions/**'
       - '.github/workflows/ci-ffmpeg.yml'
   pull_request:
     paths:
+      - 'mediaspine/**'
       - 'mediadecode/**'
+      - 'mediaencode/**'
+      - 'mediaio-ffmpeg/**'
       - 'mediadecode-ffmpeg/**'
+      - 'mediaencode-ffmpeg/**'
+      - 'mediaio/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'ci/**'
+      - '.github/actions/**'
       - '.github/workflows/ci-ffmpeg.yml'
   workflow_dispatch:
   schedule:
@@ -42,21 +60,24 @@ jobs:
     - name: Install Rust
       run: rustup update stable && rustup default stable && rustup component add rustfmt
     - name: Check formatting
-      run: cargo fmt -p mediadecode-ffmpeg -- --check
+      run: cargo fmt -p mediaio-ffmpeg -p mediadecode-ffmpeg -p mediaencode-ffmpeg -p mediaio -- --check
 
   clippy:
     name: clippy
     runs-on: macos-latest
     steps:
     - uses: actions/checkout@v7
-    - name: Install FFmpeg
-      run: brew install ffmpeg pkg-config
+    - uses: ./.github/actions/ffmpeg
+      with:
+        variant: full
     - name: Install Rust
       run: rustup update stable && rustup default stable && rustup component add clippy
     - name: Install cargo-hack
       run: cargo install cargo-hack
     - name: Apply clippy lints
-      run: cargo hack clippy -p mediadecode-ffmpeg --each-feature --exclude-no-default-features
+      run: |
+        cargo hack clippy -p mediaio-ffmpeg -p mediadecode-ffmpeg -p mediaencode-ffmpeg --each-feature --exclude-no-default-features
+        cargo clippy -p mediaio --features ffmpeg
 
   build:
     name: build
@@ -70,18 +91,18 @@ jobs:
           ~/.cargo/registry
           ~/.cargo/git
           target
-        # See the `test` job below for the `-v2-` prefix rationale.
-        key: ${{ runner.os }}-ffmpeg-build-v2-${{ hashFiles('**/Cargo.lock') }}
+        key: ${{ runner.os }}-ffmpeg-full-build-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: |
-          ${{ runner.os }}-ffmpeg-build-v2-
-    - name: Install FFmpeg
-      run: brew install ffmpeg pkg-config
+          ${{ runner.os }}-ffmpeg-full-build-
+    - uses: ./.github/actions/ffmpeg
+      with:
+        variant: full
     - name: Install Rust
       run: rustup update stable && rustup default stable
     - name: Install cargo-hack
       run: cargo install cargo-hack
     - name: Run build
-      run: cargo hack build -p mediadecode-ffmpeg --feature-powerset --exclude-no-default-features
+      run: cargo hack build -p mediaio-ffmpeg -p mediadecode-ffmpeg -p mediaencode-ffmpeg --feature-powerset --exclude-no-default-features
 
   test:
     name: test
@@ -99,39 +120,64 @@ jobs:
           ~/.cargo/registry
           ~/.cargo/git
           target
-        # `-v2-` prefix bump is a one-shot cache invalidation —
-        # earlier runs cached `ffmpeg-sys-next` artifacts that
-        # had baked in a stale brew FFmpeg path
-        # (`/opt/homebrew/Cellar/ffmpeg/<old version>/lib`).
-        # The runner now has a different patch version, so the
-        # linker fails with `library 'avutil' not found`. Once
-        # the new cache populates, the explicit clean step
-        # below keeps it fresh on every run.
-        key: ${{ runner.os }}-ffmpeg-test-v2-${{ hashFiles('**/Cargo.lock') }}
+        key: ${{ runner.os }}-ffmpeg-full-test-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: |
-          ${{ runner.os }}-ffmpeg-test-v2-
-    - name: Install FFmpeg
-      run: brew install ffmpeg pkg-config
+          ${{ runner.os }}-ffmpeg-full-test-
+    - uses: ./.github/actions/ffmpeg
+      with:
+        variant: full
     - name: Install Rust
       run: rustup update stable && rustup default stable
     - name: Install cargo-hack
       run: cargo install cargo-hack
-    - name: Refresh ffmpeg-sys-next build artifacts
-      # `ffmpeg-sys-next`'s `build.rs` bakes the brew-installed
-      # `/opt/homebrew/Cellar/ffmpeg/<version>/lib` path into its
-      # linker hints. When brew bumps FFmpeg between runs the
-      # cached output points at a path that no longer exists and
-      # the linker fails. Force a rebuild of the sys crate (and
-      # its downstream binding) so the build script re-reads
-      # `pkg-config` against the currently-installed FFmpeg.
-      run: cargo clean -p ffmpeg-sys-next -p ffmpeg-next -p mediadecode-ffmpeg
-    - name: Run test
-      run: cargo hack test -p mediadecode-ffmpeg --feature-powerset --exclude-no-default-features
+    # `test-support` doubles the powerset and adds nothing a single lane
+    # with it does not, so the powerset leaves it out and one lane runs it.
+    - name: The base and the read adapter, every feature combination
+      run: cargo hack test -p mediaio-ffmpeg -p mediadecode-ffmpeg --feature-powerset --exclude-no-default-features --exclude-features test-support
+    - name: The base and the read adapter, with test-support
+      run: cargo test -p mediaio-ffmpeg -p mediadecode-ffmpeg --features test-support
+    # The write adapter's `gpl` combinations are the GPL lane: against
+    # the full build, its GPL encoders are admitted by name.
+    - name: The write adapter, every feature combination
+      run: cargo hack test -p mediaencode-ffmpeg --feature-powerset --exclude-no-default-features
+    - name: The umbrella with ffmpeg
+      run: cargo test -p mediaio --features ffmpeg
+
+  # The refuse-by-name law against an FFmpeg with no GPL code in it: a GPL
+  # encoder is refused by its name without `gpl`, and is missing from the
+  # linked libavcodec (`NotLinked`) with it. Unit tests only — the
+  # integration tests make their fixtures with GPL encoders.
+  lgpl:
+    name: lgpl
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v7
+    - name: Cache cargo build and registry
+      uses: actions/cache@v6
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-ffmpeg-lgpl-test-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-ffmpeg-lgpl-test-
+    - uses: ./.github/actions/ffmpeg
+      with:
+        variant: lgpl
+    - name: Install Rust
+      run: rustup update stable && rustup default stable
+    - name: The three crates' unit tests
+      run: cargo test -p mediaio-ffmpeg -p mediadecode-ffmpeg -p mediaencode-ffmpeg --lib
+    - name: The write adapter with gpl
+      run: cargo test -p mediaencode-ffmpeg --lib --features gpl
+    - name: The umbrella with ffmpeg
+      run: cargo test -p mediaio --features ffmpeg
 
   coverage:
     name: coverage
     runs-on: macos-latest
-    needs: [rustfmt, clippy, build, test]
+    needs: [rustfmt, clippy, build, test, lgpl]
     steps:
       - uses: actions/checkout@v7
         with:
@@ -141,12 +187,6 @@ jobs:
           # missing files, so tarpaulin needs them too — the
           # `test` job above already runs with submodules.
           submodules: recursive
-      - name: Install FFmpeg
-        run: brew install ffmpeg pkg-config
-      - name: Install Rust
-        run: rustup update nightly && rustup default nightly
-      - name: Install cargo-tarpaulin
-        run: cargo install cargo-tarpaulin
       - name: Cache cargo build and registry
         uses: actions/cache@v6
         with:
@@ -154,21 +194,24 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          # See the `test` job above for the `-v2-` prefix + clean
-          # step rationale. Same brew-ffmpeg-path drift bites here.
-          key: ${{ runner.os }}-ffmpeg-coverage-v2-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-ffmpeg-full-coverage-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-ffmpeg-coverage-v2-
-      - name: Refresh ffmpeg-sys-next build artifacts
-        run: cargo clean -p ffmpeg-sys-next -p ffmpeg-next -p mediadecode-ffmpeg
+            ${{ runner.os }}-ffmpeg-full-coverage-
+      - uses: ./.github/actions/ffmpeg
+        with:
+          variant: full
+      - name: Install Rust
+        run: rustup update nightly && rustup default nightly
+      - name: Install cargo-tarpaulin
+        run: cargo install cargo-tarpaulin
       - name: Run tarpaulin
         env:
           RUSTFLAGS: "--cfg tarpaulin"
-        run: cargo tarpaulin -p mediadecode-ffmpeg --all-features --run-types tests --run-types doctests --out xml
+        run: cargo tarpaulin -p mediaio-ffmpeg -p mediadecode-ffmpeg -p mediaencode-ffmpeg --all-features --run-types tests --run-types doctests --out xml
       - name: Upload to codecov.io
         uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           slug: ${{ github.repository }}
           fail_ci_if_error: true
-          flags: mediadecode-ffmpeg
+          flags: ffmpeg

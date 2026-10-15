@@ -9,6 +9,47 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 The backend-agnostic core it adapts has its own log at
 [`mediadecode/CHANGELOG.md`](../mediadecode/CHANGELOG.md).
 
+## [0.19.0] - 2026-10-15
+
+The FFmpeg crossings move to the new base crate,
+[`mediaio-ffmpeg`](../mediaio-ffmpeg/CHANGELOG.md); this crate keeps the
+machines — the decoders, the demuxer, the hardware backends — and
+re-exports every name it exported before. Tracks `mediadecode` 0.19.0
+(see [its entry](../mediadecode/CHANGELOG.md#0190)). The family releases
+in lockstep.
+
+### Changed (BREAKING)
+
+- **`Received::Frame` is `Received::Produced`**, with `mediadecode`.
+- **Parameter copies answer `ParametersError`.** `TrackExtra::clone_parameters`,
+  `CodecTicket::mirror` and `CodecTicket::rebuild` return the base's
+  `ParametersError` — seven arms, the payloads of `DemuxError`'s
+  `Parameters*` arms — instead of `DemuxError`. `DemuxError:
+  From<ParametersError>` maps each arm onto its same-named `DemuxError`
+  arm, so `e.into()` restores the old type.
+- **`Frame::empty` answers `CrossingError`**, and
+  `ResampleError::Resample` carries it, instead of the decoder `Error`;
+  `Error: From<CrossingError>` maps it onto `Error::Ffmpeg`.
+
+### Changed
+
+- **The crossings live in `mediaio-ffmpeg`**: the carriers, packet and
+  frame conversion, codec tickets and identifiers, limits, the AVFrame
+  crossing, the allocator judge and the FFmpeg resampler, with `Ffmpeg`
+  and its adapter impls. Every path through this crate still resolves,
+  by re-export.
+- **Every function whose soundness rests on something its caller proves
+  is an `unsafe fn` with a written `# Safety` section**, and every call
+  site states its proof — the precondition for the crossings becoming
+  callable from another crate.
+
+### Added
+
+- `ParametersError` and `CrossingError`, re-exported from the base.
+- A `test-support` feature (off by default), forwarded to the base: the
+  fault-subprocess harness and the callback-state hooks, for the lanes
+  of crates built on this one.
+
 ## [0.18.0] - 2026-10-10
 
 Tracks `mediadecode` 0.18.0, whose `PacketFlags` names `DISPOSABLE` (see

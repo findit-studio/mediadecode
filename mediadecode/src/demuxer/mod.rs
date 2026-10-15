@@ -160,7 +160,7 @@ extern crate alloc;
 /// chapters, and a backend for a format that cannot carry them has
 /// nothing to override.
 ///
-/// Rows come back by borrow rather than through a handle seat. A
+/// Rows come back by borrow rather than through a handle type. A
 /// [`Chapter`] is small and `Clone`s where the backend's text carrier
 /// does, so a consumer that needs one past a borrow of the session
 /// copies it; there is nothing here expensive enough to be worth a
@@ -241,7 +241,7 @@ pub trait Demuxer {
   ///
   /// A container that declares none answers an empty slice — which is
   /// what the provided body does, so a backend whose format has no
-  /// chapters, and every implementor written before this seat existed,
+  /// chapters, and every implementor written before this method existed,
   /// answers it correctly without writing a line.
   ///
   /// Non-destructive and callable whenever, exactly like
@@ -382,8 +382,8 @@ mod tests {
   /// Trivial loopback session — proves the trait is implementable and
   /// that its associated types resolve through the adapter bundle.
   ///
-  /// Binds `Rc` rather than `Arc` at the [`Demuxer::TrackHandle`] seat
-  /// on purpose: the seat is a backend's choice, and a single-threaded
+  /// Binds `Rc` rather than `Arc` as the [`Demuxer::TrackHandle`] on
+  /// purpose: the handle is a backend's choice, and a single-threaded
   /// session should not be made to pay for atomics. `Vec`-backed, so
   /// the mock and the tests that construct it are gated on the
   /// allocating tier — see the `Vec`/`format!` import note above
@@ -452,9 +452,9 @@ mod tests {
     assert!(d.next_packet().expect("pull").is_some());
   }
 
-  /// **The chapter seat is provided, and neither mock writes a line
+  /// **The chapter table is provided, and neither mock writes a line
   /// for it.** That is the additivity claim stated as a test: both
-  /// implementations in this file predate the seat, both still
+  /// implementations in this file predate the method, both still
   /// compile, and both answer the empty table a container without
   /// chapters has.
   #[cfg(any(feature = "std", feature = "alloc"))]
@@ -584,7 +584,7 @@ mod tests {
   /// The same session face with **no allocator**: the row handle is a
   /// borrow, so the demux tier stays `core`-only.
   ///
-  /// The seat [`Demuxer::TrackHandle`] opens is the reason this
+  /// The choice [`Demuxer::TrackHandle`] opens is the reason this
   /// compiles at all — the table's carrier is the backend's choice,
   /// exactly as [`Demuxer::Buffer`] already was. Deliberately outside
   /// the `alloc` gate: if the tier ever grew a hard dependency on the

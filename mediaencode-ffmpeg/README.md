@@ -25,6 +25,11 @@ refused by name, never replaced by another.
 | `libx264`, `libx264rgb`, `libx265` | video | GPL — behind `gpl` |
 | `aac`, `aac_at` | audio | LGPL |
 
+The catalogue is closed on purpose: FFmpeg has no API that states an
+encoder's license, so a name this crate has not classified cannot be
+vouched for and is refused. It grows by pull request — an entry is a
+name, its kind and its license, checked against the encoder's source.
+
 ## GPL and your binary
 
 **Linking an FFmpeg built with `--enable-gpl` makes your binary GPL**,

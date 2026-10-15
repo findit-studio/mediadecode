@@ -1,7 +1,7 @@
 //! The 0.9 amputation, pinned from outside the crate.
 //!
 //! Everything here reads only the public API, which is the point: the
-//! [D-seat amputation contract][law] is a promise made to a *consumer*,
+//! [carrier amputation contract][law] is a promise made to a *consumer*,
 //! and a consumer cannot see `pub(crate)` helpers or unit-test
 //! internals. If a future release reintroduces a carrier that borrows
 //! from libavcodec, these lanes stop compiling.
@@ -23,7 +23,7 @@
 //! needs it returns early with a printed reason when the `ffmpeg` CLI
 //! is absent.
 //!
-//! [law]: mediadecode::adapter#the-d-seat-amputation-contract
+//! [law]: mediadecode::adapter#the-carrier-amputation-contract
 
 mod support;
 

@@ -78,7 +78,7 @@
 //! never inferred from a call — `Demuxer::open(path)` would have had no
 //! default to fall back on.
 //!
-//! [law]: mediaspine::adapter#the-d-seat-amputation-contract
+//! [law]: mediaspine::adapter#the-carrier-amputation-contract
 
 use ffmpeg_next::ffi::AVBufferRef;
 
@@ -302,7 +302,7 @@ pub mod ops {
     /// scoped submission to a decoder — `avcodec_send_packet` may keep a
     /// reference and never writes through it — dropped inside the call
     /// that built it; a copy kept past that call must own its bytes, as
-    /// `decoder::try_clone_packet` makes. With [`BodyRoute::Copy`] the
+    /// `boundary::try_clone_packet` makes. With [`BodyRoute::Copy`] the
     /// packet owns its body and there is nothing to prove.
     unsafe fn packet_body(
       body: &Self::Buffer,
@@ -404,7 +404,7 @@ pub trait FfmpegCarrier: sealed::Sealed + Copy + Clone + core::fmt::Debug + 'sta
 /// 'static`, clone by refcount, and owe nothing to the decoder that
 /// produced them.
 ///
-/// [law]: mediaspine::adapter#the-d-seat-amputation-contract
+/// [law]: mediaspine::adapter#the-carrier-amputation-contract
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Owned;
 

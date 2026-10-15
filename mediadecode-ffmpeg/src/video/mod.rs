@@ -1161,7 +1161,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     // back* is the hardware probe, whose rescue history goes to the
     // caller as owned, mutable `Packet`s
     // (`AllBackendsFailed::into_unconsumed_packets`); it records copies
-    // of its own (`decoder::try_clone_packet`), so nothing it hands back
+    // of its own (`boundary::try_clone_packet`), so nothing it hands back
     // addresses a carrier.
     let route = crate::BodyRoute::Submission;
     let submit = |av_pkt: &Packet| {
@@ -1226,7 +1226,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     };
     // SAFETY: `submit` hands the packet to libavcodec's send (software, or
     // the hardware session's) and to the hardware probe, whose history
-    // keeps deep copies (`decoder::try_clone_packet`); it neither clones
+    // keeps deep copies (`boundary::try_clone_packet`); it neither clones
     // the packet shallowly nor keeps it, so a shared body never outlives
     // this call.
     unsafe { boundary::with_ffmpeg_video_packet::<C, _>(packet, limits, route, submit) }

@@ -58,8 +58,9 @@ impl mediadecode::demuxer::DemuxAdapter for Loop {
 
 type Bytes = &'static [u8];
 
-/// The read faces' paths, named by bounding on them.
-#[allow(dead_code)]
+/// The read faces' paths, named by bounding on them — the bounds are the
+/// point, so the parameters have no other use.
+#[allow(dead_code, clippy::extra_unused_type_parameters)]
 fn read_faces<
   A: mediadecode::decoder::AudioStreamDecoder,
   I: mediadecode::decoder::ImageDecoder,

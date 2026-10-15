@@ -26,7 +26,7 @@
 //! All four derive `Clone`, which makes the derive's per-parameter
 //! bound (`D: Clone`, `E: Clone`, …) exactly what cloning the fields
 //! requires. What that costs is the backend's business: the
-//! [D-seat amputation contract](crate::adapter#the-d-seat-amputation-contract)
+//! [carrier amputation contract](crate::adapter#the-carrier-amputation-contract)
 //! is what makes it a refcount bump rather than a pixel copy.
 
 pub use mediaframe::frame::{Dimensions, Plane, Rect};
@@ -1146,7 +1146,7 @@ mod tests {
   fn every_frame_household_clones() {
     // The amputation contract's consumer-side half: a frame is a
     // message, and a message is cloneable. What the clone *costs* is
-    // the backend's business — see the D-seat contract on `adapter`.
+    // the backend's business — see the carrier amputation contract on `adapter`.
     fn clones<T: Clone>(_: &T) {}
     let v: VideoFrame<u32, (), &[u8]> =
       VideoFrame::new(Dimensions::new(2, 2), 0u32, empty_planes(), 1, ());

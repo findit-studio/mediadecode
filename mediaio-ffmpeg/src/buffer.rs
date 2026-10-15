@@ -7,7 +7,7 @@
 //! whose `AsRef<[u8]>` pointed straight into libavcodec's memory. That
 //! type is gone. Every byte that crosses this boundary is now copied
 //! into an [`FfmpegBytes`], which is what the core's
-//! [D-seat amputation contract][law] requires: owned, `Send + Sync`,
+//! [carrier amputation contract][law] requires: owned, `Send + Sync`,
 //! clone-is-a-refcount-bump, and with no FFmpeg lifetime riding along.
 //!
 //! What is left in this module is everything the copy still has to
@@ -222,7 +222,7 @@
 //! lossy clamp; the one floor left, `sample_rate`, is censused at its
 //! site with the reason it is metadata and sizes nothing.
 //!
-//! [law]: mediaspine::adapter#the-d-seat-amputation-contract
+//! [law]: mediaspine::adapter#the-carrier-amputation-contract
 
 use std::fmt;
 
@@ -231,7 +231,7 @@ use derive_more::{IsVariant, TryUnwrap, Unwrap};
 /// The bytes every packet and frame this crate produces are carried in.
 ///
 /// Owned, `Send + Sync`, `'static`, and clone-is-a-refcount-bump: the
-/// core's [D-seat amputation contract][law], satisfied. Nothing inside
+/// core's [carrier amputation contract][law], satisfied. Nothing inside
 /// reaches back into libavcodec.
 ///
 /// # Why it is opaque
@@ -263,7 +263,7 @@ use derive_more::{IsVariant, TryUnwrap, Unwrap};
 /// pool is built and not before — this codebase does not carry members
 /// nothing can produce.
 ///
-/// [law]: mediaspine::adapter#the-d-seat-amputation-contract
+/// [law]: mediaspine::adapter#the-carrier-amputation-contract
 #[derive(Clone, Default)]
 pub struct FfmpegBytes(Inner);
 

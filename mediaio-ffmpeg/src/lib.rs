@@ -142,7 +142,7 @@ pub mod test_support {
   };
 }
 
-// Every bare alias below binds [`FfmpegBuffer`] in the `D` seat — the
+// Every bare alias below binds [`FfmpegBuffer`] as the `D` carrier — the
 // view lane, the ordinary road: a decoder's output read where it lands
 // and dropped. The `Owned*` family binds [`FfmpegBytes`] and is what a
 // payload takes when it has to **travel** — outlive the decoder, cross

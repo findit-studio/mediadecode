@@ -9,11 +9,11 @@
 //!
 //! Frames produced via [`crate::convert::av_frame_to_audio_frame`]
 //! carry `FfmpegBytes` planes copied out of the source `AVFrame` — the
-//! [D-seat amputation contract][law]. The consumer can hold the frame
+//! [carrier amputation contract][law]. The consumer can hold the frame
 //! across decoder calls, send it to another thread, and outlive the
 //! decoder that made it.
 //!
-//! [law]: mediadecode::adapter#the-d-seat-amputation-contract
+//! [law]: mediadecode::adapter#the-carrier-amputation-contract
 
 use derive_more::{IsVariant, TryUnwrap, Unwrap};
 use ffmpeg_next::{codec::Parameters, frame};

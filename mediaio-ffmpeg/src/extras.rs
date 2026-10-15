@@ -10,7 +10,7 @@
 //!
 //! [`SideDataEntry`] carries its payload as an `FfmpegBytes`, not a
 //! `Vec<u8>`. Those bytes ride on packets and frames that a graph fans
-//! out, and the [D-seat contract][law] says a clone of a message is a
+//! out, and the [carrier contract][law] says a clone of a message is a
 //! refcount bump — a `Vec` in the extras would have made a frame's
 //! *payload* cheap to clone and its metadata expensive, which is the
 //! kind of asymmetry nobody remembers while profiling.
@@ -18,7 +18,7 @@
 //! are parsed values, a handful of words, not bytes crossing a
 //! boundary.
 //!
-//! [law]: mediaspine::adapter#the-d-seat-amputation-contract
+//! [law]: mediaspine::adapter#the-carrier-amputation-contract
 
 use std::vec::Vec;
 

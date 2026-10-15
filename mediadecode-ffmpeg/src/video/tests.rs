@@ -173,7 +173,7 @@ struct FakeHw {
   /// when a lane caps the ceiling to refuse a *carrier*.
   queued: VecDeque<frame::Video>,
   /// Copies of every packet accepted so far, made as the probe makes
-  /// them (`decoder::try_clone_packet`) — the probe's
+  /// them (`boundary::try_clone_packet`) — the probe's
   /// `unconsumed_packets` history, surfaced when it exhausts.
   history: Vec<Packet>,
   /// Where each `send_packet`'s packet kept its payload, read while it
@@ -1158,7 +1158,7 @@ impl Fx3Observation {
 /// LAW: **a rescued packet never aliases a view carrier**, on `Auto`'s
 /// road, where the probe's history comes back through a failed fallback.
 ///
-/// PLANT: `av_packet_make_writable` skipped in `decoder::try_clone_packet`
+/// PLANT: `av_packet_make_writable` skipped in `boundary::try_clone_packet`
 /// turns this red at "addresses a retained view carrier's storage".
 #[test]
 fn a_rescued_packet_never_aliases_a_view_carrier() {
@@ -1276,7 +1276,7 @@ fn a_rescued_packet_never_aliases_a_view_carrier() {
 /// The probe window is the one stretch of a session with a recorder in
 /// it: the probe keeps every packet it takes, and its exhaustion hands
 /// them to the caller as owned, mutable `Packet`s. It records copies of
-/// its own (`decoder::try_clone_packet`), so the view lane's submission
+/// its own (`boundary::try_clone_packet`), so the view lane's submission
 /// shares its carrier's buffer there as it does after the first picture.
 /// On a pinned session, whose exhaustion reports the history as the seam
 /// recorded it: each send hands the seam the retained carrier's own
@@ -1286,7 +1286,7 @@ fn a_rescued_packet_never_aliases_a_view_carrier() {
 ///
 /// PLANT: the route forced to `BodyRoute::Copy` in `send_packet_impl`
 /// turns this red at "the submission must be the carrier's own storage";
-/// `av_packet_make_writable` skipped in `decoder::try_clone_packet` turns
+/// `av_packet_make_writable` skipped in `boundary::try_clone_packet` turns
 /// it red at "shares a retained carrier's storage".
 #[test]
 fn a_view_send_in_the_probe_window_is_zero_copy() {

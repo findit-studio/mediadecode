@@ -11,6 +11,17 @@ The backend-agnostic core it adapts has its own log at
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-10-15
+
+Tracks `mediadecode` 0.19.0 (see
+[its entry](../mediadecode/CHANGELOG.md#0190)). The family releases in
+lockstep.
+
+### Changed (BREAKING)
+
+- **`Received::Frame` is `Received::Produced`**, with `mediadecode`: the
+  async faces answer the vocabulary's own rhythm.
+
 ## [0.18.0] - 2026-10-10
 
 Tracks `mediadecode` 0.18.0, whose `PacketFlags` names `DISPOSABLE` (see

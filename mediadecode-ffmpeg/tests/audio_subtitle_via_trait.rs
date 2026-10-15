@@ -466,7 +466,7 @@ fn the_feeder_loop_is_writable_against_the_trait_alone() {
 ///
 /// It used to gate the *receive* side alone. A caller that observed
 /// `Received::Ended` and then sent one more packet got `Sent::Accepted`,
-/// a filled seat, and a `Received::Produced` on the next poll — the end of
+/// a cue held in its output, and a `Received::Produced` on the next poll — the end of
 /// a stream un-ended, with no `flush` anywhere in the story.
 #[test]
 fn a_packet_after_eof_is_refused_on_an_empty_seat() {
