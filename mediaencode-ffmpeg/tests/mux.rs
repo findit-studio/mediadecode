@@ -32,7 +32,7 @@ use mediadecode_ffmpeg::{CodecId, Ffmpeg, FfmpegDemuxer, FfmpegOwnedDemuxer};
 use mediaencode::{
   MuxError, MuxRefusal, Muxer,
   mediaspine::{
-    demuxer::{AttachmentPacket, AttachmentTrackParams, Chapter},
+    demuxer::{AttachmentPacket, AttachmentTrackParams, Chapter, TrackParams},
     packet::PacketFlags,
     track::{AttachedFile, TrackDescription},
   },
@@ -42,6 +42,7 @@ use mediaencode_ffmpeg::{
   OutputError, OutputText, Uncarried,
 };
 use mediaio_ffmpeg::{CodecTicket, FfmpegBytes, PacketLimits, extras::AttachmentPacketExtra};
+use smol_bytes::Utf8Bytes;
 use support::{Corpus, remux};
 
 /// The codec parameters a row carries — the side-data carrier the FFmpeg
@@ -898,4 +899,257 @@ fn l8_presentation_order_is_judged_on_the_counts_libavformat_is_handed() {
   let written = &packets(&target)[0];
   assert_eq!(written.len(), 1, "only the admitted packet was written");
   assert_eq!(written[0].pts, Some(ms(0)), "presented at its one tick");
+}
+
+/// What a description offers, as a row: what a read-back row is judged
+/// against.
+fn offered(description: &TrackDescription<Ffmpeg, FfmpegBytes, CodecTicket>) -> Row {
+  let text = |text: Option<&Utf8Bytes>| text.map(|text| text.as_str().to_owned());
+  let file = description.file();
+  Row {
+    kind: description.kind(),
+    codec: description.codec(),
+    language: text(description.language()),
+    disposition: description.disposition(),
+    filename: text(file.and_then(|file| file.filename())),
+    mime_type: text(file.and_then(|file| file.mime_type())),
+  }
+}
+
+/// What `written` lost of `offered`, as the report names it, in its
+/// order: each field the track declared that the file does not hold — a
+/// declared text read back otherwise, or not at all, and each declared
+/// flag read back unset.
+fn lost(track: usize, offered: &Row, written: &Row) -> Vec<Uncarried> {
+  let track = TrackIndex::new(track);
+  let dropped = |declared: &Option<String>, held: &Option<String>| {
+    declared
+      .as_ref()
+      .filter(|declared| held.as_ref() != Some(*declared))
+      .map(|declared| Utf8Bytes::from(declared.as_str()))
+  };
+  let mut lost = Vec::new();
+  if let Some(filename) = dropped(&offered.filename, &written.filename) {
+    lost.push(Uncarried::Filename { track, filename });
+  }
+  if let Some(mime_type) = dropped(&offered.mime_type, &written.mime_type) {
+    lost.push(Uncarried::MimeType { track, mime_type });
+  }
+  if let Some(tag) = dropped(&offered.language, &written.language) {
+    lost.push(Uncarried::Language { track, tag });
+  }
+  let flags = offered.disposition.difference(written.disposition);
+  if !flags.is_empty() {
+    lost.push(Uncarried::Disposition { track, flags });
+  }
+  lost
+}
+
+/// **L9 — the report names every field a Matroska attachment drops, and
+/// nothing else.** A font declaring its filename, MIME type, a language
+/// and two flags reaches Matroska with its file, filename and MIME type:
+/// an attachment there has no language, and no track entry for its
+/// flags. Read back, the report and the file agree track by track — the
+/// report names exactly what each track declared and the file does not
+/// hold.
+#[test]
+fn l9_the_report_names_every_field_a_matroska_attachment_drops() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = corpus.multi_track_mkv();
+  let video = owned_video_and_font(&source, 3).video;
+  let font_ticket = {
+    let demuxer = FfmpegOwnedDemuxer::open(&source).expect("open");
+    ticket(
+      demuxer
+        .tracks()
+        .iter()
+        .find(|row| row.kind() == TrackKind::Attachment)
+        .expect("the font"),
+    )
+  };
+  let payload = AttachmentPacket::new(
+    FfmpegBytes::try_copy_from_slice(support::FONT_PAYLOAD).expect("a payload"),
+    AttachmentPacketExtra::new(0),
+  );
+  let font = TrackDescription::attachment(
+    millis(),
+    AttachmentTrackParams::new(CodecId::TTF),
+    AttachedFile::new(payload)
+      .with_filename(Some("font.ttf".into()))
+      .with_mime_type(Some("application/x-truetype-font".into())),
+    font_ticket,
+  )
+  .with_language(Some("jpn".into()))
+  .with_disposition(TrackDisposition::DEFAULT | TrackDisposition::FORCED);
+  let mut table = video_table(&source);
+  table.push(font);
+  let offered: Vec<Row> = table.iter().map(offered).collect();
+
+  let target = output(&corpus, "l9.mkv");
+  let (mut muxer, report) = FfmpegOwnedMuxer::open(
+    File::create(&target).expect("create"),
+    ContainerName::MATROSKA,
+    table,
+    &[],
+    PacketLimits::default(),
+  )
+  .expect("open");
+  for (index, packet) in video.iter().enumerate() {
+    let at = 40 * index as i64;
+    muxer
+      .write_video(restamped(packet, 0, Some(at), Some(at)))
+      .map_err(|error| error.map_packet(drop))
+      .expect("a packet");
+  }
+  muxer.finish().expect("the container is finished");
+
+  let written = rows(&target);
+  assert_eq!(written.len(), offered.len(), "the video and the font");
+  let expected: Vec<Uncarried> = offered
+    .iter()
+    .zip(&written)
+    .enumerate()
+    .flat_map(|(track, (offered, written))| lost(track, offered, written))
+    .collect();
+  assert_eq!(
+    report.uncarried(),
+    expected.as_slice(),
+    "the report names exactly what the file lost",
+  );
+  assert_eq!(
+    expected,
+    vec![
+      Uncarried::Language {
+        track: TrackIndex::new(1),
+        tag: "jpn".into(),
+      },
+      Uncarried::Disposition {
+        track: TrackIndex::new(1),
+        flags: TrackDisposition::DEFAULT | TrackDisposition::FORCED,
+      },
+    ],
+    "the premise: the font kept its filename and MIME type, and lost its language and flags",
+  );
+}
+
+/// **L10 — the report names every field MP4's cover drops, and nothing
+/// else.** An MP3's cover art, declared with a filename, a MIME type, a
+/// language and two flags beside its own, reaches MP4 as its cover: the
+/// picture alone, read back as an attached picture. The report and the
+/// file agree track by track — the cover's filename, MIME type, language
+/// and flags each named, and the audio's losses, if any, with them.
+#[test]
+fn l10_the_report_names_every_field_mp4s_cover_drops() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = corpus.cover_art_mp3();
+  let mut demuxer = FfmpegOwnedDemuxer::open(&source).expect("open the source");
+  let mut files: Vec<Option<_>> = demuxer.tracks().iter().map(|_| None).collect();
+  let mut timed = Vec::new();
+  while let Some(packet) = demuxer.next_packet().expect("a packet or the end") {
+    match packet {
+      DemuxedPacket::Attachment(attachment) => {
+        let (track, payload) = attachment.into_parts();
+        files[track.get()] = Some(payload);
+      }
+      packet => timed.push(packet),
+    }
+  }
+  let mut table: Vec<TrackDescription<Ffmpeg, FfmpegBytes, CodecTicket>> = demuxer
+    .tracks()
+    .iter()
+    .zip(files)
+    .map(|(row, file)| {
+      TrackDescription::from_track_info(&**row, file, ticket(row)).expect("a description")
+    })
+    .collect();
+  let cover = table
+    .iter()
+    .position(|description| description.kind() == TrackKind::Attachment)
+    .expect("the premise: a cover track");
+  let (timebase, params, _, cover_ticket, _, disposition, file) = table.remove(cover).into_parts();
+  let TrackParams::Attachment(params) = params else {
+    panic!("the premise: the cover is an attachment");
+  };
+  let (payload, _, _) = file.expect("the cover's picture").into_parts();
+  table.insert(
+    cover,
+    TrackDescription::attachment(
+      timebase,
+      params,
+      AttachedFile::new(payload)
+        .with_filename(Some("cover.png".into()))
+        .with_mime_type(Some("image/png".into())),
+      cover_ticket,
+    )
+    .with_language(Some("eng".into()))
+    .with_disposition(disposition | TrackDisposition::DEFAULT | TrackDisposition::COMMENT),
+  );
+  let offered: Vec<Row> = table.iter().map(offered).collect();
+
+  let target = output(&corpus, "l10.mp4");
+  let (mut muxer, report) = FfmpegOwnedMuxer::open(
+    File::create(&target).expect("create"),
+    ContainerName::MP4,
+    table,
+    &[],
+    PacketLimits::default(),
+  )
+  .expect("open");
+  for packet in timed {
+    muxer
+      .write_packet(packet)
+      .map_err(|error| error.map_packet(drop))
+      .expect("a packet");
+  }
+  muxer.finish().expect("the container is finished");
+
+  // MP4 reads its tracks back in an order of its own: each offered track
+  // is judged against the written track of its kind.
+  let written = rows(&target);
+  assert_eq!(written.len(), offered.len(), "the audio and the cover");
+  let expected: Vec<Uncarried> = offered
+    .iter()
+    .enumerate()
+    .flat_map(|(track, offered)| {
+      let written = written
+        .iter()
+        .find(|row| row.kind == offered.kind)
+        .expect("a written track of each kind");
+      lost(track, offered, written)
+    })
+    .collect();
+  assert_eq!(
+    report.uncarried(),
+    expected.as_slice(),
+    "the report names exactly what the file lost",
+  );
+  let track = TrackIndex::new(cover);
+  let on_the_cover = |lost: &&Uncarried| match lost {
+    Uncarried::Filename { track: at, .. }
+    | Uncarried::MimeType { track: at, .. }
+    | Uncarried::Language { track: at, .. }
+    | Uncarried::Disposition { track: at, .. } => *at == track,
+    _ => false,
+  };
+  assert_eq!(
+    expected.iter().filter(on_the_cover).count(),
+    4,
+    "the premise: the cover lost its filename, MIME type, language and flags: {expected:?}",
+  );
+  for named in [
+    Uncarried::Filename {
+      track,
+      filename: "cover.png".into(),
+    },
+    Uncarried::MimeType {
+      track,
+      mime_type: "image/png".into(),
+    },
+    Uncarried::Language {
+      track,
+      tag: "eng".into(),
+    },
+  ] {
+    assert!(expected.contains(&named), "{named:?} in {expected:?}");
+  }
 }

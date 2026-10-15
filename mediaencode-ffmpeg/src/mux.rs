@@ -19,6 +19,14 @@
 //! attachment MP4 has no place for, a language MP4 cannot spell, a
 //! disposition flag the container has no field for.
 //!
+//! The report follows each track's **road**, as the roads keep different
+//! fields: a timed stream keeps its language and the flags its container
+//! has fields for; an attachment Matroska writes keeps its file, filename
+//! and MIME type, but no language and no flag; MP4's cover keeps its
+//! picture alone, and reads back as an attached picture — its filename,
+//! MIME type, language and other flags are each reported
+//! ([`Uncarried::Filename`], [`Uncarried::MimeType`]).
+//!
 //! The report covers what this release knows of each container — the
 //! constants on [`ContainerName`]: Matroska, WebM and MP4. Any other
 //! muxer opens the same way and libavformat decides what it writes; an
@@ -135,17 +143,40 @@ pub enum Uncarried {
     /// The track, in the table the muxer was opened with.
     track: TrackIndex,
   },
-  /// A language the container cannot spell: MP4 stores exactly three
-  /// letters in `a`–`z` and its neighbours (`movenc.c` 8455–8458,
-  /// `isom.c` 233–258 in FFmpeg 9.0.1); anything else is written as
-  /// undetermined, or cut to three letters.
+  /// An attachment's filename its road does not keep: MP4 keeps a
+  /// cover's picture and the type of its image, and nothing else
+  /// (`mov_write_covr`, `movenc.c` 4815–4839 in FFmpeg 9.0.1).
+  Filename {
+    /// The track.
+    track: TrackIndex,
+    /// The filename the attachment declared.
+    filename: Utf8Bytes,
+  },
+  /// An attachment's MIME type its road does not keep — MP4's cover, as
+  /// for its filename.
+  MimeType {
+    /// The track.
+    track: TrackIndex,
+    /// The MIME type the attachment declared.
+    mime_type: Utf8Bytes,
+  },
+  /// A language the container cannot spell, or keeps no field for on the
+  /// track's road. MP4 stores exactly three letters in `a`–`z` and its
+  /// neighbours (`movenc.c` 8455–8458, `isom.c` 233–258 in FFmpeg
+  /// 9.0.1); anything else is written as undetermined, or cut to three
+  /// letters. An attachment Matroska writes has no language
+  /// (`mkv_write_attachments`, `matroskaenc.c` 2513–2561), nor does MP4's
+  /// cover, which no track carries.
   Language {
     /// The track.
     track: TrackIndex,
     /// The tag the track declared.
     tag: Utf8Bytes,
   },
-  /// Disposition flags the container has no field for.
+  /// Disposition flags the container has no field for on the track's
+  /// road. An attachment Matroska writes has no track entry, and so no
+  /// flag (`matroskaenc.c` 1957–1958); MP4's cover reads back as an
+  /// attached picture and nothing more.
   Disposition {
     /// The track.
     track: TrackIndex,
@@ -164,7 +195,9 @@ pub struct MuxReport {
 }
 
 impl MuxReport {
-  /// Each thing not carried, in table order.
+  /// Each thing not carried, in table order — and within a track, field
+  /// by field: an attachment's filename, its MIME type, the language, the
+  /// disposition.
   pub fn uncarried(&self) -> &[Uncarried] {
     &self.uncarried
   }
@@ -830,35 +863,78 @@ fn judge<W, D: AsRef<[u8]>>(
         Road::Attachment
       }
       Family::Mp4 if is_cover_codec(codec) => Road::Cover,
-      _ => {
-        report.uncarried.push(Uncarried::Attachment { track });
-        Road::NotWritten
-      }
+      _ => Road::NotWritten,
     },
     _ => {
       if output.query_codec(codec) == CodecQuery::NotCarried {
         return Err(MuxOpenError::CodecNotCarried { track, codec });
       }
-      let dropped = disposition_dropped(family, codec, description.disposition());
-      if !dropped.is_empty() {
-        report.uncarried.push(Uncarried::Disposition {
-          track,
-          flags: dropped,
-        });
-      }
       Road::Timed
     }
   };
-  if let Some(tag) = description.language()
-    && road != Road::NotWritten
-    && !language_carried(family, tag.as_str())
+  report
+    .uncarried
+    .extend(losses(family, road, track, description));
+  Ok(road)
+}
+
+/// What `road` drops of `description` in `family`, in the report's
+/// order: the whole attachment where it is not written; else an
+/// attachment's filename and MIME type, the language and the disposition
+/// flags the road keeps no field for.
+///
+/// The roads keep different fields. A timed stream keeps the language
+/// and the flags its container has fields for. An attachment Matroska
+/// writes keeps its file, filename and MIME type (`mkv_write_attachments`,
+/// `matroskaenc.c` 2513–2561 in FFmpeg 9.0.1) — no language, and no flag,
+/// as it has no track entry (1957–1958). MP4's cover keeps its picture
+/// and the type of its image (`mov_write_covr`, `movenc.c` 4815–4839),
+/// and reads back as an attached picture: its filename, MIME type,
+/// language and every other flag are dropped.
+fn losses<D>(
+  family: Family,
+  road: Road,
+  track: TrackIndex,
+  description: &TrackDescription<Ffmpeg, D, CodecTicket>,
+) -> Vec<Uncarried> {
+  if road == Road::NotWritten {
+    return vec![Uncarried::Attachment { track }];
+  }
+  let mut lost = Vec::new();
+  if road == Road::Cover
+    && let Some(file) = description.file()
   {
-    report.uncarried.push(Uncarried::Language {
+    if let Some(filename) = file.filename() {
+      lost.push(Uncarried::Filename {
+        track,
+        filename: filename.clone(),
+      });
+    }
+    if let Some(mime_type) = file.mime_type() {
+      lost.push(Uncarried::MimeType {
+        track,
+        mime_type: mime_type.clone(),
+      });
+    }
+  }
+  if let Some(tag) = description.language()
+    && !(road == Road::Timed && language_carried(family, tag.as_str()))
+  {
+    lost.push(Uncarried::Language {
       track,
       tag: tag.clone(),
     });
   }
-  Ok(road)
+  let flags = disposition_dropped(
+    family,
+    road,
+    description.codec(),
+    description.disposition(),
+  );
+  if !flags.is_empty() {
+    lost.push(Uncarried::Disposition { track, flags });
+  }
+  lost
 }
 
 /// The stream a track becomes, on its road.
@@ -926,18 +1002,25 @@ fn language_carried(family: Family, tag: &str) -> bool {
   }
 }
 
-/// The disposition flags `family` has no field for.
+/// The disposition flags `road` has no field for in `family`.
 fn disposition_dropped(
   family: Family,
+  road: Road,
   codec: CodecId,
   flags: TrackDisposition,
 ) -> TrackDisposition {
   use TrackDisposition as D;
-  let kept = match family {
+  let kept = match (road, family) {
+    // No track entry, so no flag (`matroskaenc.c` 1957–1958); a track
+    // not written is reported whole.
+    (Road::Attachment | Road::NotWritten, _) => D::empty(),
+    // The cover reads back as an attached picture, and nothing more
+    // (`movenc.c` 4815–4839).
+    (Road::Cover, _) => D::ATTACHED_PIC,
     // `matroskaenc.c` 1971–2023, 2157: the default and forced flags, the
     // commentary, impairment and text-description flags, and original or
     // dub — one of them; both at once write neither.
-    Family::Matroska => {
+    (Road::Timed, Family::Matroska) => {
       let mut kept = D::DEFAULT
         | D::FORCED
         | D::COMMENT
@@ -952,7 +1035,7 @@ fn disposition_dropped(
     // WebM writes the default and forced flags, and a WebVTT track's
     // kind through its codec id — the first of captions, descriptions or
     // metadata it declares (`matroskaenc.c` 1979–2002).
-    Family::WebM => {
+    (Road::Timed, Family::WebM) => {
       let mut kept = D::DEFAULT | D::FORCED;
       if codec == CodecId::WEBVTT
         && let Some(kind) = [D::CAPTIONS, D::DESCRIPTIONS, D::METADATA]
@@ -965,7 +1048,7 @@ fn disposition_dropped(
     }
     // The track's enabled flag and the DASH role `kind` boxes
     // (`movenc.c` 4338–4385, `isom.c` 450–462).
-    Family::Mp4 => {
+    (Road::Timed, Family::Mp4) => {
       D::DEFAULT
         | D::HEARING_IMPAIRED
         | D::CAPTIONS
@@ -975,7 +1058,7 @@ fn disposition_dropped(
         | D::DUB
         | D::FORCED
     }
-    Family::Other => return D::empty(),
+    (Road::Timed, Family::Other) => return D::empty(),
   };
   flags.difference(kept)
 }

@@ -21,38 +21,66 @@ fn mp4_carries_a_three_letter_language_and_reports_any_other() {
   }
 }
 
-/// **Each container drops the flags it has no field for, and only
-/// those.**
+/// **Each container drops the flags it has no field for on a timed
+/// stream, and only those.**
 #[test]
 fn each_container_reports_the_disposition_flags_it_drops() {
   use TrackDisposition as D;
   let every = D::DEFAULT | D::FORCED | D::COMMENT | D::KARAOKE | D::ORIGINAL;
-  assert_eq!(
-    disposition_dropped(Family::Matroska, CodecId::H264, every),
-    D::KARAOKE
-  );
+  let timed = |family, codec, flags| disposition_dropped(family, Road::Timed, codec, flags);
+  assert_eq!(timed(Family::Matroska, CodecId::H264, every), D::KARAOKE);
   // Original and dub at once: Matroska writes neither.
   assert_eq!(
-    disposition_dropped(Family::Matroska, CodecId::AAC, D::ORIGINAL | D::DUB),
+    timed(Family::Matroska, CodecId::AAC, D::ORIGINAL | D::DUB),
     D::ORIGINAL | D::DUB
   );
   assert_eq!(
-    disposition_dropped(Family::WebM, CodecId::VP9, every),
+    timed(Family::WebM, CodecId::VP9, every),
     D::COMMENT | D::KARAOKE | D::ORIGINAL
   );
   // A WebVTT track's first kind travels in its codec id.
   assert_eq!(
-    disposition_dropped(Family::WebM, CodecId::WEBVTT, D::CAPTIONS | D::METADATA),
+    timed(Family::WebM, CodecId::WEBVTT, D::CAPTIONS | D::METADATA),
     D::METADATA
   );
   assert_eq!(
-    disposition_dropped(Family::Mp4, CodecId::H264, every),
+    timed(Family::Mp4, CodecId::H264, every),
     D::KARAOKE | D::ORIGINAL
   );
   assert_eq!(
-    disposition_dropped(Family::Other, CodecId::H264, every),
+    timed(Family::Other, CodecId::H264, every),
     D::empty(),
     "nothing is claimed for a container this release does not know",
+  );
+}
+
+/// **An attachment's road keeps fewer fields than a timed stream.** An
+/// attachment Matroska writes has no track entry, so every flag is
+/// dropped; MP4's cover keeps its attached-picture flag alone.
+#[test]
+fn an_attachment_road_drops_the_flags_it_has_no_track_for() {
+  use TrackDisposition as D;
+  assert_eq!(
+    disposition_dropped(
+      Family::Matroska,
+      Road::Attachment,
+      CodecId::TTF,
+      D::DEFAULT | D::FORCED
+    ),
+    D::DEFAULT | D::FORCED
+  );
+  assert_eq!(
+    disposition_dropped(
+      Family::Mp4,
+      Road::Cover,
+      CodecId::PNG,
+      D::ATTACHED_PIC | D::DEFAULT | D::COMMENT
+    ),
+    D::DEFAULT | D::COMMENT
+  );
+  assert_eq!(
+    disposition_dropped(Family::Mp4, Road::Cover, CodecId::PNG, D::ATTACHED_PIC),
+    D::empty()
   );
 }
 
