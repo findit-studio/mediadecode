@@ -11,7 +11,7 @@ The sibling FFmpeg adapter has its own log at
 
 ## [Unreleased]
 
-## [0.19.0] - 2026-10-15
+## [0.19.0] - 2026-10-16
 
 The vocabulary moves to its own crate,
 [`mediaspine`](../mediaspine/CHANGELOG.md), and this crate keeps the
