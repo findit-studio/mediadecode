@@ -3942,20 +3942,21 @@ mod tests {
       len: usize,
       limits: PacketLimits,
     ) -> (usize, Vec<u8>) {
+      let read = |sent: &Packet| {
+        // SAFETY: `sent` is live for the call; its payload of `len` bytes
+        // has `PADDING` more behind it inside its own buffer —
+        // `try_packet_copy`'s on a copy, the captured packet's on a share
+        // — and both are only read.
+        unsafe {
+          let data = (*sent.as_ptr()).data;
+          let padding = core::slice::from_raw_parts(data.add(len), PADDING).to_vec();
+          (data as usize, padding)
+        }
+      };
       // SAFETY: the submission is only read, inside the call that built
       // it, and dropped there; nothing writes through it or keeps it.
       unsafe {
-        with_ffmpeg_video_packet::<crate::View, _>(packet, limits, BodyRoute::Submission, |sent| {
-          // SAFETY: `sent` is live for the call; its payload of `len`
-          // bytes has `PADDING` more behind it inside its own buffer —
-          // `try_packet_copy`'s on a copy, the captured packet's on a
-          // share — and both are only read.
-          unsafe {
-            let data = (*sent.as_ptr()).data;
-            let padding = core::slice::from_raw_parts(data.add(len), PADDING).to_vec();
-            (data as usize, padding)
-          }
-        })
+        with_ffmpeg_video_packet::<crate::View, _>(packet, limits, BodyRoute::Submission, read)
       }
       .expect("built")
     }
