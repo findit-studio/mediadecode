@@ -49,7 +49,10 @@ impl PanicLatch {
   /// Records a panic payload. The first one wins: a reader that panics
   /// again after libavformat retried is describing the same fault, and
   /// the first description is the one nearest the cause.
-  fn latch(&self, payload: &(dyn Any + Send)) {
+  ///
+  /// Shared with the writer guard ([`crate::writer_guard`]), which
+  /// latches a sink's panic the same way.
+  pub(crate) fn latch(&self, payload: &(dyn Any + Send)) {
     let message = describe(payload);
     // A poisoned lock means a previous holder panicked while
     // describing a panic. The stored value is still a plain
@@ -61,6 +64,12 @@ impl PanicLatch {
     }
     drop(slot);
     self.latched.store(true, Ordering::Release);
+  }
+
+  /// Whether a panic has been latched: an `Acquire` load, pairing with
+  /// the `Release` store in [`PanicLatch::latch`].
+  pub(crate) fn is_latched(&self) -> bool {
+    self.latched.load(Ordering::Acquire)
   }
 
   /// The latched panic's message, or `None` when no reader has

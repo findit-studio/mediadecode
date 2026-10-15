@@ -47,6 +47,8 @@ pub mod text;
 pub mod ticket;
 #[doc(hidden)]
 pub mod view;
+#[doc(hidden)]
+pub mod writer_guard;
 
 pub use adapter::Ffmpeg;
 pub use boundary::{
