@@ -1,4 +1,8 @@
-use std::{collections::VecDeque, mem::ManuallyDrop, ptr};
+use std::{
+  collections::VecDeque,
+  mem::ManuallyDrop,
+  ptr::{self, NonNull},
+};
 
 use ffmpeg_next::{
   Codec, Packet, Rational,
@@ -164,8 +168,10 @@ struct DecoderState {
   backend: Backend,
   /// Owned reference produced by `av_hwdevice_ctx_create`.
   hw_device_ref: *mut AVBufferRef,
-  /// Owned `Box<CallbackState>` raw pointer; `AVCodecContext::opaque`
-  /// aliases it.
+  /// The installed state, owned by the raw pointer
+  /// `AVCodecContext::opaque` aliases (from
+  /// [`InstalledCallbackState::into_raw`]); freed in `Drop`, after the
+  /// context.
   callback_state: *mut CallbackState,
 }
 
@@ -803,7 +809,7 @@ impl VideoDecoder {
       inner: ManuallyDrop::new(ffmpeg_next::decoder::Video(opened)),
       backend,
       hw_device_ref: ptr::null_mut(),
-      callback_state: Box::into_raw(callback_state),
+      callback_state: callback_state.into_raw(),
     })
   }
 
@@ -1946,7 +1952,7 @@ impl VideoDecoder {
     // Use our checked allocator instead of Context::from_parameters, which
     // does not null-check avcodec_alloc_context3 and would feed a null
     // AVCodecContext into FFmpeg under OOM.
-    let (mut ctx, mut state) = build_codec_context(&parameters, limits, pkt_timebase)?;
+    let (mut ctx, state) = build_codec_context(&parameters, limits, pkt_timebase)?;
     let av_type = backend.av_hwdevice_type();
 
     // Verify the codec advertises this hwaccel **with the exact HW pix_fmt
@@ -1978,13 +1984,20 @@ impl VideoDecoder {
     }
 
     // The state `build_codec_context` already installed in `opaque`,
-    // told which format this backend wants. One allocation, one seat:
-    // the budget the judge reads and the declination the funnel reads
-    // are the same object, and `Box::into_raw` hands its ownership to
-    // the guard below without moving it — so the pointer the context
-    // holds stays the one that is freed.
-    state.set_wanted(hw_pix_fmt);
-    let callback_state = Box::into_raw(state);
+    // told which format this backend wants. It is written through the
+    // very pointer the context holds, before the open, so nothing needs
+    // installing again. One allocation serves both callbacks — the
+    // budget the judge reads and the declination the funnel reads are
+    // the same object — and `into_raw` hands its ownership to the guard
+    // below as that same pointer, so the pointer the context holds stays
+    // the one that is freed.
+    //
+    // SAFETY: `state.as_ptr()` is the live state `opaque` holds. The
+    // context has not been opened, so no callback reads the state while
+    // `set_wanted` writes it, and the `&mut` that call makes is derived
+    // from the installed pointer itself, so it does not invalidate it.
+    unsafe { (*state.as_ptr()).set_wanted(hw_pix_fmt) };
+    let callback_state = state.into_raw();
     // RAII guard: from now until the end-of-function `into_owned()`, every
     // early return — `av_buffer_ref` failure, `open_as` failure, codec_type
     // mismatch, or any future error path added between here and the
@@ -2012,16 +2025,16 @@ impl VideoDecoder {
       }));
     }
     // SAFETY: device_ref_for_ctx is a valid AVBufferRef* from av_buffer_ref;
-    // ctx is freshly built and owned by us. After this point ctx aliases
-    // `callback_state` via `opaque` (FFmpeg never frees opaque, so
-    // `callback_state` ownership stays with us / the guard) and aliases
-    // `device_ref_for_ctx` (the second ref) via `hw_device_ctx` (FFmpeg
-    // unrefs that on codec context drop, independent of the guard's first
-    // ref).
+    // ctx is freshly built, not yet opened, and owned by us. It has
+    // aliased `callback_state` through `opaque` since `build_codec_context`
+    // installed it (FFmpeg never frees opaque, so ownership stays with the
+    // guard), and from here it also aliases `device_ref_for_ctx` (the
+    // second ref) via `hw_device_ctx` (FFmpeg unrefs that on codec context
+    // drop, independent of the guard's first ref). `get_hw_format` reads
+    // the same state, so it is installed before the open as well.
     unsafe {
       let raw = ctx.as_mut_ptr();
       (*raw).hw_device_ctx = device_ref_for_ctx;
-      (*raw).opaque = callback_state.cast();
       (*raw).get_format = Some(get_hw_format);
     }
 
@@ -2040,8 +2053,8 @@ impl VideoDecoder {
     // the reason has to be collected here or not at all.
     let opened = match ctx.decoder().open_as(codec) {
       Ok(opened) => opened,
-      // SAFETY: `callback_state` is the guard's live box, freed only when
-      // the guard drops on this return, after the read.
+      // SAFETY: `callback_state` is the guard's live state, freed only
+      // when the guard drops on this return, after the read.
       Err(e) => {
         return Err(unsafe { ceiling_declination_of(callback_state) }.unwrap_or(Error::Ffmpeg(e)));
       }
@@ -2055,7 +2068,7 @@ impl VideoDecoder {
       // Same exit, same collection: a declined format can leave the
       // context looking like the wrong medium.
       //
-      // SAFETY: as above — the guard's live box, read before it drops.
+      // SAFETY: as above — the guard's live state, read before it drops.
       return Err(unsafe { ceiling_declination_of(callback_state) }.unwrap_or(e));
     }
     // SAFETY of construction: `decoder::Video` is `pub struct Video(pub Opened)`.
@@ -2077,16 +2090,25 @@ impl VideoDecoder {
 
 /// RAII guard for the partially-owned FFmpeg state that
 /// [`VideoDecoder::build_state`] holds between the
-/// `av_hwdevice_ctx_create` and `Box::into_raw(CallbackState)`
-/// allocations and the final `DecoderState` construction.
+/// `av_hwdevice_ctx_create` allocation, the callback state's hand-off
+/// ([`InstalledCallbackState::into_raw`]) and the final `DecoderState`
+/// construction.
 ///
 /// If `build_state` returns `Err` for any reason in that window
 /// (`av_buffer_ref` ENOMEM, `open_as` failure, codec_type mismatch, or
 /// any future error path), this guard's `Drop` releases
 /// `hw_device_ref` — the first ref returned by `av_hwdevice_ctx_create`,
 /// distinct from the second ref FFmpeg unrefs when the codec context
-/// drops — and the boxed `CallbackState`, which FFmpeg never touches
-/// because `AVCodecContext::opaque` is purely user-owned.
+/// drops — and the `CallbackState`, which FFmpeg never frees because
+/// `AVCodecContext::opaque` is purely user-owned.
+///
+/// The state is freed after the context on every return past the open:
+/// `open_as` frees the context itself when it fails, and `opened` is
+/// declared after the guard, so it drops first. The `av_buffer_ref`
+/// return comes before the open, and there the guard frees the state
+/// while the context, never opened, still waits to be freed — the
+/// door's never-opened exception (see
+/// [`install_allocator_judge`](crate::ffi::install_allocator_judge)).
 ///
 /// Successful construction calls [`Self::into_owned`] to disarm the
 /// guard and hand both pointers to the new `DecoderState`.
@@ -2108,7 +2130,8 @@ impl PartialBuildState {
 impl Drop for PartialBuildState {
   fn drop(&mut self) {
     // SAFETY: pointers are either freshly allocated by `build_state` (via
-    // `av_hwdevice_ctx_create` and `Box::into_raw`) or null after
+    // `av_hwdevice_ctx_create`, and `InstalledCallbackState::into_raw`,
+    // whose pointer is a `Box::into_raw`'s) or null after
     // `into_owned`. Both `av_buffer_unref` and `Box::from_raw` need the
     // null check we apply here; both are otherwise sound on resources we
     // own.
@@ -2643,6 +2666,81 @@ fn alloc_av_frame() -> std::result::Result<frame::Video, ffmpeg_next::Error> {
   Ok(inner)
 }
 
+/// The [`CallbackState`] a codec context's callbacks read, owned through
+/// the very pointer the context holds.
+///
+/// [`build_codec_context`] makes it with `Box::into_raw` and hands that
+/// pointer to the one door, [`crate::ffi::install_allocator_judge`];
+/// from then on the state is reached only through it — by libavcodec's
+/// callbacks, and by the decoder's own reads through [`Self::as_ptr`].
+/// A `Box` cannot hold it: a box asserts uniqueness over what it holds,
+/// so moving one with its decoder would invalidate the pointer the
+/// context keeps. This owner moves freely and frees the state when
+/// dropped, which must come after the codec context is freed: a decoder
+/// that keeps the owner declares it after its context, so field order
+/// drops it second, and `DecoderState` takes the raw pointer instead
+/// ([`Self::into_raw`]) and frees it after the context itself.
+pub(crate) struct InstalledCallbackState(NonNull<CallbackState>);
+
+// The `Send` below rests on `CallbackState: Send + Sync`; this stops
+// compiling the day that stops being true.
+const _: fn() = || {
+  fn send_and_sync<T: Send + Sync>() {}
+  send_and_sync::<CallbackState>();
+};
+
+// SAFETY: as for `Box<CallbackState>`, which is `Send` because
+// `CallbackState` is: this is the unique owner of a heap `CallbackState`,
+// and nothing else frees it. Sending the owner sends the decoder that
+// holds it, together with the codec context whose callbacks reach the
+// state through their own copy of the pointer; they run on whichever
+// thread drives that context. Decoding is single-threaded today —
+// nothing in this crate sets `thread_count` or `thread_type`, FFmpeg's
+// default is one thread, and a file is decoded on one thread — so the
+// callbacks run on the decoding thread. Were threads enabled later, the
+// state would be reached from several at once, which `CallbackState:
+// Sync` covers: every field the callbacks write is an atomic, and the
+// plain ones are written only before the context is opened. No `Sync`:
+// the decoders holding this are not `Sync`, and nothing reaches the state
+// through a shared reference to the owner.
+unsafe impl Send for InstalledCallbackState {}
+
+impl InstalledCallbackState {
+  /// Moves `state` to the heap and takes ownership of it by raw pointer.
+  fn new(state: CallbackState) -> Self {
+    let raw = Box::into_raw(Box::new(state));
+    // SAFETY: `Box::into_raw` returns the box's own pointer, which is
+    // aligned and non-null.
+    Self(unsafe { NonNull::new_unchecked(raw) })
+  }
+
+  /// The pointer the codec context holds — the one every access to the
+  /// state goes through.
+  pub(crate) fn as_ptr(&self) -> *mut CallbackState {
+    self.0.as_ptr()
+  }
+
+  /// Gives up ownership without freeing: the caller frees the state with
+  /// `Box::from_raw`, after the codec context — as `DecoderState`'s
+  /// `Drop` and the hardware build's guard do.
+  pub(crate) fn into_raw(self) -> *mut CallbackState {
+    let raw = self.0.as_ptr();
+    core::mem::forget(self);
+    raw
+  }
+}
+
+impl Drop for InstalledCallbackState {
+  fn drop(&mut self) {
+    // SAFETY: the pointer came from `Box::into_raw` in `new`, and this is
+    // its only free (`into_raw` forgets the owner instead of dropping
+    // it). The owner is dropped after the codec context is freed, or
+    // before a context that was never opened, which makes no callback —
+    // either way nothing reaches the state again.
+    drop(unsafe { Box::from_raw(self.0.as_ptr()) });
+  }
+}
+
 /// Build a fresh `Context` from `parameters`, checking the underlying
 /// `avcodec_alloc_context3` for NULL before passing it to
 /// `avcodec_parameters_to_context`. ffmpeg-next's `Context::from_parameters`
@@ -2653,7 +2751,7 @@ pub(crate) fn build_codec_context(
   parameters: &codec::Parameters,
   limits: crate::limits::DecoderLimits,
   pkt_timebase: Option<mediadecode::Timebase>,
-) -> Result<(Context, Box<CallbackState>)> {
+) -> Result<(Context, InstalledCallbackState)> {
   ensure_parameters_non_null(parameters)?;
   // **The choke point.** `avcodec_parameters_to_context` below is a
   // wholesale copy *into* FFmpeg — it duplicates `extradata`, every
@@ -2785,13 +2883,7 @@ pub(crate) fn build_codec_context(
   //
   // See `judge_buffer` for why this hook rather than `get_format`
   // (measured: `get_format` never fires for a one-shot `png` decode).
-  //
-  // SAFETY: `ctx_ptr` is the non-null context; `get_buffer2` is a
-  // public function-pointer field, and `judge_buffer` delegates every
-  // frame it accepts to the allocator libavcodec would have used.
-  unsafe {
-    (*ctx_ptr).get_buffer2 = Some(crate::ffi::judge_buffer);
-  }
+  // It is installed below, together with the state it reads.
 
   // **The packet timebase, for every decoder opened against a stream.**
   //
@@ -2844,15 +2936,37 @@ pub(crate) fn build_codec_context(
   // every road gets one: this is the single point every decoder in the
   // crate is built through.
   //
-  // Ownership stays with the caller, which keeps the box alive for as
-  // long as the context. `Box` contents do not move when the box does,
-  // so the pointer installed here stays valid across the return.
-  let mut state = Box::new(CallbackState::new(limits.frame().max_frame_bytes() as u64));
-  // SAFETY: `ctx_ptr` is the non-null context; `opaque` is a public
-  // field FFmpeg never reads or frees.
-  unsafe {
-    (*ctx_ptr).opaque = (&raw mut *state).cast();
-  }
+  // Ownership goes back to the caller, by raw pointer — see
+  // [`InstalledCallbackState`] for why not by box.
+  let state =
+    InstalledCallbackState::new(CallbackState::new(limits.frame().max_frame_bytes() as u64));
+  // SAFETY: the door's contract, clause by clause.
+  //
+  // * `ctx_ptr` is the live context allocated above, and it has not been
+  //   opened.
+  // * `state.as_ptr()` comes from `Box::into_raw`, so no box holds the
+  //   state, and from here on it is reached only through that pointer —
+  //   by libavcodec's callbacks and by the decoder's own reads through
+  //   `InstalledCallbackState::as_ptr` — so nothing invalidates it. The
+  //   owner goes back to the caller, which frees it
+  //   after the context: the audio, image, subtitle and video decoders
+  //   declare it after their context; `DecoderState` holds it by raw
+  //   pointer and its `Drop` frees the context first; and the hardware
+  //   build's guard is dropped after the opened decoder.
+  // * The never-opened exception: a caller's return between this call
+  //   and the open (a missing decoder, an unsupported hardware backend, a
+  //   device that fails to initialise or whose reference cannot be taken)
+  //   may drop the owner before the context, which is then only freed.
+  // * Its plain fields are written only before the open — the hardware
+  //   build's `set_wanted`, through this same pointer — and no
+  //   `&mut CallbackState` is held after it. Decoding is single-threaded
+  //   today (nothing in this crate sets `thread_count` or `thread_type`,
+  //   FFmpeg's default is one thread, and a file is decoded on one
+  //   thread), so the callbacks run on the decoding thread; were threads
+  //   enabled, `CallbackState: Sync` covers the state being reached from
+  //   several.
+  // * Nothing else uses `opaque`.
+  unsafe { crate::ffi::install_allocator_judge(ctx_ptr, state.as_ptr()) };
 
   // SAFETY: ctx_ptr is valid; passing `owner: None` means our wrapper owns
   // the allocation and `Context::drop` will run `avcodec_free_context`.

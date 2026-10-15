@@ -219,8 +219,9 @@ pub(crate) fn pix_fmt_name_static(raw: i32) -> Option<&'static str> {
 /// State pointed to by `AVCodecContext::opaque` so the `get_format`
 /// callback can pick the correct hardware pixel format without globals,
 /// and the allocator judge ([`judge_buffer`]) can read its byte budget
-/// and leave its refusals. One instance per decoder; a decoder frees it
-/// only after the codec context that points at it is dropped.
+/// and leave its refusals. One instance per decoder, installed by
+/// [`install_allocator_judge`]: the decoder owns it through the pointer
+/// the context holds, and frees it only after that context is freed.
 ///
 /// Its fields are this crate's: a decoder builds one with
 /// [`CallbackState::new`], names the hardware format it wants with
@@ -436,7 +437,8 @@ pub unsafe fn declare_frame_budget_declined_for_test(state: *mut CallbackState, 
 ///
 /// This is libavcodec's to call, installed as a context's `get_format`.
 /// `ctx` must be a live `AVCodecContext` whose `opaque` is null or the
-/// [`CallbackState`] this crate installed there, live for the call, and
+/// [`CallbackState`] [`install_allocator_judge`] installed there, live
+/// for the call, and
 /// `pix_fmts` must point at a list terminated by `AV_PIX_FMT_NONE` —
 /// what libavcodec passes. A caller other than libavcodec owes the
 /// same.
@@ -447,10 +449,10 @@ pub unsafe extern "C" fn get_hw_format(
   debug_assert!(!ctx.is_null());
   debug_assert!(!pix_fmts.is_null());
 
-  // SAFETY: opaque was set by `try_open` to a valid `Box<CallbackState>`
-  // pointer that outlives the codec context (we only free it after the
-  // codec context's drop runs). When opaque is null we treat the call as
-  // strict — a stray invocation cannot silently downgrade.
+  // SAFETY: opaque is null or the `CallbackState` `install_allocator_judge`
+  // installed, which its owner frees only after the codec context (the
+  // contract above). When opaque is null we treat the call as strict — a
+  // stray invocation cannot silently downgrade.
   let state = unsafe { (*ctx).opaque as *const CallbackState };
   let (wanted, wanted_int) = if state.is_null() {
     (
@@ -872,15 +874,15 @@ pub mod c_shims {
 /// libavcodec hands back comes through it, and it sees the frame's
 /// *real* format rather than a negotiated candidate.
 ///
-/// # No state, so no lifetime to prove
+/// # Its state
 ///
-/// The composed-`opaque` design was not needed. This callback reads the
-/// ceiling from `AVCodecContext.max_pixels` — the field this crate set
-/// itself, one number, already carrying the byte ceiling converted at
-/// the worst per-pixel rate — and applies it to the aligned dimensions.
-/// Same scalar, same meaning, applied where alignment is knowable.
-/// `opaque` is untouched, so the hardware path keeps it and there is no
-/// allocation whose lifetime has to outlive a C callback.
+/// The byte budget is not recoverable from any field of the context, so
+/// the callback reads it from the [`CallbackState`] behind `opaque` —
+/// the caller's own `max_frame_bytes`, verbatim — and records a refusal
+/// there for the decoder to name. The callback and its state are
+/// installed together, by [`install_allocator_judge`], and only there:
+/// the callback is this crate's, so no context can carry it without the
+/// state it reads.
 ///
 /// Panic discipline is likewise structural rather than asserted: the
 /// body allocates nothing, indexes nothing, unwraps nothing, and calls
@@ -890,11 +892,18 @@ pub mod c_shims {
 ///
 /// # Safety
 ///
-/// Called by libavcodec with a live context and a frame whose `format`,
-/// `width` and `height` are set. Delegates every accepted frame to
-/// `avcodec_default_get_buffer2`, which is what libavcodec would have
-/// called had this hook not been installed.
-pub unsafe extern "C" fn judge_buffer(
+/// This is libavcodec's to call, as a context's `get_buffer2`, once
+/// [`install_allocator_judge`] has installed it:
+///
+/// * `ctx` must be a live `AVCodecContext`, and its `opaque` must be null
+///   or point at a live, aligned [`CallbackState`] for the whole call —
+///   the state installed with the callback;
+/// * `frame` must be a live `AVFrame` carrying what libavcodec sets
+///   before it asks for buffers: `format`, and `width` and `height` for a
+///   picture or `nb_samples` and `ch_layout` for audio — which is also
+///   what `avcodec_default_get_buffer2`, to which every accepted frame is
+///   delegated, requires.
+pub(crate) unsafe extern "C" fn judge_buffer(
   ctx: *mut ffmpeg_next::ffi::AVCodecContext,
   frame: *mut ffmpeg_next::ffi::AVFrame,
   flags: libc::c_int,
@@ -971,9 +980,10 @@ pub unsafe extern "C" fn judge_buffer(
     // the first one went wrong. Both media read the field now.
     //
     // SAFETY: `opaque` holds the `CallbackState` that
-    // `build_codec_context` installed and whose owner outlives the
-    // context. A null one means a context this crate did not build, and
-    // is refused rather than assumed generous.
+    // `install_allocator_judge` installed with this callback, and whose
+    // owner keeps it live for as long as the context can call back (the
+    // contract above). A null one means a context the door did not
+    // equip, and is refused rather than assumed generous.
     let state = unsafe { (*ctx).opaque } as *const CallbackState;
     if state.is_null() {
       return -(libc::EINVAL);
@@ -1052,6 +1062,63 @@ pub unsafe extern "C" fn judge_buffer(
 
   // SAFETY: delegating to the allocator libavcodec would have used.
   unsafe { ffmpeg_next::ffi::avcodec_default_get_buffer2(ctx, frame, flags) }
+}
+
+/// Installs the allocator judge on a codec context: the context's
+/// `get_buffer2` becomes the judge, and its `opaque` the
+/// [`CallbackState`] the judge reads its byte budget from and records
+/// its refusals in — the same state the `get_format` callback,
+/// [`get_hw_format`], reads the wanted hardware format from.
+///
+/// This is the one way to install the judge. The two fields are written
+/// together because the judge cannot run without the state, and a
+/// context the door did not equip carries none.
+///
+/// # Safety
+///
+/// * `ctx` must point at a live `AVCodecContext` the caller owns that has
+///   not been opened. No callback runs on a context before
+///   `avcodec_open2`, so none is running while the two fields are
+///   written.
+/// * `state` must point at a live, aligned [`CallbackState`] and stay
+///   valid for the callbacks' accesses — reads of its plain fields,
+///   atomic reads and writes of the rest — **until the context has been
+///   freed**, the free included. That is one address kept live, and it
+///   is also provenance kept intact: nothing may invalidate `state` in
+///   that span. A `Box` asserts uniqueness over what it holds, so a box
+///   the state was taken from must not be moved, written through or
+///   borrowed as `&mut` after this call — each of the three invalidates
+///   `state` — and no `&mut CallbackState` may be made from any other
+///   pointer. Owning the state through the pointer `Box::into_raw`
+///   returns, and freeing it with `Box::from_raw` once the context is
+///   freed, satisfies this.
+/// * **The never-opened exception.** A context that is freed without
+///   `avcodec_open2` ever having been called on it makes no callback at
+///   all, so on that road, and only there, the state may be freed first
+///   — provided nothing but the context's free follows. A caller's
+///   returns between this call and the open take this road.
+/// * From the context's opening until it has been freed, libavcodec may
+///   call back at any time: within the caller's own libavcodec calls,
+///   and — should the decoder run threads — from its own threads, which
+///   FFmpeg documents for both callbacks. The callbacks read the plain
+///   fields and record through the atomic ones, so in that span nothing
+///   may write a plain field or hold a `&mut CallbackState`. Before the
+///   opening the caller may still write the state through `state`
+///   itself — [`CallbackState::set_wanted`] called through this pointer
+///   does not invalidate it.
+/// * From this call on, `opaque` is the judge's: nothing may read it as
+///   anything but this state, and nothing but this door may replace it.
+pub unsafe fn install_allocator_judge(
+  ctx: *mut ffmpeg_next::ffi::AVCodecContext,
+  state: *mut CallbackState,
+) {
+  // SAFETY: `ctx` is live and not yet opened per the contract, so no
+  // callback reads either field while they are written; both are plain
+  // fields of it.
+  unsafe {
+    (*ctx).opaque = state.cast();
+    (*ctx).get_buffer2 = Some(judge_buffer);
+  }
 }
 
 #[cfg(test)]
@@ -1326,29 +1393,20 @@ mod tests {
           (*ctx).height = self.height.max(1);
           (*ctx).pix_fmt = core::mem::transmute::<i32, ffi::AVPixelFormat>(self.format_raw);
         }
+        // The judge reads its budget from the callback state, and a
+        // context the door did not equip has none and is refused — so the
+        // harness installs both through the door before the open, as the
+        // read adapter's `build_codec_context` does. The box is not
+        // touched again until the context is freed.
+        let mut state = Box::new(CallbackState::new(self.max_frame_bytes));
+        install_allocator_judge(ctx, &raw mut *state);
         assert_eq!(
           ffi::avcodec_open2(ctx, codec, core::ptr::null_mut()),
           0,
           "the harness codec must open",
         );
-        // Set after the open, so nothing resets them — including the
-        // callback state, which is where the judge reads its budget
-        // from. A context this crate did not build has none and is
-        // refused, so the harness installs one exactly as
-        // `build_codec_context` does.
+        // Set after the open, so nothing resets it.
         (*ctx).max_pixels = self.max_pixels;
-        let mut state = Box::new(CallbackState {
-          wanted: ffi::AVPixelFormat::AV_PIX_FMT_NONE,
-          wanted_int: ffi::AVPixelFormat::AV_PIX_FMT_NONE as i32,
-          ceiling_declined: core::sync::atomic::AtomicBool::new(false),
-          declined_pixels: core::sync::atomic::AtomicI64::new(0),
-          declined_limit: core::sync::atomic::AtomicI64::new(0),
-          max_frame_bytes: self.max_frame_bytes,
-          frame_budget_declined: core::sync::atomic::AtomicBool::new(false),
-          declined_frame_bytes: core::sync::atomic::AtomicU64::new(0),
-          declined_frame_audio: core::sync::atomic::AtomicBool::new(false),
-        });
-        (*ctx).opaque = (&raw mut *state).cast();
 
         let frame = ffi::av_frame_alloc();
         assert!(!frame.is_null());
@@ -1363,12 +1421,42 @@ mod tests {
           );
         }
 
-        let rc = judge_buffer(ctx, frame, 0);
-        drop(state);
+        // Through the pointer the door installed, as libavcodec calls it.
+        let get_buffer2 = (*ctx).get_buffer2.expect("the door installs the judge");
+        let rc = get_buffer2(ctx, frame, 0);
+        // The state outlives the context, as the door requires.
         ffi::av_frame_free(&mut (frame as *mut _));
         ffi::avcodec_free_context(&mut (ctx as *mut _));
+        drop(state);
         if rc < 0 { Err(rc) } else { Ok(()) }
       }
+    }
+  }
+
+  /// **The door installs the judge and its state together.** Afterwards
+  /// the context's `get_buffer2` is the judge and its `opaque` the state
+  /// — the only pairing the judge can run on.
+  #[test]
+  fn the_door_installs_the_judge_with_its_state() {
+    // SAFETY: a bare context is allocated, given the judge and its
+    // state, read and freed; nothing decodes on it, and the state
+    // outlives it.
+    unsafe {
+      let mut ctx = ffmpeg_next::ffi::avcodec_alloc_context3(core::ptr::null());
+      assert!(!ctx.is_null());
+      let mut state = Box::new(CallbackState::new(1 << 20));
+      let state_ptr = &raw mut *state;
+      install_allocator_judge(ctx, state_ptr);
+      assert_eq!((*ctx).opaque, state_ptr.cast::<core::ffi::c_void>());
+      assert_eq!(
+        (*ctx)
+          .get_buffer2
+          .map(|callback| callback as *const () as usize),
+        Some(judge_buffer as *const () as usize),
+        "the door installs the judge itself",
+      );
+      ffmpeg_next::ffi::avcodec_free_context(&mut ctx);
+      drop(state);
     }
   }
 

@@ -398,8 +398,10 @@ enum DecodeState {
 pub(crate) struct SwDecoder {
   decoder: ffmpeg_next::decoder::Video,
   /// Declared **after** the decoder: fields drop in declaration order,
-  /// so the codec context is freed before the state it points at.
-  _callback_state: Box<crate::ffi::CallbackState>,
+  /// so the codec context is freed before the state it points at, which
+  /// this owns through the context's own pointer — see
+  /// [`InstalledCallbackState`](crate::decoder::InstalledCallbackState).
+  _callback_state: crate::decoder::InstalledCallbackState,
 }
 
 impl SwDecoder {
@@ -417,7 +419,7 @@ impl SwDecoder {
   /// had no way out on the whole software road — including the replay
   /// helper, which drops the state when it finishes.
   pub(crate) fn state(&self) -> *const crate::ffi::CallbackState {
-    &*self._callback_state
+    self._callback_state.as_ptr()
   }
 }
 

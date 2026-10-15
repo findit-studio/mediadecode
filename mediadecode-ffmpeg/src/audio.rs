@@ -36,13 +36,14 @@ pub struct CarrierAudioStreamDecoder<C: crate::FfmpegCarrier> {
   scratch: frame::Audio,
   time_base: Timebase,
   limits: DecoderLimits,
-  /// Keeps the [`CallbackState`](crate::ffi::CallbackState) alive for as
-  /// long as the codec context that points at it.
+  /// Owns the [`CallbackState`](crate::ffi::CallbackState) the codec
+  /// context points at, through that same pointer — see
+  /// [`InstalledCallbackState`](crate::decoder::InstalledCallbackState).
   ///
   /// Declared **after** the decoder on purpose: struct fields drop in
   /// declaration order, so the `AVCodecContext` is freed first and the
   /// state it references outlives it.
-  _callback_state: Box<crate::ffi::CallbackState>,
+  _callback_state: crate::decoder::InstalledCallbackState,
   /// The lane this decoder captures into. A marker: the carrier
   /// appears in the frames it produces, not in its own state.
   /// `true` when [`Self::scratch`] holds a decoded frame whose
@@ -170,7 +171,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierAudioStreamDecoder<C> {
     // Scoped submission: the rebuilt `AVPacket` lives only inside this
     // call, which is what lets the view lane hand libavcodec its own
     // buffer instead of a copy. See `boundary::with_ffmpeg_audio_packet`.
-    let state: *const crate::ffi::CallbackState = &*self._callback_state;
+    let state: *const crate::ffi::CallbackState = self._callback_state.as_ptr();
     let phase = self.phase();
     let decoder = &mut self.decoder;
     // Funnel, then gate — the same two steps the receive road takes. A
@@ -179,8 +180,8 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierAudioStreamDecoder<C> {
     // funnel is read for back pressure.
     let submit = |av_pkt: &ffmpeg_next::Packet| match decoder.send_packet(av_pkt) {
       Ok(()) => Ok(Sent::Accepted),
-      // SAFETY: `state` points into `self._callback_state`, the box this
-      // decoder keeps for as long as its codec context.
+      // SAFETY: `state` is the pointer the codec context holds, owned by
+      // `self._callback_state` until after the context is freed.
       Err(e) => {
         unsafe { crate::decoder::software_send(state, e, phase) }.map_err(AudioDecodeError::Decode)
       }
@@ -206,7 +207,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierAudioStreamDecoder<C> {
     &mut self,
     dst: &mut AudioFrame<SampleFormat, ChannelLayoutDescription, AudioFrameExtra, C::Buffer>,
   ) -> Result<Received, AudioDecodeError> {
-    let state: *const crate::ffi::CallbackState = &*self._callback_state;
+    let state: *const crate::ffi::CallbackState = self._callback_state.as_ptr();
     let phase = self.phase();
     // A frame whose conversion did not commit is converted again before
     // another is asked for — see [`Self::scratch_pending`].
@@ -217,8 +218,8 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierAudioStreamDecoder<C> {
       // the protocol talking, so they leave through the `Ok` arm and
       // the errno never reaches the caller.
       if let Err(e) = self.decoder.receive_frame(&mut self.scratch) {
-        // SAFETY: `state` points into `self._callback_state`, the box this
-        // decoder keeps for as long as its codec context.
+        // SAFETY: `state` is the pointer the codec context holds, owned by
+        // `self._callback_state` until after the context is freed.
         return unsafe { crate::decoder::software_receive(state, e, phase) }
           .map_err(AudioDecodeError::Decode);
       }
@@ -254,15 +255,15 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierAudioStreamDecoder<C> {
   }
 
   pub(crate) fn send_eof_impl(&mut self) -> Result<Sent, AudioDecodeError> {
-    let state: *const crate::ffi::CallbackState = &*self._callback_state;
+    let state: *const crate::ffi::CallbackState = self._callback_state.as_ptr();
     let phase = self.phase();
     match self.decoder.send_eof() {
       Ok(()) => {
         self.eof = true;
         Ok(Sent::Accepted)
       }
-      // SAFETY: `state` points into `self._callback_state`, the box this
-      // decoder keeps for as long as its codec context.
+      // SAFETY: `state` is the pointer the codec context holds, owned by
+      // `self._callback_state` until after the context is freed.
       Err(e) => {
         unsafe { crate::decoder::software_send(state, e, phase) }.map_err(AudioDecodeError::Decode)
       }

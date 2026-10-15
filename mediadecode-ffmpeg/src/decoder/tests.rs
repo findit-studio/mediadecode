@@ -2154,6 +2154,36 @@ fn the_packet_timebase_reaches_the_codec_context() {
   assert_eq!(read_back(Some(unset)), (0, 1));
 }
 
+/// **A context this crate builds decodes on one thread.** Nothing here
+/// sets `thread_count` or `thread_type`, and FFmpeg's own default is one
+/// thread, so the allocator judge and the `get_format` callback run on
+/// the decoding thread. The state they share is `Sync` regardless; this
+/// pins the fact [`InstalledCallbackState`]'s safety note states, not a
+/// premise the callbacks' contract rests on.
+#[test]
+fn a_context_this_crate_builds_decodes_on_one_thread() {
+  ffmpeg_next::init().expect("ffmpeg init");
+
+  let mut parameters = ffmpeg_next::codec::Parameters::new();
+  // SAFETY: `parameters` owns a live, zeroed `AVCodecParameters`; both
+  // fields written are plain scalars.
+  unsafe {
+    let raw = parameters.as_mut_ptr();
+    (*raw).codec_type = ffmpeg_next::ffi::AVMediaType::AVMEDIA_TYPE_VIDEO;
+    (*raw).codec_id = ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_H264;
+  }
+  let (ctx, state) =
+    build_codec_context(&parameters, crate::limits::DecoderLimits::default(), None)
+      .expect("a context is allocated");
+  // SAFETY: `ctx` owns a live `AVCodecContext` for this borrow, and
+  // `thread_count` is a plain integer field.
+  let threads = unsafe { (*ctx.as_ptr()).thread_count };
+  assert_eq!(threads, 1, "one decoding thread, FFmpeg's default");
+  // The context first, then the state it points at.
+  drop(ctx);
+  drop(state);
+}
+
 /// The public standalone decoder can declare a packet timebase.
 ///
 /// Before this, only crate-private constructors could — a direct

@@ -85,13 +85,14 @@ pub struct CarrierImageDecoder<C: crate::FfmpegCarrier> {
   decoder: ffmpeg_next::decoder::Video,
   scratch: frame::Video,
   limits: DecoderLimits,
-  /// Keeps the [`CallbackState`](crate::ffi::CallbackState) alive for as
-  /// long as the codec context that points at it.
+  /// Owns the [`CallbackState`](crate::ffi::CallbackState) the codec
+  /// context points at, through that same pointer — see
+  /// [`InstalledCallbackState`](crate::decoder::InstalledCallbackState).
   ///
   /// Declared **after** the decoder on purpose: struct fields drop in
   /// declaration order, so the `AVCodecContext` is freed first and the
   /// state it references outlives it.
-  _callback_state: Box<crate::ffi::CallbackState>,
+  _callback_state: crate::decoder::InstalledCallbackState,
   /// The lane this decoder captures into. A marker: the carrier
   /// appears in the frames it produces, not in its own state.
   _carrier: core::marker::PhantomData<C>,
@@ -252,9 +253,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierImageDecoder<C> {
     unsafe { boundary::write_md_flags(&mut av_pkt, packet.flags()) };
     // Through the software funnel: a frame the allocator judge refused
     // surfaces named, not as the `EINVAL` a corrupt file also produces.
-    let state: *const crate::ffi::CallbackState = &*self._callback_state;
-    // SAFETY: `state` points into `self._callback_state`, the box this
-    // decoder keeps for as long as its codec context.
+    let state: *const crate::ffi::CallbackState = self._callback_state.as_ptr();
+    // SAFETY: `state` is the pointer the codec context holds, owned by
+    // `self._callback_state` until after the context is freed.
     self
       .decoder
       .send_packet(&av_pkt)
