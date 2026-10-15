@@ -121,6 +121,10 @@ The family — `mediadecode`, `mediadecode-ffmpeg`, `mediadecode-webcodecs`,
   ffmpeg-next drops a returned error inside its `extern "C"` callback,
   where a payload whose `Drop` panics aborted the process. That panic is
   now latched and named like any other.
+- `Output::into_sink` hands the sink back only when every byte reached
+  it: a write the sink failed, which the I/O context keeps and writes
+  nothing after, is read there after the last flush and reported
+  (`OutputError::SinkWrite`), whatever the sink's own flush answers.
 - `CodecId::mime_type` — the descriptor's first MIME type — and the
   `PNG`, `BMP`, `TTF`, `OTF` and `TEXT` ids.
 - A `test-support` feature (off by default): the fault-subprocess

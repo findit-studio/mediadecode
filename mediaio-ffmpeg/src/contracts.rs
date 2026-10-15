@@ -289,7 +289,10 @@
 //!   to its OS code or kind inside the guard's `catch_unwind`, its
 //!   payload dropped there, because ffmpeg-next drops a returned error
 //!   inside the callback. A sink that panicked, or whose error's payload
-//!   did, is latched, and never called again.
+//!   did, is latched, and never called again; and a write it failed is
+//!   read from the I/O context's `error` when the sink is handed back,
+//!   after the last flush, so a sink missing bytes is reported, never
+//!   returned as a whole one.
 //!
 //! # `AVOutputFormat`
 //!

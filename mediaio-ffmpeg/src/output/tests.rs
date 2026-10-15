@@ -550,3 +550,50 @@ fn a_sink_error_whose_payload_panics_on_drop_is_named_without_an_abort() {
     },
   );
 }
+
+/// A sink whose writes fail as a full disk fails them, and whose flush
+/// succeeds; it seeks as a buffer does.
+#[derive(Debug, Default)]
+struct Full {
+  seekable: Cursor<Vec<u8>>,
+}
+
+impl Write for Full {
+  fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+    Err(io::Error::from_raw_os_error(libc::ENOSPC))
+  }
+  fn flush(&mut self) -> io::Result<()> {
+    Ok(())
+  }
+}
+
+impl Seek for Full {
+  fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+    self.seekable.seek(pos)
+  }
+}
+
+/// **A write the sink failed is reported when the sink is handed back,
+/// though its own flush succeeds.** The header's bytes reach the sink in
+/// a write that fails as a full disk fails it; the I/O context keeps that
+/// error and writes nothing after it, and `into_sink` reports it rather
+/// than hand back a sink missing the header — whatever libavformat's
+/// header call answered.
+#[test]
+fn a_failed_write_is_reported_when_the_sink_is_handed_back() {
+  ffmpeg_next::init().expect("ffmpeg init");
+  let ticket = subrip();
+  let mut output = Output::open(Full::default(), "matroska").expect("open");
+  output
+    .add_stream(&StreamSpec::new(&ticket, millis()))
+    .expect("a stream");
+  drop(output.write_header());
+  match output.into_sink() {
+    Err(OutputError::SinkWrite(error)) => assert_eq!(
+      error,
+      ffmpeg_next::Error::from(ffmpeg_next::ffi::AVERROR(libc::ENOSPC)),
+      "the failed write's own error",
+    ),
+    other => panic!("expected the failed write reported, got {other:?}"),
+  }
+}

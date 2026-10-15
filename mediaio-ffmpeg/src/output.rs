@@ -31,6 +31,11 @@
 //! this context reports is checked against the latch first, so a panic is
 //! named as one ([`OutputError::SinkPanic`]) rather than as the error C
 //! folded it into. A panicked sink is never called again.
+//!
+//! A write the sink fails is kept by the I/O context, which writes
+//! nothing after it; [`Output::into_sink`] reads it there and reports it
+//! ([`OutputError::SinkWrite`]), so a sink missing bytes is never handed
+//! back as a whole one.
 
 use core::{
   ffi::{c_int, c_uint, c_void},
@@ -53,7 +58,7 @@ use ffmpeg_next::{
     AVRational, AVStream, av_dict_free, av_dict_set, av_dynarray_add_nofree, av_free, av_freep,
     av_guess_format, av_interleaved_write_frame, av_mallocz, av_write_trailer,
     avcodec_parameters_copy, avformat_alloc_output_context2, avformat_free_context,
-    avformat_new_stream, avformat_write_header,
+    avformat_new_stream, avformat_write_header, avio_flush,
   },
   format::context::StreamIo,
   packet::Mut,
@@ -209,6 +214,12 @@ pub enum OutputError {
   /// The caller's sink failed its final flush.
   #[error("the sink failed its final flush: {0}")]
   Sink(#[source] io::Error),
+  /// A write into the caller's sink failed, so bytes meant for it are
+  /// not in it — whatever its own flush says. The I/O context keeps the
+  /// first failed write's error (`AVIOContext.error`) and writes nothing
+  /// after it; [`Output::into_sink`] reads it there after its last flush.
+  #[error("a write into the sink failed, so bytes meant for it are missing: {0}")]
+  SinkWrite(#[source] ffmpeg_next::Error),
   /// libavformat's own error.
   #[error(transparent)]
   Ffmpeg(#[from] ffmpeg_next::Error),
@@ -842,13 +853,19 @@ impl<W: Write + Seek + Send + 'static> Output<W> {
     Ok(())
   }
 
-  /// Frees the context and hands the sink back, flushed.
+  /// Frees the context and hands the sink back, flushed — and only when
+  /// every byte libavformat wrote reached it.
   ///
   /// The bytes still buffered in the I/O context are written through
-  /// the guard first, then the sink's own `flush` runs and its error is
-  /// reported ([`OutputError::Sink`]) — or the panic it raised, at any
-  /// point ([`OutputError::SinkPanic`]). A sink that panicked is not
-  /// called again; whatever state it is in, the error says so.
+  /// the guard first. A write into the sink that failed — then or at any
+  /// earlier point — is reported ([`OutputError::SinkWrite`]): the I/O
+  /// context keeps the first failed write's error and writes nothing
+  /// after it, so the sink is missing bytes however its own `flush`
+  /// answers. Then the sink's `flush` runs and its error is reported
+  /// ([`OutputError::Sink`]). A panic the sink raised, at any point, is
+  /// reported before either ([`OutputError::SinkPanic`]): a sink that
+  /// panicked is not called again; whatever state it is in, the error
+  /// says so.
   pub fn into_sink(self) -> Result<W, OutputError> {
     let this = ManuallyDrop::new(self);
     // SAFETY: `this` is never dropped, so each field is moved out exactly
@@ -858,7 +875,20 @@ impl<W: Write + Seek + Send + 'static> Output<W> {
     // the I/O context its `pb` points at, which `AVFMT_FLAG_CUSTOM_IO`
     // keeps libavformat from touching.
     unsafe { avformat_free_context(ctx.as_ptr()) };
-    let guarded = match ManuallyDrop::into_inner(io).into_inner::<GuardedWriter<W>>() {
+    let mut io = ManuallyDrop::into_inner(io);
+    let pb = io.as_mut_ptr();
+    // SAFETY: `pb` is the live I/O context `io` owns, a write context
+    // (`open` built it over the sink), and no format context points at it
+    // any more. `avio_flush` writes what is still buffered through the
+    // guarded sink; `error` is the plain field in which `writeout` keeps
+    // the first failed write's code (`aviobuf.c` 136–166 in FFmpeg
+    // 9.0.1), read before `into_inner` frees the context. ffmpeg-next's
+    // `into_inner` flushes once more, and finds nothing buffered.
+    let written = unsafe {
+      avio_flush(pb);
+      (*pb).error
+    };
+    let guarded = match io.into_inner::<GuardedWriter<W>>() {
       Ok(guarded) => guarded,
       // `open` built the I/O context over exactly this type.
       Err(_) => unreachable!("the I/O context holds the guarded sink it was built over"),
@@ -867,6 +897,9 @@ impl<W: Write + Seek + Send + 'static> Output<W> {
     let flushed = guarded.flush();
     if let Some(message) = latch.message() {
       return Err(OutputError::SinkPanic { message });
+    }
+    if written < 0 {
+      return Err(OutputError::SinkWrite(ffmpeg_next::Error::from(written)));
     }
     flushed.map_err(OutputError::Sink)?;
     Ok(guarded.into_inner())
