@@ -1,0 +1,59 @@
+[package]
+name        = "mediaio"
+version     = "0.19.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+homepage.workspace     = true
+documentation = "https://docs.rs/mediaio"
+description = "The mediaio family in one dependency: the shared media vocabulary, the read and write faces, the editing timeline, and on request the FFmpeg and WebCodecs adapters."
+keywords   = ["media", "video", "audio", "ffmpeg", "mediaio"]
+categories = ["multimedia", "multimedia::video", "multimedia::audio"]
+
+[features]
+# Pure Rust by default: nothing here links FFmpeg unless `ffmpeg` is
+# asked for, so no user is put on a system FFmpeg by a default.
+default = ["core", "decode", "encode", "timeline"]
+# The shared vocabulary, `mediaspine`, as `mediaio::spine`.
+core     = ["dep:mediaspine"]
+# The read faces, `mediadecode`, as `mediaio::decode`.
+decode   = ["core", "dep:mediadecode"]
+# The write faces, `mediaencode`, as `mediaio::encode`.
+encode   = ["core", "dep:mediaencode"]
+# The editing timeline, `mediaio-timeline`, as `mediaio::timeline`.
+timeline = ["dep:mediaio-timeline"]
+
+# The FFmpeg adapters, as `mediaio::ffmpeg::{base, decode, encode}`.
+# Links libavcodec and libavformat. GPL encoders stay closed: they need
+# `mediaencode-ffmpeg`'s own `gpl` feature.
+ffmpeg    = ["decode", "encode", "dep:mediaio-ffmpeg", "dep:mediadecode-ffmpeg", "dep:mediaencode-ffmpeg"]
+# Reserved for the renderer a later release adds.
+render    = []
+# The WebCodecs read adapter (`wasm32` only), as `mediaio::webcodecs`.
+webcodecs = ["decode", "dep:mediadecode-webcodecs"]
+# `mediatime`, as `mediaio::time`.
+time      = ["dep:mediatime"]
+# `mediaframe`, as `mediaio::frame`.
+frame     = ["dep:mediaframe"]
+
+# Every member at its `std` tier: this crate is the one-dependency
+# convenience. A `no_std` build depends on the members directly.
+[dependencies]
+mediaspine            = { workspace = true, optional = true, features = ["std"] }
+mediadecode           = { workspace = true, optional = true, features = ["std"] }
+mediaencode           = { workspace = true, optional = true, features = ["std"] }
+mediaio-timeline      = { workspace = true, optional = true }
+mediaio-ffmpeg        = { workspace = true, optional = true, features = ["std", "resample"] }
+mediadecode-ffmpeg    = { workspace = true, optional = true, features = ["std", "resample"] }
+mediaencode-ffmpeg    = { workspace = true, optional = true, features = ["std"] }
+mediadecode-webcodecs = { workspace = true, optional = true, features = ["std"] }
+mediatime             = { workspace = true, optional = true, features = ["std"] }
+mediaframe            = { workspace = true, optional = true, features = ["std"] }
+
+[package.metadata.docs.rs]
+features = ["core", "decode", "encode", "timeline", "ffmpeg", "time", "frame"]
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true
