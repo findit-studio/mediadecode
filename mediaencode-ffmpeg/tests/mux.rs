@@ -783,3 +783,60 @@ fn the_generic_remux_writes_cues_that_share_an_instant_through_the_ffmpeg_muxer(
   assert_eq!(cues[0].pts, cues[1].pts, "at one instant");
   assert_eq!(packets(&copy), packets(&source), "and everything else");
 }
+
+/// **L7 — a presentation or decode time that lands on `AV_NOPTS_VALUE`
+/// is refused by name, the packet untouched.** `i64::MIN` is the count
+/// libavformat reads as no timestamp at all. Into Matroska's 1/1000
+/// stream a decode time of `i64::MIN` milliseconds counts to it, and so
+/// does a presentation time; each is refused as `Unrepresentable`,
+/// naming the time offered, and handed back, and only the packet with
+/// real times reaches the file.
+#[test]
+fn l7_a_time_that_lands_on_no_timestamp_is_refused_by_name() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = corpus.multi_track_mkv();
+  let video = owned_video_and_font(&source, 1).video;
+  let target = output(&corpus, "l7.mkv");
+  let (mut muxer, _) = FfmpegOwnedMuxer::open(
+    File::create(&target).expect("create"),
+    ContainerName::MATROSKA,
+    video_table(&source),
+    &[],
+    PacketLimits::default(),
+  )
+  .expect("open");
+
+  for (pts, dts, named) in [
+    (Some(0), Some(i64::MIN), ms(i64::MIN)),
+    (Some(i64::MIN), Some(0), ms(i64::MIN)),
+  ] {
+    let offered = restamped(&video[0], 0, pts, dts);
+    match muxer.write_video(offered.clone()) {
+      Err(MuxError::Backend {
+        refusal: FfmpegMuxRefusal::Unrepresentable { track, timestamp },
+        packet: back,
+      }) => {
+        assert_eq!(track.get(), 0);
+        assert_eq!(
+          (timestamp.pts(), timestamp.timebase()),
+          (named.pts(), named.timebase()),
+          "the time offered is named",
+        );
+        assert!(back.packet().data().ptr_eq(offered.packet().data()));
+        assert_eq!(back.packet().pts(), offered.packet().pts());
+        assert_eq!(back.packet().dts(), offered.packet().dts());
+      }
+      other => panic!("expected the time refused as unrepresentable, got {other:?}"),
+    }
+  }
+
+  muxer
+    .write_video(restamped(&video[0], 0, Some(0), Some(0)))
+    .expect("real times are written");
+  muxer.finish().expect("the container is finished");
+  assert_eq!(
+    packets(&target)[0].len(),
+    1,
+    "only what was admitted was written"
+  );
+}

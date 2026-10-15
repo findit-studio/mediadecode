@@ -27,8 +27,9 @@ The family releases in lockstep.
   limits, refuses by name what the container cannot take
   (`MuxOpenError`) and reports what it drops (`MuxReport`, `Uncarried`).
   Matroska keeps attachments with their filename and MIME type, MP4 keeps
-  cover art. Writes refuse a strict container's repeated decode time by
-  the muxer's own name (`FfmpegMuxRefusal`, through `MuxError::Backend`)
-  and hand the packet back; faults name their stage (`MuxFault`), a
-  sink's panic included.
+  cover art. Writes refuse a strict container's repeated decode time,
+  and a time the stream cannot count — one that lands on `i64::MIN`,
+  libavformat's no-timestamp value, among them — by the muxer's own name
+  (`FfmpegMuxRefusal`, through `MuxError::Backend`) and hand the packet
+  back; faults name their stage (`MuxFault`), a sink's panic included.
 - The encoders arrive in the following releases.

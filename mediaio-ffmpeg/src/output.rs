@@ -369,6 +369,10 @@ pub enum OutputPacket<'a, C: crate::FfmpegCarrier> {
 /// A packet's timestamps in its stream's time base, as the caller
 /// rescaled them — what libavformat is handed, in place of the
 /// carrier's own.
+///
+/// `i64::MIN` is libavformat's `AV_NOPTS_VALUE`: a presentation or decode
+/// time of that count reads as none at all, so a caller refuses such a
+/// time before building these — `mediaencode-ffmpeg`'s muxer does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PacketTimes {
   pts: Option<i64>,

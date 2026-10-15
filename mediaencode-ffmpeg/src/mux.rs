@@ -42,6 +42,7 @@
 use core::{fmt, marker::PhantomData};
 use std::io::{Seek, Write};
 
+use ffmpeg_next::ffi::AV_NOPTS_VALUE;
 use mediaencode::{
   MuxError, MuxRefusal, Muxer, check_decode_order, check_presentation_order,
   mediaspine::{
@@ -258,8 +259,13 @@ pub enum FfmpegMuxRefusal {
     /// The decode time offered.
     dts: Timestamp,
   },
-  /// A timestamp the stream's time base cannot count — past `i64` once
-  /// rescaled.
+  /// A timestamp the stream's time base cannot count: past `i64` once
+  /// rescaled, or — a presentation or decode time — landing on
+  /// `i64::MIN`, which is `AV_NOPTS_VALUE`: libavformat reads that count
+  /// as no timestamp at all, and would write the packet with timing of
+  /// its own making, or refuse it after taking it (`mux.c` 531–572 in
+  /// FFmpeg 9.0.1). Refused before libavformat is handed anything, the
+  /// packet untouched.
   #[error("track {}: {} cannot be counted in the stream's time base", .track.get(), .timestamp.pts())]
   Unrepresentable {
     /// The track.
@@ -590,18 +596,28 @@ where
         offered,
       }));
     };
-    let ticks = |timestamp: Timestamp| {
+    // Each time counted in the stream's time base, as libavformat is
+    // handed it — or refused by name, the packet untouched.
+    let unrepresentable =
+      |timestamp: Timestamp| Refusal::Container(FfmpegMuxRefusal::Unrepresentable { track, timestamp });
+    let count = |timestamp: Timestamp| {
       timestamp
         .checked_rescale_with(time_base, Rounding::Nearest)
         .map(|rescaled| rescaled.pts())
-        .ok_or(Refusal::Container(FfmpegMuxRefusal::Unrepresentable {
-          track,
-          timestamp,
-        }))
+        .ok_or_else(|| unrepresentable(timestamp))
     };
-    let dts_ticks = ticks(dts)?;
-    let pts_ticks = pts.map(ticks).transpose()?;
-    let duration_ticks = duration.map(ticks).transpose()?.unwrap_or(0);
+    // A presentation or decode time may not land on `AV_NOPTS_VALUE`, the
+    // count libavformat reads as no timestamp at all. A duration has no
+    // such count: libavformat zeroes a negative one (`mux.c` 607–611).
+    let stamp = |timestamp: Timestamp| -> Result<i64, Refusal> {
+      match count(timestamp)? {
+        ticks if ticks == AV_NOPTS_VALUE => Err(unrepresentable(timestamp)),
+        ticks => Ok(ticks),
+      }
+    };
+    let dts_ticks = stamp(dts)?;
+    let pts_ticks = pts.map(stamp).transpose()?;
+    let duration_ticks = duration.map(count).transpose()?.unwrap_or(0);
     // libavformat's rule, exactly: nothing is checked while the last
     // decode time is zero — its counter starts there — and a repeat is
     // refused after any other.
