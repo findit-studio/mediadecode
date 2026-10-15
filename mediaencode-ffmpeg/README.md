@@ -24,9 +24,9 @@ parameters are rebuilt from, an attachment track with its one file.
   spell, a disposition flag the container has no field for. The report
   covers Matroska, WebM and MP4; another container opens the same way,
   without the report's claims.
-- **Attachments**: Matroska keeps each with its filename and MIME type,
-  but no language and no disposition flag; MP4 keeps a JPEG, PNG or BMP
-  as cover art, the picture alone. The report names each field a road
+- **Attachments**: Matroska keeps each with its filename, MIME type and
+  language, but no disposition flag; MP4 keeps a JPEG, PNG or BMP as
+  cover art, the picture alone. The report names each field a road
   drops — a cover's filename and MIME type among them.
 - **Writing keeps the face's rules, then the container's.** A packet
   for no track, of the wrong kind, without a decode time, decoded before

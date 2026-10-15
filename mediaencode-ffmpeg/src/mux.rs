@@ -21,10 +21,10 @@
 //!
 //! The report follows each track's **road**, as the roads keep different
 //! fields: a timed stream keeps its language and the flags its container
-//! has fields for; an attachment Matroska writes keeps its file, filename
-//! and MIME type, but no language and no flag; MP4's cover keeps its
-//! picture alone, and reads back as an attached picture — its filename,
-//! MIME type, language and other flags are each reported
+//! has fields for; an attachment Matroska writes keeps its file, filename,
+//! MIME type and language, but no flag; MP4's cover keeps its picture
+//! alone, and reads back as an attached picture — its filename, MIME
+//! type, language and other flags are each reported
 //! ([`Uncarried::Filename`], [`Uncarried::MimeType`]).
 //!
 //! The report covers what this release knows of each container — the
@@ -164,9 +164,7 @@ pub enum Uncarried {
   /// track's road. MP4 stores exactly three letters in `a`–`z` and its
   /// neighbours (`movenc.c` 8455–8458, `isom.c` 233–258 in FFmpeg
   /// 9.0.1); anything else is written as undetermined, or cut to three
-  /// letters. An attachment Matroska writes has no language
-  /// (`mkv_write_attachments`, `matroskaenc.c` 2513–2561), nor does MP4's
-  /// cover, which no track carries.
+  /// letters. MP4's cover, which no track carries, keeps none.
   Language {
     /// The track.
     track: TrackIndex,
@@ -637,8 +635,9 @@ where
     };
     // Each time counted in the stream's time base, as libavformat is
     // handed it — or refused by name, the packet untouched.
-    let unrepresentable =
-      |timestamp: Timestamp| Refusal::Container(FfmpegMuxRefusal::Unrepresentable { track, timestamp });
+    let unrepresentable = |timestamp: Timestamp| {
+      Refusal::Container(FfmpegMuxRefusal::Unrepresentable { track, timestamp })
+    };
     let count = |timestamp: Timestamp| {
       timestamp
         .checked_rescale_with(time_base, Rounding::Nearest)
@@ -886,11 +885,12 @@ fn judge<W, D: AsRef<[u8]>>(
 /// The roads keep different fields. A timed stream keeps the language
 /// and the flags its container has fields for. An attachment Matroska
 /// writes keeps its file, filename and MIME type (`mkv_write_attachments`,
-/// `matroskaenc.c` 2513–2561 in FFmpeg 9.0.1) — no language, and no flag,
-/// as it has no track entry (1957–1958). MP4's cover keeps its picture
-/// and the type of its image (`mov_write_covr`, `movenc.c` 4815–4839),
-/// and reads back as an attached picture: its filename, MIME type,
-/// language and every other flag are dropped.
+/// `matroskaenc.c` 2513–2561 in FFmpeg 9.0.1) and its language, among the
+/// tags written for it (`mkv_write_tags`, 2377–2390), but no flag: it has
+/// no track entry (1957–1958). MP4's cover keeps its picture and the type
+/// of its image (`mov_write_covr`, `movenc.c` 4815–4839), and reads back
+/// as an attached picture: its filename, MIME type, language and every
+/// other flag are dropped.
 fn losses<D>(
   family: Family,
   road: Road,
@@ -917,20 +917,20 @@ fn losses<D>(
       });
     }
   }
+  let language_kept = |tag: &str| match road {
+    Road::Timed => language_carried(family, tag),
+    Road::Attachment => true,
+    Road::Cover | Road::NotWritten => false,
+  };
   if let Some(tag) = description.language()
-    && !(road == Road::Timed && language_carried(family, tag.as_str()))
+    && !language_kept(tag.as_str())
   {
     lost.push(Uncarried::Language {
       track,
       tag: tag.clone(),
     });
   }
-  let flags = disposition_dropped(
-    family,
-    road,
-    description.codec(),
-    description.disposition(),
-  );
+  let flags = disposition_dropped(family, road, description.codec(), description.disposition());
   if !flags.is_empty() {
     lost.push(Uncarried::Disposition { track, flags });
   }

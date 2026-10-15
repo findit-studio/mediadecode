@@ -947,11 +947,11 @@ fn lost(track: usize, offered: &Row, written: &Row) -> Vec<Uncarried> {
 
 /// **L9 — the report names every field a Matroska attachment drops, and
 /// nothing else.** A font declaring its filename, MIME type, a language
-/// and two flags reaches Matroska with its file, filename and MIME type:
-/// an attachment there has no language, and no track entry for its
-/// flags. Read back, the report and the file agree track by track — the
-/// report names exactly what each track declared and the file does not
-/// hold.
+/// and two flags reaches Matroska with its file, filename and MIME type,
+/// and its language among the tags written for it — but an attachment
+/// there has no track entry for its flags. Read back, the report and the
+/// file agree track by track: the report names exactly what each track
+/// declared and the file does not hold.
 #[test]
 fn l9_the_report_names_every_field_a_matroska_attachment_drops() {
   let Some(corpus) = Corpus::new() else { return };
@@ -1018,17 +1018,11 @@ fn l9_the_report_names_every_field_a_matroska_attachment_drops() {
   );
   assert_eq!(
     expected,
-    vec![
-      Uncarried::Language {
-        track: TrackIndex::new(1),
-        tag: "jpn".into(),
-      },
-      Uncarried::Disposition {
-        track: TrackIndex::new(1),
-        flags: TrackDisposition::DEFAULT | TrackDisposition::FORCED,
-      },
-    ],
-    "the premise: the font kept its filename and MIME type, and lost its language and flags",
+    vec![Uncarried::Disposition {
+      track: TrackIndex::new(1),
+      flags: TrackDisposition::DEFAULT | TrackDisposition::FORCED,
+    }],
+    "the premise: the font kept its filename, MIME type and language, and lost its flags",
   );
 }
 

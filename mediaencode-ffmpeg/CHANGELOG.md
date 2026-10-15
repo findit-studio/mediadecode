@@ -27,9 +27,9 @@ The family releases in lockstep.
   limits, refuses by name what the container cannot take
   (`MuxOpenError`) and reports what it drops (`MuxReport`, `Uncarried`).
   Matroska keeps attachments with their filename and MIME type, MP4 keeps
-  cover art; the report follows each track's road, naming the language
-  and flags an attachment loses in Matroska and the filename, MIME type,
-  language and flags a cover loses in MP4. Writes judge presentation
+  cover art; the report follows each track's road, naming the flags an
+  attachment loses in Matroska and the filename, MIME type, language and
+  flags a cover loses in MP4. Writes judge presentation
   order on the counts libavformat is handed, and refuse a strict
   container's repeated decode time, and a time the stream cannot count —
   one that lands on `i64::MIN`, libavformat's no-timestamp value, among
