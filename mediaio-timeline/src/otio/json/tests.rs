@@ -126,3 +126,29 @@ fn nesting_past_the_limit_is_refused_rather_than_recursed_into() {
     (MAX_DEPTH, "nested too deeply")
   );
 }
+
+#[test]
+fn a_whole_number_is_read_from_its_digits_exactly() {
+  for (text, value) in [
+    ("86400.0", Some(86_400)),
+    ("86400", Some(86_400)),
+    ("-24.000", Some(-24)),
+    ("0", Some(0)),
+    ("-0.0", Some(0)),
+    ("0e7", Some(0)),
+    ("8.64e4", Some(86_400)),
+    ("8640000e-2", Some(86_400)),
+    ("1E+3", Some(1_000)),
+    // 2^53 + 1, which an f64 reads as 2^53.
+    ("9007199254740993.0", Some(9_007_199_254_740_993)),
+    ("24.5", None),
+    ("4503599627370496.5", None),
+    ("1e-1", None),
+    ("8640001e-2", None),
+    // Past an i128.
+    ("1e39", None),
+    ("1e9999999999", None),
+  ] {
+    assert_eq!(whole(text), value, "{text}");
+  }
+}

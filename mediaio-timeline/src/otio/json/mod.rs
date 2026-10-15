@@ -125,6 +125,49 @@ fn write_string(text: &str, out: &mut Utf8BytesMut) {
   out.push('"');
 }
 
+/// The whole number a JSON number's text spells, exactly — `86400.0`,
+/// `86400`, `8.64e4` — or `None` for one with a fraction, or past what an
+/// `i128` holds.
+///
+/// Read from the digits, not through an `f64`: past 2^53 an `f64` holds
+/// only some whole numbers, and one between two of them would read as its
+/// nearest.
+pub(crate) fn whole(text: &str) -> Option<i128> {
+  let (negative, unsigned) = match text.strip_prefix('-') {
+    Some(unsigned) => (true, unsigned),
+    None => (false, text),
+  };
+  let (mantissa, exponent) = match unsigned.split_once(['e', 'E']) {
+    Some((mantissa, exponent)) => (mantissa, exponent.parse::<i64>().ok()?),
+    None => (unsigned, 0),
+  };
+  let (integer, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+  let digits = || integer.bytes().chain(fraction.bytes());
+  // The trailing zeros each scale the digits before them by ten.
+  let zeros = digits().rev().take_while(|&digit| digit == b'0').count();
+  let significant = integer.len() + fraction.len() - zeros;
+  if significant == 0 {
+    return Some(0);
+  }
+  let scale = exponent
+    .checked_sub(i64::try_from(fraction.len()).ok()?)?
+    .checked_add(i64::try_from(zeros).ok()?)?;
+  // A significant digit below the units is a fraction.
+  if scale < 0 {
+    return None;
+  }
+  let mut value: i128 = 0;
+  for digit in digits().take(significant) {
+    value = value
+      .checked_mul(10)?
+      .checked_add(i128::from(digit - b'0'))?;
+  }
+  for _ in 0..scale {
+    value = value.checked_mul(10)?;
+  }
+  Some(if negative { -value } else { value })
+}
+
 /// How deep arrays and objects may nest before the reader refuses: deep
 /// enough for any timeline this crate writes, shallow enough that a hostile
 /// document cannot exhaust the stack.

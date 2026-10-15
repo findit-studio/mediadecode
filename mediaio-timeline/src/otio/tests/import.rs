@@ -1,0 +1,599 @@
+//! The reader: what the export writes reads back exactly, and what the
+//! timeline does not model is refused by name, with where it sits.
+
+use std::{string::String, vec, vec::Vec};
+
+use smol_bytes::{Utf8Bytes, Utf8BytesMut};
+
+use super::{
+  edit,
+  json::{self, Value},
+};
+use crate::{
+  Clip, ClipAt, ClipId, Duration, Fade, FadeShape, Fades, Gain, IdClash, Marker, MarkerColor,
+  MediaRef, Rate, Refusal, TimeRange, Timeline, Timestamp, Track, TrackKind, Transition,
+  otio::{
+    Feature, Inexact, OtioTarget, Shape, UnmodelledFeature, UnmodelledSchema, Unreadable,
+    from_otio, to_otio,
+  },
+};
+
+/// One track at 24 fps: a 12-frame gap; `a` at [12, 36), fading in over 6
+/// frames, at -3 dB, with a marker; a 2 + 2-frame dissolve at 36 into `b`
+/// at [36, 60). The track carries a red marker over its first second.
+fn sample() -> Timeline {
+  let medium = |name: &str| {
+    MediaRef::new(smol_bytes::format_utf8bytes!("file:///{name}.mov"))
+      .with_available_range(Some(TimeRange::new(0, 100, edit())))
+      .with_rate(Some(Rate::FPS_24))
+  };
+  let a = Clip::new(
+    ClipId::new("a"),
+    "a",
+    medium("a"),
+    TimeRange::new(10, 34, edit()),
+    TimeRange::new(12, 36, edit()),
+  )
+  .with_gain(Gain::from_db(-3.0))
+  .with_fades(Fades::new().with_in(Some(Fade::new(
+    Duration::new(6, edit()),
+    FadeShape::Linear,
+  ))))
+  .with_marker(Marker::new("n", TimeRange::new(10, 12, edit())));
+  let b = Clip::new(
+    ClipId::new("b"),
+    "b",
+    medium("b"),
+    TimeRange::new(10, 34, edit()),
+    TimeRange::new(36, 60, edit()),
+  );
+  Timeline::new("sample", Rate::FPS_24).with_track(
+    Track::new(TrackKind::Video, "V")
+      .with_clip(a)
+      .with_clip(b)
+      .with_transition(Transition::dissolve(
+        Timestamp::new(36, edit()),
+        Duration::new(2, edit()),
+        Duration::new(2, edit()),
+      ))
+      .with_marker(Marker::new("m", TimeRange::new(0, 24, edit())).with_color(MarkerColor::Red)),
+  )
+}
+
+/// The sample's first track, as the export lays it out:
+/// `[gap, fade in, a, dissolve, b]`.
+const TRACK: &str = "tracks.children.0";
+const GAP: &str = "tracks.children.0.children.0";
+const FADE_IN: &str = "tracks.children.0.children.1";
+const A: &str = "tracks.children.0.children.2";
+const DISSOLVE: &str = "tracks.children.0.children.3";
+const B: &str = "tracks.children.0.children.4";
+const A_MEDIA: &str = "tracks.children.0.children.2.media_references.DEFAULT_MEDIA";
+
+/// The value at the dotted `path` inside `value`: object keys, and array
+/// indices as numbers.
+fn at<'a>(value: &'a mut Value, path: &str) -> &'a mut Value {
+  path
+    .split('.')
+    .filter(|step| !step.is_empty())
+    .fold(value, |value, step| match value {
+      Value::Object(members) => {
+        &mut members
+          .iter_mut()
+          .find(|(key, _)| key == step)
+          .unwrap_or_else(|| panic!("no {step}"))
+          .1
+      }
+      Value::Array(items) => &mut items[step.parse::<usize>().unwrap()],
+      _ => panic!("{step} inside a scalar"),
+    })
+}
+
+/// Sets `key` of the object at `path` to `new`, in place or appended.
+fn set(value: &mut Value, path: &str, key: &str, new: Value) {
+  let Value::Object(members) = at(value, path) else {
+    panic!("{path} is no object")
+  };
+  match members.iter_mut().find(|(name, _)| name == key) {
+    Some((_, old)) => *old = new,
+    None => members.push((Utf8Bytes::from(key), new)),
+  }
+}
+
+/// Takes `key` out of the object at `path`.
+fn remove(value: &mut Value, path: &str, key: &str) {
+  let Value::Object(members) = at(value, path) else {
+    panic!("{path} is no object")
+  };
+  members.retain(|(name, _)| name != key);
+}
+
+fn text(value: &str) -> Value {
+  Value::String(Utf8Bytes::from(value))
+}
+
+fn number(value: &str) -> Value {
+  Value::Number(Utf8Bytes::from(value))
+}
+
+fn object(members: Vec<(&str, Value)>) -> Value {
+  Value::Object(
+    members
+      .into_iter()
+      .map(|(key, value)| (Utf8Bytes::from(key), value))
+      .collect(),
+  )
+}
+
+/// The sample written for `target`, edited, written out again and read.
+fn read_edited(target: OtioTarget, edit: impl FnOnce(&mut Value)) -> Result<Timeline, Unreadable> {
+  let mut root = json::parse(&to_otio(&sample(), target).unwrap()).unwrap();
+  edit(&mut root);
+  let mut out = Utf8BytesMut::new();
+  json::write_pretty(&root, &mut out);
+  from_otio(&out.freeze_shared())
+}
+
+/// [`read_edited`] for `V0_15Plus` readers.
+fn read(edit: impl FnOnce(&mut Value)) -> Result<Timeline, Unreadable> {
+  read_edited(OtioTarget::V0_15Plus, edit)
+}
+
+/// `$.` and the dotted path, as the reader writes one.
+fn path(dotted: &str) -> String {
+  let mut path = String::from("$");
+  for step in dotted.split('.').filter(|step| !step.is_empty()) {
+    if step.bytes().all(|byte| byte.is_ascii_digit()) {
+      path.push('[');
+      path.push_str(step);
+      path.push(']');
+    } else {
+      path.push('.');
+      path.push_str(step);
+    }
+  }
+  path
+}
+
+fn schema(name: &str, dotted: &str) -> Unreadable {
+  Unreadable::Schema(UnmodelledSchema {
+    name: Utf8Bytes::from(name),
+    path: Utf8Bytes::from(path(dotted)),
+  })
+}
+
+fn feature(feature: Feature, dotted: &str) -> Unreadable {
+  Unreadable::Feature(UnmodelledFeature {
+    feature,
+    path: Utf8Bytes::from(path(dotted)),
+  })
+}
+
+fn shape(dotted: &str, expected: &'static str) -> Unreadable {
+  Unreadable::Shape(Shape {
+    path: Utf8Bytes::from(path(dotted)),
+    expected,
+  })
+}
+
+fn inexact(dotted: &str, reason: &'static str) -> Unreadable {
+  Unreadable::Inexact(Inexact {
+    path: Utf8Bytes::from(path(dotted)),
+    reason,
+  })
+}
+
+#[test]
+fn what_the_export_writes_reads_back_exactly() {
+  let sample = sample();
+  for target in [OtioTarget::V0_15Plus, OtioTarget::Legacy] {
+    let text = to_otio(&sample, target).unwrap();
+    assert_eq!(from_otio(&text), Ok(sample.clone()), "{target:?}");
+  }
+}
+
+#[test]
+fn what_carries_nothing_reads_as_nothing() {
+  // A newer reader's `color` left unset, a transition `enabled`, empty
+  // words, the stack unnamed, and a comment and a color left out: none
+  // carries anything the timeline would lose.
+  let read = read(|root| {
+    set(root, A, "color", Value::Null);
+    set(root, DISSOLVE, "enabled", Value::Bool(true));
+    set(
+      root,
+      GAP,
+      "metadata",
+      object(vec![("mediaio", object(vec![]))]),
+    );
+    set(root, "tracks", "name", text(""));
+    let marker = &format!("{TRACK}.markers.0");
+    remove(root, marker, "comment");
+    set(root, marker, "color", text("red"));
+  });
+  assert_eq!(read, Ok(sample()));
+  // A marker with no color is OpenTimelineIO's default, green.
+  let green = self::read(|root| remove(root, &format!("{TRACK}.markers.0"), "color")).unwrap();
+  assert_eq!(green.tracks()[0].markers()[0].color(), MarkerColor::Green);
+}
+
+#[test]
+fn a_schema_the_timeline_does_not_model_is_refused_with_where_it_sits() {
+  let effect = |name: &str| object(vec![("OTIO_SCHEMA", text(name))]);
+  for name in ["Effect.1", "LinearTimeWarp.1", "FreezeFrame.1"] {
+    assert_eq!(
+      read(|root| set(root, A, "effects", Value::Array(vec![effect(name)]))),
+      Err(schema(name, &format!("{A}.effects.0"))),
+    );
+  }
+  // A stack inside a track, a clip directly in the stack.
+  let nested = object(vec![
+    ("OTIO_SCHEMA", text("Stack.1")),
+    ("children", Value::Array(vec![])),
+  ]);
+  assert_eq!(
+    read(|root| {
+      let Value::Array(children) = at(root, &format!("{TRACK}.children")) else {
+        unreachable!()
+      };
+      children.push(nested);
+    }),
+    Err(schema("Stack.1", &format!("{TRACK}.children.5"))),
+  );
+  assert_eq!(
+    read(|root| {
+      let clip = at(root, A).clone();
+      let Value::Array(tracks) = at(root, "tracks.children") else {
+        unreachable!()
+      };
+      tracks.push(clip);
+    }),
+    Err(schema("Clip.2", "tracks.children.1")),
+  );
+  // A reference other than an external one, a marker of another version,
+  // a marker where the timeline keeps none, and a root that is no timeline.
+  assert_eq!(
+    read(|root| set(
+      root,
+      &format!("{A}.media_references"),
+      "DEFAULT_MEDIA",
+      effect("MissingReference.1")
+    )),
+    Err(schema("MissingReference.1", A_MEDIA)),
+  );
+  assert_eq!(
+    read(|root| set(
+      root,
+      &format!("{A}.markers.0"),
+      "OTIO_SCHEMA",
+      text("Marker.3")
+    )),
+    Err(schema("Marker.3", &format!("{A}.markers.0"))),
+  );
+  assert_eq!(
+    read(|root| {
+      let marker = at(root, &format!("{TRACK}.markers.0")).clone();
+      set(root, GAP, "markers", Value::Array(vec![marker]));
+    }),
+    Err(schema("Marker.2", &format!("{GAP}.markers.0"))),
+  );
+  assert_eq!(
+    read(|root| set(root, "", "OTIO_SCHEMA", text("SerializableCollection.1"))),
+    Err(schema("SerializableCollection.1", "")),
+  );
+}
+
+#[test]
+fn a_feature_the_timeline_has_no_word_for_is_refused_by_name() {
+  let cases: Vec<(Box<dyn FnOnce(&mut Value)>, Unreadable)> = vec![
+    (
+      Box::new(|root| set(root, A, "speed", number("2.0"))),
+      feature(Feature::Key("speed".into()), &format!("{A}.speed")),
+    ),
+    (
+      Box::new(|root| {
+        set(
+          root,
+          &format!("{A}.metadata"),
+          "Resolve_OTIO",
+          object(vec![]),
+        )
+      }),
+      feature(
+        Feature::Metadata("Resolve_OTIO".into()),
+        &format!("{A}.metadata.Resolve_OTIO"),
+      ),
+    ),
+    (
+      Box::new(|root| set(root, &format!("{A}.metadata.mediaio"), "speed", number("2"))),
+      feature(
+        Feature::Word("speed".into()),
+        &format!("{A}.metadata.mediaio.speed"),
+      ),
+    ),
+    (
+      Box::new(|root| set(root, GAP, "name", text("black"))),
+      feature(Feature::Name("black".into()), &format!("{GAP}.name")),
+    ),
+    (
+      Box::new(|root| set(root, "tracks", "name", text("Video Tracks"))),
+      feature(Feature::Name("Video Tracks".into()), "tracks.name"),
+    ),
+    (
+      Box::new(|root| set(root, TRACK, "kind", text("Data"))),
+      feature(Feature::TrackKind("Data".into()), &format!("{TRACK}.kind")),
+    ),
+    (
+      Box::new(|root| set(root, DISSOLVE, "transition_type", text("SMPTE_Wipe"))),
+      feature(
+        Feature::TransitionType("SMPTE_Wipe".into()),
+        &format!("{DISSOLVE}.transition_type"),
+      ),
+    ),
+    (
+      Box::new(|root| {
+        let range = at(root, &format!("{GAP}.source_range")).clone();
+        set(root, TRACK, "source_range", range);
+      }),
+      feature(Feature::Trim, &format!("{TRACK}.source_range")),
+    ),
+    (
+      Box::new(|root| set(root, GAP, "enabled", Value::Bool(false))),
+      feature(Feature::Disabled, &format!("{GAP}.enabled")),
+    ),
+    (
+      Box::new(|root| set(root, DISSOLVE, "enabled", Value::Bool(false))),
+      feature(Feature::Disabled, &format!("{DISSOLVE}.enabled")),
+    ),
+    (
+      Box::new(|root| set(root, A, "color", text("RED"))),
+      feature(Feature::ItemColor, &format!("{A}.color")),
+    ),
+    (
+      Box::new(|root| set(root, &format!("{TRACK}.markers.0"), "color", text("LILAC"))),
+      feature(
+        Feature::MarkerColor("LILAC".into()),
+        &format!("{TRACK}.markers.0.color"),
+      ),
+    ),
+    (
+      Box::new(|root| {
+        set(
+          root,
+          A_MEDIA,
+          "available_image_bounds",
+          object(vec![("OTIO_SCHEMA", text("Box2d.1"))]),
+        )
+      }),
+      feature(
+        Feature::ImageBounds,
+        &format!("{A_MEDIA}.available_image_bounds"),
+      ),
+    ),
+    (
+      Box::new(|root| {
+        let reference = at(root, A_MEDIA).clone();
+        set(root, &format!("{A}.media_references"), "high_res", reference);
+      }),
+      feature(Feature::MediaReferences, &format!("{A}.media_references")),
+    ),
+    (
+      Box::new(|root| {
+        set(
+          root,
+          &format!("{GAP}.source_range.start_time"),
+          "value",
+          number("5.0"),
+        )
+      }),
+      feature(Feature::GapStart, &format!("{GAP}.source_range.start_time")),
+    ),
+    (
+      // The fade's words on the dissolve: a fade between two clips.
+      Box::new(|root| {
+        let words = at(root, &format!("{FADE_IN}.metadata")).clone();
+        set(root, DISSOLVE, "metadata", words);
+      }),
+      feature(Feature::Fade, DISSOLVE),
+    ),
+    (
+      // The fade's words taken off: a dissolve from the gap.
+      Box::new(|root| set(root, FADE_IN, "metadata", object(vec![]))),
+      feature(Feature::DissolveBesideGap, FADE_IN),
+    ),
+  ];
+  for (index, (edit, refused)) in cases.into_iter().enumerate() {
+    assert_eq!(read(edit), Err(refused), "case {index}");
+  }
+  // A `Clip.1` with no reference at all.
+  assert_eq!(
+    read_edited(OtioTarget::Legacy, |root| set(
+      root,
+      A,
+      "media_reference",
+      Value::Null
+    )),
+    Err(feature(Feature::NoMedia, &format!("{A}.media_reference"))),
+  );
+}
+
+#[test]
+fn a_count_or_rate_that_does_not_land_exactly_is_refused() {
+  assert_eq!(
+    read(|root| set(
+      root,
+      "global_start_time",
+      "rate",
+      number("24.000000000000004")
+    )),
+    Err(inexact(
+      "global_start_time.rate",
+      "a rate other than the f64 of the exact ruler it is counted in"
+    )),
+  );
+  assert_eq!(
+    read(|root| set(
+      root,
+      &format!("{GAP}.source_range.duration"),
+      "value",
+      number("12.5")
+    )),
+    Err(inexact(
+      &format!("{GAP}.source_range.duration.value"),
+      "a count that is no whole number"
+    )),
+  );
+  assert_eq!(
+    read(|root| set(
+      root,
+      &format!("{A}.source_range.start_time"),
+      "value",
+      number("9007199254740994.0")
+    )),
+    Err(inexact(
+      &format!("{A}.source_range.start_time.value"),
+      "a count past 2^53, which an f64 does not hold exactly"
+    )),
+  );
+  // 47 ticks of 1/48 s: half an edit-rate tick short of 24.
+  assert_eq!(
+    read(|root| {
+      set(
+        root,
+        &format!("{A}.metadata.mediaio"),
+        "source",
+        object(vec![("ruler", text("48/1")), ("timebase", text("1/48"))]),
+      );
+      for (key, value) in [("start_time", "20.0"), ("duration", "47.0")] {
+        let time = format!("{A}.source_range.{key}");
+        set(root, &time, "rate", number("48.0"));
+        set(root, &time, "value", number(value));
+      }
+    }),
+    Err(inexact(
+      &format!("{A}.source_range"),
+      "a source range that is no whole number of edit-rate ticks"
+    )),
+  );
+}
+
+#[test]
+fn a_word_missing_or_misshapen_is_refused_by_name() {
+  assert_eq!(
+    read(|root| remove(root, &format!("{A}.metadata.mediaio"), "id")),
+    Err(shape(&format!("{A}.metadata.mediaio.id"), "a required word")),
+  );
+  assert_eq!(
+    read(|root| remove(root, "metadata.mediaio", "rate")),
+    Err(shape("metadata.mediaio.rate", "a required word")),
+  );
+  assert_eq!(
+    read(|root| set(root, "metadata.mediaio", "rate", text("23.976"))),
+    Err(shape(
+      "metadata.mediaio.rate",
+      "a rate above zero, written num/den"
+    )),
+  );
+  assert_eq!(
+    read(|root| set(
+      root,
+      &format!("{A}.metadata.mediaio"),
+      "gain_db",
+      number("1e300")
+    )),
+    Err(shape(
+      &format!("{A}.metadata.mediaio.gain_db"),
+      "a finite gain in decibels"
+    )),
+  );
+  assert_eq!(
+    read(|root| remove(root, &format!("{A_MEDIA}.metadata.mediaio"), "available")),
+    Err(shape(
+      &format!("{A_MEDIA}.metadata.mediaio.available"),
+      "a required word"
+    )),
+  );
+  // One dissolve may say its place, which is the first; no other place.
+  assert_eq!(
+    read(|root| set(
+      root,
+      &format!("{DISSOLVE}.metadata"),
+      "mediaio",
+      object(vec![("order", number("0"))])
+    )),
+    Ok(sample()),
+  );
+  assert_eq!(
+    read(|root| set(
+      root,
+      &format!("{DISSOLVE}.metadata"),
+      "mediaio",
+      object(vec![("order", number("1"))])
+    )),
+    Err(shape(
+      &format!("{DISSOLVE}.metadata.mediaio.order"),
+      "a place among the track's transitions, said by every dissolve, each place once"
+    )),
+  );
+  // A transition at a track's edge.
+  assert_eq!(
+    read(|root| {
+      let Value::Array(children) = at(root, &format!("{TRACK}.children")) else {
+        unreachable!()
+      };
+      children.remove(0);
+    }),
+    Err(shape(
+      &format!("{TRACK}.children.0"),
+      "a transition between two items"
+    )),
+  );
+}
+
+#[test]
+fn text_that_is_not_json_and_a_timeline_that_does_not_validate_are_refused() {
+  assert!(matches!(from_otio("{"), Err(Unreadable::Syntax(_))));
+  // `b` under `a`'s id: read whole, then refused as the timeline is.
+  assert_eq!(
+    read(|root| set(root, &format!("{B}.metadata.mediaio"), "id", text("a"))),
+    Err(Unreadable::Validation(vec![Refusal::DuplicateClipId(
+      IdClash::new(ClipAt::new(0, 0), ClipAt::new(0, 1))
+    )])),
+  );
+}
+
+#[test]
+fn reader_refusals_say_what_and_where() {
+  let shown = |refused: Unreadable| std::string::ToString::to_string(&refused);
+  assert_eq!(
+    shown(schema("Effect.1", &format!("{A}.effects.0"))),
+    "$.tracks.children[0].children[2].effects[0]: the schema Effect.1, which the timeline does not model there"
+  );
+  assert_eq!(
+    shown(feature(Feature::TrackKind("Data".into()), &format!("{TRACK}.kind"))),
+    "$.tracks.children[0].kind: the track kind Data, where the timeline knows Video and Audio"
+  );
+  assert_eq!(
+    shown(inexact("global_start_time.value", "a count that is no whole number")),
+    "$.global_start_time.value: a count that is no whole number"
+  );
+  assert_eq!(
+    shown(Unreadable::Validation(vec![Refusal::RateUnstated])),
+    "the timeline read does not validate: the edit rate is zero"
+  );
+}
+
+#[test]
+fn every_marker_color_reads_back_in_any_case() {
+  for color in MarkerColor::ALL {
+    let mut timeline = sample();
+    timeline.tracks_mut()[0].markers_mut()[0].set_color(color);
+    let text = to_otio(&timeline, OtioTarget::V0_15Plus).unwrap();
+    assert_eq!(from_otio(&text).as_ref(), Ok(&timeline), "{color}");
+    let lower = text.as_str().replace(color.otio_name(), &color.to_string());
+    let read = from_otio(&lower).unwrap();
+    assert_eq!(read.tracks()[0].markers()[0].color(), color, "{lower}");
+  }
+  assert_eq!(MarkerColor::from_otio_name("Green"), Some(MarkerColor::Green));
+  assert_eq!(MarkerColor::from_otio_name("GRAY"), None);
+}

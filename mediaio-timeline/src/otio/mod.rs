@@ -1,4 +1,4 @@
-//! OpenTimelineIO: export, and the structural self-check.
+//! OpenTimelineIO: export, the structural self-check, and reading back.
 //!
 //! [`to_otio`] writes a valid timeline as OpenTimelineIO JSON for the
 //! readers an [`OtioTarget`] names:
@@ -115,8 +115,16 @@
 //!
 //! [`validate_json`] reads a document back with the crate's own JSON reader
 //! and checks OpenTimelineIO's schema shape — no Python, no OpenTimelineIO
-//! install. Reading OpenTimelineIO back into a [`Timeline`] (`from_otio`) is
-//! a later row; this module is its home.
+//! install.
+//!
+//! [`from_otio`] reads a document back into a [`Timeline`]: the exact inverse
+//! of [`to_otio`]. For every timeline `to_otio` writes, for either target,
+//! `from_otio` answers that very timeline — every count, timebase and rate
+//! as the model held it — because the export writes, beside what
+//! OpenTimelineIO reads, the exact words a reader needs (the table above).
+//! A document from another writer is read where it uses only what the
+//! timeline models and carries those words; anything else is refused by
+//! name, never dropped ([`Unreadable`]).
 
 use core::fmt;
 use std::vec::Vec;
@@ -129,6 +137,7 @@ use crate::{ClipAt, EdgeAt, MarkerAt, Refusal, Timeline, TransitionAt, layout::l
 mod check;
 mod derive;
 mod export;
+mod import;
 mod json;
 
 /// Which OpenTimelineIO readers a document is written for.
@@ -649,6 +658,278 @@ impl fmt::Display for Shape {
 }
 
 impl core::error::Error for Shape {}
+
+/// Reads OpenTimelineIO JSON back into a [`Timeline`]: the exact inverse of
+/// [`to_otio`].
+///
+/// For every timeline [`to_otio`] writes, for either target,
+/// `from_otio(&to_otio(&timeline, target)?)` is `Ok` of that very timeline.
+/// The reader takes the edit rate, and for each media-side range the exact
+/// ruler its counts are written in and the timebase the model counts it in,
+/// from the words the export writes under `metadata.mediaio`, and holds
+/// every `RationalTime` to them: its rate the `f64` of its exact ruler, bit
+/// for bit, and its value a whole count within ±2^53. It lays each track's
+/// items end to end from zero, as OpenTimelineIO places them — a clip as
+/// long as its source range at the edit rate — and puts each fade on the
+/// clip beside its gap and each dissolve on the cut it straddles. Both
+/// clip schemas are read: `Clip.2` and `Clip.1`.
+///
+/// A document from another writer is read where it uses only what the
+/// timeline models and carries the crate's words. A schema the timeline
+/// does not model — an effect, a time warp, a nested stack, a reference
+/// other than an `ExternalReference.1`, a marker of another version — or
+/// one it models elsewhere is refused with its name and where it sits
+/// ([`Unreadable::Schema`]); a key, value or note of a modelled schema the
+/// timeline has no word for is refused by name too
+/// ([`Unreadable::Feature`]). A key is read only where it carries nothing —
+/// `null`, an empty list, `enabled` as `true` — or what the timeline keeps:
+/// nothing is dropped.
+///
+/// # Errors
+///
+/// - [`Unreadable::Syntax`] for text that is not JSON;
+/// - [`Unreadable::Shape`] for a value missing or not of the type read
+///   there, a word of the crate's among them;
+/// - [`Unreadable::Schema`] and [`Unreadable::Feature`] for what the
+///   timeline does not model;
+/// - [`Unreadable::Inexact`] for a count or rate that does not land exactly
+///   where the timeline counts it;
+/// - [`Unreadable::Validation`] for a timeline read whole that does not
+///   [`validate`](fn@validate).
+pub fn from_otio(json: &str) -> Result<Timeline, Unreadable> {
+  let root = json::parse(json).map_err(Unreadable::Syntax)?;
+  let timeline = import::timeline(&root)?;
+  validate(&timeline).map_err(Unreadable::Validation)?;
+  Ok(timeline)
+}
+
+/// Why [`from_otio`] read no timeline.
+///
+/// Marked `#[non_exhaustive]`: a later kind of refusal joins as a variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Unreadable {
+  /// The text is not one well-formed JSON value.
+  Syntax(Syntax),
+  /// A value is missing, or not of the type read there.
+  Shape(Shape),
+  /// An object of a schema the timeline does not model, or models in
+  /// another place.
+  Schema(UnmodelledSchema),
+  /// A key, a value or a note of a modelled schema the timeline has no
+  /// word for.
+  Feature(UnmodelledFeature),
+  /// A count or a rate that does not land exactly where the timeline
+  /// counts it.
+  Inexact(Inexact),
+  /// The timeline read does not [`validate`](fn@validate): its refusals.
+  Validation(Vec<Refusal>),
+}
+
+impl fmt::Display for Unreadable {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      Self::Syntax(syntax) => fmt::Display::fmt(syntax, f),
+      Self::Shape(shape) => fmt::Display::fmt(shape, f),
+      Self::Schema(schema) => fmt::Display::fmt(schema, f),
+      Self::Feature(feature) => fmt::Display::fmt(feature, f),
+      Self::Inexact(inexact) => fmt::Display::fmt(inexact, f),
+      Self::Validation(refusals) => {
+        f.write_str("the timeline read does not validate")?;
+        for (index, refusal) in refusals.iter().enumerate() {
+          f.write_str(if index == 0 { ": " } else { "; " })?;
+          fmt::Display::fmt(refusal, f)?;
+        }
+        Ok(())
+      }
+    }
+  }
+}
+
+impl core::error::Error for Unreadable {}
+
+/// An object of a schema the timeline does not model there, and where it
+/// sits: what [`Unreadable::Schema`] carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnmodelledSchema {
+  name: Utf8Bytes,
+  path: Utf8Bytes,
+}
+
+impl UnmodelledSchema {
+  /// The schema's name and version: `Effect.1`.
+  pub fn name(&self) -> &str {
+    &self.name
+  }
+
+  /// Where the object sits, as a path from the document's root:
+  /// `$.tracks.children[0].children[1].effects[0]`.
+  pub fn path(&self) -> &str {
+    &self.path
+  }
+}
+
+/// Writes `$.tracks.children[0].children[1].effects[0]: the schema
+/// Effect.1, which the timeline does not model there`.
+impl fmt::Display for UnmodelledSchema {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    write!(
+      f,
+      "{}: the schema {}, which the timeline does not model there",
+      self.path, self.name
+    )
+  }
+}
+
+impl core::error::Error for UnmodelledSchema {}
+
+/// A key, a value or a note of a modelled schema the timeline has no word
+/// for, and where it sits: what [`Unreadable::Feature`] carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnmodelledFeature {
+  feature: Feature,
+  path: Utf8Bytes,
+}
+
+impl UnmodelledFeature {
+  /// What the document holds that the timeline does not model.
+  pub const fn feature(&self) -> &Feature {
+    &self.feature
+  }
+
+  /// Where it sits, as a path from the document's root.
+  pub fn path(&self) -> &str {
+    &self.path
+  }
+}
+
+/// Writes `$.tracks.children[0].kind: the track kind Data, where the
+/// timeline knows Video and Audio`.
+impl fmt::Display for UnmodelledFeature {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    write!(f, "{}: {}", self.path, self.feature)
+  }
+}
+
+impl core::error::Error for UnmodelledFeature {}
+
+/// What a document holds, in a schema the timeline models, that the
+/// timeline has no word for.
+///
+/// Marked `#[non_exhaustive]`: a later feature joins as a variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Feature {
+  /// A key the reader does not know on its object.
+  Key(Utf8Bytes),
+  /// A note in an object's `metadata` under a key other than this crate's
+  /// `mediaio`: another writer's, which the timeline does not keep.
+  Metadata(Utf8Bytes),
+  /// A word under `mediaio` the reader does not know there.
+  Word(Utf8Bytes),
+  /// A name where the timeline keeps none: the stack's, other than
+  /// `tracks`, a gap's, a transition's or a media reference's.
+  Name(Utf8Bytes),
+  /// A track kind other than `Video` and `Audio`.
+  TrackKind(Utf8Bytes),
+  /// A transition type other than `SMPTE_Dissolve`.
+  TransitionType(Utf8Bytes),
+  /// A trim — a `source_range` — on the stack or a track.
+  Trim,
+  /// The stack, a gap or a transition disabled.
+  Disabled,
+  /// A `color` on an item: a newer reader's word.
+  ItemColor,
+  /// A marker color outside OpenTimelineIO's eleven.
+  MarkerColor(Utf8Bytes),
+  /// Image bounds on a media reference.
+  ImageBounds,
+  /// A clip's media references other than one, under `DEFAULT_MEDIA`, the
+  /// active one.
+  MediaReferences,
+  /// A clip with no media reference.
+  NoMedia,
+  /// A gap whose source range starts anywhere but zero.
+  GapStart,
+  /// A fade not between a gap and the clip it fades, or playing anything
+  /// of the gap's side.
+  Fade,
+  /// A dissolve beside a gap: OpenTimelineIO's fade from black or silence,
+  /// whose curve the document does not name.
+  DissolveBesideGap,
+}
+
+/// Writes `the track kind Data, where the timeline knows Video and Audio`,
+/// and so on.
+impl fmt::Display for Feature {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      Self::Key(key) => write!(f, "the key {key}, which this reader does not know there"),
+      Self::Metadata(key) => write!(
+        f,
+        "the note {key}, another writer's, which the timeline does not keep"
+      ),
+      Self::Word(word) => write!(f, "the word {word}, which this reader does not know there"),
+      Self::Name(name) => write!(f, "the name {name:?}, where the timeline keeps none"),
+      Self::TrackKind(kind) => write!(
+        f,
+        "the track kind {kind}, where the timeline knows Video and Audio"
+      ),
+      Self::TransitionType(kind) => write!(
+        f,
+        "the transition type {kind}, where the timeline knows SMPTE_Dissolve"
+      ),
+      Self::Trim => f.write_str("a trim, which the timeline keeps on clips alone"),
+      Self::Disabled => f.write_str("disabled, which the timeline keeps on tracks and clips alone"),
+      Self::ItemColor => f.write_str("a color on an item, which the timeline does not keep"),
+      Self::MarkerColor(color) => write!(
+        f,
+        "the marker color {color}, outside OpenTimelineIO's eleven"
+      ),
+      Self::ImageBounds => f.write_str("image bounds, which the timeline does not keep"),
+      Self::MediaReferences => f.write_str(
+        "media references other than one, under DEFAULT_MEDIA and active, which a clip reads",
+      ),
+      Self::NoMedia => f.write_str("a clip with no media reference"),
+      Self::GapStart => f.write_str("a gap starting anywhere but zero"),
+      Self::Fade => f.write_str(
+        "a fade not between a gap and the clip it fades, or playing the gap's side",
+      ),
+      Self::DissolveBesideGap => {
+        f.write_str("a dissolve beside a gap: a fade whose curve the document does not name")
+      }
+    }
+  }
+}
+
+/// A count or a rate that does not land exactly where the timeline counts
+/// it, and where: what [`Unreadable::Inexact`] carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Inexact {
+  path: Utf8Bytes,
+  reason: &'static str,
+}
+
+impl Inexact {
+  /// Where, as a path from the document's root.
+  pub fn path(&self) -> &str {
+    &self.path
+  }
+
+  /// Why the value does not land exactly.
+  pub const fn reason(&self) -> &'static str {
+    self.reason
+  }
+}
+
+/// Writes `$.global_start_time.value: a count that is no whole number`.
+impl fmt::Display for Inexact {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    write!(f, "{}: {}", self.path, self.reason)
+  }
+}
+
+impl core::error::Error for Inexact {}
 
 #[cfg(test)]
 mod tests;

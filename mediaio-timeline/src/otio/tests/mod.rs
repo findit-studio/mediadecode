@@ -1049,8 +1049,6 @@ fn a_document_that_is_not_json_is_refused_as_syntax() {
   );
 }
 
-mod derived;
-
 /// The words under `metadata.mediaio` of `value`, as `(word, value)` text
 /// pairs, a nested object written as JSON.
 fn words(value: &Value) -> Vec<(String, String)> {
@@ -1291,3 +1289,6 @@ fn a_marker_no_ruler_holds_whole_is_refused_by_name() {
     "{refused}"
   );
 }
+
+mod derived;
+mod import;
