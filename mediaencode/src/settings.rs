@@ -48,42 +48,54 @@ pub enum RateControl {
   Quality(u32),
 }
 
-/// A codec profile, by the number the codec itself gives it: the
-/// `profile_idc` of an H.264 stream (100 for High), the
-/// `general_profile_idc` of an HEVC stream (2 for Main 10), the audio
-/// object type of AAC (2 for LC), the profile index of ProRes in
-/// `prores_ks` (3 for 422 HQ).
+/// A codec profile, as the backend numbers it — each backend documents
+/// its numbering.
+///
+/// The FFmpeg backend's is `AVCodecContext.profile`: the codec's own
+/// number (an H.264 stream's `profile_idc`, 100 for High; an HEVC
+/// stream's `general_profile_idc`, 2 for Main 10; AAC's audio object
+/// type minus one, 1 for LC), with FFmpeg's constraint flags above bit 8
+/// — H.264 Constrained Baseline is 66 | 512 = 578, High 10 Intra is
+/// 110 | 2048. A width narrower than the backend's numbering would lose
+/// the web's commonest H.264 profile, so the number is a `u32`.
+///
+/// Where settings carry no profile (`None`), the encoder chooses.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct Profile(u8);
+pub struct Profile(u32);
 
 impl Profile {
-  /// Constructs a `Profile` from the codec's own number.
+  /// Constructs a `Profile` from the backend's number.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn new(number: u8) -> Self {
+  pub const fn new(number: u32) -> Self {
     Self(number)
   }
-  /// Returns the codec's own number.
+  /// Returns the backend's number.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn get(self) -> u8 {
+  pub const fn get(self) -> u32 {
     self.0
   }
 }
 
-/// A codec level, by the number the codec itself gives it: the
-/// `level_idc` of an H.264 stream (41 for level 4.1), the
-/// `general_level_idc` of an HEVC stream (153 for level 5.1).
+/// A codec level, as the backend numbers it — each backend documents
+/// its numbering.
+///
+/// The FFmpeg backend's is `AVCodecContext.level`: an H.264 stream's
+/// `level_idc` (41 for level 4.1), an HEVC stream's `general_level_idc`
+/// (153 for level 5.1).
+///
+/// Where settings carry no level (`None`), the encoder chooses.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct Level(u8);
+pub struct Level(u32);
 
 impl Level {
-  /// Constructs a `Level` from the codec's own number.
+  /// Constructs a `Level` from the backend's number.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn new(number: u8) -> Self {
+  pub const fn new(number: u32) -> Self {
     Self(number)
   }
-  /// Returns the codec's own number.
+  /// Returns the backend's number.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn get(self) -> u8 {
+  pub const fn get(self) -> u32 {
     self.0
   }
 }
@@ -515,5 +527,23 @@ mod tests {
       ),
       (48_000, 8, 3)
     );
+  }
+
+  /// **A profile number carries the backend's whole numbering.** FFmpeg
+  /// puts its constraint flags above bit 8, so the web's commonest H.264
+  /// profile — Constrained Baseline — is 578, not 66, and High 10 Intra
+  /// is 2158: both round-trip unchanged.
+  #[test]
+  fn a_profile_carries_ffmpegs_constraint_flags() {
+    const CONSTRAINED: u32 = 1 << 9;
+    const INTRA: u32 = 1 << 11;
+    let constrained_baseline = Profile::new(66 | CONSTRAINED);
+    let high_10_intra = Profile::new(110 | INTRA);
+    assert_eq!(constrained_baseline.get(), 578);
+    assert_eq!(high_10_intra.get(), 2158);
+    let settings: VideoEncoderSettings<VLoop> =
+      EncoderSettings::new(27, VideoParams::new(Dimensions::new(640, 360), 0, ms_tb()))
+        .with_profile(Some(constrained_baseline));
+    assert_eq!(settings.profile().map(Profile::get), Some(578));
   }
 }
