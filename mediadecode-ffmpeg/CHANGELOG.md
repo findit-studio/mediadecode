@@ -9,7 +9,16 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 The backend-agnostic core it adapts has its own log at
 [`mediadecode/CHANGELOG.md`](../mediadecode/CHANGELOG.md).
 
-## [0.19.0] - 2026-10-15
+## [Unreleased]
+
+### Added
+
+- **The demuxer fills the row's disposition**: `TrackInfo::disposition`
+  is `AVStream.disposition`, the same raw set `TrackExtra::disposition`
+  keeps — cover art arrives marked `ATTACHED_PIC`, which is what a muxer
+  needs to write it back as cover art.
+
+## [0.19.0] - 2026-10-16
 
 The FFmpeg crossings move to the new base crate,
 [`mediaio-ffmpeg`](../mediaio-ffmpeg/CHANGELOG.md); this crate keeps the
@@ -48,10 +57,6 @@ in lockstep.
 
 ### Added
 
-- **The demuxer fills the row's disposition**: `TrackInfo::disposition`
-  is `AVStream.disposition`, the same raw set `TrackExtra::disposition`
-  keeps — cover art arrives marked `ATTACHED_PIC`, which is what a muxer
-  needs to write it back as cover art.
 - `ParametersError` and `CrossingError`, re-exported from the base.
 - A `test-support` feature (off by default), forwarded to the base: the
   fault-subprocess harness and the callback-state hooks, for the lanes

@@ -8,7 +8,35 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 The family — `mediadecode`, `mediadecode-ffmpeg`, `mediadecode-webcodecs`,
 `mediaencode`, `mediaencode-ffmpeg` and `mediaio` — releases in lockstep.
 
-## [0.19.0] - 2026-10-15
+## [Unreleased]
+
+### Added
+
+- **The write crossing**: `output::Output`, libavformat's muxing
+  context owned in Rust over a caller's `Write + Seek`, for
+  `mediaencode-ffmpeg`'s muxer. It takes no pointer from a caller, so
+  nothing in it is `unsafe`; `contracts` gains "Writing a container" and
+  "`AVOutputFormat`" for what it keeps with libavformat: the context
+  freed before its I/O context, the call order kept at run time
+  (`OutputError::OutOfOrder`), packets copied in on the copy road,
+  parameters rebuilt from a `CodecTicket`, ids crossing as integers.
+- **`writer_guard::GuardedWriter`**: a caller's sink behind the reader
+  guard's panic latch. A panic inside it becomes a latched I/O error,
+  named by the context (`OutputError::SinkPanic`), and a sink that
+  panicked is never called again.
+- Both guards reduce an error the stream returns to its OS code or its
+  kind inside their `catch_unwind`, dropping its payload there:
+  ffmpeg-next drops a returned error inside its `extern "C"` callback,
+  where a payload whose `Drop` panics aborted the process. That panic is
+  now latched and named like any other.
+- `Output::into_sink` hands the sink back only when every byte reached
+  it: a write the sink failed, which the I/O context keeps and writes
+  nothing after, is read there after the last flush and reported
+  (`OutputError::SinkWrite`), whatever the sink's own flush answers.
+- `CodecId::mime_type` — the descriptor's first MIME type — and the
+  `PNG`, `BMP`, `TTF`, `OTF` and `TEXT` ids.
+
+## [0.19.0] - 2026-10-16
 
 ### Added
 
@@ -104,28 +132,5 @@ The family — `mediadecode`, `mediadecode-ffmpeg`, `mediadecode-webcodecs`,
   read them.
 - `boundary::write_md_flags` is a safe fn: it writes one field of the
   `AVPacket` an `ffmpeg_next::Packet` keeps inline.
-- **The write crossing**: `output::Output`, libavformat's muxing
-  context owned in Rust over a caller's `Write + Seek`, for
-  `mediaencode-ffmpeg`'s muxer. It takes no pointer from a caller, so
-  nothing in it is `unsafe`; `contracts` gains "Writing a container" and
-  "`AVOutputFormat`" for what it keeps with libavformat: the context
-  freed before its I/O context, the call order kept at run time
-  (`OutputError::OutOfOrder`), packets copied in on the copy road,
-  parameters rebuilt from a `CodecTicket`, ids crossing as integers.
-- **`writer_guard::GuardedWriter`**: a caller's sink behind the reader
-  guard's panic latch. A panic inside it becomes a latched I/O error,
-  named by the context (`OutputError::SinkPanic`), and a sink that
-  panicked is never called again.
-- Both guards reduce an error the stream returns to its OS code or its
-  kind inside their `catch_unwind`, dropping its payload there:
-  ffmpeg-next drops a returned error inside its `extern "C"` callback,
-  where a payload whose `Drop` panics aborted the process. That panic is
-  now latched and named like any other.
-- `Output::into_sink` hands the sink back only when every byte reached
-  it: a write the sink failed, which the I/O context keeps and writes
-  nothing after, is read there after the last flush and reported
-  (`OutputError::SinkWrite`), whatever the sink's own flush answers.
-- `CodecId::mime_type` — the descriptor's first MIME type — and the
-  `PNG`, `BMP`, `TTF`, `OTF` and `TEXT` ids.
 - A `test-support` feature (off by default): the fault-subprocess
   harness, the allocation cap and the callback-state hooks.
