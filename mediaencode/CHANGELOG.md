@@ -44,3 +44,7 @@ The family releases in lockstep.
   `MuxError::Refused` or `MuxError::Backend` — each write's error names
   its own packet type — and `MuxError::map_packet` re-wraps it, as a
   remux routing every kind through one error type does.
+- **A packet is presented no earlier than it is decoded**:
+  `MuxRefusal::PtsBeforeDts` and `check_presentation_order`, the rule
+  every container keeps and libavformat refuses only after taking the
+  packet. The face names it first and hands the packet back.
