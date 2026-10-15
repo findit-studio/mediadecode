@@ -48,6 +48,10 @@ in lockstep.
 
 ### Added
 
+- **The demuxer fills the row's disposition**: `TrackInfo::disposition`
+  is `AVStream.disposition`, the same raw set `TrackExtra::disposition`
+  keeps — cover art arrives marked `ATTACHED_PIC`, which is what a muxer
+  needs to write it back as cover art.
 - `ParametersError` and `CrossingError`, re-exported from the base.
 - A `test-support` feature (off by default), forwarded to the base: the
   fault-subprocess harness and the callback-state hooks, for the lanes

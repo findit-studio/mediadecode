@@ -41,6 +41,12 @@ Its versions are its own: they do not move with the rest of the family's.
   payload for another kind, an attachment's identity claimed by another
   kind — is refused by name, the row's kind named and the payload and
   side data handed back (`TrackMismatch`, `MismatchReason`).
+- **The declared disposition on the track row and its description**:
+  `TrackInfo::disposition` and `TrackDescription::disposition` (with
+  their `with_` and `set_` builders) carry the container's
+  `AV_DISPOSITION_*` bits as `mediaframe`'s `TrackDisposition`,
+  re-exported from `mediaspine::demuxer`, whole — an unnamed bit
+  included. `from_track_info` copies it, and `into_parts` returns it.
 - **`TrackParams::duplicate`**: a field-by-field copy of a track's
   parameters, by name — the message-carrier law keeps `Clone` off the
   type, and a consumer that needs parameters of its own spells the copy

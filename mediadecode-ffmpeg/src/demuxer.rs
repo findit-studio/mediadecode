@@ -109,8 +109,9 @@ use mediadecode::{
   demuxer::{
     AttachmentPacket, AttachmentTrackPacket, AttachmentTrackParams, AudioTrackPacket,
     AudioTrackParams, Chapter, ContainerDuration, DataTrackPacket, DataTrackParams, DemuxedPacket,
-    Demuxer, DurationSource, MeasuredEnd, SubtitleTrackPacket, SubtitleTrackParams, TrackIndex,
-    TrackInfo, TrackKind, TrackParams, UnknownTrackParams, VideoTrackPacket, VideoTrackParams,
+    Demuxer, DurationSource, MeasuredEnd, SubtitleTrackPacket, SubtitleTrackParams,
+    TrackDisposition, TrackIndex, TrackInfo, TrackKind, TrackParams, UnknownTrackParams,
+    VideoTrackPacket, VideoTrackParams,
   },
 };
 use smol_bytes::Utf8Bytes;
@@ -2608,7 +2609,12 @@ fn build_tracks<C: crate::FfmpegCarrier + crate::CarrierOps>(
       // wrote is what is read — see
       // [`TrackInfo::language`](mediadecode::demuxer::TrackInfo::language)
       // for why nothing folds it here.
-      .with_language(text(c"language")?);
+      .with_language(text(c"language")?)
+      // The container's own bits, carried whole — the same raw set the
+      // extras keep — so a remux writes back what was declared. The
+      // `c_int` is reinterpreted, not converted: a set with the sign bit
+      // is a set of bits, and `from_u32` keeps every one.
+      .with_disposition(TrackDisposition::from_u32(disposition as u32));
 
     // Capture the attachment payload now, so the queue is complete
     // before a single timed packet has been read. Every attachment
