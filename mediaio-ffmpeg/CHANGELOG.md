@@ -104,5 +104,19 @@ The family — `mediadecode`, `mediadecode-ffmpeg`, `mediadecode-webcodecs`,
   read them.
 - `boundary::write_md_flags` is a safe fn: it writes one field of the
   `AVPacket` an `ffmpeg_next::Packet` keeps inline.
+- **The write crossing**: `output::Output`, libavformat's muxing
+  context owned in Rust over a caller's `Write + Seek`, for
+  `mediaencode-ffmpeg`'s muxer. It takes no pointer from a caller, so
+  nothing in it is `unsafe`; `contracts` gains "Writing a container" and
+  "`AVOutputFormat`" for what it keeps with libavformat: the context
+  freed before its I/O context, the call order kept at run time
+  (`OutputError::OutOfOrder`), packets copied in on the copy road,
+  parameters rebuilt from a `CodecTicket`, ids crossing as integers.
+- **`writer_guard::GuardedWriter`**: a caller's sink behind the reader
+  guard's panic latch. A panic inside it becomes a latched I/O error,
+  named by the context (`OutputError::SinkPanic`), and a sink that
+  panicked is never called again.
+- `CodecId::mime_type` — the descriptor's first MIME type — and the
+  `PNG`, `BMP`, `TTF`, `OTF` and `TEXT` ids.
 - A `test-support` feature (off by default): the fault-subprocess
   harness, the allocation cap and the callback-state hooks.

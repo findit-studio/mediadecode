@@ -3,10 +3,38 @@
 </div>
 
 The FFmpeg write adapter of the mediaio family: it implements the
-`mediaencode` faces over libavcodec and libavformat. In this release it
-is the gate every encoder will be opened through: the encoder-by-name
-catalogue and its GPL rule. The muxer and the encoders themselves
-arrive in the following releases.
+`mediaencode` faces over libavcodec and libavformat. In this release:
+the **muxer**, over libavformat, and the gate every encoder will be
+opened through — the encoder-by-name catalogue and its GPL rule. The
+encoders themselves arrive in the following releases.
+
+## The muxer
+
+`FfmpegMuxer` writes any container libavformat names (`ContainerName`)
+into a caller's `Write + Seek`, from the track table a remux collects —
+one `TrackDescription` per track, each with the `CodecTicket` its codec
+parameters are rebuilt from, an attachment track with its one file.
+
+- **Opening judges the whole table first.** What the container cannot
+  take at all is refused by name, with nothing written: a codec the
+  muxer says it cannot store, a Matroska attachment without a filename
+  or a MIME type, a chapter that runs backwards. What it can take only
+  by dropping something is written, and the loss is **reported**
+  (`MuxReport`): a font MP4 has no place for, a language MP4 cannot
+  spell, a disposition flag the container has no field for. The report
+  covers Matroska, WebM and MP4; another container opens the same way,
+  without the report's claims.
+- **Attachments**: Matroska keeps each with its filename and MIME type;
+  MP4 keeps a JPEG, PNG or BMP as cover art.
+- **Writing keeps the face's rules, then the container's.** A packet
+  for no track, of the wrong kind, without a decode time, decoded before
+  the last or presented before it is decoded is refused by the face's
+  name; an equal decode time on a strict container's video or audio
+  stream — MP4 — by the muxer's own (`FfmpegMuxRefusal::RepeatedDts`).
+  Every refusal hands the packet back untouched.
+- **Packets are copied into libavformat**, never lent, and a sink that
+  panics is caught before C sees the unwind, named in the muxer's fault,
+  and never called again.
 
 ## Encoders by name
 
