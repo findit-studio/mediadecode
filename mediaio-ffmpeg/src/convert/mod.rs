@@ -915,8 +915,15 @@ pub fn audio_frame_from(
 > {
   // SAFETY: reading the pointer, not dereferencing it.
   let av_frame = unsafe { frame.as_ptr() };
-  // SAFETY: `frame` is a live borrow, so `av_frame` is a live
-  // `*const AVFrame`. `addr_of!` reaches `ch_layout.order` without
+  // **Null before any read.** ffmpeg-next's safe `Audio::empty()` keeps
+  // whatever `av_frame_alloc` answered, so a wrapper can hold null after
+  // an allocation failure; nothing below may read through it.
+  if av_frame.is_null() {
+    return Err(ConvertError::NullFrame);
+  }
+  // SAFETY: `frame` is a live borrow and its pointer is not null (checked
+  // above), so `av_frame` is a live `*const AVFrame`. `addr_of!` reaches
+  // `ch_layout.order` without
   // forming a reference, and it is read as the `i32` its bindgen enum is
   // stored as — the field may hold a value no variant names.
   // `nb_channels` and `nb_samples` are plain `c_int`s. Nothing else is

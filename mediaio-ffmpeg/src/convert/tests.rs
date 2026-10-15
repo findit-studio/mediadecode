@@ -626,6 +626,23 @@ fn a_dangling_custom_map_is_refused_by_the_safe_conversion_unread() {
   );
 }
 
+/// **A null-backed frame is refused before any field is read.**
+/// ffmpeg-next's safe `Audio::empty()` stores whatever `av_frame_alloc`
+/// answered — null, when the allocation fails — so the safe conversion
+/// can be handed a wrapper around nothing. `Audio::wrap(null)` builds
+/// that same wrapper without an allocation failure.
+#[test]
+fn a_null_backed_audio_frame_is_refused_before_any_read() {
+  // SAFETY: the state `Audio::empty()` leaves after a failed
+  // `av_frame_alloc`; dropping it calls `av_frame_free` on null, which
+  // does nothing.
+  let frame = unsafe { ffmpeg_next::frame::Audio::wrap(core::ptr::null_mut()) };
+  assert!(matches!(
+    audio_frame_from(&frame, Timebase::default(), FrameLimits::default()),
+    Err(ConvertError::NullFrame)
+  ));
+}
+
 /// **An impossible count is refused as one, whatever the layout's
 /// order.** The safe road judges the sample and channel counts exactly
 /// as the worker does before it asks the map question, so a custom
