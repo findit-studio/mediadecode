@@ -9,7 +9,7 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 The backend-agnostic core it adapts has its own log at
 [`mediadecode/CHANGELOG.md`](../mediadecode/CHANGELOG.md).
 
-## [0.19.0] - 2026-10-15
+## [0.19.0] - 2026-10-16
 
 The FFmpeg crossings move to the new base crate,
 [`mediaio-ffmpeg`](../mediaio-ffmpeg/CHANGELOG.md); this crate keeps the

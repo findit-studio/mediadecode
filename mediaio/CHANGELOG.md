@@ -15,7 +15,7 @@ The family releases in lockstep.
   markers, `otio::from_otio`, and an OpenTimelineIO export that now carries
   the exact-readback metadata.
 
-## [0.19.0] - 2026-10-15
+## [0.19.0] - 2026-10-16
 
 ### Added
 
