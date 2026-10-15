@@ -963,8 +963,10 @@ pub fn find_decoder_raw(id: c_int) -> Option<ptr::NonNull<AVCodec>> {
 /// `Ok(Some(_))` carries what `visit` broke with, `Ok(None)` means the
 /// list was walked to its end (or libavutil listed nothing), and `Err`
 /// carries libavutil's own error code. The list libavutil allocates is
-/// freed here on every road out, `visit` panicking aside, which leaks
-/// it.
+/// freed on every road out — `visit` panicking included: a guard owns it
+/// from the moment it exists, and frees it as the stack unwinds. On
+/// `Err` there is no list (libavutil stores one only on success), and
+/// nothing is freed.
 ///
 /// # Safety
 ///
@@ -986,34 +988,75 @@ pub unsafe fn visit_hwframe_download_formats<B>(
   // stores a freshly allocated, terminated list in `list`.
   let rc = unsafe { c_shims::av_hwframe_transfer_get_formats(frames_ctx, 0, &mut list, 0) };
   if rc < 0 {
+    // libavutil stores a list only on success, so there is none to free.
     return Err(rc);
   }
   if list.is_null() {
     return Ok(None);
   }
+  // **Owned before anything can unwind.** `visit` is the caller's code
+  // and may panic; a free placed after the loop would be skipped by the
+  // unwinding stack, where this guard's `Drop` is not.
+  let list = FormatList(list);
   let none = AVPixelFormat::AV_PIX_FMT_NONE as c_int;
-  let mut broke = None;
-  let mut cursor = list.cast_const();
+  let mut cursor = list.0.cast_const();
   loop {
     // SAFETY: the list is terminated by `AV_PIX_FMT_NONE`, and `cursor`
     // has not moved past the terminator: it advances only after a
-    // non-terminator element.
+    // non-terminator element. The guard keeps the list alive until the
+    // function returns.
     let candidate = unsafe { cursor.read() };
     if candidate == none {
-      break;
+      return Ok(None);
     }
     if let core::ops::ControlFlow::Break(value) = visit(candidate) {
-      broke = Some(value);
-      break;
+      return Ok(Some(value));
     }
     // SAFETY: `candidate` was not the terminator, so the list holds at
     // least one more element.
     cursor = unsafe { cursor.add(1) };
   }
-  // SAFETY: allocated by `av_hwframe_transfer_get_formats` and freed
-  // exactly once, here.
-  unsafe { ffmpeg_next::ffi::av_freep(ptr::addr_of_mut!(list).cast()) };
-  Ok(broke)
+}
+
+/// The list `av_hwframe_transfer_get_formats` allocated, owned: freed
+/// when this drops, on every road out of
+/// [`visit_hwframe_download_formats`], a panic unwinding through it
+/// included.
+struct FormatList(*mut c_int);
+
+impl Drop for FormatList {
+  fn drop(&mut self) {
+    #[cfg(test)]
+    format_list_probe::freed();
+    // SAFETY: the list was allocated by `av_hwframe_transfer_get_formats`
+    // (with `av_malloc`), this guard is its only owner, and it is freed
+    // exactly once, here.
+    unsafe { ffmpeg_next::ffi::av_freep(ptr::addr_of_mut!(self.0).cast()) };
+  }
+}
+
+/// Counts the download-format lists freed on this thread, so a law can
+/// see the guard free one while a panic unwinds. FFmpeg keeps no count
+/// of live allocations a law could read, and the allocation cap
+/// (`test_support::cap_ffmpeg_allocations`) bounds one allocation's size
+/// rather than counting any, so the guard reports its own frees.
+#[cfg(test)]
+pub(crate) mod format_list_probe {
+  use core::cell::Cell;
+
+  std::thread_local! {
+    static FREED: Cell<u32> = const { Cell::new(0) };
+  }
+
+  /// Records one free.
+  pub(crate) fn freed() {
+    FREED.with(|freed| freed.set(freed.get() + 1));
+  }
+
+  /// The frees recorded on this thread so far.
+  pub(crate) fn frees() -> u32 {
+    FREED.with(Cell::get)
+  }
 }
 
 /// `AVCodecContext.get_buffer2`: the same pixel ceiling, applied where
@@ -1626,6 +1669,93 @@ mod tests {
     );
     for id in [-1, i32::MAX, i32::MIN] {
       assert!(find_decoder_raw(id).is_none(), "no decoder for {id}");
+    }
+  }
+
+  /// **A panicking visitor leaves no list behind.** The download-format
+  /// list is libavutil's allocation, and the visitor is the caller's
+  /// code: when it panics, the guard that owns the list frees it as the
+  /// panic unwinds, where the old free after the loop was skipped and
+  /// the list leaked.
+  ///
+  /// Run against a real frames context — VideoToolbox's, whose
+  /// `transfer_get_formats` needs no hardware, only the frames context's
+  /// `sw_format`, so it answers on any macOS host. The frees are counted
+  /// by the guard itself ([`format_list_probe`]): FFmpeg keeps no count of
+  /// live allocations, and the allocation cap bounds a single
+  /// allocation's size rather than counting any.
+  #[test]
+  #[cfg(target_os = "macos")]
+  fn a_panicking_visitor_leaves_no_download_list_behind() {
+    use core::ops::ControlFlow;
+    use ffmpeg_next::ffi::{
+      AVBufferRef, AVHWDeviceType, AVHWFramesContext, av_buffer_unref, av_hwdevice_ctx_create,
+      av_hwframe_ctx_alloc,
+    };
+
+    let mut device: *mut AVBufferRef = ptr::null_mut();
+    // SAFETY: `device` is a valid out-pointer; VideoToolbox's device
+    // takes no device string and no options.
+    let rc = unsafe {
+      av_hwdevice_ctx_create(
+        &mut device,
+        AVHWDeviceType::AV_HWDEVICE_TYPE_VIDEOTOOLBOX,
+        ptr::null(),
+        ptr::null_mut(),
+        0,
+      )
+    };
+    assert_eq!(rc, 0, "a VideoToolbox device context");
+    // SAFETY: `device` is the live device reference just created.
+    let mut frames = unsafe { av_hwframe_ctx_alloc(device) };
+    assert!(!frames.is_null(), "a frames context");
+    // SAFETY: `frames` is the live reference just allocated; its `data`
+    // is the `AVHWFramesContext`, whose plain fields are set before
+    // anything reads them.
+    unsafe {
+      let ctx = (*frames).data.cast::<AVHWFramesContext>();
+      (*ctx).format = AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX;
+      (*ctx).sw_format = AVPixelFormat::AV_PIX_FMT_NV12;
+      (*ctx).width = 64;
+      (*ctx).height = 64;
+    }
+
+    // The ordinary road: the list is walked whole and freed once.
+    let before = format_list_probe::frees();
+    let mut seen = Vec::new();
+    // SAFETY: `frames` is a live reference to a frames context.
+    let walked = unsafe {
+      visit_hwframe_download_formats::<()>(frames, |format| {
+        seen.push(format);
+        ControlFlow::Continue(())
+      })
+    };
+    assert_eq!(walked, Ok(None));
+    assert_eq!(seen, [AVPixelFormat::AV_PIX_FMT_NV12 as c_int]);
+    assert_eq!(
+      format_list_probe::frees() - before,
+      1,
+      "freed on the way out"
+    );
+
+    // The visitor panics: the panic reaches the caller, and the list is
+    // freed on its way past.
+    let before = format_list_probe::frees();
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+      // SAFETY: as above.
+      unsafe { visit_hwframe_download_formats::<()>(frames, |_| panic!("a visitor that panics")) }
+    }));
+    assert!(caught.is_err(), "the visitor's panic reaches the caller");
+    assert_eq!(
+      format_list_probe::frees() - before,
+      1,
+      "the guard freed the list while the panic unwound",
+    );
+
+    // SAFETY: both references are this law's own, unreffed once each.
+    unsafe {
+      av_buffer_unref(&mut frames);
+      av_buffer_unref(&mut device);
     }
   }
 

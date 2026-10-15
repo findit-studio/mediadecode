@@ -69,6 +69,10 @@ The family — `mediadecode`, `mediadecode-ffmpeg`, `mediadecode-webcodecs`,
   plane size, and `ffmpeg_next`'s safe `BitmapMut::set_height` moves
   the height alone. Bitmaps convert through the raw entries, whose
   caller vouches for the extent.
+- **`ffi::visit_hwframe_download_formats` frees its list on unwind.**
+  The list libavutil allocates is owned by a guard from the moment it
+  exists, so a visitor that panics no longer leaks it; on an FFmpeg
+  error there is no list, and nothing is freed.
 - **A side-data type is admitted by the linked library's word.** The
   write side refused every type at or above the bindings'
   `AV_PKT_DATA_NB`, though the read side carries a type a newer library
