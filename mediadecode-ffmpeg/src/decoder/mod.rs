@@ -1093,10 +1093,11 @@ impl VideoDecoder {
     let send = |av_packet: &Packet| {
       // SAFETY: `av_packet` was built by this crate's own builder from
       // `packet`'s owned carrier, so its payload and side data are
-      // written; it is lent for this call only, and the shared body —
-      // where the submission road shares one — is reachable by no
-      // caller, so nothing writes through it while libavcodec, which
-      // never writes through a packet it is sent, may hold a reference.
+      // written, and the owned lane always copies the body into a fresh
+      // `av_new_packet` allocation, whose padding is zeroed; it is lent
+      // for this call only and reachable by no caller, so nothing writes
+      // through it while libavcodec, which never writes through a packet
+      // it is sent, may hold a reference.
       unsafe { self.send_av_packet(av_packet) }
     };
     // SAFETY: `send` hands the packet to `send_av_packet`, which gives it
@@ -1174,9 +1175,17 @@ impl VideoDecoder {
   /// not of a `Packet::new` or `Packet::grow` its caller has not written
   /// over.
   ///
-  /// And nothing may write through its payload while this decoder may
-  /// still read it: `avcodec_send_packet` keeps a reference to a
-  /// refcounted packet's buffer past the call (`libavcodec/avcodec.h`
+  /// The `AV_INPUT_BUFFER_PADDING_SIZE` bytes after its payload must lie
+  /// inside its buffer and be initialised to zero — or be the padding
+  /// libavformat delivered it with, unmodified — because libavcodec's
+  /// bitstream readers read past the end of what they are given. A packet
+  /// `av_new_packet` allocated (`Packet::new`, `Packet::copy`) has zeroed
+  /// padding, and one `av_read_frame` delivered has libavformat's; see
+  /// [the `AVPacket` contract](crate::contracts#avpacket) for both.
+  ///
+  /// And nothing may write through its payload or that padding while this
+  /// decoder may still read them: `avcodec_send_packet` keeps a reference
+  /// to a refcounted packet's buffer past the call (`libavcodec/avcodec.h`
   /// 2333–2335 in FFmpeg 9.0.1), and a frame-threaded decoder reads it
   /// on another thread. A caller that keeps the packet does not write
   /// through it — no `Packet::data_mut`, no in-place write — until this

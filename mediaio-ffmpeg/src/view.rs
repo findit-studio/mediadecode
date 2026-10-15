@@ -49,22 +49,28 @@ use ffmpeg_next::ffi::{AVBufferRef, av_buffer_ref, av_buffer_unref};
 ///
 /// The send leg needs one specific guarantee: libavcodec reads
 /// `AV_INPUT_BUFFER_PADDING_SIZE` bytes past a packet's payload, and
-/// libavformat allocates exactly that much zeroed slack behind every
-/// packet it produces. Trailing *capacity* is not that guarantee — a
-/// video plane has more pixels after it, a resampler's output frame has
-/// more samples, and a bitstream reader running off the end of a packet
-/// into either would eat them as though they were bitstream.
+/// libavformat delivers every packet it produces with that much padding
+/// of its own writing behind the payload. Trailing *capacity* is not that
+/// guarantee — a video plane has more pixels after it, a resampler's
+/// output frame has more samples, a caller's packet has whatever its
+/// caller left there, and a bitstream reader running off the end of a
+/// payload into any of them would eat them as though they were bitstream.
 ///
-/// So provenance is recorded where it is known — at capture — rather
-/// than inferred later from a size comparison that cannot tell padding
-/// from a neighbour.
+/// So provenance is recorded where it is known — at capture, from who
+/// delivered the packet (`buffer::PayloadProvenance`) — rather than
+/// inferred later from a size comparison that cannot tell padding from a
+/// neighbour, or from a buffer's contents that cannot tell padding from
+/// bytes nobody wrote.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Origin {
-  /// A packet payload captured out of an `AVPacket`'s own buffer, whose
-  /// trailing padding is libavformat's contract.
+  /// A payload captured out of the buffer of a packet **libavformat
+  /// delivered** — a demuxed packet, or a stream's parked picture —
+  /// whose trailing padding is libavformat's. The only carriers a
+  /// decoder may be handed by reference.
   PacketPayload,
   /// Anything else: a frame plane, a resampler's output, a copy this
-  /// crate allocated. Nothing may be assumed about what follows.
+  /// crate allocated, a caller's packet. Nothing may be assumed about
+  /// what follows, and a decoder is handed a padded copy.
   Foreign,
 }
 

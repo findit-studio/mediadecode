@@ -190,19 +190,25 @@ pub mod ops {
     /// may write through those bytes while it — or a clone of it — lives.
     unsafe fn capture(buf: *mut AVBufferRef, offset: usize, len: usize) -> Option<Self::Buffer>;
 
-    /// [`Self::capture`] for a payload taken out of an `AVPacket`'s own
-    /// buffer.
+    /// [`Self::capture`] for a payload taken out of the buffer of a
+    /// packet **libavformat delivered**.
     ///
     /// The only difference is what the carrier records about itself:
-    /// libavformat allocates `AV_INPUT_BUFFER_PADDING_SIZE` zeroed
-    /// bytes behind every packet it produces, and this is the one
+    /// libavformat delivers every packet with `AV_INPUT_BUFFER_PADDING_SIZE`
+    /// bytes of its own writing behind the payload, and this is the one
     /// capture that may claim them. That claim is what the send leg
-    /// checks before it shares anything with a decoder.
+    /// checks before it shares anything with a decoder — so it is never
+    /// made for a caller's packet, whose buffer the library does not
+    /// vouch for (`buffer::PayloadProvenance::vouches_for_padding`).
     ///
     /// # Safety
     ///
     /// As [`Self::capture`], and `buf` must be the buffer of an
-    /// `AVPacket` whose payload this range is.
+    /// `AVPacket` libavformat delivered — a demuxed packet, or a stream's
+    /// parked picture — whose payload this range is: the
+    /// `AV_INPUT_BUFFER_PADDING_SIZE` bytes after the range are
+    /// libavformat's, initialised, and not written while the carrier
+    /// lives.
     unsafe fn capture_packet_payload(
       buf: *mut AVBufferRef,
       offset: usize,
@@ -614,10 +620,12 @@ impl ops::CarrierOps for View {
   ) -> Option<Self::Buffer> {
     // SAFETY: as `capture` — the bytes are initialised and nothing
     // writes through them while the view lives — with the caller
-    // additionally promising this range is an `AVPacket`'s payload, which
-    // is what entitles the carrier to claim the padding behind it.
-    // `buffer::payload_of`, the one caller, reaches this only for a
-    // buffer that is unshared or whose other holders cannot write
+    // additionally promising this range is the payload of a packet
+    // libavformat delivered, which is what entitles the carrier to claim
+    // the padding behind it. `buffer::payload_of`, the one caller,
+    // reaches this only for a provenance that vouches for that padding
+    // (`PayloadProvenance::vouches_for_padding`) and a buffer that is
+    // unshared or whose other holders cannot write
     // (`PayloadProvenance::route`).
     unsafe { FfmpegBuffer::view_of(buf, offset, len, crate::view::Origin::PacketPayload) }
   }

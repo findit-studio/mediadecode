@@ -307,8 +307,10 @@ pub(crate) trait HwInner: Send {
   /// # Safety
   ///
   /// [`VideoDecoder::send_av_packet`]'s contract: `packet` meets the
-  /// `AVPacket` contract with every exported byte written, and nothing
-  /// writes through its payload while the decoder may still read it.
+  /// `AVPacket` contract with every exported byte written, the padding
+  /// after its payload is zeroed or libavformat's own, and nothing writes
+  /// through its payload or that padding while the decoder may still read
+  /// them.
   unsafe fn send_packet(&mut self, packet: &Packet) -> Result<Sent, Error>;
   /// See [`VideoDecoder::receive_frame`].
   fn receive_frame(&mut self, frame: &mut Frame) -> Result<Received, Error>;
@@ -1179,7 +1181,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       match &mut self.state {
         // SAFETY: `av_pkt` is the submission `with_ffmpeg_video_packet`
         // built from this call's carrier — its payload and side data are
-        // this crate's writes — lent for this call only, and a shared
+        // this crate's writes, and its padding is either the zeroed
+        // padding of a fresh copy or, where the body is shared, the
+        // padding of a packet libavformat delivered (`share_or_copy`
+        // shares nothing else) — lent for this call only, and a shared
         // body is reachable by no caller, so nothing writes through it
         // while the hardware session, which never writes through what it
         // is sent, may hold a reference; the probe keeps deep copies.

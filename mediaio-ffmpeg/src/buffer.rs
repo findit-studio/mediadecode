@@ -1070,14 +1070,19 @@ impl std::error::Error for TrustedPayload {}
 ///
 /// `provenance` must be true of it — it decides whether a buffer
 /// somebody else also references is refused, copied or windowed
-/// (`PayloadProvenance::route`):
+/// (`PayloadProvenance::route`), and whether the carrier may claim the
+/// padding behind the payload (`PayloadProvenance::vouches_for_padding`):
 ///
-/// * [`PayloadProvenance::CallerSupplied`] is true of every packet;
-/// * [`PayloadProvenance::DemuxDelivered`] claims that no other
-///   reference to the payload's buffer is written through while this
-///   call reads it;
-/// * [`PayloadProvenance::AttachedPicture`] claims that nothing writes
-///   through that buffer for as long as the returned carrier lives.
+/// * [`PayloadProvenance::CallerSupplied`] is true of every packet, and
+///   claims nothing about the bytes after the payload;
+/// * [`PayloadProvenance::DemuxDelivered`] claims that libavformat
+///   delivered the packet — so the padding behind its payload is
+///   libavformat's — and that no other reference to the payload's buffer
+///   is written through while this call reads it;
+/// * [`PayloadProvenance::AttachedPicture`] claims that the packet is a
+///   stream's parked picture, which libavformat built — its padding is
+///   libavformat's too — and that nothing writes through that buffer for
+///   as long as the returned carrier lives.
 ///
 /// On the view lane the returned carrier holds a reference of its own to
 /// the packet's buffer and may be a window onto it, so the packet's
@@ -1109,6 +1114,10 @@ pub struct PayloadPlan {
   offset: usize,
   len: usize,
   route: CaptureRoute,
+  /// Whether the provenance vouches for the padding behind the payload
+  /// ([`PayloadProvenance::vouches_for_padding`]) — decided here, from
+  /// the caller's claim, and nowhere else.
+  padding: bool,
 }
 
 /// **Every refusal a packet payload can earn from what the packet
@@ -1142,7 +1151,7 @@ pub struct PayloadPlan {
 /// and `flags` as plain values. It reads no payload byte.
 ///
 /// `provenance` must be true of it, as [`payload_of`] states, because
-/// the plan's route is decided by it. A plan that comes back carries raw
+/// the plan's route and its padding claim are decided by it. A plan that comes back carries raw
 /// pointers into that packet's buffer; only this crate's capture acts on
 /// one, so it is inert in anyone else's hands.
 pub unsafe fn preflight_payload(
@@ -1235,11 +1244,15 @@ pub unsafe fn preflight_payload(
   // budget, the extent proof — is shared, which is what keeps the view
   // lane from having to re-earn a single one of them.
   //
-  // The **packet-payload** capture, not the general one: this range is
-  // an `AVPacket`'s payload inside that packet's own buffer, which is
-  // the one place libavformat's trailing-padding contract applies. The
-  // view lane records that, and the send leg is the only thing that
-  // reads it back — see `boundary::share_or_copy`.
+  // **The padding claim is the provenance's, never the buffer's.**
+  // libavcodec reads `AV_INPUT_BUFFER_PADDING_SIZE` bytes past a
+  // payload, and only a packet libavformat delivered comes with padding
+  // libavformat answers for. A caller's packet may have the capacity
+  // and still hold anything there — bytes it never wrote, or bytes that
+  // are not zero — and nothing this crate can read tells the two apart.
+  // So the claim is decided by who delivered the packet, here, and the
+  // view lane records it on the carrier; the send leg is the only thing
+  // that reads it back — see `boundary::share_or_copy`.
   //
   // SAFETY: `offset + len` was just proved to lie inside `buf_ptr`'s
   // own `size`, and `buf_ptr` is a live `AVBufferRef` the packet owns.
@@ -1249,6 +1262,7 @@ pub unsafe fn preflight_payload(
     offset,
     len,
     route,
+    padding: provenance.vouches_for_padding(),
   }))
 }
 
@@ -1271,18 +1285,24 @@ unsafe fn capture_payload<C: crate::FfmpegCarrier + crate::CarrierOps>(
     offset,
     len,
     route,
+    padding,
   } = plan;
   let carried = match route {
     // SAFETY: the preflight proved `offset + len` inside `buf_ptr`'s own
     // `size`, against a buffer the live packet holds. The range is the
-    // packet's payload: written wherever FFmpeg or this crate built the
-    // packet — a demuxer's read, `try_packet_copy`, `Packet::copy` — and
-    // otherwise exactly as initialised as ffmpeg-next's own safe
-    // `Packet::data` already lends it. Nothing writes through it while a
+    // packet's payload, initialised by the caller's `AVPacket` contract
+    // (every exported byte written). Nothing writes through it while a
     // view lives: this route is taken only for a buffer that is unshared
     // or whose other holders cannot write (`PayloadProvenance::route`),
-    // and this function's contract binds the packet's own owner.
-    CaptureRoute::Capture => unsafe { C::capture_packet_payload(buf_ptr, offset, len) },
+    // and this function's contract binds the packet's own owner. The
+    // packet-payload capture — the one that claims the padding — only
+    // where the provenance vouches for it: a packet libavformat
+    // delivered (`PayloadProvenance::vouches_for_padding`). A caller's
+    // packet takes the general capture, which claims nothing past the
+    // payload, so a decoder is never handed its buffer.
+    CaptureRoute::Capture if padding => unsafe { C::capture_packet_payload(buf_ptr, offset, len) },
+    // SAFETY: as above, without the padding claim.
+    CaptureRoute::Capture => unsafe { C::capture(buf_ptr, offset, len) },
     CaptureRoute::Copy => {
       // A demux-delivered packet whose buffer libavformat also holds.
       // Reading it here is race-free — every other reference is
@@ -1501,18 +1521,34 @@ mod tests {
 /// wrong: it refused every embedded cover picture, and then every
 /// packet from a queue-backed subtitle demuxer, which delivers
 /// `av_packet_ref`s of originals it keeps in its own queue.
+///
+/// # And what follows the payload
+///
+/// The same dichotomy decides the one claim a carrier may make about the
+/// bytes **after** its payload — see [`Self::vouches_for_padding`].
+/// libavcodec reads `AV_INPUT_BUFFER_PADDING_SIZE` bytes past every
+/// payload it is sent, and libavformat delivers each packet with that
+/// padding inside its buffer: zeroes it allocated, or the rest of the
+/// very packet a parser split the payload from — bytes libavformat
+/// wrote, which libavcodec is built to read past. **The library never
+/// vouches for a caller's buffer.** A caller's packet may have the
+/// capacity and hold anything in it — bytes nobody wrote, or bytes that
+/// are not zero — and no reading of the buffer tells those apart from
+/// padding. Its carrier claims nothing past the payload, and a decoder
+/// is handed a padded, zeroed copy of it instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PayloadProvenance {
   /// A packet a caller handed to a public conversion. A second
   /// reference may be a `Packet` with a safe `data_mut`; shared is
-  /// refused by name.
+  /// refused by name. Claims nothing about the bytes after the payload.
   CallerSupplied,
   /// A packet this crate's demux loop just received from
-  /// `av_read_frame`. Secondary references are libavformat's own.
+  /// `av_read_frame`. Secondary references are libavformat's own, and
+  /// so is the padding behind the payload.
   DemuxDelivered,
   /// The container's parked picture, whether hoisted at open or queued
-  /// as a stream's first packet. Written once while the container was
-  /// opened and never again.
+  /// as a stream's first packet. Written once, with its padding, while
+  /// the container was opened and never again.
   AttachedPicture,
 }
 
@@ -1533,6 +1569,27 @@ pub(crate) enum CaptureRoute {
 }
 
 impl PayloadProvenance {
+  /// Whether a carrier captured under this provenance may claim the
+  /// padding behind its payload — the claim that lets the view lane
+  /// share the payload's buffer with a decoder rather than copy it.
+  ///
+  /// | provenance | claims the padding | the argument |
+  /// |---|---|---|
+  /// | [`Self::CallerSupplied`] | **no** | the library never vouches for a caller's buffer: what follows the payload may be unwritten or nonzero, and is indistinguishable from padding |
+  /// | [`Self::DemuxDelivered`] | yes | libavformat delivered the packet, and every packet it delivers carries `AV_INPUT_BUFFER_PADDING_SIZE` bytes of its own writing behind the payload |
+  /// | [`Self::AttachedPicture`] | yes | libavformat built the parked picture the same way, with the same padding |
+  ///
+  /// The extent is a second, separate question — whether the padding
+  /// still fits behind a view — which the send leg asks of the carrier
+  /// itself (`boundary::share_or_copy`).
+  #[inline]
+  pub(crate) const fn vouches_for_padding(self) -> bool {
+    match self {
+      Self::CallerSupplied => false,
+      Self::DemuxDelivered | Self::AttachedPicture => true,
+    }
+  }
+
   /// What to do with a payload whose buffer has `shared` other
   /// references.
   ///

@@ -54,8 +54,8 @@ fn auto_open_decodes_at_least_one_frame() {
       continue;
     }
     loop {
-      // SAFETY: `packets()` reads each packet with `av_read_frame`, so libavformat wrote it,
-      // and nothing writes through it while the decoder may still read it.
+      // SAFETY: `packets()` reads each packet with `av_read_frame`, so libavformat wrote it
+      // and its padding, and nothing writes through it while the decoder may still read it.
       match unsafe { decoder.send_av_packet(&packet) } {
         Ok(Sent::Accepted) => break,
         // The two-offer rule, retired: the decoder says which it is,

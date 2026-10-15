@@ -75,10 +75,13 @@ in lockstep.
   The hardware-probe decoder's safe input is an `OwnedVideoPacket`, built
   into an `AVPacket` on the scoped submission road; an `ffmpeg_next`
   packet goes through `VideoDecoder::send_av_packet`, which is `unsafe`:
-  its caller vouches that the payload was written and that nothing
-  writes through it while the decoder may still read it (libavcodec keeps
-  a reference past the call). The stream decoders' hardware seam takes
-  the same raw road only for the packets they build themselves.
+  its caller vouches that the payload was written, that the
+  `AV_INPUT_BUFFER_PADDING_SIZE` bytes after it are zeroed or the padding
+  libavformat delivered it with, and that nothing writes through the
+  payload or the padding while the decoder may still read them
+  (libavcodec keeps a reference past the call). The stream decoders'
+  hardware seam takes the same raw road only for the packets they build
+  themselves.
 - **A custom channel map is not walked on the borrowed road.**
   `convert::audio_frame_from` refuses it by name
   (`ConvertError::UnverifiableChannelMap`); this crate's audio decoder

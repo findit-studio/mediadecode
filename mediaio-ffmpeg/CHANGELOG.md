@@ -89,6 +89,19 @@ The family — `mediadecode`, `mediadecode-ffmpeg`, `mediadecode-webcodecs`,
   rect's `text`, an ASS rect's `ass`, or a bitmap rect's plane, palette
   and geometry — never a field of another kind, which a producer need
   not have written. The `AVSubtitle` contract says so.
+- **A decoder is handed a buffer by reference only where the library
+  vouches for its padding.** libavcodec reads
+  `AV_INPUT_BUFFER_PADDING_SIZE` bytes past every payload, and only a
+  packet libavformat delivered — a demuxed packet, a stream's parked
+  picture — comes with padding libavformat answers for. A caller's packet
+  converted on the view lane claims nothing past its payload, whatever
+  its buffer holds there — the claim is the provenance's
+  (`PayloadProvenance`), never the buffer's — and its send copies it into
+  a fresh allocation with the padding zeroed.
+  The `AVPacket` contract states the padding clause for every road that
+  hands a packet to libavcodec: the padding is zeroed or libavformat's
+  own, and neither it nor the payload is written while the decoder may
+  read them.
 - `boundary::write_md_flags` is a safe fn: it writes one field of the
   `AVPacket` an `ffmpeg_next::Packet` keeps inline.
 - A `test-support` feature (off by default): the fault-subprocess

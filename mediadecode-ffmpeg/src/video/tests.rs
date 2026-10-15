@@ -168,6 +168,63 @@ impl Storage {
   }
 }
 
+/// The clip's packets as this crate's demuxer delivers them on the view
+/// lane, with the track's timebase.
+///
+/// Muxed into a Matroska file and read back through
+/// [`crate::FfmpegDemuxer`], so every carrier is a window onto a buffer
+/// libavformat delivered, with libavformat's padding behind the payload —
+/// the one shape a view send shares with a decoder
+/// (`boundary::share_or_copy`). A carrier converted from a caller's packet
+/// never is: the library does not vouch for a caller's padding, and its
+/// send is a copy.
+fn demuxed_view_packets(clip: &SyntheticClip) -> (Vec<crate::VideoPacket>, Timebase) {
+  use ffmpeg_next as ff;
+  use std::sync::atomic::{AtomicUsize, Ordering};
+
+  static NEXT: AtomicUsize = AtomicUsize::new(0);
+  let path = std::env::temp_dir().join(format!(
+    "mediadecode-view-clip-{}-{}.mkv",
+    std::process::id(),
+    NEXT.fetch_add(1, Ordering::Relaxed),
+  ));
+  // The encoder's ruler; the container picks its own at the header.
+  let encoder_tb = ff::Rational::new(1, 25);
+  {
+    let mut output = ff::format::output(&path).expect("a Matroska output");
+    {
+      let mut stream = output.add_stream(ff::codec::Id::MPEG4).expect("a stream");
+      stream.set_parameters(clip.parameters.clone());
+      stream.set_time_base(encoder_tb);
+    }
+    output.write_header().expect("the header");
+    let stream_tb = output.stream(0).expect("the stream").time_base();
+    for packet in &clip.packets {
+      let mut packet = packet.clone();
+      packet.set_stream(0);
+      packet.rescale_ts(encoder_tb, stream_tb);
+      packet.write_interleaved(&mut output).expect("a packet");
+    }
+    output.write_trailer().expect("the trailer");
+  }
+  let mut demuxer = crate::FfmpegDemuxer::open(&path).expect("open the clip");
+  let tb = demuxer.tracks_impl()[0].timebase();
+  let mut packets = Vec::new();
+  while let Some(packet) = demuxer.next_packet_impl().expect("a packet or the end") {
+    if let mediadecode::demuxer::DemuxedPacket::Video(packet) = packet {
+      packets.push(packet.into_parts().1);
+    }
+  }
+  drop(demuxer);
+  let _ = std::fs::remove_file(&path);
+  assert_eq!(
+    packets.len(),
+    clip.packets.len(),
+    "every packet comes back from the container",
+  );
+  (packets, tb)
+}
+
 /// A test HW seam modelling a probe that exhausts.
 ///
 /// * `inert()` — never driven (a placeholder seam).
@@ -1203,7 +1260,7 @@ impl Fx3Observation {
 /// turns this red at "addresses a retained view carrier's storage".
 #[test]
 fn a_rescued_packet_never_aliases_a_view_carrier() {
-  use crate::{CarrierVideoStreamDecoder, View, boundary::video_packet_from_ffmpeg_in};
+  use crate::{CarrierVideoStreamDecoder, View};
   use ffmpeg_next::packet::Ref;
   use mediadecode::decoder::VideoStreamDecoder;
 
@@ -1218,7 +1275,10 @@ fn a_rescued_packet_never_aliases_a_view_carrier() {
   //
   // So the probe records copies of its own, and that copy is the only
   // one: this law stands on it alone. That the submission does share is
-  // `a_view_send_in_the_probe_window_is_zero_copy`'s.
+  // `a_view_send_in_the_probe_window_is_zero_copy`'s — for the carriers a
+  // demuxer delivers, which is why these are demuxed: a carrier converted
+  // from a caller's packet is copied at the send, and would leave the
+  // recorder nothing to alias.
   let (w, h) = (128u32, 96u32);
   let mut clip = encode_synthetic_clip(w, h, 12, 100);
   let p1 = clip
@@ -1233,7 +1293,7 @@ fn a_rescued_packet_never_aliases_a_view_carrier() {
   corrupt_packet_payload(&mut clip.packets[p1]);
 
   let fail_at = p1 + 3;
-  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  let (carriers, tb) = demuxed_view_packets(&clip);
   let mut dec = CarrierVideoStreamDecoder::<View>::from_hw_inner_for_test(
     Box::new(FakeHw::failing(w, h, 0, fail_at)),
     clip.parameters.clone(),
@@ -1246,15 +1306,7 @@ fn a_rescued_packet_never_aliases_a_view_carrier() {
   let mut retained: Vec<crate::VideoPacket> = Vec::new();
   let mut dst = crate::boundary::empty_video_frame();
   let mut rescued: Vec<ffmpeg_next::Packet> = Vec::new();
-  for av_pkt in &clip.packets {
-    let Some(vpkt) =
-      // SAFETY: the packet came from `avcodec_receive_packet` or `av_read_frame`, which wrote
-      // its payload.
-      unsafe { video_packet_from_ffmpeg_in(av_pkt.clone(), tb, crate::PacketLimits::default()) }
-        .expect("a wrappable payload")
-    else {
-      continue;
-    };
+  for vpkt in carriers {
     match dec.send_packet(&vpkt) {
       Ok(Sent::Accepted | Sent::MustDrain) => {}
       Err(VideoDecodeError::Decode(Error::FallbackFailed(f))) => {
@@ -1333,7 +1385,7 @@ fn a_rescued_packet_never_aliases_a_view_carrier() {
 /// it red at "shares a retained carrier's storage".
 #[test]
 fn a_view_send_in_the_probe_window_is_zero_copy() {
-  use crate::{CarrierVideoStreamDecoder, View, boundary::video_packet_from_ffmpeg_in};
+  use crate::{CarrierVideoStreamDecoder, View};
   use ffmpeg_next::{ffi::av_buffer_get_ref_count, packet::Ref};
 
   const PADDING: usize = ffmpeg_next::ffi::AV_INPUT_BUFFER_PADDING_SIZE as usize;
@@ -1341,7 +1393,8 @@ fn a_view_send_in_the_probe_window_is_zero_copy() {
   let (w, h) = (64u32, 48u32);
   let clip = encode_synthetic_clip(w, h, 8, 100);
   let fail_at = 4;
-  let tb = Timebase::new(1, NonZeroI32::new(25).expect("nonzero"));
+  // Demuxed: the zero-copy send is for the packets libavformat delivers.
+  let (carriers, tb) = demuxed_view_packets(&clip);
   // Takes every packet into its history and delivers nothing, then
   // exhausts on the send at `fail_at`.
   let seam = FakeHw::failing(w, h, 0, fail_at);
@@ -1358,15 +1411,9 @@ fn a_view_send_in_the_probe_window_is_zero_copy() {
   // whole lane: an address can match only by being that storage.
   let mut retained: Vec<crate::VideoPacket> = Vec::new();
   let mut rescued: Vec<ffmpeg_next::Packet> = Vec::new();
-  for av_pkt in &clip.packets[..=fail_at] {
-    // SAFETY: the packet came from `avcodec_receive_packet` or `av_read_frame`, which wrote its
-    // payload.
-    let vpkt =
-      unsafe { video_packet_from_ffmpeg_in(av_pkt.clone(), tb, crate::PacketLimits::default()) }
-        .expect("a wrappable payload")
-        .expect("packet has a buffer");
-    // The premise: a packet payload with FFmpeg's padding behind it,
-    // the one shape `boundary::share_or_copy` shares.
+  for vpkt in carriers.into_iter().take(fail_at + 1) {
+    // The premise: a payload libavformat delivered, with its padding
+    // behind it, the one shape `boundary::share_or_copy` shares.
     let body = vpkt.data();
     assert_eq!(body.origin(), crate::view::Origin::PacketPayload);
     // SAFETY: the carrier holds this live, non-null reference; `size`

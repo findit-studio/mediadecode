@@ -2652,8 +2652,8 @@ fn the_hardware_road_still_delivers_frames_through_its_new_seat() {
     let mut packet = ffmpeg_next::Packet::empty();
     match packet.read(&mut input) {
       Ok(()) if packet.stream() == index => {
-        // SAFETY: `Packet::read` is `av_read_frame`, so libavformat wrote the packet, and
-        // nothing writes through it while the decoder may still read it.
+        // SAFETY: `Packet::read` is `av_read_frame`, so libavformat wrote the packet and its
+        // padding, and nothing writes through it while the decoder may still read it.
         if unsafe { decoder.send_av_packet(&packet) }.is_err() {
           continue;
         }
@@ -2718,8 +2718,8 @@ fn a_cropped_stream_is_judged_on_what_it_allocates_not_what_it_displays() {
       match packet.read(&mut input) {
         Ok(()) if packet.stream() == index => {
           // Answer dropped: see the note on the first ceiling probe above.
-          // SAFETY: `Packet::read` is `av_read_frame`, so libavformat wrote the packet, and
-          // nothing writes through it while the decoder may still read it.
+          // SAFETY: `Packet::read` is `av_read_frame`, so libavformat wrote the packet and its
+          // padding, and nothing writes through it while the decoder may still read it.
           let _ = unsafe { decoder.send_av_packet(&packet) }?;
           match decoder.receive_frame(&mut frame) {
             Ok(Received::Produced) => return Ok(()),
@@ -2913,8 +2913,8 @@ fn every_hardware_exit_names_the_coded_surface_refusal() {
         // receive below is about to take.
         //
         // SAFETY: `Packet::read` is `av_read_frame`, so libavformat wrote
-        // the packet, and nothing writes through it while the decoder
-        // may still read it.
+        // the packet and its padding, and nothing writes through it
+        // while the decoder may still read it.
         let outcome = unsafe { decoder.send_av_packet(&packet) }
           .and_then(|_| decoder.receive_frame(&mut frame));
         match outcome {
@@ -2983,8 +2983,8 @@ fn a_cheap_format_is_not_charged_the_worst_formats_price() {
       match packet.read(&mut input) {
         Ok(()) if packet.stream() == index => {
           // Answer dropped: see the note on the first ceiling probe above.
-          // SAFETY: `Packet::read` is `av_read_frame`, so libavformat wrote the packet, and
-          // nothing writes through it while the decoder may still read it.
+          // SAFETY: `Packet::read` is `av_read_frame`, so libavformat wrote the packet and its
+          // padding, and nothing writes through it while the decoder may still read it.
           let _ = unsafe { decoder.send_av_packet(&packet) }?;
           match decoder.receive_frame(&mut frame) {
             Ok(Received::Produced) => return Ok(()),
@@ -3095,8 +3095,8 @@ fn a_byte_refused_frame_is_named_on_every_software_road() {
         // receive below is about to take.
         //
         // SAFETY: `Packet::read` is `av_read_frame`, so libavformat wrote
-        // the packet, and nothing writes through it while the decoder
-        // may still read it.
+        // the packet and its padding, and nothing writes through it
+        // while the decoder may still read it.
         let outcome = unsafe { decoder.send_av_packet(&packet) }
           .and_then(|_| decoder.receive_frame(&mut frame));
         match outcome {

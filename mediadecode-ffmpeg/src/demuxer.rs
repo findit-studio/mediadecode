@@ -1166,9 +1166,12 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
       // libavformat's and none is written while the conversion reads;
       // `AttachedPicture` only where `is_streams_attached_pic` proved the
       // identity; a parked packet keeps the reading made when it was
-      // delivered. `packet` is this loop's own value and is never written
-      // through: it drops at the end of the iteration, or waits in
-      // `self.unconverted` to be read again.
+      // delivered. Either way libavformat delivered the packet, with its
+      // padding behind the payload, which is what lets the view lane's
+      // carrier claim that padding and a decoder share it. `packet` is
+      // this loop's own value and is never written through: it drops at
+      // the end of the iteration, or waits in `self.unconverted` to be
+      // read again.
       let converted = match info.kind() {
         TrackKind::Video => unsafe {
           boundary::video_packet_from_borrowed::<C>(

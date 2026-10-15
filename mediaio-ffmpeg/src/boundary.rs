@@ -394,6 +394,13 @@ pub const fn is_hardware_pix_fmt(raw: i32) -> bool {
 /// `ffmpeg_next::Error` rather than aborting the process — every
 /// `send_packet` path goes through this helper.
 ///
+/// **The copy is the decoder-safe body.** `av_new_packet` allocates
+/// `AV_INPUT_BUFFER_PADDING_SIZE` bytes past the payload and zeroes them
+/// (`packet_alloc`, `libavcodec/packet.c` 83–96 in FFmpeg 9.0.1) — the
+/// padding libavcodec reads past every payload. A carrier whose padding
+/// the library cannot vouch for reaches a decoder through this copy,
+/// never by reference.
+///
 /// Failure modes:
 /// * payload larger than `c_int::MAX` (would overflow `AVPacket.size`)
 ///   → `ffmpeg_next::Error::Other { errno: libc::EINVAL }`.
@@ -758,32 +765,37 @@ fn attach_side_data(out: &mut Packet, entries: &[SideDataEntry]) -> Result<(), P
 ///
 /// libavcodec is entitled to read `AV_INPUT_BUFFER_PADDING_SIZE` bytes
 /// **past** a packet's payload — bitstream readers do it routinely, and
-/// libavformat allocates that slack behind every packet it produces. A
-/// carrier viewing such a packet inherits the slack; a carrier this
-/// crate minted from a slice through
+/// libavformat delivers that padding, of its own writing, behind every
+/// packet it produces. A carrier viewing such a packet inherits it; a
+/// carrier this crate minted from a slice through
 /// [`FfmpegCarrier::from_bytes`](crate::FfmpegCarrier::from_bytes) does
-/// not.
+/// not, and neither does one viewing a **caller's** packet: the library
+/// never vouches for a foreign buffer, whose bytes past the payload may
+/// be unwritten or nonzero however much capacity it has.
 ///
-/// So sharing is offered only where the slack is **provable**, and
+/// So sharing is offered only where the padding is **provable**, and
 /// proving it takes two facts, not one:
 ///
-/// * **provenance** — the carrier must be a payload captured out of an
-///   `AVPacket`'s own buffer, which is the only place libavformat's
-///   padding contract applies. Trailing *capacity* is not padding: a
-///   video plane has more pixels after it and a resampler's output
-///   frame has more samples, and a bitstream reader running past the
-///   payload would eat either as though it were bitstream. Provenance
-///   is recorded at capture, where it is known, rather than inferred
-///   here from a size comparison that cannot tell padding from a
-///   neighbour;
+/// * **provenance** — the carrier must be the payload of a packet
+///   libavformat delivered (a demuxed packet, a parked picture), the
+///   only place libavformat's padding contract applies. Trailing
+///   *capacity* is not padding: a video plane has more pixels after it,
+///   a resampler's output frame has more samples, a caller's packet has
+///   whatever its caller left there, and a bitstream reader running past
+///   the payload would eat any of them as though it were bitstream.
+///   Provenance is recorded at capture, from who delivered the packet
+///   (`buffer::PayloadProvenance::vouches_for_padding`), rather than
+///   inferred here from a size comparison that cannot tell padding from
+///   a neighbour;
 /// * **extent** — the view must still leave at least the padding
 ///   between its end and the end of the buffer, because a payload can
 ///   be narrowed after capture.
 ///
-/// Where either fails, the packet is copied, which is what
-/// `try_packet_copy` allocates the padding for. Handing a decoder an
+/// Where either fails, the packet is copied, into the fresh allocation
+/// `try_packet_copy` makes with the padding zeroed. Handing a decoder an
 /// unpadded buffer would be an out-of-bounds read inside somebody
-/// else's bitstream reader, found by nobody.
+/// else's bitstream reader, found by nobody; handing it a caller's
+/// buffer would let it read whatever the caller left past the payload.
 ///
 /// # Safety
 ///
@@ -3881,6 +3893,129 @@ mod tests {
       unsafe { (*copied.as_ptr()).data as usize },
       narrowed.as_ref().as_ptr() as usize,
     );
+  }
+
+  /// **A caller's packet is never shared into a decoder, whatever its
+  /// buffer holds past the payload.**
+  ///
+  /// The packet is uniquely owned and its buffer has room for the
+  /// padding, but the bytes there are not zero — a shape a caller meeting
+  /// its contract can build, since the contract asks it for the payload
+  /// alone. The library does not vouch for a caller's buffer: the view
+  /// lane marks the capture foreign, and the submission a decoder is
+  /// handed is a fresh copy whose padding is zero. The same packet read
+  /// as libavformat's (`DemuxDelivered`, with libavformat's zeroed
+  /// padding restored) is shared, which keeps this law from passing for
+  /// the wrong reason.
+  ///
+  /// PLANT: `PayloadProvenance::vouches_for_padding` answering `true` for
+  /// a caller's packet turns this red at "the library vouches for nothing
+  /// past a caller's payload"; with that assertion gone, at "a caller's
+  /// buffer must be copied".
+  #[test]
+  fn a_callers_packet_with_nonzero_padding_is_copied_before_a_decoder_sees_it() {
+    use ffmpeg_next::packet::{Mut, Ref};
+
+    const PADDING: usize = ffmpeg_next::ffi::AV_INPUT_BUFFER_PADDING_SIZE as usize;
+    let payload = [0x5Au8; 48];
+    let tb = mediaspine::Timebase::default();
+    let limits = PacketLimits::default();
+
+    /// A packet whose payload is `payload` and whose padding is `fill`,
+    /// uniquely owned.
+    fn packet_with_padding(payload: &[u8], fill: u8) -> Packet {
+      let mut packet = Packet::copy(payload);
+      // SAFETY: `Packet::copy` allocated `payload.len() + PADDING` bytes
+      // (`av_new_packet`) behind the one reference `packet` holds; the
+      // write lands in the padding, inside that buffer.
+      unsafe {
+        let raw = packet.as_mut_ptr();
+        core::ptr::write_bytes((*raw).data.add(payload.len()), fill, PADDING);
+      }
+      packet
+    }
+
+    /// Where the submission a decoder is handed keeps its payload, and
+    /// the padding bytes behind it.
+    fn submitted(
+      packet: &mediaspine::packet::VideoPacket<VideoPacketExtra, crate::FfmpegBuffer>,
+      len: usize,
+      limits: PacketLimits,
+    ) -> (usize, Vec<u8>) {
+      // SAFETY: the submission is only read, inside the call that built
+      // it, and dropped there; nothing writes through it or keeps it.
+      unsafe {
+        with_ffmpeg_video_packet::<crate::View, _>(packet, limits, BodyRoute::Submission, |sent| {
+          // SAFETY: `sent` is live for the call; its payload of `len`
+          // bytes has `PADDING` more behind it inside its own buffer —
+          // `try_packet_copy`'s on a copy, the captured packet's on a
+          // share — and both are only read.
+          unsafe {
+            let data = (*sent.as_ptr()).data;
+            let padding = core::slice::from_raw_parts(data.add(len), PADDING).to_vec();
+            (data as usize, padding)
+          }
+        })
+      }
+      .expect("built")
+    }
+
+    // A caller's packet, its padding not zero.
+    let carried = {
+      let packet = packet_with_padding(&payload, 0xA5);
+      // SAFETY: `Packet::copy` wrote every byte of the payload, and the
+      // packet is consumed.
+      unsafe { video_packet_from_ffmpeg_in(packet, tb, limits) }
+        .expect("carriable")
+        .expect("a payload")
+    };
+    assert_eq!(
+      carried.data().origin(),
+      crate::view::Origin::Foreign,
+      "the library vouches for nothing past a caller's payload",
+    );
+    let (address, padding) = submitted(&carried, payload.len(), limits);
+    assert_ne!(
+      address,
+      carried.data().as_ref().as_ptr() as usize,
+      "a caller's buffer must be copied, never shared, before a decoder sees it",
+    );
+    assert!(
+      padding.iter().all(|&byte| byte == 0),
+      "the copy a decoder is handed has zeroed padding",
+    );
+
+    // The control: libavformat's packet, with libavformat's padding, is
+    // shared — so the copy above is the provenance's doing.
+    let delivered = {
+      let packet = packet_with_padding(&payload, 0);
+      // SAFETY: what `DemuxDelivered` claims is true of this packet: its
+      // payload was written by `Packet::copy` and its padding zeroed by
+      // `av_new_packet`, as libavformat delivers a packet, and no other
+      // reference to its buffer exists. It is only read, and dropped
+      // while the carrier keeps a reference of its own.
+      unsafe {
+        video_packet_from_borrowed::<crate::View>(
+          &packet,
+          tb,
+          limits,
+          crate::buffer::PayloadProvenance::DemuxDelivered,
+        )
+      }
+      .expect("carriable")
+      .expect("a payload")
+    };
+    assert_eq!(
+      delivered.data().origin(),
+      crate::view::Origin::PacketPayload
+    );
+    let (address, padding) = submitted(&delivered, payload.len(), limits);
+    assert_eq!(
+      address,
+      delivered.data().as_ref().as_ptr() as usize,
+      "a payload libavformat delivered, its padding behind it, is shared",
+    );
+    assert!(padding.iter().all(|&byte| byte == 0));
   }
 
   #[test]

@@ -101,6 +101,42 @@
 //! - *plain*: `flags`, `pts`, `dts`, `duration`, `stream_index`, each
 //!   entry's `type`.
 //!
+//! **A packet handed to a decoder owes two things more**, because
+//! libavcodec reads past the payload and keeps what it is sent. Every
+//! road that hands an `AVPacket` to libavcodec — `mediadecode-ffmpeg`'s
+//! raw `VideoDecoder::send_av_packet`, and the seams behind it — asks its
+//! caller for both:
+//!
+//! - **the padding**: the `AV_INPUT_BUFFER_PADDING_SIZE` bytes after the
+//!   payload lie inside `buf` and are initialised to zero — or are the
+//!   padding libavformat delivered the packet with, unmodified (see
+//!   below). Bitstream readers read 32 or 64 bits at a time past the end
+//!   of what they are given;
+//! - **no writer**: neither the payload nor that padding is written while
+//!   the decoder may still read them — `avcodec_send_packet` keeps a
+//!   reference to a refcounted packet's buffer past the call
+//!   (`libavcodec/avcodec.h` 2333–2335 in FFmpeg 9.0.1), and a
+//!   frame-threaded decoder reads it on another thread — until the
+//!   decoder is flushed or dropped.
+//!
+//! A packet `av_new_packet` allocated meets the padding clause:
+//! `Packet::new` and `Packet::copy`, an `av_packet_make_writable` copy,
+//! and this crate's builders all zero it (`packet_alloc`,
+//! `libavcodec/packet.c` 83–96). A packet `av_read_frame` delivered
+//! carries libavformat's own padding — zeroes where libavformat allocated
+//! the packet, or, where a parser split it out of a larger one in place
+//! (`libavformat/demux.c` 1253–1262), the bytes that follow it in that
+//! one — initialised either way, and what libavcodec is built to read.
+//!
+//! **The library never vouches for a caller's buffer.** A conversion from
+//! a caller's packet reads no byte past the payload and claims nothing
+//! about those bytes: its carrier is marked foreign, and the view lane's
+//! send hands a decoder a padded, zeroed copy of it rather than the
+//! caller's buffer. Only a packet this crate's demuxer took from
+//! libavformat — a demuxed packet, a stream's parked picture — reaches a
+//! decoder by reference: the claim is the packet's provenance
+//! (`buffer::PayloadProvenance`), never what its buffer holds.
+//!
 //! An `ffmpeg_next::Packet` keeps its `AVPacket` inline, so the packet
 //! itself is always live and aligned behind a borrow of one, and its
 //! `buf`, `data`, `size` and `side_data` are written only by libavformat,
