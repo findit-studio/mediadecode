@@ -154,8 +154,11 @@ fn every_path_mediagraph_names_still_resolves() {
   // `resampler`: the face is bounded on in `read_faces` above.
   let _: Option<mediadecode::resampler::AdapterAudioFrame<Loop, Bytes>> = None;
 
-  // `subtitle`.
+  // `subtitle`. A bitmap cue owns its regions, so these two exist at
+  // the allocating tiers only — the tiers mediagraph builds at.
+  #[cfg(any(feature = "std", feature = "alloc"))]
   let _: Option<mediadecode::subtitle::Bitmap<Bytes>> = None;
+  #[cfg(any(feature = "std", feature = "alloc"))]
   let _: Option<mediadecode::subtitle::BitmapRegion<Bytes>> = None;
   let _: Option<mediadecode::subtitle::SubtitlePayload<Bytes>> = None;
   let _: Option<mediadecode::subtitle::Text<Bytes>> = None;

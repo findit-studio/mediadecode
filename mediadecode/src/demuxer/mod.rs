@@ -322,10 +322,12 @@ mod tests {
   use core::num::NonZeroI32;
 
   use super::*;
+  #[cfg(any(feature = "std", feature = "alloc"))]
+  use crate::packet::AudioPacket;
   use crate::{
     Timebase,
     adapter::{AudioAdapter, SubtitleAdapter, VideoAdapter},
-    packet::{AudioPacket, SubtitlePacket},
+    packet::SubtitlePacket,
   };
 
   // `Vec` is not in the prelude in the alloc-without-std tier (the
