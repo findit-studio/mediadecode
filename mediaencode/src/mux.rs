@@ -5,23 +5,35 @@
 //! write per kind, and a [`finish`](Muxer::finish) that completes the
 //! file. It takes the very envelopes a demuxer delivers — a
 //! [`VideoTrackPacket`] carries its track coordinate with it — so a
-//! remux is a match:
+//! remux is a match. A refused packet comes back inside the error,
+//! untouched, and [`MuxError::map_packet`] puts it back in the envelope
+//! it arrived in:
 //!
 //! ```
 //! use mediaencode::{MuxError, Muxer};
 //! use mediaencode::mediaspine::demuxer::DemuxedPacket;
 //!
-//! /// Copies one demuxed packet into the output. Attachments travel with
-//! /// the track table the muxer was opened with, not as packets.
+//! /// Copies one demuxed packet into the output. A refused packet is
+//! /// handed back as the demuxer delivered it, to be retried, rerouted
+//! /// or dropped. Attachments travel with the track table the muxer was
+//! /// opened with, not as packets.
 //! fn remux<M: Muxer>(
 //!   muxer: &mut M,
 //!   packet: DemuxedPacket<M::Adapter, M::Buffer>,
-//! ) -> Result<(), MuxError<M::Error>> {
+//! ) -> Result<(), MuxError<M::Error, DemuxedPacket<M::Adapter, M::Buffer>>> {
 //!   match packet {
-//!     DemuxedPacket::Video(p) => muxer.write_video(p),
-//!     DemuxedPacket::Audio(p) => muxer.write_audio(p),
-//!     DemuxedPacket::Subtitle(p) => muxer.write_subtitle(p),
-//!     DemuxedPacket::Data(p) => muxer.write_data(p),
+//!     DemuxedPacket::Video(p) => muxer
+//!       .write_video(p)
+//!       .map_err(|e| e.map_packet(DemuxedPacket::Video)),
+//!     DemuxedPacket::Audio(p) => muxer
+//!       .write_audio(p)
+//!       .map_err(|e| e.map_packet(DemuxedPacket::Audio)),
+//!     DemuxedPacket::Subtitle(p) => muxer
+//!       .write_subtitle(p)
+//!       .map_err(|e| e.map_packet(DemuxedPacket::Subtitle)),
+//!     DemuxedPacket::Data(p) => muxer
+//!       .write_data(p)
+//!       .map_err(|e| e.map_packet(DemuxedPacket::Data)),
 //!     DemuxedPacket::Attachment(_) => Ok(()),
 //!   }
 //! }
@@ -42,16 +54,16 @@
 //! rule, not a runtime check:
 //!
 //! ```compile_fail,E0382
-//! # use mediaencode::{MuxError, Muxer};
+//! # use mediaencode::Muxer;
 //! # use mediaencode::mediaspine::demuxer::VideoTrackPacket;
 //! fn write_after_finish<M: Muxer>(
 //!   mut muxer: M,
 //!   first: VideoTrackPacket<M::Adapter, M::Buffer>,
 //!   second: VideoTrackPacket<M::Adapter, M::Buffer>,
-//! ) -> Result<(), MuxError<M::Error>> {
-//!   muxer.write_video(first)?;
-//!   muxer.finish()?;
-//!   muxer.write_video(second)
+//! ) {
+//!   let _ = muxer.write_video(first);
+//!   let _ = muxer.finish();
+//!   let _ = muxer.write_video(second);
 //! }
 //! ```
 
@@ -108,16 +120,42 @@ pub enum MuxRefusal {
   },
 }
 
-/// How a muxer call failed: a refusal every muxer names the same way,
-/// or the backend's own fault.
+/// How a muxer write failed: a refusal every muxer names the same way,
+/// with the packet handed back, or the backend's own fault.
+///
+/// `P` is the packet the write took — each write method names its own —
+/// so a refused packet can be retried, rerouted or dropped whatever its
+/// buffer and extras are: it is moved back, never cloned.
 #[derive(Debug, thiserror::Error)]
-pub enum MuxError<E> {
-  /// A refusal every muxer names the same way.
-  #[error(transparent)]
-  Refused(#[from] MuxRefusal),
-  /// The backend's own fault.
+pub enum MuxError<E, P> {
+  /// A refusal every muxer names the same way. Nothing was written.
+  #[error("{refusal}")]
+  Refused {
+    /// What was refused, and why.
+    refusal: MuxRefusal,
+    /// The packet offered, handed back untouched.
+    packet: P,
+  },
+  /// The backend's own fault. The packet is not handed back: a fault can
+  /// come after the backend has taken it, so it may have been consumed.
   #[error(transparent)]
   Fault(E),
+}
+
+impl<E, P> MuxError<E, P> {
+  /// Maps the handed-back packet, leaving the refusal — or the fault —
+  /// as it is. A caller that routes several kinds of packet through one
+  /// error type gives each refused packet back its envelope this way;
+  /// see the module's remux example.
+  pub fn map_packet<Q>(self, f: impl FnOnce(P) -> Q) -> MuxError<E, Q> {
+    match self {
+      Self::Refused { refusal, packet } => MuxError::Refused {
+        refusal,
+        packet: f(packet),
+      },
+      Self::Fault(fault) => MuxError::Fault(fault),
+    }
+  }
 }
 
 /// An opened container session that writes packets.
@@ -133,8 +171,9 @@ pub enum MuxError<E> {
 ///
 /// A packet for a track the muxer does not have, of the wrong kind for
 /// its track, or without the timestamp its track is ordered by is
-/// refused by name — [`MuxRefusal`], inside [`MuxError`] — and nothing
-/// is written.
+/// refused by name — [`MuxRefusal`], inside [`MuxError::Refused`] — and
+/// nothing is written. The refusal hands the packet back untouched, so
+/// the caller still owns it.
 pub trait Muxer {
   /// Backend-specific vocabulary — the container tier's, as the
   /// `Demuxer`'s is.
@@ -148,30 +187,31 @@ pub trait Muxer {
   fn write_video(
     &mut self,
     packet: VideoTrackPacket<Self::Adapter, Self::Buffer>,
-  ) -> Result<(), MuxError<Self::Error>>;
+  ) -> Result<(), MuxError<Self::Error, VideoTrackPacket<Self::Adapter, Self::Buffer>>>;
 
   /// Writes one audio packet to the track it names.
   fn write_audio(
     &mut self,
     packet: AudioTrackPacket<Self::Adapter, Self::Buffer>,
-  ) -> Result<(), MuxError<Self::Error>>;
+  ) -> Result<(), MuxError<Self::Error, AudioTrackPacket<Self::Adapter, Self::Buffer>>>;
 
   /// Writes one subtitle packet to the track it names.
   fn write_subtitle(
     &mut self,
     packet: SubtitleTrackPacket<Self::Adapter, Self::Buffer>,
-  ) -> Result<(), MuxError<Self::Error>>;
+  ) -> Result<(), MuxError<Self::Error, SubtitleTrackPacket<Self::Adapter, Self::Buffer>>>;
 
   /// Writes one timed-data packet to the track it names.
   fn write_data(
     &mut self,
     packet: DataTrackPacket<Self::Adapter, Self::Buffer>,
-  ) -> Result<(), MuxError<Self::Error>>;
+  ) -> Result<(), MuxError<Self::Error, DataTrackPacket<Self::Adapter, Self::Buffer>>>;
 
   /// Completes the container — the packets still held for
   /// interleaving, then whatever the format writes last — and ends the
-  /// session.
-  fn finish(self) -> Result<(), MuxError<Self::Error>>;
+  /// session. It takes no packet and refuses nothing; an error is the
+  /// backend's own fault.
+  fn finish(self) -> Result<(), Self::Error>;
 }
 
 #[cfg(test)]
@@ -181,7 +221,8 @@ mod tests {
   use mediaspine::{
     Timebase,
     adapter::{AudioAdapter, SubtitleAdapter, VideoAdapter},
-    packet::{AudioPacket, VideoPacket},
+    demuxer::{DataPacket, DemuxedPacket},
+    packet::{AudioPacket, PacketFlags, SubtitlePacket, VideoPacket},
   };
 
   use super::*;
@@ -251,129 +292,196 @@ mod tests {
       }
     }
 
-    fn admit(
+    /// What every write checks, from the packet's track, kind and decode
+    /// timestamp alone — the packet itself is not touched — answering
+    /// the timestamp to record.
+    fn check(
+      &self,
+      track: TrackIndex,
+      offered: TrackKind,
+      dts: Option<Timestamp>,
+    ) -> Result<Timestamp, MuxRefusal> {
+      let expected = *self
+        .kinds
+        .get(track.get())
+        .ok_or(MuxRefusal::UnknownTrack { track })?;
+      if expected != offered {
+        return Err(MuxRefusal::KindMismatch {
+          track,
+          expected,
+          offered,
+        });
+      }
+      let dts = dts.ok_or(MuxRefusal::MissingDts { track })?;
+      if let Some(last) = self.last[track.get()]
+        && dts.pts() <= last.pts()
+      {
+        return Err(MuxRefusal::NonMonotonicDts {
+          track,
+          last,
+          offered: dts,
+        });
+      }
+      Ok(dts)
+    }
+
+    /// Writes `packet`, or hands it back with the refusal.
+    fn admit<P>(
       &mut self,
       track: TrackIndex,
       offered: TrackKind,
       dts: Option<Timestamp>,
-    ) -> Result<(), MuxError<Fault>> {
-      let slot = track.get();
-      let expected = *self
-        .kinds
-        .get(slot)
-        .ok_or(MuxRefusal::UnknownTrack { track })?;
-      if expected != offered {
-        return Err(
-          MuxRefusal::KindMismatch {
-            track,
-            expected,
-            offered,
-          }
-          .into(),
-        );
+      packet: P,
+    ) -> Result<(), MuxError<Fault, P>> {
+      match self.check(track, offered, dts) {
+        Ok(dts) => {
+          self.last[track.get()] = Some(dts);
+          self.written += 1;
+          Ok(())
+        }
+        Err(refusal) => Err(MuxError::Refused { refusal, packet }),
       }
-      let dts = dts.ok_or(MuxRefusal::MissingDts { track })?;
-      if let Some(last) = self.last[slot]
-        && dts.pts() <= last.pts()
-      {
-        return Err(
-          MuxRefusal::NonMonotonicDts {
-            track,
-            last,
-            offered: dts,
-          }
-          .into(),
-        );
-      }
-      self.last[slot] = Some(dts);
-      self.written += 1;
-      Ok(())
     }
   }
+
+  type VTrack = VideoTrackPacket<Loopback, Bytes>;
+  type ATrack = AudioTrackPacket<Loopback, Bytes>;
+  type STrack = SubtitleTrackPacket<Loopback, Bytes>;
+  type DTrack = DataTrackPacket<Loopback, Bytes>;
 
   impl Muxer for Table {
     type Adapter = Loopback;
     type Buffer = Bytes;
     type Error = Fault;
 
-    fn write_video(&mut self, p: VideoTrackPacket<Loopback, Bytes>) -> Result<(), MuxError<Fault>> {
-      let (track, packet) = p.into_parts();
-      self.admit(track, TrackKind::Video, packet.dts())
+    fn write_video(&mut self, p: VTrack) -> Result<(), MuxError<Fault, VTrack>> {
+      let (track, dts) = (p.track(), p.packet().dts());
+      self.admit(track, TrackKind::Video, dts, p)
     }
 
-    fn write_audio(&mut self, p: AudioTrackPacket<Loopback, Bytes>) -> Result<(), MuxError<Fault>> {
-      let (track, packet) = p.into_parts();
-      self.admit(track, TrackKind::Audio, packet.dts())
+    fn write_audio(&mut self, p: ATrack) -> Result<(), MuxError<Fault, ATrack>> {
+      let (track, dts) = (p.track(), p.packet().dts());
+      self.admit(track, TrackKind::Audio, dts, p)
     }
 
-    fn write_subtitle(
-      &mut self,
-      p: SubtitleTrackPacket<Loopback, Bytes>,
-    ) -> Result<(), MuxError<Fault>> {
-      let (track, packet) = p.into_parts();
-      self.admit(track, TrackKind::Subtitle, packet.pts())
+    fn write_subtitle(&mut self, p: STrack) -> Result<(), MuxError<Fault, STrack>> {
+      let (track, pts) = (p.track(), p.packet().pts());
+      self.admit(track, TrackKind::Subtitle, pts, p)
     }
 
-    fn write_data(&mut self, p: DataTrackPacket<Loopback, Bytes>) -> Result<(), MuxError<Fault>> {
-      let (track, packet) = p.into_parts();
-      self.admit(track, TrackKind::Data, packet.pts())
+    fn write_data(&mut self, p: DTrack) -> Result<(), MuxError<Fault, DTrack>> {
+      let (track, pts) = (p.track(), p.packet().pts());
+      self.admit(track, TrackKind::Data, pts, p)
     }
 
-    fn finish(self) -> Result<(), MuxError<Fault>> {
+    fn finish(self) -> Result<(), Fault> {
       Ok(())
     }
   }
 
-  fn video(track: usize, dts: Option<i64>) -> VideoTrackPacket<Loopback, Bytes> {
+  /// Every packet the laws offer carries these bytes, so a handed-back
+  /// packet can be checked to hold the very slice it was offered with.
+  const PAYLOAD: &[u8] = b"payload";
+
+  fn video(track: usize, dts: Option<i64>) -> VTrack {
     VideoTrackPacket::new(
       TrackIndex::new(track),
-      VideoPacket::new(&[][..], ()).with_dts(dts.map(ms)),
+      VideoPacket::new(PAYLOAD, ())
+        .with_dts(dts.map(ms))
+        .with_pts(dts.map(ms))
+        .with_flags(PacketFlags::KEY),
     )
   }
 
-  fn audio(track: usize, dts: i64) -> AudioTrackPacket<Loopback, Bytes> {
+  fn audio(track: usize, dts: i64) -> ATrack {
     AudioTrackPacket::new(
       TrackIndex::new(track),
-      AudioPacket::new(&[][..], ()).with_dts(Some(ms(dts))),
+      AudioPacket::new(PAYLOAD, ()).with_dts(Some(ms(dts))),
     )
+  }
+
+  fn subtitle(track: usize, pts: i64) -> STrack {
+    SubtitleTrackPacket::new(
+      TrackIndex::new(track),
+      SubtitlePacket::new(PAYLOAD, ()).with_pts(Some(ms(pts))),
+    )
+  }
+
+  fn data(track: usize, pts: i64) -> DTrack {
+    DataTrackPacket::new(
+      TrackIndex::new(track),
+      DataPacket::new(PAYLOAD, ()).with_pts(Some(ms(pts))),
+    )
+  }
+
+  /// Asserts that `back` is the packet `kept` was cloned from before it
+  /// was offered: the same track, the very bytes it was offered with,
+  /// and the same timestamps and flags.
+  macro_rules! assert_handed_back {
+    ($back:expr, $kept:expr; $($field:ident),*) => {{
+      let (back, kept) = (&$back, &$kept);
+      assert_eq!(back.track(), kept.track(), "the same track");
+      let (b, k) = (back.packet(), kept.packet());
+      assert!(
+        core::ptr::eq(*b.data(), *k.data()),
+        "the very bytes it was offered with"
+      );
+      $(assert_eq!(b.$field(), k.$field(), stringify!($field));)*
+    }};
+  }
+
+  /// The refusal and the handed-back packet, or a panic naming what came
+  /// instead.
+  fn refused<P>(result: Result<(), MuxError<Fault, P>>) -> (MuxRefusal, P) {
+    match result {
+      Err(MuxError::Refused { refusal, packet }) => (refusal, packet),
+      Err(MuxError::Fault(fault)) => panic!("expected a refusal, got the fault {fault:?}"),
+      Ok(()) => panic!("expected a refusal, the packet was written"),
+    }
   }
 
   #[test]
   fn a_packet_for_a_track_the_muxer_lacks_is_refused_by_name() {
     let mut muxer = Table::new();
-    assert!(matches!(
-      muxer.write_video(video(5, Some(0))),
-      Err(MuxError::Refused(MuxRefusal::UnknownTrack { track })) if track.get() == 5
-    ));
+    let offered = video(5, Some(0));
+    let kept = offered.clone();
+    let (refusal, back) = refused(muxer.write_video(offered));
+    assert!(matches!(refusal, MuxRefusal::UnknownTrack { track } if track.get() == 5));
+    assert_handed_back!(back, kept; pts, dts, duration, flags);
     assert_eq!(muxer.written, 0, "nothing is written for a refused packet");
   }
 
   #[test]
   fn a_packet_of_the_wrong_kind_is_refused_by_name() {
     let mut muxer = Table::new();
+    let offered = audio(0, 0);
+    let kept = offered.clone();
+    let (refusal, back) = refused(muxer.write_audio(offered));
     assert!(matches!(
-      muxer.write_audio(audio(0, 0)),
-      Err(MuxError::Refused(MuxRefusal::KindMismatch {
+      refusal,
+      MuxRefusal::KindMismatch {
         expected: TrackKind::Video,
         offered: TrackKind::Audio,
         ..
-      }))
+      }
     ));
+    assert_handed_back!(back, kept; pts, dts, duration, flags);
   }
 
   #[test]
   fn a_packet_without_a_decode_timestamp_is_refused_by_name() {
     let mut muxer = Table::new();
-    assert!(matches!(
-      muxer.write_video(video(0, None)),
-      Err(MuxError::Refused(MuxRefusal::MissingDts { .. }))
-    ));
+    let offered = video(0, None);
+    let kept = offered.clone();
+    let (refusal, back) = refused(muxer.write_video(offered));
+    assert!(matches!(refusal, MuxRefusal::MissingDts { .. }));
+    assert_handed_back!(back, kept; pts, dts, duration, flags);
   }
 
   /// **Within a track, decode timestamps increase; across tracks the
   /// packets interleave freely.** An audio packet stamped before the
   /// last video packet is written; a video packet that does not advance
-  /// its own track is refused, naming both timestamps.
+  /// its own track is refused, naming both timestamps, and handed back.
   #[test]
   fn a_decode_timestamp_that_does_not_advance_its_track_is_refused_by_name() {
     let mut muxer = Table::new();
@@ -383,21 +491,81 @@ mod tests {
     muxer
       .write_audio(audio(1, 0))
       .expect("another track, interleaved");
-    match muxer.write_video(video(0, Some(40))) {
-      Err(MuxError::Refused(MuxRefusal::NonMonotonicDts {
+    let offered = video(0, Some(40));
+    let kept = offered.clone();
+    let (refusal, back) = refused(muxer.write_video(offered));
+    match refusal {
+      MuxRefusal::NonMonotonicDts {
         track,
         last,
         offered,
-      })) => {
+      } => {
         assert_eq!(track.get(), 0);
         assert_eq!((last.pts(), offered.pts()), (40, 40));
       }
       other => panic!("expected the monotonicity refusal, got {other:?}"),
     }
+    assert_handed_back!(back, kept; pts, dts, duration, flags);
+    // The handed-back packet is the caller's again: restamped, it goes.
+    let (track, packet) = back.into_parts();
     muxer
-      .write_video(video(0, Some(80)))
-      .expect("an advancing packet");
+      .write_video(VideoTrackPacket::new(track, packet.with_dts(Some(ms(80)))))
+      .expect("the same packet, advancing");
     assert_eq!(muxer.written, 3);
     muxer.finish().expect("the session ends cleanly");
+  }
+
+  /// **Every write hands a refused packet back untouched** — the
+  /// subtitle and data writes as well as the two above, here refused for
+  /// the kind of the track they name.
+  #[test]
+  fn every_write_hands_a_refused_packet_back_untouched() {
+    let mut muxer = Table::new();
+
+    let offered = subtitle(0, 10);
+    let kept = offered.clone();
+    let (refusal, back) = refused(muxer.write_subtitle(offered));
+    assert!(matches!(
+      refusal,
+      MuxRefusal::KindMismatch {
+        offered: TrackKind::Subtitle,
+        ..
+      }
+    ));
+    assert_handed_back!(back, kept; pts, duration, flags);
+
+    let offered = data(1, 10);
+    let kept = offered.clone();
+    let (refusal, back) = refused(muxer.write_data(offered));
+    assert!(matches!(
+      refusal,
+      MuxRefusal::KindMismatch {
+        offered: TrackKind::Data,
+        ..
+      }
+    ));
+    assert_handed_back!(back, kept; pts, duration, flags);
+    assert_eq!(muxer.written, 0);
+  }
+
+  /// **A remux gets a refused packet back in the envelope it came in.**
+  /// [`MuxError::map_packet`] carries the refusal over unchanged and
+  /// wraps the packet, as the module's remux example does.
+  #[test]
+  fn map_packet_puts_a_refused_packet_back_in_its_envelope() {
+    let mut muxer = Table::new();
+    let offered = video(7, Some(0));
+    let kept = offered.clone();
+    let routed: Result<(), MuxError<Fault, DemuxedPacket<Loopback, Bytes>>> = muxer
+      .write_video(offered)
+      .map_err(|e| e.map_packet(DemuxedPacket::Video));
+    let (refusal, back) = refused(routed);
+    assert!(matches!(refusal, MuxRefusal::UnknownTrack { track } if track.get() == 7));
+    match back {
+      DemuxedPacket::Video(back) => {
+        assert_handed_back!(back, kept; pts, dts, duration, flags);
+      }
+      other => panic!("expected the video envelope, got {other:?}"),
+    }
   }
 }
