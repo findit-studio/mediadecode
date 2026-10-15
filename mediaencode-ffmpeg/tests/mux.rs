@@ -840,3 +840,62 @@ fn l7_a_time_that_lands_on_no_timestamp_is_refused_by_name() {
     "only what was admitted was written"
   );
 }
+
+/// **L8 — presentation order is judged on the counts libavformat is
+/// handed.** Into Matroska's 1/1000 stream, a packet presented at
+/// 3/10 000 s and decoded at 4/10 000 s counts to one tick, 0, for both —
+/// which libavformat writes, as a stream copy of a file with sub-tick
+/// jitter does — so it is admitted. One presented at 30 ms and decoded at
+/// 40 ms is an inversion of the counts: refused by the face's name with
+/// the times it was offered with, not their counts, and handed back.
+#[test]
+fn l8_presentation_order_is_judged_on_the_counts_libavformat_is_handed() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = corpus.multi_track_mkv();
+  let video = owned_video_and_font(&source, 2).video;
+  let target = output(&corpus, "l8.mkv");
+  let (mut muxer, _) = FfmpegOwnedMuxer::open(
+    File::create(&target).expect("create"),
+    ContainerName::MATROSKA,
+    video_table(&source),
+    &[],
+    PacketLimits::default(),
+  )
+  .expect("open");
+  let tenth_ms = Timebase::new(1, NonZeroI32::new(10_000).expect("non-zero"));
+  let at = |packet: &VideoTrackPacket<Ffmpeg, FfmpegBytes>, pts: i64, dts: i64| {
+    let (_, packet) = packet.clone().into_parts();
+    VideoTrackPacket::new(
+      TrackIndex::new(0),
+      packet
+        .with_pts(Some(Timestamp::new(pts, tenth_ms)))
+        .with_dts(Some(Timestamp::new(dts, tenth_ms))),
+    )
+  };
+
+  muxer
+    .write_video(at(&video[0], 3, 4))
+    .expect("presented and decoded within one tick: admitted");
+
+  let offered = at(&video[1], 300, 400);
+  let (refusal, back) = refused(muxer.write_video(offered.clone()));
+  match refusal {
+    MuxRefusal::PtsBeforeDts { track, pts, dts } => {
+      assert_eq!(track.get(), 0);
+      assert_eq!(
+        (pts.pts(), pts.timebase(), dts.pts(), dts.timebase()),
+        (300, tenth_ms, 400, tenth_ms),
+        "the times the packet carries, not their counts",
+      );
+    }
+    other => panic!("expected the presentation-order refusal, got {other:?}"),
+  }
+  assert!(back.packet().data().ptr_eq(offered.packet().data()));
+  assert_eq!(back.packet().pts(), offered.packet().pts());
+  assert_eq!(back.packet().dts(), offered.packet().dts());
+
+  muxer.finish().expect("the container is finished");
+  let written = &packets(&target)[0];
+  assert_eq!(written.len(), 1, "only the admitted packet was written");
+  assert_eq!(written[0].pts, Some(ms(0)), "presented at its one tick");
+}

@@ -27,17 +27,23 @@
 //!
 //! # Writing: the face's refusals, then the container's
 //!
-//! Every write keeps the face's rules first — the track exists and is of
-//! the packet's kind, it carries the decode time its track is ordered
-//! by, which does not go back ([`check_decode_order`]), and it is not
-//! presented before it is decoded ([`check_presentation_order`]) — each
-//! refused as a [`MuxRefusal`] with the packet handed back. Then the
-//! container's own: a container without `AVFMT_TS_NONSTRICT` needs a
-//! video or audio stream's decode times strictly increasing, which
-//! libavformat would refuse only after taking the packet; this muxer
-//! refuses the repeat first, by its own name
-//! ([`FfmpegMuxRefusal::RepeatedDts`], in [`MuxError::Backend`]), and
-//! hands the packet back.
+//! Every write keeps the face's rules — the track exists and is of the
+//! packet's kind, it carries the decode time its track is ordered by,
+//! which does not go back ([`check_decode_order`]), and it is not
+//! presented before it is decoded — each refused as a [`MuxRefusal`]
+//! with the packet handed back. The presentation rule is judged as
+//! libavformat judges it, on the counts it is handed in the stream's own
+//! time base ([`check_presentation_order`] over those counts), so two
+//! times a hair apart that count to one tick are written, as a stream
+//! copy writes them; its refusal names the times the packet carries.
+//! The counts come first: a time the stream cannot count — past `i64`,
+//! or landing on libavformat's no-timestamp value — is refused by the
+//! muxer's own name ([`FfmpegMuxRefusal::Unrepresentable`], in
+//! [`MuxError::Backend`]). Then the container's own rule: a container
+//! without `AVFMT_TS_NONSTRICT` needs a video or audio stream's decode
+//! times strictly increasing, which libavformat would refuse only after
+//! taking the packet; this muxer refuses the repeat first, by its own
+//! name ([`FfmpegMuxRefusal::RepeatedDts`]), and hands the packet back.
 
 use core::{fmt, marker::PhantomData};
 use std::io::{Seek, Write};
@@ -564,7 +570,8 @@ where
       .map_err(|error| MuxFault::new(MuxStage::Finish, error))
   }
 
-  /// Judges a timed packet: the face's rules, then the container's.
+  /// Judges a timed packet: the face's rules — the presentation rule on
+  /// the counts libavformat is handed — then the container's.
   fn admit(
     &self,
     track: TrackIndex,
@@ -586,7 +593,6 @@ where
     }
     let dts = dts.ok_or(Refusal::Portable(MuxRefusal::MissingDts { track }))?;
     check_decode_order(track, state.last, dts).map_err(Refusal::Portable)?;
-    check_presentation_order(track, pts, dts).map_err(Refusal::Portable)?;
     // A timed track of a known kind always has its stream: only an
     // attachment track takes none, and its kind is refused above.
     let Some((stream, time_base)) = state.stream else {
@@ -617,6 +623,23 @@ where
     };
     let dts_ticks = stamp(dts)?;
     let pts_ticks = pts.map(stamp).transpose()?;
+    // The face's presentation rule, applied as the container applies it:
+    // to the counts libavformat is handed, in the stream's time base
+    // (`mux.c` 567–572). Two instants a hair apart may count to one tick,
+    // and a packet whose presentation and decode times do is one
+    // libavformat writes — as a stream copy of a file with sub-tick
+    // jitter does — so it is admitted. The refusal names the times the
+    // packet carries, not their counts.
+    if let (Some(pts), Some(pts_ticks)) = (pts, pts_ticks) {
+      let stored = |ticks: i64| Timestamp::new(ticks, time_base);
+      if check_presentation_order(track, Some(stored(pts_ticks)), stored(dts_ticks)).is_err() {
+        return Err(Refusal::Portable(MuxRefusal::PtsBeforeDts {
+          track,
+          pts,
+          dts,
+        }));
+      }
+    }
     let duration_ticks = duration.map(count).transpose()?.unwrap_or(0);
     // libavformat's rule, exactly: nothing is checked while the last
     // decode time is zero — its counter starts there — and a repeat is

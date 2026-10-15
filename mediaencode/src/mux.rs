@@ -172,9 +172,11 @@ pub enum MuxRefusal {
     offered: Timestamp,
   },
   /// The packet's presentation timestamp is earlier than its decode
-  /// timestamp. A picture cannot be shown before it is decoded, and no
-  /// container records one that is — see [`check_presentation_order`],
-  /// the rule itself.
+  /// timestamp, as the container stores the two. A picture cannot be
+  /// shown before it is decoded, and no container records one that is —
+  /// see [`check_presentation_order`], the rule itself, and why a
+  /// backend judges the stored times rather than the instants offered.
+  /// The fields are the times the packet carries.
   #[error(
     "a packet on track {} is presented at {} before it is decoded at {}",
     .track.get(), .pts.pts(), .dts.pts()
@@ -226,15 +228,27 @@ pub fn check_decode_order(
 }
 
 /// The portable presentation-order rule, for a muxer to apply to each
-/// packet: a packet is presented no earlier than it is decoded —
-/// [`MuxRefusal::PtsBeforeDts`] otherwise. A packet with no presentation
-/// timestamp has nothing to judge. Timestamps compare by the instant they
-/// name, so the two may be stamped in different rulers.
+/// packet **as its container stores it**: a packet is presented no
+/// earlier than it is decoded — [`MuxRefusal::PtsBeforeDts`] otherwise.
+/// A packet with no presentation timestamp has nothing to judge.
 ///
-/// Every container keeps it — libavformat refuses such a packet itself
-/// (`compute_muxer_pkt_fields`, `libavformat/mux.c` 567–572 in FFmpeg
-/// 9.0.1), as a fault that consumes the packet — so the face names it
-/// first, and hands the packet back.
+/// It is the container's comparison, so a backend applies it to the two
+/// times in the representation it hands its container — counted in the
+/// stream's own time base, where that is how the container keeps them —
+/// and not to the instants a caller offered. **It is no law over
+/// instants**: two times a hair apart may count to one tick of the
+/// stream, and a container that stores them as one tick writes the
+/// packet, as a stream copy of a file with sub-tick jitter must. The
+/// refusal a backend returns names the times the packet carries. The
+/// timestamps given compare by the instant they name, so they may be
+/// stamped in different rulers; a backend whose container stores the
+/// instants themselves passes them as they are.
+///
+/// Every container keeps the rule over what it stores — libavformat
+/// refuses such a packet itself (`compute_muxer_pkt_fields`,
+/// `libavformat/mux.c` 567–572 in FFmpeg 9.0.1), comparing the counts it
+/// is handed, as a fault that consumes the packet — so a backend names
+/// it first, and hands the packet back.
 pub fn check_presentation_order(
   track: TrackIndex,
   pts: Option<Timestamp>,

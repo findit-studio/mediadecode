@@ -29,9 +29,13 @@ parameters are rebuilt from, an attachment track with its one file.
 - **Writing keeps the face's rules, then the container's.** A packet
   for no track, of the wrong kind, without a decode time, decoded before
   the last or presented before it is decoded is refused by the face's
-  name; an equal decode time on a strict container's video or audio
-  stream — MP4 — by the muxer's own (`FfmpegMuxRefusal::RepeatedDts`).
-  Every refusal hands the packet back untouched.
+  name — presentation judged, as libavformat judges it, on the counts in
+  the stream's time base, so two times that count to one tick are
+  written. A time the stream cannot count, or one that lands on
+  libavformat's no-timestamp value (`FfmpegMuxRefusal::Unrepresentable`),
+  and an equal decode time on a strict container's video or audio
+  stream — MP4 — (`FfmpegMuxRefusal::RepeatedDts`) are refused by the
+  muxer's own. Every refusal hands the packet back untouched.
 - **Packets are copied into libavformat**, never lent, and a sink that
   panics is caught before C sees the unwind, named in the muxer's fault,
   and never called again.
