@@ -423,6 +423,79 @@ fn a_feature_the_timeline_has_no_word_for_is_refused_by_name() {
 }
 
 #[test]
+fn a_gap_of_some_length_after_the_last_clip_is_refused() {
+  // The sample's leading gap, `length` frames long.
+  let gap = |root: &mut Value, length: &str| {
+    let mut gap = at(root, GAP).clone();
+    set(&mut gap, "source_range.duration", "value", number(length));
+    gap
+  };
+  let push = |root: &mut Value, dotted: &str, child: Value| {
+    let Value::Array(children) = at(root, dotted) else {
+      unreachable!()
+    };
+    children.push(child);
+  };
+  // Ten frames after `b`, the track's last clip, which OpenTimelineIO
+  // counts in the track's duration.
+  assert_eq!(
+    read(|root| {
+      let trailing = gap(root, "10.0");
+      push(root, &format!("{TRACK}.children"), trailing);
+    }),
+    Err(feature(
+      Feature::TrailingGap,
+      &format!("{TRACK}.children.5")
+    )),
+  );
+  // A track of one gap, ten frames long, where the timeline's track would
+  // hold no time.
+  assert_eq!(
+    read(|root| {
+      let mut track = at(root, TRACK).clone();
+      let only = gap(root, "10.0");
+      set(&mut track, "", "children", Value::Array(vec![only]));
+      set(&mut track, "", "markers", Value::Array(vec![]));
+      push(root, "tracks.children", track);
+    }),
+    Err(feature(Feature::TrailingGap, "tracks.children.1.children.0")),
+  );
+  // A gap of no length there carries nothing.
+  assert_eq!(
+    read(|root| {
+      let empty = gap(root, "0.0");
+      push(root, &format!("{TRACK}.children"), empty);
+    }),
+    Ok(sample()),
+  );
+  // The export writes one after a fade-out at a track's end, and reads it
+  // back.
+  let mut faded = sample();
+  let b = &mut faded.tracks_mut()[0].clips_mut()[1];
+  let fades = b
+    .fades()
+    .with_out(Some(Fade::new(Duration::new(4, edit()), FadeShape::EqualPower)));
+  b.set_fades(fades);
+  for target in [OtioTarget::V0_15Plus, OtioTarget::Legacy] {
+    let written = to_otio(&faded, target).unwrap();
+    let mut root = json::parse(&written).unwrap();
+    // `[gap, fade in, a, dissolve, b, fade out, gap]`.
+    let last = format!("{TRACK}.children.6");
+    assert_eq!(
+      at(&mut root, &format!("{last}.OTIO_SCHEMA")),
+      &text("Gap.1"),
+      "{target:?}"
+    );
+    assert_eq!(
+      at(&mut root, &format!("{last}.source_range.duration.value")),
+      &number("0.0"),
+      "{target:?}"
+    );
+    assert_eq!(from_otio(&written), Ok(faded.clone()), "{target:?}");
+  }
+}
+
+#[test]
 fn a_count_or_rate_that_does_not_land_exactly_is_refused() {
   assert_eq!(
     read(|root| set(

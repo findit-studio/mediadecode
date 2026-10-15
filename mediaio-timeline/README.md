@@ -302,7 +302,9 @@ target, it reads that very timeline back — every count, timebase and rate
 as the model held it. It holds each `RationalTime` to the exact words: its
 rate the `f64` of its exact ruler, bit for bit, and its value a whole count
 within ±2^53, read from its digits. It lays each track's items end to end
-from zero, as OpenTimelineIO places them, and validates what it read.
+from zero, as OpenTimelineIO places them, and validates what it read. A
+track ends with its last clip, so a gap of some length after it — which
+OpenTimelineIO counts in the track's duration — is refused.
 
 A document from another writer is read where it uses only what the
 timeline models and carries those words. Nothing is dropped: everything
@@ -311,8 +313,9 @@ not model there (`Unreadable::Schema`: an effect, a time warp, a nested
 stack, a reference other than an `ExternalReference.1`, a marker on a gap),
 a key, value or note it has no word for (`Unreadable::Feature`: another
 writer's metadata, a track kind or transition type it does not know, a
-trim on a track, a marker color outside the eleven, …), and a count or rate
-that does not land exactly (`Unreadable::Inexact`). A key is read only
+trim on a track, a marker color outside the eleven, a gap of some length
+after a track's last clip, …), and a count or rate that does not land
+exactly (`Unreadable::Inexact`). A key is read only
 where it carries nothing — `null`, an empty list, `enabled` as `true` — or
 what the timeline keeps.
 

@@ -20,7 +20,9 @@
 //! the model counts it in, exactly ([`Unreadable::Inexact`] otherwise).
 //! Records are not written: like OpenTimelineIO, the reader lays a track's
 //! items end to end from zero, each clip as long as its source range at the
-//! edit rate.
+//! edit rate. A track's time ends with its last clip, so a gap of some
+//! length after it — which OpenTimelineIO counts in the track's duration —
+//! is refused by name ([`Feature::TrailingGap`]).
 
 use core::str::FromStr;
 use std::{boxed::Box, vec, vec::Vec};
@@ -606,7 +608,11 @@ impl Child {
 
 /// A track's clips, each at its record, and its transitions: its items
 /// laid end to end from zero, as OpenTimelineIO places them, each fade on
-/// the clip beside it and each dissolve on the cut it straddles.
+/// the clip beside it and each dissolve on the cut it straddles. A gap
+/// after the last clip is read only where it has no length — the gap the
+/// export writes after a fade-out at the track's end — as the track ends
+/// with that clip: one of some length is refused by name, every gap of a
+/// track with no clip among them.
 fn children(
   object: &Object<'_>,
   edit: Ruler,
@@ -630,6 +636,7 @@ fn children(
   }
 
   let kinds: Vec<Kind> = read.iter().map(Child::kind).collect();
+  let last_clip = kinds.iter().rposition(|&kind| kind == Kind::Clip);
   let mut cursor: i64 = 0;
   let mut clips: Vec<Clip> = Vec::new();
   let mut dissolves = Vec::new();
@@ -648,7 +655,12 @@ fn children(
       return Err(shape(&here, "a transition between two items"));
     }
     match child {
-      Child::Gap(length) => cursor = advance(cursor, length, &here)?,
+      Child::Gap(length) => {
+        if length > 0 && last_clip.is_none_or(|last| index > last) {
+          return Err(feature(&here, Feature::TrailingGap));
+        }
+        cursor = advance(cursor, length, &here)?;
+      }
       Child::Clip(mut clip, length) => {
         let end = advance(cursor, length, &here)?;
         clip.set_record(TimeRange::new(cursor, end, ticks));

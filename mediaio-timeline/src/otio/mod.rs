@@ -673,8 +673,11 @@ impl core::error::Error for Shape {}
 /// for bit, and its value a whole count within ±2^53. It lays each track's
 /// items end to end from zero, as OpenTimelineIO places them — a clip as
 /// long as its source range at the edit rate — and puts each fade on the
-/// clip beside its gap and each dissolve on the cut it straddles. Both
-/// clip schemas are read: `Clip.2` and `Clip.1`.
+/// clip beside its gap and each dissolve on the cut it straddles. A track
+/// ends with its last clip: a gap of some length after it, which
+/// OpenTimelineIO counts in the track's duration, is refused
+/// ([`Feature::TrailingGap`]). Both clip schemas are read: `Clip.2` and
+/// `Clip.1`.
 ///
 /// A document from another writer is read where it uses only what the
 /// timeline models and carries the crate's words. A schema the timeline
@@ -871,6 +874,12 @@ pub enum Feature {
   NoMedia,
   /// A gap whose source range starts anywhere but zero.
   GapStart,
+  /// A gap of some length after a track's last clip — any gap of a track
+  /// with no clip among them. OpenTimelineIO counts it in the track's
+  /// duration, and so in the timeline's, while the timeline's track ends
+  /// with its last clip. A gap of no length there carries nothing and is
+  /// read: the export writes one after a fade-out at a track's end.
+  TrailingGap,
   /// A fade not between a gap and the clip it fades, or playing anything
   /// of the gap's side.
   Fade,
@@ -912,6 +921,9 @@ impl fmt::Display for Feature {
       ),
       Self::NoMedia => f.write_str("a clip with no media reference"),
       Self::GapStart => f.write_str("a gap starting anywhere but zero"),
+      Self::TrailingGap => {
+        f.write_str("a gap of some length after the track's last clip, where its track has ended")
+      }
       Self::Fade => {
         f.write_str("a fade not between a gap and the clip it fades, or playing the gap's side")
       }
