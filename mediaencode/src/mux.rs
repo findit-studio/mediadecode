@@ -144,11 +144,20 @@ pub enum MuxRefusal {
     /// The track the packet named.
     track: TrackIndex,
   },
-  /// The packet's decode timestamp does not advance past the last one
-  /// written on its track. Within a track, decode order is the order
-  /// packets are written in, and the container records it as such.
+  /// The packet's decode timestamp is earlier than the last one written
+  /// on its track. Within a track, decode order is the order packets are
+  /// written in, and the container records it as such, so decode
+  /// timestamps may not go back — see [`check_decode_order`], the rule
+  /// itself.
+  ///
+  /// **An equal one is admitted.** Two subtitle cues or two timed-data
+  /// events at one instant are ordinary input, and a remux of them must
+  /// not fail on the face. Whether a container takes two packets at one
+  /// decode time is the container's question: a backend whose container
+  /// needs them strictly increasing refuses the equal one by its own
+  /// name, and hands it back as this one does.
   #[error(
-    "decode timestamps on track {} must increase: {} after {}",
+    "decode timestamps on track {} must not go back: {} after {}",
     .track.get(), .offered.pts(), .last.pts()
   )]
   NonMonotonicDts {
@@ -171,6 +180,29 @@ pub enum MuxRefusal {
     /// The track the packet named.
     track: TrackIndex,
   },
+}
+
+/// The portable decode-order rule, for a muxer to apply to each track:
+/// `offered` may equal the `last` decode timestamp written on `track`,
+/// never precede it — [`MuxRefusal::NonMonotonicDts`] otherwise.
+/// Timestamps compare by the instant they name, so two rulers mix.
+///
+/// One function rather than a rule restated in every backend: the
+/// portable face admits what this admits, and a backend stricter for its
+/// container adds its own refusal after this one.
+pub fn check_decode_order(
+  track: TrackIndex,
+  last: Option<Timestamp>,
+  offered: Timestamp,
+) -> Result<(), MuxRefusal> {
+  match last {
+    Some(last) if offered < last => Err(MuxRefusal::NonMonotonicDts {
+      track,
+      last,
+      offered,
+    }),
+    _ => Ok(()),
+  }
 }
 
 /// How a muxer write failed: a refusal every muxer names the same way,
@@ -217,8 +249,10 @@ impl<E, P> MuxError<E, P> {
 ///
 /// Packets may arrive with their tracks interleaved however the caller
 /// produces them; putting them in the order the container stores them
-/// is the muxer's job. Within one track, decode timestamps must
-/// increase ([`MuxRefusal::NonMonotonicDts`]).
+/// is the muxer's job. Within one track, decode timestamps may not go
+/// back ([`check_decode_order`], [`MuxRefusal::NonMonotonicDts`]); two
+/// at one instant are admitted on this face, and refused only by a
+/// backend whose container cannot store them.
 ///
 /// # Attachments
 ///
@@ -377,12 +411,12 @@ mod tests {
     )
   }
 
-  /// A four-track muxer (video, audio, then two attachments, whose files
-  /// it was opened with) that checks what every muxer checks and writes
-  /// nothing anywhere.
+  /// A six-track muxer (video, audio, two attachments whose files it
+  /// was opened with, then subtitles and timed data) that checks what
+  /// every muxer checks and writes nothing anywhere.
   struct Table {
-    kinds: [TrackKind; 4],
-    last: [Option<Timestamp>; 4],
+    kinds: [TrackKind; 6],
+    last: [Option<Timestamp>; 6],
     written: u32,
   }
 
@@ -394,8 +428,10 @@ mod tests {
           TrackKind::Audio,
           TrackKind::Attachment,
           TrackKind::Attachment,
+          TrackKind::Subtitle,
+          TrackKind::Data,
         ],
-        last: [None; 4],
+        last: [None; 6],
         written: 0,
       }
     }
@@ -427,15 +463,7 @@ mod tests {
     ) -> Result<Timestamp, MuxRefusal> {
       self.kind_of(track, offered)?;
       let dts = dts.ok_or(MuxRefusal::MissingDts { track })?;
-      if let Some(last) = self.last[track.get()]
-        && dts.pts() <= last.pts()
-      {
-        return Err(MuxRefusal::NonMonotonicDts {
-          track,
-          last,
-          offered: dts,
-        });
-      }
+      check_decode_order(track, self.last[track.get()], dts)?;
       Ok(dts)
     }
 
@@ -566,10 +594,10 @@ mod tests {
   #[test]
   fn a_packet_for_a_track_the_muxer_lacks_is_refused_by_name() {
     let mut muxer = Table::new();
-    let offered = video(5, Some(0));
+    let offered = video(8, Some(0));
     let kept = offered.clone();
     let (refusal, back) = refused(muxer.write_video(offered));
-    assert!(matches!(refusal, MuxRefusal::UnknownTrack { track } if track.get() == 5));
+    assert!(matches!(refusal, MuxRefusal::UnknownTrack { track } if track.get() == 8));
     assert_handed_back!(back, kept; pts, dts, duration, flags);
     assert_eq!(muxer.written, 0, "nothing is written for a refused packet");
   }
@@ -601,12 +629,13 @@ mod tests {
     assert_handed_back!(back, kept; pts, dts, duration, flags);
   }
 
-  /// **Within a track, decode timestamps increase; across tracks the
-  /// packets interleave freely.** An audio packet stamped before the
-  /// last video packet is written; a video packet that does not advance
-  /// its own track is refused, naming both timestamps, and handed back.
+  /// **Within a track, decode timestamps may not go back; across tracks
+  /// the packets interleave freely.** An audio packet stamped before the
+  /// last video packet is written, and so is a video packet at the same
+  /// decode time as the last; one stamped earlier is refused, naming both
+  /// timestamps, and handed back.
   #[test]
-  fn a_decode_timestamp_that_does_not_advance_its_track_is_refused_by_name() {
+  fn an_earlier_decode_timestamp_is_refused_by_name_and_an_equal_one_admitted() {
     let mut muxer = Table::new();
     muxer
       .write_video(video(0, Some(40)))
@@ -614,7 +643,10 @@ mod tests {
     muxer
       .write_audio(audio(1, 0))
       .expect("another track, interleaved");
-    let offered = video(0, Some(40));
+    muxer
+      .write_video(video(0, Some(40)))
+      .expect("the same decode time is admitted on the face");
+    let offered = video(0, Some(30));
     let kept = offered.clone();
     let (refusal, back) = refused(muxer.write_video(offered));
     match refusal {
@@ -624,9 +656,9 @@ mod tests {
         offered,
       } => {
         assert_eq!(track.get(), 0);
-        assert_eq!((last.pts(), offered.pts()), (40, 40));
+        assert_eq!((last.pts(), offered.pts()), (40, 30));
       }
-      other => panic!("expected the monotonicity refusal, got {other:?}"),
+      other => panic!("expected the decode-order refusal, got {other:?}"),
     }
     assert_handed_back!(back, kept; pts, dts, duration, flags);
     // The handed-back packet is the caller's again: restamped, it goes.
@@ -634,8 +666,32 @@ mod tests {
     muxer
       .write_video(VideoTrackPacket::new(track, packet.with_dts(Some(ms(80)))))
       .expect("the same packet, advancing");
-    assert_eq!(muxer.written, 3);
+    assert_eq!(muxer.written, 4);
     muxer.finish().expect("the session ends cleanly");
+  }
+
+  /// **Two cues, and two data events, at one instant are ordinary
+  /// input.** A subtitle track whose cues share a start time and a data
+  /// track whose events share a timestamp are written whole on the face;
+  /// a muxer that demanded strictly increasing decode times refused the
+  /// second of each, and an unchanged remux failed on valid input.
+  #[test]
+  fn two_cues_and_two_events_at_one_instant_are_written() {
+    let mut muxer = Table::new();
+    muxer
+      .write_subtitle(subtitle(4, 10))
+      .expect("the first cue");
+    muxer
+      .write_subtitle(subtitle(4, 10))
+      .expect("a second cue at the same instant");
+    muxer.write_data(data(5, 10)).expect("the first event");
+    muxer
+      .write_data(data(5, 10))
+      .expect("a second event at the same instant");
+    assert_eq!(muxer.written, 4);
+    // And still never back.
+    let (refusal, _) = refused(muxer.write_subtitle(subtitle(4, 9)));
+    assert!(matches!(refusal, MuxRefusal::NonMonotonicDts { track, .. } if track.get() == 4));
   }
 
   /// **Every write hands a refused packet back untouched** — the

@@ -31,8 +31,13 @@ The family releases in lockstep.
   its own faults. `EncodeRefusal` names a frame of the wrong
   dimensions, format, sample rate, channel layout or size, and one sent
   after the end; `MuxRefusal` names an unknown track, a packet of the
-  wrong kind, a missing or non-advancing decode timestamp, and an
-  attachment offered as a packet. A refused mux write hands its packet back untouched, in
+  wrong kind, a missing decode timestamp, one that goes back, and an
+  attachment offered as a packet. The decode-order rule is
+  `check_decode_order`, one function for every backend: within a track
+  decode timestamps may repeat — two subtitle cues or data events at one
+  instant are ordinary input — and may not go back; a backend whose
+  container needs them strictly increasing refuses a repeat by its own
+  name. A refused mux write hands its packet back untouched, in
   `MuxError::Refused` — each write's error names its own packet type —
   and `MuxError::map_packet` re-wraps it, as a remux routing every kind
   through one error type does.

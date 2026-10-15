@@ -177,6 +177,37 @@ impl Corpus {
     out
   }
 
+  /// A Matroska file whose subtitle track carries two cues at one
+  /// instant — two speakers' lines, the same start and end, different
+  /// text — over a short H.264 video track: the input a remux must not
+  /// refuse for a decode time that repeats.
+  #[rustfmt::skip]
+  pub fn simultaneous_cues_mkv(&self) -> PathBuf {
+    let out = self.path("simultaneous.mkv");
+    if out.exists() {
+      return out;
+    }
+    // Two cues at one instant, as two speakers' lines are — the same
+    // start and end, different text, so libavformat's SubRip reader
+    // keeps both (it drops only a cue identical in all three).
+    let subs = self.path("simultaneous.srt");
+    std::fs::write(
+      &subs,
+      "1\n00:00:00,500 --> 00:00:01,000\nfirst speaker\n\n\
+       2\n00:00:00,500 --> 00:00:01,000\nsecond speaker\n\n",
+    )
+    .expect("writing the simultaneous cues");
+    run_ffmpeg(&[
+      "-f", "lavfi", "-i", "testsrc2=size=64x48:rate=25:duration=2",
+      "-i", subs.to_str().expect("utf-8 path"),
+      "-map", "0:v", "-map", "1:s",
+      "-c:v", "libx264", "-preset", "ultrafast", "-g", "25", "-pix_fmt", "yuv420p",
+      "-c:s", "srt",
+      out.to_str().expect("utf-8 path"),
+    ]);
+    out
+  }
+
   /// A Matroska file whose subtitle track is **sparse**: its one cue
   /// starts at 1.5 s of a two-second clip, so no subtitle packet is
   /// anywhere near the start of the file where libavformat probes.

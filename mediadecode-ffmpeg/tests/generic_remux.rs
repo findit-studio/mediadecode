@@ -18,12 +18,17 @@ mod support;
 
 use std::{cell::RefCell, rc::Rc};
 
-use mediadecode::demuxer::{
-  AudioTrackPacket, DataTrackPacket, DemuxAttachmentPacket, DemuxedPacket, Demuxer,
-  SubtitleTrackPacket, TrackIndex, TrackKind, VideoTrackPacket,
+use mediadecode::{
+  Timestamp,
+  demuxer::{
+    AudioTrackPacket, DataTrackPacket, DemuxAttachmentPacket, DemuxedPacket, Demuxer,
+    SubtitleTrackPacket, TrackIndex, TrackKind, VideoTrackPacket,
+  },
 };
 use mediadecode_ffmpeg::{Ffmpeg, FfmpegBuffer, FfmpegDemuxer};
-use mediaencode::{MuxError, MuxRefusal, Muxer, mediaspine::track::TrackDescription};
+use mediaencode::{
+  MuxError, MuxRefusal, Muxer, check_decode_order, mediaspine::track::TrackDescription,
+};
 use support::Corpus;
 
 /// A remux over the two faces: the attachments the demuxer hands out
@@ -111,10 +116,13 @@ struct Seen {
 }
 
 /// A muxer that records: the table it was opened with, and every packet
-/// it is asked to write, refusing what every muxer refuses — a track it
-/// does not have, and a packet of another kind.
+/// it is asked to write, refusing what every muxer refuses on the face —
+/// a track it does not have, a packet of another kind, a missing decode
+/// time, and one that goes back ([`check_decode_order`], the portable
+/// rule, which admits a repeated one).
 struct Ledger<B> {
   kinds: Vec<TrackKind>,
+  last: Vec<Option<Timestamp>>,
   seen: Rc<RefCell<Seen>>,
   _buffer: core::marker::PhantomData<B>,
 }
@@ -144,16 +152,23 @@ impl<B: AsRef<[u8]>> Ledger<B> {
         .collect();
       record.written = vec![0; kinds.len()];
     }
+    let last = vec![None; kinds.len()];
     Self {
       kinds,
+      last,
       seen,
       _buffer: core::marker::PhantomData,
     }
   }
 
-  /// The refusal for a packet of `offered` kind on `track`, if any;
-  /// otherwise the packet is counted.
-  fn admit(&mut self, track: TrackIndex, offered: TrackKind) -> Option<MuxRefusal> {
+  /// The refusal for a packet of `offered` kind on `track` decoded at
+  /// `dts`, if any; otherwise the packet is counted.
+  fn admit(
+    &mut self,
+    track: TrackIndex,
+    offered: TrackKind,
+    dts: Option<Timestamp>,
+  ) -> Option<MuxRefusal> {
     let Some(&expected) = self.kinds.get(track.get()) else {
       return Some(MuxRefusal::UnknownTrack { track });
     };
@@ -164,6 +179,13 @@ impl<B: AsRef<[u8]>> Ledger<B> {
         offered,
       });
     }
+    let Some(dts) = dts else {
+      return Some(MuxRefusal::MissingDts { track });
+    };
+    if let Err(refusal) = check_decode_order(track, self.last[track.get()], dts) {
+      return Some(refusal);
+    }
+    self.last[track.get()] = Some(dts);
     self.seen.borrow_mut().written[track.get()] += 1;
     None
   }
@@ -178,7 +200,8 @@ impl<B: AsRef<[u8]>> Muxer for Ledger<B> {
     &mut self,
     packet: VideoTrackPacket<Ffmpeg, B>,
   ) -> Result<(), MuxError<Self::Error, VideoTrackPacket<Ffmpeg, B>>> {
-    match self.admit(packet.track(), TrackKind::Video) {
+    let dts = packet.packet().dts();
+    match self.admit(packet.track(), TrackKind::Video, dts) {
       Some(refusal) => Err(MuxError::Refused { refusal, packet }),
       None => Ok(()),
     }
@@ -188,7 +211,8 @@ impl<B: AsRef<[u8]>> Muxer for Ledger<B> {
     &mut self,
     packet: AudioTrackPacket<Ffmpeg, B>,
   ) -> Result<(), MuxError<Self::Error, AudioTrackPacket<Ffmpeg, B>>> {
-    match self.admit(packet.track(), TrackKind::Audio) {
+    let dts = packet.packet().dts();
+    match self.admit(packet.track(), TrackKind::Audio, dts) {
       Some(refusal) => Err(MuxError::Refused { refusal, packet }),
       None => Ok(()),
     }
@@ -198,7 +222,9 @@ impl<B: AsRef<[u8]>> Muxer for Ledger<B> {
     &mut self,
     packet: SubtitleTrackPacket<Ffmpeg, B>,
   ) -> Result<(), MuxError<Self::Error, SubtitleTrackPacket<Ffmpeg, B>>> {
-    match self.admit(packet.track(), TrackKind::Subtitle) {
+    // A subtitle or data packet's decode time is its presentation time.
+    let dts = packet.packet().pts();
+    match self.admit(packet.track(), TrackKind::Subtitle, dts) {
       Some(refusal) => Err(MuxError::Refused { refusal, packet }),
       None => Ok(()),
     }
@@ -208,7 +234,8 @@ impl<B: AsRef<[u8]>> Muxer for Ledger<B> {
     &mut self,
     packet: DataTrackPacket<Ffmpeg, B>,
   ) -> Result<(), MuxError<Self::Error, DataTrackPacket<Ffmpeg, B>>> {
-    match self.admit(packet.track(), TrackKind::Data) {
+    let dts = packet.packet().pts();
+    match self.admit(packet.track(), TrackKind::Data, dts) {
       Some(refusal) => Err(MuxError::Refused { refusal, packet }),
       None => Ok(()),
     }
@@ -310,4 +337,38 @@ fn a_generic_remux_builds_its_table_from_a_live_demuxer() {
     Some("font.ttf"),
     "and the attachment row its identity",
   );
+}
+
+/// **Two cues at one instant remux whole.** A subtitle track whose cues
+/// share a start time is ordinary input — two speakers at once — and the
+/// portable decode-order rule admits the second: decode times may repeat
+/// on the face, and only go back is refused. Under a face that demanded
+/// strictly increasing decode times this remux failed on the second cue.
+#[test]
+fn a_generic_remux_writes_cues_that_share_an_instant() {
+  let Some(corpus) = Corpus::new() else { return };
+  let path = corpus.simultaneous_cues_mkv();
+
+  // The premise, read off the file: two subtitle packets at one instant.
+  let mut source = FfmpegDemuxer::open(&path).expect("open mkv");
+  let mut cue_times = Vec::new();
+  while let Some(packet) = source.next_packet().expect("a packet or the end") {
+    if let DemuxedPacket::Subtitle(cue) = &packet {
+      cue_times.push(cue.packet().pts().expect("a cue has a time"));
+    }
+  }
+  assert_eq!(cue_times.len(), 2, "the fixture carries two cues");
+  assert_eq!(cue_times[0], cue_times[1], "at one instant");
+
+  let seen = Rc::new(RefCell::new(Seen::default()));
+  let mut demuxer = FfmpegDemuxer::open(&path).expect("open mkv");
+  let ledger_seen = Rc::clone(&seen);
+  remux(&mut demuxer, move |table| {
+    Ledger::<FfmpegBuffer>::open(table, ledger_seen)
+  });
+
+  let seen = seen.borrow();
+  assert!(seen.finished, "the container was finished");
+  assert_eq!(seen.kinds, vec![TrackKind::Video, TrackKind::Subtitle]);
+  assert_eq!(seen.written[1], 2, "both cues were written");
 }
