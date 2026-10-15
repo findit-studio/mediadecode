@@ -148,6 +148,16 @@ fn a_whole_number_is_read_from_its_digits_exactly() {
     // Past an i128.
     ("1e39", None),
     ("1e9999999999", None),
+    // A zero at an exponent past an i64, either way.
+    ("0e9223372036854775808", Some(0)),
+    ("-0.000e-99999999999999999999", Some(0)),
+    ("0.0E+340282366920938463463374607431768211456", Some(0)),
+    // Any other number there: past an i128 above, a fraction below.
+    ("1e9223372036854775808", None),
+    ("1e-9223372036854775809", None),
+    ("100e-99999999999999999999999999999999999999999", None),
+    // An exponent of leading zeros is its value.
+    ("1e+00000000000000000000000000000000000000002", Some(100)),
   ] {
     assert_eq!(whole(text), value, "{text}");
   }

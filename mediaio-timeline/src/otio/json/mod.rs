@@ -131,27 +131,28 @@ fn write_string(text: &str, out: &mut Utf8BytesMut) {
 ///
 /// Read from the digits, not through an `f64`: past 2^53 an `f64` holds
 /// only some whole numbers, and one between two of them would read as its
-/// nearest.
+/// nearest. A zero is zero at any exponent, however long; for any other
+/// number an exponent of any length is read ([`exponent`]), so one past a
+/// machine integer makes a fraction or a number past an `i128`, by its
+/// sign.
 pub(crate) fn whole(text: &str) -> Option<i128> {
   let (negative, unsigned) = match text.strip_prefix('-') {
     Some(unsigned) => (true, unsigned),
     None => (false, text),
   };
-  let (mantissa, exponent) = match unsigned.split_once(['e', 'E']) {
-    Some((mantissa, exponent)) => (mantissa, exponent.parse::<i64>().ok()?),
-    None => (unsigned, 0),
-  };
+  let (mantissa, power) = unsigned.split_once(['e', 'E']).unwrap_or((unsigned, "0"));
   let (integer, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
   let digits = || integer.bytes().chain(fraction.bytes());
   // The trailing zeros each scale the digits before them by ten.
   let zeros = digits().rev().take_while(|&digit| digit == b'0').count();
   let significant = integer.len() + fraction.len() - zeros;
+  // A mantissa of zeros alone, before its exponent is read at all.
   if significant == 0 {
     return Some(0);
   }
-  let scale = exponent
-    .checked_sub(i64::try_from(fraction.len()).ok()?)?
-    .checked_add(i64::try_from(zeros).ok()?)?;
+  // Within ±2^100 and the two lengths within ±2^64: no overflow.
+  let scale = exponent(power)? - i128::try_from(fraction.len()).ok()?
+    + i128::try_from(zeros).ok()?;
   // A significant digit below the units is a fraction.
   if scale < 0 {
     return None;
@@ -162,10 +163,37 @@ pub(crate) fn whole(text: &str) -> Option<i128> {
       .checked_mul(10)?
       .checked_add(i128::from(digit - b'0'))?;
   }
+  // `value` is at least 1, so past 38 places the product leaves an `i128`
+  // and the loop ends.
   for _ in 0..scale {
     value = value.checked_mul(10)?;
   }
   Some(if negative { -value } else { value })
+}
+
+/// A JSON exponent's value — a sign, if any, and its digits — however many
+/// digits it has, saturated at ±2^100; `None` for text that is no exponent.
+///
+/// Saturating loses nothing [`whole`] reads: a number's text is shorter
+/// than 2^64 bytes, so the places its digits have below the units, or its
+/// trailing zeros above them, are fewer — and an exponent past ±2^100
+/// leaves any digit but zero below the units, a fraction, or more than 38
+/// places above them, past an `i128`, whichever its sign.
+fn exponent(text: &str) -> Option<i128> {
+  const SATURATED: i128 = 1 << 100;
+  let (negative, digits) = match text.as_bytes().first() {
+    Some(b'-') => (true, &text[1..]),
+    Some(b'+') => (false, &text[1..]),
+    _ => (false, text),
+  };
+  if digits.is_empty() || !digits.bytes().all(|digit| digit.is_ascii_digit()) {
+    return None;
+  }
+  // Below 2^100, ten times the value and a digit stay within an `i128`.
+  let magnitude = digits.bytes().fold(0, |value: i128, digit| {
+    (value * 10 + i128::from(digit - b'0')).min(SATURATED)
+  });
+  Some(if negative { -magnitude } else { magnitude })
 }
 
 /// How deep arrays and objects may nest before the reader refuses: deep
