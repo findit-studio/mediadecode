@@ -53,22 +53,96 @@ unsafe extern "C" {
   /// redeclared signature is ABI-identical; only the Rust-side validity
   /// obligation is dropped.
   ///
-  /// Callers must still hand it a type this build names —
-  /// [`packet_new_side_data`] enforces that — because FFmpeg's own code
-  /// compares the field against its named constants.
+  /// Callers must still hand it a type the linked library names —
+  /// [`packet_new_side_data`] enforces that, through
+  /// [`runtime_names_side_data`] — because FFmpeg's own code compares the
+  /// field against its named constants.
   #[link_name = "av_packet_new_side_data"]
   fn av_packet_new_side_data_raw(pkt: *mut AVPacket, kind: c_uint, size: usize) -> *mut u8;
+
+  /// `av_packet_side_data_name`, redeclared with a plain `c_int`
+  /// parameter instead of `AVPacketSideDataType`.
+  ///
+  /// The question it answers is whether the **linked** libavcodec names
+  /// a side-data type — which may be one the bindings this crate was
+  /// built against do not, when the library it runs against is newer.
+  /// Forming `AVPacketSideDataType` from such an integer would be
+  /// undefined behaviour, so the integer crosses as the integer it is;
+  /// C passes the enum in an `int`-sized register, so the redeclaration
+  /// is ABI-identical. libavcodec answers every integer: a `switch` over
+  /// the types it names, and null for anything else
+  /// (`libavcodec/packet.c` 269–317 in FFmpeg 9.0.1).
+  #[link_name = "av_packet_side_data_name"]
+  fn av_packet_side_data_name_raw(kind: c_int) -> *const c_char;
+}
+
+/// Whether the **linked** libavcodec names side-data type `kind` — asked
+/// of the library this process runs against, as the integer the type is,
+/// never through the bindings' enum.
+///
+/// The admission test for a side-data entry this crate hands to C. The
+/// read side carries every type as the integer it is on the wire,
+/// including one newer than the bindings this crate was built against;
+/// what may go back is exactly what the library it runs against knows.
+/// A count from the bindings (`AV_PKT_DATA_NB`) is the wrong authority
+/// for that: it is the build's, and refused a type the runtime names.
+pub(crate) fn runtime_names_side_data(kind: i32) -> bool {
+  #[cfg(test)]
+  if side_data_namer_stub::names(kind) {
+    return true;
+  }
+  // SAFETY: `av_packet_side_data_name` takes any integer and answers null
+  // or a pointer into libavcodec's static strings; only whether the
+  // pointer is null is read.
+  !unsafe { av_packet_side_data_name_raw(kind) }.is_null()
+}
+
+/// A linked library newer than the bindings, for the laws: while a
+/// [`side_data_namer_stub::name_also`] guard lives, the namer on its
+/// thread names one extra type. The linked FFmpeg 9.0.1 names exactly
+/// the types its own bindings do, so without it there is no type above
+/// the bindings' count for a law to round-trip.
+#[cfg(test)]
+pub(crate) mod side_data_namer_stub {
+  use core::cell::Cell;
+
+  std::thread_local! {
+    static EXTRA: Cell<Option<i32>> = const { Cell::new(None) };
+  }
+
+  /// Names `kind` on this thread until the guard drops.
+  pub(crate) fn name_also(kind: i32) -> Guard {
+    EXTRA.with(|extra| extra.set(Some(kind)));
+    Guard(())
+  }
+
+  /// Ends [`name_also`]'s extra name.
+  pub(crate) struct Guard(());
+
+  impl Drop for Guard {
+    fn drop(&mut self) {
+      EXTRA.with(|extra| extra.set(None));
+    }
+  }
+
+  /// Whether the stub names `kind` on this thread.
+  pub(crate) fn names(kind: i32) -> bool {
+    EXTRA.with(|extra| extra.get() == Some(kind))
+  }
 }
 
 /// Attaches a side-data buffer of `size` bytes to `pkt`, returning a
-/// pointer to it, or `None` when the type is not one this build of
-/// FFmpeg names or the allocation failed.
+/// pointer to it, or `None` when the type is not one the linked FFmpeg
+/// names or the allocation failed.
 ///
-/// The range check is what keeps the raw type integer honest:
-/// `AVPacketSideDataType` is a contiguous enum whose last member,
-/// `AV_PKT_DATA_NB`, is its count, so `0 <= kind < AV_PKT_DATA_NB` is
-/// exactly the set this build understands. Nothing outside it is handed
-/// to C.
+/// [`runtime_names_side_data`] is what keeps the raw type integer
+/// honest: only a type the library this process runs against names is
+/// handed to C, whatever the bindings' own enum says. A type
+/// `av_packet_add_side_data` keeps is any integer — it compares
+/// entries' types for equality and counts them against its own
+/// `AV_PKT_DATA_NB` (`libavcodec/packet.c` 197–228 in FFmpeg 9.0.1) —
+/// so an entry newer than the bindings attaches and reads back as the
+/// integer it is.
 ///
 /// # Safety
 ///
@@ -78,16 +152,19 @@ pub(crate) unsafe fn packet_new_side_data(
   kind: i32,
   size: usize,
 ) -> Option<*mut u8> {
-  if kind < 0 || kind >= side_data_type_count() {
+  if !runtime_names_side_data(kind) {
     return None;
   }
   // SAFETY: the caller keeps `pkt` live, and `kind` was just proved to
-  // be a type this build names.
+  // be a type the linked library names — so it is not negative, and
+  // `as c_uint` keeps its value.
   let ptr = unsafe { av_packet_new_side_data_raw(pkt, kind as c_uint, size) };
   (!ptr.is_null()).then_some(ptr)
 }
 
-/// How many side-data types this build of FFmpeg names.
+/// How many side-data types the bindings this crate was built against
+/// name — the floor of the side-data entry cap, never an admission test
+/// (see [`runtime_names_side_data`]).
 #[cfg_attr(not(tarpaulin), inline(always))]
 pub(crate) const fn side_data_type_count() -> i32 {
   AVPacketSideDataType::AV_PKT_DATA_NB as i32

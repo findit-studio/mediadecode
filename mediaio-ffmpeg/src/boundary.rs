@@ -469,33 +469,31 @@ pub fn write_md_flags(packet: &mut Packet, flags: MdPacketFlags) {
 /// A side-data entry whose type this build of FFmpeg does not name.
 ///
 /// Refused rather than dropped: this crate carries side-data types as
-/// the raw integers they are on the wire, and handing an unknown one
-/// to C would either form an invalid enum discriminant or attach a
-/// type nothing downstream can read. Everything the demuxer captured
-/// came from this same build and is in range, so this only answers a
-/// hand-built entry.
+/// the raw integers they are on the wire, and handing one the library
+/// does not know to C would attach a type nothing downstream can read.
+/// **The judge is the linked library**, asked through
+/// `av_packet_side_data_name` with the integer as it is: a type newer
+/// than the bindings this crate was built against is admitted when the
+/// library it runs against names it — which is what the read side
+/// carried it for. Everything a demuxer captured came from the same
+/// library, so this answers a hand-built entry, or one carried over from
+/// a newer library than the one now linked.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("side-data type {kind} is not one this FFmpeg build names (0..{limit})")]
+#[error("side-data type {kind} is not one the linked FFmpeg names")]
 pub struct UnknownSideData {
   kind: i32,
-  limit: i32,
 }
 
 impl UnknownSideData {
   /// Constructs an `UnknownSideData` payload.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn new(kind: i32, limit: i32) -> Self {
-    Self { kind, limit }
+  pub const fn new(kind: i32) -> Self {
+    Self { kind }
   }
   /// The type integer the entry carried.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn kind(&self) -> i32 {
     self.kind
-  }
-  /// How many side-data types this build names.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn limit(&self) -> i32 {
-    self.limit
   }
 }
 
@@ -720,17 +718,20 @@ fn attach_side_data(out: &mut Packet, entries: &[SideDataEntry]) -> Result<(), P
   for entry in entries {
     let kind = entry.kind();
     let size = entry.data().len();
+    // Admitted by the linked library's own word, asked as the integer.
+    if !crate::ffi::runtime_names_side_data(kind) {
+      return Err(PacketBuildError::UnknownSideData(UnknownSideData::new(
+        kind,
+      )));
+    }
     // SAFETY: `out` owns a live `AVPacket`; `packet_new_side_data`
-    // validates the type against this build's own range before handing
-    // it to C and reports a failed allocation as `None`.
+    // validates the type against the linked library again before handing
+    // it to C, and reports a failed allocation as `None`.
     let slot = unsafe { crate::ffi::packet_new_side_data(out.as_mut_ptr(), kind, size) };
     let Some(slot) = slot else {
-      let limit = crate::ffi::side_data_type_count();
-      return Err(if kind < 0 || kind >= limit {
-        PacketBuildError::UnknownSideData(UnknownSideData::new(kind, limit))
-      } else {
-        PacketBuildError::SideDataAlloc(SideDataAlloc::new(kind, size))
-      });
+      return Err(PacketBuildError::SideDataAlloc(SideDataAlloc::new(
+        kind, size,
+      )));
     };
     if size > 0 {
       // SAFETY: FFmpeg just allocated `size` bytes at `slot` (plus its
@@ -4073,36 +4074,96 @@ mod tests {
     }
   }
 
-  #[test]
-  fn a_side_data_type_this_build_cannot_name_is_refused_not_dropped() {
-    // This crate carries side-data types as the raw integers they are
-    // on the wire, so a hand-built entry can name anything. Handing an
-    // unknown one to C would either form an invalid discriminant or
-    // attach a type nothing downstream reads — and dropping it quietly
-    // is the very defect this whole seam exists to close.
-    let limit = crate::ffi::side_data_type_count();
-    let packet = mediaspine::packet::VideoPacket::new(
+  /// A video packet carrying one side-data entry of `kind`, bytes
+  /// `[9, 8, 7]`.
+  fn packet_with_side_data_kind(
+    kind: i32,
+  ) -> mediaspine::packet::VideoPacket<VideoPacketExtra, FfmpegBytes> {
+    mediaspine::packet::VideoPacket::new(
       FfmpegBytes::copy_from_slice(&[1u8]),
       VideoPacketExtra::new(0).with_side_data(vec![SideDataEntry::new(
-        limit,
-        FfmpegBytes::copy_from_slice(&[9u8]),
+        kind,
+        FfmpegBytes::copy_from_slice(&[9u8, 8, 7]),
       )]),
-    );
-    match ffmpeg_packet_from_owned_video_packet(&packet, PacketLimits::default()).map(|_| ()) {
-      Err(PacketBuildError::UnknownSideData(p)) => {
-        assert_eq!(p.kind(), limit);
-        assert_eq!(p.limit(), limit);
+    )
+  }
+
+  #[test]
+  fn a_side_data_type_the_linked_library_cannot_name_is_refused_not_dropped() {
+    // This crate carries side-data types as the raw integers they are
+    // on the wire, so a hand-built entry can name anything. Handing one
+    // the linked library does not know to C would attach a type nothing
+    // downstream reads — and dropping it quietly is the very defect this
+    // whole seam exists to close. No libavcodec names these two.
+    for kind in [-1, i32::MAX] {
+      assert!(
+        !crate::ffi::runtime_names_side_data(kind),
+        "the premise: {kind} is unnamed"
+      );
+      match ffmpeg_packet_from_owned_video_packet(
+        &packet_with_side_data_kind(kind),
+        PacketLimits::default(),
+      )
+      .map(|_| ())
+      {
+        Err(PacketBuildError::UnknownSideData(p)) => assert_eq!(p.kind(), kind),
+        other => panic!("expected UnknownSideData for {kind}, got {other:?}"),
       }
-      other => panic!("expected UnknownSideData, got {other:?}"),
     }
-    assert!(matches!(
-      ffmpeg_packet_from_owned_video_packet(&mediaspine::packet::VideoPacket::new(
-        FfmpegBytes::copy_from_slice(&[1u8]),
-        VideoPacketExtra::new(0).with_side_data(vec![SideDataEntry::new(-1, FfmpegBytes::copy_from_slice(&[9u8]))]),
-      ), PacketLimits::default())
-      .map(|_| ()),
-      Err(PacketBuildError::UnknownSideData(p)) if p.kind() == -1,
-    ));
+  }
+
+  /// **A type newer than the bindings round-trips when the linked
+  /// library names it.** The read side carries every side-data type as
+  /// the integer it is, so a library newer than the bindings can hand
+  /// this crate a type the bindings' `AV_PKT_DATA_NB` does not reach.
+  /// The write side used to refuse every such type by that count — a
+  /// question for the build, asked of the runtime. It now asks the
+  /// runtime: `av_packet_side_data_name`, as the integer.
+  ///
+  /// The law looks for a type above the bindings' count that the linked
+  /// library really names, and uses the namer's stub when there is none —
+  /// as there is not on FFmpeg 9.0.1, whose names stop where its bindings
+  /// do. Either way the entry is attached by the real
+  /// `av_packet_new_side_data` and read back by the real read side.
+  #[test]
+  fn a_side_data_type_above_the_bindings_that_the_library_names_round_trips() {
+    let bindings = crate::ffi::side_data_type_count();
+    let named = (bindings..bindings.saturating_add(256))
+      .find(|&kind| crate::ffi::runtime_names_side_data(kind));
+    let kind = named.unwrap_or(bindings.saturating_add(3));
+    let _stub = named
+      .is_none()
+      .then(|| crate::ffi::side_data_namer_stub::name_also(kind));
+    assert!(
+      kind >= bindings,
+      "the premise: a type the bindings do not name"
+    );
+    assert!(
+      crate::ffi::runtime_names_side_data(kind),
+      "the premise: the namer names it"
+    );
+
+    let rebuilt = ffmpeg_packet_from_owned_video_packet(
+      &packet_with_side_data_kind(kind),
+      PacketLimits::default(),
+    )
+    .expect("a type the linked library names is admitted");
+    // SAFETY: `rebuilt` came from this crate's own builder, which wrote
+    // its payload and every side-data byte it attached; it is live for
+    // the call.
+    let carried = unsafe {
+      owned_video_packet_from_ffmpeg_in(
+        &rebuilt,
+        mediaspine::Timebase::default(),
+        PacketLimits::default(),
+      )
+    }
+    .expect("the read side carries it")
+    .expect("a payload");
+    let entries = carried.extra().side_data();
+    assert_eq!(entries.len(), 1, "the entry survives the round trip");
+    assert_eq!(entries[0].kind(), kind, "as the integer it is");
+    assert_eq!(entries[0].data().as_ref(), &[9u8, 8, 7][..]);
   }
 
   #[test]

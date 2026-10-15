@@ -69,6 +69,14 @@ The family — `mediadecode`, `mediadecode-ffmpeg`, `mediadecode-webcodecs`,
   plane size, and `ffmpeg_next`'s safe `BitmapMut::set_height` moves
   the height alone. Bitmaps convert through the raw entries, whose
   caller vouches for the extent.
+- **A side-data type is admitted by the linked library's word.** The
+  write side refused every type at or above the bindings'
+  `AV_PKT_DATA_NB`, though the read side carries a type a newer library
+  hands it as the integer it is. It now asks the library it runs
+  against — `av_packet_side_data_name`, redeclared over a plain `c_int`
+  so no enum is formed — and refuses only what that library does not
+  name. `UnknownSideData` carries the type alone; its `limit` is gone,
+  since the bindings' count is no longer the judge.
 - **A subtitle rect's fields are read only under its own kind.** The
   subtitle worker reads a rect's `type` first and alone, then a text
   rect's `text`, an ASS rect's `ass`, or a bitmap rect's plane, palette
