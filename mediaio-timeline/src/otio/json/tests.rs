@@ -162,3 +162,65 @@ fn a_whole_number_is_read_from_its_digits_exactly() {
     assert_eq!(whole(text), value, "{text}");
   }
 }
+
+#[test]
+fn a_float_reads_only_where_its_text_spells_its_canonical_decimal() {
+  let f64s = [
+    // Exactly the canonical decimal, as the export writes it.
+    ("24.0", Some(24.0)),
+    ("23.976023976023978", Some(24_000.0 / 1001.0)),
+    ("0.1", Some(0.1)),
+    ("-0.0", Some(-0.0)),
+    ("5e-324", Some(f64::from_bits(1))),
+    ("1.7976931348623157e308", Some(f64::MAX)),
+    // Another spelling of the same value.
+    ("24", Some(24.0)),
+    ("2.4e1", Some(24.0)),
+    ("2400e-2", Some(24.0)),
+    ("0.24E+2", Some(24.0)),
+    ("2.39760239760239780e1", Some(24_000.0 / 1001.0)),
+    ("-0", Some(-0.0)),
+    // A value that reads only rounded: past 2^53, between two doubles, or
+    // a longer decimal of the very double.
+    ("24.0000000000000001", None),
+    ("9007199254740993", None),
+    ("0.1000000000000000055511151231257827", None),
+    ("3e-324", None),
+    // Past the largest double, and below the smallest.
+    ("1e309", None),
+    ("-1.8e308", None),
+    ("1e-400", None),
+    ("2e-324", None),
+  ];
+  for (text, value) in f64s {
+    assert_eq!(
+      exact_f64(text).map(f64::to_bits),
+      value.map(f64::to_bits),
+      "{text}"
+    );
+  }
+  let f32s = [
+    ("16777216", Some(16_777_216.0)),
+    ("1.6777216e7", Some(16_777_216.0)),
+    ("-3.0", Some(-3.0)),
+    ("-3e0", Some(-3.0)),
+    ("-0.3E1", Some(-3.0)),
+    ("0.1", Some(0.1)),
+    ("1e-45", Some(f32::from_bits(1))),
+    ("3.4028235e38", Some(f32::MAX)),
+    // 2^24 + 1 reads as 2^24; a longer decimal of 0.1's f32.
+    ("16777217", None),
+    ("0.100000001", None),
+    // Past the largest f32, and below the smallest.
+    ("1e39", None),
+    ("3.5e38", None),
+    ("1e-46", None),
+  ];
+  for (text, value) in f32s {
+    assert_eq!(
+      exact_f32(text).map(f32::to_bits),
+      value.map(f32::to_bits),
+      "{text}"
+    );
+  }
+}

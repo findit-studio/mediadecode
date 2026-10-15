@@ -125,6 +125,90 @@ fn write_string(text: &str, out: &mut Utf8BytesMut) {
   out.push('"');
 }
 
+/// A JSON number's text as the exact decimal it spells: its sign, its
+/// significant digits — none for a zero — and the power of ten the last of
+/// them counts.
+struct Decimal<'a> {
+  negative: bool,
+  integer: &'a str,
+  fraction: &'a str,
+  /// The leading zeros of the digits, which say nothing.
+  lead: usize,
+  /// How many digits are significant, after the leading zeros.
+  significant: usize,
+  /// The power of ten the last significant digit counts.
+  scale: i128,
+}
+
+impl Decimal<'_> {
+  /// The significant digits, the integer part's and the fraction's as one.
+  fn digits(&self) -> impl Iterator<Item = u8> + '_ {
+    self
+      .integer
+      .bytes()
+      .chain(self.fraction.bytes())
+      .skip(self.lead)
+      .take(self.significant)
+  }
+
+  const fn is_zero(&self) -> bool {
+    self.significant == 0
+  }
+
+  /// Whether the two spell the same number: any two zeros, else the same
+  /// sign, digits and scale.
+  fn same_value(&self, other: &Decimal<'_>) -> bool {
+    if self.is_zero() || other.is_zero() {
+      return self.is_zero() && other.is_zero();
+    }
+    self.negative == other.negative
+      && self.scale == other.scale
+      && self.significant == other.significant
+      && self.digits().eq(other.digits())
+  }
+}
+
+/// `text` — a number as the JSON grammar spells it — read as the exact
+/// decimal it spells, or `None` for an exponent that is not one.
+///
+/// A mantissa of zeros alone is zero at any exponent, however long, and its
+/// exponent is not read at all; for any other number an exponent of any
+/// length is read ([`exponent`]).
+fn decimal(text: &str) -> Option<Decimal<'_>> {
+  let (negative, unsigned) = match text.strip_prefix('-') {
+    Some(unsigned) => (true, unsigned),
+    None => (false, text),
+  };
+  let (mantissa, power) = unsigned.split_once(['e', 'E']).unwrap_or((unsigned, "0"));
+  let (integer, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+  let digits = || integer.bytes().chain(fraction.bytes());
+  let all = integer.len() + fraction.len();
+  // The trailing zeros each scale the digits before them by ten.
+  let zeros = digits().rev().take_while(|&digit| digit == b'0').count();
+  if zeros == all {
+    return Some(Decimal {
+      negative,
+      integer,
+      fraction,
+      lead: all,
+      significant: 0,
+      scale: 0,
+    });
+  }
+  let lead = digits().take_while(|&digit| digit == b'0').count();
+  // Within ±2^100 and the two lengths within ±2^64: no overflow.
+  let scale =
+    exponent(power)? - i128::try_from(fraction.len()).ok()? + i128::try_from(zeros).ok()?;
+  Some(Decimal {
+    negative,
+    integer,
+    fraction,
+    lead,
+    significant: all - zeros - lead,
+    scale,
+  })
+}
+
 /// The whole number a JSON number's text spells, exactly — `86400.0`,
 /// `86400`, `8.64e4` — or `None` for one with a fraction, or past what an
 /// `i128` holds.
@@ -136,39 +220,86 @@ fn write_string(text: &str, out: &mut Utf8BytesMut) {
 /// machine integer makes a fraction or a number past an `i128`, by its
 /// sign.
 pub(crate) fn whole(text: &str) -> Option<i128> {
-  let (negative, unsigned) = match text.strip_prefix('-') {
-    Some(unsigned) => (true, unsigned),
-    None => (false, text),
-  };
-  let (mantissa, power) = unsigned.split_once(['e', 'E']).unwrap_or((unsigned, "0"));
-  let (integer, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
-  let digits = || integer.bytes().chain(fraction.bytes());
-  // The trailing zeros each scale the digits before them by ten.
-  let zeros = digits().rev().take_while(|&digit| digit == b'0').count();
-  let significant = integer.len() + fraction.len() - zeros;
-  // A mantissa of zeros alone, before its exponent is read at all.
-  if significant == 0 {
+  let decimal = decimal(text)?;
+  if decimal.is_zero() {
     return Some(0);
   }
-  // Within ±2^100 and the two lengths within ±2^64: no overflow.
-  let scale =
-    exponent(power)? - i128::try_from(fraction.len()).ok()? + i128::try_from(zeros).ok()?;
   // A significant digit below the units is a fraction.
-  if scale < 0 {
+  if decimal.scale < 0 {
     return None;
   }
   let mut value: i128 = 0;
-  for digit in digits().take(significant) {
+  for digit in decimal.digits() {
     value = value
       .checked_mul(10)?
       .checked_add(i128::from(digit - b'0'))?;
   }
   // `value` is at least 1, so past 38 places the product leaves an `i128`
   // and the loop ends.
-  for _ in 0..scale {
+  for _ in 0..decimal.scale {
     value = value.checked_mul(10)?;
   }
-  Some(if negative { -value } else { value })
+  Some(if decimal.negative { -value } else { value })
+}
+
+/// The `f64` a JSON number's text spells **exactly**, or `None`.
+///
+/// Exactly: the text's own decimal value is that of the `f64`'s canonical
+/// decimal — the shortest that reads back as it, the one `{:?}` writes and
+/// the export writes every `f64` in. So any spelling of that value reads —
+/// `24`, `24.0`, `2.4e1` — and nothing else: a number that reads as its
+/// nearest `f64` only rounded (`24.0000000000000001`), one past the largest
+/// (which reads as an infinity) and one between zero and the smallest
+/// (which reads as zero) are each `None`.
+pub(crate) fn exact_f64(text: &str) -> Option<f64> {
+  let value = text.parse::<f64>().ok().filter(|value| value.is_finite())?;
+  spells(text, format_args!("{value:?}")).then_some(value)
+}
+
+/// The `f32` a JSON number's text spells **exactly**, or `None`: as
+/// [`exact_f64`], against the `f32`'s canonical decimal — so `16777217`,
+/// which reads as the `f32` 16777216, is `None`.
+pub(crate) fn exact_f32(text: &str) -> Option<f32> {
+  let value = text.parse::<f32>().ok().filter(|value| value.is_finite())?;
+  spells(text, format_args!("{value:?}")).then_some(value)
+}
+
+/// Whether `text` spells the same decimal as `canonical`, written out.
+fn spells(text: &str, canonical: core::fmt::Arguments<'_>) -> bool {
+  let mut written = Spelled::default();
+  if core::fmt::write(&mut written, canonical).is_err() {
+    return false;
+  }
+  match (decimal(text), decimal(written.as_str())) {
+    (Some(text), Some(canonical)) => text.same_value(&canonical),
+    _ => false,
+  }
+}
+
+/// A float's canonical decimal, written on the stack: the longest an `f64`
+/// writes is 24 bytes (`-2.2250738585072014e-308`). Longer text is refused
+/// as an error, which no float writes.
+#[derive(Default)]
+struct Spelled {
+  bytes: [u8; 32],
+  len: usize,
+}
+
+impl Spelled {
+  fn as_str(&self) -> &str {
+    // Only whole `&str`s are copied in.
+    core::str::from_utf8(&self.bytes[..self.len]).unwrap_or("")
+  }
+}
+
+impl core::fmt::Write for Spelled {
+  fn write_str(&mut self, text: &str) -> core::fmt::Result {
+    let end = self.len + text.len();
+    let slot = self.bytes.get_mut(self.len..end).ok_or(core::fmt::Error)?;
+    slot.copy_from_slice(text.as_bytes());
+    self.len = end;
+    Ok(())
+  }
 }
 
 /// A JSON exponent's value — a sign, if any, and its digits — however many
@@ -178,7 +309,10 @@ pub(crate) fn whole(text: &str) -> Option<i128> {
 /// than 2^64 bytes, so the places its digits have below the units, or its
 /// trailing zeros above them, are fewer — and an exponent past ±2^100
 /// leaves any digit but zero below the units, a fraction, or more than 38
-/// places above them, past an `i128`, whichever its sign.
+/// places above them, past an `i128`, whichever its sign. Nor anything
+/// [`exact_f64`] and [`exact_f32`] read: such a number reads as an infinity
+/// or as zero, and a finite float's canonical decimal has an exponent within
+/// ±400.
 fn exponent(text: &str) -> Option<i128> {
   const SATURATED: i128 = 1 << 100;
   let (negative, digits) = match text.as_bytes().first() {
