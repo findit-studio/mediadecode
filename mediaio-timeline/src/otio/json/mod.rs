@@ -151,8 +151,8 @@ pub(crate) fn whole(text: &str) -> Option<i128> {
     return Some(0);
   }
   // Within ±2^100 and the two lengths within ±2^64: no overflow.
-  let scale = exponent(power)? - i128::try_from(fraction.len()).ok()?
-    + i128::try_from(zeros).ok()?;
+  let scale =
+    exponent(power)? - i128::try_from(fraction.len()).ok()? + i128::try_from(zeros).ok()?;
   // A significant digit below the units is a fraction.
   if scale < 0 {
     return None;

@@ -458,7 +458,10 @@ fn a_gap_of_some_length_after_the_last_clip_is_refused() {
       set(&mut track, "", "markers", Value::Array(vec![]));
       push(root, "tracks.children", track);
     }),
-    Err(feature(Feature::TrailingGap, "tracks.children.1.children.0")),
+    Err(feature(
+      Feature::TrailingGap,
+      "tracks.children.1.children.0"
+    )),
   );
   // A gap of no length there carries nothing.
   assert_eq!(
@@ -472,9 +475,10 @@ fn a_gap_of_some_length_after_the_last_clip_is_refused() {
   // back.
   let mut faded = sample();
   let b = &mut faded.tracks_mut()[0].clips_mut()[1];
-  let fades = b
-    .fades()
-    .with_out(Some(Fade::new(Duration::new(4, edit()), FadeShape::EqualPower)));
+  let fades = b.fades().with_out(Some(Fade::new(
+    Duration::new(4, edit()),
+    FadeShape::EqualPower,
+  )));
   b.set_fades(fades);
   for target in [OtioTarget::V0_15Plus, OtioTarget::Legacy] {
     let written = to_otio(&faded, target).unwrap();
@@ -617,12 +621,7 @@ fn a_range_whose_end_opentimelineio_rounds_is_refused() {
   );
   // An available range.
   assert_eq!(
-    read(|root| set_range(
-      root,
-      &format!("{A_MEDIA}.available_range"),
-      LIMIT - 99,
-      100
-    )),
+    read(|root| set_range(root, &format!("{A_MEDIA}.available_range"), LIMIT - 99, 100)),
     Err(inexact(&format!("{A_MEDIA}.available_range"), ROUNDS)),
   );
 }
@@ -631,9 +630,8 @@ fn a_range_whose_end_opentimelineio_rounds_is_refused() {
 fn what_opentimelineio_derives_from_a_track_is_held_as_the_export_holds_it() {
   // The leading gap so long that `b` ends at 2^53: read, every record
   // moved on with it.
-  let gap = |length: i64| {
-    read(move |root| set_range(root, &format!("{GAP}.source_range"), 0, length))
-  };
+  let gap =
+    |length: i64| read(move |root| set_range(root, &format!("{GAP}.source_range"), 0, length));
   assert_eq!(
     gap(LIMIT - 48).unwrap().tracks()[0].clips()[1].record(),
     TimeRange::new(LIMIT - 24, LIMIT, edit()),

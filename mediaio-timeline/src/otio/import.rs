@@ -654,11 +654,23 @@ fn track(
     None => return Err(shape(&object.at.key("kind"), "a required key")),
   };
   let mut track = Track::new(kind, object.name()?).with_enabled(object.enabled()?);
-  let (clips, transitions, walk) = children(object, edit, ticks)?;
+  let Children {
+    clips,
+    transitions,
+    walk,
+  } = children(object, edit, ticks)?;
   *track.clips_mut() = clips;
   *track.transitions_mut() = transitions;
   *track.markers_mut() = markers(object, Placed::Edit(edit, ticks))?;
   Ok((track, walk))
+}
+
+/// A track's children as read: its clips, each at its record, its
+/// transitions, and the children as OpenTimelineIO's walk reads them.
+struct Children {
+  clips: Vec<Clip>,
+  transitions: Vec<Transition>,
+  walk: Vec<derive::Child>,
 }
 
 /// One child of a track as read, before the track places it.
@@ -701,11 +713,7 @@ impl Child {
 /// with that clip: one of some length is refused by name, every gap of a
 /// track with no clip among them. Answers the children as OpenTimelineIO's
 /// walk reads them too, each counted as the document writes it.
-fn children(
-  object: &Object<'_>,
-  edit: Ruler,
-  ticks: Timebase,
-) -> Result<(Vec<Clip>, Vec<Transition>, Vec<derive::Child>), Unreadable> {
+fn children(object: &Object<'_>, edit: Ruler, ticks: Timebase) -> Result<Children, Unreadable> {
   let at = object.at.key("children");
   let values = array(object.required("children")?, &at)?;
   let mut read = Vec::with_capacity(values.len());
@@ -800,7 +808,11 @@ fn children(
       }
     }
   }
-  Ok((clips, ordered(dissolves)?, walk))
+  Ok(Children {
+    clips,
+    transitions: ordered(dissolves)?,
+    walk,
+  })
 }
 
 /// `cursor` moved on `length` edit-rate ticks.
