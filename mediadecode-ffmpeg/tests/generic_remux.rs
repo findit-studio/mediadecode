@@ -42,6 +42,7 @@ fn remux<Dm, M>(
   Dm: Demuxer,
   Dm::Error: core::fmt::Debug,
   M: Muxer<Adapter = Dm::Adapter, Buffer = Dm::Buffer>,
+  M::Refusal: core::fmt::Debug,
   M::Error: core::fmt::Debug,
 {
   // A demuxer hands out every attachment before its first timed packet.
@@ -195,12 +196,14 @@ impl<B: AsRef<[u8]>> Ledger<B> {
 impl<B: AsRef<[u8]>> Muxer for Ledger<B> {
   type Adapter = Ffmpeg;
   type Buffer = B;
+  // The Ledger keeps the face's rules and no container's.
+  type Refusal = core::convert::Infallible;
   type Error = core::convert::Infallible;
 
   fn write_video(
     &mut self,
     packet: VideoTrackPacket<Ffmpeg, B>,
-  ) -> Result<(), MuxError<Self::Error, VideoTrackPacket<Ffmpeg, B>>> {
+  ) -> Result<(), MuxError<Self::Error, Self::Refusal, VideoTrackPacket<Ffmpeg, B>>> {
     let dts = packet.packet().dts();
     match self.admit(packet.track(), TrackKind::Video, dts) {
       Some(refusal) => Err(MuxError::Refused { refusal, packet }),
@@ -211,7 +214,7 @@ impl<B: AsRef<[u8]>> Muxer for Ledger<B> {
   fn write_audio(
     &mut self,
     packet: AudioTrackPacket<Ffmpeg, B>,
-  ) -> Result<(), MuxError<Self::Error, AudioTrackPacket<Ffmpeg, B>>> {
+  ) -> Result<(), MuxError<Self::Error, Self::Refusal, AudioTrackPacket<Ffmpeg, B>>> {
     let dts = packet.packet().dts();
     match self.admit(packet.track(), TrackKind::Audio, dts) {
       Some(refusal) => Err(MuxError::Refused { refusal, packet }),
@@ -222,7 +225,7 @@ impl<B: AsRef<[u8]>> Muxer for Ledger<B> {
   fn write_subtitle(
     &mut self,
     packet: SubtitleTrackPacket<Ffmpeg, B>,
-  ) -> Result<(), MuxError<Self::Error, SubtitleTrackPacket<Ffmpeg, B>>> {
+  ) -> Result<(), MuxError<Self::Error, Self::Refusal, SubtitleTrackPacket<Ffmpeg, B>>> {
     // A subtitle or data packet's decode time is its presentation time.
     let dts = packet.packet().pts();
     match self.admit(packet.track(), TrackKind::Subtitle, dts) {
@@ -234,7 +237,7 @@ impl<B: AsRef<[u8]>> Muxer for Ledger<B> {
   fn write_data(
     &mut self,
     packet: DataTrackPacket<Ffmpeg, B>,
-  ) -> Result<(), MuxError<Self::Error, DataTrackPacket<Ffmpeg, B>>> {
+  ) -> Result<(), MuxError<Self::Error, Self::Refusal, DataTrackPacket<Ffmpeg, B>>> {
     let dts = packet.packet().pts();
     match self.admit(packet.track(), TrackKind::Data, dts) {
       Some(refusal) => Err(MuxError::Refused { refusal, packet }),

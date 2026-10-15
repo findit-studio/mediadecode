@@ -7,7 +7,9 @@
 //! [`VideoTrackPacket`] carries its track coordinate with it — and
 //! [`write_packet`](Muxer::write_packet) routes a [`DemuxedPacket`] to
 //! the write for its kind. A refused packet comes back inside the
-//! error, untouched.
+//! error, untouched — refused by a rule every muxer keeps
+//! ([`MuxRefusal`]) or by one the backend's container keeps
+//! ([`Muxer::Refusal`]).
 //!
 //! # A remux: collect, then open, then write
 //!
@@ -67,11 +69,12 @@
 //!
 //! /// Writes the timed packets once the muxer is open. An attachment here
 //! /// would break the demuxer's promise: `write_packet` refuses it by
-//! /// name and hands it back, as it does every refused packet.
+//! /// name and hands it back, as it does every refused packet — the
+//! /// backend's own refusals included.
 //! fn write_all<M: Muxer>(
 //!   muxer: &mut M,
 //!   packets: impl IntoIterator<Item = DemuxedPacket<M::Adapter, M::Buffer>>,
-//! ) -> Result<(), MuxError<M::Error, DemuxedPacket<M::Adapter, M::Buffer>>> {
+//! ) -> Result<(), MuxError<M::Error, M::Refusal, DemuxedPacket<M::Adapter, M::Buffer>>> {
 //!   for packet in packets {
 //!     muxer.write_packet(packet)?;
 //!   }
@@ -155,7 +158,7 @@ pub enum MuxRefusal {
   /// not fail on the face. Whether a container takes two packets at one
   /// decode time is the container's question: a backend whose container
   /// needs them strictly increasing refuses the equal one by its own
-  /// name, and hands it back as this one does.
+  /// name ([`MuxError::Backend`]), and hands it back as this one does.
   #[error(
     "decode timestamps on track {} must not go back: {} after {}",
     .track.get(), .offered.pts(), .last.pts()
@@ -189,7 +192,8 @@ pub enum MuxRefusal {
 ///
 /// One function rather than a rule restated in every backend: the
 /// portable face admits what this admits, and a backend stricter for its
-/// container adds its own refusal after this one.
+/// container adds its own refusal after this one, in its own vocabulary
+/// ([`Muxer::Refusal`], handed back in [`MuxError::Backend`]).
 pub fn check_decode_order(
   track: TrackIndex,
   last: Option<Timestamp>,
@@ -206,18 +210,42 @@ pub fn check_decode_order(
 }
 
 /// How a muxer write failed: a refusal every muxer names the same way,
-/// with the packet handed back, or the backend's own fault.
+/// or one the backend names in its own vocabulary — each with the packet
+/// handed back — or the backend's own fault.
 ///
-/// `P` is the packet the write took — each write method names its own —
-/// so a refused packet can be retried, rerouted or dropped whatever its
-/// buffer and extras are: it is moved back, never cloned.
+/// `E` is the backend's fault ([`Muxer::Error`]), `R` its own refusals
+/// ([`Muxer::Refusal`]), and `P` the packet the write took — each write
+/// method names its own — so a refused packet can be retried, rerouted or
+/// dropped whatever its buffer and extras are: it is moved back, never
+/// cloned.
+///
+/// # Two vocabularies of refusal
+///
+/// The portable one, [`MuxRefusal`], is closed: what every muxer refuses,
+/// named the same way by all of them. A backend's is open: its container
+/// keeps rules the face does not — two packets at one decode time in a
+/// container that needs decode times strictly increasing, say — and it
+/// names each in a vocabulary of its own. Either way nothing was written
+/// and the packet comes back, which is what a caller needs to be able to
+/// count on: a backend never has to report a refusal as a fault, losing
+/// the packet, because its rule is not one the face knows.
 #[derive(Debug, thiserror::Error)]
-pub enum MuxError<E, P> {
+pub enum MuxError<E, R, P> {
   /// A refusal every muxer names the same way. Nothing was written.
   #[error("{refusal}")]
   Refused {
     /// What was refused, and why.
     refusal: MuxRefusal,
+    /// The packet offered, handed back untouched.
+    packet: P,
+  },
+  /// A refusal the backend names in its own vocabulary
+  /// ([`Muxer::Refusal`]) — a rule its container keeps that the portable
+  /// face does not. Nothing was written.
+  #[error("{refusal}")]
+  Backend {
+    /// What was refused, and why, in the backend's words.
+    refusal: R,
     /// The packet offered, handed back untouched.
     packet: P,
   },
@@ -227,14 +255,18 @@ pub enum MuxError<E, P> {
   Fault(E),
 }
 
-impl<E, P> MuxError<E, P> {
-  /// Maps the handed-back packet, leaving the refusal — or the fault —
-  /// as it is. A caller that routes several kinds of packet through one
-  /// error type gives each refused packet back its envelope this way;
-  /// see the module's remux example.
-  pub fn map_packet<Q>(self, f: impl FnOnce(P) -> Q) -> MuxError<E, Q> {
+impl<E, R, P> MuxError<E, R, P> {
+  /// Maps the handed-back packet, leaving the refusal — portable or the
+  /// backend's — or the fault as it is. A caller that routes several
+  /// kinds of packet through one error type gives each refused packet
+  /// back its envelope this way; see the module's remux example.
+  pub fn map_packet<Q>(self, f: impl FnOnce(P) -> Q) -> MuxError<E, R, Q> {
     match self {
       Self::Refused { refusal, packet } => MuxError::Refused {
+        refusal,
+        packet: f(packet),
+      },
+      Self::Backend { refusal, packet } => MuxError::Backend {
         refusal,
         packet: f(packet),
       },
@@ -252,7 +284,8 @@ impl<E, P> MuxError<E, P> {
 /// is the muxer's job. Within one track, decode timestamps may not go
 /// back ([`check_decode_order`], [`MuxRefusal::NonMonotonicDts`]); two
 /// at one instant are admitted on this face, and refused only by a
-/// backend whose container cannot store them.
+/// backend whose container cannot store them — by its own name, in
+/// [`MuxError::Backend`], with the packet handed back.
 ///
 /// # Attachments
 ///
@@ -277,14 +310,24 @@ impl<E, P> MuxError<E, P> {
 /// A packet for a track the muxer does not have, of the wrong kind for
 /// its track, without the timestamp its track is ordered by, or an
 /// attachment offered as a packet is refused by name — [`MuxRefusal`],
-/// inside [`MuxError::Refused`] — and nothing is written. The refusal
-/// hands the packet back untouched, so the caller still owns it.
+/// inside [`MuxError::Refused`] — and nothing is written. A packet that
+/// breaks a rule of the backend's container is refused by the backend's
+/// own name — [`Self::Refusal`], inside [`MuxError::Backend`] — and
+/// nothing is written either. Every refusal hands the packet back
+/// untouched, so the caller still owns it.
 pub trait Muxer {
   /// Backend-specific vocabulary — the container tier's, as the
   /// `Demuxer`'s is.
   type Adapter: DemuxAdapter;
   /// Buffer type held by the packets this session takes.
   type Buffer: AsRef<[u8]>;
+  /// The backend's own refusals: rules its container keeps that the
+  /// portable face ([`MuxRefusal`]) does not, each refused by name in
+  /// [`MuxError::Backend`] with the packet handed back. Open on purpose —
+  /// what a container demands is the backend's to name. A backend whose
+  /// containers keep no rule of their own names
+  /// [`core::convert::Infallible`].
+  type Refusal;
   /// Muxer-specific fault type.
   type Error;
 
@@ -292,25 +335,28 @@ pub trait Muxer {
   fn write_video(
     &mut self,
     packet: VideoTrackPacket<Self::Adapter, Self::Buffer>,
-  ) -> Result<(), MuxError<Self::Error, VideoTrackPacket<Self::Adapter, Self::Buffer>>>;
+  ) -> Result<(), MuxError<Self::Error, Self::Refusal, VideoTrackPacket<Self::Adapter, Self::Buffer>>>;
 
   /// Writes one audio packet to the track it names.
   fn write_audio(
     &mut self,
     packet: AudioTrackPacket<Self::Adapter, Self::Buffer>,
-  ) -> Result<(), MuxError<Self::Error, AudioTrackPacket<Self::Adapter, Self::Buffer>>>;
+  ) -> Result<(), MuxError<Self::Error, Self::Refusal, AudioTrackPacket<Self::Adapter, Self::Buffer>>>;
 
   /// Writes one subtitle packet to the track it names.
   fn write_subtitle(
     &mut self,
     packet: SubtitleTrackPacket<Self::Adapter, Self::Buffer>,
-  ) -> Result<(), MuxError<Self::Error, SubtitleTrackPacket<Self::Adapter, Self::Buffer>>>;
+  ) -> Result<
+    (),
+    MuxError<Self::Error, Self::Refusal, SubtitleTrackPacket<Self::Adapter, Self::Buffer>>,
+  >;
 
   /// Writes one timed-data packet to the track it names.
   fn write_data(
     &mut self,
     packet: DataTrackPacket<Self::Adapter, Self::Buffer>,
-  ) -> Result<(), MuxError<Self::Error, DataTrackPacket<Self::Adapter, Self::Buffer>>>;
+  ) -> Result<(), MuxError<Self::Error, Self::Refusal, DataTrackPacket<Self::Adapter, Self::Buffer>>>;
 
   /// Writes one demuxed packet through the write for its kind — the
   /// router a remux's write loop calls.
@@ -322,7 +368,8 @@ pub trait Muxer {
   fn write_packet(
     &mut self,
     packet: DemuxedPacket<Self::Adapter, Self::Buffer>,
-  ) -> Result<(), MuxError<Self::Error, DemuxedPacket<Self::Adapter, Self::Buffer>>> {
+  ) -> Result<(), MuxError<Self::Error, Self::Refusal, DemuxedPacket<Self::Adapter, Self::Buffer>>>
+  {
     match packet {
       DemuxedPacket::Video(p) => self
         .write_video(p)
@@ -404,6 +451,14 @@ mod tests {
   #[derive(Debug, PartialEq, Eq)]
   struct Fault;
 
+  /// The one rule of the strict containers the laws stand in for: decode
+  /// times strictly increasing within a track, named by the backend.
+  #[derive(Debug, PartialEq, Eq, thiserror::Error)]
+  enum StrictRefusal {
+    #[error("track {} already holds a packet at decode time {}", .track.get(), .dts.pts())]
+    RepeatedDts { track: TrackIndex, dts: Timestamp },
+  }
+
   fn ms(pts: i64) -> Timestamp {
     Timestamp::new(
       pts,
@@ -413,10 +468,13 @@ mod tests {
 
   /// A six-track muxer (video, audio, two attachments whose files it
   /// was opened with, then subtitles and timed data) that checks what
-  /// every muxer checks and writes nothing anywhere.
+  /// every muxer checks and writes nothing anywhere — and, when `strict`,
+  /// keeps the rule of a container that needs decode times strictly
+  /// increasing, refusing an equal one by its own name.
   struct Table {
     kinds: [TrackKind; 6],
     last: [Option<Timestamp>; 6],
+    strict: bool,
     written: u32,
   }
 
@@ -432,7 +490,16 @@ mod tests {
           TrackKind::Data,
         ],
         last: [None; 6],
+        strict: false,
         written: 0,
+      }
+    }
+
+    /// The same table over a strict container.
+    fn strict() -> Self {
+      Self {
+        strict: true,
+        ..Self::new()
       }
     }
 
@@ -467,22 +534,28 @@ mod tests {
       Ok(dts)
     }
 
-    /// Writes `packet`, or hands it back with the refusal.
+    /// Writes `packet`, or hands it back with the refusal — the
+    /// portable one, or the strict container's own after it.
     fn admit<P>(
       &mut self,
       track: TrackIndex,
       offered: TrackKind,
       dts: Option<Timestamp>,
       packet: P,
-    ) -> Result<(), MuxError<Fault, P>> {
-      match self.check(track, offered, dts) {
-        Ok(dts) => {
-          self.last[track.get()] = Some(dts);
-          self.written += 1;
-          Ok(())
-        }
-        Err(refusal) => Err(MuxError::Refused { refusal, packet }),
+    ) -> Result<(), MuxError<Fault, StrictRefusal, P>> {
+      let dts = match self.check(track, offered, dts) {
+        Ok(dts) => dts,
+        Err(refusal) => return Err(MuxError::Refused { refusal, packet }),
+      };
+      if self.strict && self.last[track.get()] == Some(dts) {
+        return Err(MuxError::Backend {
+          refusal: StrictRefusal::RepeatedDts { track, dts },
+          packet,
+        });
       }
+      self.last[track.get()] = Some(dts);
+      self.written += 1;
+      Ok(())
     }
   }
 
@@ -493,27 +566,31 @@ mod tests {
   type AtTrack = AttachmentTrackPacket<Loopback, Bytes>;
   type Demuxed = DemuxedPacket<Loopback, Bytes>;
 
+  /// A write's answer in the table's vocabulary.
+  type Written<P> = Result<(), MuxError<Fault, StrictRefusal, P>>;
+
   impl Muxer for Table {
     type Adapter = Loopback;
     type Buffer = Bytes;
+    type Refusal = StrictRefusal;
     type Error = Fault;
 
-    fn write_video(&mut self, p: VTrack) -> Result<(), MuxError<Fault, VTrack>> {
+    fn write_video(&mut self, p: VTrack) -> Written<VTrack> {
       let (track, dts) = (p.track(), p.packet().dts());
       self.admit(track, TrackKind::Video, dts, p)
     }
 
-    fn write_audio(&mut self, p: ATrack) -> Result<(), MuxError<Fault, ATrack>> {
+    fn write_audio(&mut self, p: ATrack) -> Written<ATrack> {
       let (track, dts) = (p.track(), p.packet().dts());
       self.admit(track, TrackKind::Audio, dts, p)
     }
 
-    fn write_subtitle(&mut self, p: STrack) -> Result<(), MuxError<Fault, STrack>> {
+    fn write_subtitle(&mut self, p: STrack) -> Written<STrack> {
       let (track, pts) = (p.track(), p.packet().pts());
       self.admit(track, TrackKind::Subtitle, pts, p)
     }
 
-    fn write_data(&mut self, p: DTrack) -> Result<(), MuxError<Fault, DTrack>> {
+    fn write_data(&mut self, p: DTrack) -> Written<DTrack> {
       let (track, pts) = (p.track(), p.packet().pts());
       self.admit(track, TrackKind::Data, pts, p)
     }
@@ -581,12 +658,30 @@ mod tests {
     }};
   }
 
-  /// The refusal and the handed-back packet, or a panic naming what came
-  /// instead.
-  fn refused<P>(result: Result<(), MuxError<Fault, P>>) -> (MuxRefusal, P) {
+  /// The portable refusal and the handed-back packet, or a panic naming
+  /// what came instead.
+  fn refused<P>(result: Written<P>) -> (MuxRefusal, P) {
     match result {
       Err(MuxError::Refused { refusal, packet }) => (refusal, packet),
+      Err(MuxError::Backend { refusal, .. }) => {
+        panic!("expected a portable refusal, got the backend's {refusal:?}")
+      }
       Err(MuxError::Fault(fault)) => panic!("expected a refusal, got the fault {fault:?}"),
+      Ok(()) => panic!("expected a refusal, the packet was written"),
+    }
+  }
+
+  /// The backend's refusal and the handed-back packet, or a panic naming
+  /// what came instead.
+  fn refused_by_the_backend<P>(result: Written<P>) -> (StrictRefusal, P) {
+    match result {
+      Err(MuxError::Backend { refusal, packet }) => (refusal, packet),
+      Err(MuxError::Refused { refusal, .. }) => {
+        panic!("expected the backend's refusal, got the portable {refusal:?}")
+      }
+      Err(MuxError::Fault(fault)) => {
+        panic!("expected the backend's refusal with the packet, got the fault {fault:?}")
+      }
       Ok(()) => panic!("expected a refusal, the packet was written"),
     }
   }
@@ -735,7 +830,7 @@ mod tests {
     let mut muxer = Table::new();
     let offered = video(7, Some(0));
     let kept = offered.clone();
-    let routed: Result<(), MuxError<Fault, DemuxedPacket<Loopback, Bytes>>> = muxer
+    let routed: Written<Demuxed> = muxer
       .write_video(offered)
       .map_err(|e| e.map_packet(DemuxedPacket::Video));
     let (refusal, back) = refused(routed);
@@ -782,5 +877,76 @@ mod tests {
       other => panic!("expected the video envelope, got {other:?}"),
     }
     assert_eq!(muxer.written, 2, "nothing refused was written");
+  }
+
+  /// **A backend stricter than the face refuses by its own name, through
+  /// `write_packet`, and hands the packet back untouched.** Over a strict
+  /// container the second video packet at one decode time is refused as
+  /// the backend's `RepeatedDts` — not as a fault, which would have taken
+  /// the packet — and comes back in its envelope; restamped later, the
+  /// same packet is written. The portable rule still answers first: an
+  /// earlier decode time is the face's refusal, not the backend's.
+  #[test]
+  fn a_strict_backend_refuses_an_equal_decode_time_by_name_and_hands_the_packet_back() {
+    let mut muxer = Table::strict();
+    muxer
+      .write_packet(DemuxedPacket::Video(video(0, Some(40))))
+      .expect("the first packet");
+    let offered = video(0, Some(40));
+    let kept = offered.clone();
+    let (refusal, back) =
+      refused_by_the_backend::<Demuxed>(muxer.write_packet(DemuxedPacket::Video(offered)));
+    match refusal {
+      StrictRefusal::RepeatedDts { track, dts } => {
+        assert_eq!((track.get(), dts.pts()), (0, 40));
+      }
+    }
+    let back = match back {
+      DemuxedPacket::Video(back) => back,
+      other => panic!("expected the video envelope, got {other:?}"),
+    };
+    assert_handed_back!(back, kept; pts, dts, duration, flags);
+    assert_eq!(muxer.written, 1, "nothing refused was written");
+
+    // The handed-back packet is the caller's again: restamped, it goes.
+    let (track, packet) = back.into_parts();
+    muxer
+      .write_packet(DemuxedPacket::Video(VideoTrackPacket::new(
+        track,
+        packet.with_dts(Some(ms(80))),
+      )))
+      .expect("the same packet, advancing");
+    assert_eq!(muxer.written, 2);
+
+    // An earlier decode time is the portable rule's, answered first.
+    let (refusal, _) =
+      refused::<Demuxed>(muxer.write_packet(DemuxedPacket::Video(video(0, Some(10)))));
+    assert!(matches!(refusal, MuxRefusal::NonMonotonicDts { .. }));
+  }
+
+  /// **`map_packet` carries the backend's refusal over as it carries the
+  /// portable one**: the refusal unchanged, the packet in its new
+  /// envelope.
+  #[test]
+  fn map_packet_keeps_the_backends_refusal_and_its_packet() {
+    let offered = subtitle(4, 10);
+    let kept = offered.clone();
+    let error: MuxError<Fault, StrictRefusal, STrack> = MuxError::Backend {
+      refusal: StrictRefusal::RepeatedDts {
+        track: TrackIndex::new(4),
+        dts: ms(10),
+      },
+      packet: offered,
+    };
+    match error.map_packet(DemuxedPacket::Subtitle) {
+      MuxError::Backend {
+        refusal: StrictRefusal::RepeatedDts { track, dts },
+        packet: DemuxedPacket::Subtitle(back),
+      } => {
+        assert_eq!((track.get(), dts.pts()), (4, 10));
+        assert_handed_back!(back, kept; pts, duration, flags);
+      }
+      other => panic!("expected the backend's refusal in the subtitle envelope, got {other:?}"),
+    }
   }
 }
