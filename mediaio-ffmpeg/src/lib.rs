@@ -285,7 +285,10 @@ pub type Chapter = mediaspine::demuxer::Chapter<Ffmpeg>;
 /// The `#[must_use]` on [`mediaspine::Sent`] is deliberate teeth: a
 /// test that submits and ignores the answer is a test that would not
 /// notice a session quietly asking to be drained.
-#[cfg(test)]
+///
+/// The resampler's tests are its only users here, so it is compiled
+/// where they are.
+#[cfg(all(test, feature = "resample"))]
 #[track_caller]
 pub(crate) fn accepted<E: core::fmt::Debug>(
   status: core::result::Result<mediaspine::Sent, E>,
