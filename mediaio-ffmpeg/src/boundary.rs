@@ -4163,7 +4163,7 @@ mod tests {
     let entries = carried.extra().side_data();
     assert_eq!(entries.len(), 1, "the entry survives the round trip");
     assert_eq!(entries[0].kind(), kind, "as the integer it is");
-    assert_eq!(entries[0].data().as_ref(), &[9u8, 8, 7][..]);
+    assert_eq!(entries[0].data(), &[9u8, 8, 7][..]);
   }
 
   #[test]

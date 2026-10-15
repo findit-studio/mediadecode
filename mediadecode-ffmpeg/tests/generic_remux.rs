@@ -66,12 +66,20 @@ fn remux<Dm, M>(
     .collect::<Result<Vec<_>, _>>()
     .expect("every row describes a track");
 
+  // A refusal hands the packet back; the lane only needs to know there
+  // was one, so the packet is dropped from the error before it is shown.
   let mut muxer = open(table);
   if let Some(packet) = first {
-    muxer.write_packet(packet).expect("the first timed packet");
+    muxer
+      .write_packet(packet)
+      .map_err(|error| error.map_packet(drop))
+      .expect("the first timed packet");
   }
   while let Some(packet) = demuxer.next_packet().expect("a packet or the end") {
-    muxer.write_packet(packet).expect("a timed packet");
+    muxer
+      .write_packet(packet)
+      .map_err(|error| error.map_packet(drop))
+      .expect("a timed packet");
   }
   muxer.finish().expect("the container is finished");
 }
