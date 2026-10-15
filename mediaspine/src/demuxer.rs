@@ -914,6 +914,35 @@ impl<E: DemuxAdapter> TrackInfo<E> {
   }
 }
 
+/// Everything a [`TrackInfo`] holds, moved out whole — what the write
+/// side's lossless conversion,
+/// [`TrackDescription::from_track_info`](crate::track::TrackDescription::from_track_info),
+/// takes apart. Crate-private: the row's public face is unchanged.
+pub(crate) struct TrackInfoFields<E: DemuxAdapter> {
+  pub(crate) timebase: Timebase,
+  pub(crate) duration: Option<Timestamp>,
+  pub(crate) params: TrackParams<E>,
+  pub(crate) filename: Option<E::Text>,
+  pub(crate) mime_type: Option<E::Text>,
+  pub(crate) language: Option<E::Text>,
+  pub(crate) extra: E::TrackExtra,
+}
+
+impl<E: DemuxAdapter> TrackInfo<E> {
+  /// Moves every field out, for the write side's conversion.
+  pub(crate) fn into_fields(self) -> TrackInfoFields<E> {
+    TrackInfoFields {
+      timebase: self.timebase,
+      duration: self.duration,
+      params: self.params,
+      filename: self.filename,
+      mime_type: self.mime_type,
+      language: self.language,
+      extra: self.extra,
+    }
+  }
+}
+
 // `Debug` is hand-written for the same reason as `TrackParams`'s:
 // `#[derive(Debug)]` would add `E: Debug`, but the field that
 // actually needs a bound is `E::TrackExtra` — `E::Text: Debug` is
