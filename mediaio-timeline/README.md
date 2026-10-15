@@ -301,10 +301,15 @@ inverse of `to_otio`: for every timeline `to_otio` writes, for either
 target, it reads that very timeline back — every count, timebase and rate
 as the model held it. It holds each `RationalTime` to the exact words: its
 rate the `f64` of its exact ruler, bit for bit, and its value a whole count
-within ±2^53, read from its digits. It lays each track's items end to end
-from zero, as OpenTimelineIO places them, and validates what it read. A
-track ends with its last clip, so a gap of some length after it — which
-OpenTimelineIO counts in the track's duration — is refused.
+within ±2^53, read from its digits. What OpenTimelineIO derives from those
+counts in its own `f64` arithmetic is held as the export holds it: both
+ends of every range — a marker one tick long at 2^53, whose end
+OpenTimelineIO's sum rounds back to 2^53, is refused — and every place,
+visible range and duration of each track's walk and the stack's. It lays
+each track's items end to end from zero, as OpenTimelineIO places them,
+and validates what it read. A track ends with its last clip, so a gap of
+some length after it — which OpenTimelineIO counts in the track's
+duration — is refused.
 
 A document from another writer is read where it uses only what the
 timeline models and carries those words. Nothing is dropped: everything
@@ -315,7 +320,8 @@ a key, value or note it has no word for (`Unreadable::Feature`: another
 writer's metadata, a track kind or transition type it does not know, a
 trim on a track, a marker color outside the eleven, a gap of some length
 after a track's last clip, …), and a count or rate that does not land
-exactly (`Unreadable::Inexact`). A key is read only
+exactly, or a time OpenTimelineIO would read rounded
+(`Unreadable::Inexact`). A key is read only
 where it carries nothing — `null`, an empty list, `enabled` as `true` — or
 what the timeline keeps.
 

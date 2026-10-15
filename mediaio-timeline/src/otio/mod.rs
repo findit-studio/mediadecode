@@ -670,7 +670,12 @@ impl core::error::Error for Shape {}
 /// ruler its counts are written in and the timebase the model counts it in,
 /// from the words the export writes under `metadata.mediaio`, and holds
 /// every `RationalTime` to them: its rate the `f64` of its exact ruler, bit
-/// for bit, and its value a whole count within ±2^53. It lays each track's
+/// for bit, and its value a whole count within ±2^53. What OpenTimelineIO
+/// derives from those counts in its own `f64` arithmetic is held as
+/// [`to_otio`] holds it before writing: both ends of every range — its end
+/// and its last tick — and every place, visible range and duration of the
+/// walk of each track and of the stack, so a document whose times
+/// OpenTimelineIO would read rounded is refused. It lays each track's
 /// items end to end from zero, as OpenTimelineIO places them — a clip as
 /// long as its source range at the edit rate — and puts each fade on the
 /// clip beside its gap and each dissolve on the cut it straddles. A track
@@ -698,7 +703,8 @@ impl core::error::Error for Shape {}
 /// - [`Unreadable::Schema`] and [`Unreadable::Feature`] for what the
 ///   timeline does not model;
 /// - [`Unreadable::Inexact`] for a count or rate that does not land exactly
-///   where the timeline counts it;
+///   where the timeline counts it, or a time OpenTimelineIO's `f64`
+///   arithmetic rounds;
 /// - [`Unreadable::Validation`] for a timeline read whole that does not
 ///   [`validate`](fn@validate).
 pub fn from_otio(json: &str) -> Result<Timeline, Unreadable> {
@@ -725,7 +731,8 @@ pub enum Unreadable {
   /// word for.
   Feature(UnmodelledFeature),
   /// A count or a rate that does not land exactly where the timeline
-  /// counts it.
+  /// counts it, or a time OpenTimelineIO derives from the document that its
+  /// `f64` arithmetic rounds.
   Inexact(Inexact),
   /// The timeline read does not [`validate`](fn@validate): its refusals.
   Validation(Vec<Refusal>),
@@ -935,7 +942,11 @@ impl fmt::Display for Feature {
 }
 
 /// A count or a rate that does not land exactly where the timeline counts
-/// it, and where: what [`Unreadable::Inexact`] carries.
+/// it, or a time OpenTimelineIO's `f64` arithmetic rounds, and where: what
+/// [`Unreadable::Inexact`] carries. A time OpenTimelineIO derives is
+/// refused where it is derived from: a range at the range, a place or a
+/// visible range at its child, a duration or an end at its track, the
+/// stack's pick of its longest track at the stack.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Inexact {
   path: Utf8Bytes,

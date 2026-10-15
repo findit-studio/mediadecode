@@ -555,6 +555,120 @@ fn a_count_or_rate_that_does_not_land_exactly_is_refused() {
   );
 }
 
+/// 2^53: past it an `f64` holds only some whole counts.
+const LIMIT: i64 = 1 << 53;
+
+/// `value` as the export writes a count.
+fn count(value: i64) -> Value {
+  number(&format!("{value}.0"))
+}
+
+/// Sets the start and the duration of the range at `range`.
+fn set_range(root: &mut Value, range: &str, start: i64, duration: i64) {
+  set(root, &format!("{range}.start_time"), "value", count(start));
+  set(root, &format!("{range}.duration"), "value", count(duration));
+}
+
+#[test]
+fn a_range_whose_end_opentimelineio_rounds_is_refused() {
+  const ROUNDS: &str = "a range whose end, or last tick, OpenTimelineIO's f64 arithmetic rounds";
+  // A track's marker, at the edit rate: one tick ending at 2^53 reads; one
+  // tick on, OpenTimelineIO's sum rounds 2^53 + 1 back to 2^53.
+  let marker = |start: i64| {
+    read(move |root| set_range(root, &format!("{TRACK}.markers.0.marked_range"), start, 1))
+  };
+  assert_eq!(
+    marker(LIMIT - 1).unwrap().tracks()[0].markers()[0].range(),
+    TimeRange::new(LIMIT - 1, LIMIT, edit()),
+  );
+  assert_eq!(
+    marker(LIMIT),
+    Err(inexact(&format!("{TRACK}.markers.0.marked_range"), ROUNDS)),
+  );
+  // A clip's marker, in the ruler its word names.
+  let clip_marker = |start: i64| {
+    read(move |root| set_range(root, &format!("{A}.markers.0.marked_range"), start, 2))
+  };
+  assert_eq!(
+    clip_marker(LIMIT - 2).unwrap().tracks()[0].clips()[0].markers()[0].range(),
+    TimeRange::new(LIMIT - 2, LIMIT, edit()),
+  );
+  assert_eq!(
+    clip_marker(LIMIT - 1),
+    Err(inexact(&format!("{A}.markers.0.marked_range"), ROUNDS)),
+  );
+  // `b`'s source range, its medium's available range left unknown so the
+  // source may lie anywhere.
+  let source = |start: i64| {
+    read(move |root| {
+      let media = format!("{B}.media_references.DEFAULT_MEDIA");
+      set(root, &media, "available_range", Value::Null);
+      remove(root, &format!("{media}.metadata.mediaio"), "available");
+      set_range(root, &format!("{B}.source_range"), start, 24);
+    })
+  };
+  assert_eq!(
+    source(LIMIT - 24).unwrap().tracks()[0].clips()[1].source_range(),
+    TimeRange::new(LIMIT - 24, LIMIT, edit()),
+  );
+  assert_eq!(
+    source(LIMIT - 23),
+    Err(inexact(&format!("{B}.source_range"), ROUNDS)),
+  );
+  // An available range.
+  assert_eq!(
+    read(|root| set_range(
+      root,
+      &format!("{A_MEDIA}.available_range"),
+      LIMIT - 99,
+      100
+    )),
+    Err(inexact(&format!("{A_MEDIA}.available_range"), ROUNDS)),
+  );
+}
+
+#[test]
+fn what_opentimelineio_derives_from_a_track_is_held_as_the_export_holds_it() {
+  // The leading gap so long that `b` ends at 2^53: read, every record
+  // moved on with it.
+  let gap = |length: i64| {
+    read(move |root| set_range(root, &format!("{GAP}.source_range"), 0, length))
+  };
+  assert_eq!(
+    gap(LIMIT - 48).unwrap().tracks()[0].clips()[1].record(),
+    TimeRange::new(LIMIT - 24, LIMIT, edit()),
+  );
+  // One frame longer, `b` ends at 2^53 + 1 on its track, which
+  // OpenTimelineIO's sum rounds.
+  assert_eq!(
+    gap(LIMIT - 47),
+    Err(inexact(
+      B,
+      "a place on its track that OpenTimelineIO's f64 arithmetic rounds"
+    )),
+  );
+  // `a`'s source so late that the dissolve's handle after it reaches past
+  // 2^53: its visible range.
+  assert_eq!(
+    read(|root| {
+      let start = format!("{A}.source_range.start_time");
+      set(root, &start, "value", count(LIMIT - 25));
+    }),
+    Err(inexact(
+      A,
+      "a visible range that OpenTimelineIO's f64 arithmetic rounds"
+    )),
+  );
+  // A global start so late that `b` ends past 2^53 from it.
+  assert_eq!(
+    read(|root| set(root, "global_start_time", "value", count(LIMIT - 50))),
+    Err(inexact(
+      B,
+      "a place from the global start that OpenTimelineIO's f64 arithmetic rounds"
+    )),
+  );
+}
+
 #[test]
 fn a_word_missing_or_misshapen_is_refused_by_name() {
   assert_eq!(

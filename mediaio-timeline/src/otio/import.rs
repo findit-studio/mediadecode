@@ -18,6 +18,10 @@
 //! names, bit for bit, and its value a whole count within ±2^53, which an
 //! `f64` holds exactly; a media-side range is counted again in the timebase
 //! the model counts it in, exactly ([`Unreadable::Inexact`] otherwise).
+//! What OpenTimelineIO derives from the document is held as the export
+//! holds it ([`derive`](super::derive)), and refused as
+//! [`Unreadable::Inexact`] where its `f64` arithmetic rounds: both ends of
+//! every range read, and each track's walk and the stack's.
 //! Records are not written: like OpenTimelineIO, the reader lays a track's
 //! items end to end from zero, each clip as long as its source range at the
 //! edit rate. A track's time ends with its last clip, so a gap of some
@@ -31,8 +35,9 @@ use mediatime::{Duration, Rate, Rounding, TimeRange, Timebase, Timestamp};
 use smol_bytes::{Utf8Bytes, format_utf8bytes};
 
 use super::{
-  Feature, Inexact, Shape, UnmodelledFeature, UnmodelledSchema, Unreadable,
-  derive::Ruler,
+  ChildAt, Feature, Inexact, NotRepresentable, Shape, Spot, UnmodelledFeature, UnmodelledSchema,
+  Unreadable,
+  derive::{self, Ruler, Time},
   export::{DEFAULT_MEDIA, OURS},
   json::{self, Value},
 };
@@ -440,14 +445,76 @@ fn length(value: &Value, at: &At, ruler: Ruler) -> Result<u64, Unreadable> {
     .map_err(|_| shape(&at.key("value"), "a length of zero or more"))
 }
 
-/// A `TimeRange.1` counted in `ruler`: its start and its length.
+/// A `TimeRange.1` counted in `ruler`: its start and its length, and both
+/// ends OpenTimelineIO derives from them held ([`derive::range_held`]) —
+/// its end, the two added in `f64`, and its last tick — as the export holds
+/// every range it writes.
 fn counts(value: &Value, at: &At, ruler: Ruler) -> Result<(i64, u64), Unreadable> {
   let object = Object::of(value, at.clone())?;
   object.schema(&["TimeRange.1"])?;
   object.keys(&["OTIO_SCHEMA", "duration", "start_time"])?;
   let start = count(object.required("start_time")?, &at.key("start_time"), ruler)?;
   let length = length(object.required("duration")?, &at.key("duration"), ruler)?;
+  if !derive::range_held(written(start, ruler), written(length, ruler)) {
+    return Err(inexact(
+      at,
+      "a range whose end, or last tick, OpenTimelineIO's f64 arithmetic rounds",
+    ));
+  }
   Ok((start, length))
+}
+
+/// `count` ticks of `ruler`, as the document writes them, for the
+/// arithmetic OpenTimelineIO does on them ([`Time`]).
+fn written(count: impl Into<i128>, ruler: Ruler) -> Time {
+  Time::written(count.into(), ruler)
+}
+
+/// What OpenTimelineIO's `f64` arithmetic rounds in the walk of a track
+/// or of the stack at `stack` ([`derive::track`], [`derive::stack`]),
+/// refused where it is derived: at a child of a track, at a track, or at
+/// the stack.
+fn rounded(refusal: &NotRepresentable, stack: &At) -> Unreadable {
+  let track = |index: usize| stack.key("children").index(index);
+  let child = |at: ChildAt| track(at.track()).key("children").index(at.child());
+  match refusal.at() {
+    Spot::TrackPosition(at) => inexact(
+      &child(at),
+      "a place on its track that OpenTimelineIO's f64 arithmetic rounds",
+    ),
+    Spot::Visible(at) => inexact(
+      &child(at),
+      "a visible range that OpenTimelineIO's f64 arithmetic rounds",
+    ),
+    Spot::Absolute(at) => inexact(
+      &child(at),
+      "a place from the global start that OpenTimelineIO's f64 arithmetic rounds",
+    ),
+    Spot::TrackDuration(index) => inexact(
+      &track(index),
+      "a track duration that OpenTimelineIO's f64 arithmetic rounds",
+    ),
+    Spot::AbsoluteEnd(index) => inexact(
+      &track(index),
+      "a track's end from the global start that OpenTimelineIO's f64 arithmetic rounds",
+    ),
+    Spot::StackDuration => inexact(
+      stack,
+      "tracks whose longest OpenTimelineIO's f64 comparison does not pick",
+    ),
+    Spot::TimelineEnd => inexact(
+      stack,
+      "a timeline end from the global start that OpenTimelineIO's f64 arithmetic rounds",
+    ),
+    // Counts the document writes, which a walk does not refuse.
+    Spot::Start
+    | Spot::Record(_)
+    | Spot::Source(_)
+    | Spot::Available(_)
+    | Spot::Transition(_)
+    | Spot::Fade(_)
+    | Spot::Marker(_) => inexact(stack, "a time OpenTimelineIO's f64 arithmetic rounds"),
+  }
 }
 
 /// The range `start` and `length` ticks of `exact.ruler` make, counted
@@ -498,7 +565,7 @@ pub(crate) fn timeline(root: &Value) -> Result<Timeline, Unreadable> {
     edit,
   )?;
   let stack = Object::of(object.required("tracks")?, object.at.key("tracks"))?;
-  let tracks = self::stack(&stack, edit, ticks)?;
+  let tracks = self::stack(&stack, edit, ticks, written(start, edit))?;
   Ok(
     Timeline::new(object.name()?, rate)
       .with_start(Timestamp::new(start, ticks))
@@ -508,8 +575,16 @@ pub(crate) fn timeline(root: &Value) -> Result<Timeline, Unreadable> {
 }
 
 /// The one `Stack.1`, named `tracks` as OpenTimelineIO names it, holding
-/// the tracks and nothing the timeline does not keep.
-fn stack(stack: &Object<'_>, edit: Ruler, ticks: Timebase) -> Result<Vec<Track>, Unreadable> {
+/// the tracks and nothing the timeline does not keep. Each track is walked
+/// as the export walks it, from the global start `global`, and then the
+/// stack ([`derive::track`], [`derive::stack`]): what OpenTimelineIO's
+/// `f64` arithmetic rounds there is refused ([`rounded`]).
+fn stack(
+  stack: &Object<'_>,
+  edit: Ruler,
+  ticks: Timebase,
+  global: Time,
+) -> Result<Vec<Track>, Unreadable> {
   stack.schema(&["Stack.1"])?;
   stack.keys(&[
     "OTIO_SCHEMA",
@@ -530,14 +605,26 @@ fn stack(stack: &Object<'_>, edit: Ruler, ticks: Timebase) -> Result<Vec<Track>,
   stack.never_disabled()?;
   stack.no_color()?;
   let at = stack.at.key("children");
-  array(stack.required("children")?, &at)?
-    .iter()
-    .enumerate()
-    .map(|(index, child)| track(&Object::of(child, at.index(index))?, edit, ticks))
-    .collect()
+  let children = array(stack.required("children")?, &at)?;
+  let mut tracks = Vec::with_capacity(children.len());
+  let mut durations = Vec::with_capacity(children.len());
+  for (index, child) in children.iter().enumerate() {
+    let (track, walk) = track(&Object::of(child, at.index(index))?, edit, ticks)?;
+    let duration =
+      derive::track(index, &walk, global).map_err(|refusal| rounded(&refusal, &stack.at))?;
+    tracks.push(track);
+    durations.push(duration);
+  }
+  derive::stack(&durations, global).map_err(|refusal| rounded(&refusal, &stack.at))?;
+  Ok(tracks)
 }
 
-fn track(object: &Object<'_>, edit: Ruler, ticks: Timebase) -> Result<Track, Unreadable> {
+/// A `Track.1`, and its children as OpenTimelineIO's walk reads them.
+fn track(
+  object: &Object<'_>,
+  edit: Ruler,
+  ticks: Timebase,
+) -> Result<(Track, Vec<derive::Child>), Unreadable> {
   object.schema(&["Track.1"])?;
   object.keys(&[
     "OTIO_SCHEMA",
@@ -567,11 +654,11 @@ fn track(object: &Object<'_>, edit: Ruler, ticks: Timebase) -> Result<Track, Unr
     None => return Err(shape(&object.at.key("kind"), "a required key")),
   };
   let mut track = Track::new(kind, object.name()?).with_enabled(object.enabled()?);
-  let (clips, transitions) = children(object, edit, ticks)?;
+  let (clips, transitions, walk) = children(object, edit, ticks)?;
   *track.clips_mut() = clips;
   *track.transitions_mut() = transitions;
   *track.markers_mut() = markers(object, Placed::Edit(edit, ticks))?;
-  Ok(track)
+  Ok((track, walk))
 }
 
 /// One child of a track as read, before the track places it.
@@ -612,27 +699,36 @@ impl Child {
 /// after the last clip is read only where it has no length — the gap the
 /// export writes after a fade-out at the track's end — as the track ends
 /// with that clip: one of some length is refused by name, every gap of a
-/// track with no clip among them.
+/// track with no clip among them. Answers the children as OpenTimelineIO's
+/// walk reads them too, each counted as the document writes it.
 fn children(
   object: &Object<'_>,
   edit: Ruler,
   ticks: Timebase,
-) -> Result<(Vec<Clip>, Vec<Transition>), Unreadable> {
+) -> Result<(Vec<Clip>, Vec<Transition>, Vec<derive::Child>), Unreadable> {
   let at = object.at.key("children");
   let values = array(object.required("children")?, &at)?;
   let mut read = Vec::with_capacity(values.len());
+  let mut walk = Vec::with_capacity(values.len());
   for (index, value) in values.iter().enumerate() {
     let child = Object::of(value, at.index(index))?;
-    read.push(
-      match child.schema(&["Gap.1", "Clip.1", "Clip.2", "Transition.1"])? {
-        "Gap.1" => Child::Gap(gap(&child, edit)?),
-        "Transition.1" => transition(&child, edit, ticks)?,
-        schema => {
-          let (clip, length) = clip(&child, schema, ticks)?;
-          Child::Clip(Box::new(clip), length)
-        }
-      },
-    );
+    let (read_as, walked) = match child.schema(&["Gap.1", "Clip.1", "Clip.2", "Transition.1"])? {
+      "Gap.1" => {
+        let length = gap(&child, edit)?;
+        let walked = derive::Child::Item {
+          start: written(0, edit),
+          duration: written(length, edit),
+        };
+        (Child::Gap(length), walked)
+      }
+      "Transition.1" => transition(&child, edit, ticks)?,
+      schema => {
+        let (clip, length, walked) = clip(&child, schema, ticks)?;
+        (Child::Clip(Box::new(clip), length), walked)
+      }
+    };
+    read.push(read_as);
+    walk.push(walked);
   }
 
   let kinds: Vec<Kind> = read.iter().map(Child::kind).collect();
@@ -704,7 +800,7 @@ fn children(
       }
     }
   }
-  Ok((clips, ordered(dissolves)?))
+  Ok((clips, ordered(dissolves)?, walk))
 }
 
 /// `cursor` moved on `length` edit-rate ticks.
@@ -768,8 +864,13 @@ fn gap(object: &Object<'_>, edit: Ruler) -> Result<u64, Unreadable> {
   Ok(length)
 }
 
-/// A `Transition.1`: a fade, by this crate's words, or a dissolve.
-fn transition(object: &Object<'_>, edit: Ruler, ticks: Timebase) -> Result<Child, Unreadable> {
+/// A `Transition.1`: a fade, by this crate's words, or a dissolve — and
+/// the transition as OpenTimelineIO's walk reads it.
+fn transition(
+  object: &Object<'_>,
+  edit: Ruler,
+  ticks: Timebase,
+) -> Result<(Child, derive::Child), Unreadable> {
   object.keys(&[
     "OTIO_SCHEMA",
     "metadata",
@@ -801,6 +902,10 @@ fn transition(object: &Object<'_>, edit: Ruler, ticks: Timebase) -> Result<Child
     &object.at.key("out_offset"),
     edit,
   )?;
+  let walked = derive::Child::Transition {
+    in_offset: written(in_offset, edit),
+    out_offset: written(out_offset, edit),
+  };
   let words = Words::of(object, &["fade", "shape", "order"])?;
   let Some(fade) = words.text("fade")? else {
     if words.get("shape").is_some() {
@@ -818,7 +923,7 @@ fn transition(object: &Object<'_>, edit: Ruler, ticks: Timebase) -> Result<Child
           .ok_or_else(|| shape(&at, "a place among the track's transitions"))
       })
       .transpose()?;
-    return Ok(Child::Dissolve(in_offset, out_offset, order));
+    return Ok((Child::Dissolve(in_offset, out_offset, order), walked));
   };
   if words.get("order").is_some() {
     return Err(feature(
@@ -845,15 +950,20 @@ fn transition(object: &Object<'_>, edit: Ruler, ticks: Timebase) -> Result<Child
   if gap_side != 0 {
     return Err(feature(&object.at, Feature::Fade));
   }
-  Ok(Child::Fade(
-    edge,
-    Fade::new(Duration::new(inside, ticks), curve),
+  Ok((
+    Child::Fade(edge, Fade::new(Duration::new(inside, ticks), curve)),
+    walked,
   ))
 }
 
-/// A `Clip.1` or a `Clip.2`, and its length at the edit rate; its record is
-/// the track's to place.
-fn clip(object: &Object<'_>, schema: &str, ticks: Timebase) -> Result<(Clip, u64), Unreadable> {
+/// A `Clip.1` or a `Clip.2`, its length at the edit rate — its record is
+/// the track's to place — and the clip as OpenTimelineIO's walk reads it:
+/// its source range, counted in the ruler the document writes it in.
+fn clip(
+  object: &Object<'_>,
+  schema: &str,
+  ticks: Timebase,
+) -> Result<(Clip, u64, derive::Child), Unreadable> {
   let references: &[&str] = match schema {
     "Clip.2" => &["media_references", "active_media_reference_key"],
     _ => &["media_reference"],
@@ -876,11 +986,12 @@ fn clip(object: &Object<'_>, schema: &str, ticks: Timebase) -> Result<(Clip, u64
   object.no_effects()?;
   object.no_color()?;
   let at = object.at.key("source_range");
-  let (start, length) = counts(
-    object.required("source_range")?,
-    &at,
-    Ruler::new(exact.ruler),
-  )?;
+  let ruler = Ruler::new(exact.ruler);
+  let (start, length) = counts(object.required("source_range")?, &at, ruler)?;
+  let walked = derive::Child::Item {
+    start: written(start, ruler),
+    duration: written(length, ruler),
+  };
   let source = exact_range(start, length, exact, &at)?;
   // With no time-warp, a clip runs exactly as long as its source.
   let length = source
@@ -904,7 +1015,7 @@ fn clip(object: &Object<'_>, schema: &str, ticks: Timebase) -> Result<(Clip, u64
   .with_gain(words.gain("gain_db")?)
   .with_metadata(words.notes()?);
   *clip.markers_mut() = markers(object, Placed::Exact)?;
-  Ok((clip, length))
+  Ok((clip, length, walked))
 }
 
 /// The one medium a clip reads: `Clip.1`'s `media_reference`, or the one
