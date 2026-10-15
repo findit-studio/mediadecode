@@ -19,9 +19,11 @@ The family releases in lockstep.
   `frame_size`. An audio encoder takes every frame at its frame size
   and the stream's last, which may be shorter, through
   `send_final_frame`, which ends the stream as `send_eof` does. `Muxer`
-  takes the per-kind track packets a demuxer delivers — attachments
-  through `write_attachment`, before the first packet of another kind —
-  and `finish(self)` ends the session.
+  takes the per-kind track packets a demuxer delivers, with
+  `write_packet` routing a `DemuxedPacket` to the write for its kind,
+  and `finish(self)` ends the session. A muxer is given its attachments
+  when it is opened, in its track table — each attachment track's
+  `TrackDescription` carries its one file — and never as a packet.
 - `EncoderSettings` with `VideoParams` / `AudioParams`, `RateControl`,
   `Profile`, `Level` and `Gop`.
 - The write errors: `EncodeError` / `EncodeRefusal` and `MuxError` /
@@ -29,8 +31,8 @@ The family releases in lockstep.
   its own faults. `EncodeRefusal` names a frame of the wrong
   dimensions, format, sample rate, channel layout or size, and one sent
   after the end; `MuxRefusal` names an unknown track, a packet of the
-  wrong kind, a missing or non-advancing decode timestamp, and a late
-  attachment. A refused mux write hands its packet back untouched, in
+  wrong kind, a missing or non-advancing decode timestamp, and an
+  attachment offered as a packet. A refused mux write hands its packet back untouched, in
   `MuxError::Refused` — each write's error names its own packet type —
   and `MuxError::map_packet` re-wraps it, as a remux routing every kind
   through one error type does.

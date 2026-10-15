@@ -24,6 +24,19 @@ Its versions are its own: they do not move with the rest of the family's.
   `mediadecode-ffmpeg`'s extras so a write backend can take them too.
 - **`track::TrackDescription`**: what a muxer needs to open one output
   track — the timebase, the codec and its parameters (`TrackParams`),
-  optional extradata and the backend's side data.
+  optional extradata and the backend's side data, and the portable
+  track metadata the read side states: the declared language, and for
+  an attachment track its file (`AttachedFile` — the payload the
+  demuxer delivered, its filename and MIME type). An attachment track
+  carries exactly one file, by construction: `TrackDescription::attachment`
+  takes one, and `TrackDescription::new` refuses an attachment's
+  parameters by name (`AttachmentWithoutFile`).
+- **`TrackDescription::from_track_info`**: the lossless conversion
+  from a demuxed `TrackInfo` and the payload delivered for it, for a
+  remux. What only the read side states (the library's duration, the
+  backend's extras) comes back beside it; a row that does not fit — an
+  attachment without its payload, a payload for another kind, an
+  attachment's identity claimed by another kind — is refused by name
+  with everything handed back (`TrackMismatch`, `MismatchReason`).
 - `no_std` with no allocator required; `alloc`, `std`, `serde`,
   `arbitrary` and `quickcheck` as in `mediadecode`.

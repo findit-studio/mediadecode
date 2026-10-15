@@ -14,7 +14,7 @@ allocator.
 | `subtitle` | the subtitle payloads: `SubtitlePayload`, `Text`, `Bitmap`, `BitmapRegion` |
 | `rhythm` | the push rhythm's answers: `Sent::{Accepted, MustDrain}`, `Received::{Produced, NeedsInput, Ended}` |
 | `demuxer` | the demux tier's types: `DemuxAdapter`, `TrackIndex`, `TrackKind`, `TrackParams`, `TrackInfo`, `Chapter`, `ContainerDuration`, `MeasuredEnd`, `DataPacket`, `AttachmentPacket`, `DemuxedPacket` |
-| `track` | `TrackDescription`: what a muxer needs to open one output track |
+| `track` | `TrackDescription`: what a muxer needs to open one output track, with the portable metadata (language; an attachment's file) and a lossless conversion from `TrackInfo` |
 | `adapter` | the per-kind adapter traits: `VideoAdapter`, `AudioAdapter`, `SubtitleAdapter`, `ImageAdapter` |
 | `resampler` | the resampler face: `AudioResampler`, `AdapterAudioFrame` |
 | `hdr` | HDR metadata: `MasteringDisplay`, `ContentLightLevel` |

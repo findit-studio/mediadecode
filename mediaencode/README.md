@@ -10,7 +10,7 @@ FFmpeg, and it builds with `no_std` and no allocator.
 | item | what it is |
 |---|---|
 | `VideoEncoder`, `AudioEncoder` | raw frames in, compressed packets out, in the push rhythm the decoders keep: `send_frame` answers `Sent`, `receive_packet` answers `Received`, `send_eof` drains to `Ended`; `flush` resets, or answers `Flushed::Refused` where the codec cannot; `force_keyframe` (video); `frame_size`, and `send_final_frame` for the stream's last, possibly short, frame (audio) |
-| `Muxer` | per-kind writes of the packets a demuxer delivers — attachments before the first packet of another kind — and `finish`, which ends the session; opened by the backend, never by the face |
+| `Muxer` | per-kind writes of the packets a demuxer delivers, `write_packet` routing them by kind, and `finish`, which ends the session; opened by the backend, never by the face, from a track table that carries each attachment's file |
 | `EncoderSettings` | the codec, rate control, profile and level, and the kind's own parameters: `VideoParams` (dimensions, pixel format, timebase, frame rate, GOP, color, HDR metadata) or `AudioParams` (sample rate, sample format, channel layout) |
 | `EncodeError`, `MuxError` | a named refusal every backend shares (`EncodeRefusal`, `MuxRefusal`), or the backend's own fault; a refused mux write hands its packet back untouched |
 

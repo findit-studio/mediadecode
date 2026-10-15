@@ -41,7 +41,10 @@ in lockstep.
 - **Every function whose soundness rests on something its caller proves
   is an `unsafe fn` with a written `# Safety` section**, and every call
   site states its proof — the precondition for the crossings becoming
-  callable from another crate.
+  callable from another crate. Each re-exported `unsafe fn` names every
+  pointer it dereferences, against `mediaio-ffmpeg`'s new `contracts`
+  module.
+- `boundary::write_md_flags` is a safe fn.
 
 ### Added
 
@@ -65,6 +68,13 @@ in lockstep.
   (`ConvertError::UnverifiableChannelMap`); this crate's audio decoder
   converts the frames libavcodec gives it through the `unsafe` entry,
   whose map extent libavcodec guarantees.
+- **The safe conversions read nothing they cannot bound.**
+  `convert::audio_frame_from` refuses a null-backed frame before
+  reading a field, and `convert::subtitle_frame_from` refuses a bitmap
+  rect carrying a plane, whose size nothing records
+  (`ConvertError::UnverifiableBitmap`). This crate's subtitle decoder
+  converts through the `unsafe` entry, whose bitmap extents libavcodec
+  guarantees.
 
 ## [0.18.0] - 2026-10-10
 

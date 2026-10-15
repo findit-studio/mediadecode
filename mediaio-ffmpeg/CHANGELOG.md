@@ -41,5 +41,24 @@ The family — `mediadecode`, `mediadecode-ffmpeg`, `mediadecode-webcodecs`,
   state's lifetime, that its pointer must not be invalidated (no `Box`
   it came from may move afterwards), and the threads the callbacks may
   run on.
+- **`contracts`**: what the `unsafe` crossings read through the
+  pointers they are handed, stated once per FFmpeg object. Every
+  publicly reachable `unsafe fn` names, in its own `# Safety`, each
+  pointer it dereferences and links the section for its object; a
+  wrapper forwards its worker's contract whole.
+- **The raw extern declarations are crate-private.** `ffi::c_shims` is
+  `pub(crate)`; what `mediadecode-ffmpeg` needs goes through two
+  documented doors, the safe `ffi::find_decoder_raw` and
+  `ffi::visit_hwframe_download_formats`.
+- **The safe roads refuse what they cannot bound, before reading.**
+  `convert::audio_frame_from` answers `ConvertError::NullFrame` for a
+  null-backed frame before reading any field, and
+  `convert::subtitle_frame_from` refuses a bitmap rect carrying a plane
+  (`ConvertError::UnverifiableBitmap`): an `AVSubtitleRect` records no
+  plane size, and `ffmpeg_next`'s safe `BitmapMut::set_height` moves
+  the height alone. Bitmaps convert through the `unsafe` entries,
+  whose caller vouches for the extent.
+- `boundary::write_md_flags` is a safe fn: it writes one field of the
+  `AVPacket` an `ffmpeg_next::Packet` keeps inline.
 - A `test-support` feature (off by default): the fault-subprocess
   harness, the allocation cap and the callback-state hooks.
