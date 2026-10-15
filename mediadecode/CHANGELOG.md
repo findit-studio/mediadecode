@@ -11,6 +11,31 @@ The sibling FFmpeg adapter has its own log at
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-10-10
+
+### Added
+
+- **`PacketFlags::DISPOSABLE` (`0b1_0000`)**: the demuxer states that
+  nothing references this packet (FFmpeg `AV_PKT_FLAG_DISPOSABLE`).
+  Dropping such a packet loses its own picture and no other, so a consumer
+  that samples pictures can skip the B pictures nothing references. In
+  libavformat 9.0.1 one demuxer sets it: MP4/MOV, from `sdtp`
+  (`libavformat/mov.c` 11719–11723). Matroska's discardable bit is NOT
+  mapped (`libavformat/matroskadec.c` 4319–4320 reads the keyframe bit
+  alone), so a Matroska packet reads absent. The bit's ABSENCE means
+  unknown, never "referenced": that is the rule a consumer must honour.
+
+### Changed (BREAKING)
+
+- **`PacketFlags` names a fourth bit.** No packet's serialized number moves:
+  `0b1_0000` is the bit FFmpeg's demuxer already set, and the set already
+  carried it as an unnamed bit (`from_bits_retain` on both serde legs), so a
+  stored 0.17 number reads back the same set, the bit now named. What changes
+  is everything that reads the named set: `PacketFlags::all()` is
+  `0b1_0111` (was `0b111`), `complement()` / `!` and the strict
+  `from_bits` include the bit, `from_bits_truncate` keeps it, and `Debug`
+  prints `DISPOSABLE` where it printed `0x10`.
+
 ## [0.17.0] - 2026-10-10
 
 Both public dependencies cross a breaking minor at once: `mediatime`

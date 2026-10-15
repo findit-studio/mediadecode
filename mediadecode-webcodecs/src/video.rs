@@ -906,6 +906,10 @@ impl VideoStreamDecoder for WebCodecsVideoStreamDecoder {
       return Ok(Sent::MustDrain);
     }
 
+    // `KEY` is the one flag WebCodecs has a place for: a chunk is `key`
+    // or `delta` and nothing more. `PacketFlags::DISPOSABLE` has no
+    // counterpart, so it is not passed in, and this backend demuxes
+    // nothing, so it never sets it either.
     let key = packet.flags().contains(PacketFlags::KEY);
     let chunk_type = if key {
       web_sys::EncodedVideoChunkType::Key
