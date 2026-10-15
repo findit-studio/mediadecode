@@ -3,6 +3,8 @@
 
 use core::num::NonZeroI32;
 
+use smol_bytes::format_utf8bytes;
+
 use super::*;
 use crate::{
   Clip, ClipId, Fade, FadeShape, Fades, MediaRef, Rate, TimeRange, Timeline, Track, TrackKind,
@@ -39,7 +41,7 @@ fn fade(n: u64) -> Option<Fade> {
 /// clip's id is its name.
 fn baseline() -> Timeline {
   let video = |name: &str| {
-    MediaRef::new(alloc::format!("file:///{name}.mov"))
+    MediaRef::new(format_utf8bytes!("file:///{name}.mov"))
       .with_available_range(Some(TimeRange::new(0, 240, edit())))
       .with_rate(Some(Rate::FPS_24))
   };
@@ -601,7 +603,7 @@ fn every_refusal_comes_back_at_once_in_the_documented_order() {
 
 #[test]
 fn refusals_name_what_they_refuse() {
-  let shown = |refusal: Refusal| alloc::string::ToString::to_string(&refusal);
+  let shown = |refusal: Refusal| std::string::ToString::to_string(&refusal);
   assert_eq!(shown(Refusal::RateUnstated), "the edit rate is zero");
   assert_eq!(
     shown(Refusal::DuplicateClipId(IdClash::new(

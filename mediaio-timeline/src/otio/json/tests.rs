@@ -1,19 +1,17 @@
-use alloc::{string::String, vec};
-
 use super::*;
 
 fn n(text: &str) -> Value {
-  Value::Number(String::from(text))
+  Value::Number(Utf8Bytes::from(text))
 }
 
 fn s(text: &str) -> Value {
-  Value::String(String::from(text))
+  Value::String(Utf8Bytes::from(text))
 }
 
-fn pretty(value: &Value) -> String {
-  let mut out = String::new();
+fn pretty(value: &Value) -> Utf8Bytes {
+  let mut out = Utf8BytesMut::new();
   write_pretty(value, &mut out);
-  out
+  out.freeze_shared()
 }
 
 fn refusal(text: &str) -> (usize, &'static str) {
@@ -24,13 +22,13 @@ fn refusal(text: &str) -> (usize, &'static str) {
 #[test]
 fn the_writer_indents_four_spaces_a_level_and_keeps_empty_containers_inline() {
   let value = Value::Object(vec![
-    (String::from("a"), n("1.0")),
+    (Utf8Bytes::from("a"), n("1.0")),
     (
-      String::from("b"),
+      Utf8Bytes::from("b"),
       Value::Array(vec![Value::Null, Value::Bool(true), s("x")]),
     ),
-    (String::from("c"), Value::Object(vec![])),
-    (String::from("d"), Value::Array(vec![])),
+    (Utf8Bytes::from("c"), Value::Object(vec![])),
+    (Utf8Bytes::from("d"), Value::Array(vec![])),
   ]);
   assert_eq!(
     pretty(&value),
@@ -49,10 +47,13 @@ fn strings_escape_the_quote_the_backslash_and_control_characters_only() {
 #[test]
 fn what_is_written_reads_back() {
   let value = Value::Object(vec![
-    (String::from("n"), n("-0.5e-3")),
+    (Utf8Bytes::from("n"), n("-0.5e-3")),
     (
-      String::from("deep"),
-      Value::Array(vec![Value::Object(vec![(String::from("k"), Value::Null)])]),
+      Utf8Bytes::from("deep"),
+      Value::Array(vec![Value::Object(vec![(
+        Utf8Bytes::from("k"),
+        Value::Null,
+      )])]),
     ),
   ]);
   assert_eq!(parse(&pretty(&value)), Ok(value));
@@ -110,7 +111,7 @@ fn a_key_named_twice_in_one_object_is_refused_at_the_second() {
 #[test]
 fn nesting_past_the_limit_is_refused_rather_than_recursed_into() {
   let deep = |levels: usize| {
-    let mut text = String::new();
+    let mut text = Utf8BytesMut::new();
     for _ in 0..levels {
       text.push('[');
     }

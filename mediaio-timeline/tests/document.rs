@@ -1,5 +1,6 @@
 //! The stored document: its wire names, its round trip, and what a reader
-//! refuses by name.
+//! refuses by name. The document is the `serde` feature's.
+#![cfg(all(feature = "serde", any(feature = "std", feature = "alloc")))]
 
 use core::num::NonZeroI32;
 

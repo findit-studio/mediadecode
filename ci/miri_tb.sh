@@ -8,6 +8,17 @@ fi
 
 TARGET="$1"
 shift
+# Features to enable besides the defaults, comma separated, named as
+# `--features LIST` before the packages; none unless the caller names some.
+FEATURES=""
+if [ "${1:-}" = "--features" ]; then
+  if [ -z "${2:-}" ]; then
+    echo "Error: --features needs a list"
+    exit 1
+  fi
+  FEATURES="$2"
+  shift 2
+fi
 # The packages to run: the ones the caller names, all pure Rust, or the
 # read faces when it names none.
 if [ "$#" -eq 0 ]; then
@@ -47,4 +58,4 @@ export MIRIFLAGS="-Zmiri-strict-provenance -Zmiri-disable-isolation -Zmiri-symbo
 
 # The FFmpeg crates call FFmpeg's C library through FFI, which Miri
 # can't interpret. Run Miri only against the pure-Rust crates.
-cargo miri test "${PKGS[@]}" --all-targets --target "$TARGET"
+cargo miri test "${PKGS[@]}" --all-targets --target "$TARGET" ${FEATURES:+--features "$FEATURES"}

@@ -279,9 +279,13 @@ jobs:
       - name: Miri
         run: bash ci/miri_sb.sh "${{ matrix.target }}" mediaspine mediadecode mediaencode
 
-  # `mediaio-timeline`: pure Rust, `no_std` + `alloc`, no features. Its
-  # tests are the unit laws, the integration laws (the hand-predicted
-  # OTIO goldens among them), the seeded properties and the doc tests.
+  # `mediaio-timeline`: pure Rust, `no_std` in every tier. Features: `std`
+  # (the default), `alloc` and `serde`; on `core` alone it exports only its
+  # time words. Its tests are the unit laws, the integration laws (the
+  # hand-predicted OTIO goldens and the JSON document among them), the
+  # seeded properties and the doc tests. Clippy and the tests run on every
+  # combination of the three features, the empty one included (`default`
+  # is `std`, so it is not run again on its own).
   timeline:
     name: timeline (${{ matrix.os }})
     strategy:
@@ -302,31 +306,37 @@ jobs:
           ${{ runner.os }}-timeline-
     - name: Install Rust
       run: rustup update stable --no-self-update && rustup default stable && rustup component add rustfmt clippy
+    - name: Install cargo-hack
+      run: cargo install cargo-hack
     - name: Check formatting
       run: cargo fmt -p mediaio-timeline -- --check
     - name: Apply clippy lints
-      run: cargo clippy -p mediaio-timeline --all-targets
+      run: cargo hack clippy -p mediaio-timeline --feature-powerset --exclude-features default --all-targets
     - name: Run tests
-      run: cargo test -p mediaio-timeline
+      run: cargo hack test -p mediaio-timeline --feature-powerset --exclude-features default
+    # The crate's doc is the README with `std` or `alloc`, and a doc of its
+    # own on `core` alone.
     - name: Build docs
       env:
         RUSTDOCFLAGS: -Dwarnings
-      run: cargo doc -p mediaio-timeline --no-deps
+      run: |
+        cargo doc -p mediaio-timeline --no-deps --no-default-features
+        cargo doc -p mediaio-timeline --no-deps --all-features
 
-  # The crate builds where there is no operating system at all
-  # (`thumbv7em-none-eabihf`), on the wasm targets, and on a 32-bit and a
-  # big-endian one.
+  # The `no_std` tiers build where there is no operating system at all
+  # (`thumbv7em-none-eabihf`, which has no `std`); every tier builds on the
+  # wasm targets, and on a 32-bit and a big-endian one.
   timeline-cross:
     name: timeline-cross (${{ matrix.target }})
     strategy:
       matrix:
-        target:
-          - thumbv7em-none-eabihf
-          - wasm32-unknown-unknown
-          - wasm32-wasip1
-          - wasm32-wasip2
-          - i686-unknown-linux-gnu
-          - powerpc64-unknown-linux-gnu
+        include:
+          - { target: thumbv7em-none-eabihf,       std: false }
+          - { target: wasm32-unknown-unknown,      std: true }
+          - { target: wasm32-wasip1,               std: true }
+          - { target: wasm32-wasip2,               std: true }
+          - { target: i686-unknown-linux-gnu,      std: true }
+          - { target: powerpc64-unknown-linux-gnu, std: true }
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -342,12 +352,22 @@ jobs:
             ${{ runner.os }}-timeline-cross-
       - name: Install Rust
         run: rustup update stable && rustup default stable
-      - name: cargo build -p mediaio-timeline --target ${{ matrix.target }}
+      - name: no_std tiers (core alone, alloc, serde, alloc + serde)
         run: |
           rustup target add ${{ matrix.target }}
+          cargo build -p mediaio-timeline --target ${{ matrix.target }} --no-default-features
+          cargo build -p mediaio-timeline --target ${{ matrix.target }} --no-default-features --features alloc
+          cargo build -p mediaio-timeline --target ${{ matrix.target }} --no-default-features --features serde
+          cargo build -p mediaio-timeline --target ${{ matrix.target }} --no-default-features --features alloc,serde
+      - name: std tiers (std, std + serde)
+        if: matrix.std
+        run: |
           cargo build -p mediaio-timeline --target ${{ matrix.target }}
+          cargo build -p mediaio-timeline --target ${{ matrix.target }} --features serde
 
   # Each target's verdict stands alone: one lane failing cancels no other.
+  # Miri runs the default features with `serde`: every test the crate has
+  # (the document laws among them), as when `serde` was always on.
   timeline-miri:
     name: timeline-miri-${{ matrix.target }}
     strategy:
@@ -372,7 +392,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-timeline-miri-
       - name: Miri
-        run: bash ci/miri_tb.sh "${{ matrix.target }}" mediaio-timeline
+        run: bash ci/miri_tb.sh "${{ matrix.target }}" --features serde mediaio-timeline
 
   coverage:
     name: coverage

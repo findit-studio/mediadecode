@@ -116,10 +116,11 @@
 //! install. Reading OpenTimelineIO back into a [`Timeline`] (`from_otio`) is
 //! a later row; this module is its home.
 
-use alloc::{string::String, vec::Vec};
 use core::fmt;
+use std::vec::Vec;
 
 use mediatime::Rate;
+use smol_bytes::{Utf8Bytes, Utf8BytesMut};
 
 use crate::{ClipAt, EdgeAt, Refusal, Timeline, TransitionAt, layout::layout_valid, validate};
 
@@ -156,14 +157,14 @@ pub enum OtioTarget {
 ///   tries ([`RulerSearch`]): one past 2^53, where its `f64` no longer holds
 ///   every whole number, or one its arithmetic would land half a tick off
 ///   or more (see [the module's docs](self)).
-pub fn to_otio(timeline: &Timeline, target: OtioTarget) -> Result<String, Refused> {
+pub fn to_otio(timeline: &Timeline, target: OtioTarget) -> Result<Utf8Bytes, Refused> {
   validate(timeline).map_err(Refused::Validation)?;
   let tree = export::timeline(timeline, &layout_valid(timeline), target)
     .map_err(Refused::NotRepresentable)?;
-  let mut out = String::new();
+  let mut out = Utf8BytesMut::new();
   json::write_pretty(&tree, &mut out);
   out.push('\n');
-  Ok(out)
+  Ok(out.freeze_shared())
 }
 
 /// Why [`to_otio`] wrote nothing.
@@ -614,7 +615,7 @@ impl fmt::Display for Syntax {
 /// there.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Shape {
-  path: String,
+  path: Utf8Bytes,
   expected: &'static str,
 }
 

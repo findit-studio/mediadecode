@@ -1,7 +1,9 @@
 //! The law: a two-track, three-clip timeline with a dissolve and fades
 //! validates, lays out with the right gaps, exports to OpenTimelineIO the
 //! self-check accepts and that matches the hand-predicted golden byte for
-//! byte, round-trips as a document, and diffs every kind of change.
+//! byte, round-trips as a document (with `serde`), and diffs every kind of
+//! change.
+#![cfg(any(feature = "std", feature = "alloc"))]
 
 mod common;
 
@@ -58,6 +60,7 @@ fn the_law_timeline_validates_lays_out_and_exports_its_golden() {
   }
 }
 
+#[cfg(feature = "serde")]
 #[test]
 fn the_law_timeline_round_trips_as_a_document() {
   let law = common::law();

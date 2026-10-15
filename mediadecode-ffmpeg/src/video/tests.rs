@@ -1,8 +1,10 @@
 use super::*;
 
 use mediadecode::decoder::VideoStreamDecoder;
-use std::num::NonZeroI32;
-use std::sync::{Arc, Mutex};
+use std::{
+  num::NonZeroI32,
+  sync::{Arc, Mutex},
+};
 
 // The hardware-fallback suite runs on the **owned** lane, because it
 // replays one `Vec<Packet>` through several decoders: a borrowed source
@@ -1882,16 +1884,13 @@ fn the_post_eof_fault_is_the_one_the_substrate_gives() {
   )
   .expect("build test decoder");
 
-  for index in 0..3 {
-    let pkt = video_packet_from_ffmpeg_in(
-      clip.packets[index].clone(),
-      tb,
-      crate::PacketLimits::default(),
-    )
-    .expect("a wrappable payload")
-    .expect("packet has a buffer");
+  for item in clip.packets.iter().take(3) {
+    let pkt = video_packet_from_ffmpeg_in(item.clone(), tb, crate::PacketLimits::default())
+      .expect("a wrappable payload")
+      .expect("packet has a buffer");
     crate::accepted(dec.send_packet(&pkt), "send_packet");
   }
+
   assert!(
     dec.is_software(),
     "the substrate under test is libavcodec's"

@@ -1,5 +1,7 @@
 use core::num::NonZeroI32;
 
+use smol_bytes::format_utf8bytes;
+
 use super::*;
 use crate::{ClipId, Duration, Fade, FadeShape, Gain, MediaRef, Rate, Timebase, Track, TrackKind};
 
@@ -12,7 +14,7 @@ fn clip(name: &str, start: i64, end: i64) -> Clip {
   Clip::new(
     ClipId::new(name),
     name,
-    MediaRef::new(alloc::format!("file:///{name}.mov")),
+    MediaRef::new(format_utf8bytes!("file:///{name}.mov")),
     TimeRange::new(100, 100 + end - start, edit()),
     TimeRange::new(start, end, edit()),
   )
@@ -248,7 +250,7 @@ fn a_timeline_carrying_one_id_twice_is_ambiguous() {
     IdClash::new(ClipAt::new(0, 0), ClipAt::new(1, 0))
   );
   assert_eq!(
-    alloc::string::ToString::to_string(&ambiguous),
+    std::string::ToString::to_string(&ambiguous),
     "before: track 1, clip 0 has the id of track 0, clip 0"
   );
   // On the other side, too, and the side before is named first.

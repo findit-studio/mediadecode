@@ -210,7 +210,7 @@ fn placed(id: &str, source: TimeRange, record: TimeRange) -> Clip {
   Clip::new(
     ClipId::new(id),
     id,
-    MediaRef::new(format!("file:///{id}")),
+    MediaRef::new(format_utf8bytes!("file:///{id}")),
     source,
     record,
   )

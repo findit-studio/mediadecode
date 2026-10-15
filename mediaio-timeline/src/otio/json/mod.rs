@@ -1,8 +1,9 @@
 //! A small JSON value: written pretty for the export, read strictly for the
 //! self-check.
 
-use alloc::{string::String, vec::Vec};
 use core::fmt::Write as _;
+use smol_bytes::{Utf8Bytes, Utf8BytesMut};
+use std::vec::Vec;
 
 use super::Syntax;
 
@@ -13,14 +14,14 @@ use super::Syntax;
 pub(crate) enum Value {
   Null,
   Bool(bool),
-  Number(String),
-  String(String),
+  Number(Utf8Bytes),
+  String(Utf8Bytes),
   Array(Vec<Value>),
-  Object(Vec<(String, Value)>),
+  Object(Vec<(Utf8Bytes, Value)>),
 }
 
 impl Value {
-  pub(crate) fn as_object(&self) -> Option<&[(String, Value)]> {
+  pub(crate) fn as_object(&self) -> Option<&[(Utf8Bytes, Value)]> {
     match self {
       Self::Object(members) => Some(members),
       _ => None,
@@ -36,7 +37,7 @@ impl Value {
 
   pub(crate) fn as_str(&self) -> Option<&str> {
     match self {
-      Self::String(text) => Some(text),
+      Self::String(text) => Some(text.as_str()),
       _ => None,
     }
   }
@@ -53,11 +54,11 @@ impl Value {
 /// Writes `value` with four spaces of indent per level and `": "` after a
 /// key — the layout OpenTimelineIO's own writer uses — without a final
 /// newline.
-pub(crate) fn write_pretty(value: &Value, out: &mut String) {
+pub(crate) fn write_pretty(value: &Value, out: &mut Utf8BytesMut) {
   write_value(value, 0, out);
 }
 
-fn write_value(value: &Value, depth: usize, out: &mut String) {
+fn write_value(value: &Value, depth: usize, out: &mut Utf8BytesMut) {
   match value {
     Value::Null => out.push_str("null"),
     Value::Bool(true) => out.push_str("true"),
@@ -95,7 +96,7 @@ fn write_value(value: &Value, depth: usize, out: &mut String) {
   }
 }
 
-fn newline(depth: usize, out: &mut String) {
+fn newline(depth: usize, out: &mut Utf8BytesMut) {
   out.push('\n');
   for _ in 0..depth {
     out.push_str("    ");
@@ -104,7 +105,7 @@ fn newline(depth: usize, out: &mut String) {
 
 /// Writes `text` as a JSON string: the quote, the backslash and the control
 /// characters escaped, everything else as it is.
-fn write_string(text: &str, out: &mut String) {
+fn write_string(text: &str, out: &mut Utf8BytesMut) {
   out.push('"');
   for c in text.chars() {
     match c {
@@ -207,7 +208,7 @@ impl Reader<'_> {
 
   fn object(&mut self) -> Result<Value, Syntax> {
     self.at += 1;
-    let mut members: Vec<(String, Value)> = Vec::new();
+    let mut members: Vec<(Utf8Bytes, Value)> = Vec::new();
     self.skip_space();
     if self.peek() == Some(b'}') {
       self.at += 1;
@@ -310,12 +311,12 @@ impl Reader<'_> {
         return Err(self.refuse("expected a digit in the exponent"));
       }
     }
-    Ok(Value::Number(String::from(&self.text[start..self.at])))
+    Ok(Value::Number(Utf8Bytes::from(&self.text[start..self.at])))
   }
 
-  fn string(&mut self) -> Result<String, Syntax> {
+  fn string(&mut self) -> Result<Utf8Bytes, Syntax> {
     self.at += 1;
-    let mut out = String::new();
+    let mut out = Utf8BytesMut::new();
     loop {
       let run = self.at;
       while let Some(b) = self.peek()
@@ -331,7 +332,7 @@ impl Reader<'_> {
       match self.peek() {
         Some(b'"') => {
           self.at += 1;
-          return Ok(out);
+          return Ok(out.freeze_shared());
         }
         Some(b'\\') => {
           self.at += 1;
@@ -343,7 +344,7 @@ impl Reader<'_> {
     }
   }
 
-  fn escape(&mut self, out: &mut String) -> Result<(), Syntax> {
+  fn escape(&mut self, out: &mut Utf8BytesMut) -> Result<(), Syntax> {
     let c = match self.peek() {
       Some(b'"') => '"',
       Some(b'\\') => '\\',

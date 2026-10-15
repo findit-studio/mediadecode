@@ -1,10 +1,10 @@
 //! What changed between two timelines, clip by clip.
 
-use alloc::{
+use core::{cmp::Ordering, fmt};
+use std::{
   collections::{BTreeMap, btree_map::Entry},
   vec::Vec,
 };
-use core::{cmp::Ordering, fmt};
 
 use mediatime::{TimeRange, Timestamp};
 
@@ -129,7 +129,7 @@ fn diff_track(track: usize, before: &[Clip], after: &[Clip], out: &mut Vec<Chang
     .enumerate()
     .map(|(index, clip)| (clip.id().as_str(), index))
     .collect();
-  let mut matched = alloc::vec![false; after.len()];
+  let mut matched = std::vec![false; after.len()];
   for (index, clip) in before.iter().enumerate() {
     let Some(partner) = waiting.remove(clip.id().as_str()) else {
       out.push(Change::new(track, ChangeKind::Removed, Some(index), None));
@@ -253,12 +253,12 @@ pub struct Delta {
 
 impl Delta {
   /// The changes, by track, then by where the clip sits, then by kind.
-  pub fn changes(&self) -> &[Change] {
-    &self.changes
+  pub const fn changes(&self) -> &[Change] {
+    self.changes.as_slice()
   }
 
   /// Whether nothing [`diff`] compares changed.
-  pub fn is_empty(&self) -> bool {
+  pub const fn is_empty(&self) -> bool {
     self.changes.is_empty()
   }
 }
@@ -322,26 +322,34 @@ impl Change {
 /// How a clip changed between two timelines.
 ///
 /// Marked `#[non_exhaustive]`: a later kind of change joins as a variant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, derive_more::IsVariant, derive_more::Display)]
 #[non_exhaustive]
 pub enum ChangeKind {
   /// The clip is new.
+  #[display("added")]
   Added,
   /// The clip is gone.
+  #[display("removed")]
   Removed,
   /// The clip's record changed: it sits elsewhere on the timeline, or covers
   /// more or less of it.
+  #[display("moved")]
   Moved,
   /// The clip's source range changed: it plays a different stretch of its
   /// medium.
+  #[display("retimed")]
   Retimed,
   /// The clip's gain or fades changed.
+  #[display("regained")]
   Regained,
   /// The clip was enabled and is disabled, or the other way round.
+  #[display("enabled_flipped")]
   EnabledFlipped,
   /// The clip's name changed.
+  #[display("renamed")]
   Renamed,
   /// The clip's medium's locator changed: it reads another medium.
+  #[display("relinked")]
   Relinked,
 }
 

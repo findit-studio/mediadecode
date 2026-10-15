@@ -1,5 +1,6 @@
 //! Seeded properties: valid timelines built at random, from fixed seeds, so
 //! every run checks the same few hundred and a failure names its seed.
+#![cfg(any(feature = "std", feature = "alloc"))]
 
 mod common;
 
@@ -10,6 +11,7 @@ use mediaio_timeline::{
   validate,
 };
 use mediatime::Rounding;
+use smol_bytes::{Utf8Bytes, format_utf8bytes};
 
 /// Seeds checked per property; fewer under Miri, which interprets slowly.
 const SEEDS: u64 = if cfg!(miri) { 4 } else { 256 };
@@ -81,7 +83,7 @@ fn timeline(seed: u64) -> Timeline {
   let rate = rng.pick(&RATES);
   let edit = rate.checked_to_timebase().unwrap();
   let frames = |n: u64| Duration::new(n, edit);
-  let mut timeline = Timeline::new(format!("seed {seed}"), rate)
+  let mut timeline = Timeline::new(format_utf8bytes!("seed {seed}"), rate)
     .with_start(Timestamp::new(rng.within(0, 200_000) as i64, edit));
   for track_index in 0..rng.within(1, 3) {
     let kind = if rng.one_in(2) {
@@ -117,7 +119,7 @@ fn timeline(seed: u64) -> Timeline {
         entering,
       });
     }
-    let mut track = Track::new(kind, format!("T{track_index}"));
+    let mut track = Track::new(kind, format_utf8bytes!("T{track_index}"));
     let mut cursor = 0;
     for (index, planned) in plan.iter().enumerate() {
       let leaving = plan.get(index + 1).and_then(|next| next.entering);
@@ -153,7 +155,7 @@ fn timeline(seed: u64) -> Timeline {
       } else {
         index as u64
       };
-      let mut media = MediaRef::new(format!("file:///{track_index}/{placed}"));
+      let mut media = MediaRef::new(format_utf8bytes!("file:///{track_index}/{placed}"));
       if !rng.one_in(4) {
         media.set_available_range(Some(TimeRange::new(available_start, available_end, ruler)));
       }
@@ -161,7 +163,7 @@ fn timeline(seed: u64) -> Timeline {
         media.set_rate(Some(rng.pick(&[rate, Rate::hz(48_000), Rate::FPS_25])));
       }
       if rng.one_in(3) {
-        media.set_reel(Some(format!("R{index}")));
+        media.set_reel(Some(format_utf8bytes!("R{index}")));
       }
       let mut fades = Fades::new();
       if planned.entering.is_none() && rng.one_in(3) {
@@ -181,8 +183,8 @@ fn timeline(seed: u64) -> Timeline {
         .then(|| Gain::from_db(-(rng.within(0, 240) as f32) / 10.0).unwrap());
       track.clips_mut().push(
         Clip::new(
-          ClipId::new(format!("{track_index}.{index}")),
-          format!("c{placed}"),
+          ClipId::new(format_utf8bytes!("{track_index}.{index}")),
+          format_utf8bytes!("c{placed}"),
           media,
           TimeRange::new(source_start, source_end, ruler),
           TimeRange::new(start as i64, cursor as i64, edit),
@@ -265,12 +267,12 @@ fn diff_names_exactly_the_change_made() {
         ChangeKind::EnabledFlipped
       }
       1 => {
-        let name = format!("{}, renamed", edited.name());
+        let name = format_utf8bytes!("{}, renamed", edited.name());
         edited.set_name(name);
         ChangeKind::Renamed
       }
       _ => {
-        let locator = format!("{}, moved", edited.media().locator());
+        let locator = format_utf8bytes!("{}, moved", edited.media().locator());
         edited.media_mut().set_locator(locator);
         ChangeKind::Relinked
       }
@@ -296,6 +298,7 @@ fn diff_names_exactly_the_change_made() {
   }
 }
 
+#[cfg(feature = "serde")]
 #[test]
 fn a_document_round_trips() {
   for seed in 0..SEEDS {
@@ -317,7 +320,7 @@ const REFUSED: u64 = 132;
 
 /// `timeline`, built from `seed`, as the export writes it for `target` —
 /// `None` for [`REFUSED`], after checking it is refused exactly there.
-fn exported(seed: u64, timeline: &Timeline, target: OtioTarget) -> Option<String> {
+fn exported(seed: u64, timeline: &Timeline, target: OtioTarget) -> Option<Utf8Bytes> {
   match to_otio(timeline, target) {
     Ok(text) if seed != REFUSED => Some(text),
     Err(Refused::NotRepresentable(count)) if seed == REFUSED => {
