@@ -455,3 +455,98 @@ fn a_sink_that_panics_is_named_and_never_called_again() {
     "only the first call reached the sink",
   );
 }
+
+/// An error's payload whose destructor panics — safe code, returned
+/// rather than raised.
+#[derive(Debug)]
+struct HostilePayload;
+
+impl core::fmt::Display for HostilePayload {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.write_str("an error whose payload panics when dropped")
+  }
+}
+
+impl std::error::Error for HostilePayload {}
+
+impl Drop for HostilePayload {
+  fn drop(&mut self) {
+    panic!("the error's payload exploded");
+  }
+}
+
+/// A sink whose every write fails with an error carrying that payload,
+/// and counts the writes; it seeks and flushes as a buffer does.
+#[derive(Default)]
+struct ReturnsAHostileError {
+  seekable: Cursor<Vec<u8>>,
+  writes: std::sync::Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl Write for ReturnsAHostileError {
+  fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+    self
+      .writes
+      .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Err(io::Error::new(io::ErrorKind::StorageFull, HostilePayload))
+  }
+  fn flush(&mut self) -> io::Result<()> {
+    Ok(())
+  }
+}
+
+impl Seek for ReturnsAHostileError {
+  fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+    self.seekable.seek(pos)
+  }
+}
+
+/// **A sink error whose payload panics on drop is latched and named,
+/// and the process does not abort.** libavformat writes the header
+/// through ffmpeg-next's `extern "C"` callback, which drops the error a
+/// sink returns before it answers C; the guard reduces the error inside
+/// its `catch_unwind` first, so the destructor's panic is latched, the
+/// context names it, and the sink is never written again.
+///
+/// It runs in a child process ([`crate::fault_subprocess`]): the parent
+/// re-runs this one test in a child of the test binary and asserts the
+/// child exited cleanly. Without the reduction the payload is dropped in
+/// the callback, the panic cannot unwind through C, and the child dies
+/// of the abort — which the parent reports as this law failing, with the
+/// child's output, instead of losing the test binary to it.
+#[test]
+fn a_sink_error_whose_payload_panics_on_drop_is_named_without_an_abort() {
+  crate::fault_subprocess::in_subprocess(
+    "output::tests::a_sink_error_whose_payload_panics_on_drop_is_named_without_an_abort",
+    || {
+      ffmpeg_next::init().expect("ffmpeg init");
+      let sink = ReturnsAHostileError::default();
+      let writes = std::sync::Arc::clone(&sink.writes);
+      let ticket = subrip();
+      let (panic, handed_back) = quietly(|| {
+        let mut output = Output::open(sink, "matroska").expect("open");
+        output
+          .add_stream(&StreamSpec::new(&ticket, millis()))
+          .expect("a stream");
+        // Whether the header's own call reports the failed write is
+        // libavformat's business; the context hands the sink back
+        // either way, and names the panic there.
+        drop(output.write_header());
+        (output.sink_panic(), output.into_sink().err())
+      });
+      assert_eq!(panic.as_deref(), Some("the error's payload exploded"));
+      assert!(
+        matches!(
+          &handed_back,
+          Some(OutputError::SinkPanic { message }) if message == "the error's payload exploded"
+        ),
+        "the panic is named: {handed_back:?}",
+      );
+      assert_eq!(
+        writes.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "only the first write reached the sink",
+      );
+    },
+  );
+}

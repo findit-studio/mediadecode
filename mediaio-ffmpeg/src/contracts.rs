@@ -285,7 +285,11 @@
 //!   library may know and the bindings do not;
 //! - **the sink**: driven from `extern "C"` callbacks under the
 //!   [writer guard](crate::writer_guard), so a panic never unwinds into
-//!   C; a sink that panicked is latched, and never called again.
+//!   C — nor an error's payload: every error the sink returns is reduced
+//!   to its OS code or kind inside the guard's `catch_unwind`, its
+//!   payload dropped there, because ffmpeg-next drops a returned error
+//!   inside the callback. A sink that panicked, or whose error's payload
+//!   did, is latched, and never called again.
 //!
 //! # `AVOutputFormat`
 //!

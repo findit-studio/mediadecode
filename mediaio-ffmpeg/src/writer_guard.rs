@@ -15,6 +15,13 @@
 //! the muxer names the latch once control is back in Rust. The panic
 //! never reaches the `extern "C"` frame.
 //!
+//! **Nor does an error's payload.** ffmpeg-next drops an error the sink
+//! returns inside its `extern "C"` callback, and an `io::Error` can box
+//! a payload whose `Drop` panics. Every error the sink returns is
+//! reduced inside the guard's `catch_unwind` to its OS code or kind, its
+//! payload dropped there ([`InertError`]): a destructor that panics is
+//! latched like any other panic, and what reaches C owns nothing.
+//!
 //! **A latched sink is terminal.** Unlike a reader, which libavformat may
 //! simply stop reading, a sink that panicked part way through a write is
 //! in a state nothing can describe — some bytes of a packet may have
@@ -31,7 +38,7 @@ use std::{
   sync::Arc,
 };
 
-use crate::reader_guard::PanicLatch;
+use crate::reader_guard::{InertError, PanicLatch};
 
 /// A caller's byte sink, wrapped so that a panic inside it becomes an
 /// I/O error instead of an abort, and stays one.
@@ -70,7 +77,8 @@ impl<W> GuardedWriter<W> {
   }
 
   /// Runs one call into the caller's sink under `catch_unwind` — or none
-  /// at all, once a panic is latched.
+  /// at all, once a panic is latched — an error it returns reduced there
+  /// ([`InertError`]).
   fn guard<T>(&mut self, call: impl FnOnce(&mut W) -> io::Result<T>) -> io::Result<T> {
     let Self { inner, latch } = self;
     if latch.is_latched() {
@@ -81,8 +89,13 @@ impl<W> GuardedWriter<W> {
     // `AssertUnwindSafe` because the sink is exactly what may be left
     // inconsistent by its own panic — and that is why the latch makes the
     // sink terminal: nothing calls it again.
-    match catch_unwind(AssertUnwindSafe(|| call(inner))) {
-      Ok(result) => result,
+    //
+    // An error the sink returns is reduced inside the catch, so its
+    // payload is dropped here and not in ffmpeg-next's `extern "C"`
+    // callback: a payload whose `Drop` panics takes the path below, and
+    // the sink that returned it is terminal like one that panicked.
+    match catch_unwind(AssertUnwindSafe(|| call(inner).map_err(InertError::reduce))) {
+      Ok(result) => result.map_err(InertError::rebuild),
       Err(payload) => {
         latch.latch(&*payload);
         // Described, then deliberately forgotten, for the reason the
@@ -216,6 +229,120 @@ mod tests {
     let (mut guarded, latch) = GuardedWriter::new(PanicsWithAPayload);
     assert!(quietly(|| guarded.write(b"bytes")).is_err());
     assert!(latch.message().is_some());
+  }
+
+  /// An error's payload whose destructor panics — safe code, returned
+  /// rather than raised.
+  #[derive(Debug)]
+  struct HostilePayload;
+
+  impl core::fmt::Display for HostilePayload {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+      f.write_str("an error whose payload panics when dropped")
+    }
+  }
+
+  impl std::error::Error for HostilePayload {}
+
+  impl Drop for HostilePayload {
+    fn drop(&mut self) {
+      panic!("the error's payload exploded");
+    }
+  }
+
+  /// A sink whose every call returns an error carrying that payload, and
+  /// counts the calls.
+  #[derive(Default)]
+  struct ReturnsAHostileError {
+    calls: u32,
+  }
+
+  impl ReturnsAHostileError {
+    fn fail<T>(&mut self) -> io::Result<T> {
+      self.calls += 1;
+      Err(io::Error::new(io::ErrorKind::StorageFull, HostilePayload))
+    }
+  }
+
+  impl Write for ReturnsAHostileError {
+    fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+      self.fail()
+    }
+    fn flush(&mut self) -> io::Result<()> {
+      self.fail()
+    }
+  }
+
+  impl Seek for ReturnsAHostileError {
+    fn seek(&mut self, _pos: SeekFrom) -> io::Result<u64> {
+      self.fail()
+    }
+  }
+
+  /// **An error whose payload panics on drop is reduced inside the
+  /// guard: the destructor's panic is latched and named, and the sink is
+  /// not called again.** ffmpeg-next drops a returned error inside its
+  /// `extern "C"` callback, where that panic would abort the process
+  /// (`output::tests` drives the whole road in a child process); here it
+  /// is caught where the error is reduced, and what leaves the guard is
+  /// the guard's own error.
+  #[test]
+  fn an_error_whose_payload_panics_on_drop_is_latched_and_named() {
+    let (mut guarded, latch) = GuardedWriter::new(ReturnsAHostileError::default());
+    let err = quietly(|| guarded.write(b"bytes")).expect_err("the write failed");
+    let said = err.to_string();
+    // Forgotten, not dropped: were the guard to hand the payload out,
+    // dropping it while this law fails would panic during the unwind and
+    // abort the test binary instead of naming the defect.
+    core::mem::forget(err);
+    assert_eq!(said, "the caller's writer panicked");
+    assert_eq!(
+      latch.message().as_deref(),
+      Some("the error's payload exploded")
+    );
+    assert!(guarded.write(b"more").is_err());
+    assert!(guarded.flush().is_err());
+    assert!(guarded.seek(SeekFrom::Start(0)).is_err());
+    assert_eq!(
+      guarded.into_inner().calls,
+      1,
+      "a sink whose error panicked is not called again",
+    );
+  }
+
+  /// **An error leaves the guard saying what it said, and owning
+  /// nothing**: an OS error keeps its code, any other its kind — all
+  /// ffmpeg-next reads of it — and neither carries a payload out. Nothing
+  /// is latched: an error is not a panic, and the sink stays callable.
+  #[test]
+  fn a_returned_error_keeps_its_code_or_kind_and_no_payload() {
+    #[derive(Default)]
+    struct Failing {
+      calls: u32,
+    }
+    impl Write for Failing {
+      fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+        self.calls += 1;
+        Err(io::Error::from_raw_os_error(28))
+      }
+      fn flush(&mut self) -> io::Result<()> {
+        self.calls += 1;
+        Err(io::Error::new(
+          io::ErrorKind::WriteZero,
+          "the sink's own words",
+        ))
+      }
+    }
+    let (mut guarded, latch) = GuardedWriter::new(Failing::default());
+    let os = guarded.write(b"bytes").expect_err("the write failed");
+    assert_eq!(os.raw_os_error(), Some(28));
+    assert!(os.get_ref().is_none(), "no payload leaves the guard");
+    let custom = guarded.flush().expect_err("the flush failed");
+    assert_eq!(custom.kind(), io::ErrorKind::WriteZero);
+    assert!(custom.get_ref().is_none(), "no payload leaves the guard");
+    assert!(latch.message().is_none(), "an error is not a panic");
+    assert!(guarded.write(b"again").is_err());
+    assert_eq!(guarded.into_inner().calls, 3, "the sink is called again");
   }
 
   #[test]

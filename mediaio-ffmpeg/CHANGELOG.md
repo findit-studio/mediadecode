@@ -116,6 +116,11 @@ The family — `mediadecode`, `mediadecode-ffmpeg`, `mediadecode-webcodecs`,
   guard's panic latch. A panic inside it becomes a latched I/O error,
   named by the context (`OutputError::SinkPanic`), and a sink that
   panicked is never called again.
+- Both guards reduce an error the stream returns to its OS code or its
+  kind inside their `catch_unwind`, dropping its payload there:
+  ffmpeg-next drops a returned error inside its `extern "C"` callback,
+  where a payload whose `Drop` panics aborted the process. That panic is
+  now latched and named like any other.
 - `CodecId::mime_type` — the descriptor's first MIME type — and the
   `PNG`, `BMP`, `TTF`, `OTF` and `TEXT` ids.
 - A `test-support` feature (off by default): the fault-subprocess
