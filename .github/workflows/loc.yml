@@ -21,19 +21,13 @@ on:
       - 'art'
   workflow_dispatch:
 
+# One job counts every crate and updates the Gist once, with every file in
+# that one update. Separate jobs updating one Gist at the same time were
+# refused with HTTP 409.
 jobs:
   loc:
+    name: loc
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        target:
-          - { dir: mediadecode,        gist_file: mediadecode }
-          - { dir: mediadecode-ffmpeg, gist_file: mediadecode-ffmpeg }
-          - { dir: mediadecode-webcodecs, gist_file: mediadecode-webcodecs }
-          - { dir: mediaio-timeline,   gist_file: mediaio-timeline }
-          - { dir: .,                  gist_file: mediadecode-root }
-    name: loc (${{ matrix.target.gist_file }})
     steps:
       - uses: actions/checkout@v7
 
@@ -43,23 +37,37 @@ jobs:
       - name: Install tokeit
         run: cargo install tokeit --force
 
-      - name: Count total lines of code
-        run: tokeit --lang rust
-        working-directory: ${{ matrix.target.dir }}
+      - name: Count lines of code, per crate and for the workspace
+        run: |
+          set -euo pipefail
+          for dir in mediaspine mediadecode mediaencode mediaio-ffmpeg mediadecode-ffmpeg mediaencode-ffmpeg mediadecode-webcodecs mediaio-timeline mediaio .; do
+            (cd "$dir" && tokeit --lang rust)
+          done
 
-      - name: Upload total loc to GitHub Gist
+      - name: Upload the counts to the Gist
         uses: actions/github-script@v9
-        env:
-          TOKEIT_FILE: ${{ matrix.target.dir }}/tokeit.json
-          GIST_FILE:   ${{ matrix.target.gist_file }}
         with:
           github-token: ${{ secrets.GIST_PAT }}
           script: |
             const fs = require('fs');
-            const output = fs.readFileSync(process.env.TOKEIT_FILE, 'utf8');
+            // [directory, Gist file name]
+            const targets = [
+              ['mediaspine', 'mediaspine'],
+              ['mediadecode', 'mediadecode'],
+              ['mediaencode', 'mediaencode'],
+              ['mediaio-ffmpeg', 'mediaio-ffmpeg'],
+              ['mediadecode-ffmpeg', 'mediadecode-ffmpeg'],
+              ['mediaencode-ffmpeg', 'mediaencode-ffmpeg'],
+              ['mediadecode-webcodecs', 'mediadecode-webcodecs'],
+              ['mediaio-timeline', 'mediaio-timeline'],
+              ['mediaio', 'mediaio'],
+              ['.', 'mediaio-root'],
+            ];
+            const files = {};
+            for (const [dir, name] of targets) {
+              files[name] = { content: fs.readFileSync(`${dir}/tokeit.json`, 'utf8') };
+            }
             await github.rest.gists.update({
               gist_id: '327b2a8aef9003246e45c6e47fe63937',
-              files: {
-                [process.env.GIST_FILE]: { content: output }
-              }
+              files,
             });

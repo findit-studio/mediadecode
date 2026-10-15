@@ -1070,7 +1070,7 @@ impl VideoStreamDecoder for WebCodecsVideoStreamDecoder {
     .with_duration(duration)
     .with_visible_rect(visible_rect)
     .with_color(color);
-    Ok(Received::Frame)
+    Ok(Received::Produced)
   }
 
   async fn send_eof(&mut self) -> Result<Sent, Self::Error> {

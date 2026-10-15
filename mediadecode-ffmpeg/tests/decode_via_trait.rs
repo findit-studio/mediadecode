@@ -47,13 +47,13 @@ where
     match decoder.send_packet(packet)? {
       Sent::Accepted => break,
       Sent::MustDrain => {
-        while let Received::Frame = decoder.receive_frame(dst)? {
+        while let Received::Produced = decoder.receive_frame(dst)? {
           delivered = true;
         }
       }
     }
   }
-  Ok(matches!(decoder.receive_frame(dst)?, Received::Frame) || delivered)
+  Ok(matches!(decoder.receive_frame(dst)?, Received::Produced) || delivered)
 }
 
 #[test]
@@ -113,11 +113,15 @@ fn decode_one_frame_through_trait() {
     if s.index() != stream_index {
       continue;
     }
-    let pkt = match mediadecode_ffmpeg::boundary::owned_video_packet_from_ffmpeg_in(
-      &av_packet,
-      mediadecode::Timebase::default(),
-      mediadecode_ffmpeg::PacketLimits::default(),
-    )
+    // SAFETY: `packets()` reads each packet with `av_read_frame`, so libavformat wrote its
+    // payload, and it is live for the call.
+    let pkt = match unsafe {
+      mediadecode_ffmpeg::boundary::owned_video_packet_from_ffmpeg_in(
+        &av_packet,
+        mediadecode::Timebase::default(),
+        mediadecode_ffmpeg::PacketLimits::default(),
+      )
+    }
     .expect("a wrappable payload")
     {
       Some(p) => p,

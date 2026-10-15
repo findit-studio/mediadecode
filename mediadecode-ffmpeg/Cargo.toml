@@ -1,6 +1,6 @@
 [package]
 name        = "mediadecode-ffmpeg"
-version     = "0.18.0"
+version     = "0.19.0"
 edition.workspace      = true
 rust-version.workspace = true
 license.workspace      = true
@@ -20,19 +20,28 @@ default = ["std", "resample"]
 # `SubtitlePayload::Bitmap`, etc.) so `alloc` cannot be
 # optional — pinning it via the dep features keeps
 # `--no-default-features` builds compiling.
-std     = ["mediadecode/default"]
+std     = ["mediadecode/default", "mediaio-ffmpeg/std"]
 alloc   = []
 
-# Gates `FfmpegResampler` (the `AudioResampler` impl over `swresample`)
-# and, with it, `ffmpeg-next/software-resampling` — `swresample` is a
-# separate FFmpeg library, so linking it is a separate feature. On by
-# default so existing consumers see no change; a decode-only build
-# that never resamples can drop it and the `libswresample` link along
-# with it.
-resample = ["ffmpeg-next/software-resampling"]
+# Gates `FfmpegResampler` (the `AudioResampler` impl over `swresample`,
+# which lives in `mediaio-ffmpeg`) and, with it, the `libswresample`
+# link. On by default so existing consumers see no change; a
+# decode-only build that never resamples can drop it and the link
+# along with it.
+resample = ["mediaio-ffmpeg/resample"]
+
+# The test machinery `mediaio-ffmpeg` gates behind its own
+# `test-support` — the fault-subprocess harness, the allocation cap and
+# the callback-state hooks — forwarded for crates that test through
+# this one. Off by default and never needed to decode.
+test-support = ["mediaio-ffmpeg/test-support"]
 
 [dependencies]
 mediadecode = { workspace = true, features = ["alloc"] }
+# The base: the FFmpeg link and every crossing between FFmpeg's memory
+# and the vocabulary. The machines here — the decoders and the demuxer —
+# drive its carriers and conversions.
+mediaio-ffmpeg = { workspace = true }
 # The channel-layout vocabulary this adapter produces lives in
 # `mediaframe::audio`, which is compiled only at the alloc-or-std
 # tier — hence the unconditional `alloc`, the same shape as the
@@ -48,10 +57,16 @@ libc        = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+# This crate's unit lanes drive the base's test machinery: the fault
+# subprocess, the allocation cap and the callback-state hooks.
+mediaio-ffmpeg = { workspace = true, features = ["test-support"] }
 # The demux and resample lanes generate their own media (multi-track
 # containers, cover art, sine WAVs) with the `ffmpeg` CLI at run time —
 # see `tests/support/mod.rs`. This is where it goes.
 tempfile  = { workspace = true }
+# The write faces, for `tests/generic_remux.rs`: a remux written against
+# `Demuxer` and `Muxer` alone, run over this crate's demuxer.
+mediaencode = { workspace = true, features = ["std"] }
 
 [[example]]
 name = "decode"

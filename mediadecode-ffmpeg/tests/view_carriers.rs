@@ -238,16 +238,22 @@ fn a_trusted_payload_is_uncarriable_on_both_lanes() {
   let tb = mediadecode::Timebase::default();
 
   assert!(matches!(
-    owned_video_packet_from_ffmpeg_in(&packet, tb, PacketLimits::default()),
+    // SAFETY: `Packet::copy` wrote every byte of the payload, and the packet is live for the
+    // call.
+    unsafe { owned_video_packet_from_ffmpeg_in(&packet, tb, PacketLimits::default()) },
     Err(PacketBufferError::TrustedPayload(_)),
   ));
   assert!(matches!(
-    video_packet_from_ffmpeg_in(packet.clone(), tb, PacketLimits::default()),
+    // SAFETY: `Packet::copy` wrote every byte of the payload, and the packet is live for the
+    // call.
+    unsafe { video_packet_from_ffmpeg_in(packet.clone(), tb, PacketLimits::default()) },
     Err(PacketBufferError::TrustedPayload(_)),
   ));
   // The bare name is the view lane, and refuses the same way.
   assert!(matches!(
-    video_packet_from_ffmpeg_in(packet, tb, PacketLimits::default()),
+    // SAFETY: `Packet::copy` wrote every byte of the payload, and the packet is live for the
+    // call.
+    unsafe { video_packet_from_ffmpeg_in(packet, tb, PacketLimits::default()) },
     Err(PacketBufferError::TrustedPayload(_)),
   ));
 }
@@ -317,18 +323,20 @@ fn a_packet_handed_to_a_caller_never_shares_its_carrier() {
 
 /// The view lane's frame conversion.
 ///
-/// `unsafe` for the reason the safe borrowed wrapper is owned-lane: a
-/// view plane is a window into `frame`'s own buffer, and a caller who
-/// keeps the frame keeps a `data_mut` away from a mutable alias of it.
-/// Every call below satisfies the contract the same way — the frame is
-/// read, never written, for as long as the carriers live.
+/// `unsafe` for the reason the borrowed conversion is owned-lane: a view
+/// plane is a window into `frame`'s own buffer, and a caller who keeps
+/// the frame keeps a `data_mut` away from a mutable alias of it. Every
+/// call below satisfies the contract the same way — the frame is read,
+/// never written, for as long as the carriers live — and every frame
+/// handed in had its planes written by the builder that made it.
 unsafe fn view_video_frame(
   frame: &ffmpeg_next::frame::Video,
   time_base: mediadecode::Timebase,
   limits: mediadecode_ffmpeg::FrameLimits,
 ) -> Result<mediadecode_ffmpeg::VideoFrame, mediadecode_ffmpeg::convert::ConvertError> {
-  // SAFETY: `frame` is a live `AVFrame` for the whole call, and this
-  // test never writes through it while a carrier is alive.
+  // SAFETY: `frame` is a live `AVFrame` for the whole call, its planes
+  // written by the builder that made it (this function's own contract),
+  // and this test never writes through it while a carrier is alive.
   unsafe { mediadecode_ffmpeg::convert::av_frame_to_video_frame(frame.as_ptr(), time_base, limits) }
 }
 
@@ -344,7 +352,8 @@ unsafe fn view_audio_frame(
 }
 
 /// A GRAY8 `AVFrame` of `width x height`, refcount-allocated by FFmpeg
-/// and filled with a per-row pattern.
+/// and filled with a per-row pattern — every byte of every row its
+/// geometry describes is written, which is what a conversion reads.
 ///
 /// GRAY8 is one byte per sample and one plane, so `row_bytes == width`
 /// and the tight/padded question is decided by `width` alone: a
@@ -353,6 +362,9 @@ unsafe fn view_audio_frame(
 fn gray_frame(width: u32, height: u32) -> ffmpeg_next::frame::Video {
   support::init_ffmpeg();
   let mut frame = ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::GRAY8, width, height);
+  // Written before anything lends it: `data_mut` below forms a slice over
+  // the plane, and `av_frame_get_buffer` left it unwritten.
+  write_every_buffer(&mut frame);
   let linesize = frame.stride(0);
   let data = frame.data_mut(0);
   for y in 0..height as usize {
@@ -361,6 +373,23 @@ fn gray_frame(width: u32, height: u32) -> ffmpeg_next::frame::Video {
     }
   }
   frame
+}
+
+/// Writes every byte of every buffer `frame` holds — what a decoder does
+/// to the frames it hands out, and what `frame::Audio::new` leaves
+/// undone: `av_frame_get_buffer` allocates without writing.
+fn write_every_buffer(frame: &mut ffmpeg_next::Frame) {
+  // SAFETY: the frame is live and uniquely borrowed. Each non-null
+  // `buf[i]` is a live `AVBufferRef` whose `data` is valid for `size`
+  // bytes, written through the raw pointer without forming a reference
+  // to the unwritten bytes.
+  unsafe {
+    for buf in (*frame.as_mut_ptr()).buf {
+      if !buf.is_null() {
+        core::ptr::write_bytes((*buf).data, 0, (*buf).size);
+      }
+    }
+  }
 }
 
 /// The `(start, end)` addresses of `buf[0]`, the allocation a
@@ -443,7 +472,8 @@ fn a_padded_video_plane_is_compacted_on_both_lanes() {
   let time_base = mediadecode::Timebase::default();
   let viewed = unsafe { view_video_frame(&frame, time_base, FrameLimits::default()) }
     .expect("converts on the view lane");
-  let owned = convert::video_frame_from(&frame, time_base, FrameLimits::default())
+  // SAFETY: `gray_frame` wrote every row of its one plane, and the frame is live for the call.
+  let owned = unsafe { convert::video_frame_from(&frame, time_base, FrameLimits::default()) }
     .expect("converts on the owned lane");
 
   let view_plane = &viewed.planes()[0];
@@ -479,7 +509,9 @@ fn the_two_lanes_carry_the_same_video_content() {
     let viewed =
       unsafe { view_video_frame(&frame, time_base, FrameLimits::default()) }.expect("view lane");
     let owned =
-      convert::video_frame_from(&frame, time_base, FrameLimits::default()).expect("owned lane");
+      // SAFETY: `gray_frame` wrote every row of its one plane, and the frame is live for the
+      // call.
+      unsafe { convert::video_frame_from(&frame, time_base, FrameLimits::default()) }.expect("owned lane");
 
     // **Content, not spans.** A tight plane is shared at the decoder's
     // stride and a padded one is compacted at `row_bytes`, so the raw
@@ -507,7 +539,8 @@ fn the_frame_budget_fires_identically_on_both_lanes() {
   let tight = FrameLimits::new().with_max_frame_bytes(16);
 
   let viewed = unsafe { view_video_frame(&frame, time_base, tight) };
-  let owned = convert::video_frame_from(&frame, time_base, tight);
+  // SAFETY: `gray_frame` wrote every row of its one plane, and the frame is live for the call.
+  let owned = unsafe { convert::video_frame_from(&frame, time_base, tight) };
   match (viewed, owned) {
     (Err(v), Err(o)) => assert_eq!(
       core::mem::discriminant(&v),
@@ -524,7 +557,8 @@ fn the_frame_budget_fires_identically_on_both_lanes() {
   // And the same ceiling, raised, admits the frame on both.
   let roomy = FrameLimits::new().with_max_frame_bytes(1 << 20);
   assert!(unsafe { view_video_frame(&frame, time_base, roomy) }.is_ok());
-  assert!(convert::video_frame_from(&frame, time_base, roomy).is_ok());
+  // SAFETY: `gray_frame` wrote every row of its one plane, and the frame is live for the call.
+  assert!(unsafe { convert::video_frame_from(&frame, time_base, roomy) }.is_ok());
 }
 
 #[test]
@@ -536,11 +570,13 @@ fn an_audio_view_plane_stops_at_exactly_the_valid_bytes() {
   // in **one** allocation — which is what makes the second assert below
   // a proof rather than a coincidence.
   const SAMPLES: usize = 100;
-  let frame = ffmpeg_next::frame::Audio::new(
+  let mut frame = ffmpeg_next::frame::Audio::new(
     ffmpeg_next::format::Sample::I16(ffmpeg_next::format::sample::Type::Planar),
     SAMPLES,
     ffmpeg_next::ChannelLayout::STEREO,
   );
+  // Written, as a decoder's samples are: the view lane lends them.
+  write_every_buffer(&mut frame);
   // **One buffer per plane**, for planar audio: `av_frame_get_buffer`
   // allocates `buf[i]` per channel rather than one run for all of them.
   // Each plane is therefore proved against its own.
@@ -624,6 +660,9 @@ fn the_two_lanes_carry_the_same_audio_samples() {
     SAMPLES,
     ffmpeg_next::ChannelLayout::STEREO,
   );
+  // Written before anything lends it: `data_mut` below forms a slice over
+  // each plane, and `av_frame_get_buffer` left them unwritten.
+  write_every_buffer(&mut frame);
   for plane in 0..2usize {
     let data = frame.data_mut(plane);
     for (index, byte) in data.iter_mut().take(SAMPLES * 2).enumerate() {
@@ -635,7 +674,9 @@ fn the_two_lanes_carry_the_same_audio_samples() {
   let viewed =
     unsafe { view_audio_frame(&frame, time_base, FrameLimits::default()) }.expect("view lane");
   let owned =
-    convert::audio_frame_from(&frame, time_base, FrameLimits::default()).expect("owned lane");
+    // SAFETY: every sample of both planes was written above, and the frame is live for the
+    // call.
+    unsafe { convert::audio_frame_from(&frame, time_base, FrameLimits::default()) }.expect("owned lane");
 
   assert_eq!(viewed.nb_samples(), owned.nb_samples());
   assert_eq!(viewed.plane_count(), owned.plane_count());
@@ -708,7 +749,7 @@ fn a_resampled_view_frame_shares_the_resamplers_output_buffer() {
     resampler
       .receive_frame(&mut dst)
       .expect("no fault in the tail"),
-    Received::Frame
+    Received::Produced
   ) {
     if dst.nb_samples() == 0 || dst.plane_count() < 2 {
       continue;
@@ -857,7 +898,7 @@ fn a_side_data_only_packet_reaches_a_view_decoder_without_a_buffer_behind_it() {
     support::accepted(decoder.send_packet(p.packet()), "send a real packet");
     while matches!(
       decoder.receive_frame(&mut frame).expect("receive_frame"),
-      Received::Frame
+      Received::Produced
     ) {
       samples += u64::from(frame.nb_samples());
     }
@@ -904,7 +945,9 @@ fn the_borrowed_doors_copy_and_the_consuming_ones_share() {
     let tb = mediadecode::Timebase::default();
 
     // Borrowed: the owned lane, and it copies.
-    let owned = owned_video_packet_from_ffmpeg_in(&packet, tb, PacketLimits::default())
+    // SAFETY: `packets()` reads each packet with `av_read_frame`, so libavformat wrote its
+    // payload, and it is live for the call.
+    let owned = unsafe { owned_video_packet_from_ffmpeg_in(&packet, tb, PacketLimits::default()) }
       .expect("carried")
       .expect("a payload");
     assert_ne!(
@@ -917,7 +960,9 @@ fn the_borrowed_doors_copy_and_the_consuming_ones_share() {
     // here, which is exactly what makes the line above's alias
     // unconstructible.
     let expected = owned.data().as_ref().to_vec();
-    let viewed = video_packet_from_ffmpeg_in(packet, tb, PacketLimits::default())
+    // SAFETY: `packets()` reads each packet with `av_read_frame`, so libavformat wrote its
+    // payload, and it is live for the call.
+    let viewed = unsafe { video_packet_from_ffmpeg_in(packet, tb, PacketLimits::default()) }
       .expect("carried")
       .expect("a payload");
     assert_eq!(
@@ -941,14 +986,15 @@ fn a_tight_plane_copies_on_the_borrowed_road_and_shares_on_the_consuming_one() {
 
   // The same frame, the same tight geometry, two roads. The view road
   // is proved to share by `a_tight_video_plane_is_a_window_...`; this
-  // pins the other half — the safe borrowed conversion copies, because
+  // pins the other half — the borrowed conversion copies, because
   // `frame` is still the caller's and still mutable.
   let frame = gray_frame(128, 8);
   assert_eq!(frame.stride(0), 128, "the premise: a tight plane");
   let (start, end) = backing_range(&frame);
   let time_base = mediadecode::Timebase::default();
 
-  let borrowed = convert::video_frame_from(&frame, time_base, FrameLimits::default())
+  // SAFETY: `gray_frame` wrote every row of its one plane, and the frame is live for the call.
+  let borrowed = unsafe { convert::video_frame_from(&frame, time_base, FrameLimits::default()) }
     .expect("the owned lane converts");
   let ptr = borrowed.planes()[0].data_ref().as_ref().as_ptr() as usize;
   assert!(
@@ -1411,7 +1457,7 @@ fn a_failed_frame_conversion_parks_the_frame_instead_of_losing_it() {
         support::accepted(decoder.send_packet(p.packet()), "send");
         if matches!(
           decoder.receive_frame(&mut frame).expect("receive_frame"),
-          Received::Frame
+          Received::Produced
         ) {
           expected = Some((
             frame.nb_samples(),
@@ -1438,7 +1484,7 @@ fn a_failed_frame_conversion_parks_the_frame_instead_of_losing_it() {
         let got = decoder.receive_frame(&mut frame);
         cap_allocations(i32::MAX as usize);
         match got {
-          Ok(Received::Frame) => panic!("the ceiling should have refused the carrier"),
+          Ok(Received::Produced) => panic!("the ceiling should have refused the carrier"),
           // This packet produced nothing yet.
           Ok(Received::NeedsInput | Received::Ended) => {}
           Err(e) if format!("{e:?}").contains("CarrierAllocFailed") => {
@@ -1457,7 +1503,7 @@ fn a_failed_frame_conversion_parks_the_frame_instead_of_losing_it() {
       // uncapped run saw, not the one after it.
       assert_eq!(
         decoder.receive_frame(&mut frame).expect("the parked frame"),
-        Received::Frame,
+        Received::Produced,
       );
       assert_eq!(
         (
@@ -1517,7 +1563,7 @@ fn a_failed_video_frame_conversion_parks_the_frame_instead_of_losing_it() {
         support::accepted(decoder.send_packet(p.packet()), "send");
         if matches!(
           decoder.receive_frame(&mut frame).expect("receive_frame"),
-          Received::Frame
+          Received::Produced
         ) {
           expected = Some(frame.planes()[0].data_ref().as_ref().to_vec());
           break 'reference;
@@ -1541,7 +1587,7 @@ fn a_failed_video_frame_conversion_parks_the_frame_instead_of_losing_it() {
         let got = decoder.receive_frame(&mut frame);
         cap_allocations(i32::MAX as usize);
         match got {
-          Ok(Received::Frame) => panic!("the ceiling should have refused the carrier"),
+          Ok(Received::Produced) => panic!("the ceiling should have refused the carrier"),
           Ok(Received::NeedsInput | Received::Ended) => {}
           Err(e) if format!("{e:?}").contains("CarrierAllocFailed") => {
             refused = true;
@@ -1557,7 +1603,7 @@ fn a_failed_video_frame_conversion_parks_the_frame_instead_of_losing_it() {
 
       assert_eq!(
         decoder.receive_frame(&mut frame).expect("the parked frame"),
-        Received::Frame,
+        Received::Produced,
       );
       assert_eq!(
         frame.planes()[0].data_ref().as_ref().to_vec(),
@@ -1619,7 +1665,7 @@ fn a_failed_cue_conversion_parks_the_cue_instead_of_losing_it() {
       let mut frame = empty_subtitle_frame();
       assert_eq!(
         decoder.receive_frame(&mut frame).expect("the cue"),
-        Received::Frame,
+        Received::Produced,
       );
       let expected = format!("{:?}", frame.payload());
       assert!(expected.contains("Text"), "the fixture must decode to text");
@@ -1643,7 +1689,7 @@ fn a_failed_cue_conversion_parks_the_cue_instead_of_losing_it() {
       // not the next one.
       assert_eq!(
         decoder.receive_frame(&mut frame).expect("the parked cue"),
-        Received::Frame,
+        Received::Produced,
       );
       assert_eq!(
         format!("{:?}", frame.payload()),

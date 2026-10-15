@@ -61,7 +61,9 @@ fn first_video_frame(path: &std::path::Path) -> OwnedVideoFrame {
       continue;
     }
     let Some(packet) =
-      owned_video_packet_from_ffmpeg_in(&av_packet, time_base, PacketLimits::default())
+      // SAFETY: `packets()` reads each packet with `av_read_frame`, so libavformat wrote its
+      // payload, and it is live for the call.
+      unsafe { owned_video_packet_from_ffmpeg_in(&av_packet, time_base, PacketLimits::default()) }
         .expect("a wrappable video payload")
     else {
       continue;
@@ -69,7 +71,7 @@ fn first_video_frame(path: &std::path::Path) -> OwnedVideoFrame {
     if decoder.send_packet(&packet).expect("send packet") != Sent::Accepted {
       continue;
     }
-    if let Received::Frame = decoder.receive_frame(&mut frame).expect("receive frame") {
+    if let Received::Produced = decoder.receive_frame(&mut frame).expect("receive frame") {
       return frame;
     }
     assert!(index < 64, "no frame within the first 64 packets");

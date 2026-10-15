@@ -9,6 +9,92 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 The backend-agnostic core it adapts has its own log at
 [`mediadecode/CHANGELOG.md`](../mediadecode/CHANGELOG.md).
 
+## [0.19.0] - 2026-10-15
+
+The FFmpeg crossings move to the new base crate,
+[`mediaio-ffmpeg`](../mediaio-ffmpeg/CHANGELOG.md); this crate keeps the
+machines — the decoders, the demuxer, the hardware backends — and
+re-exports every name it exported before. Tracks `mediadecode` 0.19.0
+(see [its entry](../mediadecode/CHANGELOG.md#0190)). The family releases
+in lockstep.
+
+### Changed (BREAKING)
+
+- **`Received::Frame` is `Received::Produced`**, with `mediadecode`.
+- **Parameter copies answer `ParametersError`.** `TrackExtra::clone_parameters`,
+  `CodecTicket::mirror` and `CodecTicket::rebuild` return the base's
+  `ParametersError` — seven arms, the payloads of `DemuxError`'s
+  `Parameters*` arms — instead of `DemuxError`. `DemuxError:
+  From<ParametersError>` maps each arm onto its same-named `DemuxError`
+  arm, so `e.into()` restores the old type.
+- **`Frame::empty` answers `CrossingError`**, and
+  `ResampleError::Resample` carries it, instead of the decoder `Error`;
+  `Error: From<CrossingError>` maps it onto `Error::Ffmpeg`.
+
+### Changed
+
+- **The crossings live in `mediaio-ffmpeg`**: the carriers, packet and
+  frame conversion, codec tickets and identifiers, limits, the AVFrame
+  crossing, the allocator judge and the FFmpeg resampler, with `Ffmpeg`
+  and its adapter impls. Every path through this crate still resolves,
+  by re-export.
+- **Every function whose soundness rests on something its caller proves
+  is an `unsafe fn` with a written `# Safety` section**, and every call
+  site states its proof — the precondition for the crossings becoming
+  callable from another crate. Each re-exported `unsafe fn` names every
+  pointer it dereferences, against `mediaio-ffmpeg`'s new `contracts`
+  module.
+- `boundary::write_md_flags` is a safe fn.
+
+### Added
+
+- `ParametersError` and `CrossingError`, re-exported from the base.
+- A `test-support` feature (off by default), forwarded to the base: the
+  fault-subprocess harness and the callback-state hooks, for the lanes
+  of crates built on this one.
+
+### Fixed
+
+- **The callback state is owned through the pointer the codec context
+  holds.** The audio, image, subtitle and video decoders kept it in a
+  `Box` and moved that box after the context took its pointer — and a
+  `Box` asserts uniqueness over what it holds, so the move invalidated
+  the pointer the callbacks use. They now hold a raw-pointer owner that
+  frees the state after the context, and the hardware probe names its
+  wanted format through that same pointer before the open, instead of
+  installing a second one.
+- **The re-exported conversions from `ffmpeg_next` objects are
+  `unsafe`.** `ffmpeg_next`'s safe API builds frames and packets whose
+  bytes were never written (`frame::Video::new`, `Packet::new`), so a
+  borrow of one cannot vouch for them and every conversion from one —
+  the four `convert::*_frame_from` and the thirteen packet conversions —
+  is an `unsafe fn` (see `mediaio-ffmpeg`). This crate's decoders and
+  demuxer state where their bytes were written — `avcodec_receive_frame`,
+  `av_hwframe_transfer_data`, `av_read_frame` — beside each conversion.
+- **`VideoDecoder::send_packet` takes the crate's own packet carrier.**
+  The hardware-probe decoder's safe input is an `OwnedVideoPacket`, built
+  into an `AVPacket` on the scoped submission road; an `ffmpeg_next`
+  packet goes through `VideoDecoder::send_av_packet`, which is `unsafe`:
+  its caller vouches that the payload was written, that the
+  `AV_INPUT_BUFFER_PADDING_SIZE` bytes after it are zeroed or the padding
+  libavformat delivered it with, and that nothing writes through the
+  payload or the padding while the decoder may still read them
+  (libavcodec keeps a reference past the call). The stream decoders'
+  hardware seam takes the same raw road only for the packets they build
+  themselves.
+- **A custom channel map is not walked on the borrowed road.**
+  `convert::audio_frame_from` refuses it by name
+  (`ConvertError::UnverifiableChannelMap`); this crate's audio decoder
+  converts the frames libavcodec gives it through the raw entry, whose
+  map extent libavcodec guarantees.
+- **The borrowed conversions read nothing they cannot bound.**
+  `convert::audio_frame_from` refuses a null-backed frame before
+  reading a field, and `convert::subtitle_frame_from` refuses a bitmap
+  rect carrying a plane, whose size nothing records
+  (`ConvertError::UnverifiableBitmap`). This crate's subtitle decoder
+  converts through the raw entry, whose bitmap extents libavcodec
+  guarantees.
+
 ## [0.18.0] - 2026-10-10
 
 Tracks `mediadecode` 0.18.0, whose `PacketFlags` names `DISPOSABLE` (see

@@ -43,7 +43,7 @@ fn decode_all_hw(path: &PathBuf) -> Result<usize, mediadecode_ffmpeg::Error> {
     |decoder: &mut VideoDecoder, count: &mut usize| -> Result<(), mediadecode_ffmpeg::Error> {
       loop {
         match decoder.receive_frame(&mut frame) {
-          Ok(Received::Frame) => *count += 1,
+          Ok(Received::Produced) => *count += 1,
           Ok(Received::NeedsInput | Received::Ended) => return Ok(()),
           Err(e) => return Err(e),
         }
@@ -56,7 +56,9 @@ fn decode_all_hw(path: &PathBuf) -> Result<usize, mediadecode_ffmpeg::Error> {
     }
 
     loop {
-      match decoder.send_packet(&packet) {
+      // SAFETY: `packets()` reads each packet with `av_read_frame`, so libavformat wrote it,
+      // and nothing writes through it while the decoder may still read it.
+      match unsafe { decoder.send_av_packet(&packet) } {
         Ok(Sent::Accepted) => break,
         // Back pressure, named: drain and offer again. No errno
         // to decode, and no second offer needed to find out.
@@ -180,11 +182,13 @@ fn bench_decode(c: &mut Criterion) {
           // frame (which either completes the probe or frees queue
           // space), then retry send_packet.
           loop {
-            match dec.send_packet(&packet) {
+            // SAFETY: `packets()` reads each packet with `av_read_frame`, so libavformat wrote
+            // it, and nothing writes through it while the decoder may still read it.
+            match unsafe { dec.send_av_packet(&packet) } {
               Ok(Sent::Accepted) => break,
               Ok(Sent::MustDrain) => {
                 match dec.receive_frame(&mut frame) {
-                  Ok(Received::Frame) => break 'probe,
+                  Ok(Received::Produced) => break 'probe,
                   // Defensive: per FFmpeg's send/receive contract, a
                   // decoder that asked to be drained has something to
                   // give. Retry the send anyway rather than spinning.
@@ -197,7 +201,7 @@ fn bench_decode(c: &mut Criterion) {
             }
           }
           match dec.receive_frame(&mut frame) {
-            Ok(Received::Frame) => break 'probe,
+            Ok(Received::Produced) => break 'probe,
             Ok(Received::NeedsInput) => continue,
             Ok(Received::Ended) => break 'probe,
             Err(e) => panic!("probe receive_frame: {e}"),

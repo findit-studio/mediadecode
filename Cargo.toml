@@ -4,19 +4,31 @@ members = [
   "mediadecode",
   "mediadecode-ffmpeg",
   "mediadecode-webcodecs",
+  "mediaencode",
+  "mediaencode-ffmpeg",
+  "mediaio",
+  "mediaio-ffmpeg",
   "mediaio-timeline",
+  "mediaspine",
 ]
 
 [workspace.package]
 edition      = "2024"
 rust-version = "1.95.0"
 license      = "MIT OR Apache-2.0"
-repository   = "https://github.com/findit-studio/mediadecode"
-homepage     = "https://github.com/findit-studio/mediadecode"
+repository   = "https://github.com/findit-studio/mediaio"
+homepage     = "https://github.com/findit-studio/mediaio"
 
 [workspace.dependencies]
 # Workspace-internal crates — referenced by sibling members via workspace inheritance.
-mediadecode = { version = "0.18", path = "mediadecode", default-features = false }
+mediadecode = { version = "0.19", path = "mediadecode", default-features = false }
+mediadecode-ffmpeg = { version = "0.19", path = "mediadecode-ffmpeg", default-features = false }
+mediadecode-webcodecs = { version = "0.19", path = "mediadecode-webcodecs", default-features = false }
+mediaencode = { version = "0.19", path = "mediaencode", default-features = false }
+mediaencode-ffmpeg = { version = "0.19", path = "mediaencode-ffmpeg", default-features = false }
+mediaio-ffmpeg = { version = "0.19", path = "mediaio-ffmpeg", default-features = false }
+mediaio-timeline = { version = "0.2", path = "mediaio-timeline" }
+mediaspine  = { version = "0.1", path = "mediaspine", default-features = false }
 mediaframe  = { version = "0.12", default-features = false, features = ["frame"] }
 
 # External deps used by more than one member, pinned at the workspace level.

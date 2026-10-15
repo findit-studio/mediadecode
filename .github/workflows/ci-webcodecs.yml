@@ -1,13 +1,14 @@
 name: CI / mediadecode-webcodecs
 
-# Triggered by changes to either the WebCodecs adapter, the core
-# crate it adapts (since core changes can break the adapter), or
-# shared workspace files. The crate is `wasm32`-only — every
-# job here builds against `wasm32-unknown-unknown`.
+# Triggered by changes to the WebCodecs adapter, to the read faces it
+# implements and the vocabulary they speak (a change there can break the
+# adapter), or to shared workspace files. The crate is `wasm32`-only —
+# every job here builds against `wasm32-unknown-unknown`.
 on:
   push:
     branches: [main]
     paths:
+      - 'mediaspine/**'
       - 'mediadecode/**'
       - 'mediadecode-webcodecs/**'
       - 'Cargo.toml'
@@ -15,6 +16,7 @@ on:
       - '.github/workflows/ci-webcodecs.yml'
   pull_request:
     paths:
+      - 'mediaspine/**'
       - 'mediadecode/**'
       - 'mediadecode-webcodecs/**'
       - 'Cargo.toml'
@@ -116,19 +118,20 @@ jobs:
       run: |
         cargo install wasm-bindgen-cli --locked
         cargo install wasm-pack --locked
-    - name: Install Chromium + chromedriver
-      run: |
-        sudo apt-get update -y
-        sudo apt-get install -y chromium-browser chromium-chromedriver
-    - name: Run wasm-bindgen-test in headless Chromium
-      env:
-        CHROMEDRIVER: /usr/bin/chromedriver
+    # The runner image ships Google Chrome with the ChromeDriver that
+    # matches it ($CHROMEWEBDRIVER is its directory). Ubuntu's own
+    # `chromium-browser` package is a snap stub that no longer installs
+    # on the runner, so nothing is installed here.
+    - name: Run wasm-bindgen-test in headless Chrome
       # `cargo test --target wasm32-unknown-unknown` alone only
       # builds — the produced `.wasm` is not a native binary, so
       # cargo's default test runner exits 126 trying to execute
       # it. Route through `wasm-bindgen-test-runner` (set via
       # `CARGO_TARGET_..._RUNNER`) so the test harness actually
-      # boots in headless Chromium.
+      # boots in headless Chrome.
       run: |
+        export CHROMEDRIVER="$CHROMEWEBDRIVER/chromedriver"
+        google-chrome --version
+        "$CHROMEDRIVER" --version
         export CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER="wasm-bindgen-test-runner"
         cargo test -p mediadecode-webcodecs --target wasm32-unknown-unknown

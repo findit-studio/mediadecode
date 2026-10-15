@@ -54,14 +54,16 @@ fn auto_open_decodes_at_least_one_frame() {
       continue;
     }
     loop {
-      match decoder.send_packet(&packet) {
+      // SAFETY: `packets()` reads each packet with `av_read_frame`, so libavformat wrote it
+      // and its padding, and nothing writes through it while the decoder may still read it.
+      match unsafe { decoder.send_av_packet(&packet) } {
         Ok(Sent::Accepted) => break,
         // The two-offer rule, retired: the decoder says which it is,
         // so this drains and re-offers the same packet instead of
         // guessing that a second failure means damage.
         Ok(Sent::MustDrain) => loop {
           match decoder.receive_frame(&mut frame) {
-            Ok(Received::Frame) => {
+            Ok(Received::Produced) => {
               assert_eq!(frame.width(), expected_w);
               assert_eq!(frame.height(), expected_h);
               count += 1;
@@ -78,7 +80,7 @@ fn auto_open_decodes_at_least_one_frame() {
     }
     loop {
       match decoder.receive_frame(&mut frame) {
-        Ok(Received::Frame) => {
+        Ok(Received::Produced) => {
           assert_eq!(frame.width(), expected_w);
           assert_eq!(frame.height(), expected_h);
           count += 1;

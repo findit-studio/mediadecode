@@ -1,24 +1,24 @@
 [package]
 name        = "mediadecode"
-version     = "0.18.0"
+version     = "0.19.0"
 edition.workspace      = true
 rust-version.workspace = true
 license.workspace      = true
 repository.workspace   = true
 homepage.workspace     = true
 documentation = "https://docs.rs/mediadecode"
-description = "Generic, no_std-friendly type-and-trait spine for media decoders (FFmpeg, WebCodecs, R3D, BRAW, ARRIRAW, X-OCN, ProRes RAW, Canon Cinema RAW Light)."
+description = "The read faces of the mediaio family: the decoder traits, the frame sources and the Demuxer session, over the mediaspine vocabulary. no_std-friendly; backends for FFmpeg, WebCodecs, R3D, BRAW, ARRIRAW, X-OCN, ProRes RAW, Canon Cinema RAW Light."
 keywords   = ["media", "decoder", "video", "audio", "no-std"]
 categories = ["multimedia", "multimedia::video", "multimedia::audio", "no-std", "no-std::no-alloc"]
 
 [features]
 default = ["std"]
-# `serde?/alloc` and `serde?/std` keep serde's own capability tier in
-# step with this crate's, so a type that gains an owning payload at one
-# of them can still derive `Deserialize`. The `?` keeps serde out of the
-# build entirely when this crate's `serde` feature is off.
-alloc   = ["serde?/alloc"]
-std     = ["mediatime/default", "serde?/std"]
+# The vocabulary is `mediaspine`'s, so each capability tier is forwarded
+# to it: `alloc` and `std` are its tiers (and, through it, `mediatime`'s
+# and serde's), and `serde`, `arbitrary` and `quickcheck` are the trait
+# matrices it carries. Every name a dependant enables here still works.
+alloc   = ["mediaspine/alloc"]
+std     = ["mediaspine/std"]
 
 # Async-fn-in-trait variants of the decoder traits, exposed under
 # `mediadecode::future`. No runtime dependency — only a proc-macro
@@ -26,32 +26,20 @@ std     = ["mediatime/default", "serde?/std"]
 # each `!Send` trait. Callers pick their own executor.
 future = ["dep:trait-variant"]
 
-# `bitflags/serde` is deliberately absent. It is opt-in per type (a
-# `Serialize` / `Deserialize` derive inside the `bitflags!` body, which
-# `PacketFlags` does not carry) and its wire shape is a flag *grammar*
-# — `"KEY | CORRUPT"` — in any human-readable format. `PacketFlags`
-# serializes as its bits instead, hand-written in `packet::serde_impls`.
-serde      = ["dep:serde", "mediatime/serde", "mediaframe/serde"]
-arbitrary  = ["dep:arbitrary", "mediatime/arbitrary"]
-quickcheck = ["dep:quickcheck", "mediatime/quickcheck"]
+serde      = ["mediaspine/serde"]
+arbitrary  = ["mediaspine/arbitrary"]
+quickcheck = ["mediaspine/quickcheck"]
 
 [dependencies]
-mediatime   = { workspace = true }
-bitflags    = { workspace = true }
-derive_more = { workspace = true, features = ["display", "is_variant", "try_unwrap", "unwrap"] }
-thiserror   = { workspace = true }
-mediaframe  = { workspace = true }
-
-serde      = { workspace = true, optional = true }
-arbitrary  = { workspace = true, optional = true }
-quickcheck = { workspace = true, optional = true }
+mediaspine = { workspace = true }
 
 trait-variant = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion  = { workspace = true }
-tempfile   = { workspace = true }
-serde_json = { workspace = true }
+# `tests/time_primitives.rs` reads the instants `mediaframe`'s frames
+# carry, so it names `mediaframe` itself.
+mediaframe = { workspace = true }
 
 [[bench]]
 path    = "benches/foo.rs"

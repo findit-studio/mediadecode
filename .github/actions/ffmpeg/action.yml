@@ -1,0 +1,74 @@
+name: Pinned FFmpeg
+description: >-
+  Restores one variant of the pinned FFmpeg build from the cache, or builds
+  it with ci/ffmpeg.sh, and points pkg-config and PATH at it.
+
+inputs:
+  variant:
+    description: >-
+      `full` (GPL, with libx264, libx265, libmp3lame, libvpx and the
+      `ffmpeg` program) or `lgpl` (no GPL code, libraries only).
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Install pkg-config and the variant's codec libraries
+      id: deps
+      shell: bash
+      env:
+        VARIANT: ${{ inputs.variant }}
+      run: |
+        set -euo pipefail
+        libs=""
+        if [ "$VARIANT" = full ]; then
+          libs="x264 x265 lame libvpx"
+        fi
+        # shellcheck disable=SC2086 # the word list is the point
+        brew install pkgconf $libs
+        if [ -n "$libs" ]; then
+          # The cached build links these libraries by path, so a new
+          # version of any of them is a new build.
+          # shellcheck disable=SC2086
+          hash="$(brew list --versions $libs | sort | shasum -a 256 | cut -c1-16)"
+        else
+          hash="none"
+        fi
+        echo "hash=$hash" >> "$GITHUB_OUTPUT"
+        echo "prefix=$HOME/ffmpeg/$VARIANT" >> "$GITHUB_OUTPUT"
+
+    - name: Restore the pinned FFmpeg
+      id: cache
+      uses: actions/cache/restore@v6
+      with:
+        path: ${{ steps.deps.outputs.prefix }}
+        key: ffmpeg-9.0.1-${{ inputs.variant }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.deps.outputs.hash }}-${{ hashFiles('ci/ffmpeg.sh') }}
+
+    # No exact match restored: build it. (There are no fallback keys, so
+    # the matched key is the primary one or empty.)
+    - name: Build the pinned FFmpeg
+      if: steps.cache.outputs.cache-matched-key != steps.cache.outputs.cache-primary-key
+      shell: bash
+      env:
+        VARIANT: ${{ inputs.variant }}
+        PREFIX: ${{ steps.deps.outputs.prefix }}
+      run: bash ci/ffmpeg.sh "$VARIANT" "$PREFIX"
+
+    # Saved as soon as it is built, not at the end of the job, so a job
+    # that fails later still leaves the build for the next run.
+    - name: Save the pinned FFmpeg
+      if: steps.cache.outputs.cache-matched-key != steps.cache.outputs.cache-primary-key
+      uses: actions/cache/save@v6
+      with:
+        path: ${{ steps.deps.outputs.prefix }}
+        key: ${{ steps.cache.outputs.cache-primary-key }}
+
+    - name: Point pkg-config and PATH at it
+      shell: bash
+      env:
+        PREFIX: ${{ steps.deps.outputs.prefix }}
+      run: |
+        set -euo pipefail
+        echo "PKG_CONFIG_PATH=$PREFIX/lib/pkgconfig" >> "$GITHUB_ENV"
+        echo "$PREFIX/bin" >> "$GITHUB_PATH"
+        PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" pkg-config --modversion libavcodec

@@ -77,7 +77,7 @@
 //! again, and one not yet handed out is still owed.
 
 use std::{
-  collections::{TryReserveError, VecDeque},
+  collections::VecDeque,
   ffi::{CStr, CString, c_int},
   io::{Read, Seek},
   num::NonZeroI32,
@@ -116,14 +116,20 @@ use mediadecode::{
 use smol_bytes::Utf8Bytes;
 
 use crate::{
-  Ffmpeg, boundary,
+  CodecId, Ffmpeg, SampleFormat, boundary,
   buffer::PacketBufferError,
-  codec_id::CodecId,
   extras::{AttachmentPacketExtra, TrackExtra},
   limits::DemuxLimits,
   measured::Measured,
   reader_guard::{GuardedReader, PanicLatch},
-  sample_format::SampleFormat,
+  text::{lossy_len, lossy_text},
+};
+// The codec-parameter refusals are the base's: `mediaio-ffmpeg` mirrors,
+// copies and rebuilds parameters, and this demuxer reports each of its
+// refusals under the same payload (`From<ParametersError>` below).
+use mediaio_ffmpeg::error::{
+  ParametersAlloc, ParametersChannelMap, ParametersCopy, ParametersError, ParametersLayoutShape,
+  ParametersMissing, ParametersOpaque, ParametersTooLarge,
 };
 
 /// One microsecond — the timebase `avformat_seek_file` expects when no
@@ -154,6 +160,82 @@ enum InjectedRead {
 ///
 /// Construction is deliberately not on the trait — see [`Self::open`]
 /// and [`Self::open_reader`].
+///
+/// # The lanes, from outside this crate
+///
+/// Holding a lane-parameterized type generically — the public structs
+/// carry **only** this bound, so a consumer's own generic code can pass
+/// them around:
+///
+/// ```
+/// use mediadecode::demuxer::TrackInfo;
+/// use mediadecode_ffmpeg::{
+///   CarrierAudioStreamDecoder, CarrierDemuxer, CarrierVideoStreamDecoder, Ffmpeg,
+///   FfmpegCarrier, Owned, View,
+/// };
+///
+/// fn tracks_of<C: FfmpegCarrier>(demuxer: &CarrierDemuxer<C>) -> usize {
+///   // A field read is not an operation on the lane, so this is
+///   // exactly as generic as it looks.
+///   core::mem::size_of_val(demuxer)
+/// }
+///
+/// fn hold<C: FfmpegCarrier>(
+///   _demuxer: &CarrierDemuxer<C>,
+///   _audio: &CarrierAudioStreamDecoder<C>,
+///   _video: &CarrierVideoStreamDecoder<C>,
+/// ) {
+/// }
+///
+/// let _: fn(&CarrierDemuxer<View>) -> usize = tracks_of::<View>;
+/// let _: fn(&CarrierDemuxer<Owned>) -> usize = tracks_of::<Owned>;
+/// let _ = hold::<View>;
+/// let _ = hold::<Owned>;
+/// let _: fn() -> Vec<TrackInfo<Ffmpeg>> = || Vec::new();
+/// ```
+///
+/// And calling at either concrete lane, through the aliases or through
+/// the `Carrier*` names directly:
+///
+/// ```no_run
+/// use mediadecode::demuxer::Demuxer;
+/// use mediadecode_ffmpeg::{
+///   CarrierDemuxer, FfmpegDemuxer, FfmpegOwnedDemuxer, Owned, View,
+/// };
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let mut viewed = FfmpegDemuxer::open("clip.mkv")?;
+/// let mut owned = CarrierDemuxer::<Owned>::open("clip.mkv")?;
+/// let _ = viewed.tracks().len();
+/// let _ = owned.next_packet()?;
+/// let _: fn(&std::path::Path) -> _ = CarrierDemuxer::<View>::open::<std::path::Path>;
+/// let _: fn(&std::path::Path) -> _ = FfmpegOwnedDemuxer::open::<std::path::Path>;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// The generic bodies behind the per-lane faces stay out of reach:
+/// they carry the lane operations' bound, so reaching one at a
+/// concrete lane would drive the operations without the proofs the
+/// per-lane faces supply.
+///
+/// ```compile_fail,E0624
+/// use mediadecode_ffmpeg::{CarrierAudioStreamDecoder, DecoderLimits, Owned};
+/// fn downstream(parameters: ffmpeg_next::codec::Parameters) {
+///   let _ = CarrierAudioStreamDecoder::<Owned>::open_impl(
+///     parameters,
+///     mediadecode::Timebase::default(),
+///     DecoderLimits::default(),
+///   );
+/// }
+/// ```
+///
+/// ```compile_fail,E0624
+/// use mediadecode_ffmpeg::{CarrierDemuxer, View};
+/// fn downstream() {
+///   let _ = CarrierDemuxer::<View>::open_impl("clip.mkv");
+/// }
+/// ```
 pub struct CarrierDemuxer<C: crate::FfmpegCarrier> {
   input: Input,
   /// The track table, built once at open and held for the life of the
@@ -1074,34 +1156,58 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
       // consumed it. Nothing outside this loop ever sees the packet, so
       // the borrow cannot become the aliasing shape the public faces
       // refuse.
+      //
+      // SAFETY (each of the four arms): `packet` came out of
+      // `av_read_frame`, so libavformat wrote its payload and its side
+      // data — every byte it exports. `provenance` is this loop's own
+      // reading of `packet` — `DemuxDelivered` for what `av_read_frame`
+      // just handed a session that holds its `AVFormatContext` through
+      // `&mut self`, so every other reference to the buffer is
+      // libavformat's and none is written while the conversion reads;
+      // `AttachedPicture` only where `is_streams_attached_pic` proved the
+      // identity; a parked packet keeps the reading made when it was
+      // delivered. Either way libavformat delivered the packet, with its
+      // padding behind the payload, which is what lets the view lane's
+      // carrier claim that padding and a decoder share it. `packet` is
+      // this loop's own value and is never written through: it drops at
+      // the end of the iteration, or waits in `self.unconverted` to be
+      // read again.
       let converted = match info.kind() {
-        TrackKind::Video => boundary::video_packet_from_borrowed::<C>(
-          &packet,
-          time_base,
-          self.limits.packet(),
-          provenance,
-        )
+        TrackKind::Video => unsafe {
+          boundary::video_packet_from_borrowed::<C>(
+            &packet,
+            time_base,
+            self.limits.packet(),
+            provenance,
+          )
+        }
         .map(|built| built.map(|p| DemuxedPacket::Video(VideoTrackPacket::new(track, p)))),
-        TrackKind::Audio => boundary::audio_packet_from_borrowed::<C>(
-          &packet,
-          time_base,
-          self.limits.packet(),
-          provenance,
-        )
+        TrackKind::Audio => unsafe {
+          boundary::audio_packet_from_borrowed::<C>(
+            &packet,
+            time_base,
+            self.limits.packet(),
+            provenance,
+          )
+        }
         .map(|built| built.map(|p| DemuxedPacket::Audio(AudioTrackPacket::new(track, p)))),
-        TrackKind::Subtitle => boundary::subtitle_packet_from_borrowed::<C>(
-          &packet,
-          time_base,
-          self.limits.packet(),
-          provenance,
-        )
+        TrackKind::Subtitle => unsafe {
+          boundary::subtitle_packet_from_borrowed::<C>(
+            &packet,
+            time_base,
+            self.limits.packet(),
+            provenance,
+          )
+        }
         .map(|built| built.map(|p| DemuxedPacket::Subtitle(SubtitleTrackPacket::new(track, p)))),
-        TrackKind::Data => boundary::data_packet_from_borrowed::<C>(
-          &packet,
-          time_base,
-          self.limits.packet(),
-          provenance,
-        )
+        TrackKind::Data => unsafe {
+          boundary::data_packet_from_borrowed::<C>(
+            &packet,
+            time_base,
+            self.limits.packet(),
+            provenance,
+          )
+        }
         .map(|built| built.map(|p| DemuxedPacket::Data(DataTrackPacket::new(track, p)))),
         // Every attachment track's one packet was queued at open time,
         // so anything arriving on one now is the duplicate some
@@ -1129,7 +1235,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
           // well-formed by retrying, and parking it would answer every
           // later pull with the same error instead of letting the
           // session make progress.
-          if source.parks_in_demux() {
+          if parks_in_demux(&source) {
             self.unconverted = Some((packet, provenance));
           } else {
             // Dropped: this walk will not have observed every packet,
@@ -1519,53 +1625,6 @@ impl AttachmentBudgetExhausted {
   }
 }
 
-/// Payload for [`DemuxError::ParametersTooLarge`].
-///
-/// One stream's codec parameters hold more heap bytes than
-/// [`DemuxLimits::max_codec_parameter_bytes`] allows.
-///
-/// The bytes are `extradata` plus every `coded_side_data` entry plus a
-/// custom channel map — the three seats `AVCodecParameters` reaches the
-/// heap through. A MOV `prof` atom lands in the second of those as an
-/// ICC profile, which is where the honest large values live and where
-/// the forged ones do too.
-#[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
-#[error(
-  "the codec parameters on stream {stream_index} hold {bytes} heap bytes, over the {limit}-byte budget"
-)]
-pub struct ParametersTooLarge {
-  stream_index: usize,
-  bytes: usize,
-  limit: usize,
-}
-
-impl ParametersTooLarge {
-  /// Constructs a `ParametersTooLarge` payload.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn new(stream_index: usize, bytes: usize, limit: usize) -> Self {
-    Self {
-      stream_index,
-      bytes,
-      limit,
-    }
-  }
-  /// The `AVStream.index` whose parameters were refused.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn stream_index(&self) -> usize {
-    self.stream_index
-  }
-  /// The heap bytes the parameters declared.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn bytes(&self) -> usize {
-    self.bytes
-  }
-  /// The budget in force.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn limit(&self) -> usize {
-    self.limit
-  }
-}
-
 /// Payload for [`DemuxError::ParametersBudgetExhausted`].
 ///
 /// Every stream's codec parameters, together, hold more heap bytes than
@@ -1610,57 +1669,6 @@ impl ParametersBudgetExhausted {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn limit(&self) -> usize {
     self.limit
-  }
-}
-
-/// Payload for [`DemuxError::ParametersMissing`].
-///
-/// Codec parameters arrived that were never allocated.
-///
-/// `ffmpeg_next::codec::Parameters` has safe constructors that hand
-/// back a null-backed value when FFmpeg's allocation failed, and they
-/// report nothing. Copying from one dereferences null, so it is
-/// refused where it arrives — at construction, and again in the
-/// copier — rather than crashing later somewhere that has forgotten
-/// the allocator ever failed.
-#[derive(thiserror::Error, Debug, Clone)]
-#[error("the codec parameters for stream {stream_index} were never allocated")]
-pub struct ParametersMissing {
-  stream_index: usize,
-}
-
-impl ParametersMissing {
-  /// Constructs a `ParametersMissing` payload.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn new(stream_index: usize) -> Self {
-    Self { stream_index }
-  }
-  /// The `AVStream.index` the parameters were offered for.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn stream_index(&self) -> usize {
-    self.stream_index
-  }
-}
-
-/// Payload for [`DemuxError::ParametersAlloc`].
-///
-/// Codec parameters for a track could not be allocated.
-#[derive(thiserror::Error, Debug, Clone)]
-#[error("out of memory allocating the codec parameters for stream {stream_index}")]
-pub struct ParametersAlloc {
-  stream_index: usize,
-}
-
-impl ParametersAlloc {
-  /// Constructs a `ParametersAlloc` payload.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn new(stream_index: usize) -> Self {
-    Self { stream_index }
-  }
-  /// The `AVStream.index` whose parameters could not be copied.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn stream_index(&self) -> usize {
-    self.stream_index
   }
 }
 
@@ -2103,226 +2111,6 @@ impl ChapterAlloc {
   }
 }
 
-/// Payload for [`DemuxError::ParametersCopy`].
-///
-/// Copying a track's codec parameters failed part way.
-#[derive(thiserror::Error, Debug, Clone)]
-#[error("the codec parameters for stream {stream_index} could not be copied: {source}")]
-pub struct ParametersCopy {
-  stream_index: usize,
-  #[source]
-  source: ffmpeg_next::Error,
-}
-
-impl ParametersCopy {
-  /// Constructs a `ParametersCopy` payload.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn new(stream_index: usize, source: ffmpeg_next::Error) -> Self {
-    Self {
-      stream_index,
-      source,
-    }
-  }
-  /// The `AVStream.index` whose parameters could not be copied.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn stream_index(&self) -> usize {
-    self.stream_index
-  }
-  /// What FFmpeg said.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn source(&self) -> &ffmpeg_next::Error {
-    &self.source
-  }
-}
-
-/// Payload for [`DemuxError::ParametersOpaque`].
-///
-/// A channel layout arrived carrying `opaque` — a raw pointer FFmpeg
-/// documents as "private data of the user".
-///
-/// [`CodecTicket`](crate::ticket::CodecTicket) is an **owned** mirror:
-/// it outlives the `AVCodecParameters` it was read from, and it may
-/// cross threads, so a pointer into somebody else's data is exactly
-/// what it cannot carry. libavformat sets neither
-/// `AVChannelLayout::opaque` nor `AVChannelCustom::opaque`, so no
-/// demuxed stream reaches the mirror with one; if one ever does, the
-/// mirror refuses rather than dropping the pointer in silence. That is
-/// the same fail-closed answer `extras::measure_parameters` gives a
-/// channel order it has never heard of, and for the same reason:
-/// carrying on would be a guess about memory nobody here owns.
-#[derive(thiserror::Error, Debug, Clone)]
-#[error(
-  "the channel layout for stream {stream_index} carries user-private data \
-   ({}) that an owned codec ticket cannot mirror",
-  match channel { Some(i) => format!("custom channel {i}"), None => "the layout".to_owned() },
-)]
-pub struct ParametersOpaque {
-  stream_index: usize,
-  channel: Option<usize>,
-}
-
-impl ParametersOpaque {
-  /// Constructs a `ParametersOpaque` payload. `channel` names the
-  /// custom-map entry when the pointer was on one, and is `None` when
-  /// it was on the layout itself.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn new(stream_index: usize, channel: Option<usize>) -> Self {
-    Self {
-      stream_index,
-      channel,
-    }
-  }
-  /// The `AVStream.index` whose layout carried the pointer.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn stream_index(&self) -> usize {
-    self.stream_index
-  }
-  /// The custom-map entry the pointer was on, or `None` when it was on
-  /// the layout itself.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn channel(&self) -> Option<usize> {
-    self.channel
-  }
-}
-
-/// Payload for [`DemuxError::ParametersChannelMap`].
-///
-/// A channel layout declared `AV_CHANNEL_ORDER_CUSTOM` without the map
-/// that order requires.
-///
-/// **This one is a crash, not a curiosity.** For a custom order,
-/// `av_channel_layout_copy` — which is how
-/// `avcodec_parameters_to_context` moves a layout into a decoder's
-/// context — does
-///
-/// ```c
-/// dst->u.map = av_malloc_array(src->nb_channels, sizeof(*dst->u.map));
-/// if (!dst->u.map)
-///     return AVERROR(ENOMEM);
-/// memcpy(dst->u.map, src->u.map, src->nb_channels * sizeof(*src->u.map));
-/// ```
-///
-/// with **no null check on `src->u.map`** — verified against FFmpeg
-/// n9.0. A layout that names channels it has no map for therefore makes
-/// libavcodec `memcpy` from a null pointer the moment a decoder opens
-/// from it.
-///
-/// So the mirror refuses such a layout at the door rather than
-/// reproducing it. An earlier draft carried it through, on the argument
-/// that a malformed layout in should be a malformed layout out — the
-/// round trip is faithful either way, and the parity comparator agreed.
-/// That symmetry was the wrong test: faithfully reproducing a shape
-/// whose only consumer dereferences null is not fidelity, it is
-/// forwarding a crash. Refusing is the same fail-closed answer
-/// `extras::measure_parameters` gives a channel order it has never
-/// heard of.
-#[derive(thiserror::Error, Debug, Clone)]
-#[error(
-  "the custom channel layout for stream {stream_index} declares {channels} channels \
-   and carries no usable map for them"
-)]
-pub struct ParametersChannelMap {
-  stream_index: usize,
-  channels: i32,
-}
-
-impl ParametersChannelMap {
-  /// Constructs a `ParametersChannelMap` payload.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn new(stream_index: usize, channels: i32) -> Self {
-    Self {
-      stream_index,
-      channels,
-    }
-  }
-  /// The `AVStream.index` whose layout was malformed.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn stream_index(&self) -> usize {
-    self.stream_index
-  }
-  /// The `nb_channels` the layout declared with no map to describe them.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn channels(&self) -> i32 {
-    self.channels
-  }
-}
-
-/// Payload for [`DemuxError::ParametersLayoutShape`].
-///
-/// The non-custom half of what a channel layout can be wrong about, and
-/// the half that went unchecked for eleven rounds of review on the
-/// argument that an order describing its channels through a `uint64_t`
-/// mask cannot be malformed. The mask is not the only field:
-/// `nb_channels` is an `int` a caller writes, and FFmpeg's helpers
-/// compute `nb_channels - popcount(mask)` and take an integer square
-/// root of it without checking either.
-///
-/// See
-/// [`layout_preflight`](crate::channel_layout::layout_preflight) for
-/// the complete rule and why it is one function.
-#[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
-#[error(
-  "the channel layout for stream {stream_index} declares order {order} with {channels} \
-   channels, which is not a shape FFmpeg's own helpers can be given"
-)]
-pub struct ParametersLayoutShape {
-  stream_index: usize,
-  order: i32,
-  channels: i32,
-}
-
-impl ParametersLayoutShape {
-  /// Constructs a `ParametersLayoutShape` payload.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn new(stream_index: usize, order: i32, channels: i32) -> Self {
-    Self {
-      stream_index,
-      order,
-      channels,
-    }
-  }
-  /// The `AVStream.index` whose layout declared it.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn stream_index(&self) -> usize {
-    self.stream_index
-  }
-  /// `AVChannelLayout.order`, as the raw `c_int` it is on the wire.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn order(&self) -> i32 {
-    self.order
-  }
-  /// `nb_channels`, as the layout declared it.
-  #[cfg_attr(not(tarpaulin), inline(always))]
-  pub const fn channels(&self) -> i32 {
-    self.channels
-  }
-}
-
-/// Names a channel-layout fault for a demux caller — **one mapper, so
-/// the roads that share the preflight also share its report**.
-///
-/// `Alloc` is the only arm that is not a statement about the container:
-/// it is the allocator declining a rendering buffer, and it keeps the
-/// name every other allocator refusal on this road has.
-pub(crate) fn layout_fault_to_demux(
-  stream_index: usize,
-  fault: crate::channel_layout::ChannelLayoutFault,
-) -> DemuxError {
-  use crate::channel_layout::ChannelLayoutFault as Fault;
-  match fault {
-    // The second cannot arrive from a pointer road — it is how the
-    // *safe* conversion refuses a custom layout whose extent it cannot
-    // establish — but both say the same thing about this stream.
-    Fault::MalformedCustomMap { channels } | Fault::UnverifiableCustomMap { channels } => {
-      DemuxError::ParametersChannelMap(ParametersChannelMap::new(stream_index, channels))
-    }
-    Fault::MalformedLayout { order, channels } => {
-      DemuxError::ParametersLayoutShape(ParametersLayoutShape::new(stream_index, order, channels))
-    }
-    Fault::Alloc => DemuxError::ParametersAlloc(ParametersAlloc::new(stream_index)),
-  }
-}
-
 /// Payload for [`DemuxError::PacketBuffer`].
 ///
 /// A packet's payload could not be referenced — the bytes are there
@@ -2533,6 +2321,53 @@ pub enum DemuxError {
   ReaderPanic(#[from] ReaderPanic),
 }
 
+/// The base's parameter refusals, each reported under the arm that has
+/// always named it here — the payload is the same value.
+///
+/// Exhaustive on purpose: [`ParametersError`] is closed, so an arm added
+/// there fails to compile here until the demuxer names it too.
+impl From<ParametersError> for DemuxError {
+  fn from(e: ParametersError) -> Self {
+    match e {
+      ParametersError::TooLarge(p) => Self::ParametersTooLarge(p),
+      ParametersError::Missing(p) => Self::ParametersMissing(p),
+      ParametersError::Alloc(p) => Self::ParametersAlloc(p),
+      ParametersError::Copy(p) => Self::ParametersCopy(p),
+      ParametersError::Opaque(p) => Self::ParametersOpaque(p),
+      ParametersError::ChannelMap(p) => Self::ParametersChannelMap(p),
+      ParametersError::LayoutShape(p) => Self::ParametersLayoutShape(p),
+    }
+  }
+}
+
+/// Whether the demux session should **park** the packet a payload
+/// refusal came from and re-attempt it on the next pull.
+///
+/// Named for the decision rather than for a property of the error, and
+/// kept here rather than on `PacketBufferError`: whether retrying helps
+/// depends on *what was retried*. `SharedPayload` is permanent for a
+/// caller who keeps their other reference and retryable the moment they
+/// drop it; `CaptureFailed` is worth another attempt only if the packet
+/// still exists to attempt, which on a **consuming** conversion it does
+/// not. Only the demux loop knows both halves — it still holds the
+/// packet, and it knows nobody else does.
+///
+/// An allocation that failed says nothing about the packet, and the
+/// demux loop is holding the bytes; everything else is a fact about the
+/// packet itself, and parking it would answer every later pull with the
+/// same error instead of letting the session make progress.
+///
+/// **The door left open:** a public retry signal would have to know
+/// which operation produced the error and what the caller still holds —
+/// an operation-aware answer, not a property of `PacketBufferError`. If
+/// one is ever wanted it is designed then, not approximated now.
+fn parks_in_demux(source: &PacketBufferError) -> bool {
+  matches!(
+    source,
+    PacketBufferError::CaptureFailed(_) | PacketBufferError::SideDataAlloc(_)
+  )
+}
+
 // ---------------------------------------------------------------------------
 //  Track-table construction.
 // ---------------------------------------------------------------------------
@@ -2671,7 +2506,7 @@ fn build_tracks<C: crate::FfmpegCarrier + crate::CarrierOps>(
           // layout — a precondition, not a courtesy.
           let channel_layout =
             unsafe { crate::channel_layout::channel_layout_description_from_raw_ptr(ch_layout) }
-              .map_err(|fault| layout_fault_to_demux(index, fault))?;
+              .map_err(|fault| ParametersError::from_layout_fault(index, fault))?;
           TrackParams::Audio(AudioTrackParams::new(
             codec,
             unsafe { (*par).sample_rate }.max(0) as u32,
@@ -2788,6 +2623,9 @@ fn build_tracks<C: crate::FfmpegCarrier + crate::CarrierOps>(
         // value, and `addr_of!` reaches it without forming a reference
         // to the stream.
         let pkt = unsafe { std::ptr::addr_of!((*stream.as_ptr()).attached_pic) };
+        // SAFETY: `pkt` is this stream's own parked picture, live with the
+        // format context `stream` borrows, and written only while the
+        // container opened — which is over.
         unsafe { attached_pic_payload::<C>(pkt, index, limits) }?
       } else {
         extradata_payload::<C>(&stream, limits)?
@@ -3265,99 +3103,6 @@ unsafe fn metadata_value<'a>(dict: *const AVDictionary, key: &CStr) -> MetadataV
   MetadataValue::NotTerminated
 }
 
-/// The length `String::from_utf8_lossy` would produce for `bytes`,
-/// **without producing it**.
-///
-/// The charge has to be the decoded size rather than the raw one:
-/// lossy decoding replaces each invalid sequence with `U+FFFD`, three
-/// bytes, so a value of invalid single bytes triples on the way in. It
-/// also has to be knowable before anything is allocated, which rules
-/// out decoding first and measuring afterwards.
-///
-/// Exactness is not decorative — an approximation would either
-/// under-charge the budget or refuse ordinary text — so agreement with
-/// `from_utf8_lossy` is asserted directly in the unit lanes rather
-/// than argued here.
-pub(crate) fn lossy_len(bytes: &[u8]) -> usize {
-  const REPLACEMENT: usize = char::REPLACEMENT_CHARACTER.len_utf8();
-
-  let mut rest = bytes;
-  let mut total = 0usize;
-  loop {
-    match std::str::from_utf8(rest) {
-      Ok(valid) => return total + valid.len(),
-      Err(fault) => {
-        total += fault.valid_up_to() + REPLACEMENT;
-        match fault.error_len() {
-          // An invalid sequence of `skip` bytes becomes one `U+FFFD`.
-          Some(skip) => rest = &rest[fault.valid_up_to() + skip..],
-          // A truncated trailing sequence: one `U+FFFD`, and the end.
-          None => return total,
-        }
-      }
-    }
-  }
-}
-
-/// Decodes measured bytes into owned text, through a buffer reserved
-/// **fallibly**.
-///
-/// `decoded` is [`lossy_len`]'s answer for the same bytes, so the one
-/// reservation here is exact and the pushes that follow cannot grow
-/// it.
-///
-/// # Nothing is copied, and nothing allocates after the charge
-///
-/// The buffer is reserved once, fallibly, at the exact decoded size,
-/// and then **moved** into the carrier: `Utf8Bytes::from(String)`
-/// keeps a short value inline (`smol_bytes::INLINE_CAP`, no allocation
-/// at all) and hands a longer one to `bytes::Bytes::from(Vec<u8>)`,
-/// which takes the vector's own allocation over. The `Utf8Bytes` this
-/// replaced copied into a fresh `Arc<str>` instead — a second
-/// allocation, infallible, of an attacker-sized value, made while the
-/// first was still live, so failing it aborted the process that the
-/// budget above existed to keep alive.
-///
-/// **The one residue, stated exactly.** `Bytes::from(Vec<u8>)` moves
-/// the buffer outright when the vector's length equals its capacity,
-/// which `try_reserve_exact` followed by exactly `decoded` bytes is
-/// what produces; should an allocator hand back more capacity than was
-/// asked for, `bytes` allocates a fixed-size reference-count header —
-/// thirty-two bytes, the same for a ten-byte title and a sixty-four
-/// kibibyte one. What is gone is the part an attacker could scale.
-pub(crate) fn lossy_text(bytes: &[u8], decoded: usize) -> Result<Utf8Bytes, TryReserveError> {
-  let mut buffer = std::string::String::new();
-  buffer.try_reserve_exact(decoded)?;
-
-  let mut rest = bytes;
-  loop {
-    match std::str::from_utf8(rest) {
-      Ok(valid) => {
-        buffer.push_str(valid);
-        break;
-      }
-      Err(fault) => {
-        let (valid, after) = rest.split_at(fault.valid_up_to());
-        buffer.push_str(
-          std::str::from_utf8(valid).expect("valid_up_to bounds a valid prefix by definition"),
-        );
-        buffer.push(char::REPLACEMENT_CHARACTER);
-        match fault.error_len() {
-          Some(skip) => rest = &after[skip..],
-          None => break,
-        }
-      }
-    }
-  }
-  debug_assert_eq!(
-    buffer.len(),
-    decoded,
-    "lossy_len must price exactly what lossy_text builds",
-  );
-  // The move. Nothing past this point copies the value.
-  Ok(Utf8Bytes::from(buffer))
-}
-
 /// Names the fault a stream's metadata ran into, for the key it was
 /// reading.
 ///
@@ -3508,9 +3253,13 @@ const RETAINED_STREAM_METADATA: [&CStr; 3] = [c"filename", c"mimetype", c"langua
 ///
 /// # Safety
 ///
-/// `pkt` must be a live `*const AVPacket` — in practice the
-/// `attached_pic` embedded in the `AVStream` at `index` — for the
-/// duration of this call.
+/// `pkt` must be a live `*const AVPacket` for the duration of this call,
+/// and it must be the container's parked picture — the `attached_pic`
+/// embedded in the `AVStream` at `index`, written once while the
+/// container opened — or a packet nothing writes through for as long as
+/// the returned carrier lives: the capture is made under
+/// `PayloadProvenance::AttachedPicture`, which may window a buffer
+/// libavformat also holds.
 unsafe fn attached_pic_payload<C: crate::FfmpegCarrier + crate::CarrierOps>(
   pkt: *const ffmpeg_next::ffi::AVPacket,
   index: usize,
@@ -3522,7 +3271,11 @@ unsafe fn attached_pic_payload<C: crate::FfmpegCarrier + crate::CarrierOps>(
   // this packet's own ceiling anyway, so the funnel is guarded even if
   // a future caller reaches it without the admission pass.
   //
-  // SAFETY: `pkt` is live per the contract above.
+  // SAFETY: `pkt` is live per the contract above, and libavformat wrote
+  // its payload when the container opened (`avformat_open_input` reads
+  // the cover art into `attached_pic`), so every byte it exports is
+  // written. The `AttachedPicture` claim is the contract's own: nothing
+  // writes through the buffer while the carrier lives.
   // **The container's own cover art**, whose buffer libavformat also
   // holds — see [`crate::buffer::PayloadProvenance`] for why that
   // second reference is not the hazard a caller's second `Packet` is.
@@ -3822,7 +3575,9 @@ fn admit_streams(input: &Input, limits: DemuxLimits) -> Result<(), DemuxError> {
       //
       // SAFETY: `pkt` points at the live embedded `AVPacket` for the
       // whole of this call, and no plan outlives it — it is discarded
-      // here, the capture happens later against the same packet.
+      // here, the capture happens later against the same packet. It is
+      // the stream's parked picture, which is what `AttachedPicture`
+      // claims.
       let _plan = unsafe {
         crate::buffer::preflight_payload(
           pkt,
@@ -4500,7 +4255,7 @@ mod tests {
     // payload outside `catch_unwind`, so a payload whose `Drop` panics
     // sent that second panic straight out of `read` and into C —
     // through the very guard that exists to stop it.
-    crate::fault_subprocess::in_subprocess(
+    mediaio_ffmpeg::test_support::in_subprocess(
       "demuxer::tests::a_reader_panic_with_a_hostile_payload_does_not_abort_the_process",
       || {
         let previous = std::panic::take_hook();
@@ -4522,7 +4277,7 @@ mod tests {
     // `Parameters::new` does not check `avcodec_parameters_alloc`, and
     // `clone_from` dereferences the result immediately: under a failed
     // allocation the shipped clone would write through null.
-    crate::fault_subprocess::in_subprocess(
+    mediaio_ffmpeg::test_support::in_subprocess(
       "demuxer::tests::codec_parameters_that_cannot_be_allocated_are_named",
       || {
         let source = Parameters::new();
@@ -4530,13 +4285,15 @@ mod tests {
           !unsafe { source.as_ptr() }.is_null(),
           "the source allocates before the cap goes on",
         );
-        crate::fault_subprocess::cap_ffmpeg_allocations(1);
+        // SAFETY: in `in_subprocess`'s child, alone. The capped window runs only
+        // `bounded_clone_parameters`, which checks the allocation it makes.
+        unsafe { mediaio_ffmpeg::test_support::cap_ffmpeg_allocations(1) };
         let refused = crate::extras::bounded_clone_parameters(&source, 4, usize::MAX);
-        crate::fault_subprocess::uncap_ffmpeg_allocations();
+        mediaio_ffmpeg::test_support::uncap_ffmpeg_allocations();
         assert!(
           matches!(
             refused,
-            Err(DemuxError::ParametersAlloc(ref p)) if p.stream_index() == 4
+            Err(ParametersError::Alloc(ref p)) if p.stream_index() == 4
           ),
           "expected ParametersAlloc, got {:?}",
           refused.map(|_| ()),
@@ -4564,7 +4321,7 @@ mod tests {
     //   law, and a capped allocator is the only way to pin it.
     // * `clone_parameters` is the rebuild, and it is where FFmpeg
     //   allocation moved to. It still answers.
-    crate::fault_subprocess::in_subprocess(
+    mediaio_ffmpeg::test_support::in_subprocess(
       "demuxer::tests::the_public_track_extra_handoffs_still_answer_the_allocator",
       || {
         let source = Parameters::new();
@@ -4574,10 +4331,13 @@ mod tests {
           crate::ticket::CodecTicket::mirror(&source, 6, usize::MAX).expect("uncapped"),
         );
 
-        crate::fault_subprocess::cap_ffmpeg_allocations(1);
+        // SAFETY: in `in_subprocess`'s child, alone. The capped window holds a
+        // `TrackExtra` clone, which allocates nothing from FFmpeg, and
+        // `clone_parameters`, which checks the allocation it makes.
+        unsafe { mediaio_ffmpeg::test_support::cap_ffmpeg_allocations(1) };
         let cloned = extra.clone();
         let handed = extra.clone_parameters().map(|_| ());
-        crate::fault_subprocess::uncap_ffmpeg_allocations();
+        mediaio_ffmpeg::test_support::uncap_ffmpeg_allocations();
 
         assert_eq!(
           cloned.parameter_bytes(),
@@ -4585,7 +4345,7 @@ mod tests {
           "the row cloned under an allocator that refuses everything",
         );
         assert!(
-          matches!(handed, Err(DemuxError::ParametersAlloc(ref p)) if p.stream_index() == 6),
+          matches!(handed, Err(ParametersError::Alloc(ref p)) if p.stream_index() == 6),
           "TrackExtra::clone_parameters: {handed:?}",
         );
 
@@ -4604,14 +4364,17 @@ mod tests {
     // then — and called `avcodec_parameters_copy(out, NULL)`, which
     // dereferences its source. Same crash, one recovery later, still
     // from safe public code.
-    crate::fault_subprocess::in_subprocess(
+    mediaio_ffmpeg::test_support::in_subprocess(
       "demuxer::tests::parameters_that_never_allocated_are_refused_at_the_door",
       || {
         // The cap is on *while the source is built* — that is the whole
         // difference from the destination lane.
-        crate::fault_subprocess::cap_ffmpeg_allocations(1);
+        // SAFETY: in `in_subprocess`'s child, alone. `Parameters::new` hands back a
+        // null-backed value here, and the lane below only inspects it and hands
+        // it to doors that refuse a null.
+        unsafe { mediaio_ffmpeg::test_support::cap_ffmpeg_allocations(1) };
         let never_allocated = Parameters::new();
-        crate::fault_subprocess::uncap_ffmpeg_allocations();
+        mediaio_ffmpeg::test_support::uncap_ffmpeg_allocations();
         assert!(
           unsafe { never_allocated.as_ptr() }.is_null(),
           "the safe constructor really does hand back a null-backed value",
@@ -4623,7 +4386,7 @@ mod tests {
         // where the check now lives, and where it belongs: beside the
         // raw pointer rather than one type downstream of it.
         let refused = crate::ticket::CodecTicket::mirror(&never_allocated, 9, usize::MAX);
-        let Err(DemuxError::ParametersMissing(p)) = refused.map(|_| ()) else {
+        let Err(ParametersError::Missing(p)) = refused.map(|_| ()) else {
           panic!("a null-backed source must not become a codec ticket");
         };
         assert_eq!(p.stream_index(), 9);
@@ -4631,14 +4394,16 @@ mod tests {
         // And the copier refuses it too, so the invariant is not the
         // only thing standing between this and a null dereference.
         let never_allocated = {
-          crate::fault_subprocess::cap_ffmpeg_allocations(1);
+          // SAFETY: as above — the null-backed value is only handed to a door that
+          // refuses it.
+          unsafe { mediaio_ffmpeg::test_support::cap_ffmpeg_allocations(1) };
           let p = Parameters::new();
-          crate::fault_subprocess::uncap_ffmpeg_allocations();
+          mediaio_ffmpeg::test_support::uncap_ffmpeg_allocations();
           p
         };
         assert!(matches!(
           crate::extras::bounded_clone_parameters(&never_allocated, 9, usize::MAX).map(|_| ()),
-          Err(DemuxError::ParametersMissing(p)) if p.stream_index() == 9,
+          Err(ParametersError::Missing(p)) if p.stream_index() == 9,
         ));
 
         // A row built over real parameters still hands off both ways,
@@ -4661,12 +4426,15 @@ mod tests {
     // `ResampleSpec::from_parameters` asks `parameters.medium()`
     // first, and *that* dereferences the pointer inside ffmpeg-next
     // before any code of ours runs.
-    crate::fault_subprocess::in_subprocess(
+    mediaio_ffmpeg::test_support::in_subprocess(
       "demuxer::tests::a_spec_read_from_parameters_that_never_allocated_is_absent",
       || {
-        crate::fault_subprocess::cap_ffmpeg_allocations(1);
+        // SAFETY: in `in_subprocess`'s child, alone. `Parameters::new` hands back a
+        // null-backed value, which the lane only inspects and hands to
+        // `ResampleSpec::from_parameters`, which refuses a null.
+        unsafe { mediaio_ffmpeg::test_support::cap_ffmpeg_allocations(1) };
         let never_allocated = Parameters::new();
-        crate::fault_subprocess::uncap_ffmpeg_allocations();
+        mediaio_ffmpeg::test_support::uncap_ffmpeg_allocations();
         assert!(unsafe { never_allocated.as_ptr() }.is_null());
         assert_eq!(
           crate::ResampleSpec::from_parameters(&never_allocated),
@@ -4683,7 +4451,7 @@ mod tests {
     // the extradata does not. `clone_from` discards that return value,
     // so the shipped clone handed back parameters missing the very
     // bytes a decoder needs to open — and said nothing.
-    crate::fault_subprocess::in_subprocess(
+    mediaio_ffmpeg::test_support::in_subprocess(
       "demuxer::tests::codec_parameters_whose_copy_fails_are_named",
       || {
         const EXTRADATA: usize = 8 * 1024 * 1024;
@@ -4701,11 +4469,13 @@ mod tests {
 
         // Big enough for the destination `AVCodecParameters`, far too
         // small for its extradata.
-        crate::fault_subprocess::cap_ffmpeg_allocations(64 * 1024);
+        // SAFETY: in `in_subprocess`'s child, alone. The capped window runs only
+        // `bounded_clone_parameters`, which checks every allocation it makes.
+        unsafe { mediaio_ffmpeg::test_support::cap_ffmpeg_allocations(64 * 1024) };
         let refused = crate::extras::bounded_clone_parameters(&source, 2, usize::MAX);
-        crate::fault_subprocess::uncap_ffmpeg_allocations();
+        mediaio_ffmpeg::test_support::uncap_ffmpeg_allocations();
         match refused {
-          Err(DemuxError::ParametersCopy(p)) => assert_eq!(p.stream_index(), 2),
+          Err(ParametersError::Copy(p)) => assert_eq!(p.stream_index(), 2),
           Err(other) => panic!("expected ParametersCopy, got {other:?}"),
           Ok(_) => panic!("a copy that could not copy the extradata must not succeed"),
         }
@@ -4804,7 +4574,10 @@ mod tests {
     // **The first pull.** Two references, one of them the container's.
     // From a *caller* that shape is refused, because a caller's second
     // reference may be a `Packet` with a safe `data_mut`.
-    // SAFETY: `queued` is live for every call in this test.
+    // SAFETY: `queued` is live for every call in this test, and nothing in
+    // it writes through either packet that shares its buffer, so every
+    // provenance claim below holds: no write while a call reads, and none
+    // while a carrier lives.
     assert!(matches!(
       unsafe {
         payload_of::<crate::View>(
@@ -4878,7 +4651,8 @@ mod tests {
     // so it stays on the `Delivered` road, is unique, and the view lane
     // shares it.
     let later = Packet::copy(&[4u8; 1024]);
-    // SAFETY: `later` is live.
+    // SAFETY: `later` is live, its buffer unshared, and nothing writes
+    // through it while the view lives.
     let shared = unsafe {
       payload_of::<crate::View>(
         later.as_ptr(),
@@ -4942,7 +4716,12 @@ mod tests {
     // packet, because `ff_add_attached_pic` sets the disposition and
     // fills it in the same call. A zeroed `AVPacket` is exactly what
     // `attached_pic` would hold if one ever did not.
+    // SAFETY: an all-zero `AVPacket` is a valid empty packet — null
+    // buffer and data, zero size.
     let empty: ffmpeg_next::ffi::AVPacket = unsafe { std::mem::zeroed() };
+    // SAFETY: `empty` is a live local, and it has no buffer at all, so
+    // nothing can write through one while the (owned, empty) carrier
+    // lives — the contract's "or a packet nothing writes through".
     let packet = unsafe { attached_pic_payload::<crate::Owned>(&empty, 7, DemuxLimits::default()) }
       .expect("an unparked cover is a degenerate track, not an unreadable file");
     assert!(packet.data().as_ref().is_empty());
@@ -4951,46 +4730,6 @@ mod tests {
       "nothing in the container handed this payload over",
     );
     assert_eq!(packet.extra().stream_index(), 7);
-  }
-
-  /// **`lossy_len` prices exactly what `from_utf8_lossy` builds.**
-  ///
-  /// The budget charge is made from this number *before* anything is
-  /// decoded, so a disagreement would either under-charge the budget —
-  /// the hostile case, where bytes that are not UTF-8 triple on the way
-  /// through — or refuse ordinary text. Asserted against the real
-  /// decoder rather than argued, over the shapes that differ: valid
-  /// ASCII and multi-byte text, a lone invalid byte, a run of them, an
-  /// invalid sequence between valid text, and a truncated trailing
-  /// sequence (which `error_len() == None` reports and which becomes
-  /// exactly one replacement).
-  #[test]
-  fn lossy_len_prices_exactly_what_lossy_text_builds() {
-    let cases: [&[u8]; 9] = [
-      b"",
-      b"Opening",
-      "héllo wörld".as_bytes(),
-      b"\xff",
-      b"\xff\xfe\xfd",
-      b"before\xffafter",
-      b"\xe2\x82",           // truncated three-byte sequence
-      b"ok\xe2\x82",         // ... after valid text
-      b"\xf0\x9f\x92\xa9ok", // a real four-byte sequence, untouched
-    ];
-    for raw in cases {
-      let built = std::string::String::from_utf8_lossy(raw);
-      assert_eq!(
-        lossy_len(raw),
-        built.len(),
-        "{raw:?} must be priced at what from_utf8_lossy produces",
-      );
-      let text = lossy_text(raw, lossy_len(raw)).expect("a small reservation");
-      assert_eq!(
-        text.as_str(),
-        built.as_ref(),
-        "{raw:?} must decode identically"
-      );
-    }
   }
 
   /// **Measure, charge, materialise — and a value the budget refuses is

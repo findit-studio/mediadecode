@@ -20,17 +20,108 @@
 //!
 //! Every `send_packet` / `send_eof` here answers [`Sent`] — *accepted*
 //! or *must drain* — and every `receive_frame` answers [`Received`] —
-//! *a frame*, *needs input*, or *ended*. `Err` is reserved for faults
-//! on both faces. The rationale, and the reason those two vocabularies
-//! are exhaustive while the backends' error types are not, is on the
-//! [`rhythm`](crate::rhythm) module.
+//! *produced* (a frame, on these faces), *needs input*, or *ended*.
+//! `Err` is reserved for faults on both faces. The rationale, and the
+//! reason those two vocabularies are exhaustive while the backends'
+//! error types are not, is on the [`rhythm`](crate::rhythm) module.
+//!
+//! ## The feeder loop
+//!
+//! ```
+//! use mediadecode::{Received, Sent, decoder::AudioStreamDecoder};
+//! # use mediadecode::{adapter::AudioAdapter, frame::AudioFrame, packet::AudioPacket};
+//! # type Frame<D> = AudioFrame<
+//! #   <<D as AudioStreamDecoder>::Adapter as AudioAdapter>::SampleFormat,
+//! #   <<D as AudioStreamDecoder>::Adapter as AudioAdapter>::ChannelLayout,
+//! #   <<D as AudioStreamDecoder>::Adapter as AudioAdapter>::FrameExtra,
+//! #   <D as AudioStreamDecoder>::Buffer,
+//! # >;
+//! # type Packet<D> = AudioPacket<
+//! #   <<D as AudioStreamDecoder>::Adapter as AudioAdapter>::PacketExtra,
+//! #   <D as AudioStreamDecoder>::Buffer,
+//! # >;
+//! /// Feeds one packet, draining as required, and delivers every frame
+//! /// it makes ready. Answers `true` once the stream is over.
+//! fn feed<D: AudioStreamDecoder>(
+//!   decoder: &mut D,
+//!   packet: &Packet<D>,
+//!   dst: &mut Frame<D>,
+//!   mut on_frame: impl FnMut(&Frame<D>),
+//! ) -> Result<bool, D::Error> {
+//!   loop {
+//!     // `?` means what it says on both faces: only a fault leaves.
+//!     match decoder.send_packet(packet)? {
+//!       Sent::Accepted => break,
+//!       // Not a failed submission — a full decoder. Drain and
+//!       // re-offer *this same packet*; nothing consumed it.
+//!       Sent::MustDrain => loop {
+//!         match decoder.receive_frame(dst)? {
+//!           Received::Produced => on_frame(dst),
+//!           Received::NeedsInput | Received::Ended => break,
+//!         }
+//!       },
+//!     }
+//!   }
+//!   loop {
+//!     match decoder.receive_frame(dst)? {
+//!       Received::Produced => on_frame(dst),
+//!       Received::NeedsInput => return Ok(false),
+//!       Received::Ended => return Ok(true),
+//!     }
+//!   }
+//! }
+//! ```
+//!
+//! That loop is the point. Under the older convention it could not be
+//! written against the trait at all: "drain me first" and "this packet
+//! is damaged" were both `Err`, indistinguishable to a generic
+//! consumer, so the idiom that survived was to **offer the packet
+//! twice** — submit, drain on any failure, submit again, and treat the
+//! second failure as real. Twice, because once meant nothing.
+//!
+//! ## The drain loop
+//!
+//! ```
+//! use mediadecode::{Received, decoder::AudioStreamDecoder};
+//! # use mediadecode::{adapter::AudioAdapter, frame::AudioFrame};
+//! # type Frame<D> = AudioFrame<
+//! #   <<D as AudioStreamDecoder>::Adapter as AudioAdapter>::SampleFormat,
+//! #   <<D as AudioStreamDecoder>::Adapter as AudioAdapter>::ChannelLayout,
+//! #   <<D as AudioStreamDecoder>::Adapter as AudioAdapter>::FrameExtra,
+//! #   <D as AudioStreamDecoder>::Buffer,
+//! # >;
+//! /// Drains everything ready right now. Answers `true` once the
+//! /// stream is over, so the caller knows not to feed it again.
+//! fn drain<D: AudioStreamDecoder>(
+//!   decoder: &mut D,
+//!   dst: &mut Frame<D>,
+//!   mut on_frame: impl FnMut(&Frame<D>),
+//! ) -> Result<bool, D::Error> {
+//!   loop {
+//!     // `?` means what it says again: only a fault leaves here.
+//!     match decoder.receive_frame(dst)? {
+//!       Received::Produced => on_frame(dst),
+//!       Received::NeedsInput => return Ok(false),
+//!       Received::Ended => return Ok(true),
+//!     }
+//!   }
+//! }
+//! ```
+//!
+//! The loop terminates by construction: the two non-frame arms both
+//! return, and neither can be reached without the callee having decided
+//! which one it is. Under the older convention — both conditions
+//! arriving as unnamed `Err` variants — a caller that had already sent
+//! end-of-stream could not tell "send me more" from "there is no more",
+//! and a drain that answered the first forever was an ordinary,
+//! silent infinite loop.
 //!
 //! # The buffer seat
 //!
 //! Every trait here carries a `Buffer` associated type bounded only by
 //! `AsRef<[u8]>`, and none of them names a concrete carrier. What a
 //! backend may bind there is the
-//! [D-seat amputation contract](crate::adapter#the-d-seat-amputation-contract):
+//! [carrier amputation contract](crate::adapter#the-carrier-amputation-contract):
 //! owned, `Send + Sync`, clone-is-a-refcount-bump, with no
 //! backend-internal lifetime crossing the seam.
 //!
@@ -123,7 +214,7 @@ pub trait VideoStreamDecoder {
 
   /// Drains one decoded frame into `dst`.
   ///
-  /// [`Received::Frame`] means `dst` was written.
+  /// [`Received::Produced`] means `dst` was written.
   /// [`Received::NeedsInput`] and [`Received::Ended`] are the protocol's
   /// other two answers, and neither is an error — `Err` is a fault.
   fn receive_frame(
@@ -637,5 +728,198 @@ mod tests {
     let mut decoder = LoopImage;
     let packet: AttachmentPacket<(), &'static [u8]> = AttachmentPacket::new(&[][..], ());
     assert!(decoder.decode(&packet).is_err());
+  }
+
+  /// The push rhythm against a decoder face: the tests that implement
+  /// `AudioStreamDecoder` to prove `Sent` and `Received` make the
+  /// two-offer rule writable against the trait alone.
+  mod rhythm {
+    use crate::{
+      Received, Sent,
+      adapter::AudioAdapter,
+      decoder::AudioStreamDecoder,
+      frame::{AudioFrame, Plane},
+      packet::AudioPacket,
+    };
+
+    struct ALoop;
+    impl AudioAdapter for ALoop {
+      type CodecId = u32;
+      type SampleFormat = u32;
+      type ChannelLayout = u32;
+      type PacketExtra = ();
+      type FrameExtra = ();
+    }
+
+    /// **Faults only**, and with the two protocol states gone there is
+    /// nothing this decoder can fail at — which is the shape the reform
+    /// produces at the small end.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Fault;
+
+    /// A decoder with a **one-frame output queue**: the smallest thing
+    /// that can answer [`Sent::MustDrain`] and mean it.
+    struct Squeeze {
+      queued: bool,
+      eof: bool,
+      /// Counts submissions the session actually consumed, so a test can
+      /// prove a back-pressured packet was not silently eaten.
+      accepted: u32,
+    }
+
+    impl AudioStreamDecoder for Squeeze {
+      type Adapter = ALoop;
+      type Buffer = &'static [u8];
+      type Error = Fault;
+
+      fn send_packet(&mut self, _: &AudioPacket<(), &'static [u8]>) -> Result<Sent, Fault> {
+        // **The terminal state is checked first, and a fixture that
+        // models the face has to model this too.** `MustDrain` promises
+        // that draining makes the same offer acceptable; past the end it
+        // never does, so answering it under a held frame would send a
+        // caller round a loop that cannot finish — and the drained retry
+        // would then be *accepted*, un-ending a stream that ended.
+        if self.eof {
+          return Err(Fault);
+        }
+        if self.queued {
+          // Nothing consumed. The caller still owns this packet.
+          return Ok(Sent::MustDrain);
+        }
+        self.queued = true;
+        self.accepted += 1;
+        Ok(Sent::Accepted)
+      }
+
+      fn receive_frame(
+        &mut self,
+        _: &mut AudioFrame<u32, u32, (), &'static [u8]>,
+      ) -> Result<Received, Fault> {
+        if self.queued {
+          self.queued = false;
+          return Ok(Received::Produced);
+        }
+        Ok(if self.eof {
+          Received::Ended
+        } else {
+          Received::NeedsInput
+        })
+      }
+
+      fn send_eof(&mut self) -> Result<Sent, Fault> {
+        // A held frame is output too: the queue has to clear before the
+        // end can be recorded, and saying so is the same back pressure.
+        if self.queued {
+          return Ok(Sent::MustDrain);
+        }
+        self.eof = true;
+        Ok(Sent::Accepted)
+      }
+
+      fn flush(&mut self) -> Result<(), Fault> {
+        self.queued = false;
+        self.eof = false;
+        Ok(())
+      }
+    }
+
+    fn packet() -> AudioPacket<(), &'static [u8]> {
+      AudioPacket::new(&b"compressed"[..], ())
+    }
+
+    fn frame() -> AudioFrame<u32, u32, (), &'static [u8]> {
+      const EMPTY: &[u8] = &[];
+      AudioFrame::new(48_000, 1024, 2, 0, 0, [Plane::new(EMPTY, 0); 8], 1, ())
+    }
+
+    /// **The two-offer rule, written once and generically.**
+    ///
+    /// Bounded on the trait alone — no backend type, no predicate, no
+    /// error inspection. That is the property under test: before the
+    /// reform this function could not exist, because "drain me first" and
+    /// "this packet is damaged" were both `Err` on a `Self::Error` the
+    /// bound says nothing about. The idiom that replaced it was to submit
+    /// the packet **twice** and treat the second failure as real — a
+    /// guess that is wrong whenever one drain is not enough.
+    ///
+    /// Here the loop offers until the answer is `Accepted`, and `?` is
+    /// honest: only a fault leaves.
+    fn feed<D: AudioStreamDecoder>(
+      decoder: &mut D,
+      packet: &AudioPacket<<D::Adapter as AudioAdapter>::PacketExtra, D::Buffer>,
+      dst: &mut AudioFrame<
+        <D::Adapter as AudioAdapter>::SampleFormat,
+        <D::Adapter as AudioAdapter>::ChannelLayout,
+        <D::Adapter as AudioAdapter>::FrameExtra,
+        D::Buffer,
+      >,
+      frames: &mut u32,
+      offers: &mut u32,
+    ) -> Result<(), D::Error> {
+      loop {
+        *offers += 1;
+        match decoder.send_packet(packet)? {
+          Sent::Accepted => return Ok(()),
+          Sent::MustDrain => {
+            while let Received::Produced = decoder.receive_frame(dst)? {
+              *frames += 1;
+            }
+          }
+        }
+      }
+    }
+
+    #[test]
+    fn the_two_offer_rule_is_writable_against_the_trait_alone() {
+      let mut decoder = Squeeze {
+        queued: false,
+        eof: false,
+        accepted: 0,
+      };
+      let packet = packet();
+      let mut dst = frame();
+      let (mut frames, mut offers) = (0, 0);
+
+      // First packet: the queue is empty, so it goes straight in.
+      feed(&mut decoder, &packet, &mut dst, &mut frames, &mut offers).expect("no fault");
+      assert_eq!((offers, frames), (1, 0));
+
+      // Second packet: the queue is occupied. The loop is told so, drains
+      // the one frame, and re-offers the SAME packet — which is only
+      // sound because `MustDrain` promises nothing was consumed.
+      feed(&mut decoder, &packet, &mut dst, &mut frames, &mut offers).expect("no fault");
+      assert_eq!(
+        (offers, frames),
+        (3, 1),
+        "one refused offer, one drained frame, one accepted offer",
+      );
+      assert_eq!(
+        decoder.accepted, 2,
+        "a back-pressured submission must not be counted as consumed",
+      );
+    }
+
+    #[test]
+    fn end_of_stream_is_back_pressured_the_same_way() {
+      let mut decoder = Squeeze {
+        queued: false,
+        eof: false,
+        accepted: 0,
+      };
+      let mut dst = frame();
+      decoder
+        .send_packet(&packet())
+        .expect("no fault")
+        .is_accepted()
+        .then_some(())
+        .expect("the empty queue takes it");
+
+      // The queue is full, so the end cannot be recorded yet — and the
+      // caller is told which of the two it is.
+      assert_eq!(decoder.send_eof(), Ok(Sent::MustDrain));
+      assert_eq!(decoder.receive_frame(&mut dst), Ok(Received::Produced));
+      assert_eq!(decoder.send_eof(), Ok(Sent::Accepted));
+      assert_eq!(decoder.receive_frame(&mut dst), Ok(Received::Ended));
+    }
   }
 }

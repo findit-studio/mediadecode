@@ -83,7 +83,9 @@ impl Session {
         continue;
       }
       let Some(packet) =
-        owned_video_packet_from_ffmpeg_in(&av_packet, self.time_base, PacketLimits::default())
+        // SAFETY: `packets()` reads each packet with `av_read_frame`, so libavformat wrote its
+        // payload, and it is live for the call.
+        unsafe { owned_video_packet_from_ffmpeg_in(&av_packet, self.time_base, PacketLimits::default()) }
           .expect("a wrappable video payload")
       else {
         continue;
@@ -91,7 +93,7 @@ impl Session {
       if self.decoder.send_packet(&packet).expect("send packet") != Sent::Accepted {
         continue;
       }
-      if let Received::Frame = self.decoder.receive_frame(frame).expect("receive frame") {
+      if let Received::Produced = self.decoder.receive_frame(frame).expect("receive frame") {
         return Some((frame.width(), frame.height()));
       }
     }

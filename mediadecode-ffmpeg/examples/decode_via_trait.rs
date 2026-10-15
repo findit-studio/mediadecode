@@ -12,9 +12,14 @@
 //!   loop produces frames that can be queued and sent elsewhere.
 //! - **Transparent SW fallback** — `FfmpegVideoStreamDecoder::open`
 //!   handles HW probe + SW fallback under the hood.
-//! - **No `unsafe`** — wrappers like `video_packet_from_ffmpeg` and
-//!   `empty_video_frame` mean the caller never reads or constructs
-//!   raw FFmpeg buffer pointers.
+//! - **One `unsafe`, at the packet's crossing** — `empty_video_frame`
+//!   and the decoder mean the caller never reads or constructs a raw
+//!   FFmpeg buffer pointer. Converting an `ffmpeg_next::Packet` is
+//!   `unsafe` all the same, because a borrow of one cannot vouch that
+//!   its payload was ever written (`Packet::new` leaves it unwritten);
+//!   a packet `packets()` hands over was filled by libavformat, and the
+//!   one `SAFETY` comment says so. A caller who wants no `unsafe` at all
+//!   reads packets through `FfmpegDemuxer`, which converts them itself.
 //! - **No errno either** — `receive_frame` answers
 //!   `mediadecode::Received`, so this generic loop distinguishes
 //!   *needs input* from *ended* from *broken* without naming an FFmpeg
@@ -112,7 +117,7 @@ where
   {
     loop {
       match decoder.receive_frame(dst)? {
-        Received::Frame => {
+        Received::Produced => {
           *count += 1;
           println!(
             "frame#{count} pts={:?} {}x{} pix_fmt={}",
@@ -137,11 +142,16 @@ where
     // that survived the call would be a mutable alias of it — which is
     // why the borrowing door is the owned lane. See
     // `boundary::video_packet_from_ffmpeg_in`.
-    let pkt =
-      match video_packet_from_ffmpeg_in(av_packet, Timebase::default(), PacketLimits::default())? {
-        Some(p) => p,
-        None => continue,
-      };
+    //
+    // SAFETY: `packets()` reads each packet with `av_read_frame`, so
+    // libavformat wrote its payload and side data, and it is consumed
+    // here.
+    let pkt = match unsafe {
+      video_packet_from_ffmpeg_in(av_packet, Timebase::default(), PacketLimits::default())
+    }? {
+      Some(p) => p,
+      None => continue,
+    };
     // **The two-offer rule, retired.** It used to read: submit, and if
     // that fails drain and submit again, because "drain me first" and
     // "this packet is damaged" arrived as the same `Err` and only a

@@ -3,12 +3,12 @@
 </div>
 <div align="center">
 
-Generic, `no_std`-friendly type-and-trait spine for media decoders.
+The read faces of the mediaio family: the decoders and the demuxer, `no_std`-friendly.
 
-[<img alt="github" src="https://img.shields.io/badge/github-findit--ai/mediadecode-8da0cb?style=for-the-badge&logo=Github" height="22">][Github-url]
+[<img alt="github" src="https://img.shields.io/badge/github-findit--studio/mediaio-8da0cb?style=for-the-badge&logo=Github" height="22">][Github-url]
 <img alt="LoC" src="https://img.shields.io/endpoint?url=https%3A%2F%2Fgist.githubusercontent.com%2Fal8n%2F327b2a8aef9003246e45c6e47fe63937%2Fraw%2Fmediadecode" height="22">
-[<img alt="Build" src="https://img.shields.io/github/actions/workflow/status/findit-studio/mediadecode/ci-core.yml?logo=Github-Actions&style=for-the-badge" height="22">][CI-url]
-[<img alt="codecov" src="https://img.shields.io/codecov/c/gh/findit-studio/mediadecode?style=for-the-badge&logo=codecov" height="22">][codecov-url]
+[<img alt="Build" src="https://img.shields.io/github/actions/workflow/status/findit-studio/mediaio/ci-core.yml?logo=Github-Actions&style=for-the-badge" height="22">][CI-url]
+[<img alt="codecov" src="https://img.shields.io/codecov/c/gh/findit-studio/mediaio?style=for-the-badge&logo=codecov" height="22">][codecov-url]
 
 [<img alt="docs.rs" src="https://img.shields.io/badge/docs.rs-mediadecode-66c2a5?style=for-the-badge&labelColor=555555&logo=data:image/svg+xml;base64,PHN2ZyByb2xlPSJpbWciIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyIgdmlld0JveD0iMCAwIDUxMiA1MTIiPjxwYXRoIGZpbGw9IiNmNWY1ZjUiIGQ9Ik00ODguNiAyNTAuMkwzOTIgMjE0VjEwNS41YzAtMTUtOS4zLTI4LjQtMjMuNC0zMy43bC0xMDAtMzcuNWMtOC4xLTMuMS0xNy4xLTMuMS0yNS4zIDBsLTEwMCAzNy41Yy0xNC4xIDUuMy0yMy40IDE4LjctMjMuNCAzMy43VjIxNGwtOTYuNiAzNi4yQzkuMyAyNTUuNSAwIDI2OC45IDAgMjgzLjlWMzk0YzAgMTMuNiA3LjcgMjYuMSAxOS45IDMyLjJsMTAwIDUwYzEwLjEgNS4xIDIyLjEgNS4xIDMyLjIgMGwxMDMuOS01MiAxMDMuOSA1MmMxMC4xIDUuMSAyMi4xIDUuMSAzMi4yIDBsMTAwLTUwYzEyLjItNi4xIDE5LjktMTguNiAxOS45LTMyLjJWMjgzLjljMC0xNS05LjMtMjguNC0yMy40LTMzLjd6TTM1OCAyMTQuOGwtODUgMzEuOXYtNjguMmw4NS0zN3Y3My4zek0xNTQgMTA0LjFsMTAyLTM4LjIgMTAyIDM4LjJ2LjZsLTEwMiA0MS40LTEwMi00MS40di0uNnptODQgMjkxLjFsLTg1IDQyLjV2LTc5LjFsODUtMzguOHY3NS40em0wLTExMmwtMTAyIDQxLjQtMTAyLTQxLjR2LS42bDEwMi0zOC4yIDEwMiAzOC4ydi42em0yNDAgMTEybC04NSA0Mi41di03OS4xbDg1LTM4Ljh2NzUuNHptMC0xMTJsLTEwMiA0MS40LTEwMi00MS40di0uNmwxMDItMzguMiAxMDIgMzguMnYuNnoiPjwvcGF0aD48L3N2Zz4K" height="20">][doc-url]
 [<img alt="crates.io" src="https://img.shields.io/crates/v/mediadecode?style=for-the-badge&logo=data:image/svg+xml;base64,PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iaXNvLTg4NTktMSI/Pg0KPCEtLSBHZW5lcmF0b3I6IEFkb2JlIElsbHVzdHJhdG9yIDE5LjAuMCwgU1ZHIEV4cG9ydCBQbHVnLUluIC4gU1ZHIFZlcnNpb246IDYuMDAgQnVpbGQgMCkgIC0tPg0KPHN2ZyB2ZXJzaW9uPSIxLjEiIGlkPSJMYXllcl8xIiB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHhtbG5zOnhsaW5rPSJodHRwOi8vd3d3LnczLm9yZy8xOTk5L3hsaW5rIiB4PSIwcHgiIHk9IjBweCINCgkgdmlld0JveD0iMCAwIDUxMiA1MTIiIHhtbDpzcGFjZT0icHJlc2VydmUiPg0KPGc+DQoJPGc+DQoJCTxwYXRoIGQ9Ik0yNTYsMEwzMS41MjgsMTEyLjIzNnYyODcuNTI4TDI1Niw1MTJsMjI0LjQ3Mi0xMTIuMjM2VjExMi4yMzZMMjU2LDB6IE0yMzQuMjc3LDQ1Mi41NjRMNzQuOTc0LDM3Mi45MTNWMTYwLjgxDQoJCQlsMTU5LjMwMyw3OS42NTFWNDUyLjU2NHogTTEwMS44MjYsMTI1LjY2MkwyNTYsNDguNTc2bDE1NC4xNzQsNzcuMDg3TDI1NiwyMDIuNzQ5TDEwMS44MjYsMTI1LjY2MnogTTQzNy4wMjYsMzcyLjkxMw0KCQkJbC0xNTkuMzAzLDc5LjY1MVYyNDAuNDYxbDE1OS4zMDMtNzkuNjUxVjM3Mi45MTN6IiBmaWxsPSIjRkZGIi8+DQoJPC9nPg0KPC9nPg0KPGc+DQo8L2c+DQo8Zz4NCjwvZz4NCjxnPg0KPC9nPg0KPGc+DQo8L2c+DQo8Zz4NCjwvZz4NCjxnPg0KPC9nPg0KPGc+DQo8L2c+DQo8Zz4NCjwvZz4NCjxnPg0KPC9nPg0KPGc+DQo8L2c+DQo8Zz4NCjwvZz4NCjxnPg0KPC9nPg0KPGc+DQo8L2c+DQo8Zz4NCjwvZz4NCjxnPg0KPC9nPg0KPC9zdmc+DQo=" height="22">][crates-url]
@@ -17,130 +17,76 @@ Generic, `no_std`-friendly type-and-trait spine for media decoders.
 
 </div>
 
-The backend-agnostic core of the [`mediadecode`](https://github.com/findit-studio/mediadecode)
-workspace. Defines the unified `Packet` / `Frame` types,
-`VideoAdapter` / `AudioAdapter` / `SubtitleAdapter` traits, the
-matching push-style `*StreamDecoder` traits that concrete decoder
-backends implement, and the two tiers on either side of them: the
-`Demuxer` session that produces packets and the `AudioResampler` seam
-that reshapes decoded audio.
+The read faces of the mediaio family: the push-style decoder traits,
+the pull-style frame sources, the one-shot image decoder, the
+`Demuxer` session, and their async mirrors under `future`. A backend
+implements them; a consumer programs against them and never names the
+backend.
 
-This crate ships **no decoder code** and **no FFmpeg dependency**.
-It's `no_std`-clean (with optional `alloc` / `std` features) and zero
-heavy deps — downstream crates (`colconv`, `scenesdetect`, …) program
-against this vocabulary regardless of which backend produced the
-bytes. Adapter implementations live in sibling crates such as
-[`mediadecode-ffmpeg`](../mediadecode-ffmpeg).
+The vocabulary the faces speak — frames, packets, subtitles, the push
+rhythm's `Sent` and `Received`, the demuxer's track types, the adapter
+traits, the resampler face, the time primitives — is
+[`mediaspine`](https://crates.io/crates/mediaspine)'s. This crate
+re-exports it under the module names it has always used
+(`mediadecode::frame`, `mediadecode::packet`, `mediadecode::demuxer`,
+`mediadecode::Received`, …), so every path a consumer wrote still
+resolves, to the same item a `mediaspine::` path names. The write
+faces are [`mediaencode`](https://crates.io/crates/mediaencode)'s.
+
+This crate ships **no decoder code** and **no FFmpeg dependency**. It
+is `no_std`-clean (with optional `alloc` / `std` features). Adapter
+implementations live in sibling crates:
+[`mediadecode-ffmpeg`](../mediadecode-ffmpeg) and
+[`mediadecode-webcodecs`](../mediadecode-webcodecs).
 
 ## What's in the box
 
-- **Pixel and sample formats** — `PixelFormat` (~270 variants
-  covering every FFmpeg `n9.0` `AVPixelFormat` slug plus cinema-RAW
-  additions; sourced from
-  [`videoframe`](https://crates.io/crates/videoframe) and re-exported
-  here so consumers keep their `mediadecode::PixelFormat` import).
-  `Unknown(u32)` preserves the raw wire identifier for lossless
-  round-trip via `from_u32` / `to_u32`. H.273-aligned color enums
-  (`ColorMatrix`, `ColorPrimaries`, `ColorTransfer`, `ColorRange`,
-  `ChromaLocation`) and `BayerPattern` for RAW are similarly
-  re-exported from `videoframe`.
-- **Generic packet / frame types** — `VideoPacket<A, B>`,
-  `AudioPacket<A, B>`, `SubtitlePacket<A, B>`, `VideoFrame<A, B>`,
-  `AudioFrame<A, B>`, `SubtitleFrame<A, B>` and `ImageFrame<A, B>`
-  parameterized over an adapter's per-item **extras** type `A` and
-  **buffer** type `B`. `Plane<B>` is the generic plane carrier.
-  `ImageFrame` is the still-image household: no `pts`, no `duration`,
-  because a still is not on the timeline — the same fact
-  `AttachmentPacket` states on the packet side.
-- **The D-seat amputation contract** — the one law a backend's buffer
-  type `B` must obey: owned, `Send + Sync`, cheap to clone (a refcount
-  bump), with no backend-internal lifetime crossing the seam. This
-  crate names no carrier and pins no bound past `AsRef<[u8]>`; the
-  contract is written out in full on the `adapter` module.
-- **Adapter traits** — `VideoAdapter`, `AudioAdapter`,
-  `SubtitleAdapter`, `ImageAdapter`. A backend implements these on a
-  zero-sized type to fix `A` and `B` once for the whole pipeline.
 - **Decoder traits** — `VideoStreamDecoder`, `AudioStreamDecoder`,
   `SubtitleDecoder`, `ImageDecoder`. The two `*Stream*` faces are
   push-style (`send_packet` / `receive_frame` / `send_eof` / `flush`),
   mirroring FFmpeg's decoder API while staying backend-agnostic; the
   other two are not, and their names say so — a subtitle cue and a
   still image each come out of exactly the packet that went in.
-- **The demux tier** — `Demuxer`, the pull session over an opened
-  container (`tracks()` / `next_packet()` / `seek()`), the five-arm
-  `DemuxedPacket` envelope, the `TrackInfo` / `TrackParams` /
-  `TrackKind` table, and the `DemuxAdapter` vocabulary bundle. Opening
-  is each backend's own, so the trait covers only the opened session.
-  A session keeps its track table for life: `tracks()` is a
-  non-destructive read that hands out `TrackHandle`s — the backend's
-  own row carrier, `Arc` / `Rc` / a plain borrow — so a consumer that
-  needs a row past the pull loop clones a refcount rather than taking
-  the table away from the session that classifies against it. A row
-  carries the identity the container declares about a track, its
-  `language` among it — as the file wrote it, unfolded, because the
-  registries that reconcile an MKV's `ger` with an MP4's `deu` belong
-  to whoever owns the language vocabulary.
-- **The resample seam** — `AudioResampler`, the `AudioStreamDecoder`
-  push pair one tier along, converting rate, sample format and channel
-  layout between a source spec read off `TrackInfo` and a target spec
-  that is always the caller's options.
-- **Time primitives** — re-exported `Timebase` / `Timestamp` /
-  `TimeRange` from [`mediatime`](https://crates.io/crates/mediatime),
-  with `InvertedRange`, the refusal a range's checked moves answer when
-  its end would precede its start, and the rest of `mediatime` as
-  `mediadecode::mediatime`, where every type their methods take or
-  answer (`Rounding`, `Duration`, `Rate`, …) is named — so consumers
-  don't need a separate dep.
-
-## API style
-
-Mirrors the [`mediatime`](https://crates.io/crates/mediatime) idioms
-the rest of the findit-studio workspace uses:
-
-- All public fields are private; access is via `field()` getters,
-  consuming `with_field(value)` builders, and in-place
-  `set_field(value)` mutators that return `&mut Self`.
-- `const fn` everywhere the field type allows.
-- Panicking constructors come with `try_*` fallible counterparts
-  (`empty` / `try_empty`, `clone` / `try_clone`, …).
-- Errors via [`thiserror`](https://crates.io/crates/thiserror) over
-  the stable `core::error::Error`, so failures still implement the
-  `Error` trait under `--no-default-features`.
+  `VideoStreamDecoder` also states whether it can decode to a smaller
+  size (`ScaledOutputCapability`).
+- **Frame sources** — `VideoFrameSource`, `AudioFrameSource`: the
+  pull-style faces of clip-oriented SDKs (R3D, BRAW, ARRIRAW, X-OCN,
+  Canon Cinema RAW Light), which hand out frames by index.
+- **The demux face** — `Demuxer`, the pull session over an opened
+  container (`tracks()` / `next_packet()` / `seek()`, with the chapter
+  table, the container duration and the measured end provided). Opening
+  is each backend's own, so the trait covers only the opened session. A
+  session keeps its track table for life: `tracks()` hands out
+  `TrackHandle`s — the backend's own row carrier, `Arc` / `Rc` / a plain
+  borrow — so a consumer that needs a row past the pull loop clones a
+  refcount rather than taking the table away from the session.
+- **Async faces** — under the `future` feature, every decoder face again
+  with `async fn` methods, in a `!Send` and a `Send`-bounded variant.
+- **The vocabulary, re-exported** — everything above is written against
+  `mediaspine`'s types, re-exported here: `PixelFormat` and the color and
+  CFA vocabulary from `mediaframe`, the packet and frame households, the
+  carrier amputation contract every backend's buffer type obeys (on the
+  `adapter` module), the demuxer's `TrackInfo` / `TrackParams` /
+  `DemuxedPacket`, the resampler face, and `Timebase` / `Timestamp` /
+  `TimeRange` with the rest of `mediatime` as `mediadecode::mediatime`.
 
 ## Cargo features
 
-| Feature      | Default | Effect                                                        |
-| ------------ | :-----: | ------------------------------------------------------------- |
-| `std`        |   yes   | Enable the standard library and `mediatime/default`.          |
-| `alloc`      |    —    | Enable owning collections (`Vec`, `String`) without `std`.    |
-| `serde`      |    —    | Every type below on the wire, plus `mediatime`.               |
-| `arbitrary`  |    —    | `Arbitrary` impls for fuzzing, same coverage.                 |
-| `quickcheck` |    —    | The same coverage again, for `quickcheck`.                    |
-
-The three optional matrices cover the same type, and its wire shape
-follows what it *is*:
-
-| Type | Tier | serde wire shape |
-| ---- | ---- | ---------------- |
-| `packet::PacketFlags`            | any     | the raw bits, as a number                   |
-
-A **bit set** travels as a number, because every bit pattern is
-meaningful and bits this build has no constant for still have to survive
-the round trip.
-
-The audio channel-layout vocabulary this crate used to own —
-`ChannelLayoutKind`, `AudioChannelOrderKind`, `AudioChannelSpec`,
-`AudioChannelLayout` — now lives in
-[`mediaframe::audio`](https://docs.rs/mediaframe/latest/mediaframe/audio/),
-whose wire shapes are documented there. `AudioFrame`'s channel-layout
-parameter is generic, so this crate names no channel type at all.
+| Feature      | Default | Effect                                                         |
+| ------------ | :-----: | -------------------------------------------------------------- |
+| `std`        |   yes   | The standard library, here and in `mediaspine`.                |
+| `alloc`      |    —    | Owning collections without `std`, here and in `mediaspine`.    |
+| `future`     |    —    | The async faces under `mediadecode::future`.                   |
+| `serde`      |    —    | `mediaspine`'s wire formats.                                    |
+| `arbitrary`  |    —    | `mediaspine`'s `Arbitrary` impls, for fuzzing.                  |
+| `quickcheck` |    —    | `mediaspine`'s `quickcheck` impls.                              |
 
 `no_std` builds: disable defaults and pick `alloc` if you need
 `Vec`-backed payloads:
 
 ```toml
 [dependencies]
-mediadecode = { version = "0.18", default-features = false, features = ["alloc"] }
+mediadecode = { version = "0.19", default-features = false, features = ["alloc"] }
 ```
 
 ## Usage
@@ -148,7 +94,7 @@ mediadecode = { version = "0.18", default-features = false, features = ["alloc"]
 This crate defines the surface; concrete decoding happens in adapter
 crates. A backend-agnostic consumer programs against the traits, and
 both faces answer states: `send_packet` answers `Sent` — *accepted* or
-*must drain* — and `receive_frame` answers `Received` — *a frame*,
+*must drain* — and `receive_frame` answers `Received` — *produced*,
 *needs input*, or *ended*. `Err` means a fault and nothing else:
 
 ```rust,no_run
@@ -184,7 +130,7 @@ fn decode_one<D: VideoStreamDecoder>(
     match decoder.send_packet(packet)? {
       Sent::Accepted => break,
       Sent::MustDrain => {
-        while let Received::Frame = decoder.receive_frame(dst)? {
+        while let Received::Produced = decoder.receive_frame(dst)? {
           on_frame(dst);
         }
       }
@@ -192,7 +138,7 @@ fn decode_one<D: VideoStreamDecoder>(
   }
   loop {
     match decoder.receive_frame(dst)? {
-      Received::Frame => on_frame(dst),
+      Received::Produced => on_frame(dst),
       Received::NeedsInput => return Ok(false),
       Received::Ended => return Ok(true),
     }
@@ -224,8 +170,8 @@ See [LICENSE-APACHE](LICENSE-APACHE), [LICENSE-MIT](LICENSE-MIT) for details.
 
 Copyright (c) 2026 FinDIT Studio authors.
 
-[Github-url]: https://github.com/findit-studio/mediadecode
-[CI-url]: https://github.com/findit-studio/mediadecode/actions/workflows/ci.yml
-[codecov-url]: https://app.codecov.io/gh/findit-studio/mediadecode/
+[Github-url]: https://github.com/findit-studio/mediaio
+[CI-url]: https://github.com/findit-studio/mediaio/actions/workflows/ci-core.yml
+[codecov-url]: https://app.codecov.io/gh/findit-studio/mediaio/
 [doc-url]: https://docs.rs/mediadecode
 [crates-url]: https://crates.io/crates/mediadecode

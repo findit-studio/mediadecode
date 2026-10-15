@@ -302,8 +302,16 @@ pub struct CarrierVideoStreamDecoder<C: crate::FfmpegCarrier> {
 /// the subset of `VideoDecoder`'s surface the wrapper drives on the HW
 /// path.
 pub(crate) trait HwInner: Send {
-  /// See [`VideoDecoder::send_packet`].
-  fn send_packet(&mut self, packet: &Packet) -> Result<Sent, Error>;
+  /// See [`VideoDecoder::send_av_packet`].
+  ///
+  /// # Safety
+  ///
+  /// [`VideoDecoder::send_av_packet`]'s contract: `packet` meets the
+  /// `AVPacket` contract with every exported byte written, the padding
+  /// after its payload is zeroed or libavformat's own, and nothing writes
+  /// through its payload or that padding while the decoder may still read
+  /// them.
+  unsafe fn send_packet(&mut self, packet: &Packet) -> Result<Sent, Error>;
   /// See [`VideoDecoder::receive_frame`].
   fn receive_frame(&mut self, frame: &mut Frame) -> Result<Received, Error>;
   /// See [`VideoDecoder::send_eof`].
@@ -339,8 +347,9 @@ pub(crate) trait HwInner: Send {
 
 impl HwInner for VideoDecoder {
   #[inline]
-  fn send_packet(&mut self, packet: &Packet) -> Result<Sent, Error> {
-    VideoDecoder::send_packet(self, packet)
+  unsafe fn send_packet(&mut self, packet: &Packet) -> Result<Sent, Error> {
+    // SAFETY: the seam's contract is `send_av_packet`'s, forwarded.
+    unsafe { VideoDecoder::send_av_packet(self, packet) }
   }
   #[inline]
   fn receive_frame(&mut self, frame: &mut Frame) -> Result<Received, Error> {
@@ -398,8 +407,10 @@ enum DecodeState {
 pub(crate) struct SwDecoder {
   decoder: ffmpeg_next::decoder::Video,
   /// Declared **after** the decoder: fields drop in declaration order,
-  /// so the codec context is freed before the state it points at.
-  _callback_state: Box<crate::ffi::CallbackState>,
+  /// so the codec context is freed before the state it points at, which
+  /// this owns through the context's own pointer — see
+  /// [`InstalledCallbackState`](crate::decoder::InstalledCallbackState).
+  _callback_state: crate::decoder::InstalledCallbackState,
 }
 
 impl SwDecoder {
@@ -417,7 +428,7 @@ impl SwDecoder {
   /// had no way out on the whole software road — including the replay
   /// helper, which drops the state when it finishes.
   pub(crate) fn state(&self) -> *const crate::ffi::CallbackState {
-    &*self._callback_state
+    self._callback_state.as_ptr()
   }
 }
 
@@ -860,7 +871,12 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     // so a non-recoverable error surfaces as `FallbackFailed` (carrying the
     // replay packets) instead of being silently swallowed and the fallback
     // committed over corruption.
-    fn drain_into(
+    //
+    // # Safety
+    //
+    // `state` must be null or point at a `CallbackState` that stays live
+    // for the duration of the call — in practice `sw`'s own.
+    unsafe fn drain_into(
       sw: &mut ffmpeg_next::decoder::Video,
       state: *const crate::ffi::CallbackState,
       local_replay: &mut VecDeque<frame::Video>,
@@ -890,7 +906,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
           Err(ffmpeg_next::Error::Eof) => break,
           // Any other error is a genuine decode failure on a replayed
           // packet — surface it so it is not masked as a clean fallback.
-          Err(other) => return Err(crate::decoder::software_exit(state, other)),
+          //
+          // SAFETY: this function's own contract, forwarded.
+          Err(other) => return Err(unsafe { crate::decoder::software_exit(state, other) }),
         }
       }
       Ok(())
@@ -902,7 +920,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
         match sw.send_packet(pkt) {
           Ok(()) => break,
           Err(ffmpeg_next::Error::Other { errno }) if errno == ffmpeg_next::error::EAGAIN => {
-            drain_into(&mut sw, sw_state, &mut local_replay)?;
+            // SAFETY: `sw_state` is `sw`'s own callback state, and `sw`
+            // lives until the commit at the end of this function.
+            unsafe { drain_into(&mut sw, sw_state, &mut local_replay) }?;
             attempts += 1;
             if attempts > 16 {
               return Err(Error::Ffmpeg(ffmpeg_next::Error::Other {
@@ -910,7 +930,8 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
               }));
             }
           }
-          Err(other) => return Err(crate::decoder::software_exit(sw_state, other)),
+          // SAFETY: `sw_state` is `sw`'s own callback state, live here.
+          Err(other) => return Err(unsafe { crate::decoder::software_exit(sw_state, other) }),
         }
       }
     }
@@ -923,7 +944,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
         match sw.send_eof() {
           Ok(()) => break,
           Err(ffmpeg_next::Error::Other { errno }) if errno == ffmpeg_next::error::EAGAIN => {
-            drain_into(&mut sw, sw_state, &mut local_replay)?;
+            // SAFETY: `sw_state` is `sw`'s own callback state, and `sw`
+            // lives until the commit at the end of this function.
+            unsafe { drain_into(&mut sw, sw_state, &mut local_replay) }?;
             attempts += 1;
             if attempts > 16 {
               return Err(Error::Ffmpeg(ffmpeg_next::Error::Other {
@@ -931,7 +954,8 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
               }));
             }
           }
-          Err(other) => return Err(crate::decoder::software_exit(sw_state, other)),
+          // SAFETY: `sw_state` is `sw`'s own callback state, live here.
+          Err(other) => return Err(unsafe { crate::decoder::software_exit(sw_state, other) }),
         }
       }
     }
@@ -947,7 +971,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     // Draining to EAGAIN/EOF here forces any such error to surface now, so it is
     // wrapped as `FallbackFailed` (retaining the rescued packets) and the
     // decoder stays on HW — nothing is committed.
-    drain_into(&mut sw, sw_state, &mut local_replay)?;
+    // SAFETY: `sw_state` is `sw`'s own callback state, and `sw` is still
+    // here — it moves into `self.state` only below.
+    unsafe { drain_into(&mut sw, sw_state, &mut local_replay) }?;
     // Commit: only after replay, any EOF forwarding, AND the final drain
     // succeeded do we move the new SW decoder and queue into `self`.
     self.sw_replay_frames.append(&mut local_replay);
@@ -993,24 +1019,28 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     dst: &mut VideoFrame<mediadecode::PixelFormat, VideoFrameExtra, C::Buffer>,
   ) -> Result<Received, VideoDecodeError> {
     let av_frame = match &mut self.state {
+      // SAFETY: only a const pointer is read out of the frame; nothing
+      // `as_inner_mut`'s contract guards is touched.
       DecodeState::Hw(_) => unsafe { self.hw_scratch.as_inner_mut().as_ptr() },
       DecodeState::Sw(_) => unsafe { self.sw_scratch.as_ptr() },
     };
     // SAFETY: the scratch frame is live — either just filled by the
-    // inner decoder's `receive_frame`, or left holding a frame whose
-    // conversion did not commit. Convert takes what it needs out of it,
-    // so the scratch can be reused once this has committed.
+    // inner decoder's `receive_frame` (libavcodec's decode, or
+    // `av_hwframe_transfer_data` out of a hardware surface, wrote every
+    // byte it exports), or left holding such a frame whose conversion
+    // did not commit. Convert takes what it needs out of it, so the
+    // scratch can be reused once this has committed.
     let converted = unsafe {
       convert::av_frame_to_video_frame_as::<C>(av_frame, self.time_base, self.limits.frame())
     };
     match converted {
       Ok(new_frame) => {
         self.commit_delivery(new_frame, dst);
-        Ok(Received::Frame)
+        Ok(Received::Produced)
       }
       Err(e) => {
         // Park only what another attempt could survive.
-        self.scratch_pending = e.parks_in_decode();
+        self.scratch_pending = crate::decoder::parks_in_decode(&e);
         Err(VideoDecodeError::Convert(e))
       }
     }
@@ -1144,12 +1174,21 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     // back* is the hardware probe, whose rescue history goes to the
     // caller as owned, mutable `Packet`s
     // (`AllBackendsFailed::into_unconsumed_packets`); it records copies
-    // of its own (`decoder::try_clone_packet`), so nothing it hands back
+    // of its own (`boundary::try_clone_packet`), so nothing it hands back
     // addresses a carrier.
-    let route = crate::carrier::BodyRoute::Submission;
-    boundary::with_ffmpeg_video_packet::<C, _>(packet, limits, route, |av_pkt| {
+    let route = crate::BodyRoute::Submission;
+    let submit = |av_pkt: &Packet| {
       match &mut self.state {
-        DecodeState::Hw(hw) => match hw.send_packet(av_pkt) {
+        // SAFETY: `av_pkt` is the submission `with_ffmpeg_video_packet`
+        // built from this call's carrier — its payload and side data are
+        // this crate's writes, and its padding is either the zeroed
+        // padding of a fresh copy or, where the body is shared, the
+        // padding of a packet libavformat delivered (`share_or_copy`
+        // shares nothing else) — lent for this call only, and a shared
+        // body is reachable by no caller, so nothing writes through it
+        // while the hardware session, which never writes through what it
+        // is sent, may hold a reference; the probe keeps deep copies.
+        DecodeState::Hw(hw) => match unsafe { hw.send_packet(av_pkt) } {
           // The seam already classified libavcodec's back pressure, so
           // both states travel on unchanged.
           Ok(status) => Ok(status),
@@ -1182,7 +1221,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
             if let DecodeState::Sw(sw) = &mut self.state {
               let st = sw.state();
               if let Err(e) = sw.send_packet(av_pkt) {
-                return crate::decoder::software_send(st, e, phase)
+                // SAFETY: `st` is `sw`'s own callback state, live while
+                // `sw` is.
+                return unsafe { crate::decoder::software_send(st, e, phase) }
                   .map_err(VideoDecodeError::Decode);
               }
             }
@@ -1196,12 +1237,22 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
             Ok(()) => Ok(Sent::Accepted),
             // Funnel, then gate: a refusal the allocator judge latched
             // comes back named, and back pressure is `MustDrain`.
-            Err(e) => crate::decoder::software_send(st, e, phase).map_err(VideoDecodeError::Decode),
+            //
+            // SAFETY: `st` is `sw`'s own callback state, live while `sw`
+            // is.
+            Err(e) => unsafe { crate::decoder::software_send(st, e, phase) }
+              .map_err(VideoDecodeError::Decode),
           }
         }
       }
-    })
-    .map_err(|e| VideoDecodeError::Decode(Error::PacketBuild(e)))?
+    };
+    // SAFETY: `submit` hands the packet to libavcodec's send (software, or
+    // the hardware session's) and to the hardware probe, whose history
+    // keeps deep copies (`boundary::try_clone_packet`); it neither clones
+    // the packet shallowly nor keeps it, so a shared body never outlives
+    // this call.
+    unsafe { boundary::with_ffmpeg_video_packet::<C, _>(packet, limits, route, submit) }
+      .map_err(|e| VideoDecodeError::Decode(Error::PacketBuild(e)))?
   }
 
   pub(crate) fn receive_frame_impl(
@@ -1217,8 +1268,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     // any allocation failure, which is the one thing this queue exists
     // to prevent. It leaves the queue when a carrier exists for it.
     if let Some(replayed) = self.sw_replay_frames.front() {
-      // SAFETY: `replayed` is a live AVFrame owned by this queue;
-      // convert takes what it needs out of it.
+      // SAFETY: `replayed` is a live AVFrame owned by this queue, which
+      // the software decoder filled during replay, writing every byte it
+      // exports; convert takes what it needs out of it.
       let converted = unsafe {
         convert::av_frame_to_video_frame_as::<C>(
           replayed.as_ptr(),
@@ -1228,7 +1280,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       };
       let new_frame = match converted {
         Ok(new_frame) => new_frame,
-        Err(e) if e.parks_in_decode() => return Err(VideoDecodeError::Convert(e)),
+        Err(e) if crate::decoder::parks_in_decode(&e) => return Err(VideoDecodeError::Convert(e)),
         // A frame nothing can carry is dropped rather than re-offered
         // forever — the same rule the scratch seat follows.
         Err(e) => {
@@ -1238,7 +1290,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       };
       self.sw_replay_frames.pop_front();
       self.commit_delivery(new_frame, dst);
-      return Ok(Received::Frame);
+      return Ok(Received::Produced);
     }
     // A frame whose conversion did not commit is converted again before
     // the decoder is asked for another — see [`Self::scratch_pending`].
@@ -1251,7 +1303,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     loop {
       match &mut self.state {
         DecodeState::Hw(hw) => match hw.receive_frame(&mut self.hw_scratch) {
-          Ok(Received::Frame) => {
+          Ok(Received::Produced) => {
             // The frame is out of the decoder's queue from here; the
             // seat is what keeps it if the conversion cannot commit.
             self.scratch_pending = true;
@@ -1286,7 +1338,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
             // it is rather than advance past it.
             if let Some(replayed) = self.sw_replay_frames.front() {
               // SAFETY: `replayed` is a live AVFrame owned by this
-              // queue; convert takes what it needs out of it.
+              // queue, which the software decoder filled during replay,
+              // writing every byte it exports; convert takes what it
+              // needs out of it.
               let converted = unsafe {
                 convert::av_frame_to_video_frame_as::<C>(
                   replayed.as_ptr(),
@@ -1296,7 +1350,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
               };
               let new_frame = match converted {
                 Ok(new_frame) => new_frame,
-                Err(e) if e.parks_in_decode() => return Err(VideoDecodeError::Convert(e)),
+                Err(e) if crate::decoder::parks_in_decode(&e) => {
+                  return Err(VideoDecodeError::Convert(e));
+                }
                 // A frame nothing can carry is dropped rather than
                 // re-offered forever.
                 Err(e) => {
@@ -1306,7 +1362,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
               };
               self.sw_replay_frames.pop_front();
               self.commit_delivery(new_frame, dst);
-              return Ok(Received::Frame);
+              return Ok(Received::Produced);
             }
             // Fall through to the loop; next iteration takes the Sw arm.
           }
@@ -1322,9 +1378,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
               // The frame is out of the decoder's queue from here; the
               // seat is what keeps it if the conversion cannot commit.
               self.scratch_pending = true;
-              // SAFETY: the scratch frame is live (just filled by
-              // `receive_frame`); convert takes what it needs out of
-              // it, so the scratch can be reused once this commits.
+              // SAFETY: the scratch frame is live, just filled by
+              // `receive_frame`, so libavcodec wrote every byte it
+              // exports; convert takes what it needs out of it, so the
+              // scratch can be reused once this commits.
               let converted = unsafe {
                 convert::av_frame_to_video_frame_as::<C>(
                   self.sw_scratch.as_ptr(),
@@ -1335,19 +1392,21 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
               let new_frame = match converted {
                 Ok(new_frame) => new_frame,
                 Err(e) => {
-                  self.scratch_pending = e.parks_in_decode();
+                  self.scratch_pending = crate::decoder::parks_in_decode(&e);
                   return Err(VideoDecodeError::Convert(e));
                 }
               };
               self.commit_delivery(new_frame, dst);
-              return Ok(Received::Frame);
+              return Ok(Received::Produced);
             }
             // Funnel first — so a recorded budget refusal is named
             // rather than laundered — and read as a status second:
             // `EAGAIN` is `NeedsInput`, `Eof` is `Ended`, and the errno
             // stops inside this crate either way.
             Err(e) => {
-              return crate::decoder::software_receive(st, e, phase)
+              // SAFETY: `st` is `sw`'s own callback state, live while
+              // `sw` is.
+              return unsafe { crate::decoder::software_receive(st, e, phase) }
                 .map_err(VideoDecodeError::Decode);
             }
           }
@@ -1405,7 +1464,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
         let st = sw.state();
         match sw.send_eof() {
           Ok(()) => Ok(Sent::Accepted),
-          Err(e) => crate::decoder::software_send(st, e, phase).map_err(VideoDecodeError::Decode),
+          // SAFETY: `st` is `sw`'s own callback state, live while `sw` is.
+          Err(e) => {
+            unsafe { crate::decoder::software_send(st, e, phase) }.map_err(VideoDecodeError::Decode)
+          }
         }
       }
     };

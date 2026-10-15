@@ -108,13 +108,14 @@ pub struct CarrierSubtitleStreamDecoder<C: crate::FfmpegCarrier> {
   /// [`DecoderLimits::max_packet_bytes`] against every packet it
   /// rebuilds into an `AVPacket`.
   limits: DecoderLimits,
-  /// Keeps the [`CallbackState`](crate::ffi::CallbackState) alive for as
-  /// long as the codec context that points at it.
+  /// Owns the [`CallbackState`](crate::ffi::CallbackState) the codec
+  /// context points at, through that same pointer — see
+  /// [`InstalledCallbackState`](crate::decoder::InstalledCallbackState).
   ///
   /// Declared **after** the decoder on purpose: struct fields drop in
   /// declaration order, so the `AVCodecContext` is freed first and the
   /// state it references outlives it.
-  _callback_state: Box<crate::ffi::CallbackState>,
+  _callback_state: crate::decoder::InstalledCallbackState,
   /// The lane this decoder captures into. A marker: the carrier
   /// appears in the frames it produces, not in its own state.
   _carrier: core::marker::PhantomData<C>,
@@ -224,22 +225,30 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierSubtitleStreamDecoder<C
     // frame (got == false, which still mutates the struct).
     self.scratch.clear();
     // Scoped submission — see `boundary::with_ffmpeg_subtitle_packet`.
-    let state: *const crate::ffi::CallbackState = &*self._callback_state;
+    let state: *const crate::ffi::CallbackState = self._callback_state.as_ptr();
     let decoder = &mut self.decoder;
     let scratch = &mut self.scratch.inner;
-    let got = boundary::with_ffmpeg_subtitle_packet::<C, _>(
-      packet,
-      self.limits.packet_limits(),
-      // Nothing on this road records what it is sent, so the packet
-      // really does die inside the call and its body may be shared.
-      crate::carrier::BodyRoute::Submission,
-      |av_pkt| {
-        decoder.decode(av_pkt, scratch).map_err(|e| {
-          // SAFETY: the callback state outlives this decoder.
-          SubtitleDecodeError::Decode(crate::decoder::software_exit(unsafe { &*state }, e))
-        })
-      },
-    )
+    let submit = |av_pkt: &ffmpeg_next::Packet| {
+      decoder.decode(av_pkt, scratch).map_err(|e| {
+        // SAFETY: `state` is the pointer the codec context holds, owned by
+        // `self._callback_state` until after the context is freed.
+        SubtitleDecodeError::Decode(unsafe { crate::decoder::software_exit(state, e) })
+      })
+    };
+    // SAFETY: `submit` hands the packet to `avcodec_decode_subtitle2`
+    // (through `decode`), which reads it and does not write through it;
+    // the closure neither clones nor keeps it, so a shared body never
+    // outlives this call.
+    let got = unsafe {
+      boundary::with_ffmpeg_subtitle_packet::<C, _>(
+        packet,
+        self.limits.packet_limits(),
+        // Nothing on this road records what it is sent, so the packet
+        // really does die inside the call and its body may be shared.
+        crate::BodyRoute::Submission,
+        submit,
+      )
+    }
     .map_err(|e| SubtitleDecodeError::Decode(Error::PacketBuild(e)))??;
     // The cue stays in the scratch until a carrier exists for it — see
     // [`Self::scratch_pending`]. Nothing is converted here.
@@ -261,10 +270,12 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierSubtitleStreamDecoder<C
       });
     }
     // SAFETY: `scratch.inner` is a live `AVSubtitle` filled by the
-    // decode this seat is holding. Conversion copies every rect it
-    // takes — `AVSubtitleRect` has no refcounted buffer, so both lanes
-    // copy — and the FFmpeg-side allocations are released below, once
-    // there is something to release them in favour of.
+    // decode whose result the scratch holds — `avcodec_decode_subtitle2` wrote its
+    // rects, their strings and their planes, each plane for its own
+    // `linesize[0] × h`. Conversion copies every rect it takes —
+    // `AVSubtitleRect` has no refcounted buffer, so both lanes copy — and
+    // the FFmpeg-side allocations are released below, once there is
+    // something to release them in favour of.
     let converted =
       unsafe { convert::av_subtitle_to_subtitle_frame_as::<C>(self.scratch.inner.as_ptr()) };
     match converted {
@@ -272,9 +283,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierSubtitleStreamDecoder<C
         self.scratch.clear();
         self.scratch_pending = false;
         *dst = frame;
-        Ok(Received::Frame)
+        Ok(Received::Produced)
       }
-      Err(e) if e.parks_in_decode() => {
+      Err(e) if crate::decoder::parks_in_decode(&e) => {
         // Kept: another attempt could carry this cue, and there is no
         // other copy of it anywhere.
         Err(SubtitleDecodeError::Convert(e))

@@ -85,13 +85,14 @@ pub struct CarrierImageDecoder<C: crate::FfmpegCarrier> {
   decoder: ffmpeg_next::decoder::Video,
   scratch: frame::Video,
   limits: DecoderLimits,
-  /// Keeps the [`CallbackState`](crate::ffi::CallbackState) alive for as
-  /// long as the codec context that points at it.
+  /// Owns the [`CallbackState`](crate::ffi::CallbackState) the codec
+  /// context points at, through that same pointer — see
+  /// [`InstalledCallbackState`](crate::decoder::InstalledCallbackState).
   ///
   /// Declared **after** the decoder on purpose: struct fields drop in
   /// declaration order, so the `AVCodecContext` is freed first and the
   /// state it references outlives it.
-  _callback_state: Box<crate::ffi::CallbackState>,
+  _callback_state: crate::decoder::InstalledCallbackState,
   /// The lane this decoder captures into. A marker: the carrier
   /// appears in the frames it produces, not in its own state.
   _carrier: core::marker::PhantomData<C>,
@@ -153,7 +154,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierImageDecoder<C> {
       .map_err(|e| ImageDecodeError::Decode(Error::Ffmpeg(e)))?;
     ensure_video_codec_type(&opened).map_err(ImageDecodeError::Decode)?;
     let decoder = ffmpeg_next::decoder::Video(opened);
-    let scratch = alloc_av_video_frame().map_err(ImageDecodeError::Decode)?;
+    let scratch = alloc_av_video_frame().map_err(|e| ImageDecodeError::Decode(e.into()))?;
     Ok(Self {
       decoder,
       scratch,
@@ -246,25 +247,26 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierImageDecoder<C> {
     // decoded anyway. The three stream families have always gone
     // through `write_md_flags`; the image road now does too rather than
     // growing a second copy of the same three lines.
-    //
-    // SAFETY: `av_pkt` owns a live `AVPacket` returned by
-    // `try_packet_copy`.
-    unsafe { boundary::write_md_flags(&mut av_pkt, packet.flags()) };
+    boundary::write_md_flags(&mut av_pkt, packet.flags());
     // Through the software funnel: a frame the allocator judge refused
     // surfaces named, not as the `EINVAL` a corrupt file also produces.
-    let state: *const crate::ffi::CallbackState = &*self._callback_state;
+    let state: *const crate::ffi::CallbackState = self._callback_state.as_ptr();
+    // SAFETY: `state` is the pointer the codec context holds, owned by
+    // `self._callback_state` until after the context is freed.
     self
       .decoder
       .send_packet(&av_pkt)
-      .map_err(|e| ImageDecodeError::Decode(crate::decoder::software_exit(state, e)))?;
+      .map_err(|e| ImageDecodeError::Decode(unsafe { crate::decoder::software_exit(state, e) }))?;
     // Every still codec answers its one packet with its one frame, but
     // it is entitled to want the end of the stream first — so the EOF
     // goes in before the drain rather than after a speculative
     // `receive_frame` that would have to interpret `EAGAIN`.
+    //
+    // SAFETY: as above.
     self
       .decoder
       .send_eof()
-      .map_err(|e| ImageDecodeError::Decode(crate::decoder::software_exit(state, e)))?;
+      .map_err(|e| ImageDecodeError::Decode(unsafe { crate::decoder::software_exit(state, e) }))?;
     if let Err(e) = self.decoder.receive_frame(&mut self.scratch) {
       self.decoder.flush();
       // Funnelled, then classified — the same two steps every receive
@@ -287,7 +289,11 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierImageDecoder<C> {
         // three lines up, and a one-shot decoder has no probe. Both
         // flow signals therefore read as the end — which is exactly the
         // collapse this road has always made by hand.
-        match crate::decoder::software_receive(state, e, crate::decoder::SessionPhase::Draining) {
+        //
+        // SAFETY: as above — this decoder's own callback state.
+        match unsafe {
+          crate::decoder::software_receive(state, e, crate::decoder::SessionPhase::Draining)
+        } {
           Ok(_) => ImageDecodeError::NoImage,
           Err(fault) => ImageDecodeError::Decode(fault),
         },
@@ -334,10 +340,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierImageDecoder<C> {
     // on the way out so the next attempt starts from the same place
     // this one did.
     //
-    // SAFETY: `scratch` was just filled by `receive_frame`; the
-    // conversion copies every byte it takes, so the scratch frame can
-    // be reused on the next call and the produced `ImageFrame` outlives
-    // this decoder.
+    // SAFETY: `scratch` was just filled by `receive_frame`, so libavcodec
+    // wrote every byte it exports; the conversion copies every byte it
+    // takes, so the scratch frame can be reused on the next call and the
+    // produced `ImageFrame` outlives this decoder.
     let image = unsafe {
       convert::av_frame_to_image_frame_as::<C>(self.scratch.as_ptr(), self.limits.frame())
     }

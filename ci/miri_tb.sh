@@ -7,12 +7,27 @@ if [ -z "$1" ]; then
 fi
 
 TARGET="$1"
-# The package to run; the core crate unless the caller names another
-# pure-Rust one.
-PKG="${2:-mediadecode}"
-# Features to enable on it besides its defaults, comma separated; none
-# unless the caller names some.
-FEATURES="${3:-}"
+shift
+# Features to enable besides the defaults, comma separated, named as
+# `--features LIST` before the packages; none unless the caller names some.
+FEATURES=""
+if [ "${1:-}" = "--features" ]; then
+  if [ -z "${2:-}" ]; then
+    echo "Error: --features needs a list"
+    exit 1
+  fi
+  FEATURES="$2"
+  shift 2
+fi
+# The packages to run: the ones the caller names, all pure Rust, or the
+# read faces when it names none.
+if [ "$#" -eq 0 ]; then
+  set -- mediadecode
+fi
+PKGS=()
+for pkg in "$@"; do
+  PKGS+=("-p" "$pkg")
+done
 
 # Install cross-compilation toolchain on Linux
 if [ "$(uname)" = "Linux" ]; then
@@ -41,7 +56,6 @@ cargo miri setup
 
 export MIRIFLAGS="-Zmiri-strict-provenance -Zmiri-disable-isolation -Zmiri-symbolic-alignment-check -Zmiri-tree-borrows"
 
-# `mediadecode-ffmpeg` calls FFmpeg's C library through FFI, which
-# Miri can't interpret. Run Miri only against the pure-Rust crates:
-# `mediadecode`, or the one the caller names.
-cargo miri test -p "$PKG" --all-targets --target "$TARGET" ${FEATURES:+--features "$FEATURES"}
+# The FFmpeg crates call FFmpeg's C library through FFI, which Miri
+# can't interpret. Run Miri only against the pure-Rust crates.
+cargo miri test "${PKGS[@]}" --all-targets --target "$TARGET" ${FEATURES:+--features "$FEATURES"}

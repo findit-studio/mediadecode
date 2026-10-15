@@ -11,6 +11,34 @@ The sibling FFmpeg adapter has its own log at
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-10-15
+
+The vocabulary moves to its own crate,
+[`mediaspine`](../mediaspine/CHANGELOG.md), and this crate keeps the
+read faces. The family releases 0.19.0 in lockstep with the new write
+faces (`mediaencode`), the FFmpeg base (`mediaio-ffmpeg`), the FFmpeg
+write adapter (`mediaencode-ffmpeg`) and the umbrella (`mediaio`).
+
+### Changed (BREAKING)
+
+- **`Received::Frame` is `Received::Produced`.** The answer that
+  delivers output is the one an encoder answers with a packet, so it is
+  named for what every push session does: a decoder or a resampler
+  produces a frame, an encoder a packet. The derived `is_frame` is
+  `is_produced`. A `match` on the old name no longer compiles, which is
+  how every site is found.
+- **The vocabulary is `mediaspine`'s.** `adapter`, `cfa`, `color`,
+  `frame`, `packet`, `pixel_format`, `resampler`, `rhythm` and
+  `subtitle`, and the demuxer's types, live in `mediaspine` and are
+  re-exported here under the same paths. `mediadecode::frame::VideoFrame`
+  *is* `mediaspine::frame::VideoFrame`, so code that mixes the two paths
+  type-checks. The `Demuxer` trait stays here, beside a re-export of the
+  demux types, and `mediaspine` itself is re-exported as
+  `mediadecode::mediaspine`.
+- **Every feature is forwarded.** `alloc`, `std`, `serde`, `arbitrary`
+  and `quickcheck` enable the same features of `mediaspine`, where the
+  types they apply to now live; `future` stays this crate's.
+
 ## [0.18.0] - 2026-10-10
 
 ### Added

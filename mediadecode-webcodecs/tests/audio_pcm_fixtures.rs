@@ -267,7 +267,7 @@ async fn decode_fixture(fix: &Fixture) {
 
     loop {
       match decoder.receive_frame(&mut frame).await {
-        Ok(Received::Frame) => {
+        Ok(Received::Produced) => {
           total_samples_out = total_samples_out.saturating_add(frame.nb_samples() as u64);
           frames_total = frames_total.saturating_add(1);
           assert_eq!(frame.sample_rate(), sample_rate, "{}", fix.name);
@@ -303,7 +303,7 @@ async fn decode_fixture(fix: &Fixture) {
   );
   loop {
     match decoder.receive_frame(&mut frame).await {
-      Ok(Received::Frame) => {
+      Ok(Received::Produced) => {
         total_samples_out = total_samples_out.saturating_add(frame.nb_samples() as u64);
         frames_total = frames_total.saturating_add(1);
         let pts = frame

@@ -1,0 +1,632 @@
+//! The carrier-strategy seam: which lane a demuxer or decoder captures
+//! into.
+//!
+//! This crate ships **two first-class carriers**, and neither is a
+//! feature flag on the other:
+//!
+//! * [`Owned`] captures into [`FfmpegBytes`](crate::FfmpegBytes) — every
+//!   byte copied once at the boundary into memory Rust owns. `Send +
+//!   Sync`, lifetime answerable to nobody, safe to fan out across a
+//!   graph. This is the default, and the lane the
+//!   [amputation contract][law] governs.
+//! * [`View`] captures into [`FfmpegBuffer`](crate::FfmpegBuffer) — a
+//!   refcounted view onto the allocation FFmpeg already made. `Send`
+//!   and **not** `Sync`, lifetime pinned to the backend's pools,
+//!   zero-copy.
+//!
+//! # Why a sealed seam and not an open trait
+//!
+//! A carrier strategy is not an extension point. Implementing one
+//! correctly means knowing what an `AVBufferRef` guarantees, which
+//! plane extents are initialised, and which of this crate's proofs run
+//! before a capture is allowed to happen — knowledge that lives in this
+//! crate and cannot be documented into a third party. A third strategy
+//! would also have to answer the questions this seam does not ask,
+//! because only two lanes exist to ask them of.
+//!
+//! So the trait is **sealed**: public to name and to bound on, closed
+//! to implement. If a third lane is ever wanted, it is added here,
+//! where it can be held to the same proofs — the seam being closed is
+//! what makes that a change to one file rather than a change to a
+//! contract.
+//!
+//! # Why the operations are `unsafe` where it matters
+//!
+//! Sealing stopped outsiders *implementing* the seam. It did not stop
+//! them *calling* it, and for a while that was a hole with teeth: the
+//! operations take offsets, lengths and row geometry which the unsafe
+//! layer beneath them acts on, so their invariants live in the caller.
+//! `View::from_rows(1, 64, |_| &[0])` was safe code, compiled, and
+//! copied sixty-four bytes out of a one-byte slice.
+//!
+//! The operations live on [`CarrierOps`], which is **not** a supertrait
+//! of [`FfmpegCarrier`]: a bound on the lane alone reaches none of them.
+//! The machines that drive the lanes live in another crate
+//! (`mediadecode-ffmpeg`), so `CarrierOps` is public — hidden from the
+//! documentation, because a consumer has no use for it — and the wall
+//! that kept callers out is now in the signatures:
+//!
+//! * every operation whose invariant lives in its caller — an extent
+//!   inside a live buffer, initialised bytes, a packet-payload
+//!   provenance claim, a packet body that may share the carrier's
+//!   buffer — is an `unsafe fn` whose `# Safety` section says what the
+//!   caller proves;
+//! * and where a length still arrives from a caller, it is **checked**
+//!   rather than asserted, which is why `from_rows` stays safe. A
+//!   `debug_assert` is a note to the author; it is not a bounds check,
+//!   and it is not there at all in the profile that matters.
+//!
+//! # Where the bound sits
+//!
+//! At the narrowest site each one can be written at, and no wider:
+//!
+//! * **Structural** on the types whose *fields* name `C::Buffer` —
+//!   `mediadecode-ffmpeg`'s `CarrierDemuxer` holds built tracks,
+//!   `CarrierResampler` holds a queue of frames. A struct whose field
+//!   type is a projection
+//!   cannot be well-formed without the bound that gives the projection
+//!   meaning, so writing it there is not a choice.
+//! * **Behavioural** on the decoders, which carry `C` only as a
+//!   `PhantomData` marker: their struct declarations take a bare `C`
+//!   and the bound sits on the impls whose methods capture.
+//! * **Absent** from `*Extra`, `SideDataEntry` and every side-data
+//!   collector. Side data has no `AVBufferRef` to share, so both lanes
+//!   copy it and the parameter never reaches those types at all.
+//!
+//! The lanes are then named by alias rather than by a defaulted type
+//! parameter, because a default is used when a type is *written* and
+//! never inferred from a call — `Demuxer::open(path)` would have had no
+//! default to fall back on.
+//!
+//! [law]: mediaspine::adapter#the-carrier-amputation-contract
+
+use ffmpeg_next::ffi::AVBufferRef;
+
+use crate::{FfmpegBytes, view::FfmpegBuffer};
+
+pub use ops::{BodyRoute, CarrierOps};
+
+pub(crate) mod sealed {
+  /// Closes [`super::FfmpegCarrier`] to outside implementations, and
+  /// **carries nothing**.
+  ///
+  /// An earlier round put the operations here, reasoning that a trait
+  /// no outside path can name is a trait no outside call can reach.
+  /// That was wrong in a way worth recording: associated items resolve
+  /// through a *bound*, not through a path, so downstream code written
+  /// as `fn f<C: FfmpegCarrier>()` type-checked `C::capture(..)` and
+  /// `C::from_rows(..)` perfectly well — the seal stopped
+  /// implementations and nothing else. The operations now live on
+  /// [`CarrierOps`](super::CarrierOps), which is **not** a supertrait
+  /// of [`super::FfmpegCarrier`], so a bound on the lane alone reaches
+  /// none of them — and the ones whose invariants live in the caller are
+  /// `unsafe fn`.
+  pub trait Sealed {}
+}
+
+pub mod ops {
+  use ffmpeg_next::ffi::AVBufferRef;
+
+  /// Which body a rebuilt `AVPacket` gets.
+  ///
+  /// The distinction exists because the two roads have different
+  /// exposure. A packet a caller is *handed* is a public
+  /// `ffmpeg_next::Packet`, and that type can lend `&mut [u8]` — so its
+  /// body must be storage nobody else can read, which means a copy on
+  /// either lane. A packet built to be **submitted and dropped** inside
+  /// one scoped call never escapes to anywhere a `&mut` can be taken
+  /// from it, so the view lane may share there — which is why every
+  /// road that takes `Submission` is an `unsafe fn` whose contract
+  /// forbids the escape. The one decoder that hands back what it is
+  /// sent, the video decoder's hardware probe, keeps copies of its own
+  /// ([`crate::boundary::try_clone_packet`]), so nothing it hands back
+  /// shares the carrier's buffer either.
+  #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+  pub enum BodyRoute {
+    /// The body is copied into storage the packet alone owns. For a
+    /// packet handed to a caller.
+    Copy,
+    /// The body may share the carrier's buffer, if this lane can prove
+    /// that is safe for a decoder to read. Only ever asked for from a
+    /// scoped submission.
+    Submission,
+  }
+
+  /// Every operation a lane performs.
+  ///
+  /// This trait is deliberately **not** a supertrait of
+  /// [`FfmpegCarrier`](super::FfmpegCarrier). A supertrait would put
+  /// its items in scope for any bound that names the subtrait, so a
+  /// consumer that only names a lane reaches none of them. It is
+  /// public — hidden from the documentation — because the machines that
+  /// drive the lanes live in another crate (`mediadecode-ffmpeg`), and
+  /// what keeps a caller honest is in the signatures: every operation
+  /// whose invariant lives in its caller is an `unsafe fn` with a
+  /// `# Safety` section, and the safe ones check what they are given.
+  /// Implementing it stays closed: its supertrait is sealed.
+  pub trait CarrierOps: super::FfmpegCarrier {
+    /// A carrier over no bytes.
+    ///
+    /// Allocation-free on both lanes; it is what an unpopulated plane
+    /// slot holds, and eight per frame is not a place to put a
+    /// failure mode.
+    fn empty() -> Self::Buffer;
+
+    /// A carrier over bytes that live outside any `AVBufferRef`.
+    ///
+    /// Subtitle rect text and a rect's own palette are plain
+    /// allocations with no refcount to share, so **both** lanes copy
+    /// here. The view lane says so rather than implying its whole road
+    /// is zero-copy.
+    ///
+    /// `None` when the copy cannot be allocated. Fallible on both lanes
+    /// so that neither can answer an allocation failure with an empty
+    /// carrier — a plane that silently became zero bytes is a frame
+    /// whose header is a lie.
+    fn from_bytes(bytes: &[u8]) -> Option<Self::Buffer>;
+
+    /// A carrier over `len` bytes at `offset` inside the live
+    /// `AVBufferRef` `buf`.
+    ///
+    /// The owned lane copies them out; the view lane takes a reference.
+    /// Either way the caller has already proved the extent lies inside
+    /// the buffer — this is the capture, not the judgement.
+    ///
+    /// Nothing may be assumed about the bytes **after** the captured
+    /// range: this is the road frame planes and palettes take. See
+    /// [`Self::capture_packet_payload`] for the one that may.
+    ///
+    /// `None` when the capture itself fails: an allocation on the owned
+    /// lane, a refcount on the view lane.
+    ///
+    /// # Safety
+    ///
+    /// `buf` must point at an [`AVBufferRef`](crate::contracts#avbufferref)
+    /// — live, aligned, its `buffer` live — with `offset + len` within its
+    /// `size`, and those `len` bytes at `data + offset` initialised: the
+    /// owned lane reads them to copy, and the view lane lends them as
+    /// `&[u8]` while holding a reference of its own (`av_buffer_ref`). On the
+    /// view lane the carrier is a window onto the buffer itself, so nothing
+    /// may write through those bytes while it — or a clone of it — lives.
+    unsafe fn capture(buf: *mut AVBufferRef, offset: usize, len: usize) -> Option<Self::Buffer>;
+
+    /// [`Self::capture`] for a payload taken out of the buffer of a
+    /// packet **libavformat delivered**.
+    ///
+    /// The only difference is what the carrier records about itself:
+    /// libavformat delivers every packet with `AV_INPUT_BUFFER_PADDING_SIZE`
+    /// bytes of its own writing behind the payload, and this is the one
+    /// capture that may claim them. That claim is what the send leg
+    /// checks before it shares anything with a decoder — so it is never
+    /// made for a caller's packet, whose buffer the library does not
+    /// vouch for (`buffer::PayloadProvenance::vouches_for_padding`).
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::capture`], and `buf` must be the buffer of an
+    /// `AVPacket` libavformat delivered — a demuxed packet, or a stream's
+    /// parked picture — whose payload this range is: the
+    /// `AV_INPUT_BUFFER_PADDING_SIZE` bytes after the range are
+    /// libavformat's, initialised, and not written while the carrier
+    /// lives.
+    unsafe fn capture_packet_payload(
+      buf: *mut AVBufferRef,
+      offset: usize,
+      len: usize,
+    ) -> Option<Self::Buffer>;
+
+    /// A carrier over `rows` runs of `row_bytes`, gathered from a
+    /// **padded** plane.
+    ///
+    /// Copied on **both** lanes, and this is the one place the view
+    /// lane cannot share on principle rather than on plumbing. A padded
+    /// plane is `linesize` wide and only its first `row_bytes` per row
+    /// are the decoder's output; the rest is allocator scratch that
+    /// nothing wrote. A carrier is an `AsRef<[u8]>`, so sharing the
+    /// padded span would form a slice over uninitialised memory —
+    /// undefined before a consumer reads a byte of it, and the same
+    /// information leak the owned lane refused when it stopped
+    /// exporting `linesize`.
+    ///
+    /// So a padded plane is compacted, on either lane, and arrives with
+    /// `row_bytes` as its stride. `None` when the gather cannot be
+    /// allocated, or when a row is not exactly `row_bytes` wide.
+    fn from_rows<'a>(
+      rows: usize,
+      row_bytes: usize,
+      row: impl FnMut(usize) -> &'a [u8],
+    ) -> Option<Self::Buffer>;
+
+    /// A capture claimed **before** the bytes exist, whose length is
+    /// settled after they do. See [`Self::reserve`].
+    type Reserved;
+
+    /// Claims `cap` bytes at `offset` inside `buf`, without reading
+    /// them.
+    ///
+    /// For a producer that allocates its own output frame and then
+    /// hands it to FFmpeg to fill — the resampler — this is what keeps
+    /// every fallible step on the *near* side of the conversion. `swr`
+    /// consumes its input as it runs, so a failure after it has run
+    /// leaves a session no caller can retry; reserving first and
+    /// committing after means the only thing left to do once the bytes
+    /// are there is name how many of them are real.
+    ///
+    /// The view lane takes its reference here — the refcount is what
+    /// can fail, and it fails before anything is consumed. The owned
+    /// lane reserves nothing and copies at [`Self::commit`], because
+    /// copying uninitialised capacity is exactly the read this crate
+    /// refuses everywhere else.
+    ///
+    /// # Safety
+    ///
+    /// `buf` must point at an [`AVBufferRef`](crate::contracts#avbufferref)
+    /// — live, aligned, its `buffer` live — with `offset + cap` within its
+    /// `size`, and the buffer must stay alive until the matching
+    /// [`Self::commit`]. No byte is read here; the view lane takes its
+    /// reference (`av_buffer_ref`) now.
+    unsafe fn reserve(buf: *mut AVBufferRef, offset: usize, cap: usize) -> Option<Self::Reserved>;
+
+    /// Settles a [`Self::reserve`] at its true length. Infallible.
+    ///
+    /// # Safety
+    ///
+    /// `len` must be at most the `cap` the reservation was taken with,
+    /// those `len` bytes must now be initialised, and the buffer must
+    /// still be alive.
+    /// **Infallible, and that is the whole reason [`Self::reserve`]
+    /// exists.** By the time this runs `swr` has consumed its input and
+    /// written its output; an allocation that failed here would leave a
+    /// caller with samples that are simply gone and nothing to retry
+    /// with. The owned lane therefore takes its allocation in
+    /// `reserve`, before the conversion, and this only copies into it
+    /// and names the length; the view lane only narrows a reference it
+    /// already holds.
+    unsafe fn commit(reserved: Self::Reserved, len: usize) -> Self::Buffer;
+
+    /// Builds the body of an `AVPacket` on the way **into** a decoder.
+    ///
+    /// [`BodyRoute::Copy`] always copies, on either lane. Only
+    /// [`BodyRoute::Submission`] lets the view lane share, and only
+    /// where it can prove a decoder may read past the payload — see
+    /// `boundary::share_or_copy`.
+    ///
+    /// This is why the reverse builders are one family rather than
+    /// two: every judgement they make — the `TRUSTED` refusal, the
+    /// side-data caps, the send budget — is about sizes and shapes,
+    /// which are the same on both lanes. Only the body differs, and
+    /// only here.
+    ///
+    /// # Safety
+    ///
+    /// It reads no pointer of its caller's: `body` is a carrier, whose buffer
+    /// is live by its construction. What it asks is about the packet it
+    /// hands back.
+    ///
+    /// With [`BodyRoute::Submission`] that packet may be a second reference
+    /// to `body`'s buffer — on the view lane, wherever
+    /// `boundary::share_or_copy` can prove the padding behind it — while
+    /// `body` still lends those bytes as `&[u8]`. Nothing may then write
+    /// through the packet: it must not reach `ffmpeg_next::Packet::data_mut`
+    /// or an in-place FFmpeg write, must not be shallow-cloned
+    /// (`ffmpeg_next::Packet::clone` ignores a failed
+    /// `av_packet_make_writable`, so its clone can keep sharing and then
+    /// lend `&mut [u8]`), and must not be handed to a caller. It is for a
+    /// scoped submission to a decoder — `avcodec_send_packet` may keep a
+    /// reference and never writes through it — dropped inside the call
+    /// that built it; a copy kept past that call must own its bytes, as
+    /// `boundary::try_clone_packet` makes. With [`BodyRoute::Copy`] the
+    /// packet owns its body and there is nothing to prove.
+    unsafe fn packet_body(
+      body: &Self::Buffer,
+      route: BodyRoute,
+    ) -> std::result::Result<ffmpeg_next::Packet, ffmpeg_next::Error>;
+  }
+}
+
+/// How a lane turns FFmpeg's bytes into a carrier.
+///
+/// **Sealed, and almost empty by design.** Naming a lane, bounding on
+/// one, and asking what it carries are public; a bound on the lane
+/// alone performs nothing. Every operation lives on `CarrierOps`, which
+/// is *not* a supertrait of this one, and every operation whose
+/// invariant lives in its caller is an `unsafe fn` — see the
+/// [module docs](self).
+///
+/// What a downstream crate can do — name a lane and be generic over it:
+///
+/// ```
+/// use mediaio_ffmpeg::{FfmpegBuffer, FfmpegBytes, FfmpegCarrier, Owned, View};
+///
+/// // Name what a lane carries, and be generic over the lane.
+/// fn carried<C: FfmpegCarrier>(buffer: &C::Buffer) -> usize {
+///   buffer.as_ref().len()
+/// }
+/// let _: fn(&FfmpegBytes) -> usize = carried::<Owned>;
+/// let _: fn(&FfmpegBuffer) -> usize = carried::<View>;
+/// ```
+///
+/// What no bound on the lane reaches is the **operations**: every one of
+/// them takes an extent, a geometry or a provenance claim that only the
+/// code driving the lane is in a position to establish.
+///
+/// ```compile_fail,E0599
+/// use mediaio_ffmpeg::FfmpegCarrier;
+/// fn downstream<C: FfmpegCarrier>() -> C::Buffer {
+///   C::empty()
+/// }
+/// ```
+///
+/// ```compile_fail,E0599
+/// use mediaio_ffmpeg::FfmpegCarrier;
+/// fn downstream<C: FfmpegCarrier>(row: &[u8]) -> Option<C::Buffer> {
+///   C::from_rows(1, 64, |_| row)
+/// }
+/// ```
+///
+/// ```compile_fail,E0599
+/// use mediaio_ffmpeg::FfmpegCarrier;
+/// unsafe fn downstream<C: FfmpegCarrier>(
+///   buf: *mut ffmpeg_next::ffi::AVBufferRef,
+/// ) -> Option<C::Buffer> {
+///   unsafe { C::capture(buf, 0, 64) }
+/// }
+/// ```
+///
+/// ```compile_fail,E0599
+/// use mediaio_ffmpeg::FfmpegCarrier;
+/// unsafe fn downstream<C: FfmpegCarrier>(
+///   buf: *mut ffmpeg_next::ffi::AVBufferRef,
+/// ) -> Option<C::Buffer> {
+///   // The provenance claim: minting this downstream would let a frame
+///   // plane pass itself off as a padded packet payload.
+///   unsafe { C::capture_packet_payload(buf, 0, 64) }
+/// }
+/// ```
+///
+/// ```compile_fail,E0599
+/// use mediaio_ffmpeg::FfmpegCarrier;
+/// unsafe fn downstream<C: FfmpegCarrier>(buf: *mut ffmpeg_next::ffi::AVBufferRef) {
+///   let reserved = unsafe { C::reserve(buf, 0, 64) };
+/// }
+/// ```
+///
+/// ```compile_fail,E0599
+/// use mediaio_ffmpeg::FfmpegCarrier;
+/// unsafe fn downstream<C: FfmpegCarrier>(reserved: ()) -> C::Buffer {
+///   unsafe { C::commit(reserved, 64) }
+/// }
+/// ```
+pub trait FfmpegCarrier: sealed::Sealed + Copy + Clone + core::fmt::Debug + 'static {
+  /// The carrier this lane produces.
+  ///
+  /// `Send` but not necessarily `Sync`: the view lane is `Send`-only,
+  /// and requiring `Sync` here would have closed the seam to it.
+  ///
+  /// A **type**, and the only thing on this trait — naming
+  /// `<View as FfmpegCarrier>::Buffer` tells a consumer what a lane
+  /// hands them, and tells them nothing they could misuse. Everything
+  /// that *acts* is on the private ops trait.
+  type Buffer: AsRef<[u8]> + Clone + Send + 'static;
+}
+
+/// The **owned** lane: every byte copied once at the boundary.
+///
+/// The default carrier, and the one the [amputation contract][law]
+/// governs. Frames and packets on this lane are `Send + Sync +
+/// 'static`, clone by refcount, and owe nothing to the decoder that
+/// produced them.
+///
+/// [law]: mediaspine::adapter#the-carrier-amputation-contract
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct Owned;
+
+/// The **view** lane: refcounted zero-copy handles onto FFmpeg's own
+/// allocations.
+///
+/// `Send` and not `Sync`, with a lifetime pinned to the backend's
+/// buffer pools — a frame held is a pool slot held. See
+/// [the carrier lanes][lanes] for the tradeoff table and for why graph
+/// traffic belongs on [`Owned`].
+///
+/// [lanes]: mediaspine::adapter#the-two-carrier-lanes
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct View;
+
+impl sealed::Sealed for Owned {}
+impl sealed::Sealed for View {}
+
+impl FfmpegCarrier for Owned {
+  type Buffer = FfmpegBytes;
+}
+
+impl FfmpegCarrier for View {
+  type Buffer = FfmpegBuffer;
+}
+
+impl ops::CarrierOps for Owned {
+  fn empty() -> Self::Buffer {
+    FfmpegBytes::empty()
+  }
+
+  fn from_bytes(bytes: &[u8]) -> Option<Self::Buffer> {
+    FfmpegBytes::try_copy_from_slice(bytes)
+  }
+
+  fn from_rows<'a>(
+    rows: usize,
+    row_bytes: usize,
+    row: impl FnMut(usize) -> &'a [u8],
+  ) -> Option<Self::Buffer> {
+    FfmpegBytes::from_rows(rows, row_bytes, row)
+  }
+
+  /// The plane's start. Nothing is claimed and nothing can fail:
+  /// this lane's cost is a copy, and the copy happens at `commit` once
+  /// the bytes are real.
+  /// The source FFmpeg will write into, and **the destination carrier,
+  /// allocated up front**.
+  ///
+  /// The allocation used to happen in `commit`, after `swr` had already
+  /// consumed the input — so a refusal there lost converted samples
+  /// with no way to retry. It happens here instead, where a refusal
+  /// costs nothing but the attempt.
+  type Reserved = (*const u8, triomphe::UniqueArc<[u8]>);
+
+  unsafe fn reserve(buf: *mut AVBufferRef, offset: usize, cap: usize) -> Option<Self::Reserved> {
+    // SAFETY: `buf` is live per the contract and `offset` is inside it.
+    let data = unsafe { (*buf).data };
+    if data.is_null() {
+      return None;
+    }
+    // The fallible half, taken before the conversion runs.
+    let destination = FfmpegBytes::reserve(cap)?;
+    // SAFETY: `offset` is within the buffer per the contract.
+    Some((unsafe { data.add(offset).cast_const() }, destination))
+  }
+
+  unsafe fn commit((source, mut destination): Self::Reserved, len: usize) -> Self::Buffer {
+    let len = len.min(destination.len());
+    if len == 0 {
+      return FfmpegBytes::empty();
+    }
+    // SAFETY: the caller promises `len` initialised bytes at `source`
+    // inside a buffer still alive; `destination` was allocated with at
+    // least `len` bytes in `reserve` and is unique, so the two cannot
+    // overlap.
+    unsafe {
+      core::ptr::copy_nonoverlapping(source, destination.as_mut_ptr(), len);
+    }
+    FfmpegBytes::from_reservation(destination, len)
+  }
+
+  /// Both routes copy. This lane's carrier is Rust-owned memory with no
+  /// `AVBufferRef` behind it to hand back, so there is nothing to share
+  /// on either road and no distinction to draw — the contract has nothing
+  /// to ask of a caller here.
+  unsafe fn packet_body(
+    body: &Self::Buffer,
+    _route: BodyRoute,
+  ) -> std::result::Result<ffmpeg_next::Packet, ffmpeg_next::Error> {
+    crate::boundary::try_packet_copy(body.as_ref())
+  }
+
+  unsafe fn capture(buf: *mut AVBufferRef, offset: usize, len: usize) -> Option<Self::Buffer> {
+    if len == 0 {
+      return Some(FfmpegBytes::empty());
+    }
+    // SAFETY: the caller proved `offset + len <= (*buf).size` against a
+    // live buffer, so the range is inside an allocation FFmpeg holds, and
+    // its contract makes those bytes initialised.
+    let bytes = unsafe {
+      let data = (*buf).data;
+      if data.is_null() {
+        return None;
+      }
+      core::slice::from_raw_parts(data.add(offset).cast_const(), len)
+    };
+    FfmpegBytes::try_copy_from_slice(bytes)
+  }
+
+  /// Indistinguishable from [`capture`](Self::capture) here: this lane
+  /// copies the payload out, so what follows it in FFmpeg's allocation
+  /// is not a fact about the carrier.
+  unsafe fn capture_packet_payload(
+    buf: *mut AVBufferRef,
+    offset: usize,
+    len: usize,
+  ) -> Option<Self::Buffer> {
+    // SAFETY: the caller's contract is the one `capture` states.
+    unsafe { <Self as ops::CarrierOps>::capture(buf, offset, len) }
+  }
+}
+
+impl ops::CarrierOps for View {
+  fn empty() -> Self::Buffer {
+    FfmpegBuffer::empty()
+  }
+
+  fn from_bytes(bytes: &[u8]) -> Option<Self::Buffer> {
+    // No `AVBufferRef` to share, so this lane copies too — into one of
+    // its own, so the carrier type stays uniform.
+    FfmpegBuffer::copy_from_slice(bytes)
+  }
+
+  fn from_rows<'a>(
+    rows: usize,
+    row_bytes: usize,
+    row: impl FnMut(usize) -> &'a [u8],
+  ) -> Option<Self::Buffer> {
+    FfmpegBuffer::from_rows(rows, row_bytes, row)
+  }
+
+  /// The view itself, taken at full capacity. The refcount — the only
+  /// step that can fail — is therefore already paid when the bytes
+  /// arrive.
+  type Reserved = FfmpegBuffer;
+
+  unsafe fn reserve(buf: *mut AVBufferRef, offset: usize, cap: usize) -> Option<Self::Reserved> {
+    // SAFETY: the caller proved the extent; `view_of` proves it again.
+    // A reservation is over an output frame this crate allocated, not
+    // over a packet, so it carries no padding claim.
+    unsafe { FfmpegBuffer::view_of(buf, offset, cap, crate::view::Origin::Foreign) }
+  }
+
+  unsafe fn commit(mut reserved: Self::Reserved, len: usize) -> Self::Buffer {
+    // No bytes move: the reference is held already and this only names
+    // how much of it is real output. The capacity past `len` is
+    // untouched allocator memory, and narrowing here is what keeps it
+    // out of every span this carrier hands out.
+    reserved.shrink_to(len);
+    reserved
+  }
+
+  unsafe fn packet_body(
+    body: &Self::Buffer,
+    route: BodyRoute,
+  ) -> std::result::Result<ffmpeg_next::Packet, ffmpeg_next::Error> {
+    match route {
+      // **A packet handed to a caller never shares.** `ffmpeg_next::
+      // Packet` lends `&mut [u8]` through `data_mut`, and the carrier
+      // it was built from still lends `&[u8]` — two live references to
+      // one allocation, one of them mutable, from entirely safe code.
+      // Copying here is what makes that unconstructible.
+      BodyRoute::Copy => crate::boundary::try_packet_copy(body.as_ref()),
+      // **A scoped submission may share**, on every road: the packet is
+      // dropped inside the call, and the one decoder that hands back
+      // what it is sent — the video decoder's hardware probe — keeps
+      // copies.
+      //
+      // SAFETY: `share_or_copy`'s contract is this function's own for
+      // `BodyRoute::Submission`, forwarded unchanged to the caller.
+      BodyRoute::Submission => unsafe { crate::boundary::share_or_copy(body) },
+    }
+  }
+
+  unsafe fn capture(buf: *mut AVBufferRef, offset: usize, len: usize) -> Option<Self::Buffer> {
+    // SAFETY: the caller proved the extent; `view_of` proves it again
+    // against the buffer's own `size`, because a constructor that
+    // trusts its arguments is one bad caller away from a view over
+    // somebody else's memory. The bytes the view will lend are
+    // initialised and unwritten for its life by this function's own
+    // contract.
+    unsafe { FfmpegBuffer::view_of(buf, offset, len, crate::view::Origin::Foreign) }
+  }
+
+  unsafe fn capture_packet_payload(
+    buf: *mut AVBufferRef,
+    offset: usize,
+    len: usize,
+  ) -> Option<Self::Buffer> {
+    // SAFETY: as `capture` — the bytes are initialised and nothing
+    // writes through them while the view lives — with the caller
+    // additionally promising this range is the payload of a packet
+    // libavformat delivered, which is what entitles the carrier to claim
+    // the padding behind it. `buffer::payload_of`, the one caller,
+    // reaches this only for a provenance that vouches for that padding
+    // (`PayloadProvenance::vouches_for_padding`) and a buffer that is
+    // unshared or whose other holders cannot write
+    // (`PayloadProvenance::route`).
+    unsafe { FfmpegBuffer::view_of(buf, offset, len, crate::view::Origin::PacketPayload) }
+  }
+}

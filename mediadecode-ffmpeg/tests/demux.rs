@@ -1640,7 +1640,7 @@ fn decoded_samples(path: &std::path::Path, strip_side_data: bool) -> u64 {
     support::accepted(decoder.send_packet(&packet), "send_packet");
     while matches!(
       decoder.receive_frame(&mut frame).expect("receive_frame"),
-      Received::Frame
+      Received::Produced
     ) {
       total += u64::from(frame.nb_samples());
     }
@@ -1648,7 +1648,7 @@ fn decoded_samples(path: &std::path::Path, strip_side_data: bool) -> u64 {
   support::accepted(decoder.send_eof(), "eof");
   loop {
     match decoder.receive_frame(&mut frame).expect("receive_frame") {
-      Received::Frame => total += u64::from(frame.nb_samples()),
+      Received::Produced => total += u64::from(frame.nb_samples()),
       Received::NeedsInput => panic!("a decoder at EOF asked for input"),
       Received::Ended => break,
     }
@@ -1742,7 +1742,7 @@ fn the_demux_to_decoder_handoff_survives_an_allocation_fault() {
       unsafe { ffmpeg_next::ffi::av_max_alloc(i32::MAX as usize) };
 
       assert!(
-        matches!(refused, Err(DemuxError::ParametersAlloc(_))),
+        matches!(refused, Err(mediadecode_ffmpeg::ParametersError::Alloc(_))),
         "expected a named refusal, got {refused:?}",
       );
 

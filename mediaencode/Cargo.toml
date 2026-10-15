@@ -1,0 +1,31 @@
+[package]
+name        = "mediaencode"
+version     = "0.19.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+homepage.workspace     = true
+documentation = "https://docs.rs/mediaencode"
+description = "The write faces of the mediaio family: the Muxer, the video and audio encoders in the push rhythm the decoders share, the encoder settings and the write errors. no_std, no allocator required."
+keywords   = ["media", "encoder", "muxer", "mediaio", "no-std"]
+categories = ["multimedia", "multimedia::video", "multimedia::audio", "no-std", "no-std::no-alloc"]
+
+[features]
+default = ["std"]
+# The faces themselves are `core`-only; these tiers are the vocabulary's,
+# forwarded so a dependant that enables them here gets them there.
+alloc   = ["mediaspine/alloc"]
+std     = ["mediaspine/std"]
+
+[dependencies]
+mediaspine  = { workspace = true }
+derive_more = { workspace = true, features = ["is_variant"] }
+thiserror   = { workspace = true }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true
