@@ -29,5 +29,17 @@ The family — `mediadecode`, `mediadecode-ffmpeg`, `mediadecode-webcodecs`,
   resampler's `Resample` arm carry.
 - `try_clone_packet`: a deep copy of a packet that checks both
   `av_packet_ref` and `av_packet_make_writable`.
+- **A custom channel map is refused unread on the safe road.** The safe
+  `convert::audio_frame_from` answers
+  `ConvertError::UnverifiableChannelMap` for a frame whose layout is a
+  custom map, before reading it: nothing safe can verify the map holds
+  `nb_channels` entries. A frame libavcodec produced converts through
+  the `unsafe` entries, whose `# Safety` states the map's extent.
+- **The allocator judge has one door.** `judge_buffer` is private, and
+  the plumbing's `ffi::install_allocator_judge` installs it together
+  with the `CallbackState` it reads, under a contract that states the
+  state's lifetime, that its pointer must not be invalidated (no `Box`
+  it came from may move afterwards), and the threads the callbacks may
+  run on.
 - A `test-support` feature (off by default): the fault-subprocess
   harness, the allocation cap and the callback-state hooks.

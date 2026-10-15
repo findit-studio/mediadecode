@@ -50,6 +50,22 @@ in lockstep.
   fault-subprocess harness and the callback-state hooks, for the lanes
   of crates built on this one.
 
+### Fixed
+
+- **The callback state is owned through the pointer the codec context
+  holds.** The audio, image, subtitle and video decoders kept it in a
+  `Box` and moved that box after the context took its pointer — and a
+  `Box` asserts uniqueness over what it holds, so the move invalidated
+  the pointer the callbacks use. They now hold a raw-pointer owner that
+  frees the state after the context, and the hardware probe names its
+  wanted format through that same pointer before the open, instead of
+  installing a second one.
+- **A custom channel map is not walked on the safe road.**
+  `convert::audio_frame_from` refuses it by name
+  (`ConvertError::UnverifiableChannelMap`); this crate's audio decoder
+  converts the frames libavcodec gives it through the `unsafe` entry,
+  whose map extent libavcodec guarantees.
+
 ## [0.18.0] - 2026-10-10
 
 Tracks `mediadecode` 0.18.0, whose `PacketFlags` names `DISPOSABLE` (see
