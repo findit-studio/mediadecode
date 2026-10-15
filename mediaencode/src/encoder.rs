@@ -58,6 +58,58 @@
 //! }
 //! ```
 //!
+//! An audio encoder with a fixed frame size takes every frame but the
+//! stream's last at exactly that size. The last — usually short — goes
+//! through [`send_final_frame`](AudioEncoder::send_final_frame), which
+//! ends the sending side as `send_eof` does:
+//!
+//! ```
+//! use mediaencode::{AudioEncoder, EncodeError, Received, Sent};
+//! # use mediaencode::mediaspine::{adapter::AudioAdapter, frame::AudioFrame, packet::AudioPacket};
+//! # type Frame<E> = AudioFrame<
+//! #   <<E as AudioEncoder>::Adapter as AudioAdapter>::SampleFormat,
+//! #   <<E as AudioEncoder>::Adapter as AudioAdapter>::ChannelLayout,
+//! #   <<E as AudioEncoder>::Adapter as AudioAdapter>::FrameExtra,
+//! #   <E as AudioEncoder>::Buffer,
+//! # >;
+//! # type Packet<E> = AudioPacket<
+//! #   <<E as AudioEncoder>::Adapter as AudioAdapter>::PacketExtra,
+//! #   <E as AudioEncoder>::Buffer,
+//! # >;
+//! /// Encodes `full` — frames of the encoder's frame size — then `last`,
+//! /// which may be shorter and ends the stream, and drains the encoder
+//! /// to its end.
+//! fn encode_audio<E: AudioEncoder>(
+//!   encoder: &mut E,
+//!   full: &[Frame<E>],
+//!   last: &Frame<E>,
+//!   dst: &mut Packet<E>,
+//!   mut out: impl FnMut(&Packet<E>),
+//! ) -> Result<(), EncodeError<E::Error>> {
+//!   for frame in full {
+//!     while let Sent::MustDrain = encoder.send_frame(frame)? {
+//!       while let Received::Produced = encoder.receive_packet(dst)? {
+//!         out(dst);
+//!       }
+//!     }
+//!   }
+//!   // The last frame ends the sending side, as `send_eof` would; on
+//!   // back pressure the same final frame is offered again.
+//!   while let Sent::MustDrain = encoder.send_final_frame(last)? {
+//!     while let Received::Produced = encoder.receive_packet(dst)? {
+//!       out(dst);
+//!     }
+//!   }
+//!   loop {
+//!     match encoder.receive_packet(dst)? {
+//!       Received::Produced => out(dst),
+//!       Received::Ended => return Ok(()),
+//!       Received::NeedsInput => continue,
+//!     }
+//!   }
+//! }
+//! ```
+//!
 //! # Where the faces differ from the decoders'
 //!
 //! - **`flush` resets, and says so.** A decoder's flush always succeeds;
@@ -71,7 +123,11 @@
 //!   sent as one.
 //! - **An audio encoder states its frame size**: most codecs take a fixed
 //!   number of samples per frame (1024 for AAC), and
-//!   [`frame_size`](AudioEncoder::frame_size) says how many.
+//!   [`frame_size`](AudioEncoder::frame_size) says how many. Every frame
+//!   `send_frame` takes carries exactly that many; the stream's last,
+//!   which may carry fewer, is sent with
+//!   [`send_final_frame`](AudioEncoder::send_final_frame) and ends the
+//!   stream.
 //! - **The refusals every encoder shares have names.** A frame of the
 //!   wrong shape, or one sent after the end, is refused with an
 //!   [`EncodeRefusal`] — the same one whichever backend refused it —
@@ -128,8 +184,10 @@ pub enum EncodeRefusal {
   /// opened with.
   #[error("the frame's format is not the one the encoder was opened with")]
   Format,
-  /// An audio frame other than the stream's last carries a sample count
-  /// other than the encoder's [frame size](AudioEncoder::frame_size).
+  /// An audio frame carries a sample count the encoder cannot take:
+  /// through [`send_frame`](AudioEncoder::send_frame), any count but the
+  /// encoder's [frame size](AudioEncoder::frame_size); through
+  /// [`send_final_frame`](AudioEncoder::send_final_frame), more than it.
   #[error("the frame carries {offered} samples per channel, the encoder takes {expected}")]
   FrameSize {
     /// The encoder's frame size.
@@ -137,8 +195,10 @@ pub enum EncodeRefusal {
     /// The frame's sample count per channel.
     offered: u32,
   },
-  /// A frame was sent after the end of the stream was accepted. Only a
-  /// flush that answers [`Flushed::Reset`] opens the stream again.
+  /// A frame was sent after the end of the stream was accepted — by
+  /// `send_eof`, or by an audio encoder's
+  /// [`send_final_frame`](AudioEncoder::send_final_frame). Only a flush
+  /// that answers [`Flushed::Reset`] opens the stream again.
   #[error("the stream has ended")]
   Ended,
 }
@@ -226,16 +286,50 @@ pub trait AudioEncoder {
   /// Encoder-specific fault type.
   type Error;
 
-  /// The number of samples per channel every frame but the stream's
-  /// last must carry, or `None` where the encoder takes frames of any
-  /// size.
+  /// The number of samples per channel every frame sent through
+  /// [`send_frame`](Self::send_frame) must carry, or `None` where the
+  /// encoder takes frames of any size. The stream's last frame, sent
+  /// through [`send_final_frame`](Self::send_final_frame), may carry
+  /// fewer.
   fn frame_size(&self) -> Option<NonZeroU32>;
 
   /// Submits one raw frame.
   ///
-  /// Answers as [`VideoEncoder::send_frame`] does; a frame of the wrong
-  /// size is refused by name ([`EncodeRefusal::FrameSize`]).
+  /// Answers as [`VideoEncoder::send_frame`] does. A frame of any size
+  /// but the [frame size](Self::frame_size) is refused by name
+  /// ([`EncodeRefusal::FrameSize`]), with no exception for a short last
+  /// frame: the stream's last frame goes through
+  /// [`send_final_frame`](Self::send_final_frame), which takes one.
   fn send_frame(
+    &mut self,
+    frame: &AudioFrame<
+      <Self::Adapter as AudioAdapter>::SampleFormat,
+      <Self::Adapter as AudioAdapter>::ChannelLayout,
+      <Self::Adapter as AudioAdapter>::FrameExtra,
+      Self::Buffer,
+    >,
+  ) -> Result<Sent, EncodeError<Self::Error>>;
+
+  /// Submits the stream's last frame, and ends the sending side with it.
+  ///
+  /// The frame may carry fewer samples per channel than the
+  /// [frame size](Self::frame_size) — a codec's last frame usually does
+  /// — but not more ([`EncodeRefusal::FrameSize`]); otherwise it is
+  /// refused as [`send_frame`](Self::send_frame) refuses.
+  /// [`Sent::MustDrain`] means the frame was **not** consumed and the
+  /// stream has not ended: drain through
+  /// [`receive_packet`](Self::receive_packet) and offer the same final
+  /// frame again.
+  ///
+  /// [`Sent::Accepted`] ends the stream exactly as an accepted
+  /// [`send_eof`](Self::send_eof) does: `receive_packet` produces the
+  /// packets the encoder held back, this frame's among them, then
+  /// answers [`Received::Ended`], and a later `send_frame` or
+  /// `send_final_frame` is refused by name ([`EncodeRefusal::Ended`]).
+  /// A stream whose samples fill their last frame exactly may end either
+  /// way: that frame through `send_final_frame`, or through `send_frame`
+  /// and then `send_eof`.
+  fn send_final_frame(
     &mut self,
     frame: &AudioFrame<
       <Self::Adapter as AudioAdapter>::SampleFormat,
@@ -253,7 +347,8 @@ pub trait AudioEncoder {
   ) -> Result<Received, EncodeError<Self::Error>>;
 
   /// Signals the end of the stream, answering as
-  /// [`VideoEncoder::send_eof`] does.
+  /// [`VideoEncoder::send_eof`] does. A stream whose last frame is short
+  /// ends with [`send_final_frame`](Self::send_final_frame) instead.
   fn send_eof(&mut self) -> Result<Sent, EncodeError<Self::Error>>;
 
   /// Resets the session, or refuses by name — see [`Flushed`].
@@ -422,10 +517,60 @@ mod tests {
     }
   }
 
-  /// An audio encoder with a fixed frame size whose codec cannot reset.
+  /// An audio encoder with a fixed frame size, a one-packet output queue,
+  /// and a codec that cannot reset.
   struct FixedAac {
     queued: bool,
     ended: bool,
+    /// Accepted frames, so a test can prove a refused or back-pressured
+    /// frame was not consumed.
+    accepted: u32,
+  }
+
+  impl FixedAac {
+    const FRAME_SIZE: u32 = 1024;
+
+    fn new() -> Self {
+      Self {
+        queued: false,
+        ended: false,
+        accepted: 0,
+      }
+    }
+
+    /// What `send_frame` and `send_final_frame` share: the end, the size
+    /// rule — exact for a frame, at most the frame size for the last —
+    /// then back pressure.
+    fn submit(&mut self, frame: &AFrame, last: bool) -> Result<Sent, EncodeError<Fault>> {
+      if self.ended {
+        return Err(EncodeRefusal::Ended.into());
+      }
+      let offered = frame.nb_samples();
+      let fits = if last {
+        offered <= Self::FRAME_SIZE
+      } else {
+        offered == Self::FRAME_SIZE
+      };
+      if !fits {
+        return Err(
+          EncodeRefusal::FrameSize {
+            expected: Self::FRAME_SIZE,
+            offered,
+          }
+          .into(),
+        );
+      }
+      if self.queued {
+        // Nothing consumed, and for a final frame nothing ended.
+        return Ok(Sent::MustDrain);
+      }
+      self.queued = true;
+      self.accepted += 1;
+      if last {
+        self.ended = true;
+      }
+      Ok(Sent::Accepted)
+    }
   }
 
   impl AudioEncoder for FixedAac {
@@ -434,27 +579,15 @@ mod tests {
     type Error = Fault;
 
     fn frame_size(&self) -> Option<NonZeroU32> {
-      NonZeroU32::new(1024)
+      NonZeroU32::new(Self::FRAME_SIZE)
     }
 
     fn send_frame(&mut self, frame: &AFrame) -> Result<Sent, EncodeError<Fault>> {
-      if self.ended {
-        return Err(EncodeRefusal::Ended.into());
-      }
-      if frame.nb_samples() != 1024 {
-        return Err(
-          EncodeRefusal::FrameSize {
-            expected: 1024,
-            offered: frame.nb_samples(),
-          }
-          .into(),
-        );
-      }
-      if self.queued {
-        return Ok(Sent::MustDrain);
-      }
-      self.queued = true;
-      Ok(Sent::Accepted)
+      self.submit(frame, false)
+    }
+
+    fn send_final_frame(&mut self, frame: &AFrame) -> Result<Sent, EncodeError<Fault>> {
+      self.submit(frame, true)
     }
 
     fn receive_packet(&mut self, _: &mut APacket) -> Result<Received, EncodeError<Fault>> {
@@ -612,10 +745,7 @@ mod tests {
       "the frame held before the reset is gone: one packet, not two",
     );
 
-    let mut audio = FixedAac {
-      queued: false,
-      ended: false,
-    };
+    let mut audio = FixedAac::new();
     let mut apacket = APacket::new(EMPTY, ());
     assert_eq!(
       audio.send_frame(&audio_frame(1024)).expect("no fault"),
@@ -667,10 +797,7 @@ mod tests {
 
   #[test]
   fn an_audio_frame_of_the_wrong_size_is_refused_by_name() {
-    let mut encoder = FixedAac {
-      queued: false,
-      ended: false,
-    };
+    let mut encoder = FixedAac::new();
     assert_eq!(encoder.frame_size(), NonZeroU32::new(1024));
     assert!(matches!(
       encoder.send_frame(&audio_frame(960)),
@@ -679,6 +806,111 @@ mod tests {
         offered: 960
       }))
     ));
+    // The last frame may be short, never long.
+    assert!(matches!(
+      encoder.send_final_frame(&audio_frame(1500)),
+      Err(EncodeError::Refused(EncodeRefusal::FrameSize {
+        expected: 1024,
+        offered: 1500
+      }))
+    ));
+    assert_eq!(encoder.accepted, 0, "a refused frame is not consumed");
+  }
+
+  /// **The stream's last frame may be short, and it ends the stream.**
+  /// `send_final_frame` takes 600 samples where `send_frame` takes only
+  /// 1024. Under back pressure it consumes nothing and ends nothing; once
+  /// accepted, the stream ends as `send_eof` ends it — the final packet,
+  /// then `Ended`, and every later frame refused by name.
+  #[test]
+  fn the_final_frame_may_be_short_and_ends_the_stream() {
+    let mut encoder = FixedAac::new();
+    let mut dst = APacket::new(EMPTY, ());
+    assert_eq!(
+      encoder.send_frame(&audio_frame(1024)).expect("no fault"),
+      Sent::Accepted
+    );
+    // The first packet waits to be drained: back pressure.
+    assert_eq!(
+      encoder
+        .send_final_frame(&audio_frame(600))
+        .expect("no fault"),
+      Sent::MustDrain
+    );
+    assert_eq!(
+      encoder.accepted, 1,
+      "a back-pressured frame is not consumed"
+    );
+    assert_eq!(
+      encoder.receive_packet(&mut dst).expect("no fault"),
+      Received::Produced
+    );
+    assert_eq!(
+      encoder.receive_packet(&mut dst).expect("no fault"),
+      Received::NeedsInput,
+      "a back-pressured final frame ends nothing",
+    );
+    // Offered again, accepted, and the stream is over.
+    assert_eq!(
+      encoder
+        .send_final_frame(&audio_frame(600))
+        .expect("no fault"),
+      Sent::Accepted
+    );
+    assert_eq!(encoder.accepted, 2);
+    assert_eq!(
+      encoder.receive_packet(&mut dst).expect("no fault"),
+      Received::Produced,
+      "the final frame's packet",
+    );
+    assert_eq!(
+      encoder.receive_packet(&mut dst).expect("no fault"),
+      Received::Ended
+    );
+    assert_eq!(
+      encoder.receive_packet(&mut dst).expect("no fault"),
+      Received::Ended,
+      "the end is sticky",
+    );
+    assert!(matches!(
+      encoder.send_frame(&audio_frame(1024)),
+      Err(EncodeError::Refused(EncodeRefusal::Ended))
+    ));
+    assert!(matches!(
+      encoder.send_final_frame(&audio_frame(600)),
+      Err(EncodeError::Refused(EncodeRefusal::Ended))
+    ));
+  }
+
+  /// **`send_frame` has no last-frame exception.** A short frame offered
+  /// through it is refused by name wherever it falls in the stream, and
+  /// consumes nothing; the same frame through `send_final_frame` is taken.
+  #[test]
+  fn send_frame_takes_no_short_last_frame() {
+    let mut encoder = FixedAac::new();
+    let mut dst = APacket::new(EMPTY, ());
+    assert_eq!(
+      encoder.send_frame(&audio_frame(1024)).expect("no fault"),
+      Sent::Accepted
+    );
+    assert_eq!(
+      encoder.receive_packet(&mut dst).expect("no fault"),
+      Received::Produced
+    );
+    assert!(matches!(
+      encoder.send_frame(&audio_frame(600)),
+      Err(EncodeError::Refused(EncodeRefusal::FrameSize {
+        expected: 1024,
+        offered: 600
+      }))
+    ));
+    assert_eq!(encoder.accepted, 1, "a refused frame is not consumed");
+    assert_eq!(
+      encoder
+        .send_final_frame(&audio_frame(600))
+        .expect("no fault"),
+      Sent::Accepted
+    );
   }
 
   /// Compiles only where both arguments are one type.
