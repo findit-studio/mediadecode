@@ -799,7 +799,10 @@ mod tests {
     // The handed-back packet is the caller's again: restamped, it goes.
     let (track, packet) = back.into_parts();
     muxer
-      .write_video(VideoTrackPacket::new(track, packet.with_dts(Some(ms(80)))))
+      .write_video(VideoTrackPacket::new(
+        track,
+        packet.with_dts(Some(ms(80))).with_pts(Some(ms(80))),
+      ))
       .expect("the same packet, advancing");
     assert_eq!(muxer.written, 4);
     muxer.finish().expect("the session ends cleanly");
@@ -953,7 +956,7 @@ mod tests {
     muxer
       .write_packet(DemuxedPacket::Video(VideoTrackPacket::new(
         track,
-        packet.with_dts(Some(ms(80))),
+        packet.with_dts(Some(ms(80))).with_pts(Some(ms(80))),
       )))
       .expect("the same packet, advancing");
     assert_eq!(muxer.written, 2);

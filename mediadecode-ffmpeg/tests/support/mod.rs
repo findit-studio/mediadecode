@@ -995,8 +995,8 @@ pub fn remux<Dm, M, S>(
   M::Refusal: std::fmt::Debug,
   M::Error: std::fmt::Debug,
 {
-  use mediadecode::demuxer::{DemuxAttachmentPacket, DemuxedPacket, Demuxer};
-  use mediaencode::{Muxer, mediaspine::track::TrackDescription};
+  use mediadecode::demuxer::{DemuxAttachmentPacket, DemuxedPacket};
+  use mediaencode::mediaspine::track::TrackDescription;
 
   // A demuxer hands out every attachment before its first timed packet.
   let mut files: Vec<Option<DemuxAttachmentPacket<Dm::Adapter, Dm::Buffer>>> =

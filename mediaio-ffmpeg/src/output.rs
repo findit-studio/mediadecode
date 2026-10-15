@@ -50,8 +50,8 @@ use ffmpeg_next::{
   ffi::{
     AV_DISPOSITION_ATTACHED_PIC, AV_INPUT_BUFFER_PADDING_SIZE, AVChapter, AVCodecParameters,
     AVFMT_FLAG_CUSTOM_IO, AVFMT_NOFILE, AVFMT_NOTIMESTAMPS, AVFMT_TS_NONSTRICT, AVFormatContext,
-    AVOutputFormat, AVRational, AVStream, av_dict_free, av_dict_set, av_dynarray_add_nofree,
-    av_free, av_freep, av_guess_format, av_interleaved_write_frame, av_mallocz, av_write_trailer,
+    AVRational, AVStream, av_dict_free, av_dict_set, av_dynarray_add_nofree, av_free, av_freep,
+    av_guess_format, av_interleaved_write_frame, av_mallocz, av_write_trailer,
     avcodec_parameters_copy, avformat_alloc_output_context2, avformat_free_context,
     avformat_new_stream, avformat_write_header,
   },

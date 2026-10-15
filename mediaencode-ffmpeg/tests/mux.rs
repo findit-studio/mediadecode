@@ -396,30 +396,34 @@ fn l3_an_mp3s_cover_art_reaches_mp4_as_its_cover() {
   );
 }
 
+/// Owned packets taken from a file for the refusal laws.
+struct Sample {
+  video: Vec<VideoTrackPacket<Ffmpeg, FfmpegBytes>>,
+  font: Option<AttachmentTrackPacket<Ffmpeg, FfmpegBytes>>,
+  audio: Option<AudioTrackPacket<Ffmpeg, FfmpegBytes>>,
+}
+
 /// The first `count` video packets of `path`, owned, and its first
-/// attachment packet.
-fn owned_video_and_font(
-  path: &Path,
-  count: usize,
-) -> (
-  Vec<VideoTrackPacket<Ffmpeg, FfmpegBytes>>,
-  Option<AttachmentTrackPacket<Ffmpeg, FfmpegBytes>>,
-  Option<AudioTrackPacket<Ffmpeg, FfmpegBytes>>,
-) {
+/// attachment and audio packets.
+fn owned_video_and_font(path: &Path, count: usize) -> Sample {
   let mut demuxer = FfmpegOwnedDemuxer::open(path).expect("open");
-  let (mut video, mut font, mut audio) = (Vec::new(), None, None);
+  let mut sample = Sample {
+    video: Vec::new(),
+    font: None,
+    audio: None,
+  };
   while let Some(packet) = demuxer.next_packet().expect("a packet or the end") {
     match packet {
-      DemuxedPacket::Video(p) if video.len() < count => video.push(p),
-      DemuxedPacket::Attachment(p) if font.is_none() => font = Some(p),
-      DemuxedPacket::Audio(p) if audio.is_none() => audio = Some(p),
+      DemuxedPacket::Video(p) if sample.video.len() < count => sample.video.push(p),
+      DemuxedPacket::Attachment(p) if sample.font.is_none() => sample.font = Some(p),
+      DemuxedPacket::Audio(p) if sample.audio.is_none() => sample.audio = Some(p),
       _ => {}
     }
-    if video.len() == count && font.is_some() && audio.is_some() {
+    if sample.video.len() == count && sample.font.is_some() && sample.audio.is_some() {
       break;
     }
   }
-  (video, font, audio)
+  sample
 }
 
 /// A one-track table: `path`'s video track.
@@ -469,7 +473,7 @@ fn refused<P: core::fmt::Debug>(
 fn l4_every_refusal_hands_the_packet_back() {
   let Some(corpus) = Corpus::new() else { return };
   let source = corpus.multi_track_mkv();
-  let (video, font, audio) = owned_video_and_font(&source, 3);
+  let Sample { video, font, audio } = owned_video_and_font(&source, 3);
   let (font, audio) = (font.expect("the font"), audio.expect("an audio packet"));
   assert_eq!(video.len(), 3, "the premise: three video packets");
 
@@ -715,7 +719,7 @@ impl Seek for Exploding {
 fn l6_a_sink_that_panics_is_named_in_the_fault() {
   let Some(corpus) = Corpus::new() else { return };
   let source = corpus.multi_track_mkv();
-  let (video, _, _) = owned_video_and_font(&source, 3);
+  let video = owned_video_and_font(&source, 3).video;
   let sink = Exploding::default();
   let calls = Arc::clone(&sink.calls);
 
