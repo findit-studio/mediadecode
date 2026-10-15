@@ -12,12 +12,17 @@
 //! it carries nothing — `null`, an empty list, `true` for `enabled` — or
 //! what the timeline keeps.
 //!
-//! Counts are read where the export writes them, and held to the exact
-//! words it writes beside them ([`export`](super::export)): each
-//! `RationalTime`'s rate must be the `f64` of the exact ruler its word
-//! names, bit for bit, and its value a whole count within ±2^53, which an
-//! `f64` holds exactly; a media-side range is counted again in the timebase
-//! the model counts it in, exactly ([`Unreadable::Inexact`] otherwise).
+//! Every number is read exactly, or refused as [`Unreadable::Inexact`]: a
+//! count or a place as the whole number its digits spell
+//! ([`json::whole`]), a float as the one whose canonical decimal its text
+//! spells ([`json::exact_f64`], [`json::exact_f32`]) — so `2.4e1` reads as
+//! `24.0` does, and `16777217` does not read as the `f32` 16777216. Counts
+//! are read where the export writes them, and held to the exact words it
+//! writes beside them ([`export`](super::export)): each `RationalTime`'s
+//! rate must be the `f64` of the exact ruler its word names, bit for bit,
+//! and its value a whole count within ±2^53, which an `f64` holds exactly;
+//! a media-side range is counted again in the timebase the model counts it
+//! in, exactly.
 //! What OpenTimelineIO derives from the document is held as the export
 //! holds it ([`derive`](super::derive)), and refused as
 //! [`Unreadable::Inexact`] where its `f64` arithmetic rounds: both ends of
@@ -325,18 +330,17 @@ impl<'a> Words<'a> {
       .transpose()
   }
 
-  /// A gain in decibels, finite.
+  /// A gain in decibels: the `f32` its number spells exactly
+  /// ([`json::exact_f32`]), finite so.
   fn gain(&self, word: &str) -> Result<Option<Gain>, Unreadable> {
     let Some(value) = self.get(word) else {
       return Ok(None);
     };
     let at = self.at.key(word);
-    number(value, &at)?
-      .parse::<f32>()
-      .ok()
+    json::exact_f32(number(value, &at)?)
       .and_then(Gain::from_db)
       .map(Some)
-      .ok_or_else(|| shape(&at, "a finite gain in decibels"))
+      .ok_or_else(|| inexact(&at, "a gain that is not exactly the f32 it reads as"))
   }
 
   /// The exact words of a media-side range: the ruler its counts are
@@ -410,16 +414,16 @@ struct Exact {
   timebase: Timebase,
 }
 
-/// A `RationalTime.1` counted in `ruler`: its rate the `f64` of the exact
-/// ruler, bit for bit, and its value a whole count within ±2^53.
+/// A `RationalTime.1` counted in `ruler`: its rate the `f64` its number
+/// spells exactly ([`json::exact_f64`]) and that `f64` the exact ruler's,
+/// bit for bit; its value a whole count within ±2^53.
 fn count(value: &Value, at: &At, ruler: Ruler) -> Result<i64, Unreadable> {
   let object = Object::of(value, at.clone())?;
   object.schema(&["RationalTime.1"])?;
   object.keys(&["OTIO_SCHEMA", "rate", "value"])?;
   let rate_at = at.key("rate");
-  let rate = number(object.required("rate")?, &rate_at)?
-    .parse::<f64>()
-    .map_err(|_| shape(&rate_at, "a number"))?;
+  let rate = json::exact_f64(number(object.required("rate")?, &rate_at)?)
+    .ok_or_else(|| inexact(&rate_at, "a rate that is not exactly the f64 it reads as"))?;
   if rate.to_bits() != ruler.otio().to_bits() {
     return Err(inexact(
       &rate_at,

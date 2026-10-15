@@ -40,10 +40,12 @@ Its versions are its own: they do not move with `mediadecode`'s.
   `UnmodelledSchema`, `UnmodelledFeature` and its `Feature`, `Inexact`, and
   the self-check's `Shape` and `Syntax` — never dropped: a gap of some
   length after a track's last clip, which OpenTimelineIO counts in the
-  track's duration, among them (`Feature::TrailingGap`). What
-  OpenTimelineIO derives from the document in its own `f64` arithmetic —
-  both ends of every range, and each track's walk and the stack's — is held
-  as `to_otio` holds it, and refused as `Inexact` where it rounds.
+  track's duration, among them (`Feature::TrailingGap`). Every number is
+  read exactly — a float only where its text spells the float's canonical
+  decimal — and what OpenTimelineIO derives from the document in its own
+  `f64` arithmetic — both ends of every range, and each track's walk and
+  the stack's — is held as `to_otio` holds it; each is refused as
+  `Inexact` where it rounds.
 - The export writes markers as `Marker.2`, refusing one no ruler holds
   whole as `Spot::Marker`.
 - `validate_json` holds every marker to `Marker.2`, with the

@@ -670,7 +670,11 @@ impl core::error::Error for Shape {}
 /// ruler its counts are written in and the timebase the model counts it in,
 /// from the words the export writes under `metadata.mediaio`, and holds
 /// every `RationalTime` to them: its rate the `f64` of its exact ruler, bit
-/// for bit, and its value a whole count within ±2^53. What OpenTimelineIO
+/// for bit, and its value a whole count within ±2^53. Every number is read
+/// exactly: a count or a place as the whole number its digits spell, and a
+/// float — a rate, a gain — only where its text spells the float's
+/// canonical decimal, in any spelling (`2.4e1` reads as `24.0` does); a
+/// number its float holds only rounded, or not at all, is refused. What OpenTimelineIO
 /// derives from those counts in its own `f64` arithmetic is held as
 /// [`to_otio`] holds it before writing: both ends of every range — its end
 /// and its last tick — and every place, visible range and duration of the
@@ -702,9 +706,9 @@ impl core::error::Error for Shape {}
 ///   there, a word of the crate's among them;
 /// - [`Unreadable::Schema`] and [`Unreadable::Feature`] for what the
 ///   timeline does not model;
-/// - [`Unreadable::Inexact`] for a count or rate that does not land exactly
-///   where the timeline counts it, or a time OpenTimelineIO's `f64`
-///   arithmetic rounds;
+/// - [`Unreadable::Inexact`] for a number its type holds only rounded, a
+///   count or rate that does not land exactly where the timeline counts it,
+///   or a time OpenTimelineIO's `f64` arithmetic rounds;
 /// - [`Unreadable::Validation`] for a timeline read whole that does not
 ///   [`validate`](fn@validate).
 pub fn from_otio(json: &str) -> Result<Timeline, Unreadable> {

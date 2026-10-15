@@ -668,6 +668,52 @@ fn what_opentimelineio_derives_from_a_track_is_held_as_the_export_holds_it() {
 }
 
 #[test]
+fn every_number_is_read_exactly_or_refused() {
+  const GAIN: &str = "a gain that is not exactly the f32 it reads as";
+  const RATE: &str = "a rate that is not exactly the f64 it reads as";
+  let gain_at = format!("{A}.metadata.mediaio.gain_db");
+  let gain = |spelled: &'static str| {
+    read(move |root| {
+      set(
+        root,
+        &format!("{A}.metadata.mediaio"),
+        "gain_db",
+        number(spelled),
+      )
+    })
+  };
+  // Exactly an f32, and other spellings of the sample's own -3 dB.
+  assert_eq!(
+    gain("16777216").unwrap().tracks()[0].clips()[0].gain(),
+    Gain::from_db(16_777_216.0),
+  );
+  for spelled in ["-3", "-3e0", "-0.3E1", "-30e-1"] {
+    assert_eq!(gain(spelled), Ok(sample()), "{spelled}");
+  }
+  // Rounded to its nearest f32 (2^24 + 1 reads as 2^24), past the largest,
+  // and below the smallest.
+  for spelled in ["16777217", "-3.0000001", "1e39", "1e-50"] {
+    assert_eq!(gain(spelled), Err(inexact(&gain_at, GAIN)), "{spelled}");
+  }
+
+  // A RationalTime's rate, the same way: any spelling of the f64 the
+  // export writes, and no other number.
+  let rate = |spelled: &'static str| {
+    read(move |root| set(root, "global_start_time", "rate", number(spelled)))
+  };
+  for spelled in ["24", "2.4e1", "2400E-2", "24.000"] {
+    assert_eq!(rate(spelled), Ok(sample()), "{spelled}");
+  }
+  for spelled in ["24.0000000000000001", "1e309", "1e-400"] {
+    assert_eq!(
+      rate(spelled),
+      Err(inexact("global_start_time.rate", RATE)),
+      "{spelled}"
+    );
+  }
+}
+
+#[test]
 fn a_word_missing_or_misshapen_is_refused_by_name() {
   assert_eq!(
     read(|root| remove(root, &format!("{A}.metadata.mediaio"), "id")),
@@ -685,18 +731,6 @@ fn a_word_missing_or_misshapen_is_refused_by_name() {
     Err(shape(
       "metadata.mediaio.rate",
       "a rate above zero, written num/den"
-    )),
-  );
-  assert_eq!(
-    read(|root| set(
-      root,
-      &format!("{A}.metadata.mediaio"),
-      "gain_db",
-      number("1e300")
-    )),
-    Err(shape(
-      &format!("{A}.metadata.mediaio.gain_db"),
-      "a finite gain in decibels"
     )),
   );
   assert_eq!(

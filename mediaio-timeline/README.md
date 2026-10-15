@@ -301,7 +301,10 @@ inverse of `to_otio`: for every timeline `to_otio` writes, for either
 target, it reads that very timeline back — every count, timebase and rate
 as the model held it. It holds each `RationalTime` to the exact words: its
 rate the `f64` of its exact ruler, bit for bit, and its value a whole count
-within ±2^53, read from its digits. What OpenTimelineIO derives from those
+within ±2^53, read from its digits. Every number is read exactly: a float —
+a rate, a clip's gain — only where its text spells the float's canonical
+decimal, in any spelling, so a gain of `16777217` dB, which an `f32` holds
+only as 16777216, is refused. What OpenTimelineIO derives from those
 counts in its own `f64` arithmetic is held as the export holds it: both
 ends of every range — a marker one tick long at 2^53, whose end
 OpenTimelineIO's sum rounds back to 2^53, is refused — and every place,
