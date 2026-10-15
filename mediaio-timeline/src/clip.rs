@@ -37,9 +37,9 @@ pub struct Clip {
   id: ClipId,
   name: Utf8Bytes,
   media: MediaRef,
-  #[serde(deserialize_with = "crate::wire::time_range")]
+  #[cfg_attr(feature = "serde", serde(deserialize_with = "crate::wire::time_range"))]
   source_range: TimeRange,
-  #[serde(deserialize_with = "crate::wire::time_range")]
+  #[cfg_attr(feature = "serde", serde(deserialize_with = "crate::wire::time_range"))]
   record: TimeRange,
   enabled: bool,
   gain: Option<Gain>,
@@ -217,8 +217,9 @@ impl Clip {
 /// ([`Refusal::DuplicateClipId`](crate::Refusal::DuplicateClipId)), and
 /// [`diff`](fn@crate::diff) matches clips by it. On the wire an id is the
 /// bare string.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(transparent))]
 pub struct ClipId(Utf8Bytes);
 
 impl ClipId {
@@ -254,13 +255,20 @@ impl fmt::Display for ClipId {
 /// - [`rate`](Self::rate) — the medium's frame or sample rate;
 /// - [`reel`](Self::reel) — the tape or card name an edit decision list
 ///   carries.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 pub struct MediaRef {
   locator: Utf8Bytes,
-  #[serde(default, deserialize_with = "crate::wire::option_time_range")]
+  #[cfg_attr(
+    feature = "serde",
+    serde(default, deserialize_with = "crate::wire::option_time_range")
+  )]
   available_range: Option<TimeRange>,
-  #[serde(default, deserialize_with = "crate::wire::option_rate")]
+  #[cfg_attr(
+    feature = "serde",
+    serde(default, deserialize_with = "crate::wire::option_rate")
+  )]
   rate: Option<Rate>,
   reel: Option<Utf8Bytes>,
 }

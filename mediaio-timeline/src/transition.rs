@@ -1,6 +1,7 @@
 //! A transition between two adjacent clips.
 
 use mediatime::{Duration, Timestamp};
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
 /// A blend across the cut between two adjacent clips of one track.
@@ -18,15 +19,16 @@ use serde::{Deserialize, Serialize};
 /// These are OpenTimelineIO's `in_offset` and `out_offset`, with the same
 /// meaning. [`validate`](fn@crate::validate) holds each handle inside its
 /// clip's available media when that is known.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 pub struct Transition {
   kind: TransitionKind,
-  #[serde(deserialize_with = "crate::wire::timestamp")]
+  #[cfg_attr(feature = "serde", serde(deserialize_with = "crate::wire::timestamp"))]
   at: Timestamp,
-  #[serde(deserialize_with = "crate::wire::duration")]
+  #[cfg_attr(feature = "serde", serde(deserialize_with = "crate::wire::duration"))]
   in_offset: Duration,
-  #[serde(deserialize_with = "crate::wire::duration")]
+  #[cfg_attr(feature = "serde", serde(deserialize_with = "crate::wire::duration"))]
   out_offset: Duration,
 }
 
@@ -76,8 +78,9 @@ impl Transition {
 /// The kind of blend a [`Transition`] performs.
 ///
 /// Marked `#[non_exhaustive]`: a later kind (a wipe) joins as a variant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 #[non_exhaustive]
 pub enum TransitionKind {
   /// A cross-dissolve: the outgoing picture or sound gives way to the

@@ -156,7 +156,6 @@ impl Timeline {
   }
 
   /// Sets the tracks, replacing any existing ones, in place.
-  #[must_use]
   pub fn set_tracks(&mut self, tracks: impl Into<Vec<Track>>) -> &mut Self {
     self.tracks = tracks.into();
     self
@@ -165,7 +164,6 @@ impl Timeline {
 
 /// One layer of a timeline: clips of one kind of medium, in record order,
 /// and the transitions between them.
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "serde", serde(deny_unknown_fields))]

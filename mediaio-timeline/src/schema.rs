@@ -2,8 +2,6 @@
 
 use core::fmt;
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
-
 /// Which shape of timeline document a value is.
 ///
 /// A stored [`Timeline`](crate::Timeline) carries it as the number under
@@ -47,19 +45,24 @@ impl fmt::Display for Schema {
   }
 }
 
-impl Serialize for Schema {
-  fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-    serializer.serialize_u64(self.number())
-  }
-}
+#[cfg(feature = "serde")]
+const _: () = {
+  use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
-impl<'de> Deserialize<'de> for Schema {
-  fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-    let number = u64::deserialize(deserializer)?;
-    Self::from_number(number).ok_or_else(|| {
-      de::Error::custom(format_args!(
-        "unknown timeline schema {number}: this reader knows schema 1"
-      ))
-    })
+  impl Serialize for Schema {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+      serializer.serialize_u64(self.number())
+    }
   }
-}
+
+  impl<'de> Deserialize<'de> for Schema {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+      let number = u64::deserialize(deserializer)?;
+      Self::from_number(number).ok_or_else(|| {
+        de::Error::custom(format_args!(
+          "unknown timeline schema {number}: this reader knows schema 1"
+        ))
+      })
+    }
+  }
+};

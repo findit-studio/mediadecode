@@ -1,5 +1,6 @@
 //! Seeded properties: valid timelines built at random, from fixed seeds, so
 //! every run checks the same few hundred and a failure names its seed.
+#![cfg(any(feature = "std", feature = "alloc"))]
 
 mod common;
 
@@ -297,6 +298,7 @@ fn diff_names_exactly_the_change_made() {
   }
 }
 
+#[cfg(feature = "serde")]
 #[test]
 fn a_document_round_trips() {
   for seed in 0..SEEDS {

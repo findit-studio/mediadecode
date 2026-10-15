@@ -1,9 +1,21 @@
-#![doc = include_str!("../README.md")]
+#![cfg_attr(any(feature = "std", feature = "alloc"), doc = include_str!("../README.md"))]
+#![cfg_attr(
+  not(any(feature = "std", feature = "alloc")),
+  doc = "The editing timeline as data. This build has neither the `std` nor the `alloc` \
+         feature, and on `core` alone the crate exports only the time words it re-exports \
+         from `mediatime`: [`Duration`], [`Rate`], [`TimeRange`], [`Timebase`] and \
+         [`Timestamp`]. Every model type owns its names, lists and maps, so the timeline, \
+         `validate`, `layout`, `diff` and `otio` need `alloc`: enable the `alloc` feature, \
+         or `std` (the default)."
+)]
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+// The heap types are named `std::…` in every tier: without `std`, the
+// `alloc` crate takes the name. That covers only what `alloc` has, which is
+// all the crate uses.
 #[cfg(all(not(feature = "std"), feature = "alloc"))]
 extern crate alloc as std;
 
@@ -31,7 +43,7 @@ mod timeline;
 mod transition;
 #[cfg(any(feature = "std", feature = "alloc"))]
 mod validate;
-#[cfg(any(feature = "std", feature = "alloc"))]
+#[cfg(all(feature = "serde", any(feature = "std", feature = "alloc")))]
 mod wire;
 
 #[cfg(any(feature = "std", feature = "alloc"))]
