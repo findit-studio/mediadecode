@@ -626,6 +626,65 @@ fn a_dangling_custom_map_is_refused_by_the_safe_conversion_unread() {
   );
 }
 
+/// **An impossible count is refused as one, whatever the layout's
+/// order.** The safe road judges the sample and channel counts exactly
+/// as the worker does before it asks the map question, so a custom
+/// layout declaring `-1`, `256`, or no channels under samples — or a
+/// negative sample count — is refused for the count, and the worker is
+/// never entered. Only a count the worker would take reaches
+/// [`ConvertError::UnverifiableChannelMap`].
+#[test]
+fn a_custom_layout_with_an_impossible_count_is_refused_for_the_count() {
+  use ffmpeg_next::ffi::{AVChannelCustom, AVChannelOrder};
+
+  let mut frame = ffmpeg_next::frame::Audio::empty();
+  // SAFETY: reading the pointer of a live frame.
+  let raw = unsafe { frame.as_mut_ptr() };
+  let refuse = |channels: i32, samples: i32| {
+    // SAFETY: `raw` is the live frame. Its empty layout owns nothing,
+    // so overwriting the fields leaks nothing; the map is a dangling,
+    // well-aligned address that nothing here reads.
+    unsafe {
+      (*raw).nb_samples = samples;
+      (*raw).ch_layout.order = AVChannelOrder::AV_CHANNEL_ORDER_CUSTOM;
+      (*raw).ch_layout.nb_channels = channels;
+      (*raw).ch_layout.u.map = core::ptr::NonNull::<AVChannelCustom>::dangling().as_ptr();
+    }
+    let before = worker_probe::entries();
+    worker_probe::arm(true);
+    let result = audio_frame_from(&frame, Timebase::default(), FrameLimits::default());
+    worker_probe::arm(false);
+    assert_eq!(
+      worker_probe::entries() - before,
+      0,
+      "the safe road must not enter the worker"
+    );
+    // SAFETY: as above. The frame goes back to an empty layout before it
+    // drops, or `av_frame_free` would free the dangling map.
+    unsafe {
+      (*raw).nb_samples = 0;
+      (*raw).ch_layout.order = AVChannelOrder::AV_CHANNEL_ORDER_UNSPEC;
+      (*raw).ch_layout.nb_channels = 0;
+      (*raw).ch_layout.u.mask = 0;
+    }
+    result.err()
+  };
+
+  for (channels, samples) in [(-1, 0), (256, 0), (i32::MAX, 0), (0, 64)] {
+    assert!(
+      matches!(
+        refuse(channels, samples),
+        Some(ConvertError::UnsupportedChannelCount(p)) if p.channels() == channels
+      ),
+      "{channels} channels under {samples} samples is refused for the count",
+    );
+  }
+  assert!(matches!(
+    refuse(2, -1),
+    Some(ConvertError::InvalidSampleCount(p)) if p.count() == -1
+  ));
+}
+
 /// **A custom map libavcodec allocated still converts — on the road
 /// whose caller vouches for it.** `av_channel_layout_custom_init` sizes
 /// the map for `nb_channels` entries, which is the shape every

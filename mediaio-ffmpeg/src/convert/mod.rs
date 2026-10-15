@@ -919,14 +919,19 @@ pub fn audio_frame_from(
   // `*const AVFrame`. `addr_of!` reaches `ch_layout.order` without
   // forming a reference, and it is read as the `i32` its bindgen enum is
   // stored as — the field may hold a value no variant names.
-  // `nb_channels` is a plain `c_int`. Nothing else is read, and the map
-  // is not touched.
-  let (order, channels) = unsafe {
+  // `nb_channels` and `nb_samples` are plain `c_int`s. Nothing else is
+  // read, and the map is not touched.
+  let (order, channels, nb_samples) = unsafe {
     (
       core::ptr::read_unaligned(core::ptr::addr_of!((*av_frame).ch_layout.order).cast::<i32>()),
       (*av_frame).ch_layout.nb_channels,
+      (*av_frame).nb_samples,
     )
   };
+  // The counts first, as the worker judges them: an impossible count is
+  // refused as one whatever the layout's order, and only a count the
+  // worker would take reaches the map question.
+  judge_audio_counts(nb_samples, channels)?;
   if matches!(
     crate::channel_layout::channel_order_from_raw(order),
     mediaframe::audio::ChannelOrder::Custom
@@ -2406,6 +2411,45 @@ fn map_chroma_loc(raw: i32) -> ChromaLocation {
   }
 }
 
+/// The audio road's two header counts, judged off their raw fields
+/// before anything reads them — the sample count, then the channel
+/// count — and answered as the types the road uses: the sample count,
+/// and a channel count proved to be in `0..=255`, and not zero under
+/// samples.
+///
+/// One judgement for both roads. [`av_frame_to_audio_frame_as`] runs it
+/// before it materialises the layout, and [`audio_frame_from`] before it
+/// refuses a custom map — so the safe road answers an impossible count
+/// exactly as the worker does, and asks the map question only of a count
+/// the worker would have taken.
+fn judge_audio_counts(
+  nb_samples_raw: i32,
+  channel_count_raw: i32,
+) -> Result<(u32, u8), ConvertError> {
+  if nb_samples_raw < 0 {
+    return Err(ConvertError::InvalidSampleCount(InvalidSampleCount::new(
+      nb_samples_raw,
+    )));
+  }
+  // Refused before any plane geometry, and refused for packed layouts
+  // too — which the old `> 8` plane check never reached, because packed
+  // audio declares one plane whatever its channel count is.
+  let Ok(channel_count) = u8::try_from(channel_count_raw) else {
+    return Err(ConvertError::UnsupportedChannelCount(
+      UnsupportedChannelCount::new(channel_count_raw),
+    ));
+  };
+  // A frame carrying samples across no channels is not an empty frame;
+  // it is an incoherent one. The packed byte product used to substitute
+  // 1 here, which invented a channel the file never declared.
+  if channel_count == 0 && nb_samples_raw > 0 {
+    return Err(ConvertError::UnsupportedChannelCount(
+      UnsupportedChannelCount::new(channel_count_raw),
+    ));
+  }
+  Ok((nb_samples_raw as u32, channel_count))
+}
+
 /// Converts an FFmpeg audio `AVFrame` into a `mediaspine::AudioFrame`.
 ///
 /// Each plane is copied out of the source frame's `AVBufferRef`
@@ -2488,12 +2532,9 @@ pub unsafe fn av_frame_to_audio_frame_as<C: crate::FfmpegCarrier + crate::Carrie
   // kept: it feeds no geometry, no allocation and no copy length — it
   // is metadata — and zero is already this crate's "rate unspecified".
   // Nothing downstream sizes anything from it.
-  if nb_samples_raw < 0 {
-    return Err(ConvertError::InvalidSampleCount(InvalidSampleCount::new(
-      nb_samples_raw,
-    )));
-  }
-  let nb_samples = nb_samples_raw as u32;
+  //
+  // The two counts are judged together, in `judge_audio_counts` below:
+  // the sample count first, then the channel count.
 
   // SAFETY: `av_frame` is a live `*const AVFrame`; passing the
   // address of the embedded ch_layout as `*const AVChannelLayout`
@@ -2525,29 +2566,8 @@ pub unsafe fn av_frame_to_audio_frame_as<C: crate::FfmpegCarrier + crate::Carrie
   // needs `addr_of!` + a raw `i32` read, and that read happens inside
   // the description helper below, not here.
   let channel_count_raw = unsafe { (*ch_layout_ptr).nb_channels };
-  if channel_count_raw < 0 {
-    return Err(ConvertError::UnsupportedChannelCount(
-      UnsupportedChannelCount::new(channel_count_raw),
-    ));
-  }
-  // Refused before any plane geometry, and refused for packed layouts
-  // too — which the old `> 8` plane check never reached, because packed
-  // audio declares one plane whatever its channel count is.
-  if channel_count_raw > i32::from(u8::MAX) {
-    return Err(ConvertError::UnsupportedChannelCount(
-      UnsupportedChannelCount::new(channel_count_raw),
-    ));
-  }
-  // A frame carrying samples across no channels is not an empty frame;
-  // it is an incoherent one. The packed byte product used to substitute
-  // 1 here, which invented a channel the file never declared.
-  if channel_count_raw == 0 && nb_samples > 0 {
-    return Err(ConvertError::UnsupportedChannelCount(
-      UnsupportedChannelCount::new(channel_count_raw),
-    ));
-  }
-  let channel_count_full = channel_count_raw as u32;
-  let channel_count = channel_count_raw as u8;
+  let (nb_samples, channel_count) = judge_audio_counts(nb_samples_raw, channel_count_raw)?;
+  let channel_count_full = u32::from(channel_count);
 
   // Materialised only now, with the count it will report already
   // proved to be one this crate can carry. Because the raw field is in
