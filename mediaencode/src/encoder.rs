@@ -184,6 +184,21 @@ pub enum EncodeRefusal {
   /// opened with.
   #[error("the frame's format is not the one the encoder was opened with")]
   Format,
+  /// An audio frame's sample rate is not the one the encoder was opened
+  /// with. An encoder does not resample; a frame is converted before it
+  /// is sent.
+  #[error("the frame is at {offered} Hz, the encoder was opened for {expected} Hz")]
+  SampleRate {
+    /// What the encoder was opened with.
+    expected: u32,
+    /// What the frame carries.
+    offered: u32,
+  },
+  /// An audio frame's channel layout is not the one the encoder was
+  /// opened with. The layout is the adapter's own type, as the format
+  /// is, so the refusal names the mismatch rather than the two layouts.
+  #[error("the frame's channel layout is not the one the encoder was opened with")]
+  ChannelLayout,
   /// An audio frame carries a sample count the encoder cannot take:
   /// through [`send_frame`](AudioEncoder::send_frame), any count but the
   /// encoder's [frame size](AudioEncoder::frame_size); through
@@ -295,9 +310,11 @@ pub trait AudioEncoder {
 
   /// Submits one raw frame.
   ///
-  /// Answers as [`VideoEncoder::send_frame`] does. A frame of any size
-  /// but the [frame size](Self::frame_size) is refused by name
-  /// ([`EncodeRefusal::FrameSize`]), with no exception for a short last
+  /// Answers as [`VideoEncoder::send_frame`] does. A frame whose sample
+  /// rate or channel layout is not the encoder's is refused by name
+  /// ([`EncodeRefusal::SampleRate`], [`EncodeRefusal::ChannelLayout`]),
+  /// as is one of any size but the [frame size](Self::frame_size)
+  /// ([`EncodeRefusal::FrameSize`]) — with no exception for a short last
   /// frame: the stream's last frame goes through
   /// [`send_final_frame`](Self::send_final_frame), which takes one.
   fn send_frame(
@@ -517,8 +534,14 @@ mod tests {
     }
   }
 
-  /// An audio encoder with a fixed frame size, a one-packet output queue,
-  /// and a codec that cannot reset.
+  /// The loopback's sample rate, and its channel layouts: `u32` ids, as
+  /// `ALoop` declares them.
+  const RATE: u32 = 48_000;
+  const STEREO: u32 = 3;
+  const MONO: u32 = 4;
+
+  /// An audio encoder opened for 48 kHz stereo, with a fixed frame size,
+  /// a one-packet output queue, and a codec that cannot reset.
   struct FixedAac {
     queued: bool,
     ended: bool,
@@ -538,12 +561,24 @@ mod tests {
       }
     }
 
-    /// What `send_frame` and `send_final_frame` share: the end, the size
-    /// rule — exact for a frame, at most the frame size for the last —
-    /// then back pressure.
+    /// What `send_frame` and `send_final_frame` share: the end, the rate
+    /// and the layout, the size rule — exact for a frame, at most the
+    /// frame size for the last — then back pressure.
     fn submit(&mut self, frame: &AFrame, last: bool) -> Result<Sent, EncodeError<Fault>> {
       if self.ended {
         return Err(EncodeRefusal::Ended.into());
+      }
+      if frame.sample_rate() != RATE {
+        return Err(
+          EncodeRefusal::SampleRate {
+            expected: RATE,
+            offered: frame.sample_rate(),
+          }
+          .into(),
+        );
+      }
+      if *frame.channel_layout() != STEREO {
+        return Err(EncodeRefusal::ChannelLayout.into());
       }
       let offered = frame.nb_samples();
       let fits = if last {
@@ -617,7 +652,21 @@ mod tests {
   }
 
   fn audio_frame(samples: u32) -> AFrame {
-    AudioFrame::new(48_000, samples, 2, 0, 0, [Plane::new(EMPTY, 0); 8], 1, ())
+    audio_frame_at(RATE, STEREO, samples)
+  }
+
+  fn audio_frame_at(rate: u32, layout: u32, samples: u32) -> AFrame {
+    let channels = if layout == MONO { 1 } else { 2 };
+    AudioFrame::new(
+      rate,
+      samples,
+      channels,
+      0,
+      layout,
+      [Plane::new(EMPTY, 0); 8],
+      1,
+      (),
+    )
   }
 
   /// Drains until the answer is not `Produced`, at most `bound` times,
@@ -911,6 +960,34 @@ mod tests {
         .expect("no fault"),
       Sent::Accepted
     );
+  }
+
+  /// **A frame at another rate or in another layout is refused by name.**
+  /// An encoder neither resamples nor remixes; the final frame is held to
+  /// the same rule, and nothing refused is consumed.
+  #[test]
+  fn an_audio_frame_at_another_rate_or_layout_is_refused_by_name() {
+    let mut encoder = FixedAac::new();
+    assert!(matches!(
+      encoder.send_frame(&audio_frame_at(44_100, STEREO, 1024)),
+      Err(EncodeError::Refused(EncodeRefusal::SampleRate {
+        expected: 48_000,
+        offered: 44_100
+      }))
+    ));
+    assert!(matches!(
+      encoder.send_frame(&audio_frame_at(RATE, MONO, 1024)),
+      Err(EncodeError::Refused(EncodeRefusal::ChannelLayout))
+    ));
+    assert!(matches!(
+      encoder.send_final_frame(&audio_frame_at(44_100, STEREO, 600)),
+      Err(EncodeError::Refused(EncodeRefusal::SampleRate { .. }))
+    ));
+    assert!(matches!(
+      encoder.send_final_frame(&audio_frame_at(RATE, MONO, 600)),
+      Err(EncodeError::Refused(EncodeRefusal::ChannelLayout))
+    ));
+    assert_eq!(encoder.accepted, 0, "a refused frame is not consumed");
   }
 
   /// Compiles only where both arguments are one type.
