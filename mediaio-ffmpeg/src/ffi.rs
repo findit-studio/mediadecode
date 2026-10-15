@@ -936,6 +936,32 @@ pub(crate) mod c_shims {
       formats: *mut *mut c_int,
       flags: c_int,
     ) -> c_int;
+
+    /// `AVCodecID` as `c_int`: whether a muxer can store a codec — `1`
+    /// yes, `0` no, negative when the muxer cannot tell. libavformat
+    /// answers every integer (its tag tables are searched, never
+    /// indexed).
+    pub(crate) fn avformat_query_codec(
+      ofmt: *const ffmpeg_next::ffi::AVOutputFormat,
+      codec_id: c_int,
+      std_compliance: c_int,
+    ) -> c_int;
+
+    /// `AVCodecID` as `c_int`: the tag a muxer's table gives a codec,
+    /// written to `tag`; answers `0` when the table names none.
+    pub(crate) fn av_codec_get_tag2(
+      tags: *const *const ffmpeg_next::ffi::AVCodecTag,
+      id: c_int,
+      tag: *mut libc::c_uint,
+    ) -> c_int;
+
+    /// Returns `AVCodecID` as `c_int`: the codec a muxer's table names
+    /// for a tag — `AV_CODEC_ID_NONE` where none — so an id this build's
+    /// bindings do not name is never formed into the enum.
+    pub(crate) fn av_codec_get_id(
+      tags: *const *const ffmpeg_next::ffi::AVCodecTag,
+      tag: libc::c_uint,
+    ) -> c_int;
   }
 }
 

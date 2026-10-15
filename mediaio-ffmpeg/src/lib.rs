@@ -36,6 +36,11 @@ pub mod frame;
 pub mod limits;
 #[doc(hidden)]
 pub mod measured;
+// The muxing context: public because the write adapter
+// (`mediaencode-ffmpeg`) drives it, hidden because nothing else should.
+// It takes no pointer from a caller, so nothing in it is an `unsafe fn`.
+#[doc(hidden)]
+pub mod output;
 mod pixdesc;
 #[doc(hidden)]
 pub mod reader_guard;

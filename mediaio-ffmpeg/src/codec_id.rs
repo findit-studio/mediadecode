@@ -122,6 +122,37 @@ impl CodecId {
       .map(Utf8Bytes::from_static)
   }
 
+  /// The MIME type libavcodec's descriptor names first for this codec —
+  /// `"image/png"`, `"application/x-truetype-font"` — or `None` where the
+  /// build has no descriptor for the id, or the descriptor names none.
+  ///
+  /// The word Matroska's muxer writes for an attachment whose row names
+  /// no MIME type of its own (`get_mimetype`, `libavformat/matroskaenc.c`
+  /// 2496–2511 in FFmpeg 9.0.1), and so the one a writer asks before it
+  /// opens one: an attachment with neither is refused there. Like
+  /// [`name`](Self::name), an open vocabulary — whatever the linked
+  /// libavcodec's table says.
+  pub fn mime_type(self) -> Option<&'static str> {
+    let descriptor = self.descriptor();
+    if descriptor.is_null() {
+      return None;
+    }
+    // SAFETY: as [`Self::name`]: `descriptor` points into libavcodec's
+    // static table and the field is reached through `addr_of!`, without
+    // forming a reference. `mime_types` is null, or a null-terminated
+    // array of NUL-terminated literals in that same table.
+    let list = unsafe { core::ptr::addr_of!((*descriptor).mime_types).read() };
+    if list.is_null() {
+      return None;
+    }
+    // SAFETY: a non-null `mime_types` holds at least its terminating
+    // null, so its first element is in bounds and initialised.
+    let first = unsafe { list.read() };
+    // SAFETY: `first` is null or a static, NUL-terminated literal, the
+    // reader's contract — a borrow valid for the process.
+    unsafe { crate::ffi::table_text(first, DESCRIPTOR_TEXT_MAX_BYTES) }
+  }
+
   /// libavcodec's descriptor for this id, or null where this build
   /// names no codec for it.
   ///
@@ -217,6 +248,19 @@ impl CodecId {
   pub const PCM_F32LE: Self = Self(AVCodecID::AV_CODEC_ID_PCM_F32LE as i32);
   /// PCM 64-bit float little-endian.
   pub const PCM_F64LE: Self = Self(AVCodecID::AV_CODEC_ID_PCM_F64LE as i32);
+
+  // --- Still-image and attachment codecs -------------------------------
+
+  /// PNG — a cover picture's usual codec.
+  pub const PNG: Self = Self(AVCodecID::AV_CODEC_ID_PNG as i32);
+  /// BMP — a cover picture MP4 can carry.
+  pub const BMP: Self = Self(AVCodecID::AV_CODEC_ID_BMP as i32);
+  /// TrueType font — a Matroska attachment.
+  pub const TTF: Self = Self(AVCodecID::AV_CODEC_ID_TTF as i32);
+  /// OpenType font — a Matroska attachment.
+  pub const OTF: Self = Self(AVCodecID::AV_CODEC_ID_OTF as i32);
+  /// Plain text — an attachment Matroska labels `text/plain`.
+  pub const TEXT: Self = Self(AVCodecID::AV_CODEC_ID_TEXT as i32);
 
   // --- Subtitle codecs -------------------------------------------------
 

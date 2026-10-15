@@ -982,7 +982,7 @@ pub unsafe fn with_ffmpeg_video_packet<C: crate::FfmpegCarrier + crate::CarrierO
 /// [`BodyRoute::Submission`] the packet returned may share the carrier's
 /// buffer, and nothing may write through it, shallow-clone it, or hand
 /// it to a caller. With [`BodyRoute::Copy`] there is nothing to prove.
-unsafe fn build_video_packet<C: crate::FfmpegCarrier + crate::CarrierOps>(
+pub(crate) unsafe fn build_video_packet<C: crate::FfmpegCarrier + crate::CarrierOps>(
   packet: &mediaspine::packet::VideoPacket<VideoPacketExtra, C::Buffer>,
   limits: PacketLimits,
   route: BodyRoute,
@@ -1101,7 +1101,7 @@ pub unsafe fn with_ffmpeg_audio_packet<C: crate::FfmpegCarrier + crate::CarrierO
 /// [`BodyRoute::Submission`] the packet returned may share the carrier's
 /// buffer, and nothing may write through it, shallow-clone it, or hand
 /// it to a caller. With [`BodyRoute::Copy`] there is nothing to prove.
-unsafe fn build_audio_packet<C: crate::FfmpegCarrier + crate::CarrierOps>(
+pub(crate) unsafe fn build_audio_packet<C: crate::FfmpegCarrier + crate::CarrierOps>(
   packet: &mediaspine::packet::AudioPacket<AudioPacketExtra, C::Buffer>,
   limits: PacketLimits,
   route: BodyRoute,
@@ -1220,7 +1220,7 @@ pub unsafe fn with_ffmpeg_subtitle_packet<C: crate::FfmpegCarrier + crate::Carri
 /// [`BodyRoute::Submission`] the packet returned may share the carrier's
 /// buffer, and nothing may write through it, shallow-clone it, or hand
 /// it to a caller. With [`BodyRoute::Copy`] there is nothing to prove.
-unsafe fn build_subtitle_packet<C: crate::FfmpegCarrier + crate::CarrierOps>(
+pub(crate) unsafe fn build_subtitle_packet<C: crate::FfmpegCarrier + crate::CarrierOps>(
   packet: &mediaspine::packet::SubtitlePacket<SubtitlePacketExtra, C::Buffer>,
   limits: PacketLimits,
   route: BodyRoute,
@@ -1253,6 +1253,68 @@ unsafe fn build_subtitle_packet<C: crate::FfmpegCarrier + crate::CarrierOps>(
   if let Some(d) = packet.duration() {
     out.set_duration(d.pts());
   }
+  write_md_flags(&mut out, packet.flags());
+  out.set_stream(packet.extra().stream_index() as usize);
+  Ok(out)
+}
+
+/// [`build_video_packet`] for a timed-data packet — the muxer's road
+/// for a data track. A data packet's decode time is its presentation
+/// time, so only the presentation timestamp is set here.
+///
+/// # Safety
+///
+/// [`build_video_packet`]'s, for `route`.
+pub(crate) unsafe fn build_data_packet<C: crate::FfmpegCarrier + crate::CarrierOps>(
+  packet: &DataPacket<DataPacketExtra, C::Buffer>,
+  limits: PacketLimits,
+  route: BodyRoute,
+) -> std::result::Result<Packet, PacketBuildError> {
+  let body = packet.data().as_ref();
+  refuse_trusted(packet.flags(), body.len())?;
+  check_side_data_budget(packet.extra().side_data())?;
+  if body.len() > limits.max_packet_bytes() {
+    return Err(PacketBuildError::SendPayloadTooLarge(
+      SendPayloadTooLarge::new(body.len(), limits.max_packet_bytes()),
+    ));
+  }
+  // SAFETY: this builder's own contract, forwarded for `route`. Nothing
+  // below writes the payload.
+  let mut out = unsafe { C::packet_body(packet.data(), route) }?;
+  attach_side_data(&mut out, packet.extra().side_data())?;
+  if let Some(ts) = packet.pts() {
+    out.set_pts(Some(ts.pts()));
+  }
+  if let Some(d) = packet.duration() {
+    out.set_duration(d.pts());
+  }
+  write_md_flags(&mut out, packet.flags());
+  out.set_stream(packet.extra().stream_index() as usize);
+  Ok(out)
+}
+
+/// [`build_video_packet`] for an attachment's one packet — the muxer's
+/// road for cover art, which a container that keeps an attached picture
+/// takes as a packet. It carries no timestamp and no side data.
+///
+/// # Safety
+///
+/// [`build_video_packet`]'s, for `route`.
+pub(crate) unsafe fn build_attachment_packet<C: crate::FfmpegCarrier + crate::CarrierOps>(
+  packet: &AttachmentPacket<AttachmentPacketExtra, C::Buffer>,
+  limits: PacketLimits,
+  route: BodyRoute,
+) -> std::result::Result<Packet, PacketBuildError> {
+  let body = packet.data().as_ref();
+  refuse_trusted(packet.flags(), body.len())?;
+  if body.len() > limits.max_packet_bytes() {
+    return Err(PacketBuildError::SendPayloadTooLarge(
+      SendPayloadTooLarge::new(body.len(), limits.max_packet_bytes()),
+    ));
+  }
+  // SAFETY: this builder's own contract, forwarded for `route`. Nothing
+  // below writes the payload.
+  let mut out = unsafe { C::packet_body(packet.data(), route) }?;
   write_md_flags(&mut out, packet.flags());
   out.set_stream(packet.extra().stream_index() as usize);
   Ok(out)
