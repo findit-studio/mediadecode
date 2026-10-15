@@ -270,7 +270,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierSubtitleStreamDecoder<C
       });
     }
     // SAFETY: `scratch.inner` is a live `AVSubtitle` filled by the
-    // decode this seat is holding — `avcodec_decode_subtitle2` wrote its
+    // decode whose result the scratch holds — `avcodec_decode_subtitle2` wrote its
     // rects, their strings and their planes, each plane for its own
     // `linesize[0] × h`. Conversion copies every rect it takes —
     // `AVSubtitleRect` has no refcounted buffer, so both lanes copy — and

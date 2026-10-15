@@ -1861,7 +1861,7 @@ fn a_packed_frame_at_255_channels_still_converts() {
       FrameLimits::default(),
     )
   }
-  .expect("255 channels is inside the seat");
+  .expect("255 channels is inside the frame's channel limit");
 
   assert_eq!(out.channel_count(), 255);
   assert_eq!(out.nb_samples(), 1);
@@ -2278,8 +2278,8 @@ fn a_still_refuses_oversized_side_data_rather_than_dropping_the_orientation() {
   let ok = with_side_data(4 * 1024 * 1024);
   // SAFETY: `allocated_picture` wrote every buffer and `with_side_data` every side-data byte;
   // the frame is live for the call.
-  let image =
-    unsafe { convert::image_frame_from(&ok, FrameLimits::default()) }.expect("inside the seat");
+  let image = unsafe { convert::image_frame_from(&ok, FrameLimits::default()) }
+    .expect("inside the side-data budget");
   let kinds: Vec<i32> = image.extra().side_data().iter().map(|e| e.kind()).collect();
   assert!(kinds.contains(&(ICC as i32)), "the profile was dropped");
   assert!(
@@ -2652,7 +2652,9 @@ fn the_hardware_road_still_delivers_frames_through_its_new_seat() {
     let mut packet = ffmpeg_next::Packet::empty();
     match packet.read(&mut input) {
       Ok(()) if packet.stream() == index => {
-        if decoder.send_packet(&packet).is_err() {
+        // SAFETY: `Packet::read` is `av_read_frame`, so libavformat wrote the packet, and
+        // nothing writes through it while the decoder may still read it.
+        if unsafe { decoder.send_av_packet(&packet) }.is_err() {
           continue;
         }
         if matches!(decoder.receive_frame(&mut frame), Ok(Received::Produced)) {
@@ -2716,7 +2718,9 @@ fn a_cropped_stream_is_judged_on_what_it_allocates_not_what_it_displays() {
       match packet.read(&mut input) {
         Ok(()) if packet.stream() == index => {
           // Answer dropped: see the note on the first ceiling probe above.
-          let _ = decoder.send_packet(&packet)?;
+          // SAFETY: `Packet::read` is `av_read_frame`, so libavformat wrote the packet, and
+          // nothing writes through it while the decoder may still read it.
+          let _ = unsafe { decoder.send_av_packet(&packet) }?;
           match decoder.receive_frame(&mut frame) {
             Ok(Received::Produced) => return Ok(()),
             Ok(Received::NeedsInput | Received::Ended) => continue,
@@ -2907,8 +2911,11 @@ fn every_hardware_exit_names_the_coded_surface_refusal() {
         // *receive* is refused by the ceiling. A `MustDrain` here
         // simply means the decoder had output waiting, which the
         // receive below is about to take.
-        let outcome = decoder
-          .send_packet(&packet)
+        //
+        // SAFETY: `Packet::read` is `av_read_frame`, so libavformat wrote
+        // the packet, and nothing writes through it while the decoder
+        // may still read it.
+        let outcome = unsafe { decoder.send_av_packet(&packet) }
           .and_then(|_| decoder.receive_frame(&mut frame));
         match outcome {
           Ok(Received::Produced) => panic!("a 2 Mpx coded surface passed a 1 Mpx ceiling"),
@@ -2976,7 +2983,9 @@ fn a_cheap_format_is_not_charged_the_worst_formats_price() {
       match packet.read(&mut input) {
         Ok(()) if packet.stream() == index => {
           // Answer dropped: see the note on the first ceiling probe above.
-          let _ = decoder.send_packet(&packet)?;
+          // SAFETY: `Packet::read` is `av_read_frame`, so libavformat wrote the packet, and
+          // nothing writes through it while the decoder may still read it.
+          let _ = unsafe { decoder.send_av_packet(&packet) }?;
           match decoder.receive_frame(&mut frame) {
             Ok(Received::Produced) => return Ok(()),
             Ok(Received::NeedsInput | Received::Ended) => continue,
@@ -3084,8 +3093,11 @@ fn a_byte_refused_frame_is_named_on_every_software_road() {
         // *receive* is refused by the ceiling. A `MustDrain` here
         // simply means the decoder had output waiting, which the
         // receive below is about to take.
-        let outcome = decoder
-          .send_packet(&packet)
+        //
+        // SAFETY: `Packet::read` is `av_read_frame`, so libavformat wrote
+        // the packet, and nothing writes through it while the decoder
+        // may still read it.
+        let outcome = unsafe { decoder.send_av_packet(&packet) }
           .and_then(|_| decoder.receive_frame(&mut frame));
         match outcome {
           Ok(Received::Produced) => panic!("a 3.1 MB frame passed a 1 MiB ceiling"),

@@ -60,7 +60,9 @@ fn auto_probe_picks_hardware_backend() {
     // (which either completes the smoke test or frees queue space),
     // then retry send_packet.
     loop {
-      match decoder.send_packet(&packet) {
+      // SAFETY: `packets()` reads each packet with `av_read_frame`, so libavformat wrote it,
+      // and nothing writes through it while the decoder may still read it.
+      match unsafe { decoder.send_av_packet(&packet) } {
         Ok(Sent::Accepted) => break,
         // The two-offer rule, retired: the decoder says which it is,
         // so this drains and re-offers the same packet instead of

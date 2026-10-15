@@ -89,7 +89,8 @@ fn remux<Dm, M>(
   muxer.finish().expect("the container is finished");
 }
 
-/// A text seat's contents, owned — through its `AsRef<str>` alone.
+/// A text carrier's contents, owned — read through its `AsRef<str>`
+/// alone.
 fn owned_text(text: &impl AsRef<str>) -> String {
   text.as_ref().to_owned()
 }
