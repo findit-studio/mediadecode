@@ -33,10 +33,20 @@ Its versions are its own: they do not move with the rest of the family's.
   parameters by name (`AttachmentWithoutFile`).
 - **`TrackDescription::from_track_info`**: the lossless conversion
   from a demuxed `TrackInfo` and the payload delivered for it, for a
-  remux. What only the read side states (the library's duration, the
-  backend's extras) comes back beside it; a row that does not fit — an
-  attachment without its payload, a payload for another kind, an
-  attachment's identity claimed by another kind — is refused by name
-  with everything handed back (`TrackMismatch`, `MismatchReason`).
+  remux. It **borrows** the row, so a remux describes each track from
+  the handle `Demuxer::tracks` hands out and the session keeps its rows;
+  the portable fields are copied explicitly. What only the read side
+  states (the library's duration, the backend's extras) stays on the
+  row. A row that does not fit — an attachment without its payload, a
+  payload for another kind, an attachment's identity claimed by another
+  kind — is refused by name, the row's kind named and the payload and
+  side data handed back (`TrackMismatch`, `MismatchReason`).
+- **`TrackParams::duplicate`**: a field-by-field copy of a track's
+  parameters, by name — the message-carrier law keeps `Clone` off the
+  type, and a consumer that needs parameters of its own spells the copy
+  out.
+- **`DemuxAdapter::Text` is `Clone`**: a copy of `&'static str` or a
+  refcount bump of a shared string, how the conversion takes a row's
+  text from a row it borrows.
 - `no_std` with no allocator required; `alloc`, `std`, `serde`,
   `arbitrary` and `quickcheck` as in `mediadecode`.

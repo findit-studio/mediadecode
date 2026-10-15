@@ -131,13 +131,19 @@ pub trait DemuxAdapter {
   type TrackExtra;
 
   /// Text carrier for a track's identity metadata — the attachment
-  /// filename and MIME type on [`TrackInfo`].
+  /// filename and MIME type on [`TrackInfo`], and its language.
   ///
   /// A seat rather than a fixed string type so the core stays
   /// allocator-free: a backend with compile-time names can bind
   /// `&'static str`, one that reads them out of a container binds an
   /// owned inline string.
-  type Text: AsRef<str> + Debug;
+  ///
+  /// `Clone`, as a message carrier is: a copy of `&'static str` or a
+  /// refcount bump of a shared string, never a deep copy. It is how the
+  /// write side's conversion,
+  /// [`TrackDescription::from_track_info`](crate::track::TrackDescription::from_track_info),
+  /// takes a row's text from a row it only borrows.
+  type Text: AsRef<str> + Clone + Debug;
 }
 
 /// The [`VideoPacket`] a [`DemuxAdapter`] delivers over buffer `D`.
@@ -680,6 +686,63 @@ impl<E: DemuxAdapter> TrackParams<E> {
       Self::Unknown(p) => p.codec(),
     }
   }
+
+  /// A field-by-field copy of these parameters — **named, and not
+  /// `Clone`**.
+  ///
+  /// The message-carrier law keeps `Clone` off this type: `Clone` is a
+  /// refcount bump, and a deep copy of parameters is not one. A consumer
+  /// that does need parameters of its own — the write side's
+  /// [`TrackDescription::from_track_info`](crate::track::TrackDescription::from_track_info),
+  /// which describes a track from a row it only borrows — asks for the
+  /// copy by name, so the cost is written where it is paid.
+  ///
+  /// Every field is copied explicitly, by destructuring, so a field added
+  /// to a payload is a compile error here rather than a field silently
+  /// left behind: the codec, sample format and frame rate by `Copy`, and
+  /// the backend's pixel format and channel layout through their own
+  /// `Clone`.
+  #[must_use]
+  pub fn duplicate(&self) -> Self {
+    match self {
+      Self::Video(VideoTrackParams {
+        codec,
+        width,
+        height,
+        pixel_format,
+        frame_rate,
+      }) => Self::Video(VideoTrackParams {
+        codec: *codec,
+        width: *width,
+        height: *height,
+        pixel_format: pixel_format.clone(),
+        frame_rate: *frame_rate,
+      }),
+      Self::Audio(AudioTrackParams {
+        codec,
+        sample_rate,
+        channel_count,
+        sample_format,
+        channel_layout,
+      }) => Self::Audio(AudioTrackParams {
+        codec: *codec,
+        sample_rate: *sample_rate,
+        channel_count: *channel_count,
+        sample_format: *sample_format,
+        channel_layout: channel_layout.clone(),
+      }),
+      Self::Subtitle(SubtitleTrackParams { codec }) => {
+        Self::Subtitle(SubtitleTrackParams { codec: *codec })
+      }
+      Self::Data(DataTrackParams { codec }) => Self::Data(DataTrackParams { codec: *codec }),
+      Self::Attachment(AttachmentTrackParams { codec }) => {
+        Self::Attachment(AttachmentTrackParams { codec: *codec })
+      }
+      Self::Unknown(UnknownTrackParams { codec }) => {
+        Self::Unknown(UnknownTrackParams { codec: *codec })
+      }
+    }
+  }
 }
 
 // `Debug` is hand-written, not derived: a flat `#[derive(Debug)]`
@@ -911,35 +974,6 @@ impl<E: DemuxAdapter> TrackInfo<E> {
   pub fn set_language(&mut self, v: Option<E::Text>) -> &mut Self {
     self.language = v;
     self
-  }
-}
-
-/// Everything a [`TrackInfo`] holds, moved out whole — what the write
-/// side's lossless conversion,
-/// [`TrackDescription::from_track_info`](crate::track::TrackDescription::from_track_info),
-/// takes apart. Crate-private: the row's public face is unchanged.
-pub(crate) struct TrackInfoFields<E: DemuxAdapter> {
-  pub(crate) timebase: Timebase,
-  pub(crate) duration: Option<Timestamp>,
-  pub(crate) params: TrackParams<E>,
-  pub(crate) filename: Option<E::Text>,
-  pub(crate) mime_type: Option<E::Text>,
-  pub(crate) language: Option<E::Text>,
-  pub(crate) extra: E::TrackExtra,
-}
-
-impl<E: DemuxAdapter> TrackInfo<E> {
-  /// Moves every field out, for the write side's conversion.
-  pub(crate) fn into_fields(self) -> TrackInfoFields<E> {
-    TrackInfoFields {
-      timebase: self.timebase,
-      duration: self.duration,
-      params: self.params,
-      filename: self.filename,
-      mime_type: self.mime_type,
-      language: self.language,
-      extra: self.extra,
-    }
   }
 }
 

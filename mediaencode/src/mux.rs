@@ -19,6 +19,7 @@
 //! the timed packets:
 //!
 //! ```
+//! use core::ops::Deref;
 //! use mediaencode::{MuxError, Muxer};
 //! use mediaencode::mediaspine::{
 //!   demuxer::{DemuxAdapter, DemuxedPacket, TrackInfo},
@@ -29,8 +30,12 @@
 //! /// attachment track carrying the payload the demuxer delivered for it
 //! /// before its first timed packet — which comes back too, for the
 //! /// write loop.
-//! fn table<A: DemuxAdapter, B>(
-//!   rows: Vec<TrackInfo<A>>,
+//! ///
+//! /// `rows` is what a demuxer's `tracks()` answers: handles that
+//! /// dereference to the rows its session keeps. Each row is described
+//! /// through a borrow, so nothing is taken from the session.
+//! fn table<A: DemuxAdapter, B, H: Deref<Target = TrackInfo<A>>>(
+//!   rows: &[H],
 //!   packets: &mut impl Iterator<Item = DemuxedPacket<A, B>>,
 //! ) -> Result<
 //!   (Vec<TrackDescription<A, B, ()>>, Option<DemuxedPacket<A, B>>),
@@ -53,9 +58,9 @@
 //!     }
 //!   }
 //!   let mut table = Vec::with_capacity(rows.len());
-//!   for (row, file) in rows.into_iter().zip(files) {
-//!     let (description, _duration, _extra) = TrackDescription::from_track_info(row, file, ())?;
-//!     table.push(description);
+//!   for (row, file) in rows.iter().zip(files) {
+//!     // `&**row`: the handle, dereferenced to the row it shares.
+//!     table.push(TrackDescription::from_track_info(&**row, file, ())?);
 //!   }
 //!   Ok((table, first))
 //! }

@@ -17,7 +17,7 @@
 use core::fmt::{self, Debug};
 
 use crate::{
-  Timebase, Timestamp,
+  Timebase,
   demuxer::{
     AttachmentTrackParams, DemuxAdapter, DemuxAttachmentPacket, TrackInfo, TrackKind, TrackParams,
   },
@@ -120,24 +120,34 @@ impl<E: DemuxAdapter, D, S> TrackDescription<E, D, S> {
   /// attachment track its file, from `payload` (the packet the demuxer
   /// delivered for it at open) and the row's filename and MIME type.
   ///
-  /// What only the read side states comes back beside the description,
-  /// untouched: the duration the library reported, and the backend's
-  /// extras. Extradata is the backend's to set
-  /// ([`with_extradata`](Self::with_extradata)): this tier's row does not
-  /// carry it.
+  /// **The row is borrowed, never consumed.** A demuxer keeps its rows
+  /// for its whole session and hands out handles on them — the
+  /// `Demuxer::tracks` face of `mediadecode` answers a slice of handles
+  /// that dereference to rows — so a remux describes each track from the
+  /// handle it holds (`&**handle`), and the session keeps every row. The
+  /// portable fields are copied explicitly: the timebase by `Copy`, the
+  /// parameters by their named [`TrackParams::duplicate`], and the
+  /// language, filename and MIME type by the text carrier's `Clone`, a
+  /// refcount bump.
   ///
-  /// Refused by name, with everything given handed back
+  /// What only the read side states stays on the row: the duration the
+  /// library reported, and the backend's extras. Extradata is the
+  /// backend's to set ([`with_extradata`](Self::with_extradata)): this
+  /// tier's row does not carry it.
+  ///
+  /// Refused by name, with what was given handed back
   /// ([`TrackMismatch`]): an attachment track with no `payload`, a
   /// `payload` for a track of another kind, and a row of another kind
   /// that claims an attachment's filename or MIME type — which the row
   /// states for attachments alone, and which this side has nowhere to
   /// carry for any other kind.
   pub fn from_track_info(
-    info: TrackInfo<E>,
+    info: &TrackInfo<E>,
     payload: Option<DemuxAttachmentPacket<E, D>>,
     side_data: S,
-  ) -> Result<(Self, Option<Timestamp>, E::TrackExtra), TrackMismatch<E, D, S>> {
-    let attachment = matches!(info.kind(), TrackKind::Attachment);
+  ) -> Result<Self, TrackMismatch<E, D, S>> {
+    let kind = info.kind();
+    let attachment = matches!(kind, TrackKind::Attachment);
     let reason = match (attachment, payload.is_some()) {
       (true, false) => Some(MismatchReason::MissingFile),
       (false, true) => Some(MismatchReason::StrayFile),
@@ -149,34 +159,34 @@ impl<E: DemuxAdapter, D, S> TrackDescription<E, D, S> {
     if let Some(reason) = reason {
       return Err(TrackMismatch {
         reason,
-        info,
+        kind,
         payload,
         side_data,
       });
     }
 
-    // Taken apart only now that the row is accepted, so a refusal above
-    // could hand it back whole.
-    let fields = info.into_fields();
-    let description = match (fields.params, payload) {
+    // The portable fields, each copied by name from the borrowed row.
+    let timebase = info.timebase();
+    let params = info.params().duplicate();
+    let language = info.language().cloned();
+    Ok(match (params, payload) {
       (TrackParams::Attachment(params), Some(payload)) => {
         let file = AttachedFile::new(payload)
-          .with_filename(fields.filename)
-          .with_mime_type(fields.mime_type);
-        Self::attachment(fields.timebase, params, file, side_data).with_language(fields.language)
+          .with_filename(info.filename().cloned())
+          .with_mime_type(info.mime_type().cloned());
+        Self::attachment(timebase, params, file, side_data).with_language(language)
       }
       // Any other kind, with no payload (the reasons above leave nothing
       // else), and no identity to carry.
       (params, _) => Self {
-        timebase: fields.timebase,
+        timebase,
         params,
         extradata: None,
         side_data,
-        language: fields.language,
+        language,
         file: None,
       },
-    };
-    Ok((description, fields.duration, fields.extra))
+    })
   }
 
   /// Returns the track's kind, read off [`Self::params`].
@@ -456,10 +466,12 @@ pub enum MismatchReason {
 }
 
 /// [`TrackDescription::from_track_info`] refused a row, by name: the
-/// [reason](Self::reason), and everything it was given, handed back.
+/// [reason](Self::reason) and the row's [kind](Self::kind), and what it
+/// was given by value — the payload and the side data — handed back. The
+/// row itself was only borrowed, and is still the caller's.
 pub struct TrackMismatch<E: DemuxAdapter, D, S> {
   reason: MismatchReason,
-  info: TrackInfo<E>,
+  kind: TrackKind,
   payload: Option<DemuxAttachmentPacket<E, D>>,
   side_data: S,
 }
@@ -471,10 +483,16 @@ impl<E: DemuxAdapter, D, S> TrackMismatch<E, D, S> {
     self.reason
   }
 
-  /// Returns the row, the payload and the side data, as they were given.
+  /// The kind of the row that was refused.
   #[cfg_attr(not(tarpaulin), inline(always))]
-  pub fn into_parts(self) -> (TrackInfo<E>, Option<DemuxAttachmentPacket<E, D>>, S) {
-    (self.info, self.payload, self.side_data)
+  pub const fn kind(&self) -> TrackKind {
+    self.kind
+  }
+
+  /// Returns the payload and the side data, as they were given.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub fn into_parts(self) -> (Option<DemuxAttachmentPacket<E, D>>, S) {
+    (self.payload, self.side_data)
   }
 }
 
@@ -482,7 +500,7 @@ impl<E: DemuxAdapter, D, S> Debug for TrackMismatch<E, D, S> {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     f.debug_struct("TrackMismatch")
       .field("reason", &self.reason)
-      .field("kind", &self.info.kind())
+      .field("kind", &self.kind)
       .finish_non_exhaustive()
   }
 }
@@ -493,15 +511,13 @@ impl<E: DemuxAdapter, D, S> fmt::Display for TrackMismatch<E, D, S> {
       MismatchReason::MissingFile => {
         f.write_str("an attachment track came without the payload the demuxer delivered for it")
       }
-      MismatchReason::StrayFile => write!(
-        f,
-        "an attachment payload came for a {:?} track",
-        self.info.kind()
-      ),
+      MismatchReason::StrayFile => {
+        write!(f, "an attachment payload came for a {:?} track", self.kind)
+      }
       MismatchReason::StrayIdentity => write!(
         f,
         "a {:?} track claims an attachment's filename or MIME type",
-        self.info.kind()
+        self.kind
       ),
     }
   }
@@ -515,8 +531,12 @@ mod tests {
 
   use super::*;
   use crate::{
+    Timestamp,
     adapter::{AudioAdapter, SubtitleAdapter, VideoAdapter},
-    demuxer::{AttachmentPacket, AudioTrackParams, VideoTrackParams},
+    demuxer::{
+      AttachmentPacket, AudioTrackParams, DataTrackParams, SubtitleTrackParams, UnknownTrackParams,
+      VideoTrackParams,
+    },
     packet::PacketFlags,
   };
 
@@ -634,12 +654,10 @@ mod tests {
   /// the track's one file, with the track's language beside it.
   #[test]
   fn an_attachments_identity_and_payload_survive_the_conversion() {
-    let (description, duration, ()) = TrackDescription::<Loopback, &[u8], ()>::from_track_info(
-      font_row(),
-      Some(font_payload()),
-      (),
-    )
-    .expect("an attachment track with its file");
+    let row = font_row();
+    let description =
+      TrackDescription::<Loopback, &[u8], ()>::from_track_info(&row, Some(font_payload()), ())
+        .expect("an attachment track with its file");
     assert_eq!(description.kind(), TrackKind::Attachment);
     assert_eq!(description.codec(), 98_307);
     assert_eq!(description.language(), Some(&"und"));
@@ -653,12 +671,12 @@ mod tests {
       "the very bytes the demuxer delivered"
     );
     assert_eq!(file.payload().flags(), PacketFlags::KEY);
-    assert_eq!(duration, None);
+    assert_eq!(row.filename(), Some(&"Noto.otf"), "the row is still whole");
   }
 
   /// **A track's language survives the conversion**, for every kind, and
-  /// what only the read side states — the library's duration — comes
-  /// back beside the description.
+  /// what only the read side states — the library's duration — stays on
+  /// the row, which the conversion only borrows.
   #[test]
   fn a_tracks_language_survives_the_conversion() {
     let reported = Timestamp::new(90_000, ms_tb());
@@ -669,12 +687,66 @@ mod tests {
     )
     .with_language(Some("deu"))
     .with_duration(Some(reported));
-    let (description, duration, ()) =
-      TrackDescription::<Loopback, &[u8], ()>::from_track_info(row, None, ())
-        .expect("an audio track");
+    let description = TrackDescription::<Loopback, &[u8], ()>::from_track_info(&row, None, ())
+      .expect("an audio track");
     assert_eq!(description.language(), Some(&"deu"));
     assert!(description.file().is_none());
-    assert_eq!(duration, Some(reported));
+    assert_eq!(row.duration(), Some(reported), "the row keeps its duration");
+    assert_eq!(row.language(), Some(&"deu"), "and its language");
+  }
+
+  /// **The conversion borrows its row and copies every portable field.**
+  /// A row is described twice from one borrow — as a remux describes it
+  /// from the handle a demuxer keeps — and both descriptions carry every
+  /// field of every arm's parameters, the timebase and the language, while
+  /// the row stays as it was.
+  #[test]
+  fn the_conversion_borrows_its_row_and_copies_every_portable_field() {
+    let tb = Timebase::new(1, core::num::NonZeroI32::new(90_000).expect("non-zero"));
+    let rate = Some(Timebase::new(
+      30_000,
+      core::num::NonZeroI32::new(1001).expect("non-zero"),
+    ));
+    let arms: [TrackParams<Loopback>; 5] = [
+      TrackParams::Video(VideoTrackParams::new(27, 1920, 1080, 64, rate)),
+      TrackParams::Audio(AudioTrackParams::new(86018, 44_100, 6, 8, 1551)),
+      TrackParams::Subtitle(SubtitleTrackParams::new(94_210)),
+      TrackParams::Data(DataTrackParams::new(98_313)),
+      TrackParams::Unknown(UnknownTrackParams::new(0)),
+    ];
+    for params in arms {
+      let row = TrackInfo::<Loopback>::new(tb, params, ()).with_language(Some("jpn"));
+      for _ in 0..2 {
+        let description = TrackDescription::<Loopback, &[u8], ()>::from_track_info(&row, None, ())
+          .expect("a track of packets");
+        assert_eq!(description.timebase(), tb);
+        assert_eq!(description.language(), Some(&"jpn"));
+        assert_eq!(description.kind(), row.kind());
+        match (description.params(), row.params()) {
+          (TrackParams::Video(copy), TrackParams::Video(source)) => {
+            assert_eq!(copy.codec(), source.codec());
+            assert_eq!(
+              (copy.width(), copy.height()),
+              (source.width(), source.height())
+            );
+            assert_eq!(copy.pixel_format(), source.pixel_format());
+            assert_eq!(copy.frame_rate(), source.frame_rate());
+          }
+          (TrackParams::Audio(copy), TrackParams::Audio(source)) => {
+            assert_eq!(copy.codec(), source.codec());
+            assert_eq!(copy.sample_rate(), source.sample_rate());
+            assert_eq!(copy.channel_count(), source.channel_count());
+            assert_eq!(copy.sample_format(), source.sample_format());
+            assert_eq!(copy.channel_layout(), source.channel_layout());
+          }
+          (copy, source) => {
+            assert_eq!(copy.kind(), source.kind());
+            assert_eq!(copy.codec(), source.codec());
+          }
+        }
+      }
+      assert_eq!(row.language(), Some(&"jpn"), "the row is untouched");
+    }
   }
 
   /// **An attachment track has exactly one file.** Without one it is
@@ -682,14 +754,16 @@ mod tests {
   /// alike — and everything given comes back; a second has no seat.
   #[test]
   fn an_attachment_track_without_its_file_is_refused_by_name() {
-    let refused = TrackDescription::<Loopback, &[u8], ()>::from_track_info(font_row(), None, ())
+    let row = font_row();
+    let refused = TrackDescription::<Loopback, &[u8], ()>::from_track_info(&row, None, ())
       .expect_err("no file, no attachment track");
     assert_eq!(refused.reason(), MismatchReason::MissingFile);
-    let (row, payload, ()) = refused.into_parts();
+    assert_eq!(refused.kind(), TrackKind::Attachment);
+    let (payload, ()) = refused.into_parts();
     assert_eq!(
       row.filename(),
       Some(&"Noto.otf"),
-      "the row comes back whole"
+      "the row was only borrowed, and is whole"
     );
     assert!(payload.is_none());
 
@@ -716,17 +790,18 @@ mod tests {
       )
     };
     let refused =
-      TrackDescription::<Loopback, &[u8], ()>::from_track_info(video(), Some(font_payload()), ())
+      TrackDescription::<Loopback, &[u8], ()>::from_track_info(&video(), Some(font_payload()), ())
         .expect_err("a video track takes no file");
     assert_eq!(refused.reason(), MismatchReason::StrayFile);
-    let (_, payload, ()) = refused.into_parts();
+    assert_eq!(refused.kind(), TrackKind::Video);
+    let (payload, ()) = refused.into_parts();
     assert!(
       core::ptr::eq(*payload.expect("handed back").data(), FONT),
       "the payload comes back untouched"
     );
 
     let refused = TrackDescription::<Loopback, &[u8], ()>::from_track_info(
-      video().with_filename(Some("not-a-font.otf")),
+      &video().with_filename(Some("not-a-font.otf")),
       None,
       (),
     )

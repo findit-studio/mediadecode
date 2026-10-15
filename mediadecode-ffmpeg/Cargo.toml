@@ -64,6 +64,9 @@ mediaio-ffmpeg = { workspace = true, features = ["test-support"] }
 # containers, cover art, sine WAVs) with the `ffmpeg` CLI at run time —
 # see `tests/support/mod.rs`. This is where it goes.
 tempfile  = { workspace = true }
+# The write faces, for `tests/generic_remux.rs`: a remux written against
+# `Demuxer` and `Muxer` alone, run over this crate's demuxer.
+mediaencode = { workspace = true, features = ["std"] }
 
 [[example]]
 name = "decode"
