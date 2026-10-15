@@ -110,15 +110,7 @@ impl Marker {
 ///
 /// Marked `#[non_exhaustive]`: a later color joins as a variant.
 #[derive(
-  Debug,
-  Clone,
-  Copy,
-  Default,
-  PartialEq,
-  Eq,
-  Hash,
-  derive_more::IsVariant,
-  derive_more::Display,
+  Debug, Clone, Copy, Default, PartialEq, Eq, Hash, derive_more::IsVariant, derive_more::Display,
 )]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]

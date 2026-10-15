@@ -835,7 +835,10 @@ fn marker(marker: &Marker, range: Counted, exact: Option<Value>) -> Value {
 /// each as `num/den`.
 fn exact_ruler(ruler: Ruler, timebase: Timebase) -> Value {
   object(vec![
-    ("ruler", Value::String(format_utf8bytes!("{}", ruler.exact()))),
+    (
+      "ruler",
+      Value::String(format_utf8bytes!("{}", ruler.exact())),
+    ),
     ("timebase", Value::String(format_utf8bytes!("{timebase}"))),
   ])
 }

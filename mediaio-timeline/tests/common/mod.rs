@@ -45,10 +45,7 @@ pub fn law() -> Timeline {
             TimeRange::new(24_024, 120_120, movie),
             TimeRange::new(0, 96, edit),
           )
-          .with_marker(Marker::new(
-            "slate",
-            TimeRange::new(48_048, 72_072, movie),
-          )),
+          .with_marker(Marker::new("slate", TimeRange::new(48_048, 72_072, movie))),
         )
         .with_clip(
           Clip::new(

@@ -566,8 +566,8 @@ fn every_count_in_the_goldens_is_one_an_f64_holds_exactly() {
     let mut times = Vec::new();
     named(&root, "RationalTime.1", &mut times);
     // The start; per clip its source and available ranges; per gap its range;
-    // per transition its two offsets.
-    assert_eq!(times.len(), 1 + 3 * 4 + 2 * 2 + 3 * 2);
+    // per transition its two offsets; per marker its range.
+    assert_eq!(times.len(), 1 + 3 * 4 + 2 * 2 + 3 * 2 + 2 * 2);
     for time in &times {
       // A whole count within ±2^53, written as `<digits>.0`, which an f64
       // reads back as exactly that count.
@@ -585,7 +585,7 @@ fn every_count_in_the_goldens_is_one_an_f64_holds_exactly() {
     }
     let mut ranges = Vec::new();
     named(&root, "TimeRange.1", &mut ranges);
-    assert_eq!(ranges.len(), 3 * 2 + 2);
+    assert_eq!(ranges.len(), 3 * 2 + 2 + 2);
     for range in ranges {
       let time = |key: &str| match range.iter().find(|(k, _)| k == key) {
         Some((_, Value::Object(members))) => members.as_slice(),
@@ -1060,7 +1060,10 @@ fn words(value: &Value) -> Vec<(String, String)> {
     .map(|(key, word)| {
       let mut text = Utf8BytesMut::new();
       json::write_pretty(word, &mut text);
-      (String::from(key.as_str()), String::from(text.freeze_shared().as_str()))
+      (
+        String::from(key.as_str()),
+        String::from(text.freeze_shared().as_str()),
+      )
     })
     .collect()
 }
@@ -1124,7 +1127,10 @@ fn markers_are_written_as_marker_2_where_their_owners_count_time() {
     (48_000.0, 60_000.0, 12_000.0)
   );
   let range = "{\n    \"ruler\": \"48000/1\",\n    \"timebase\": \"1/48000\"\n}";
-  assert_eq!(words(&on_clip), [(String::from("range"), String::from(range))]);
+  assert_eq!(
+    words(&on_clip),
+    [(String::from("range"), String::from(range))]
+  );
 }
 
 #[test]
@@ -1166,7 +1172,10 @@ fn the_exact_words_name_the_edit_rate_and_each_ranges_rulers() {
       (String::from("available"), String::from(exact)),
     ]
   );
-  assert_eq!(source_range(&timeline), (Rate::FPS_29_97.as_f64(), 1.0, 30.0));
+  assert_eq!(
+    source_range(&timeline),
+    (Rate::FPS_29_97.as_f64(), 1.0, 30.0)
+  );
 }
 
 /// Three abutting clips with a dissolve at each of their two cuts, kept in
@@ -1264,8 +1273,11 @@ fn a_marker_no_ruler_holds_whole_is_refused_by_name() {
   // coarsest whole ruler that lands on it — the same thirds — count past
   // 2^53, and no operand's ruler holds it either.
   let mut timeline = marked();
-  timeline.tracks_mut()[0].clips_mut()[0].markers_mut()[0]
-    .set_range(TimeRange::new(0, 1 << 62, tb(1, 3)));
+  timeline.tracks_mut()[0].clips_mut()[0].markers_mut()[0].set_range(TimeRange::new(
+    0,
+    1 << 62,
+    tb(1, 3),
+  ));
   assert_eq!(validate(&timeline), Ok(()));
   let refused = match to_otio(&timeline, OtioTarget::V0_15Plus) {
     Err(Refused::NotRepresentable(count)) => count,
@@ -1284,8 +1296,9 @@ fn a_marker_no_ruler_holds_whole_is_refused_by_name() {
   );
   assert_eq!(refused.searched().map(|search| search.walks()), Some(0));
   assert!(
-    std::string::ToString::to_string(&refused)
-      .starts_with("the marked range of track 0, clip 0, marker 0 counts 4611686018427387904 ticks"),
+    std::string::ToString::to_string(&refused).starts_with(
+      "the marked range of track 0, clip 0, marker 0 counts 4611686018427387904 ticks"
+    ),
     "{refused}"
   );
 }

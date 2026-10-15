@@ -52,10 +52,7 @@ fn sample() -> Timeline {
             Duration::new(24, edit),
             FadeShape::EqualPower,
           ))))
-          .with_marker(Marker::new(
-            "slate",
-            TimeRange::new(48_048, 72_072, media),
-          )),
+          .with_marker(Marker::new("slate", TimeRange::new(48_048, 72_072, media))),
         )
         .with_transition(Transition::dissolve(
           Timestamp::new(96, edit),
@@ -477,10 +474,7 @@ fn markers_left_out_read_as_none_and_a_marker_reads_strictly() {
   // A document from before markers — none written — reads with none, and
   // a timeline without markers writes no `markers` word at all.
   let mut doc = serde_json::to_value(sample()).unwrap();
-  doc["tracks"][0]
-    .as_object_mut()
-    .unwrap()
-    .remove("markers");
+  doc["tracks"][0].as_object_mut().unwrap().remove("markers");
   doc["tracks"][0]["clips"][0]
     .as_object_mut()
     .unwrap()

@@ -35,10 +35,7 @@ fn sample() -> Timeline {
     TimeRange::new(12, 36, edit()),
   )
   .with_gain(Gain::from_db(-3.0))
-  .with_fades(Fades::new().with_in(Some(Fade::new(
-    Duration::new(6, edit()),
-    FadeShape::Linear,
-  ))))
+  .with_fades(Fades::new().with_in(Some(Fade::new(Duration::new(6, edit()), FadeShape::Linear))))
   .with_marker(Marker::new("n", TimeRange::new(10, 12, edit())));
   let b = Clip::new(
     ClipId::new("b"),
@@ -156,17 +153,17 @@ fn path(dotted: &str) -> String {
 }
 
 fn schema(name: &str, dotted: &str) -> Unreadable {
-  Unreadable::Schema(UnmodelledSchema {
-    name: Utf8Bytes::from(name),
-    path: Utf8Bytes::from(path(dotted)),
-  })
+  Unreadable::Schema(UnmodelledSchema::new(
+    Utf8Bytes::from(name),
+    Utf8Bytes::from(path(dotted)),
+  ))
 }
 
 fn feature(feature: Feature, dotted: &str) -> Unreadable {
-  Unreadable::Feature(UnmodelledFeature {
+  Unreadable::Feature(UnmodelledFeature::new(
     feature,
-    path: Utf8Bytes::from(path(dotted)),
-  })
+    Utf8Bytes::from(path(dotted)),
+  ))
 }
 
 fn shape(dotted: &str, expected: &'static str) -> Unreadable {
@@ -283,9 +280,12 @@ fn a_schema_the_timeline_does_not_model_is_refused_with_where_it_sits() {
   );
 }
 
+/// An edit of a written document, for a law that tries many.
+type Edit = Box<dyn FnOnce(&mut Value)>;
+
 #[test]
 fn a_feature_the_timeline_has_no_word_for_is_refused_by_name() {
-  let cases: Vec<(Box<dyn FnOnce(&mut Value)>, Unreadable)> = vec![
+  let cases: Vec<(Edit, Unreadable)> = vec![
     (
       Box::new(|root| set(root, A, "speed", number("2.0"))),
       feature(Feature::Key("speed".into()), &format!("{A}.speed")),
@@ -373,7 +373,12 @@ fn a_feature_the_timeline_has_no_word_for_is_refused_by_name() {
     (
       Box::new(|root| {
         let reference = at(root, A_MEDIA).clone();
-        set(root, &format!("{A}.media_references"), "high_res", reference);
+        set(
+          root,
+          &format!("{A}.media_references"),
+          "high_res",
+          reference,
+        );
       }),
       feature(Feature::MediaReferences, &format!("{A}.media_references")),
     ),
@@ -481,7 +486,10 @@ fn a_count_or_rate_that_does_not_land_exactly_is_refused() {
 fn a_word_missing_or_misshapen_is_refused_by_name() {
   assert_eq!(
     read(|root| remove(root, &format!("{A}.metadata.mediaio"), "id")),
-    Err(shape(&format!("{A}.metadata.mediaio.id"), "a required word")),
+    Err(shape(
+      &format!("{A}.metadata.mediaio.id"),
+      "a required word"
+    )),
   );
   assert_eq!(
     read(|root| remove(root, "metadata.mediaio", "rate")),
@@ -570,11 +578,17 @@ fn reader_refusals_say_what_and_where() {
     "$.tracks.children[0].children[2].effects[0]: the schema Effect.1, which the timeline does not model there"
   );
   assert_eq!(
-    shown(feature(Feature::TrackKind("Data".into()), &format!("{TRACK}.kind"))),
+    shown(feature(
+      Feature::TrackKind("Data".into()),
+      &format!("{TRACK}.kind")
+    )),
     "$.tracks.children[0].kind: the track kind Data, where the timeline knows Video and Audio"
   );
   assert_eq!(
-    shown(inexact("global_start_time.value", "a count that is no whole number")),
+    shown(inexact(
+      "global_start_time.value",
+      "a count that is no whole number"
+    )),
     "$.global_start_time.value: a count that is no whole number"
   );
   assert_eq!(
@@ -594,6 +608,9 @@ fn every_marker_color_reads_back_in_any_case() {
     let read = from_otio(&lower).unwrap();
     assert_eq!(read.tracks()[0].markers()[0].color(), color, "{lower}");
   }
-  assert_eq!(MarkerColor::from_otio_name("Green"), Some(MarkerColor::Green));
+  assert_eq!(
+    MarkerColor::from_otio_name("Green"),
+    Some(MarkerColor::Green)
+  );
   assert_eq!(MarkerColor::from_otio_name("GRAY"), None);
 }

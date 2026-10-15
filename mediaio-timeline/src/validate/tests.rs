@@ -656,7 +656,10 @@ fn marked() -> Timeline {
     .push(Marker::new("act one", rec(0, 48)));
   clip_mut(&mut timeline, 1, 0)
     .markers_mut()
-    .push(Marker::new("breath", TimeRange::new(60_000, 60_000, tb(1, 48_000))));
+    .push(Marker::new(
+      "breath",
+      TimeRange::new(60_000, 60_000, tb(1, 48_000)),
+    ));
   timeline
 }
 
@@ -668,16 +671,14 @@ fn markers_where_their_owners_count_time_are_valid() {
   // play, are both notes the timeline may carry.
   let mut timeline = marked();
   timeline.tracks_mut()[0].markers_mut()[0].set_range(rec(500, 600));
-  clip_mut(&mut timeline, 1, 0).markers_mut()[0]
-    .set_range(TimeRange::new(0, 10, tb(1, 48_000)));
+  clip_mut(&mut timeline, 1, 0).markers_mut()[0].set_range(TimeRange::new(0, 10, tb(1, 48_000)));
   assert_eq!(validate(&timeline), Ok(()));
 }
 
 #[test]
 fn a_track_marker_off_the_edit_rate_is_refused() {
   let mut timeline = marked();
-  timeline.tracks_mut()[0].markers_mut()[0]
-    .set_range(TimeRange::new(0, 2000, Timebase::MILLIS));
+  timeline.tracks_mut()[0].markers_mut()[0].set_range(TimeRange::new(0, 2000, Timebase::MILLIS));
   assert_eq!(
     refusals(&timeline),
     [Refusal::OffEditRate(Place::Marker(MarkerAt::Track {
@@ -690,8 +691,7 @@ fn a_track_marker_off_the_edit_rate_is_refused() {
 #[test]
 fn a_clip_marker_in_a_degenerate_timebase_is_refused() {
   let mut timeline = marked();
-  clip_mut(&mut timeline, 1, 0).markers_mut()[0]
-    .set_range(TimeRange::new(0, 10, tb(0, 1)));
+  clip_mut(&mut timeline, 1, 0).markers_mut()[0].set_range(TimeRange::new(0, 10, tb(0, 1)));
   assert_eq!(
     refusals(&timeline),
     [Refusal::MarkerRateUnstated(MarkerAt::Clip {
@@ -704,19 +704,22 @@ fn a_clip_marker_in_a_degenerate_timebase_is_refused() {
 #[test]
 fn a_marker_longer_than_i64_max_ticks_is_refused() {
   let mut timeline = marked();
-  timeline.tracks_mut()[0].markers_mut()[0]
-    .set_range(TimeRange::new(-1, i64::MAX, edit()));
-  clip_mut(&mut timeline, 1, 0).markers_mut()[0]
-    .set_range(TimeRange::new(i64::MIN, 0, tb(1, 48_000)));
+  timeline.tracks_mut()[0].markers_mut()[0].set_range(TimeRange::new(-1, i64::MAX, edit()));
+  clip_mut(&mut timeline, 1, 0).markers_mut()[0].set_range(TimeRange::new(
+    i64::MIN,
+    0,
+    tb(1, 48_000),
+  ));
+  // Track by track: V1's own marker, then A1's clip's.
   assert_eq!(
     refusals(&timeline),
     [
-      Refusal::MarkerTooLong(MarkerAt::Clip {
-        clip: ClipAt::new(1, 0),
-        marker: 0
-      }),
       Refusal::MarkerTooLong(MarkerAt::Track {
         track: 0,
+        marker: 0
+      }),
+      Refusal::MarkerTooLong(MarkerAt::Clip {
+        clip: ClipAt::new(1, 0),
         marker: 0
       }),
     ]

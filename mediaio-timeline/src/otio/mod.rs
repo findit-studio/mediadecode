@@ -127,12 +127,14 @@
 //! name, never dropped ([`Unreadable`]).
 
 use core::fmt;
-use std::vec::Vec;
+use std::{boxed::Box, vec::Vec};
 
 use mediatime::Rate;
 use smol_bytes::{Utf8Bytes, Utf8BytesMut};
 
-use crate::{ClipAt, EdgeAt, MarkerAt, Refusal, Timeline, TransitionAt, layout::layout_valid, validate};
+use crate::{
+  ClipAt, EdgeAt, MarkerAt, Refusal, Timeline, TransitionAt, layout::layout_valid, validate,
+};
 
 mod check;
 mod derive;
@@ -750,22 +752,31 @@ impl core::error::Error for Unreadable {}
 
 /// An object of a schema the timeline does not model there, and where it
 /// sits: what [`Unreadable::Schema`] carries.
+///
+/// Held boxed, so a refusal stays small to return.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnmodelledSchema {
+pub struct UnmodelledSchema(Box<SchemaAt>);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SchemaAt {
   name: Utf8Bytes,
   path: Utf8Bytes,
 }
 
 impl UnmodelledSchema {
+  pub(crate) fn new(name: Utf8Bytes, path: Utf8Bytes) -> Self {
+    Self(Box::new(SchemaAt { name, path }))
+  }
+
   /// The schema's name and version: `Effect.1`.
   pub fn name(&self) -> &str {
-    &self.name
+    &self.0.name
   }
 
   /// Where the object sits, as a path from the document's root:
   /// `$.tracks.children[0].children[1].effects[0]`.
   pub fn path(&self) -> &str {
-    &self.path
+    &self.0.path
   }
 }
 
@@ -776,7 +787,7 @@ impl fmt::Display for UnmodelledSchema {
     write!(
       f,
       "{}: the schema {}, which the timeline does not model there",
-      self.path, self.name
+      self.0.path, self.0.name
     )
   }
 }
@@ -785,21 +796,30 @@ impl core::error::Error for UnmodelledSchema {}
 
 /// A key, a value or a note of a modelled schema the timeline has no word
 /// for, and where it sits: what [`Unreadable::Feature`] carries.
+///
+/// Held boxed, so a refusal stays small to return.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnmodelledFeature {
+pub struct UnmodelledFeature(Box<FeatureAt>);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FeatureAt {
   feature: Feature,
   path: Utf8Bytes,
 }
 
 impl UnmodelledFeature {
+  pub(crate) fn new(feature: Feature, path: Utf8Bytes) -> Self {
+    Self(Box::new(FeatureAt { feature, path }))
+  }
+
   /// What the document holds that the timeline does not model.
-  pub const fn feature(&self) -> &Feature {
-    &self.feature
+  pub fn feature(&self) -> &Feature {
+    &self.0.feature
   }
 
   /// Where it sits, as a path from the document's root.
   pub fn path(&self) -> &str {
-    &self.path
+    &self.0.path
   }
 }
 
@@ -807,7 +827,7 @@ impl UnmodelledFeature {
 /// timeline knows Video and Audio`.
 impl fmt::Display for UnmodelledFeature {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    write!(f, "{}: {}", self.path, self.feature)
+    write!(f, "{}: {}", self.0.path, self.0.feature)
   }
 }
 
@@ -892,9 +912,9 @@ impl fmt::Display for Feature {
       ),
       Self::NoMedia => f.write_str("a clip with no media reference"),
       Self::GapStart => f.write_str("a gap starting anywhere but zero"),
-      Self::Fade => f.write_str(
-        "a fade not between a gap and the clip it fades, or playing the gap's side",
-      ),
+      Self::Fade => {
+        f.write_str("a fade not between a gap and the clip it fades, or playing the gap's side")
+      }
       Self::DissolveBesideGap => {
         f.write_str("a dissolve beside a gap: a fade whose curve the document does not name")
       }

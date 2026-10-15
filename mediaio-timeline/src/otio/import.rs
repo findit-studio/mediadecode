@@ -68,17 +68,11 @@ fn shape(at: &At, expected: &'static str) -> Unreadable {
 }
 
 fn unmodelled(at: &At, name: &str) -> Unreadable {
-  Unreadable::Schema(UnmodelledSchema {
-    name: Utf8Bytes::from(name),
-    path: at.0.clone(),
-  })
+  Unreadable::Schema(UnmodelledSchema::new(Utf8Bytes::from(name), at.0.clone()))
 }
 
 fn feature(at: &At, feature: Feature) -> Unreadable {
-  Unreadable::Feature(UnmodelledFeature {
-    feature,
-    path: at.0.clone(),
-  })
+  Unreadable::Feature(UnmodelledFeature::new(feature, at.0.clone()))
 }
 
 fn inexact(at: &At, reason: &'static str) -> Unreadable {
@@ -642,7 +636,9 @@ fn children(
   let mut fade_in = None;
   for (index, child) in read.into_iter().enumerate() {
     let here = at.index(index);
-    let before = index.checked_sub(1).and_then(|before| kinds.get(before).copied());
+    let before = index
+      .checked_sub(1)
+      .and_then(|before| kinds.get(before).copied());
     let after = kinds.get(index + 1).copied();
     if kinds[index] == Kind::Transition
       && [before, after]
@@ -712,7 +708,12 @@ fn advance(cursor: i64, length: u64, at: &At) -> Result<i64, Unreadable> {
 /// place once.
 fn ordered(dissolves: Vec<(Transition, Option<usize>, At)>) -> Result<Vec<Transition>, Unreadable> {
   if dissolves.iter().all(|(_, order, _)| order.is_none()) {
-    return Ok(dissolves.into_iter().map(|(dissolve, ..)| dissolve).collect());
+    return Ok(
+      dissolves
+        .into_iter()
+        .map(|(dissolve, ..)| dissolve)
+        .collect(),
+    );
   }
   let mut places = vec![None; dissolves.len()];
   for (dissolve, order, at) in dissolves {
@@ -863,7 +864,11 @@ fn clip(object: &Object<'_>, schema: &str, ticks: Timebase) -> Result<(Clip, u64
   object.no_effects()?;
   object.no_color()?;
   let at = object.at.key("source_range");
-  let (start, length) = counts(object.required("source_range")?, &at, Ruler::new(exact.ruler))?;
+  let (start, length) = counts(
+    object.required("source_range")?,
+    &at,
+    Ruler::new(exact.ruler),
+  )?;
   let source = exact_range(start, length, exact, &at)?;
   // With no time-warp, a clip runs exactly as long as its source.
   let length = source
@@ -904,7 +909,12 @@ fn media(object: &Object<'_>, schema: &str) -> Result<MediaRef, Unreadable> {
   let references = Object::of(object.required("media_references")?, at.clone())?;
   let active = object
     .string("active_media_reference_key")?
-    .ok_or_else(|| shape(&object.at.key("active_media_reference_key"), "a required key"))?;
+    .ok_or_else(|| {
+      shape(
+        &object.at.key("active_media_reference_key"),
+        "a required key",
+      )
+    })?;
   match references.members {
     [] => Err(feature(&at, Feature::NoMedia)),
     [(key, value)] if key == DEFAULT_MEDIA && active == DEFAULT_MEDIA => {
