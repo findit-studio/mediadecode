@@ -57,6 +57,18 @@ loop of it, places one medium twice, under two ids, and a medium on a video
 and an audio track is two clips with two ids. `diff` matches clips by the
 id, so a clip renamed or pointed at another medium is still the same clip.
 
+### Text is `Utf8Bytes`
+
+Every text the model holds — a timeline's, a track's and a clip's name, a
+clip's id, a medium's locator and reel, a note's key and value — and the
+OpenTimelineIO document `to_otio` writes is a
+[`smol_bytes::Utf8Bytes`](https://docs.rs/smol-bytes): immutable UTF-8, held
+inline when short and shared by reference count when long, so a clone is
+cheap. Constructors and setters take `impl Into<Utf8Bytes>` — a `&str`, a
+`String` or a `Utf8Bytes` — and a reel, being optional, an
+`Option<Utf8Bytes>`; getters lend a `&str`. `smol_bytes::format_utf8bytes!`
+formats straight into one.
+
 ## Validation
 
 `validate(&Timeline) -> Result<(), Vec<Refusal>>` answers every defect at
@@ -104,7 +116,7 @@ not.
 
 ## OpenTimelineIO
 
-`otio::to_otio(&Timeline, OtioTarget) -> Result<String, otio::Refused>`
+`otio::to_otio(&Timeline, OtioTarget) -> Result<Utf8Bytes, otio::Refused>`
 writes a valid timeline as OpenTimelineIO JSON, keys in OpenTimelineIO's own
 writer order. A timeline that does not validate is refused with its
 refusals (`Refused::Validation`); a count OpenTimelineIO cannot hold exactly
@@ -265,7 +277,8 @@ runs it on the goldens.
 
 ## The stored document
 
-With `serde`, a timeline is a document whose first field is `schema` (`1`).
+With the `serde` feature, a timeline is a document whose first field is
+`schema` (`1`).
 A reader refuses by name an unknown schema, a field it does not know — inside
 a time value too, a record's or a rate's — a required field left out (a
 clip's `id` among them), a metadata key named twice, a gain that is not
@@ -353,12 +366,33 @@ assert_eq!(
 );
 ```
 
+## Features
+
+| feature | default | what it gives |
+|---|---|---|
+| `std` | yes | what `alloc` gives, on the `std` builds of `smol-bytes`, `mediatime` and `serde`; the crate itself uses nothing of `std` |
+| `alloc` | | the model, `validate`, `layout`, `diff` and `otio`, on `no_std` + `alloc` |
+| `serde` | | the stored document: `Serialize` and `Deserialize` for `Timeline` and every type in it, with `std` or `alloc` |
+
+The crate is `#![no_std]` in every tier. With neither `std` nor `alloc` it
+builds on `core` alone and exports only the time words it re-exports from
+`mediatime` (`Duration`, `Rate`, `TimeRange`, `Timebase`, `Timestamp`):
+every model type owns its names, lists and maps, so all of the model needs
+`alloc`, and `serde` adds nothing there. CI builds the `no_std` tiers for
+`thumbv7em-none-eabihf`, a target with no operating system, and runs clippy
+and the tests on every combination of the three features.
+
+Without `std`:
+
+```toml
+mediaio-timeline = { version = "0.2", default-features = false, features = ["alloc"] }
+```
+
 ## Requirements
 
 - Rust ≥ **1.95**, edition 2024.
-- `#![no_std]`, needing only `alloc`: a timeline owns its names, lists and
-  maps. The crate has no features; `serde` and `mediatime` are taken without
-  their `std`, and nothing links FFmpeg.
+- `mediatime` 0.5.1 or later.
+- Nothing links FFmpeg.
 
 ## License
 

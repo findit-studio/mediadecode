@@ -10,6 +10,9 @@ TARGET="$1"
 # The package to run; the core crate unless the caller names another
 # pure-Rust one.
 PKG="${2:-mediadecode}"
+# Features to enable on it besides its defaults, comma separated; none
+# unless the caller names some.
+FEATURES="${3:-}"
 
 # Install cross-compilation toolchain on Linux
 if [ "$(uname)" = "Linux" ]; then
@@ -41,4 +44,4 @@ export MIRIFLAGS="-Zmiri-strict-provenance -Zmiri-disable-isolation -Zmiri-symbo
 # `mediadecode-ffmpeg` calls FFmpeg's C library through FFI, which
 # Miri can't interpret. Run Miri only against the pure-Rust crates:
 # `mediadecode`, or the one the caller names.
-cargo miri test -p "$PKG" --all-targets --target "$TARGET"
+cargo miri test -p "$PKG" --all-targets --target "$TARGET" ${FEATURES:+--features "$FEATURES"}
