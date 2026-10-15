@@ -5,8 +5,8 @@ use smol_bytes::{Utf8Bytes, Utf8BytesMut, format_utf8bytes};
 
 use super::{json::Value, *};
 use crate::{
-  Clip, ClipId, Duration, Fade, FadeShape, Fades, MediaRef, Rate, TimeRange, Timebase, Timestamp,
-  Track, TrackKind, Transition,
+  Clip, ClipId, Duration, Fade, FadeShape, Fades, Marker, MarkerAt, MarkerColor, MediaRef, Rate,
+  TimeRange, Timebase, Timestamp, Track, TrackKind, Transition,
 };
 
 fn tb(num: i32, den: i32) -> Timebase {
@@ -847,6 +847,7 @@ fn required_by_readers(schema: &str, target: OtioTarget) -> &'static [&'static s
     ("Clip.1" | "Gap.1", _) => &[],
     ("Transition.1", _) => &["in_offset", "out_offset", "transition_type"],
     ("ExternalReference.1", _) => &["target_url"],
+    ("Marker.2", _) => &["marked_range"],
     ("RationalTime.1", _) => &["rate", "value"],
     ("TimeRange.1", _) => &["start_time", "duration"],
     _ => panic!("no audit for {schema}"),
@@ -1049,3 +1050,244 @@ fn a_document_that_is_not_json_is_refused_as_syntax() {
 }
 
 mod derived;
+
+/// The words under `metadata.mediaio` of `value`, as `(word, value)` text
+/// pairs, a nested object written as JSON.
+fn words(value: &Value) -> Vec<(String, String)> {
+  let ours = member(&member(value, "metadata"), "mediaio");
+  ours
+    .as_object()
+    .unwrap()
+    .iter()
+    .map(|(key, word)| {
+      let mut text = Utf8BytesMut::new();
+      json::write_pretty(word, &mut text);
+      (String::from(key.as_str()), String::from(text.freeze_shared().as_str()))
+    })
+    .collect()
+}
+
+/// A clip `m` at [0, 24) of a 24 fps timeline, playing a second of a
+/// 48 kHz medium, with a marker on the clip and one on its track.
+fn marked() -> Timeline {
+  let sound = tb(1, 48_000);
+  let mut m = clip("m", 0, 24);
+  m.set_source_range(TimeRange::new(48_000, 96_000, sound));
+  m.markers_mut().push(
+    Marker::new("breath", TimeRange::new(60_000, 72_000, sound))
+      .with_color(MarkerColor::Cyan)
+      .with_comment("a \"quoted\" note"),
+  );
+  one_track(
+    Track::new(TrackKind::Audio, "A")
+      .with_clip(m)
+      .with_marker(Marker::new("act one", TimeRange::new(6, 18, edit()))),
+  )
+}
+
+#[test]
+fn markers_are_written_as_marker_2_where_their_owners_count_time() {
+  let timeline = marked();
+  assert_eq!(validate(&timeline), Ok(()));
+  for target in [OtioTarget::V0_15Plus, OtioTarget::Legacy] {
+    let text = to_otio(&timeline, target).unwrap();
+    assert_eq!(validate_json(&text, target), Ok(()), "{target:?}");
+  }
+  let text = to_otio(&timeline, OtioTarget::V0_15Plus).unwrap();
+  let root = json::parse(&text).unwrap();
+  let track = member(&member(&root, "tracks"), "children")
+    .as_array()
+    .unwrap()[0]
+    .clone();
+
+  // The track's: at the edit rate, from the timeline's zero, with no words.
+  let on_track = member(&track, "markers").as_array().unwrap()[0].clone();
+  assert_eq!(member(&on_track, "OTIO_SCHEMA").as_str(), Some("Marker.2"));
+  assert_eq!(member(&on_track, "metadata"), Value::Object(Vec::new()));
+  assert_eq!(member(&on_track, "name").as_str(), Some("act one"));
+  assert_eq!(member(&on_track, "color").as_str(), Some("GREEN"));
+  assert_eq!(member(&on_track, "comment").as_str(), Some(""));
+  assert_eq!(
+    rate_start_duration(&member(&on_track, "marked_range")),
+    (24.0, 6.0, 12.0)
+  );
+
+  // The clip's: in its medium's ticks, the exact ruler and timebase beside.
+  let clip = member(&track, "children").as_array().unwrap()[0].clone();
+  let on_clip = member(&clip, "markers").as_array().unwrap()[0].clone();
+  assert_eq!(member(&on_clip, "name").as_str(), Some("breath"));
+  assert_eq!(member(&on_clip, "color").as_str(), Some("CYAN"));
+  assert_eq!(
+    member(&on_clip, "comment").as_str(),
+    Some("a \"quoted\" note")
+  );
+  assert_eq!(
+    rate_start_duration(&member(&on_clip, "marked_range")),
+    (48_000.0, 60_000.0, 12_000.0)
+  );
+  let range = "{\n    \"ruler\": \"48000/1\",\n    \"timebase\": \"1/48000\"\n}";
+  assert_eq!(words(&on_clip), [(String::from("range"), String::from(range))]);
+}
+
+#[test]
+fn the_exact_words_name_the_edit_rate_and_each_ranges_rulers() {
+  // At 30000/1001 the edit rate's f64 names many rationals: the timeline
+  // says which. A source range in 1/90 000 s ticks of a 29.97 fps medium is
+  // written in its frames: the clip says which ruler, and which timebase
+  // the model counts it in; so does its reference, for its available range.
+  let edit = Rate::FPS_29_97;
+  let ticks = tb(1, 90_000);
+  let mut timeline = one_source(
+    edit,
+    30,
+    TimeRange::new(3003, 3003 * 31, ticks),
+    Some(Rate::FPS_29_97),
+  );
+  timeline.tracks_mut()[0].clips_mut()[0]
+    .media_mut()
+    .set_available_range(Some(TimeRange::new(0, 3003 * 100, ticks)));
+  let text = to_otio(&timeline, OtioTarget::Legacy).unwrap();
+  let root = json::parse(&text).unwrap();
+  assert_eq!(
+    words(&root),
+    [(String::from("rate"), String::from("\"30000/1001\""))]
+  );
+  let exact = "{\n    \"ruler\": \"30000/1001\",\n    \"timebase\": \"1/90000\"\n}";
+  let clip = first_clip(&timeline);
+  assert_eq!(
+    words(&clip),
+    [
+      (String::from("id"), String::from("\"a\"")),
+      (String::from("source"), String::from(exact)),
+    ]
+  );
+  assert_eq!(
+    words(&member(&clip, "media_reference")),
+    [
+      (String::from("rate"), String::from("\"30000/1001\"")),
+      (String::from("available"), String::from(exact)),
+    ]
+  );
+  assert_eq!(source_range(&timeline), (Rate::FPS_29_97.as_f64(), 1.0, 30.0));
+}
+
+/// Three abutting clips with a dissolve at each of their two cuts, kept in
+/// `order`.
+fn two_dissolves(order: [i64; 2]) -> Timeline {
+  let mut track = Track::new(TrackKind::Video, "V");
+  for (name, start) in [("a", 0), ("b", 24), ("c", 48)] {
+    let mut placed = clip(name, start, start + 24);
+    placed.set_source_range(TimeRange::new(10, 34, edit()));
+    placed
+      .media_mut()
+      .set_available_range(Some(TimeRange::new(0, 100, edit())));
+    track.clips_mut().push(placed);
+  }
+  for cut in order {
+    track.transitions_mut().push(Transition::dissolve(
+      crate::Timestamp::new(cut, edit()),
+      Duration::new(2, edit()),
+      Duration::new(2, edit()),
+    ));
+  }
+  one_track(track)
+}
+
+/// The `order` word of each dissolve the first track writes, in the order
+/// they are written.
+fn orders(timeline: &Timeline) -> Vec<Option<String>> {
+  let text = to_otio(timeline, OtioTarget::V0_15Plus).unwrap();
+  let root = json::parse(&text).unwrap();
+  let track = member(&member(&root, "tracks"), "children")
+    .as_array()
+    .unwrap()[0]
+    .clone();
+  member(&track, "children")
+    .as_array()
+    .unwrap()
+    .iter()
+    .filter(|child| member(child, "OTIO_SCHEMA").as_str() == Some("Transition.1"))
+    .map(|dissolve| {
+      words_or_none(dissolve)
+        .into_iter()
+        .find(|(word, _)| word == "order")
+        .map(|(_, value)| value)
+    })
+    .collect()
+}
+
+/// [`words`], or none where the object's metadata holds no `mediaio`.
+fn words_or_none(value: &Value) -> Vec<(String, String)> {
+  let metadata = member(value, "metadata");
+  if metadata.as_object().unwrap().is_empty() {
+    Vec::new()
+  } else {
+    words(value)
+  }
+}
+
+#[test]
+fn a_dissolve_says_its_place_only_where_its_track_keeps_transitions_out_of_order() {
+  // Written in their cuts' order, the dissolves need no word…
+  let ordered = two_dissolves([24, 48]);
+  assert_eq!(validate(&ordered), Ok(()));
+  assert_eq!(orders(&ordered), [None, None]);
+  // …kept the other way round, each says its place among the track's.
+  let reversed = two_dissolves([48, 24]);
+  assert_eq!(validate(&reversed), Ok(()));
+  assert_eq!(
+    orders(&reversed),
+    [Some(String::from("1")), Some(String::from("0"))]
+  );
+  assert_eq!(
+    to_otio(&reversed, OtioTarget::Legacy).map(drop),
+    Ok(()),
+    "the same dissolves, in the same places"
+  );
+}
+
+#[test]
+fn a_marker_no_ruler_holds_whole_is_refused_by_name() {
+  // A track's marker is counted at the edit rate: past 2^53 there, refused
+  // with no search.
+  let mut timeline = marked();
+  timeline.tracks_mut()[0].markers_mut()[0].set_range(TimeRange::new(0, TWO_53 + 1, edit()));
+  assert_eq!(
+    not_representable(&timeline),
+    (
+      Spot::Marker(MarkerAt::Track {
+        track: 0,
+        marker: 0
+      }),
+      i128::from(TWO_53 + 1)
+    )
+  );
+  // A clip's marker of 2^62 thirds of a second: its own ticks, and the
+  // coarsest whole ruler that lands on it — the same thirds — count past
+  // 2^53, and no operand's ruler holds it either.
+  let mut timeline = marked();
+  timeline.tracks_mut()[0].clips_mut()[0].markers_mut()[0]
+    .set_range(TimeRange::new(0, 1 << 62, tb(1, 3)));
+  assert_eq!(validate(&timeline), Ok(()));
+  let refused = match to_otio(&timeline, OtioTarget::V0_15Plus) {
+    Err(Refused::NotRepresentable(count)) => count,
+    other => panic!("{other:?}"),
+  };
+  assert_eq!(
+    (refused.at(), refused.value(), refused.rate()),
+    (
+      Spot::Marker(MarkerAt::Clip {
+        clip: crate::ClipAt::new(0, 0),
+        marker: 0
+      }),
+      1_i128 << 62,
+      Rate::hz(3)
+    )
+  );
+  assert_eq!(refused.searched().map(|search| search.walks()), Some(0));
+  assert!(
+    std::string::ToString::to_string(&refused)
+      .starts_with("the marked range of track 0, clip 0, marker 0 counts 4611686018427387904 ticks"),
+    "{refused}"
+  );
+}

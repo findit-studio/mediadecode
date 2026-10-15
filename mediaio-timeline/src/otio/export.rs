@@ -9,7 +9,8 @@
 //! exactly; a clip's source range in the first of its own rulers that writes
 //! it, or else in the first ruler the timeline's operands are counted in
 //! that does ([`source_plan`]); its medium's available range likewise, in the
-//! first that holds it whole, its end with it ([`available_plan`]) — and the
+//! first that holds it whole, its end with it ([`whole_plan`]), and each of
+//! its markers the same way; a track's markers at the edit rate — and the
 //! walk, [`mod@derive`], forms what OpenTimelineIO derives from those counts,
 //! in its own arithmetic, holding each: a source range's end among them,
 //! which the plan leaves to the walk. Where the walk refuses a value, a
@@ -19,11 +20,24 @@
 //! plan's — one clip one ruler at a time, and walks again; what no plan it
 //! tries holds is refused, with the last walk's refusal and what the search
 //! tried.
+//!
+//! OpenTimelineIO keeps a rate as an `f64`, which names many rationals, and
+//! a range as two counts in one ruler, which says nothing of the timebase
+//! the model counts it in. So beside what OpenTimelineIO reads, the export
+//! writes the exact words a reader needs to rebuild the timeline exactly,
+//! under `metadata.mediaio` ([`OURS`]): the edit rate (`rate`); for each
+//! media-side range — a clip's source range, its medium's available range,
+//! a clip's marker — the exact ruler its counts are written in and the
+//! timebase the model counts it in (`source`, `available`, `range`); and,
+//! on a track whose transitions are kept out of their cuts' order, each
+//! dissolve's place among them (`order`). OpenTimelineIO's own fields stay
+//! the authority for every count; a reader holds each written rate to its
+//! exact word.
 
 use core::cmp::Reverse;
 use std::{collections::BTreeSet, vec, vec::Vec};
 
-use mediatime::{Duration, Rate, Rounding, TimeRange};
+use mediatime::{Duration, Rate, Rounding, TimeRange, Timebase};
 use smol_bytes::{Utf8Bytes, format_utf8bytes};
 
 use super::{
@@ -32,16 +46,16 @@ use super::{
   json::Value,
 };
 use crate::{
-  Clip, ClipAt, Edge, EdgeAt, Fade, FadeShape, Item, Layout, MediaRef, Metadata, Timeline, Track,
-  TrackKind, TrackLayout, Transition, TransitionAt,
+  Clip, ClipAt, Edge, EdgeAt, Fade, FadeShape, Item, Layout, Marker, MarkerAt, MediaRef, Metadata,
+  Timeline, Track, TrackKind, TrackLayout, Transition, TransitionAt,
 };
 
 /// The key under which this crate's own words ride in an object's
 /// `metadata`.
-const OURS: &str = "mediaio";
+pub(super) const OURS: &str = "mediaio";
 
 /// The key a `Clip.2` keeps its one media reference under.
-const DEFAULT_MEDIA: &str = "DEFAULT_MEDIA";
+pub(super) const DEFAULT_MEDIA: &str = "DEFAULT_MEDIA";
 
 /// 2^53: an `f64` holds every whole number of no greater magnitude, and past
 /// it only some — a count there is read rounded.
@@ -62,16 +76,27 @@ pub(crate) fn timeline(
     .enumerate()
     .map(|(index, laid)| plan(index, laid, edit, &operands))
     .collect::<Result<Vec<_>, _>>()?;
+  let marked = laid
+    .tracks()
+    .iter()
+    .enumerate()
+    .map(|(index, laid)| markers_planned(index, laid.track(), edit, &operands))
+    .collect::<Result<Vec<_>, _>>()?;
   let settled = settle(planned, edit, &operands, Time::written(start, edit))?;
   let tracks = laid
     .tracks()
     .iter()
     .zip(&settled)
-    .map(|(laid, children)| track(laid.track(), children, edit, target))
+    .zip(&marked)
+    .map(|((laid, children), marked)| track(laid.track(), children, marked, edit, target))
     .collect();
+  let rate = vec![(
+    "rate",
+    Value::String(format_utf8bytes!("{}", timeline.rate())),
+  )];
   Ok(object(vec![
     ("OTIO_SCHEMA", text("Timeline.1")),
-    ("metadata", metadata(Vec::new(), timeline.metadata())),
+    ("metadata", metadata(rate, timeline.metadata())),
     ("name", text(timeline.name())),
     ("global_start_time", rational_time(edit, start)),
     (
@@ -104,15 +129,15 @@ enum Planned<'a> {
   },
   /// A fade at one edge of a clip, as a dissolve against a gap.
   Fade(Fade, Edge),
-  /// A transition between two clips.
-  Dissolve(&'a Transition),
+  /// A transition between two clips, and its index among its track's.
+  Dissolve(usize, &'a Transition),
 }
 
 /// A track's children in OpenTimelineIO's order — items end to end, each
 /// transition between the two items it joins — each count written held within
 /// ±2^53, a clip's source range planned among the timeline's `operands` where
 /// none of its own rulers writes it ([`source_plan`]), and its medium's
-/// available range where none holds it whole ([`available_plan`]).
+/// available range where none holds it whole ([`whole_plan`]).
 ///
 /// A fade is a dissolve against a gap: a fade-in after the gap before its
 /// clip, a fade-out before the gap after it. Where the clip abuts another
@@ -161,7 +186,7 @@ fn plan<'a>(
           let spot = Spot::Transition(TransitionAt::new(track_index, which));
           held(i128::from(transition.in_offset().ticks()), edit, spot)?;
           held(i128::from(transition.out_offset().ticks()), edit, spot)?;
-          out.push(Planned::Dissolve(transition));
+          out.push(Planned::Dissolve(which, transition));
         }
       }
     }
@@ -191,7 +216,7 @@ fn fade_planned(fade: Fade, at: EdgeAt, edit: Ruler) -> Result<Planned<'static>,
 /// duration is the record's length: the clip fills exactly its record. The
 /// medium's available range, where it is known, in the first of its own
 /// rulers, else of the rulers the timeline's `operands` are counted in, that
-/// holds it whole ([`available_plan`]).
+/// holds it whole ([`whole_plan`]).
 fn clip_planned<'a>(
   clip: &'a Clip,
   at: ClipAt,
@@ -206,7 +231,7 @@ fn clip_planned<'a>(
   )?;
   let available = media
     .available_range()
-    .map(|range| available_plan(range, media.rate(), Spot::Available(at), operands))
+    .map(|range| whole_plan(range, media.rate(), Spot::Available(at), operands))
     .transpose()?;
   Ok(Planned::Clip {
     clip,
@@ -446,7 +471,7 @@ fn choices(tracks: &[Vec<Planned<'_>>], operands: &BTreeSet<Rate>) -> Vec<Choice
 /// none.
 ///
 /// A medium's available range gives no rate, wherever it is planned
-/// ([`available_plan`]): OpenTimelineIO derives nothing from it but its own
+/// ([`whole_plan`]): OpenTimelineIO derives nothing from it but its own
 /// two ends, so no operand is ever counted in its ruler.
 fn operands(laid: &Layout<'_>, edit: Ruler) -> BTreeSet<Rate> {
   let clips = laid
@@ -574,7 +599,7 @@ fn walked(planned: &[Planned<'_>], edit: Ruler) -> Vec<Child> {
           out_offset: ticks(out_offset),
         }
       }
-      Planned::Dissolve(transition) => Child::Transition {
+      Planned::Dissolve(_, transition) => Child::Transition {
         in_offset: ticks(transition.in_offset().ticks()),
         out_offset: ticks(transition.out_offset().ticks()),
       },
@@ -593,7 +618,17 @@ fn fade_offsets(fade: Fade, edge: Edge) -> (u64, u64) {
   }
 }
 
-fn track(track: &Track, children: &[Planned<'_>], edit: Ruler, target: OtioTarget) -> Value {
+fn track(
+  track: &Track,
+  children: &[Planned<'_>],
+  marked: &Marked,
+  edit: Ruler,
+  target: OtioTarget,
+) -> Value {
+  // Dissolves are written in their cuts' order; where the track keeps its
+  // transitions in another, each says its place among them.
+  let reordered = reordered(track);
+  let mut clips = marked.clips.iter();
   let children = children
     .iter()
     .map(|child| match *child {
@@ -602,10 +637,21 @@ fn track(track: &Track, children: &[Planned<'_>], edit: Ruler, target: OtioTarge
         clip,
         source,
         available,
-      } => self::clip(clip, source, available, target),
+      } => {
+        let markers = clips.next().map_or(&[][..], Vec::as_slice);
+        self::clip(clip, source, available, markers, target)
+      }
       Planned::Fade(fade, edge) => fade_transition(fade, edge, edit),
-      Planned::Dissolve(transition) => dissolve(transition, edit),
+      Planned::Dissolve(index, transition) => {
+        dissolve(transition, edit, reordered.then_some(index))
+      }
     })
+    .collect();
+  let markers = track
+    .markers()
+    .iter()
+    .zip(&marked.track)
+    .map(|(marker, &range)| self::marker(marker, range, None))
     .collect();
   object(vec![
     ("OTIO_SCHEMA", text("Track.1")),
@@ -613,7 +659,7 @@ fn track(track: &Track, children: &[Planned<'_>], edit: Ruler, target: OtioTarge
     ("name", text(track.name())),
     ("source_range", Value::Null),
     ("effects", Value::Array(Vec::new())),
-    ("markers", Value::Array(Vec::new())),
+    ("markers", Value::Array(markers)),
     ("enabled", Value::Bool(track.enabled())),
     ("children", Value::Array(children)),
     (
@@ -626,7 +672,13 @@ fn track(track: &Track, children: &[Planned<'_>], edit: Ruler, target: OtioTarge
   ])
 }
 
-fn clip(clip: &Clip, source: Counted, available: Option<Counted>, target: OtioTarget) -> Value {
+fn clip(
+  clip: &Clip,
+  source: Counted,
+  available: Option<Counted>,
+  markers: &[Counted],
+  target: OtioTarget,
+) -> Value {
   let mut words = vec![("id", text(clip.id().as_str()))];
   if let Some(gain) = clip.gain() {
     words.push((
@@ -634,6 +686,19 @@ fn clip(clip: &Clip, source: Counted, available: Option<Counted>, target: OtioTa
       Value::Number(format_utf8bytes!("{:?}", gain.db())),
     ));
   }
+  words.push((
+    "source",
+    exact_ruler(source.ruler, clip.source_range().timebase()),
+  ));
+  let markers = clip
+    .markers()
+    .iter()
+    .zip(markers)
+    .map(|(marker, &range)| {
+      let exact = exact_ruler(range.ruler, marker.range().timebase());
+      self::marker(marker, range, Some(exact))
+    })
+    .collect();
   let mut members = vec![
     (
       "OTIO_SCHEMA",
@@ -646,7 +711,7 @@ fn clip(clip: &Clip, source: Counted, available: Option<Counted>, target: OtioTa
     ("name", text(clip.name())),
     ("source_range", source.time_range()),
     ("effects", Value::Array(Vec::new())),
-    ("markers", Value::Array(Vec::new())),
+    ("markers", Value::Array(markers)),
     ("enabled", Value::Bool(clip.enabled())),
   ];
   let reference = external_reference(clip.media(), available, target);
@@ -667,6 +732,9 @@ fn external_reference(media: &MediaRef, available: Option<Counted>, target: Otio
   }
   if let Some(reel) = media.reel() {
     words.push(("reel", text(reel)));
+  }
+  if let (Some(range), Some(counted)) = (media.available_range(), available) {
+    words.push(("available", exact_ruler(counted.ruler, range.timebase())));
   }
   let mut members = vec![
     ("OTIO_SCHEMA", text("ExternalReference.1")),
@@ -724,12 +792,110 @@ fn fade_transition(fade: Fade, edge: Edge, edit: Ruler) -> Value {
   )
 }
 
-fn dissolve(transition: &Transition, edit: Ruler) -> Value {
+/// A transition as a dissolve, with its index among its track's
+/// transitions where the track keeps them out of their cuts' order.
+fn dissolve(transition: &Transition, edit: Ruler, order: Option<usize>) -> Value {
+  let words = order.map_or_else(Vec::new, |index| {
+    vec![("order", Value::Number(format_utf8bytes!("{index}")))]
+  });
   self::transition(
-    Value::Object(Vec::new()),
+    metadata(words, &Metadata::new()),
     rational_time(edit, i128::from(transition.in_offset().ticks())),
     rational_time(edit, i128::from(transition.out_offset().ticks())),
   )
+}
+
+/// Whether `track` keeps its transitions in an order other than their
+/// cuts'. A valid track holds one transition at a cut at most, so in their
+/// cuts' order each cut is later than the one before.
+fn reordered(track: &Track) -> bool {
+  track
+    .transitions()
+    .windows(2)
+    .any(|pair| pair[1].at() <= pair[0].at())
+}
+
+/// A marker as `Marker.2`: its `range` counted in one ruler — the edit
+/// rate's, for a track's marker; for a clip's, the ruler its plan chose,
+/// with `exact` naming it and the marker's own timebase.
+fn marker(marker: &Marker, range: Counted, exact: Option<Value>) -> Value {
+  let words = exact.map_or_else(Vec::new, |exact| vec![("range", exact)]);
+  object(vec![
+    ("OTIO_SCHEMA", text("Marker.2")),
+    ("metadata", metadata(words, &Metadata::new())),
+    ("name", text(marker.name())),
+    ("color", text(marker.color().otio_name())),
+    ("marked_range", range.time_range()),
+    ("comment", text(marker.comment())),
+  ])
+}
+
+/// The exact words for a media-side range written in `ruler`: the rate its
+/// counts are ticks of, and the `timebase` the model counts the range in,
+/// each as `num/den`.
+fn exact_ruler(ruler: Ruler, timebase: Timebase) -> Value {
+  object(vec![
+    ("ruler", Value::String(format_utf8bytes!("{}", ruler.exact()))),
+    ("timebase", Value::String(format_utf8bytes!("{timebase}"))),
+  ])
+}
+
+/// A track's markers, and each of its clips', counted: a track's at the
+/// edit rate, held whole there; a clip's held whole in the first of its own
+/// rulers that does, else the first the timeline's operands are counted in
+/// ([`whole_plan`]). OpenTimelineIO derives nothing from a marker but its
+/// own two ends, so none is ever an operand, and no search moves one.
+struct Marked {
+  track: Vec<Counted>,
+  /// Per clip, in the track's order.
+  clips: Vec<Vec<Counted>>,
+}
+
+/// The markers of `track`, the `index`-th, planned ([`Marked`]); a marker
+/// none of its rulers holds whole is refused before any walk — a track's
+/// with no search, at the edit rate, as any count the export writes there.
+fn markers_planned(
+  index: usize,
+  track: &Track,
+  edit: Ruler,
+  operands: &BTreeSet<Rate>,
+) -> Result<Marked, NotRepresentable> {
+  let on_track = track
+    .markers()
+    .iter()
+    .enumerate()
+    .map(|(marker, placed)| {
+      let range = placed.range();
+      let at = Spot::Marker(MarkerAt::Track {
+        track: index,
+        marker,
+      });
+      Counted::new(edit, range.start_pts(), range.span().ticks()).within(true, at, None)
+    })
+    .collect::<Result<Vec<_>, _>>()?;
+  let on_clips = track
+    .clips()
+    .iter()
+    .enumerate()
+    .map(|(clip_index, clip)| {
+      clip
+        .markers()
+        .iter()
+        .enumerate()
+        .map(|(marker, placed)| {
+          let at = Spot::Marker(MarkerAt::Clip {
+            clip: ClipAt::new(index, clip_index),
+            marker,
+          });
+          whole_plan(placed.range(), clip.media().rate(), at, operands)
+        })
+        .collect::<Result<Vec<_>, _>>()
+    })
+    .collect::<Result<Vec<_>, _>>()?;
+  Ok(Marked {
+    track: on_track,
+    clips: on_clips,
+  })
 }
 
 fn transition(metadata: Value, in_offset: Value, out_offset: Value) -> Value {
@@ -819,18 +985,20 @@ fn source_plan(
   own_ticks(range).within(false, at, Some(RulerSearch { walks: 0 }))
 }
 
-/// The available range of a clip's medium, `range`, planned: start and
-/// length in one ruler, the first that holds it whole — its start, its
-/// length and the end they make within ±2^53:
+/// A media-side range OpenTimelineIO derives only its own ends from — the
+/// available range of a clip's medium, or a clip's marker — `range`,
+/// planned: start and length in one ruler, the first that holds it whole —
+/// its start, its length and the end they make within ±2^53:
 ///
-/// 1. of its own rulers ([`own_rulers`]);
+/// 1. of its own rulers ([`own_rulers`]), frames of the medium's stated
+///    `rate` first;
 /// 2. where none of them does, of the timeline's `operands`, finest first
 ///    ([`operand_plan`]).
 ///
 /// Its end is held here with its start and its length, not left to the
-/// walk: OpenTimelineIO derives nothing from an available range but its own
-/// two ends, and the search never writes it in another ruler, so no walk
-/// could change that end. Its ruler is no operand ([`operands`]).
+/// walk: OpenTimelineIO derives nothing from such a range but its own two
+/// ends, and the search never writes it in another ruler, so no walk could
+/// change that end. Its ruler is no operand ([`operands`]).
 ///
 /// As for a source range ([`source_plan`]), only a ruler at a fractional
 /// rate can hold a range none of its own rulers holds whole: every whole
@@ -840,7 +1008,7 @@ fn source_plan(
 /// rulers holds whole either is refused before any walk, with its own count
 /// past 2^53 — its start, its length or its end — and with the search's
 /// bands, no ruler of which holds it ([`RulerSearch::walks`] 0).
-fn available_plan(
+fn whole_plan(
   range: TimeRange,
   rate: Option<Rate>,
   at: Spot,

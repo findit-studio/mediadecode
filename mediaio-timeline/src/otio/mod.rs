@@ -15,6 +15,8 @@
 //! | [`Transition`](crate::Transition) | `Transition.1`, `SMPTE_Dissolve`, its offsets at the edit rate |
 //! | a [`Fade`](crate::Fade) | `Transition.1`, `SMPTE_Dissolve` against a gap — a gap of no length where the clip abuts a clip or a track's end |
 //! | a clip's [`id`](crate::Clip::id), gain, reel, the medium's rate, a fade's curve, [`Metadata`](crate::Metadata) | `metadata.mediaio`: `id`, `gain_db`, `reel`, `rate`, `fade` and `shape`, `metadata` |
+//! | a [`Marker`](crate::Marker), on a track or a clip | `Marker.2` among the item's `markers`: `name`, `color` (OpenTimelineIO's capitals), `marked_range`, `comment` — a track's at the edit rate, a clip's in its medium's time |
+//! | the exact words a reader needs | `metadata.mediaio`: the edit rate (`rate`, `num/den`) on the timeline; on a clip, its reference and a clip's marker, the exact ruler a media-side range's counts are written in and the timebase the model counts it in (`source`, `available`, `range`); on a dissolve, its place among its track's transitions where the track keeps them out of their cuts' order (`order`) |
 //!
 //! Every position on the record side is a whole count at the edit rate. A
 //! media-side range (a source range, an available range) is written whole in
@@ -122,7 +124,7 @@ use std::vec::Vec;
 use mediatime::Rate;
 use smol_bytes::{Utf8Bytes, Utf8BytesMut};
 
-use crate::{ClipAt, EdgeAt, Refusal, Timeline, TransitionAt, layout::layout_valid, validate};
+use crate::{ClipAt, EdgeAt, MarkerAt, Refusal, Timeline, TransitionAt, layout::layout_valid, validate};
 
 mod check;
 mod derive;
@@ -228,11 +230,13 @@ impl core::error::Error for Refused {}
 /// ruler the timeline's operands are counted in; and an available range no
 /// ruler of the bands holds whole — its start, its length or its end past
 /// 2^53 in each of those, its end held with its start and its length, as
-/// the search never moves it. The operands' rulers are the only rulers of
-/// the bands that can write or hold a range its own cannot: every whole
-/// rate that lands on a range is a multiple of its coarsest whole ruler, one
-/// of its own, which counts it in the smallest counts. Those two refusals
-/// say what the search tried too: its bands, and no walk.
+/// the search never moves it — and a clip's marker likewise. The operands'
+/// rulers are the only rulers of the bands that can write or hold a range
+/// its own cannot: every whole rate that lands on a range is a multiple of
+/// its coarsest whole ruler, one of its own, which counts it in the smallest
+/// counts. Those refusals say what the search tried too: its bands, and no
+/// walk. A track's marker is counted at the edit rate, as a count the
+/// export writes there, and refused with no search.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NotRepresentable {
   at: Spot,
@@ -490,6 +494,11 @@ pub enum Spot {
   /// counted at rate 1. A timeline with a track ends with its longest
   /// track ([`AbsoluteEnd`](Self::AbsoluteEnd)).
   TimelineEnd,
+  /// A marker's range — its start, its length or its end — refused as the
+  /// timeline holds it, before any walk: a track's marker counted at the
+  /// edit rate; a clip's in none of its own rulers, nor of the rulers the
+  /// timeline's operands are counted in, held whole.
+  Marker(MarkerAt),
 }
 
 /// Writes `the start`, `the place of track 0, child 2`, and so on.
@@ -511,6 +520,7 @@ impl fmt::Display for Spot {
       Self::TimelineEnd => {
         f.write_str("the end of the timeline, which has no track, from the global start")
       }
+      Self::Marker(at) => write!(f, "the marked range of {at}"),
     }
   }
 }

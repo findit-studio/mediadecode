@@ -22,6 +22,7 @@
 //! | `Gap.1` | — | an item's keys only |
 //! | `Transition.1` | `in_offset`, `out_offset`, `transition_type` | `transition.cpp:35–37` |
 //! | `ExternalReference.1` | `target_url` | `externalReference.cpp:23` |
+//! | `Marker.2` | `marked_range` | `marker.cpp:28` (0.15: `:26`, 0.14.1: `:23`, 0.12: `:20`) |
 //! | `RationalTime.1` | `rate`, `value` | `deserialization.cpp:578–583` |
 //! | `TimeRange.1` | `start_time`, `duration` | `deserialization.cpp:585–591` |
 //!
@@ -30,17 +31,21 @@
 //! item's `source_range`, `effects`, `markers` and `enabled`
 //! (`item.cpp:185–188`), a timeline's `global_start_time`
 //! (`timeline.cpp:31`), a media reference's `available_range` and
-//! `available_image_bounds` (`mediaReference.cpp:30–33`).
+//! `available_image_bounds` (`mediaReference.cpp:30–33`), a marker's
+//! `color` and, from 0.16, its `comment` (`marker.cpp:29`; readers
+//! before 0.16 keep a `comment` as a field they do not know, and write it
+//! back).
 //!
 //! # What a value is held to
 //!
 //! A value present is held to the type the reader takes, and in places to
 //! more — a string where a reader would take `null` as empty, a positive,
 //! finite rate, a length of zero or more, an active media key among the
-//! references, every transition between two items. Keys this crate never
-//! writes are not checked: a newer reader's `color` on an item or `enabled`
-//! on a transition, an effect's or a marker's own fields, an image bound's
-//! corners.
+//! references, every transition between two items, every marker a
+//! `Marker.2` — the one marker schema the readers 0.12 to 0.18.1 know.
+//! Keys this crate never writes are not checked: a newer reader's `color`
+//! on an item or `enabled` on a transition, an effect's own fields, an
+//! image bound's corners.
 
 use std::format;
 
@@ -196,11 +201,27 @@ fn item(members: &Members, path: &str) -> Result<(), Shape> {
     nullable(value, at, time_range)
   })?;
   optional(members, path, "effects", schema_objects)?;
-  optional(members, path, "markers", schema_objects)?;
+  optional(members, path, "markers", |value, at| {
+    for (index, entry) in array(value, at)?.iter().enumerate() {
+      marker(entry, &format!("{at}[{index}]"))?;
+    }
+    Ok(())
+  })?;
   optional(members, path, "enabled", |value, at| match value {
     Value::Bool(_) => Ok(()),
     _ => Err(shape(at, "a boolean")),
   })
+}
+
+/// A `Marker.2`: its name and metadata, its color and comment strings, and
+/// the range it marks, which every reader requires.
+fn marker(value: &Value, path: &str) -> Result<(), Shape> {
+  let members = schema(value, path, &["Marker.2"], "the schema Marker.2")?;
+  named(members, path)?;
+  optional(members, path, "color", string)?;
+  let (range, at) = required(members, path, "marked_range")?;
+  time_range(range, &at)?;
+  optional(members, path, "comment", string)
 }
 
 fn named(members: &Members, path: &str) -> Result<(), Shape> {
@@ -247,8 +268,8 @@ fn rational_time(value: &Value, path: &str) -> Result<(), Shape> {
   }
 }
 
-/// An array of objects that each name their schema: effects and markers,
-/// whose own fields this check does not read.
+/// An array of objects that each name their schema: effects, whose own
+/// fields this check does not read.
 fn schema_objects(value: &Value, path: &str) -> Result<(), Shape> {
   for (index, entry) in array(value, path)?.iter().enumerate() {
     let at = format!("{path}[{index}]");
