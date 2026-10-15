@@ -2,6 +2,25 @@ use super::*;
 
 use ffmpeg_next::ffi::AVColorRange;
 
+/// Writes every byte of every buffer `frame` holds — what a decoder does
+/// to the frames it hands out, and what `frame::Video::new` and
+/// `frame::Audio::new` leave undone: `av_frame_get_buffer` allocates
+/// their planes without writing them, and every conversion reads only
+/// [written bytes](crate::contracts#every-exported-byte-initialised).
+fn write_every_plane(frame: &mut ffmpeg_next::Frame) {
+  // SAFETY: the frame is live and uniquely borrowed. Each non-null
+  // `buf[i]` is a live `AVBufferRef` whose `data` is valid for `size`
+  // bytes, written through the raw pointer without forming a reference
+  // to the unwritten bytes.
+  unsafe {
+    for buf in (*frame.as_mut_ptr()).buf {
+      if !buf.is_null() {
+        core::ptr::write_bytes((*buf).data, 0, (*buf).size);
+      }
+    }
+  }
+}
+
 /// The `yuvj*` family is JPEG full-range *by definition*. `map_range_for`
 /// must report [`ColorRange::Full`] for every one of the five variants —
 /// including when the frame's `color_range` field is
@@ -113,8 +132,11 @@ fn is_yuvj_covers_exactly_the_five_variants() {
 #[test]
 fn yuvj420p_unspecified_range_delivers_full() {
   // `Video::new` allocates real plane buffers via `av_frame_get_buffer`
-  // and leaves `color_range` at its zero default (== UNSPECIFIED).
+  // and leaves `color_range` at its zero default (== UNSPECIFIED). The
+  // planes it leaves unwritten; a decoder would write them, and so does
+  // this law.
   let mut frame = ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::YUVJ420P, 64, 48);
+  write_every_plane(&mut frame);
 
   // Pin the regression precondition explicitly: color_range is UNSPECIFIED.
   // SAFETY: `frame` is a live, uniquely-owned AVFrame; we only write the
@@ -123,7 +145,9 @@ fn yuvj420p_unspecified_range_delivers_full() {
     (*frame.as_mut_ptr()).color_range = AVColorRange::AVCOL_RANGE_UNSPECIFIED;
   }
 
-  let out = video_frame_from(&frame, Timebase::default(), FrameLimits::default())
+  // SAFETY: the frame is live for the call, its geometry is
+  // `av_frame_get_buffer`'s own, and every plane was written above.
+  let out = unsafe { video_frame_from(&frame, Timebase::default(), FrameLimits::default()) }
     .expect("YUVJ420P frame should convert to a VideoFrame");
 
   assert_eq!(*out.pixel_format(), PixelFormat::Yuvj420p);
@@ -168,7 +192,12 @@ fn an_unsupported_format_is_named_in_the_error() {
   let frame = frame_with_raw_format(raw);
 
   // `VideoFrame` has no `Debug`, so `expect_err` is unavailable.
-  let Err(err) = video_frame_from(&frame, Timebase::default(), FrameLimits::default()) else {
+  //
+  // SAFETY: the frame is live for the call and holds no planes — its
+  // `data[]` and `buf[]` are null — so it exports no byte to be
+  // unwritten; the format is refused before anything else is read.
+  let Err(err) = (unsafe { video_frame_from(&frame, Timebase::default(), FrameLimits::default()) })
+  else {
     panic!("a hardware surface carries no deliverable CPU layout");
   };
 
@@ -203,7 +232,10 @@ fn an_unnameable_format_still_reports_its_raw_id() {
   let raw = 99_999;
   let frame = frame_with_raw_format(raw);
 
-  let Err(err) = video_frame_from(&frame, Timebase::default(), FrameLimits::default()) else {
+  // SAFETY: as in the law above — no planes, so no exported byte; the
+  // format is refused first.
+  let Err(err) = (unsafe { video_frame_from(&frame, Timebase::default(), FrameLimits::default()) })
+  else {
     panic!("an unmappable format integer has no deliverable layout");
   };
 
@@ -582,14 +614,15 @@ fn hdr_seats_are_found_by_kind_among_unrelated_side_data() {
   assert_eq!(cll.max_fall(), 100);
 }
 
-/// **A custom channel map reaching the safe conversion is refused
+/// **A custom channel map reaching the borrowed conversion is refused
 /// unread.** Safe `ffmpeg_next` code can give a frame a `CUSTOM` layout
-/// whose map points at nothing; walking it would read out of bounds
-/// through a safe call. The refusal is by name, and the worker — the
-/// only code that walks a map — is never entered: the probe's tripwire
-/// would stop it at the door before it touched the frame.
+/// whose map points at nothing, and the borrowed conversion's contract
+/// does not ask its caller to vouch for the map. The refusal is by name,
+/// and the worker — the only code that walks a map — is never entered:
+/// the probe's tripwire would stop it at the door before it touched the
+/// frame.
 #[test]
-fn a_dangling_custom_map_is_refused_by_the_safe_conversion_unread() {
+fn a_dangling_custom_map_is_refused_by_the_borrowed_conversion_unread() {
   use ffmpeg_next::ffi::{AVChannelCustom, AVChannelOrder};
 
   let mut frame = ffmpeg_next::frame::Audio::empty();
@@ -606,7 +639,10 @@ fn a_dangling_custom_map_is_refused_by_the_safe_conversion_unread() {
 
   let before = worker_probe::entries();
   worker_probe::arm(true);
-  let result = audio_frame_from(&frame, Timebase::default(), FrameLimits::default());
+  // SAFETY: the frame is live for the call and holds no planes, so it
+  // exports no byte to be unwritten; its map is not the contract's to
+  // vouch for on this road, which refuses it unread — the law.
+  let result = unsafe { audio_frame_from(&frame, Timebase::default(), FrameLimits::default()) };
   worker_probe::arm(false);
   let entered = worker_probe::entries() - before;
 
@@ -618,7 +654,7 @@ fn a_dangling_custom_map_is_refused_by_the_safe_conversion_unread() {
     (*raw).ch_layout.u.mask = 0;
   }
 
-  assert_eq!(entered, 0, "the safe road must not enter the worker");
+  assert_eq!(entered, 0, "the borrowed road must not enter the worker");
   assert!(
     matches!(result, Err(ConvertError::UnverifiableChannelMap(p)) if p.channels() == 1),
     "a custom map is refused by name, got {:?}",
@@ -628,9 +664,9 @@ fn a_dangling_custom_map_is_refused_by_the_safe_conversion_unread() {
 
 /// **A null-backed frame is refused before any field is read.**
 /// ffmpeg-next's safe `Audio::empty()` stores whatever `av_frame_alloc`
-/// answered — null, when the allocation fails — so the safe conversion
-/// can be handed a wrapper around nothing. `Audio::wrap(null)` builds
-/// that same wrapper without an allocation failure.
+/// answered — null, when the allocation fails — so the borrowed
+/// conversion can be handed a wrapper around nothing. `Audio::wrap(null)`
+/// builds that same wrapper without an allocation failure.
 #[test]
 fn a_null_backed_audio_frame_is_refused_before_any_read() {
   // SAFETY: the state `Audio::empty()` leaves after a failed
@@ -638,13 +674,15 @@ fn a_null_backed_audio_frame_is_refused_before_any_read() {
   // does nothing.
   let frame = unsafe { ffmpeg_next::frame::Audio::wrap(core::ptr::null_mut()) };
   assert!(matches!(
-    audio_frame_from(&frame, Timebase::default(), FrameLimits::default()),
+    // SAFETY: a wrapper around null is the contract's one admitted
+    // exception: it is refused before anything is read.
+    unsafe { audio_frame_from(&frame, Timebase::default(), FrameLimits::default()) },
     Err(ConvertError::NullFrame)
   ));
 }
 
 /// **An impossible count is refused as one, whatever the layout's
-/// order.** The safe road judges the sample and channel counts exactly
+/// order.** The borrowed road judges the sample and channel counts exactly
 /// as the worker does before it asks the map question, so a custom
 /// layout declaring `-1`, `256`, or no channels under samples — or a
 /// negative sample count — is refused for the count, and the worker is
@@ -669,12 +707,14 @@ fn a_custom_layout_with_an_impossible_count_is_refused_for_the_count() {
     }
     let before = worker_probe::entries();
     worker_probe::arm(true);
-    let result = audio_frame_from(&frame, Timebase::default(), FrameLimits::default());
+    // SAFETY: the frame is live for the call and holds no planes; the
+    // counts are refused before anything else is read — the law.
+    let result = unsafe { audio_frame_from(&frame, Timebase::default(), FrameLimits::default()) };
     worker_probe::arm(false);
     assert_eq!(
       worker_probe::entries() - before,
       0,
-      "the safe road must not enter the worker"
+      "the borrowed road must not enter the worker"
     );
     // SAFETY: as above. The frame goes back to an empty layout before it
     // drops, or `av_frame_free` would free the dangling map.
@@ -705,7 +745,7 @@ fn a_custom_layout_with_an_impossible_count_is_refused_for_the_count() {
 /// **A custom map libavcodec allocated still converts — on the road
 /// whose caller vouches for it.** `av_channel_layout_custom_init` sizes
 /// the map for `nb_channels` entries, which is the shape every
-/// decoder's frame carries. The safe road refuses this frame too: it
+/// decoder's frame carries. The borrowed road refuses this frame too: it
 /// cannot tell an honest map from a forged one.
 #[test]
 fn a_libavcodec_owned_custom_layout_converts_through_the_unsafe_entry() {
@@ -717,6 +757,9 @@ fn a_libavcodec_owned_custom_layout_converts_through_the_unsafe_entry() {
 
   let mut frame =
     ffmpeg_next::frame::Audio::new(Sample::F32(Type::Planar), 64, ChannelLayout::STEREO);
+  // `Audio::new` leaves the samples unwritten; a decoder writes them, and
+  // so does this law, before anything reads them.
+  write_every_plane(&mut frame);
   // SAFETY: reading the pointer of a live frame.
   let raw = unsafe { frame.as_mut_ptr() };
   // SAFETY: `raw` is the live frame. Its stereo layout is released by
@@ -733,12 +776,15 @@ fn a_libavcodec_owned_custom_layout_converts_through_the_unsafe_entry() {
   }
 
   assert!(matches!(
-    audio_frame_from(&frame, Timebase::default(), FrameLimits::default()),
+    // SAFETY: the frame is live for the call and every sample was written
+    // above; its map is refused unread on this road.
+    unsafe { audio_frame_from(&frame, Timebase::default(), FrameLimits::default()) },
     Err(ConvertError::UnverifiableChannelMap(p)) if p.channels() == 2
   ));
 
-  // SAFETY: the frame is live for the call, its custom map holds the
-  // two entries FFmpeg allocated for it, and the owned lane copies.
+  // SAFETY: the frame is live for the call, every sample was written
+  // above, its custom map holds the two entries FFmpeg allocated for it,
+  // and the owned lane copies.
   let converted = unsafe {
     av_frame_to_audio_frame_as::<crate::Owned>(
       frame.as_ptr(),
@@ -751,14 +797,14 @@ fn a_libavcodec_owned_custom_layout_converts_through_the_unsafe_entry() {
   assert_eq!(converted.channel_layout().channels(), 2);
 }
 
-/// **A bitmap rect is refused by the safe conversion, unread.** A
+/// **A bitmap rect is refused by the borrowed conversion, unread.** A
 /// decoded bitmap rect owns a plane of `linesize[0] × h` bytes, and
 /// `ffmpeg_next`'s safe `BitmapMut::set_height` moves `h` alone — here
-/// to a million rows over a four-byte plane. The safe road refuses the
-/// rect by name, and the worker, the only code that reads a plane, is
-/// never entered: the probe's tripwire would stop it at the door.
+/// to a million rows over a four-byte plane. The borrowed road refuses
+/// the rect by name, and the worker, the only code that reads a plane,
+/// is never entered: the probe's tripwire would stop it at the door.
 #[test]
-fn a_bitmap_rect_is_refused_by_the_safe_subtitle_conversion_unread() {
+fn a_bitmap_rect_is_refused_by_the_borrowed_subtitle_conversion_unread() {
   use ffmpeg_next::subtitle::{RectMut, Type};
 
   let mut subtitle = ffmpeg_next::Subtitle::new();
@@ -787,13 +833,16 @@ fn a_bitmap_rect_is_refused_by_the_safe_subtitle_conversion_unread() {
 
   let before = worker_probe::entries();
   worker_probe::arm(true);
-  let result = subtitle_frame_from(&subtitle);
+  // SAFETY: the subtitle is live for the call; its text rect's string is
+  // `ffmpeg_next`'s NUL-terminated copy, and the bitmap's plane is not
+  // this road's to read — it is refused unread, the law.
+  let result = unsafe { subtitle_frame_from(&subtitle) };
   worker_probe::arm(false);
 
   assert_eq!(
     worker_probe::entries() - before,
     0,
-    "the safe road must not enter the worker"
+    "the borrowed road must not enter the worker"
   );
   assert!(
     matches!(result, Err(ConvertError::UnverifiableBitmap(p)) if p.rect() == 1),
@@ -802,18 +851,20 @@ fn a_bitmap_rect_is_refused_by_the_safe_subtitle_conversion_unread() {
   );
 }
 
-/// **Text still converts on the safe road.** The refusal is the
+/// **Text still converts on the borrowed road.** The refusal is the
 /// bitmap's alone: a subtitle of text rects, whose strings `ffmpeg_next`
-/// duplicates NUL-terminated, comes through the safe conversion.
+/// duplicates NUL-terminated, comes through the borrowed conversion.
 #[test]
-fn a_text_subtitle_converts_on_the_safe_road() {
+fn a_text_subtitle_converts_on_the_borrowed_road() {
   use ffmpeg_next::subtitle::{RectMut, Type};
 
   let mut subtitle = ffmpeg_next::Subtitle::new();
   if let RectMut::Text(mut text) = subtitle.add_rect(Type::Text) {
     text.set("hello");
   }
-  let frame = subtitle_frame_from(&subtitle).expect("a text subtitle converts");
+  // SAFETY: the subtitle is live for the call, and its one rect's string
+  // is `ffmpeg_next`'s NUL-terminated copy.
+  let frame = unsafe { subtitle_frame_from(&subtitle) }.expect("a text subtitle converts");
   match frame.payload() {
     mediaspine::subtitle::SubtitlePayload::Text(text) => {
       assert_eq!(text.text().as_ref(), b"hello");

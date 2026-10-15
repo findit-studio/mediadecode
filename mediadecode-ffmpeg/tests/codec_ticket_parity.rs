@@ -591,7 +591,9 @@ fn a_decoder_opened_from_a_rebuilt_ticket_produces_frames() {
     let index = stream.index();
     if index == video_index && video_frames == 0 {
       let Some(packet) =
-        owned_video_packet_from_ffmpeg_in(&av_packet, video_tb, PacketLimits::default())
+        // SAFETY: `packets()` reads each packet with `av_read_frame`, so libavformat wrote its
+        // payload, and it is live for the call.
+        unsafe { owned_video_packet_from_ffmpeg_in(&av_packet, video_tb, PacketLimits::default()) }
           .expect("a wrappable video payload")
       else {
         continue;
@@ -608,7 +610,9 @@ fn a_decoder_opened_from_a_rebuilt_ticket_produces_frames() {
       }
     } else if index == audio_index && audio_frames == 0 {
       let Some(packet) =
-        owned_audio_packet_from_ffmpeg_in(&av_packet, audio_tb, PacketLimits::default())
+        // SAFETY: `packets()` reads each packet with `av_read_frame`, so libavformat wrote its
+        // payload, and it is live for the call.
+        unsafe { owned_audio_packet_from_ffmpeg_in(&av_packet, audio_tb, PacketLimits::default()) }
           .expect("a wrappable audio payload")
       else {
         continue;

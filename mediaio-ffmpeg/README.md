@@ -21,8 +21,13 @@ libavcodec and libavformat (through
 
 Every operation whose soundness rests on something only its caller can
 establish — a raw pointer's liveness, an extent, a claim about who else
-can write a buffer, a geometry a frame must keep — is an `unsafe fn`
-with a `# Safety` section saying what the caller proves. The machines in
+can write a buffer, a geometry a frame must keep, that every byte an
+object exports was written — is an `unsafe fn` with a `# Safety` section
+saying what the caller proves, against the sections of
+`mediaio_ffmpeg::contracts`. That includes every conversion from an
+`ffmpeg_next` frame, packet or subtitle: `ffmpeg_next`'s safe API builds
+ones whose bytes were never written (`frame::Video::new`, `Packet::new`),
+so no safe function here reads their storage. The machines in
 `mediadecode-ffmpeg` call them with their proofs written beside each
 call. What a consumer holds — a packet, a frame, a carrier — is safe to
 use without any of that.

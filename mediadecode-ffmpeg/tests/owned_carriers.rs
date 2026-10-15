@@ -397,14 +397,18 @@ fn a_packet_over_budget_is_refused_before_the_copy() {
   let tb = mediadecode::Timebase::default();
 
   // Under the default budget this is an ordinary packet.
-  let carried = owned_video_packet_from_ffmpeg_in(&packet, tb, PacketLimits::default())
+  // SAFETY: `Packet::copy` wrote every byte of the payload, and the packet is live for the
+  // call.
+  let carried = unsafe { owned_video_packet_from_ffmpeg_in(&packet, tb, PacketLimits::default()) }
     .expect("4 KiB is nothing")
     .expect("present");
   assert_eq!(carried.data().len(), 4096);
 
   // One byte under what it needs: refused, by name, with both numbers.
   let tight = PacketLimits::new().with_max_packet_bytes(4095);
-  match owned_video_packet_from_ffmpeg_in(&packet, tb, tight) {
+  // SAFETY: `Packet::copy` wrote every byte of the payload, and the packet is live for the
+  // call.
+  match unsafe { owned_video_packet_from_ffmpeg_in(&packet, tb, tight) } {
     Err(PacketBufferError::PacketTooLarge(p)) => {
       assert_eq!(p.bytes(), 4096);
       assert_eq!(p.limit(), 4095);
@@ -414,9 +418,17 @@ fn a_packet_over_budget_is_refused_before_the_copy() {
 
   // Exactly at the line is not over it.
   assert!(
-    owned_video_packet_from_ffmpeg_in(&packet, tb, PacketLimits::new().with_max_packet_bytes(4096))
-      .expect("exactly at the cap is not over it")
-      .is_some()
+    // SAFETY: `Packet::copy` wrote every byte of the payload, and the packet is live for the
+    // call.
+    unsafe {
+      owned_video_packet_from_ffmpeg_in(
+        &packet,
+        tb,
+        PacketLimits::new().with_max_packet_bytes(4096),
+      )
+    }
+    .expect("exactly at the cap is not over it")
+    .is_some()
   );
 }
 
@@ -441,19 +453,29 @@ fn the_packet_budget_fires_on_every_arm() {
 
   let over = |r: Result<Option<bool>, PacketBufferError>| matches!(r, Err(PacketBufferError::PacketTooLarge(p)) if p.bytes() == 512 && p.limit() == 8);
   assert!(over(
-    owned_video_packet_from_ffmpeg_in(&packet, tb, tight).map(|p| p.map(|_| true))
+    // SAFETY: `Packet::copy` wrote every byte of the payload, and the packet is live for the
+    // call.
+    unsafe { owned_video_packet_from_ffmpeg_in(&packet, tb, tight) }.map(|p| p.map(|_| true))
   ));
   assert!(over(
-    owned_audio_packet_from_ffmpeg_in(&packet, tb, tight).map(|p| p.map(|_| true))
+    // SAFETY: `Packet::copy` wrote every byte of the payload, and the packet is live for the
+    // call.
+    unsafe { owned_audio_packet_from_ffmpeg_in(&packet, tb, tight) }.map(|p| p.map(|_| true))
   ));
   assert!(over(
-    owned_subtitle_packet_from_ffmpeg_in(&packet, tb, tight).map(|p| p.map(|_| true))
+    // SAFETY: `Packet::copy` wrote every byte of the payload, and the packet is live for the
+    // call.
+    unsafe { owned_subtitle_packet_from_ffmpeg_in(&packet, tb, tight) }.map(|p| p.map(|_| true))
   ));
   assert!(over(
-    owned_data_packet_from_ffmpeg_in(&packet, tb, tight).map(|p| p.map(|_| true))
+    // SAFETY: `Packet::copy` wrote every byte of the payload, and the packet is live for the
+    // call.
+    unsafe { owned_data_packet_from_ffmpeg_in(&packet, tb, tight) }.map(|p| p.map(|_| true))
   ));
   assert!(over(
-    owned_attachment_packet_from_ffmpeg(&packet, tight).map(|p| p.map(|_| true))
+    // SAFETY: `Packet::copy` wrote every byte of the payload, and the packet is live for the
+    // call.
+    unsafe { owned_attachment_packet_from_ffmpeg(&packet, tight) }.map(|p| p.map(|_| true))
   ));
 }
 
@@ -606,7 +628,9 @@ fn a_decoded_still_over_the_frame_ceilings_is_refused_before_the_planes() {
   // Reached here by converting directly, which is the road with no
   // decoder to have pushed anything down.
   let frame = picture_av_frame(64, 64);
-  match convert::image_frame_from(&frame, FrameLimits::new().with_max_frame_bytes(8)) {
+  // SAFETY: the frame is live for the call and holds no buffers, so it exports no byte to be
+  // unwritten; it is refused on its declared size before anything is read.
+  match unsafe { convert::image_frame_from(&frame, FrameLimits::new().with_max_frame_bytes(8)) } {
     Err(ConvertError::FrameTooLarge(p)) => {
       assert_eq!(p.limit(), 8);
       assert!(p.bytes() > 8, "the ask is reported: {}", p.bytes());
@@ -1306,7 +1330,9 @@ fn an_audio_plane_exports_valid_samples_not_alignment_padding() {
       continue;
     }
     let Ok(Some(portable)) =
-      mediadecode_ffmpeg::audio_packet_from_ffmpeg(&packet, mediadecode::Timebase::SECONDS)
+      // SAFETY: `Packet::read` is `av_read_frame`, so libavformat wrote the payload, and the
+      // packet is live for the call.
+      (unsafe { mediadecode_ffmpeg::audio_packet_from_ffmpeg(&packet, mediadecode::Timebase::SECONDS) })
     else {
       continue;
     };
@@ -1595,11 +1621,14 @@ fn a_packed_zero_sample_frame_converts_to_empty_planes() {
 
   // Packed: one plane for every channel together.
   let frame = empty_audio_av_frame(ffmpeg_next::ffi::AVSampleFormat::AV_SAMPLE_FMT_S16, 2);
-  let out = convert::audio_frame_from(
-    &frame,
-    mediadecode::Timebase::default(),
-    FrameLimits::default(),
-  )
+  // SAFETY: an empty frame: no buffers and no samples, so it exports no byte to be unwritten.
+  let out = unsafe {
+    convert::audio_frame_from(
+      &frame,
+      mediadecode::Timebase::default(),
+      FrameLimits::default(),
+    )
+  }
   .expect("a header frame is a frame, not a layout error");
 
   assert_eq!(out.nb_samples(), 0);
@@ -1621,11 +1650,14 @@ fn a_planar_zero_sample_frame_converts_to_empty_planes() {
 
   // Planar: one plane per channel, all of them empty.
   let frame = empty_audio_av_frame(ffmpeg_next::ffi::AVSampleFormat::AV_SAMPLE_FMT_S16P, 6);
-  let out = convert::audio_frame_from(
-    &frame,
-    mediadecode::Timebase::default(),
-    FrameLimits::default(),
-  )
+  // SAFETY: an empty frame: no buffers and no samples, so it exports no byte to be unwritten.
+  let out = unsafe {
+    convert::audio_frame_from(
+      &frame,
+      mediadecode::Timebase::default(),
+      FrameLimits::default(),
+    )
+  }
   .expect("a header frame is a frame, not a layout error");
 
   assert_eq!(out.nb_samples(), 0);
@@ -1697,11 +1729,15 @@ fn a_negative_sample_count_is_refused_by_name() {
     2,
     0,
   );
-  match convert::audio_frame_from(
-    &frame,
-    mediadecode::Timebase::default(),
-    FrameLimits::default(),
-  ) {
+  // SAFETY: the frame is live for the call and holds no buffers, so it exports no byte to be
+  // unwritten; it is refused on its header before anything else is read.
+  match unsafe {
+    convert::audio_frame_from(
+      &frame,
+      mediadecode::Timebase::default(),
+      FrameLimits::default(),
+    )
+  } {
     Err(ConvertError::InvalidSampleCount(payload)) => {
       assert_eq!(payload.count(), -1, "the refusal reports what it read");
     }
@@ -1725,11 +1761,15 @@ fn a_zero_sample_frame_with_no_sample_format_is_refused() {
     99_999, // and an unknown one, which is the same claim from a file
   ] {
     let frame = raw_audio_av_frame(format_raw, 0, 2, 0);
-    match convert::audio_frame_from(
-      &frame,
-      mediadecode::Timebase::default(),
-      FrameLimits::default(),
-    ) {
+    // SAFETY: the frame is live for the call and holds no buffers, so it exports no byte to be
+    // unwritten; it is refused on its header before anything else is read.
+    match unsafe {
+      convert::audio_frame_from(
+        &frame,
+        mediadecode::Timebase::default(),
+        FrameLimits::default(),
+      )
+    } {
       Err(ConvertError::UnsupportedSampleFormat(payload)) => {
         assert_eq!(payload.raw(), format_raw);
       }
@@ -1761,11 +1801,15 @@ fn a_packed_frame_above_255_channels_is_refused_before_any_copy() {
     256,
     512,
   );
-  match convert::audio_frame_from(
-    &frame,
-    mediadecode::Timebase::default(),
-    FrameLimits::default(),
-  ) {
+  // SAFETY: the frame is live for the call and holds no buffers, so it exports no byte to be
+  // unwritten; it is refused on its header before anything else is read.
+  match unsafe {
+    convert::audio_frame_from(
+      &frame,
+      mediadecode::Timebase::default(),
+      FrameLimits::default(),
+    )
+  } {
     Err(ConvertError::UnsupportedChannelCount(payload)) => {
       assert_eq!(
         payload.channels(),
@@ -1800,13 +1844,23 @@ fn a_packed_frame_at_255_channels_still_converts() {
     ffmpeg_next::ffi::av_channel_layout_default(core::ptr::addr_of_mut!((*p).ch_layout), 255);
     let rc = ffmpeg_next::ffi::av_frame_get_buffer(p, 0);
     assert_eq!(rc, 0, "255 packed channels is an allocation FFmpeg makes");
+    // `av_frame_get_buffer` leaves the samples unwritten; written here, as
+    // a decoder writes them, through each buffer's raw pointer.
+    for buf in (*p).buf {
+      if !buf.is_null() {
+        core::ptr::write_bytes((*buf).data, 0, (*buf).size);
+      }
+    }
   }
 
-  let out = convert::audio_frame_from(
-    &frame,
-    mediadecode::Timebase::default(),
-    FrameLimits::default(),
-  )
+  // SAFETY: the frame is live for the call, and its one buffer was written whole above.
+  let out = unsafe {
+    convert::audio_frame_from(
+      &frame,
+      mediadecode::Timebase::default(),
+      FrameLimits::default(),
+    )
+  }
   .expect("255 channels is inside the seat");
 
   assert_eq!(out.channel_count(), 255);
@@ -1870,11 +1924,15 @@ fn a_negative_channel_count_is_refused_rather_than_read_as_zero() {
     ffmpeg_next::ffi::AVChannelOrder::AV_CHANNEL_ORDER_UNSPEC as i32,
     -1,
   );
-  match convert::audio_frame_from(
-    &frame,
-    mediadecode::Timebase::default(),
-    FrameLimits::default(),
-  ) {
+  // SAFETY: the frame is live for the call and holds no buffers, so it exports no byte to be
+  // unwritten; it is refused on its header before anything else is read.
+  match unsafe {
+    convert::audio_frame_from(
+      &frame,
+      mediadecode::Timebase::default(),
+      FrameLimits::default(),
+    )
+  } {
     Err(ConvertError::UnsupportedChannelCount(p)) => {
       assert_eq!(
         p.channels(),
@@ -1908,11 +1966,15 @@ fn an_oversized_custom_layout_is_refused_before_its_map_is_walked() {
     ffmpeg_next::ffi::AVChannelOrder::AV_CHANNEL_ORDER_CUSTOM as i32,
     i32::MAX,
   );
-  match convert::audio_frame_from(
-    &frame,
-    mediadecode::Timebase::default(),
-    FrameLimits::default(),
-  ) {
+  // SAFETY: the frame is live for the call and holds no buffers, so it exports no byte to be
+  // unwritten; it is refused on its header before anything else is read.
+  match unsafe {
+    convert::audio_frame_from(
+      &frame,
+      mediadecode::Timebase::default(),
+      FrameLimits::default(),
+    )
+  } {
     Err(ConvertError::UnsupportedChannelCount(p)) => assert_eq!(p.channels(), i32::MAX),
     Err(other) => panic!("expected UnsupportedChannelCount, got {other:?}"),
     Ok(_) => panic!("a custom layout of i32::MAX channels produced a frame"),
@@ -1945,11 +2007,15 @@ fn negative_picture_dimensions_are_refused_on_both_picture_roads() {
   for (w, h) in [(-1, 32), (32, -1), (-4, -4)] {
     let frame = picture_av_frame(w, h);
 
-    match convert::video_frame_from(
-      &frame,
-      mediadecode::Timebase::default(),
-      FrameLimits::default(),
-    ) {
+    // SAFETY: the frame is live for the call and holds no buffers, so it exports no byte to be
+    // unwritten; it is refused on its header before anything else is read.
+    match unsafe {
+      convert::video_frame_from(
+        &frame,
+        mediadecode::Timebase::default(),
+        FrameLimits::default(),
+      )
+    } {
       Err(ConvertError::InvalidDimensions(p)) => {
         assert_eq!((p.width(), p.height()), (w, h), "reported as declared");
       }
@@ -1959,7 +2025,9 @@ fn negative_picture_dimensions_are_refused_on_both_picture_roads() {
 
     // The still road reads the same two fields the same way, so it had
     // the same hole.
-    match convert::image_frame_from(&frame, FrameLimits::default()) {
+    // SAFETY: the frame is live for the call and holds no buffers, so it exports no byte to be
+    // unwritten; it is refused on its header before anything else is read.
+    match unsafe { convert::image_frame_from(&frame, FrameLimits::default()) } {
       Err(ConvertError::InvalidDimensions(p)) => {
         assert_eq!((p.width(), p.height()), (w, h));
       }
@@ -2060,12 +2128,15 @@ fn the_image_seam_honours_the_packet_flags_it_used_to_drop() {
 //  R9: uncarriable payloads, and numbers judged before they are spent.
 // ---------------------------------------------------------------------------
 
-/// A real allocated YUV420P frame, optionally cropped.
+/// A real allocated YUV420P frame, optionally cropped, its planes written
+/// as a decoder's are — `av_frame_get_buffer` leaves them unwritten, and a
+/// conversion reads only written bytes.
 fn allocated_picture(width: i32, height: i32, crop: [u64; 4]) -> ffmpeg_next::frame::Video {
   let mut frame = ffmpeg_next::frame::Video::empty();
   // SAFETY: `frame` owns a live, zeroed `AVFrame`; the fields written are
   // the scalars `av_frame_get_buffer` reads to size the allocation, and
-  // its return code is checked before the frame is used.
+  // its return code is checked before the frame is used. Each non-null
+  // `buf[i]` it allocated is then written whole through its raw pointer.
   unsafe {
     let p = frame.as_mut_ptr();
     (*p).format = ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_YUV420P as i32;
@@ -2073,6 +2144,11 @@ fn allocated_picture(width: i32, height: i32, crop: [u64; 4]) -> ffmpeg_next::fr
     (*p).height = height;
     let rc = ffmpeg_next::ffi::av_frame_get_buffer(p, 32);
     assert_eq!(rc, 0, "av_frame_get_buffer");
+    for buf in (*p).buf {
+      if !buf.is_null() {
+        core::ptr::write_bytes((*buf).data, 0, (*buf).size);
+      }
+    }
     (*p).crop_left = crop[0] as usize;
     (*p).crop_top = crop[1] as usize;
     (*p).crop_right = crop[2] as usize;
@@ -2087,11 +2163,15 @@ fn a_crop_that_cannot_be_a_crop_withholds_the_rect_instead_of_inventing_one() {
   support::init_ffmpeg();
 
   let convert_it = |frame: &ffmpeg_next::frame::Video| {
-    convert::video_frame_from(
-      frame,
-      mediadecode::Timebase::default(),
-      FrameLimits::default(),
-    )
+    // SAFETY: every frame this closure converts is `allocated_picture`'s, live for the call,
+    // with every buffer written.
+    unsafe {
+      convert::video_frame_from(
+        frame,
+        mediadecode::Timebase::default(),
+        FrameLimits::default(),
+      )
+    }
     .expect("a well-formed picture converts")
   };
 
@@ -2145,11 +2225,15 @@ fn an_undersized_stride_is_refused_before_any_plane_is_copied() {
   unsafe {
     (*frame.as_ptr().cast_mut()).linesize[0] = 8; // 64 bytes of row claimed by 8
   }
-  match convert::video_frame_from(
-    &frame,
-    mediadecode::Timebase::default(),
-    FrameLimits::default(),
-  ) {
+  // SAFETY: `allocated_picture` wrote every buffer, and the frame is live for the call; the
+  // corrupt `linesize` is a plain field the conversion judges.
+  match unsafe {
+    convert::video_frame_from(
+      &frame,
+      mediadecode::Timebase::default(),
+      FrameLimits::default(),
+    )
+  } {
     Err(ConvertError::InvalidPlaneLayout(p)) => assert_eq!(p.plane(), 0),
     Err(other) => panic!("expected InvalidPlaneLayout, got {other:?}"),
     Ok(_) => panic!("a plane narrower than its format converted"),
@@ -2171,15 +2255,19 @@ fn a_still_refuses_oversized_side_data_rather_than_dropping_the_orientation() {
   let with_side_data = |icc_bytes: usize| {
     let frame = allocated_picture(16, 16, [0; 4]);
     // SAFETY: `frame` owns a live `AVFrame`; `av_frame_new_side_data`
-    // allocates and attaches an entry, returning null on failure.
+    // allocates and attaches an entry, returning null on failure. Its
+    // bytes come unwritten (`av_buffer_alloc`), so each entry is written
+    // whole, `size` bytes at `data`, before anything converts the frame.
     unsafe {
       let icc = ffmpeg_next::ffi::av_frame_new_side_data(frame.as_ptr().cast_mut(), ICC, icc_bytes);
       assert!(!icc.is_null(), "side-data allocation");
+      core::ptr::write_bytes((*icc).data, 0, (*icc).size);
       // The display matrix goes in *after* the profile, which is the
       // shape that used to lose it: the byte cap was reached partway
       // through the list and everything past it was skipped.
       let m = ffmpeg_next::ffi::av_frame_new_side_data(frame.as_ptr().cast_mut(), MATRIX, 36);
       assert!(!m.is_null(), "side-data allocation");
+      core::ptr::write_bytes((*m).data, 0, (*m).size);
     }
     frame
   };
@@ -2188,7 +2276,10 @@ fn a_still_refuses_oversized_side_data_rather_than_dropping_the_orientation() {
   // real device-link ICC — is carried whole, and the entry behind it
   // survives.
   let ok = with_side_data(4 * 1024 * 1024);
-  let image = convert::image_frame_from(&ok, FrameLimits::default()).expect("inside the seat");
+  // SAFETY: `allocated_picture` wrote every buffer and `with_side_data` every side-data byte;
+  // the frame is live for the call.
+  let image =
+    unsafe { convert::image_frame_from(&ok, FrameLimits::default()) }.expect("inside the seat");
   let kinds: Vec<i32> = image.extra().side_data().iter().map(|e| e.kind()).collect();
   assert!(kinds.contains(&(ICC as i32)), "the profile was dropped");
   assert!(
@@ -2198,7 +2289,9 @@ fn a_still_refuses_oversized_side_data_rather_than_dropping_the_orientation() {
 
   // Over the seat: a named refusal, never a truncated list.
   let over = with_side_data(DEFAULT_MAX_IMAGE_SIDE_DATA_BYTES + 1);
-  match convert::image_frame_from(&over, FrameLimits::default()) {
+  // SAFETY: `allocated_picture` wrote every buffer and `with_side_data` every side-data byte;
+  // the frame is live for the call.
+  match unsafe { convert::image_frame_from(&over, FrameLimits::default()) } {
     Err(ConvertError::ImageSideDataTooLarge(p)) => {
       assert_eq!(p.limit(), DEFAULT_MAX_IMAGE_SIDE_DATA_BYTES);
       assert!(p.bytes() > p.limit());
@@ -2210,7 +2303,11 @@ fn a_still_refuses_oversized_side_data_rather_than_dropping_the_orientation() {
   // And the seat is configurable, so a caller with a tighter budget
   // gets the same named answer rather than a quiet loss.
   assert!(matches!(
-    convert::image_frame_from(&ok, FrameLimits::new().with_max_image_side_data_bytes(1024)),
+    // SAFETY: `allocated_picture` wrote every buffer and `with_side_data` every side-data byte;
+    // the frame is live for the call.
+    unsafe {
+      convert::image_frame_from(&ok, FrameLimits::new().with_max_image_side_data_bytes(1024))
+    },
     Err(ConvertError::ImageSideDataTooLarge(_)),
   ));
 }
@@ -2249,10 +2346,15 @@ fn a_still_judges_its_side_data_before_it_buys_a_single_plane() {
     let sd =
       ffmpeg_next::ffi::av_frame_new_side_data(p, ICC, DEFAULT_MAX_IMAGE_SIDE_DATA_BYTES + 1);
     assert!(!sd.is_null(), "side-data allocation");
+    // Written, as a decoder's side data is, though the refusal under test
+    // reads only its size.
+    core::ptr::write_bytes((*sd).data, 0, (*sd).size);
     (*p).data[0] = core::ptr::null_mut();
   }
 
-  match convert::image_frame_from(&frame, FrameLimits::default()) {
+  // SAFETY: `allocated_picture` wrote every buffer and the side data was written above; the
+  // frame is live for the call.
+  match unsafe { convert::image_frame_from(&frame, FrameLimits::default()) } {
     Err(ConvertError::ImageSideDataTooLarge(p)) => {
       assert_eq!(p.limit(), DEFAULT_MAX_IMAGE_SIDE_DATA_BYTES);
     }

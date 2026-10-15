@@ -1246,17 +1246,20 @@ unsafe fn build_subtitle_packet<C: crate::FfmpegCarrier + crate::CarrierOps>(
 }
 
 // ---------------------------------------------------------------------------
-//  Safe wrappers — `&ffmpeg::Packet` → `mediaspine::*Packet`.
+//  Borrowed conversions — `&ffmpeg::Packet` → `mediaspine::*Packet`.
+//
+//  `unsafe`, as every conversion from an `ffmpeg_next` object is: a
+//  borrow cannot vouch that the payload was ever written (see
+//  `crate::contracts`, "Every exported byte initialised").
 // ---------------------------------------------------------------------------
 
 /// Carries a borrowed [`ffmpeg::Packet`] out as a
-/// [`mediaspine::packet::VideoPacket`] on the **view** lane: the
-/// payload is a refcounted window onto the source `AVPacket`'s own
-/// buffer, which is why the delivered packet's lifetime is answerable
-/// to libavformat's — see [the two carrier lanes][lanes]. For a packet
-/// that must outlive the demuxer, ask for the owned lane by name:
-/// `video_packet_from_ffmpeg_as::<Owned>`, whose payload is copied and
-/// which the [carrier amputation contract][law] governs.
+/// [`mediaspine::packet::VideoPacket`] on the **owned** lane: the payload
+/// and the side data are copied, so the delivered packet answers to
+/// nothing the source does, and the [carrier amputation contract][law]
+/// governs it — see [the two carrier lanes][lanes]. The view lane, a
+/// refcounted window onto the source's own buffer, takes the packet by
+/// value: [`video_packet_from_ffmpeg_in`].
 ///
 /// Timestamps, duration, key/corrupt flags, and the source stream index
 /// are forwarded to the produced packet.
@@ -1274,14 +1277,31 @@ unsafe fn build_subtitle_packet<C: crate::FfmpegCarrier + crate::CarrierOps>(
 /// `side_data` post-construction if they need those.
 ///
 /// [law]: mediaspine::adapter#the-carrier-amputation-contract
-pub fn video_packet_from_ffmpeg(
+///
+/// A call without `unsafe` does not compile:
+///
+/// ```compile_fail,E0133
+/// let packet = ffmpeg_next::Packet::copy(&[0u8; 64]);
+/// let _ = mediaio_ffmpeg::video_packet_from_ffmpeg(&packet, mediaspine::Timebase::default());
+/// ```
+///
+/// # Safety
+///
+/// `packet` must meet [the `AVPacket` contract](crate::contracts#avpacket)
+/// and, with it, [every exported byte
+/// initialised](crate::contracts#every-exported-byte-initialised): its
+/// payload and each side-data entry's bytes were written. A packet
+/// `av_read_frame`, an encoder or `Packet::copy` filled meets both; a
+/// `Packet::new` or `Packet::grow` its caller has not written over does
+/// not.
+pub unsafe fn video_packet_from_ffmpeg(
   packet: &Packet,
   time_base: mediaspine::Timebase,
 ) -> Result<Option<VideoPacket<VideoPacketExtra, FfmpegBytes>>, PacketBufferError> {
   // SAFETY: `CallerSupplied` is true of every packet, and the owned lane
   // copies, so nothing about `packet` outlives this borrow.
-  // The packet, an `ffmpeg_next::Packet`, meets the `AVPacket`
-  // contract (`crate::contracts`), as every one does.
+  // The caller vouches for the `AVPacket` contract and every byte it
+  // exports (this function's own `# Safety`).
   unsafe {
     video_packet_from_borrowed::<crate::Owned>(
       packet,
@@ -1296,14 +1316,24 @@ pub fn video_packet_from_ffmpeg(
 /// [`mediaspine::packet::AudioPacket`]. Same shape as
 /// [`video_packet_from_ffmpeg`] — shared payload, forwarded metadata,
 /// default budgets.
-pub fn audio_packet_from_ffmpeg(
+///
+/// # Safety
+///
+/// `packet` must meet [the `AVPacket` contract](crate::contracts#avpacket)
+/// and, with it, [every exported byte
+/// initialised](crate::contracts#every-exported-byte-initialised): its
+/// payload and each side-data entry's bytes were written. A packet
+/// `av_read_frame`, an encoder or `Packet::copy` filled meets both; a
+/// `Packet::new` or `Packet::grow` its caller has not written over does
+/// not.
+pub unsafe fn audio_packet_from_ffmpeg(
   packet: &Packet,
   time_base: mediaspine::Timebase,
 ) -> Result<Option<AudioPacket<AudioPacketExtra, FfmpegBytes>>, PacketBufferError> {
   // SAFETY: `CallerSupplied` is true of every packet, and the owned lane
   // copies, so nothing about `packet` outlives this borrow.
-  // The packet, an `ffmpeg_next::Packet`, meets the `AVPacket`
-  // contract (`crate::contracts`), as every one does.
+  // The caller vouches for the `AVPacket` contract and every byte it
+  // exports (this function's own `# Safety`).
   unsafe {
     audio_packet_from_borrowed::<crate::Owned>(
       packet,
@@ -1318,14 +1348,24 @@ pub fn audio_packet_from_ffmpeg(
 /// [`mediaspine::packet::SubtitlePacket`]. Subtitle packets have no
 /// `dts` in the mediaspine model; everything else mirrors
 /// [`video_packet_from_ffmpeg`], shared payload included.
-pub fn subtitle_packet_from_ffmpeg(
+///
+/// # Safety
+///
+/// `packet` must meet [the `AVPacket` contract](crate::contracts#avpacket)
+/// and, with it, [every exported byte
+/// initialised](crate::contracts#every-exported-byte-initialised): its
+/// payload and each side-data entry's bytes were written. A packet
+/// `av_read_frame`, an encoder or `Packet::copy` filled meets both; a
+/// `Packet::new` or `Packet::grow` its caller has not written over does
+/// not.
+pub unsafe fn subtitle_packet_from_ffmpeg(
   packet: &Packet,
   time_base: mediaspine::Timebase,
 ) -> Result<Option<SubtitlePacket<SubtitlePacketExtra, FfmpegBytes>>, PacketBufferError> {
   // SAFETY: `CallerSupplied` is true of every packet, and the owned lane
   // copies, so nothing about `packet` outlives this borrow.
-  // The packet, an `ffmpeg_next::Packet`, meets the `AVPacket`
-  // contract (`crate::contracts`), as every one does.
+  // The caller vouches for the `AVPacket` contract and every byte it
+  // exports (this function's own `# Safety`).
   unsafe {
     subtitle_packet_from_borrowed::<crate::Owned>(
       packet,
@@ -1374,7 +1414,15 @@ fn side_data_entry_cap() -> usize {
 /// the integer it is on the wire — a discriminant this build has no
 /// name for would be undefined behaviour the moment it existed as an
 /// `AVPacketSideDataType`.
-fn packet_side_data(packet: &Packet) -> Result<Vec<SideDataEntry>, PacketBufferError> {
+///
+/// # Safety
+///
+/// `packet` must meet the side-data clause of [the `AVPacket`
+/// contract](crate::contracts#avpacket): each entry's bytes valid for and
+/// [initialised](crate::contracts#every-exported-byte-initialised) in its
+/// `size`. A private `unsafe fn` rather than a safe one, because it reads
+/// a foreign packet's storage, which no safe function of this crate does.
+unsafe fn packet_side_data(packet: &Packet) -> Result<Vec<SideDataEntry>, PacketBufferError> {
   use ffmpeg_next::packet::Ref;
   // SAFETY: `packet` keeps the `AVPacket` live; `side_data` and
   // `side_data_elems` are public fields.
@@ -1584,7 +1632,9 @@ pub unsafe fn video_packet_from_borrowed<C: crate::FfmpegCarrier + crate::Carrie
   limits: PacketLimits,
   provenance: crate::buffer::PayloadProvenance,
 ) -> Result<Option<VideoPacket<VideoPacketExtra, C::Buffer>>, PacketBufferError> {
-  let side_data = packet_side_data(packet)?;
+  // SAFETY: this function's own contract, forwarded for `packet`'s side
+  // data.
+  let side_data = unsafe { packet_side_data(packet) }?;
   // SAFETY: this function's own contract, forwarded for `packet`.
   let Some(buf) = (unsafe { delivered_payload::<C>(packet, &side_data, limits, provenance) })?
   else {
@@ -1676,7 +1726,9 @@ pub unsafe fn audio_packet_from_borrowed<C: crate::FfmpegCarrier + crate::Carrie
   limits: PacketLimits,
   provenance: crate::buffer::PayloadProvenance,
 ) -> Result<Option<AudioPacket<AudioPacketExtra, C::Buffer>>, PacketBufferError> {
-  let side_data = packet_side_data(packet)?;
+  // SAFETY: this function's own contract, forwarded for `packet`'s side
+  // data.
+  let side_data = unsafe { packet_side_data(packet) }?;
   // SAFETY: this function's own contract, forwarded for `packet`.
   let Some(buf) = (unsafe { delivered_payload::<C>(packet, &side_data, limits, provenance) })?
   else {
@@ -1768,7 +1820,9 @@ pub unsafe fn subtitle_packet_from_borrowed<C: crate::FfmpegCarrier + crate::Car
   limits: PacketLimits,
   provenance: crate::buffer::PayloadProvenance,
 ) -> Result<Option<SubtitlePacket<SubtitlePacketExtra, C::Buffer>>, PacketBufferError> {
-  let side_data = packet_side_data(packet)?;
+  // SAFETY: this function's own contract, forwarded for `packet`'s side
+  // data.
+  let side_data = unsafe { packet_side_data(packet) }?;
   // SAFETY: this function's own contract, forwarded for `packet`.
   let Some(buf) = (unsafe { delivered_payload::<C>(packet, &side_data, limits, provenance) })?
   else {
@@ -1866,7 +1920,9 @@ pub unsafe fn data_packet_from_borrowed<C: crate::FfmpegCarrier + crate::Carrier
   limits: PacketLimits,
   provenance: crate::buffer::PayloadProvenance,
 ) -> Result<Option<DataPacket<DataPacketExtra, C::Buffer>>, PacketBufferError> {
-  let side_data = packet_side_data(packet)?;
+  // SAFETY: this function's own contract, forwarded for `packet`'s side
+  // data.
+  let side_data = unsafe { packet_side_data(packet) }?;
   // SAFETY: this function's own contract, forwarded for `packet`.
   let Some(buf) = (unsafe { delivered_payload::<C>(packet, &side_data, limits, provenance) })?
   else {
@@ -2241,7 +2297,9 @@ pub(crate) fn empty_subtitle_frame_as<C: crate::FfmpegCarrier + crate::CarrierOp
 /// use mediaio_ffmpeg::{PacketLimits, video_packet_from_ffmpeg_in};
 ///
 /// let mut packet = ffmpeg_next::Packet::copy(&[0u8; 64]);
-/// let viewed = video_packet_from_ffmpeg_in(packet, Timebase::default(), PacketLimits::default());
+/// // SAFETY: `Packet::copy` wrote every byte of the payload.
+/// let viewed =
+///   unsafe { video_packet_from_ffmpeg_in(packet, Timebase::default(), PacketLimits::default()) };
 /// // The source is gone, so this cannot be written.
 /// let _aliased = packet.data_mut();
 /// ```
@@ -2249,15 +2307,25 @@ pub(crate) fn empty_subtitle_frame_as<C: crate::FfmpegCarrier + crate::CarrierOp
 /// A caller who wants to keep the packet wants the owned lane, which
 /// copies and may therefore borrow:
 /// [`owned_video_packet_from_ffmpeg_in`].
-pub fn video_packet_from_ffmpeg_in(
+///
+/// # Safety
+///
+/// `packet` must meet [the `AVPacket` contract](crate::contracts#avpacket)
+/// and, with it, [every exported byte
+/// initialised](crate::contracts#every-exported-byte-initialised): its
+/// payload and each side-data entry's bytes were written. A packet
+/// `av_read_frame`, an encoder or `Packet::copy` filled meets both; a
+/// `Packet::new` or `Packet::grow` its caller has not written over does
+/// not.
+pub unsafe fn video_packet_from_ffmpeg_in(
   packet: Packet,
   time_base: mediaspine::Timebase,
   limits: PacketLimits,
 ) -> Result<Option<VideoPacket<VideoPacketExtra, crate::FfmpegBuffer>>, PacketBufferError> {
   // SAFETY: `CallerSupplied` is true of every packet; the packet is
   // consumed, so nothing is left to write through the view lane's window.
-  // The packet, an `ffmpeg_next::Packet`, meets the `AVPacket`
-  // contract (`crate::contracts`), as every one does.
+  // The caller vouches for the `AVPacket` contract and every byte it
+  // exports (this function's own `# Safety`).
   unsafe {
     video_packet_from_ffmpeg_as::<crate::View>(
       packet,
@@ -2269,15 +2337,25 @@ pub fn video_packet_from_ffmpeg_in(
 }
 
 /// [`audio_packet_from_ffmpeg_as`] on the view lane.
-pub fn audio_packet_from_ffmpeg_in(
+///
+/// # Safety
+///
+/// `packet` must meet [the `AVPacket` contract](crate::contracts#avpacket)
+/// and, with it, [every exported byte
+/// initialised](crate::contracts#every-exported-byte-initialised): its
+/// payload and each side-data entry's bytes were written. A packet
+/// `av_read_frame`, an encoder or `Packet::copy` filled meets both; a
+/// `Packet::new` or `Packet::grow` its caller has not written over does
+/// not.
+pub unsafe fn audio_packet_from_ffmpeg_in(
   packet: Packet,
   time_base: mediaspine::Timebase,
   limits: PacketLimits,
 ) -> Result<Option<AudioPacket<AudioPacketExtra, crate::FfmpegBuffer>>, PacketBufferError> {
   // SAFETY: `CallerSupplied` is true of every packet; the packet is
   // consumed, so nothing is left to write through the view lane's window.
-  // The packet, an `ffmpeg_next::Packet`, meets the `AVPacket`
-  // contract (`crate::contracts`), as every one does.
+  // The caller vouches for the `AVPacket` contract and every byte it
+  // exports (this function's own `# Safety`).
   unsafe {
     audio_packet_from_ffmpeg_as::<crate::View>(
       packet,
@@ -2289,15 +2367,25 @@ pub fn audio_packet_from_ffmpeg_in(
 }
 
 /// [`subtitle_packet_from_ffmpeg_as`] on the view lane.
-pub fn subtitle_packet_from_ffmpeg_in(
+///
+/// # Safety
+///
+/// `packet` must meet [the `AVPacket` contract](crate::contracts#avpacket)
+/// and, with it, [every exported byte
+/// initialised](crate::contracts#every-exported-byte-initialised): its
+/// payload and each side-data entry's bytes were written. A packet
+/// `av_read_frame`, an encoder or `Packet::copy` filled meets both; a
+/// `Packet::new` or `Packet::grow` its caller has not written over does
+/// not.
+pub unsafe fn subtitle_packet_from_ffmpeg_in(
   packet: Packet,
   time_base: mediaspine::Timebase,
   limits: PacketLimits,
 ) -> Result<Option<SubtitlePacket<SubtitlePacketExtra, crate::FfmpegBuffer>>, PacketBufferError> {
   // SAFETY: `CallerSupplied` is true of every packet; the packet is
   // consumed, so nothing is left to write through the view lane's window.
-  // The packet, an `ffmpeg_next::Packet`, meets the `AVPacket`
-  // contract (`crate::contracts`), as every one does.
+  // The caller vouches for the `AVPacket` contract and every byte it
+  // exports (this function's own `# Safety`).
   unsafe {
     subtitle_packet_from_ffmpeg_as::<crate::View>(
       packet,
@@ -2309,15 +2397,25 @@ pub fn subtitle_packet_from_ffmpeg_in(
 }
 
 /// [`data_packet_from_ffmpeg_as`] on the view lane.
-pub fn data_packet_from_ffmpeg_in(
+///
+/// # Safety
+///
+/// `packet` must meet [the `AVPacket` contract](crate::contracts#avpacket)
+/// and, with it, [every exported byte
+/// initialised](crate::contracts#every-exported-byte-initialised): its
+/// payload and each side-data entry's bytes were written. A packet
+/// `av_read_frame`, an encoder or `Packet::copy` filled meets both; a
+/// `Packet::new` or `Packet::grow` its caller has not written over does
+/// not.
+pub unsafe fn data_packet_from_ffmpeg_in(
   packet: Packet,
   time_base: mediaspine::Timebase,
   limits: PacketLimits,
 ) -> Result<Option<DataPacket<DataPacketExtra, crate::FfmpegBuffer>>, PacketBufferError> {
   // SAFETY: `CallerSupplied` is true of every packet; the packet is
   // consumed, so nothing is left to write through the view lane's window.
-  // The packet, an `ffmpeg_next::Packet`, meets the `AVPacket`
-  // contract (`crate::contracts`), as every one does.
+  // The caller vouches for the `AVPacket` contract and every byte it
+  // exports (this function's own `# Safety`).
   unsafe {
     data_packet_from_ffmpeg_as::<crate::View>(
       packet,
@@ -2338,15 +2436,25 @@ pub fn data_packet_from_ffmpeg_in(
 
 /// [`video_packet_from_ffmpeg`] with the stream's timebase and explicit
 /// budgets.
-pub fn owned_video_packet_from_ffmpeg_in(
+///
+/// # Safety
+///
+/// `packet` must meet [the `AVPacket` contract](crate::contracts#avpacket)
+/// and, with it, [every exported byte
+/// initialised](crate::contracts#every-exported-byte-initialised): its
+/// payload and each side-data entry's bytes were written. A packet
+/// `av_read_frame`, an encoder or `Packet::copy` filled meets both; a
+/// `Packet::new` or `Packet::grow` its caller has not written over does
+/// not.
+pub unsafe fn owned_video_packet_from_ffmpeg_in(
   packet: &Packet,
   time_base: mediaspine::Timebase,
   limits: PacketLimits,
 ) -> Result<Option<VideoPacket<VideoPacketExtra, FfmpegBytes>>, PacketBufferError> {
   // SAFETY: `CallerSupplied` is true of every packet, and the owned lane
   // copies, so nothing about `packet` outlives this borrow.
-  // The packet, an `ffmpeg_next::Packet`, meets the `AVPacket`
-  // contract (`crate::contracts`), as every one does.
+  // The caller vouches for the `AVPacket` contract and every byte it
+  // exports (this function's own `# Safety`).
   unsafe {
     video_packet_from_borrowed::<crate::Owned>(
       packet,
@@ -2359,15 +2467,25 @@ pub fn owned_video_packet_from_ffmpeg_in(
 
 /// [`audio_packet_from_ffmpeg`] with the stream's timebase and explicit
 /// budgets.
-pub fn owned_audio_packet_from_ffmpeg_in(
+///
+/// # Safety
+///
+/// `packet` must meet [the `AVPacket` contract](crate::contracts#avpacket)
+/// and, with it, [every exported byte
+/// initialised](crate::contracts#every-exported-byte-initialised): its
+/// payload and each side-data entry's bytes were written. A packet
+/// `av_read_frame`, an encoder or `Packet::copy` filled meets both; a
+/// `Packet::new` or `Packet::grow` its caller has not written over does
+/// not.
+pub unsafe fn owned_audio_packet_from_ffmpeg_in(
   packet: &Packet,
   time_base: mediaspine::Timebase,
   limits: PacketLimits,
 ) -> Result<Option<AudioPacket<AudioPacketExtra, FfmpegBytes>>, PacketBufferError> {
   // SAFETY: `CallerSupplied` is true of every packet, and the owned lane
   // copies, so nothing about `packet` outlives this borrow.
-  // The packet, an `ffmpeg_next::Packet`, meets the `AVPacket`
-  // contract (`crate::contracts`), as every one does.
+  // The caller vouches for the `AVPacket` contract and every byte it
+  // exports (this function's own `# Safety`).
   unsafe {
     audio_packet_from_borrowed::<crate::Owned>(
       packet,
@@ -2380,15 +2498,25 @@ pub fn owned_audio_packet_from_ffmpeg_in(
 
 /// [`subtitle_packet_from_ffmpeg`] with the stream's timebase and
 /// explicit budgets.
-pub fn owned_subtitle_packet_from_ffmpeg_in(
+///
+/// # Safety
+///
+/// `packet` must meet [the `AVPacket` contract](crate::contracts#avpacket)
+/// and, with it, [every exported byte
+/// initialised](crate::contracts#every-exported-byte-initialised): its
+/// payload and each side-data entry's bytes were written. A packet
+/// `av_read_frame`, an encoder or `Packet::copy` filled meets both; a
+/// `Packet::new` or `Packet::grow` its caller has not written over does
+/// not.
+pub unsafe fn owned_subtitle_packet_from_ffmpeg_in(
   packet: &Packet,
   time_base: mediaspine::Timebase,
   limits: PacketLimits,
 ) -> Result<Option<SubtitlePacket<SubtitlePacketExtra, FfmpegBytes>>, PacketBufferError> {
   // SAFETY: `CallerSupplied` is true of every packet, and the owned lane
   // copies, so nothing about `packet` outlives this borrow.
-  // The packet, an `ffmpeg_next::Packet`, meets the `AVPacket`
-  // contract (`crate::contracts`), as every one does.
+  // The caller vouches for the `AVPacket` contract and every byte it
+  // exports (this function's own `# Safety`).
   unsafe {
     subtitle_packet_from_borrowed::<crate::Owned>(
       packet,
@@ -2401,15 +2529,25 @@ pub fn owned_subtitle_packet_from_ffmpeg_in(
 
 /// [`data_packet_from_ffmpeg_in`] on the owned lane, borrowing its
 /// source.
-pub fn owned_data_packet_from_ffmpeg_in(
+///
+/// # Safety
+///
+/// `packet` must meet [the `AVPacket` contract](crate::contracts#avpacket)
+/// and, with it, [every exported byte
+/// initialised](crate::contracts#every-exported-byte-initialised): its
+/// payload and each side-data entry's bytes were written. A packet
+/// `av_read_frame`, an encoder or `Packet::copy` filled meets both; a
+/// `Packet::new` or `Packet::grow` its caller has not written over does
+/// not.
+pub unsafe fn owned_data_packet_from_ffmpeg_in(
   packet: &Packet,
   time_base: mediaspine::Timebase,
   limits: PacketLimits,
 ) -> Result<Option<DataPacket<DataPacketExtra, FfmpegBytes>>, PacketBufferError> {
   // SAFETY: `CallerSupplied` is true of every packet, and the owned lane
   // copies, so nothing about `packet` outlives this borrow.
-  // The packet, an `ffmpeg_next::Packet`, meets the `AVPacket`
-  // contract (`crate::contracts`), as every one does.
+  // The caller vouches for the `AVPacket` contract and every byte it
+  // exports (this function's own `# Safety`).
   unsafe {
     data_packet_from_borrowed::<crate::Owned>(
       packet,
@@ -2422,14 +2560,24 @@ pub fn owned_data_packet_from_ffmpeg_in(
 
 /// [`attachment_packet_from_ffmpeg`] on the owned lane, borrowing its
 /// source.
-pub fn owned_attachment_packet_from_ffmpeg(
+///
+/// # Safety
+///
+/// `packet` must meet [the `AVPacket` contract](crate::contracts#avpacket)
+/// and, with it, [every exported byte
+/// initialised](crate::contracts#every-exported-byte-initialised): its
+/// payload and each side-data entry's bytes were written. A packet
+/// `av_read_frame`, an encoder or `Packet::copy` filled meets both; a
+/// `Packet::new` or `Packet::grow` its caller has not written over does
+/// not.
+pub unsafe fn owned_attachment_packet_from_ffmpeg(
   packet: &Packet,
   limits: PacketLimits,
 ) -> Result<Option<AttachmentPacket<AttachmentPacketExtra, FfmpegBytes>>, PacketBufferError> {
   // SAFETY: `CallerSupplied` is true of every packet, and the owned lane
   // copies, so nothing about `packet` outlives this borrow.
-  // The packet, an `ffmpeg_next::Packet`, meets the `AVPacket`
-  // contract (`crate::contracts`), as every one does.
+  // The caller vouches for the `AVPacket` contract and every byte it
+  // exports (this function's own `# Safety`).
   unsafe {
     attachment_packet_from_borrowed::<crate::Owned>(
       packet,
@@ -2479,15 +2627,25 @@ pub fn empty_owned_subtitle_frame() -> SubtitleFrame<SubtitleFrameExtra, FfmpegB
 }
 
 /// [`attachment_packet_from_ffmpeg_as`] on the view lane.
-pub fn attachment_packet_from_ffmpeg(
+///
+/// # Safety
+///
+/// `packet` must meet [the `AVPacket` contract](crate::contracts#avpacket)
+/// and, with it, [every exported byte
+/// initialised](crate::contracts#every-exported-byte-initialised): its
+/// payload and each side-data entry's bytes were written. A packet
+/// `av_read_frame`, an encoder or `Packet::copy` filled meets both; a
+/// `Packet::new` or `Packet::grow` its caller has not written over does
+/// not.
+pub unsafe fn attachment_packet_from_ffmpeg(
   packet: Packet,
   limits: PacketLimits,
 ) -> Result<Option<AttachmentPacket<AttachmentPacketExtra, crate::FfmpegBuffer>>, PacketBufferError>
 {
   // SAFETY: `CallerSupplied` is true of every packet; the packet is
   // consumed, so nothing is left to write through the view lane's window.
-  // The packet, an `ffmpeg_next::Packet`, meets the `AVPacket`
-  // contract (`crate::contracts`), as every one does.
+  // The caller vouches for the `AVPacket` contract and every byte it
+  // exports (this function's own `# Safety`).
   unsafe {
     attachment_packet_from_ffmpeg_as::<crate::View>(
       packet,
@@ -3514,7 +3672,8 @@ mod tests {
 
     // The refusal is lane-independent, because the hazard is: both
     // lanes read the payload, one to view it and one to copy it.
-    // SAFETY: `CallerSupplied` is true of every packet, and the packet is consumed.
+    // SAFETY: `CallerSupplied` is true of every packet, the packet is
+    // consumed, and its payload is `Packet::copy`'s, every byte written.
     match unsafe {
       video_packet_from_ffmpeg_as::<crate::View>(
         shared,
@@ -3553,11 +3712,15 @@ mod tests {
       );
     }
     assert!(matches!(
-      owned_video_packet_from_ffmpeg_in(
-        &shared_again,
-        mediaspine::Timebase::default(),
-        PacketLimits::default(),
-      ),
+      // SAFETY: the payload is `Packet::copy`'s, every byte written, and
+      // the packet is live for the call.
+      unsafe {
+        owned_video_packet_from_ffmpeg_in(
+          &shared_again,
+          mediaspine::Timebase::default(),
+          PacketLimits::default(),
+        )
+      },
       Err(PacketBufferError::SharedPayload(_)),
     ));
   }
@@ -3863,7 +4026,9 @@ mod tests {
       .expect("present");
       let rebuilt =
         ffmpeg_packet_from_owned_video_packet(&video, PacketLimits::default()).expect("rebuilt");
-      let carried = packet_side_data(&rebuilt).expect("readable");
+      // SAFETY: `rebuilt` came from this crate's own builder, which wrote
+      // every side-data byte it attached.
+      let carried = unsafe { packet_side_data(&rebuilt) }.expect("readable");
       assert_eq!(carried.len(), 1, "{name}: video lost its side data");
       assert_eq!(carried[0].kind(), expected_kind, "{name}: video");
       assert_eq!(carried[0].data(), video.extra().side_data()[0].data());
@@ -3881,7 +4046,9 @@ mod tests {
       .expect("present");
       let rebuilt =
         ffmpeg_packet_from_owned_audio_packet(&audio, PacketLimits::default()).expect("rebuilt");
-      let carried = packet_side_data(&rebuilt).expect("readable");
+      // SAFETY: `rebuilt` came from this crate's own builder, which wrote
+      // every side-data byte it attached.
+      let carried = unsafe { packet_side_data(&rebuilt) }.expect("readable");
       assert_eq!(carried.len(), 1, "{name}: audio lost its side data");
       assert_eq!(carried[0].data(), audio.extra().side_data()[0].data());
 
@@ -3898,7 +4065,9 @@ mod tests {
       .expect("present");
       let rebuilt = ffmpeg_packet_from_owned_subtitle_packet(&subtitle, PacketLimits::default())
         .expect("rebuilt");
-      let carried = packet_side_data(&rebuilt).expect("readable");
+      // SAFETY: `rebuilt` came from this crate's own builder, which wrote
+      // every side-data byte it attached.
+      let carried = unsafe { packet_side_data(&rebuilt) }.expect("readable");
       assert_eq!(carried.len(), 1, "{name}: subtitle lost its side data");
       assert_eq!(carried[0].data(), subtitle.extra().side_data()[0].data());
     }

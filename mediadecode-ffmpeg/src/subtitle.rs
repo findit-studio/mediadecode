@@ -270,10 +270,12 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierSubtitleStreamDecoder<C
       });
     }
     // SAFETY: `scratch.inner` is a live `AVSubtitle` filled by the
-    // decode this seat is holding. Conversion copies every rect it
-    // takes — `AVSubtitleRect` has no refcounted buffer, so both lanes
-    // copy — and the FFmpeg-side allocations are released below, once
-    // there is something to release them in favour of.
+    // decode this seat is holding — `avcodec_decode_subtitle2` wrote its
+    // rects, their strings and their planes, each plane for its own
+    // `linesize[0] × h`. Conversion copies every rect it takes —
+    // `AVSubtitleRect` has no refcounted buffer, so both lanes copy — and
+    // the FFmpeg-side allocations are released below, once there is
+    // something to release them in favour of.
     let converted =
       unsafe { convert::av_subtitle_to_subtitle_frame_as::<C>(self.scratch.inner.as_ptr()) };
     match converted {

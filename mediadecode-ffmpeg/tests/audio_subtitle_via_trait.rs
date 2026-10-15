@@ -84,11 +84,15 @@ fn decode_one_audio_frame_through_trait() {
     if s.index() != stream_index {
       continue;
     }
-    let pkt = match mediadecode_ffmpeg::boundary::owned_audio_packet_from_ffmpeg_in(
-      &av_packet,
-      mediadecode::Timebase::default(),
-      mediadecode_ffmpeg::PacketLimits::default(),
-    )
+    // SAFETY: `packets()` reads each packet with `av_read_frame`, so libavformat wrote its
+    // payload, and it is live for the call.
+    let pkt = match unsafe {
+      mediadecode_ffmpeg::boundary::owned_audio_packet_from_ffmpeg_in(
+        &av_packet,
+        mediadecode::Timebase::default(),
+        mediadecode_ffmpeg::PacketLimits::default(),
+      )
+    }
     .expect("a wrappable payload")
     {
       Some(p) => p,
@@ -157,11 +161,15 @@ fn decode_one_subtitle_through_trait() {
     if s.index() != stream_index {
       continue;
     }
-    let pkt = match mediadecode_ffmpeg::boundary::owned_subtitle_packet_from_ffmpeg_in(
-      &av_packet,
-      mediadecode::Timebase::default(),
-      mediadecode_ffmpeg::PacketLimits::default(),
-    )
+    // SAFETY: `packets()` reads each packet with `av_read_frame`, so libavformat wrote its
+    // payload, and it is live for the call.
+    let pkt = match unsafe {
+      mediadecode_ffmpeg::boundary::owned_subtitle_packet_from_ffmpeg_in(
+        &av_packet,
+        mediadecode::Timebase::default(),
+        mediadecode_ffmpeg::PacketLimits::default(),
+      )
+    }
     .expect("a wrappable payload")
     {
       Some(p) => p,

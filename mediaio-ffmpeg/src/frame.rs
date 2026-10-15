@@ -357,6 +357,13 @@ impl Frame {
   /// `ffmpeg_next::frame::Video` offers as safe (`set_width`,
   /// `set_height`, `set_format`, ...), which move the geometry and leave
   /// the buffers where they were.
+  ///
+  /// The frame left behind must also meet [every exported byte
+  /// initialised](crate::contracts#every-exported-byte-initialised): the
+  /// accessors lend each row as `&[u8]`, so every row of every plane must
+  /// have been written. A whole `frame::Video::new` does not meet it until
+  /// its caller writes its planes — `av_frame_get_buffer` leaves them
+  /// unwritten.
   pub unsafe fn as_inner_mut(&mut self) -> &mut frame::Video {
     &mut self.inner
   }

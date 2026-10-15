@@ -16,6 +16,29 @@ use std::{
 // come from a demuxer that hands them over.
 use crate::{FfmpegBytes, FfmpegOwnedVideoStreamDecoder as FfmpegVideoStreamDecoder};
 
+/// A `frame::Video::new` whose planes are written, as a decoder's are.
+///
+/// `av_frame_get_buffer` allocates the planes without writing them, and
+/// a frame reaches the conversions only with [every exported byte
+/// written](mediaio_ffmpeg::contracts#every-exported-byte-initialised) —
+/// which is also what [`Frame::as_inner_mut`] asks of the frame a fake
+/// seam leaves behind.
+fn written_video(format: ffmpeg_next::format::Pixel, width: u32, height: u32) -> frame::Video {
+  let mut av = frame::Video::new(format, width, height);
+  // SAFETY: the frame is live and uniquely owned. Each non-null `buf[i]`
+  // is a live `AVBufferRef` whose `data` is valid for `size` bytes,
+  // written through the raw pointer without forming a reference to the
+  // unwritten bytes.
+  unsafe {
+    for buf in (*av.as_mut_ptr()).buf {
+      if !buf.is_null() {
+        core::ptr::write_bytes((*buf).data, 0, (*buf).size);
+      }
+    }
+  }
+  av
+}
+
 // ---------------------------------------------------------------------------
 //  Fake-HW fallback seam: synthetic clip + driver
 // ---------------------------------------------------------------------------
@@ -61,7 +84,9 @@ fn encode_synthetic_clip(width: u32, height: u32, frames: usize, gop: u32) -> Sy
     }
   };
 
-  let mut frame = ff::frame::Video::new(ff::format::Pixel::YUV420P, width, height);
+  // Written before `data_mut` lends it: `av_frame_get_buffer` leaves the
+  // planes unwritten.
+  let mut frame = written_video(ff::format::Pixel::YUV420P, width, height);
   for i in 0..frames as i64 {
     let ystride = frame.stride(0);
     {
@@ -276,7 +301,7 @@ impl HwInner for FakeHw {
       self.history.push(cloned);
     }
     if idx < self.doom_from_send {
-      let mut av = frame::Video::new(ffmpeg_next::format::Pixel::YUV420P, self.width, self.height);
+      let mut av = written_video(ffmpeg_next::format::Pixel::YUV420P, self.width, self.height);
       av.set_pts(packet.pts());
       self.queued.push_back(av);
     }
@@ -294,7 +319,7 @@ impl HwInner for FakeHw {
     match self.queued.pop_front() {
       Some(av) => {
         // SAFETY: the slot is replaced by a whole `frame::Video`, its geometry and
-        // buffers together.
+        // buffers together, every plane written.
         *unsafe { frame.as_inner_mut() } = av;
         Ok(Received::Produced)
       }
@@ -354,11 +379,10 @@ impl HwInner for FakeHwEofFails {
   fn receive_frame(&mut self, frame: &mut Frame) -> Result<Received, Error> {
     match self.queued.pop_front() {
       Some(pts) => {
-        let mut av =
-          frame::Video::new(ffmpeg_next::format::Pixel::YUV420P, self.width, self.height);
+        let mut av = written_video(ffmpeg_next::format::Pixel::YUV420P, self.width, self.height);
         av.set_pts(Some(pts));
         // SAFETY: the slot is replaced by a whole `frame::Video`, its geometry and
-        // buffers together.
+        // buffers together, every plane written.
         *unsafe { frame.as_inner_mut() } = av;
         Ok(Received::Produced)
       }
@@ -453,9 +477,12 @@ fn drive(dec: &mut FfmpegVideoStreamDecoder, clip: &SyntheticClip) -> Vec<i64> {
   };
 
   for av_pkt in &clip.packets {
-    let vpkt = boundary::video_packet_from_ffmpeg(av_pkt, mediadecode::Timebase::SECONDS)
-      .expect("a wrappable payload")
-      .expect("packet has a buffer");
+    // SAFETY: the packet came from `avcodec_receive_packet` or `av_read_frame`, which wrote its
+    // payload.
+    let vpkt =
+      unsafe { boundary::video_packet_from_ffmpeg(av_pkt, mediadecode::Timebase::SECONDS) }
+        .expect("a wrappable payload")
+        .expect("packet has a buffer");
     crate::accepted(dec.send_packet(&vpkt), "send_packet");
     drain_frames(dec, &mut out);
   }
@@ -571,10 +598,11 @@ fn probe_era_sw_open_failure_stays_on_hw_transactionally() {
   assert!(dec.is_hardware(), "must start on the HW seam");
 
   // Build a throwaway packet to send (content is irrelevant — HW fails before
-  // touching it).
-  let mut raw = Packet::new(16);
+  // touching it). Written, all the same: the conversion copies it.
+  let mut raw = Packet::copy(&[0u8; 16]);
   raw.set_pts(Some(0));
-  let vpkt = boundary::video_packet_from_ffmpeg(&raw, mediadecode::Timebase::SECONDS)
+  // SAFETY: `Packet::copy` wrote every byte of the payload.
+  let vpkt = unsafe { boundary::video_packet_from_ffmpeg(&raw, mediadecode::Timebase::SECONDS) }
     .expect("a wrappable payload")
     .expect("packet has a buffer");
 
@@ -648,9 +676,12 @@ fn sw_replay_drain_surfaces_non_transient_decode_error() {
   let mut dst = crate::empty_owned_video_frame();
   let mut err = None;
   for av_pkt in &clip.packets {
-    let vpkt = boundary::video_packet_from_ffmpeg(av_pkt, mediadecode::Timebase::SECONDS)
-      .expect("a wrappable payload")
-      .expect("packet has a buffer");
+    // SAFETY: the packet came from `avcodec_receive_packet` or `av_read_frame`, which wrote its
+    // payload.
+    let vpkt =
+      unsafe { boundary::video_packet_from_ffmpeg(av_pkt, mediadecode::Timebase::SECONDS) }
+        .expect("a wrappable payload")
+        .expect("packet has a buffer");
     if let Err(e) = dec.send_packet(&vpkt) {
       err = Some(e);
       break;
@@ -749,9 +780,12 @@ fn sw_replay_deferred_error_surfaces_fallback_failed_at_commit() {
   let mut surfaced = None;
   let mut dst = crate::empty_owned_video_frame();
   for av_pkt in clip.packets.iter().take(fail_at + 1) {
-    let vpkt = boundary::video_packet_from_ffmpeg(av_pkt, mediadecode::Timebase::SECONDS)
-      .expect("a wrappable payload")
-      .expect("packet has a buffer");
+    // SAFETY: the packet came from `avcodec_receive_packet` or `av_read_frame`, which wrote its
+    // payload.
+    let vpkt =
+      unsafe { boundary::video_packet_from_ffmpeg(av_pkt, mediadecode::Timebase::SECONDS) }
+        .expect("a wrappable payload")
+        .expect("packet has a buffer");
     match dec.send_packet(&vpkt) {
       // A full decoder would need draining first; here nothing is
       // queued, so the two send answers are handled the same way.
@@ -963,8 +997,11 @@ fn fx3_high_422_10bit_falls_back_to_software_and_decodes_whole_stream() {
     }
     let is_key = packet.is_key();
     let pkt_pts = packet.pts();
-    let Some(vpkt) = boundary::video_packet_from_ffmpeg(&packet, mediadecode::Timebase::SECONDS)
-      .expect("a wrappable payload")
+    // SAFETY: the packet came from `avcodec_receive_packet` or `av_read_frame`, which wrote its
+    // payload.
+    let Some(vpkt) =
+      unsafe { boundary::video_packet_from_ffmpeg(&packet, mediadecode::Timebase::SECONDS) }
+        .expect("a wrappable payload")
     else {
       continue; // empty packet (no payload) — skip
     };
@@ -1209,7 +1246,9 @@ fn a_rescued_packet_never_aliases_a_view_carrier() {
   let mut rescued: Vec<ffmpeg_next::Packet> = Vec::new();
   for av_pkt in &clip.packets {
     let Some(vpkt) =
-      video_packet_from_ffmpeg_in(av_pkt.clone(), tb, crate::PacketLimits::default())
+      // SAFETY: the packet came from `avcodec_receive_packet` or `av_read_frame`, which wrote
+      // its payload.
+      unsafe { video_packet_from_ffmpeg_in(av_pkt.clone(), tb, crate::PacketLimits::default()) }
         .expect("a wrappable payload")
     else {
       continue;
@@ -1318,9 +1357,12 @@ fn a_view_send_in_the_probe_window_is_zero_copy() {
   let mut retained: Vec<crate::VideoPacket> = Vec::new();
   let mut rescued: Vec<ffmpeg_next::Packet> = Vec::new();
   for av_pkt in &clip.packets[..=fail_at] {
-    let vpkt = video_packet_from_ffmpeg_in(av_pkt.clone(), tb, crate::PacketLimits::default())
-      .expect("a wrappable payload")
-      .expect("packet has a buffer");
+    // SAFETY: the packet came from `avcodec_receive_packet` or `av_read_frame`, which wrote its
+    // payload.
+    let vpkt =
+      unsafe { video_packet_from_ffmpeg_in(av_pkt.clone(), tb, crate::PacketLimits::default()) }
+        .expect("a wrappable payload")
+        .expect("packet has a buffer");
     // The premise: a packet payload with FFmpeg's padding behind it,
     // the one shape `boundary::share_or_copy` shares.
     let body = vpkt.data();
@@ -1446,7 +1488,9 @@ fn the_receive_time_fallback_queue_survives_a_failed_carrier() {
         // the same call, leaving this lane nothing to cap.
         for av_pkt in &clip.packets {
           let Some(vpkt) =
-            video_packet_from_ffmpeg_in(av_pkt.clone(), tb, crate::PacketLimits::default())
+            // SAFETY: the packet came from `avcodec_receive_packet` or `av_read_frame`, which
+            // wrote its payload.
+            unsafe { video_packet_from_ffmpeg_in(av_pkt.clone(), tb, crate::PacketLimits::default()) }
               .expect("a wrappable payload")
           else {
             continue;
@@ -1561,11 +1605,15 @@ fn eof_with_a_parked_frame(
       .expect("build test decoder");
 
   let packet = |index: usize| {
-    video_packet_from_ffmpeg_in(
-      clip.packets[index].clone(),
-      tb,
-      crate::PacketLimits::default(),
-    )
+    // SAFETY: the packet came from `avcodec_receive_packet` or `av_read_frame`, which wrote its
+    // payload.
+    unsafe {
+      video_packet_from_ffmpeg_in(
+        clip.packets[index].clone(),
+        tb,
+        crate::PacketLimits::default(),
+      )
+    }
     .expect("a wrappable payload")
     .expect("packet has a buffer")
   };
@@ -1653,11 +1701,15 @@ fn a_post_eof_send_is_a_fault_not_backpressure(hw: bool) {
 
   let (mut dec, clip, tb) = eof_with_a_parked_frame(hw);
   let packet = |index: usize| {
-    video_packet_from_ffmpeg_in(
-      clip.packets[index].clone(),
-      tb,
-      crate::PacketLimits::default(),
-    )
+    // SAFETY: the packet came from `avcodec_receive_packet` or `av_read_frame`, which wrote its
+    // payload.
+    unsafe {
+      video_packet_from_ffmpeg_in(
+        clip.packets[index].clone(),
+        tb,
+        crate::PacketLimits::default(),
+      )
+    }
     .expect("a wrappable payload")
     .expect("packet has a buffer")
   };
@@ -1780,9 +1832,12 @@ fn a_post_eof_frame_time_fallback_never_strands_the_caller_in_needs_input() {
   .expect("build test decoder");
 
   for av_pkt in &clip.packets {
-    let pkt = video_packet_from_ffmpeg_in(av_pkt.clone(), tb, crate::PacketLimits::default())
-      .expect("a wrappable payload")
-      .expect("packet has a buffer");
+    // SAFETY: the packet came from `avcodec_receive_packet` or `av_read_frame`, which wrote its
+    // payload.
+    let pkt =
+      unsafe { video_packet_from_ffmpeg_in(av_pkt.clone(), tb, crate::PacketLimits::default()) }
+        .expect("a wrappable payload")
+        .expect("packet has a buffer");
     crate::accepted(dec.send_packet(&pkt), "send_packet");
   }
 
@@ -1885,9 +1940,12 @@ fn the_post_eof_fault_is_the_one_the_substrate_gives() {
   .expect("build test decoder");
 
   for item in clip.packets.iter().take(3) {
-    let pkt = video_packet_from_ffmpeg_in(item.clone(), tb, crate::PacketLimits::default())
-      .expect("a wrappable payload")
-      .expect("packet has a buffer");
+    // SAFETY: the packet came from `avcodec_receive_packet` or `av_read_frame`, which wrote its
+    // payload.
+    let pkt =
+      unsafe { video_packet_from_ffmpeg_in(item.clone(), tb, crate::PacketLimits::default()) }
+        .expect("a wrappable payload")
+        .expect("packet has a buffer");
     crate::accepted(dec.send_packet(&pkt), "send_packet");
   }
 
@@ -1967,11 +2025,15 @@ fn a_parked_hardware_frame_is_delivered_before_any_fallback() {
       .expect("build test decoder");
 
       let packet = |index: usize| {
-        video_packet_from_ffmpeg_in(
-          clip.packets[index].clone(),
-          tb,
-          crate::PacketLimits::default(),
-        )
+        // SAFETY: the packet came from `avcodec_receive_packet` or `av_read_frame`, which wrote
+        // its payload.
+        unsafe {
+          video_packet_from_ffmpeg_in(
+            clip.packets[index].clone(),
+            tb,
+            crate::PacketLimits::default(),
+          )
+        }
         .expect("a wrappable payload")
         .expect("packet has a buffer")
       };
@@ -2073,9 +2135,12 @@ fn the_software_path_opens_without_probing_anything() {
   let mut dst = crate::empty_owned_video_frame();
   let mut delivered = 0usize;
   for av_pkt in &clip.packets {
-    let vpkt = boundary::video_packet_from_ffmpeg(av_pkt, mediadecode::Timebase::SECONDS)
-      .expect("a wrappable payload")
-      .expect("packet has a buffer");
+    // SAFETY: the packet came from `avcodec_receive_packet` or `av_read_frame`, which wrote its
+    // payload.
+    let vpkt =
+      unsafe { boundary::video_packet_from_ffmpeg(av_pkt, mediadecode::Timebase::SECONDS) }
+        .expect("a wrappable payload")
+        .expect("packet has a buffer");
     crate::accepted(dec.send_packet(&vpkt), "send_packet");
     while let Ok(Received::Produced) = dec.receive_frame(&mut dst) {
       delivered += 1;
@@ -2225,9 +2290,12 @@ fn a_hardware_pin_reports_a_frame_time_exhaustion_too() {
   )
   .expect("build a pinned test decoder");
 
-  let vpkt = boundary::video_packet_from_ffmpeg(&clip.packets[0], mediadecode::Timebase::SECONDS)
-    .expect("a wrappable payload")
-    .expect("packet has a buffer");
+  // SAFETY: the packet came from `avcodec_receive_packet` or `av_read_frame`, which wrote its
+  // payload.
+  let vpkt =
+    unsafe { boundary::video_packet_from_ffmpeg(&clip.packets[0], mediadecode::Timebase::SECONDS) }
+      .expect("a wrappable payload")
+      .expect("packet has a buffer");
   crate::accepted(dec.send_packet(&vpkt), "send_packet");
 
   let mut dst = crate::empty_owned_video_frame();
@@ -2263,9 +2331,12 @@ fn a_hardware_pin_reports_an_exhaustion_raised_at_eof() {
   )
   .expect("build a pinned test decoder");
 
-  let vpkt = boundary::video_packet_from_ffmpeg(&clip.packets[0], mediadecode::Timebase::SECONDS)
-    .expect("a wrappable payload")
-    .expect("packet has a buffer");
+  // SAFETY: the packet came from `avcodec_receive_packet` or `av_read_frame`, which wrote its
+  // payload.
+  let vpkt =
+    unsafe { boundary::video_packet_from_ffmpeg(&clip.packets[0], mediadecode::Timebase::SECONDS) }
+      .expect("a wrappable payload")
+      .expect("packet has a buffer");
   crate::accepted(dec.send_packet(&vpkt), "send_packet");
 
   let refusal = dec
@@ -2462,9 +2533,13 @@ fn drain_pictures(dec: &mut FfmpegVideoStreamDecoder, pictures: &mut Vec<i64>) {
 
 /// The packet at `index`, as a caller hands it over.
 fn pushed(clip: &SyntheticClip, index: usize) -> crate::OwnedVideoPacket {
-  boundary::video_packet_from_ffmpeg(&clip.packets[index], mediadecode::Timebase::SECONDS)
-    .expect("a wrappable payload")
-    .expect("packet has a buffer")
+  // SAFETY: the packet came from `avcodec_receive_packet` or `av_read_frame`, which wrote its
+  // payload.
+  unsafe {
+    boundary::video_packet_from_ffmpeg(&clip.packets[index], mediadecode::Timebase::SECONDS)
+  }
+  .expect("a wrappable payload")
+  .expect("packet has a buffer")
 }
 
 /// What a session answered across a clip: the pictures that came out, by

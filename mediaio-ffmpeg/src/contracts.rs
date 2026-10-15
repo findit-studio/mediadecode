@@ -38,6 +38,42 @@
 //! the source by that reference, and nothing may write through those
 //! bytes while the carrier — or any clone of it — lives.
 //!
+//! # Every exported byte initialised
+//!
+//! An object's **exported bytes** are the ones it offers a reader: each
+//! plane of a frame — every row its format, width and height describe,
+//! not the padding out to `linesize`, which no crossing reads — and each
+//! of its side-data entries' bytes; a packet's payload and each side-data
+//! entry's bytes; a subtitle rect's text, and a bitmap rect's plane and
+//! palette. Every one of them is initialised before the
+//! object reaches a crossing — written by the library that produced it,
+//! or by its caller. A crossing reads only exported bytes, and reading one
+//! that was never written is undefined behaviour whatever is done with it
+//! afterwards, so no check inside a crossing can stand in for this.
+//!
+//! The objects libav* hands out meet it: a frame `avcodec_receive_frame`
+//! filled (libavcodec's frame pools are zeroed when they are allocated,
+//! `libavcodec/get_buffer.c` 122–125 and 145–148 in FFmpeg 9.0.1, and a
+//! decoder writes the picture over them), a frame
+//! `av_hwframe_transfer_data` or `sws_scale` wrote, a packet
+//! `av_read_frame` or `avcodec_receive_packet` filled, a subtitle
+//! `avcodec_decode_subtitle2` filled — and so do the ones this crate
+//! builds from bytes it owns.
+//!
+//! **`ffmpeg_next`'s safe API builds objects that do not.**
+//! `frame::Video::new` and `frame::Audio::new` allocate their planes with
+//! `av_frame_get_buffer`, which leaves them unwritten (its buffer is
+//! `av_buffer_alloc`, `libavutil/frame.c` 122); `Packet::new` allocates
+//! its payload with `av_new_packet` and `Packet::grow` extends one with
+//! `av_grow_packet`, both of which zero only the padding. A borrow of an
+//! `ffmpeg_next` object therefore cannot vouch for this section, and **no
+//! safe function of this crate reads the storage of an `ffmpeg_next`
+//! frame, packet or subtitle**: every conversion from one is an `unsafe
+//! fn` whose caller vouches for this section and for the object's own
+//! below. Those conversions keep their named refusals — a null frame, a
+//! custom channel map, a bitmap rect's plane — for what their contracts
+//! do not ask the caller to vouch for.
+//!
 //! # `AVBufferRef`
 //!
 //! - the `AVBufferRef` itself, read;
@@ -53,7 +89,9 @@
 //! - `buf`: null, or an [`AVBufferRef`](#avbufferref) — the payload's
 //!   owner;
 //! - the `size` payload bytes at `data`, when `buf` is non-null and
-//!   `size > 0`: initialised. Their extent is *checked* against `buf`'s
+//!   `size > 0`: initialised, as
+//!   [every exported byte](#every-exported-byte-initialised) is. Their
+//!   extent is *checked* against `buf`'s
 //!   own `data` and `size` before anything is read;
 //! - `side_data`, when `side_data_elems > 0`: valid for
 //!   `side_data_elems` `AVPacketSideData` entries (the count is *checked*
@@ -64,23 +102,25 @@
 //!   entry's `type`.
 //!
 //! An `ffmpeg_next::Packet` keeps its `AVPacket` inline, so the packet
-//! itself is always live and aligned behind a borrow of one; what the
-//! borrow cannot vouch for is the list above — and every
-//! `ffmpeg_next::Packet` meets it, with one exception that is upstream's.
-//! Its `buf`, `data`, `size` and `side_data` are written only by
-//! libavformat, libavcodec and ffmpeg-next's own allocating calls
-//! (`copy`, `grow`, `shrink`), which keep them in step, and no safe call
-//! writes them otherwise. Its payload is initialised by every road that
-//! fills one except `ffmpeg_next::Packet::new`, which leaves the bytes
-//! unwritten — bytes ffmpeg-next's own safe `Packet::data` already lends
-//! as `&[u8]`, recorded as an upstream defect rather than one this crate
-//! can close. The safe conversions rely on this paragraph.
+//! itself is always live and aligned behind a borrow of one, and its
+//! `buf`, `data`, `size` and `side_data` are written only by libavformat,
+//! libavcodec and ffmpeg-next's own allocating calls (`copy`, `grow`,
+//! `shrink`), which keep them in step. What the borrow cannot vouch for is
+//! the payload's initialisation: `Packet::new` and `Packet::grow` leave
+//! bytes unwritten (see [above](#every-exported-byte-initialised)) —
+//! bytes ffmpeg-next's own safe `Packet::data` already lends as `&[u8]`,
+//! an upstream defect this crate records and does not inherit. So every
+//! conversion from an `ffmpeg_next::Packet` is `unsafe`, and its caller
+//! vouches that the packet came from a road that writes its payload:
+//! `av_read_frame`, an encoder, `Packet::copy`, or this crate's own
+//! builders.
 //!
 //! # A picture `AVFrame`
 //!
 //! - `buf[0..8]`: each null, or an [`AVBufferRef`](#avbufferref);
 //! - each plane's rows — `data[i]` plus `linesize[i]` per row, for the
-//!   plane's height, `row_bytes` read from each — initialised. The planes
+//!   plane's height, `row_bytes` read from each — initialised, as
+//!   [every exported byte](#every-exported-byte-initialised) is. The planes
 //!   are *checked*: a plane is read only after a buffer in `buf[]` is
 //!   found whose `data .. data + size` contains every row it reads;
 //! - `side_data`, when `nb_side_data > 0` and the array is not null:
@@ -98,7 +138,8 @@
 //!
 //! - `buf[0..8]`: each null, or an [`AVBufferRef`](#avbufferref);
 //! - each plane's samples — `data[i]`, for the bytes `nb_samples` of the
-//!   frame's format occupy in that plane — initialised. The planes are
+//!   frame's format occupy in that plane — initialised, as
+//!   [every exported byte](#every-exported-byte-initialised) is. The planes are
 //!   *checked* as a picture's are, against `buf[]`;
 //! - `ch_layout`: an [`AVChannelLayout`](#avchannellayout), read in
 //!   place;
@@ -120,7 +161,8 @@
 //! A layout FFmpeg filled — `av_channel_layout_copy`,
 //! `av_channel_layout_custom_init` — always holds its map for its count.
 //! Nothing safe can establish that of a layout it did not fill, which is
-//! why the safe conversions refuse a custom map rather than read one.
+//! why the borrowed conversions — whose contracts do not ask for it —
+//! refuse a custom map rather than read one.
 //!
 //! # `AVSubtitle`
 //!

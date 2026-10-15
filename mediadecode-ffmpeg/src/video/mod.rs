@@ -1016,9 +1016,11 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       DecodeState::Sw(_) => unsafe { self.sw_scratch.as_ptr() },
     };
     // SAFETY: the scratch frame is live — either just filled by the
-    // inner decoder's `receive_frame`, or left holding a frame whose
-    // conversion did not commit. Convert takes what it needs out of it,
-    // so the scratch can be reused once this has committed.
+    // inner decoder's `receive_frame` (libavcodec's decode, or
+    // `av_hwframe_transfer_data` out of a hardware surface, wrote every
+    // byte it exports), or left holding such a frame whose conversion
+    // did not commit. Convert takes what it needs out of it, so the
+    // scratch can be reused once this has committed.
     let converted = unsafe {
       convert::av_frame_to_video_frame_as::<C>(av_frame, self.time_base, self.limits.frame())
     };
@@ -1248,8 +1250,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     // any allocation failure, which is the one thing this queue exists
     // to prevent. It leaves the queue when a carrier exists for it.
     if let Some(replayed) = self.sw_replay_frames.front() {
-      // SAFETY: `replayed` is a live AVFrame owned by this queue;
-      // convert takes what it needs out of it.
+      // SAFETY: `replayed` is a live AVFrame owned by this queue, which
+      // the software decoder filled during replay, writing every byte it
+      // exports; convert takes what it needs out of it.
       let converted = unsafe {
         convert::av_frame_to_video_frame_as::<C>(
           replayed.as_ptr(),
@@ -1317,7 +1320,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
             // it is rather than advance past it.
             if let Some(replayed) = self.sw_replay_frames.front() {
               // SAFETY: `replayed` is a live AVFrame owned by this
-              // queue; convert takes what it needs out of it.
+              // queue, which the software decoder filled during replay,
+              // writing every byte it exports; convert takes what it
+              // needs out of it.
               let converted = unsafe {
                 convert::av_frame_to_video_frame_as::<C>(
                   replayed.as_ptr(),
@@ -1355,9 +1360,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
               // The frame is out of the decoder's queue from here; the
               // seat is what keeps it if the conversion cannot commit.
               self.scratch_pending = true;
-              // SAFETY: the scratch frame is live (just filled by
-              // `receive_frame`); convert takes what it needs out of
-              // it, so the scratch can be reused once this commits.
+              // SAFETY: the scratch frame is live, just filled by
+              // `receive_frame`, so libavcodec wrote every byte it
+              // exports; convert takes what it needs out of it, so the
+              // scratch can be reused once this commits.
               let converted = unsafe {
                 convert::av_frame_to_video_frame_as::<C>(
                   self.sw_scratch.as_ptr(),

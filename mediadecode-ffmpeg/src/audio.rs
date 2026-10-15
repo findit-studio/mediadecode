@@ -227,8 +227,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierAudioStreamDecoder<C> {
     // SAFETY: the scratch holds a frame — either one `receive_frame`
     // just filled it with, or one it was left holding by a conversion
     // that did not commit. Convert takes what it needs out of it, so
-    // the scratch can be reused once this has committed. Its channel
-    // layout is libavcodec's: `avcodec_receive_frame` fills it with
+    // the scratch can be reused once this has committed. Every byte it
+    // exports was written by libavcodec: `avcodec_receive_frame` decodes
+    // into its own zero-allocated pools. Its channel layout is
+    // libavcodec's too: `avcodec_receive_frame` fills it with
     // `av_channel_layout_copy`, so a custom map holds exactly
     // `nb_channels` entries, which is the worker's map clause.
     let converted = unsafe {

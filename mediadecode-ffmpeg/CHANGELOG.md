@@ -63,17 +63,25 @@ in lockstep.
   frees the state after the context, and the hardware probe names its
   wanted format through that same pointer before the open, instead of
   installing a second one.
-- **A custom channel map is not walked on the safe road.**
+- **The re-exported conversions from `ffmpeg_next` objects are
+  `unsafe`.** `ffmpeg_next`'s safe API builds frames and packets whose
+  bytes were never written (`frame::Video::new`, `Packet::new`), so a
+  borrow of one cannot vouch for them and every conversion from one —
+  the four `convert::*_frame_from` and the thirteen packet conversions —
+  is an `unsafe fn` (see `mediaio-ffmpeg`). This crate's decoders and
+  demuxer state where their bytes were written — `avcodec_receive_frame`,
+  `av_hwframe_transfer_data`, `av_read_frame` — beside each conversion.
+- **A custom channel map is not walked on the borrowed road.**
   `convert::audio_frame_from` refuses it by name
   (`ConvertError::UnverifiableChannelMap`); this crate's audio decoder
-  converts the frames libavcodec gives it through the `unsafe` entry,
-  whose map extent libavcodec guarantees.
-- **The safe conversions read nothing they cannot bound.**
+  converts the frames libavcodec gives it through the raw entry, whose
+  map extent libavcodec guarantees.
+- **The borrowed conversions read nothing they cannot bound.**
   `convert::audio_frame_from` refuses a null-backed frame before
   reading a field, and `convert::subtitle_frame_from` refuses a bitmap
   rect carrying a plane, whose size nothing records
   (`ConvertError::UnverifiableBitmap`). This crate's subtitle decoder
-  converts through the `unsafe` entry, whose bitmap extents libavcodec
+  converts through the raw entry, whose bitmap extents libavcodec
   guarantees.
 
 ## [0.18.0] - 2026-10-10

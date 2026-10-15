@@ -1157,7 +1157,9 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
       // the borrow cannot become the aliasing shape the public faces
       // refuse.
       //
-      // SAFETY (each of the four arms): `provenance` is this loop's own
+      // SAFETY (each of the four arms): `packet` came out of
+      // `av_read_frame`, so libavformat wrote its payload and its side
+      // data — every byte it exports. `provenance` is this loop's own
       // reading of `packet` — `DemuxDelivered` for what `av_read_frame`
       // just handed a session that holds its `AVFormatContext` through
       // `&mut self`, so every other reference to the buffer is
@@ -3266,9 +3268,11 @@ unsafe fn attached_pic_payload<C: crate::FfmpegCarrier + crate::CarrierOps>(
   // this packet's own ceiling anyway, so the funnel is guarded even if
   // a future caller reaches it without the admission pass.
   //
-  // SAFETY: `pkt` is live per the contract above, and the
-  // `AttachedPicture` claim is the contract's own: nothing writes through
-  // the buffer while the carrier lives.
+  // SAFETY: `pkt` is live per the contract above, and libavformat wrote
+  // its payload when the container opened (`avformat_open_input` reads
+  // the cover art into `attached_pic`), so every byte it exports is
+  // written. The `AttachedPicture` claim is the contract's own: nothing
+  // writes through the buffer while the carrier lives.
   // **The container's own cover art**, whose buffer libavformat also
   // holds — see [`crate::buffer::PayloadProvenance`] for why that
   // second reference is not the hazard a caller's second `Packet` is.

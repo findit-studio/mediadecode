@@ -166,8 +166,11 @@ fn main() -> Result<(), BoxError> {
     // is handed over rather than lent. (The borrowing doors,
     // `owned_*`, are the owned lane: they copy, so the packet stays
     // yours.)
+    //
+    // SAFETY: `packets()` reads each packet with `av_read_frame`, so
+    // libavformat wrote its payload; it is consumed here.
     let Some(pkt) =
-      video_packet_from_ffmpeg_in(av_packet, time_base, PacketLimits::default())?
+      (unsafe { video_packet_from_ffmpeg_in(av_packet, time_base, PacketLimits::default()) })?
     else { continue };
     track.push(&pkt)?;
   }
@@ -389,7 +392,11 @@ for end-to-end demuxer-driven runs that cover all three streams.
   the stream's timebase, so the produced `Timestamp` says what its
   ticks mean instead of carrying the 1/1 placeholder an `AVPacket`
   alone leaves you with. `attachment_packet_from_ffmpeg` wraps a
-  cover-art packet, which has no timestamps to carry.
+  cover-art packet, which has no timestamps to carry. Every one is
+  `unsafe`: a borrow of an `ffmpeg_next` packet cannot vouch that its
+  payload was ever written (`Packet::new` leaves it unwritten), so the
+  caller does — a packet `av_read_frame` filled always was. The demuxer,
+  `FfmpegDemuxer`, converts its own packets and needs no `unsafe`.
 - **Empty-frame builders**: `empty_video_frame`, `empty_audio_frame`,
   `empty_subtitle_frame` — well-formed destinations for `receive_frame`.
 

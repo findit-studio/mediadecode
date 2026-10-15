@@ -338,16 +338,17 @@ impl core::fmt::Display for MalformedChannelLayout {
 
 /// Payload for [`ConvertError::UnverifiableChannelMap`].
 ///
-/// A frame reached the **safe** conversion, [`audio_frame_from`], with a
-/// custom channel layout. `ffmpeg_next`'s safe frame and channel-layout
-/// types let safe code point `u.map` at fewer entries than `nb_channels`,
-/// at a dangling address, or at something misaligned, and neither the
-/// map's provenance nor its extent can be observed from the pointer — the
-/// walk that would check it is itself the out-of-bounds read. So the safe
-/// road refuses the layout without reading the map, and the map is walked
-/// only on the `unsafe` road, whose caller vouches for it (a frame
-/// libavcodec filled, as the decoders' frames are). Structural, and
-/// therefore permanent.
+/// A frame reached the **borrowed** conversion, [`audio_frame_from`],
+/// with a custom channel layout. `ffmpeg_next`'s safe frame and
+/// channel-layout types let safe code point `u.map` at fewer entries than
+/// `nb_channels`, at a dangling address, or at something misaligned, and
+/// neither the map's provenance nor its extent can be observed from the
+/// pointer — the walk that would check it is itself the out-of-bounds
+/// read. That conversion's contract does not ask its caller for the map,
+/// so it refuses the layout without reading it, and the map is walked
+/// only on the raw entry, [`av_frame_to_audio_frame`], whose caller
+/// vouches for it (a frame libavcodec filled, as the decoders' frames
+/// are). Structural, and therefore permanent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UnverifiableChannelMap {
   channels: i32,
@@ -370,8 +371,8 @@ impl core::fmt::Display for UnverifiableChannelMap {
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
     write!(
       f,
-      "convert: a custom channel layout declaring {} channels reached the safe conversion, \
-       which cannot verify that its map has that many entries",
+      "convert: a custom channel layout declaring {} channels reached the borrowed \
+       conversion, which cannot verify that its map has that many entries",
       self.channels,
     )
   }
@@ -379,15 +380,16 @@ impl core::fmt::Display for UnverifiableChannelMap {
 
 /// Payload for [`ConvertError::UnverifiableBitmap`].
 ///
-/// A subtitle reached the **safe** conversion, [`subtitle_frame_from`],
+/// A subtitle reached the **borrowed** conversion, [`subtitle_frame_from`],
 /// with a bitmap rect carrying a plane. An `AVSubtitleRect` holds plain
 /// allocations that record no size, so the plane's extent — `linesize[0]`
 /// times `h` bytes — cannot be checked against anything, and
 /// `ffmpeg_next`'s safe `BitmapMut::set_height` moves `h` without
-/// touching the plane. So the safe road refuses the rect without reading
-/// it, and a bitmap is read only on the `unsafe` road, whose caller
-/// vouches for the extent (a subtitle libavcodec decoded, as the
-/// subtitle decoder's are). Structural, and therefore permanent.
+/// touching the plane. That conversion's contract does not ask its caller
+/// for the extent, so it refuses the rect without reading it, and a
+/// bitmap is read only on the raw entry, [`av_subtitle_to_subtitle_frame`],
+/// whose caller vouches for the extent (a subtitle libavcodec decoded, as
+/// the subtitle decoder's are). Structural, and therefore permanent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UnverifiableBitmap {
   rect: usize,
@@ -410,7 +412,7 @@ impl core::fmt::Display for UnverifiableBitmap {
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
     write!(
       f,
-      "convert: subtitle rect {} is a bitmap, which the safe conversion cannot read: \
+      "convert: subtitle rect {} is a bitmap, which the borrowed conversion cannot read: \
        nothing records how many bytes its plane holds",
       self.rect,
     )
@@ -840,11 +842,11 @@ pub enum ConvertError {
   /// A frame's custom channel layout cannot be described — structural,
   /// and therefore permanent. See [`MalformedChannelLayout`].
   MalformedChannelLayout(MalformedChannelLayout),
-  /// A custom channel layout reached the safe conversion, which cannot
+  /// A custom channel layout reached the borrowed conversion, which cannot
   /// verify its map and so refuses it unread. See
   /// [`UnverifiableChannelMap`].
   UnverifiableChannelMap(UnverifiableChannelMap),
-  /// A bitmap subtitle rect reached the safe conversion, which cannot
+  /// A bitmap subtitle rect reached the borrowed conversion, which cannot
   /// verify its plane's extent and so refuses it unread. See
   /// [`UnverifiableBitmap`].
   UnverifiableBitmap(UnverifiableBitmap),
@@ -887,70 +889,120 @@ fn unsupported_pixel_format(raw: i32) -> ConvertError {
   ))
 }
 
-/// Safe wrapper around [`av_frame_to_video_frame`] taking a borrowed
-/// [`ffmpeg::Frame`](ffmpeg_next::Frame). Recommended entry point for
-/// most callers — equivalent to passing `frame.as_ptr()` to the
-/// unsafe variant, but the FFmpeg side keeps the frame alive for the
-/// duration of the call so the safety contract is satisfied
-/// internally.
+/// [`av_frame_to_video_frame`] for a borrowed
+/// [`ffmpeg::Frame`](ffmpeg_next::Frame), on the owned lane — the entry
+/// point for a caller holding one of `ffmpeg_next`'s frames.
+///
+/// **`unsafe`, because a borrow cannot vouch for the bytes.** The borrow
+/// keeps the `AVFrame` alive and its pointer valid for the call. It says
+/// nothing about whether the planes were ever written, and
+/// `ffmpeg_next`'s safe `frame::Video::new` hands out a frame whose
+/// planes were not; see [every exported byte
+/// initialised](crate::contracts#every-exported-byte-initialised). So the
+/// caller vouches for that, and nothing safe reads a frame's storage.
 ///
 /// **Borrowed source, owned lane.** This road copies, on purpose and
 /// without a lane to choose. `ffmpeg_next`'s frame wrappers lend
 /// `&mut [u8]` through `data_mut` and share their buffers by refcount
 /// with no copy-on-write, so a caller who still holds the frame holds a
 /// mutable alias of every byte a view would read — and both sides are
-/// `Send`, so the two halves need not even be on one thread. No safe
+/// `Send`, so the two halves need not even be on one thread. No
 /// signature that borrows a frame can hand out a window onto it.
 ///
 /// The view lane reaches frames the way it is meant to: through a
 /// decoder, which owns the `AVFrame` it decoded into and never lends it
-/// out. A caller holding an `AVFrame` of their own can use the `unsafe`
-/// entry point below, whose contract names the obligation this
-/// signature cannot express.
-/// The lane is not a parameter here, and asking for one does not
-/// compile:
+/// out. A caller holding an `AVFrame` of their own can use the raw entry
+/// point, whose contract names the obligation this signature cannot
+/// express. The lane is not a parameter here, and asking for one does
+/// not compile:
 ///
 /// ```compile_fail,E0107
 /// use mediaio_ffmpeg::{FrameLimits, View, convert::video_frame_from};
-/// let frame = ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::GRAY8, 64, 4);
-/// let _ = video_frame_from::<View>(&frame, mediaspine::Timebase::default(), FrameLimits::default());
+/// let frame = ffmpeg_next::frame::Video::empty();
+/// // SAFETY: never run — the call does not compile.
+/// let _ = unsafe {
+///   video_frame_from::<View>(&frame, mediaspine::Timebase::default(), FrameLimits::default())
+/// };
 /// ```
-pub fn video_frame_from(
+///
+/// Nor does a call without `unsafe`:
+///
+/// ```compile_fail,E0133
+/// use mediaio_ffmpeg::{FrameLimits, convert::video_frame_from};
+/// let frame = ffmpeg_next::frame::Video::empty();
+/// let _ = video_frame_from(&frame, mediaspine::Timebase::default(), FrameLimits::default());
+/// ```
+///
+/// # Safety
+///
+/// For the duration of the call, `frame` must meet [the picture `AVFrame`
+/// contract](crate::contracts#a-picture-avframe) — a wrapper around null
+/// is refused as [`ConvertError::NullFrame`] before anything is read —
+/// and with it [every exported byte
+/// initialised](crate::contracts#every-exported-byte-initialised): every
+/// row of every plane its geometry describes was written. A frame a
+/// decoder, `av_hwframe_transfer_data` or a scaler filled meets both; a
+/// `frame::Video::new` its caller has not written over does not.
+///
+/// Nothing returned refers to the frame: the owned lane copies every byte
+/// it reads, so the frame may be dropped or reused the moment this
+/// returns.
+pub unsafe fn video_frame_from(
   frame: &ffmpeg_next::Frame,
   time_base: Timebase,
   limits: FrameLimits,
 ) -> Result<VideoFrame<mediaspine::PixelFormat, VideoFrameExtra, FfmpegBytes>, ConvertError> {
   // SAFETY: `&frame` keeps the AVFrame alive for the duration of this
-  // call; the unsafe convert just reads through the pointer, and the
-  // owned lane copies every byte it reads, so nothing outlives the
-  // borrow.
+  // call, and the caller vouches for the picture contract and its bytes
+  // (this function's own `# Safety`); the owned lane copies every byte
+  // it reads, so nothing outlives the borrow.
   unsafe { av_frame_to_video_frame_as::<crate::Owned>(frame.as_ptr(), time_base, limits) }
 }
 
-/// Safe wrapper around [`av_frame_to_audio_frame`] taking a borrowed
-/// [`ffmpeg::frame::Audio`](ffmpeg_next::frame::Audio).
+/// [`av_frame_to_audio_frame`] for a borrowed
+/// [`ffmpeg::frame::Audio`](ffmpeg_next::frame::Audio), on the owned
+/// lane.
+///
+/// **`unsafe`, because a borrow cannot vouch for the bytes** — for the
+/// reason [`video_frame_from`] states: `ffmpeg_next`'s safe
+/// `frame::Audio::new` hands out a frame whose planes were never
+/// written.
 ///
 /// **Borrowed source, owned lane.** This road copies, on purpose and
 /// without a lane to choose. `ffmpeg_next`'s frame wrappers lend
 /// `&mut [u8]` through `data_mut` and share their buffers by refcount
 /// with no copy-on-write, so a caller who still holds the frame holds a
 /// mutable alias of every byte a view would read — and both sides are
-/// `Send`, so the two halves need not even be on one thread. No safe
+/// `Send`, so the two halves need not even be on one thread. No
 /// signature that borrows a frame can hand out a window onto it.
 ///
 /// The view lane reaches frames the way it is meant to: through a
 /// decoder, which owns the `AVFrame` it decoded into and never lends it
-/// out. A caller holding an `AVFrame` of their own can use the `unsafe`
-/// entry point below, whose contract names the obligation this
-/// signature cannot express.
+/// out. A caller holding an `AVFrame` of their own can use the raw entry
+/// point, whose contract names the obligation this signature cannot
+/// express.
 ///
 /// **A custom channel layout is refused, unread**, as
 /// [`ConvertError::UnverifiableChannelMap`]. `ffmpeg_next` lets safe code
 /// point a layout's `u.map` at fewer entries than it declares, or at
-/// nothing, so walking the map from here could read out of bounds
-/// through a safe call. The map is walked only on the `unsafe` entry,
-/// whose caller vouches for it.
-pub fn audio_frame_from(
+/// nothing, and this road's contract does not ask its caller to vouch for
+/// the map. The map is walked only on the raw entry, whose caller does.
+///
+/// # Safety
+///
+/// For the duration of the call, `frame` must meet [the audio `AVFrame`
+/// contract](crate::contracts#an-audio-avframe), less the channel map,
+/// which this road never reads — a wrapper around null is refused as
+/// [`ConvertError::NullFrame`] before anything is read — and with it
+/// [every exported byte
+/// initialised](crate::contracts#every-exported-byte-initialised): every
+/// plane's samples were written. A frame a decoder or a resampler filled
+/// meets both; a `frame::Audio::new` its caller has not written over does
+/// not.
+///
+/// Nothing returned refers to the frame: the owned lane copies every byte
+/// it reads.
+pub unsafe fn audio_frame_from(
   frame: &ffmpeg_next::frame::Audio,
   time_base: Timebase,
   limits: FrameLimits,
@@ -993,19 +1045,42 @@ pub fn audio_frame_from(
     ));
   }
   // SAFETY: `&frame` keeps the AVFrame alive for the duration of this
-  // call, and the owned lane copies what it reads. The layout is not a
-  // custom one (refused above), so the worker reads no channel map and
-  // its map clause has nothing to ask.
+  // call, the caller vouches for the audio contract and its bytes (this
+  // function's own `# Safety`), and the owned lane copies what it reads.
+  // The layout is not a custom one (refused above), so the worker reads
+  // no channel map and its map clause has nothing to ask.
   unsafe { av_frame_to_audio_frame_as::<crate::Owned>(av_frame, time_base, limits) }
 }
 
-/// Safe wrapper around [`av_subtitle_to_subtitle_frame`] taking a
-/// borrowed [`ffmpeg::Subtitle`](ffmpeg_next::Subtitle).
+/// [`av_subtitle_to_subtitle_frame`] for a borrowed
+/// [`ffmpeg::Subtitle`](ffmpeg_next::Subtitle), on the owned lane.
 ///
 /// Owned-lane, like its siblings — though a subtitle rect is copied on
 /// both lanes anyway (`AVSubtitleRect` has no refcounted buffer), so
 /// here the restriction costs a caller nothing at all.
-pub fn subtitle_frame_from(
+///
+/// **`unsafe`, like every conversion from an `ffmpeg_next` object**: the
+/// borrow keeps the `AVSubtitle` alive, and says nothing about what its
+/// rects point at.
+///
+/// **A bitmap rect carrying a plane is refused, unread**, as
+/// [`ConvertError::UnverifiableBitmap`]: nothing records the plane's
+/// size, `ffmpeg_next`'s safe `BitmapMut::set_height` moves `h` alone,
+/// and this road's contract does not ask its caller to vouch for the
+/// extent. A bitmap is read only on the raw entry, whose caller does.
+///
+/// # Safety
+///
+/// For the duration of the call, `subtitle` must meet [the `AVSubtitle`
+/// contract](crate::contracts#avsubtitle), less a bitmap rect's plane and
+/// palette, which this road never reads, and with it [every exported
+/// byte initialised](crate::contracts#every-exported-byte-initialised):
+/// each text and ASS rect's string was written, up to its terminator. A
+/// subtitle libavcodec decoded meets both, and so does one built through
+/// `ffmpeg_next`'s safe setters, which duplicate a NUL-terminated copy.
+///
+/// Nothing returned refers to the subtitle.
+pub unsafe fn subtitle_frame_from(
   subtitle: &ffmpeg_next::Subtitle,
 ) -> Result<SubtitleFrame<SubtitleFrameExtra, FfmpegBytes>, ConvertError> {
   // SAFETY: reading the pointer to the `AVSubtitle` the wrapper keeps
@@ -1014,21 +1089,21 @@ pub fn subtitle_frame_from(
   // **A bitmap is refused here rather than read.** Its plane's extent
   // is recorded nowhere, and safe code can move `h` alone; see
   // [`UnverifiableBitmap`]. Text and ASS rects are read as the worker
-  // reads them: their strings come from libavcodec or from
-  // `ffmpeg_next`'s safe setter, which duplicates a NUL-terminated copy.
+  // reads them, and the caller vouches for their strings.
   //
-  // SAFETY: `rects` and its entries are libavcodec's or `ffmpeg_next`'s
-  // own (`add_rect` keeps the array and its count in step, and a failed
-  // allocation leaves a null this checks); each non-null rect's `type`
-  // and `data[0]` are read as plain values.
+  // SAFETY: the caller vouches for the `AVSubtitle` contract's `rects`
+  // clause (this function's own `# Safety`); each non-null rect's `type`
+  // is read as a plain value, and a bitmap rect's `data[0]` — its own
+  // kind's field — as a pointer value.
   if let Some(rect) = unsafe { first_bitmap_with_plane(av_subtitle) } {
     return Err(ConvertError::UnverifiableBitmap(UnverifiableBitmap::new(
       rect,
     )));
   }
   // SAFETY: `&subtitle` keeps the AVSubtitle alive for the duration of
-  // this call; no rect left to read is a bitmap, so no plane extent is
-  // asked of the worker.
+  // this call, and the caller vouches for its rects and strings (this
+  // function's own `# Safety`); no rect left to read is a bitmap carrying
+  // a plane, so no plane extent is asked of the worker.
   unsafe { av_subtitle_to_subtitle_frame_as::<crate::Owned>(av_subtitle) }
 }
 
@@ -1090,7 +1165,7 @@ unsafe fn first_bitmap_with_plane(
 /// live. `ffmpeg_next`'s wrappers lend `&mut [u8]` by refcount with no
 /// copy-on-write, so keeping the source frame and writing through it
 /// would race a carrier a consumer is reading — consume the frame, use
-/// the owned lane, or use the safe borrowed wrapper (which is the owned
+/// the owned lane, or use the borrowed conversion (which is the owned
 /// lane for exactly this reason).
 #[doc(hidden)]
 pub unsafe fn av_frame_to_video_frame_as<C: crate::FfmpegCarrier + crate::CarrierOps>(
@@ -1208,17 +1283,31 @@ pub unsafe fn av_frame_to_video_frame_as<C: crate::FfmpegCarrier + crate::Carrie
   Ok(out)
 }
 
-/// Safe wrapper around [`av_frame_to_image_frame`] taking a borrowed
-/// [`ffmpeg::Frame`](ffmpeg_next::Frame).
+/// [`av_frame_to_image_frame`] for a borrowed
+/// [`ffmpeg::Frame`](ffmpeg_next::Frame), on the owned lane.
 ///
-/// Owned-lane, for the reason [`video_frame_from`] states: a borrowed
-/// frame cannot be safely viewed.
-pub fn image_frame_from(
+/// Owned-lane, and `unsafe`, for the reasons [`video_frame_from`] states:
+/// a borrowed frame cannot be viewed, and a borrow cannot vouch for its
+/// bytes.
+///
+/// # Safety
+///
+/// For the duration of the call, `frame` must meet [the picture `AVFrame`
+/// contract](crate::contracts#a-picture-avframe) — a wrapper around null
+/// is refused as [`ConvertError::NullFrame`] before anything is read —
+/// and with it [every exported byte
+/// initialised](crate::contracts#every-exported-byte-initialised): every
+/// row of every plane its geometry describes was written.
+///
+/// Nothing returned refers to the frame: the owned lane copies every byte
+/// it reads.
+pub unsafe fn image_frame_from(
   frame: &ffmpeg_next::Frame,
   limits: FrameLimits,
 ) -> Result<ImageFrame<mediaspine::PixelFormat, ImageFrameExtra, FfmpegBytes>, ConvertError> {
   // SAFETY: `&frame` keeps the AVFrame alive for the duration of this
-  // call, and the owned lane copies what it reads.
+  // call, the caller vouches for the picture contract and its bytes (this
+  // function's own `# Safety`), and the owned lane copies what it reads.
   unsafe { av_frame_to_image_frame_as::<crate::Owned>(frame.as_ptr(), limits) }
 }
 
@@ -1260,7 +1349,7 @@ pub fn image_frame_from(
 /// live. `ffmpeg_next`'s wrappers lend `&mut [u8]` by refcount with no
 /// copy-on-write, so keeping the source frame and writing through it
 /// would race a carrier a consumer is reading — consume the frame, use
-/// the owned lane, or use the safe borrowed wrapper (which is the owned
+/// the owned lane, or use the borrowed conversion (which is the owned
 /// lane for exactly this reason).
 #[doc(hidden)]
 pub unsafe fn av_frame_to_image_frame_as<C: crate::FfmpegCarrier + crate::CarrierOps>(
@@ -2537,9 +2626,9 @@ fn map_chroma_loc(raw: i32) -> ChromaLocation {
 ///
 /// One judgement for both roads. [`av_frame_to_audio_frame_as`] runs it
 /// before it materialises the layout, and [`audio_frame_from`] before it
-/// refuses a custom map — so the safe road answers an impossible count
-/// exactly as the worker does, and asks the map question only of a count
-/// the worker would have taken.
+/// refuses a custom map — so the borrowed road answers an impossible
+/// count exactly as the worker does, and asks the map question only of a
+/// count the worker would have taken.
 fn judge_audio_counts(
   nb_samples_raw: i32,
   channel_count_raw: i32,
@@ -2607,7 +2696,7 @@ fn judge_audio_counts(
 /// live. `ffmpeg_next`'s wrappers lend `&mut [u8]` by refcount with no
 /// copy-on-write, so keeping the source frame and writing through it
 /// would race a carrier a consumer is reading — consume the frame, use
-/// the owned lane, or use the safe borrowed wrapper (which is the owned
+/// the owned lane, or use the borrowed conversion (which is the owned
 /// lane for exactly this reason).
 #[doc(hidden)]
 pub unsafe fn av_frame_to_audio_frame_as<C: crate::FfmpegCarrier + crate::CarrierOps>(
@@ -2713,10 +2802,10 @@ pub unsafe fn av_frame_to_audio_frame_as<C: crate::FfmpegCarrier + crate::Carrie
   // `u.map` is FFmpeg's own allocation of exactly `nb_channels`
   // `AVChannelCustom` entries: the frame came out of libavcodec, which
   // fills `ch_layout` through `av_channel_layout_copy`, and no caller
-  // of this crate supplies a layout here. The `unsafe` road is the only
-  // one that reads a custom map at all — the safe conversion refuses
-  // one, because the extent this comment supplies is exactly what a
-  // safe signature cannot demand.
+  // of this crate supplies a layout here. The raw road is the only one
+  // that reads a custom map at all — the borrowed conversion refuses one,
+  // because the extent this comment supplies is exactly what its
+  // contract does not demand.
   let channel_layout =
     unsafe { crate::channel_layout::channel_layout_description_from_raw_ptr(ch_layout_ptr) }
       .map_err(|fault| match fault {

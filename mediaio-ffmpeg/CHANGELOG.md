@@ -29,12 +29,23 @@ The family — `mediadecode`, `mediadecode-ffmpeg`, `mediadecode-webcodecs`,
   resampler's `Resample` arm carry.
 - `try_clone_packet`: a deep copy of a packet that checks both
   `av_packet_ref` and `av_packet_make_writable`.
-- **A custom channel map is refused unread on the safe road.** The safe
+- **No safe function reads the storage of an `ffmpeg_next` frame,
+  packet or subtitle.** `ffmpeg_next`'s safe API builds objects whose
+  bytes were never written — `frame::Video::new` and `frame::Audio::new`
+  (`av_frame_get_buffer`), `Packet::new` and `Packet::grow` — so every
+  conversion from one is an `unsafe fn` whose caller vouches for the new
+  `contracts` section, "Every exported byte initialised", and for the
+  object's own: `convert::video_frame_from`, `image_frame_from`,
+  `audio_frame_from` and `subtitle_frame_from`, and the thirteen
+  `boundary` packet conversions (`*_packet_from_ffmpeg`, `*_in`,
+  `owned_*`, `attachment_packet_from_ffmpeg`). Their named refusals stay.
+  A call without `unsafe` does not compile (`compile_fail,E0133`).
+- **A custom channel map is refused unread on the borrowed road.**
   `convert::audio_frame_from` answers
   `ConvertError::UnverifiableChannelMap` for a frame whose layout is a
-  custom map, before reading it: nothing safe can verify the map holds
-  `nb_channels` entries. A frame libavcodec produced converts through
-  the `unsafe` entries, whose `# Safety` states the map's extent.
+  custom map, before reading it: its contract does not ask for the map.
+  A frame libavcodec produced converts through the raw entries, whose
+  `# Safety` states the map's extent.
 - **The allocator judge has one door.** `judge_buffer` is private, and
   the plumbing's `ffi::install_allocator_judge` installs it together
   with the `CallbackState` it reads, under a contract that states the
@@ -50,14 +61,14 @@ The family — `mediadecode`, `mediadecode-ffmpeg`, `mediadecode-webcodecs`,
   `pub(crate)`; what `mediadecode-ffmpeg` needs goes through two
   documented doors, the safe `ffi::find_decoder_raw` and
   `ffi::visit_hwframe_download_formats`.
-- **The safe roads refuse what they cannot bound, before reading.**
+- **The borrowed roads refuse what they cannot bound, before reading.**
   `convert::audio_frame_from` answers `ConvertError::NullFrame` for a
   null-backed frame before reading any field, and
   `convert::subtitle_frame_from` refuses a bitmap rect carrying a plane
   (`ConvertError::UnverifiableBitmap`): an `AVSubtitleRect` records no
   plane size, and `ffmpeg_next`'s safe `BitmapMut::set_height` moves
-  the height alone. Bitmaps convert through the `unsafe` entries,
-  whose caller vouches for the extent.
+  the height alone. Bitmaps convert through the raw entries, whose
+  caller vouches for the extent.
 - `boundary::write_md_flags` is a safe fn: it writes one field of the
   `AVPacket` an `ffmpeg_next::Packet` keeps inline.
 - A `test-support` feature (off by default): the fault-subprocess

@@ -340,10 +340,10 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierImageDecoder<C> {
     // on the way out so the next attempt starts from the same place
     // this one did.
     //
-    // SAFETY: `scratch` was just filled by `receive_frame`; the
-    // conversion copies every byte it takes, so the scratch frame can
-    // be reused on the next call and the produced `ImageFrame` outlives
-    // this decoder.
+    // SAFETY: `scratch` was just filled by `receive_frame`, so libavcodec
+    // wrote every byte it exports; the conversion copies every byte it
+    // takes, so the scratch frame can be reused on the next call and the
+    // produced `ImageFrame` outlives this decoder.
     let image = unsafe {
       convert::av_frame_to_image_frame_as::<C>(self.scratch.as_ptr(), self.limits.frame())
     }
