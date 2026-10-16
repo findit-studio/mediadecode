@@ -285,10 +285,11 @@ spelling (`start`, `record`, `timebase`, `at`, `in_offset`,
 `out_offset`), so every value reads back as it was written. The model's
 notes ride beside the clip's words as an array of `[key, value]` pairs,
 never as an object: a note's key is anything, and OpenTimelineIO reads an
-object carrying `OTIO_SCHEMA` as an object of that schema. Available ranges and the start are written as the timeline holds
-them: a medium read through `mediadecode` starts at zero until the read side
-exposes the container's timecode, so its available range does not yet carry
-the camera's.
+object carrying `OTIO_SCHEMA` as an object of that schema. Available
+ranges and the start are written as the timeline holds them: a medium read
+through `mediadecode` starts at zero until the read side exposes the
+container's timecode, so its available range does not yet carry the
+camera's.
 
 `otio::validate_json(&str, OtioTarget)` is the structural self-check the
 export is held to: the crate's own strict JSON reader, then OpenTimelineIO's
@@ -297,8 +298,11 @@ against each schema's `read_from`, per target: `Track.1` needs its `kind`,
 a `Marker.2` its `marked_range`, and a reader before 0.15 a `Clip.1`'s
 `media_reference`), the types of the keys the export writes, media
 references, the target's clip schema, every marker a `Marker.2`, every
-transition between two items. No Python and no OpenTimelineIO install; CI
-runs it on the goldens.
+transition between two items. It walks every dictionary, metadata
+included: OpenTimelineIO decodes one carrying `OTIO_SCHEMA` as an object
+of that schema wherever it sits, so the check holds it to that schema's
+rules, and refuses by name a schema whose rules it does not know. No
+Python and no OpenTimelineIO install; CI runs it on the goldens.
 
 ### Reading back
 

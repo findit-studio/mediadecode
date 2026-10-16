@@ -23,8 +23,19 @@
 //! | `Transition.1` | `in_offset`, `out_offset`, `transition_type` | `transition.cpp:35–37` |
 //! | `ExternalReference.1` | `target_url` | `externalReference.cpp:23` |
 //! | `Marker.2` | `marked_range` | `marker.cpp:28` (0.15: `:26`, 0.14.1: `:23`, 0.12: `:20`) |
+//! | `Effect.1`, `TimeEffect.1` | `effect_name` | `effect.cpp:25` (0.15: `:23`, 0.14.1: `:20`, 0.12: `:17`) |
+//! | `LinearTimeWarp.1`, `FreezeFrame.1` | `time_scalar`, then an effect's | `linearTimeWarp.cpp:23` (0.14.1: `:20`, 0.12: `:17`) |
 //! | `RationalTime.1` | `rate`, `value` | `deserialization.cpp:578–583` |
 //! | `TimeRange.1` | `start_time`, `duration` | `deserialization.cpp:585–591` |
+//! | `TimeTransform.1` | `offset`, `rate`, `scale` | `deserialization.cpp:602–610` |
+//! | `V2d.1` | `x`, `y` | `deserialization.cpp:621–627`, from 0.15 |
+//! | `Box2d.1` | `min`, `max` | `deserialization.cpp:628–635`, from 0.15 |
+//! | `Color.1` | `name`, `r`, `g`, `b`, `a` | `deserialization.cpp:593–600`, from 0.18 |
+//!
+//! A reader that does not decode a value schema — one before 0.15 a `V2d.1`
+//! or a `Box2d.1`, one before 0.18 a `Color.1` — keeps the dictionary as an
+//! object of a schema it does not know (below); the check holds it to the
+//! newer readers' rules for every target.
 //!
 //! Everything else these schemas read is read only if present: `metadata`
 //! and `name` on each (`serializableObjectWithMetadata.cpp:21–22`), an
@@ -36,16 +47,37 @@
 //! before 0.16 keep a `comment` as a field they do not know, and write it
 //! back).
 //!
+//! # Every dictionary
+//!
+//! A reader converts each dictionary as its parser closes it, wherever it
+//! sits (`deserialization.cpp:156–190`): one without `OTIO_SCHEMA` stays a
+//! dictionary, and one carrying it becomes an object of the schema it names
+//! (`:564–568`), which that schema's own `read_from` then reads
+//! (`serializableObject.h:222–235`). So a dictionary in metadata, under a
+//! key no reader reads, or nested inside either, refuses the document when
+//! its schema's reader would. The check walks every dictionary alike and
+//! holds each one carrying `OTIO_SCHEMA` to that schema's rules, wherever it
+//! sits. Metadata itself is a dictionary, never a schema's object.
+//!
+//! A schema whose rules the check does not know is refused by name, at its
+//! `OTIO_SCHEMA`. In one case that is stricter than a reader: a name no
+//! reader registers becomes an `UnknownSchema` (`typeRegistry.cpp:260–290`
+//! in 0.17.0), which a reader keeps where the document leaves the type
+//! open. The check does not vouch for an object it cannot read, and the
+//! export writes none.
+//!
 //! # What a value is held to
 //!
 //! A value present is held to the type the reader takes, and in places to
 //! more — a string where a reader would take `null` as empty, a positive,
 //! finite rate, a length of zero or more, an active media key among the
 //! references, every transition between two items, every marker a
-//! `Marker.2` — the one marker schema the readers 0.12 to 0.18.1 know.
-//! Keys this crate never writes are not checked: a newer reader's `color`
-//! on an item or `enabled` on a transition, an effect's own fields, an
-//! image bound's corners.
+//! `Marker.2` — the one marker schema the readers 0.12 to 0.18.1 know —
+//! every effect one of the four effect schemas, and, for readers from
+//! 0.15, a media reference's image bounds a `Box2d.1`. Keys this crate
+//! never writes and no reader of the target requires are walked but not
+//! typed: a newer reader's `color` on an item or `enabled` on a transition
+//! or an effect, a generator's parameters.
 
 use std::format;
 
@@ -55,30 +87,59 @@ use super::{OtioTarget, Shape, json::Value};
 
 type Members = [(Utf8Bytes, Value)];
 
+/// The keys every schema with metadata reads.
+const NAMED: &[&str] = &["metadata", "name"];
+
+/// The keys every item reads, beside [`NAMED`].
+const ITEM: &[&str] = &["source_range", "effects", "markers", "enabled"];
+
+const MEDIA_REFERENCES: &[&str] = &[
+  "ExternalReference.1",
+  "MissingReference.1",
+  "GeneratorReference.1",
+  "ImageSequenceReference.1",
+];
+
+const EFFECTS: &[&str] = &[
+  "Effect.1",
+  "TimeEffect.1",
+  "LinearTimeWarp.1",
+  "FreezeFrame.1",
+];
+
 pub(crate) fn timeline(root: &Value, target: OtioTarget) -> Result<(), Shape> {
-  let path = "$";
-  let members = schema(root, path, &["Timeline.1"], "the schema Timeline.1")?;
-  named(members, path)?;
+  timeline_at(root, "$", target)
+}
+
+fn timeline_at(value: &Value, path: &str, target: OtioTarget) -> Result<(), Shape> {
+  let members = schema(value, path, &["Timeline.1"], "the schema Timeline.1")?;
+  named(members, path, target)?;
   optional(members, path, "global_start_time", |value, at| {
-    nullable(value, at, rational_time)
+    nullable(value, at, |value, at| rational_time(value, at, target))
   })?;
   let (tracks, at) = required(members, path, "tracks")?;
-  stack(tracks, &at, target)
+  stack(tracks, &at, target)?;
+  others(
+    members,
+    path,
+    target,
+    &[NAMED, &["global_start_time", "tracks"]],
+  )
 }
 
 fn stack(value: &Value, path: &str, target: OtioTarget) -> Result<(), Shape> {
   let members = schema(value, path, &["Stack.1"], "the schema Stack.1")?;
-  item(members, path)?;
+  item(members, path, target)?;
   let (children, at) = required(members, path, "children")?;
   for (index, child) in array(children, &at)?.iter().enumerate() {
     composable(child, &format!("{at}[{index}]"), target, false)?;
   }
-  Ok(())
+  others(members, path, target, &[NAMED, ITEM, &["children"]])
 }
 
 fn track(value: &Value, path: &str, target: OtioTarget) -> Result<(), Shape> {
   let members = schema(value, path, &["Track.1"], "the schema Track.1")?;
-  item(members, path)?;
+  item(members, path, target)?;
   let (kind, at) = required(members, path, "kind")?;
   string(kind, &at)?;
   let (children, at) = required(members, path, "children")?;
@@ -103,7 +164,7 @@ fn track(value: &Value, path: &str, target: OtioTarget) -> Result<(), Shape> {
       return Err(shape(&here, "a transition between two items"));
     }
   }
-  Ok(())
+  others(members, path, target, &[NAMED, ITEM, &["kind", "children"]])
 }
 
 fn composable(value: &Value, path: &str, target: OtioTarget, in_track: bool) -> Result<(), Shape> {
@@ -112,25 +173,17 @@ fn composable(value: &Value, path: &str, target: OtioTarget, in_track: bool) -> 
   match name {
     "Track.1" => track(value, path, target),
     "Stack.1" => stack(value, path, target),
-    "Gap.1" => item(members, path),
-    "Clip.1" => {
-      item(members, path)?;
-      match target {
-        OtioTarget::V0_15Plus => optional(members, path, "media_reference", |value, at| {
-          nullable(value, at, media_reference)
-        }),
-        OtioTarget::Legacy => {
-          let (reference, at) = required(members, path, "media_reference")?;
-          nullable(reference, &at, media_reference)
-        }
-      }
+    "Gap.1" => {
+      item(members, path, target)?;
+      others(members, path, target, &[NAMED, ITEM])
     }
-    "Clip.2" if target == OtioTarget::V0_15Plus => clip2(members, path),
+    "Clip.1" => clip1(members, path, target),
+    "Clip.2" if target == OtioTarget::V0_15Plus => clip2(members, path, target),
     "Clip.2" => Err(shape(
       &format!("{path}.OTIO_SCHEMA"),
       "Clip.1, the only clip readers before OpenTimelineIO 0.15 know",
     )),
-    "Transition.1" if in_track => transition(members, path),
+    "Transition.1" if in_track => transition(members, path, target),
     _ => Err(shape(
       &format!("{path}.OTIO_SCHEMA"),
       if in_track {
@@ -142,68 +195,108 @@ fn composable(value: &Value, path: &str, target: OtioTarget, in_track: bool) -> 
   }
 }
 
-fn clip2(members: &Members, path: &str) -> Result<(), Shape> {
-  item(members, path)?;
+fn clip1(members: &Members, path: &str, target: OtioTarget) -> Result<(), Shape> {
+  item(members, path, target)?;
+  let reference = |value: &Value, at: &str| {
+    nullable(value, at, |value, at| media_reference(value, at, target))
+  };
+  match target {
+    OtioTarget::V0_15Plus => optional(members, path, "media_reference", reference)?,
+    OtioTarget::Legacy => {
+      let (value, at) = required(members, path, "media_reference")?;
+      reference(value, &at)?;
+    }
+  }
+  others(members, path, target, &[NAMED, ITEM, &["media_reference"]])
+}
+
+fn clip2(members: &Members, path: &str, target: OtioTarget) -> Result<(), Shape> {
+  item(members, path, target)?;
   let (references, at) = required(members, path, "media_references")?;
   let references = object(references, &at)?;
   for (key, reference) in references {
-    media_reference(reference, &format!("{at}.{key}"))?;
+    media_reference(reference, &format!("{at}.{key}"), target)?;
   }
   let (active, at) = required(members, path, "active_media_reference_key")?;
   let active = string_value(active, &at)?;
   if member(references, active).is_none() {
     return Err(shape(&at, "a key of media_references"));
   }
-  Ok(())
+  others(
+    members,
+    path,
+    target,
+    &[
+      NAMED,
+      ITEM,
+      &["media_references", "active_media_reference_key"],
+    ],
+  )
 }
 
-fn media_reference(value: &Value, path: &str) -> Result<(), Shape> {
-  let members = schema(
-    value,
-    path,
-    &[
-      "ExternalReference.1",
-      "MissingReference.1",
-      "GeneratorReference.1",
-      "ImageSequenceReference.1",
-    ],
-    "a media reference schema",
-  )?;
-  named(members, path)?;
+fn media_reference(value: &Value, path: &str, target: OtioTarget) -> Result<(), Shape> {
+  let members = schema(value, path, MEDIA_REFERENCES, "a media reference schema")?;
+  named(members, path, target)?;
   optional(members, path, "available_range", |value, at| {
-    nullable(value, at, time_range)
+    nullable(value, at, |value, at| time_range(value, at, target))
   })?;
+  // Read from 0.15 as a `Box2d`; kept before as a key the reader does not
+  // know.
   optional(members, path, "available_image_bounds", |value, at| {
-    nullable(value, at, |value, at| object(value, at).map(drop))
+    nullable(value, at, |value, at| match target {
+      OtioTarget::V0_15Plus => box2d(value, at, target),
+      OtioTarget::Legacy => {
+        object(value, at)?;
+        contents(value, at, target)
+      }
+    })
   })?;
-  if schema_name(members, path)? == "ExternalReference.1" {
+  let external = schema_name(members, path)? == "ExternalReference.1";
+  if external {
     let (url, at) = required(members, path, "target_url")?;
     string(url, &at)?;
   }
-  Ok(())
+  let url: &[&str] = if external { &["target_url"] } else { &[] };
+  others(
+    members,
+    path,
+    target,
+    &[NAMED, &["available_range", "available_image_bounds"], url],
+  )
 }
 
-fn transition(members: &Members, path: &str) -> Result<(), Shape> {
-  named(members, path)?;
+fn transition(members: &Members, path: &str, target: OtioTarget) -> Result<(), Shape> {
+  named(members, path, target)?;
   let (in_offset, at) = required(members, path, "in_offset")?;
-  length(in_offset, &at)?;
+  length(in_offset, &at, target)?;
   let (out_offset, at) = required(members, path, "out_offset")?;
-  length(out_offset, &at)?;
+  length(out_offset, &at, target)?;
   let (kind, at) = required(members, path, "transition_type")?;
-  string(kind, &at)
+  string(kind, &at)?;
+  others(
+    members,
+    path,
+    target,
+    &[NAMED, &["in_offset", "out_offset", "transition_type"]],
+  )
 }
 
 /// The fields every item carries: a name and metadata, a trim, effects,
 /// markers, and whether it plays.
-fn item(members: &Members, path: &str) -> Result<(), Shape> {
-  named(members, path)?;
+fn item(members: &Members, path: &str, target: OtioTarget) -> Result<(), Shape> {
+  named(members, path, target)?;
   optional(members, path, "source_range", |value, at| {
-    nullable(value, at, time_range)
+    nullable(value, at, |value, at| time_range(value, at, target))
   })?;
-  optional(members, path, "effects", schema_objects)?;
+  optional(members, path, "effects", |value, at| {
+    for (index, entry) in array(value, at)?.iter().enumerate() {
+      effect(entry, &format!("{at}[{index}]"), target)?;
+    }
+    Ok(())
+  })?;
   optional(members, path, "markers", |value, at| {
     for (index, entry) in array(value, at)?.iter().enumerate() {
-      marker(entry, &format!("{at}[{index}]"))?;
+      marker(entry, &format!("{at}[{index}]"), target)?;
     }
     Ok(())
   })?;
@@ -215,33 +308,142 @@ fn item(members: &Members, path: &str) -> Result<(), Shape> {
 
 /// A `Marker.2`: its name and metadata, its color and comment strings, and
 /// the range it marks, which every reader requires.
-fn marker(value: &Value, path: &str) -> Result<(), Shape> {
+fn marker(value: &Value, path: &str, target: OtioTarget) -> Result<(), Shape> {
   let members = schema(value, path, &["Marker.2"], "the schema Marker.2")?;
-  named(members, path)?;
+  named(members, path, target)?;
   optional(members, path, "color", string)?;
   let (range, at) = required(members, path, "marked_range")?;
-  time_range(range, &at)?;
-  optional(members, path, "comment", string)
+  time_range(range, &at, target)?;
+  optional(members, path, "comment", string)?;
+  others(
+    members,
+    path,
+    target,
+    &[NAMED, &["color", "marked_range", "comment"]],
+  )
 }
 
-fn named(members: &Members, path: &str) -> Result<(), Shape> {
+/// An effect: its name and metadata, the `effect_name` every reader
+/// requires, and a time warp's `time_scalar`. An item holds its effects as
+/// `Effect`s, so every reader refuses another schema there too.
+fn effect(value: &Value, path: &str, target: OtioTarget) -> Result<(), Shape> {
+  let members = schema(value, path, EFFECTS, "an effect schema")?;
+  named(members, path, target)?;
+  let (name, at) = required(members, path, "effect_name")?;
+  string(name, &at)?;
+  let warp = matches!(
+    schema_name(members, path)?,
+    "LinearTimeWarp.1" | "FreezeFrame.1"
+  );
+  if warp {
+    let (scalar, at) = required(members, path, "time_scalar")?;
+    number(scalar, &at)?;
+  }
+  let scalar: &[&str] = if warp { &["time_scalar"] } else { &[] };
+  others(members, path, target, &[NAMED, &["effect_name"], scalar])
+}
+
+fn named(members: &Members, path: &str, target: OtioTarget) -> Result<(), Shape> {
   optional(members, path, "metadata", |value, at| {
-    object(value, at).map(drop)
+    dictionary(value, at, target)
   })?;
   optional(members, path, "name", string)
 }
 
-fn time_range(value: &Value, path: &str) -> Result<(), Shape> {
+/// Metadata: a dictionary every reader takes as one, never a schema's
+/// object. Its values are walked as any others are ([`contents`]).
+fn dictionary(value: &Value, path: &str, target: OtioTarget) -> Result<(), Shape> {
+  let members = object(value, path)?;
+  if member(members, "OTIO_SCHEMA").is_some() {
+    return Err(shape(
+      &format!("{path}.OTIO_SCHEMA"),
+      "no schema: metadata is a dictionary",
+    ));
+  }
+  contents(value, path, target)
+}
+
+/// A value where the document leaves the type open — metadata, a key no
+/// reader reads, and what either holds. A reader decodes every dictionary
+/// there all the same: a plain one stays a dictionary, whose values are
+/// walked in turn, and one carrying `OTIO_SCHEMA` is an object of that
+/// schema ([`any_schema`]).
+fn contents(value: &Value, path: &str, target: OtioTarget) -> Result<(), Shape> {
+  match value {
+    Value::Array(entries) => {
+      for (index, entry) in entries.iter().enumerate() {
+        contents(entry, &format!("{path}[{index}]"), target)?;
+      }
+      Ok(())
+    }
+    Value::Object(members) => {
+      if member(members, "OTIO_SCHEMA").is_some() {
+        return any_schema(value, path, target);
+      }
+      for (key, entry) in members {
+        contents(entry, &format!("{path}.{key}"), target)?;
+      }
+      Ok(())
+    }
+    _ => Ok(()),
+  }
+}
+
+/// A dictionary carrying `OTIO_SCHEMA` where the document leaves the type
+/// open: held to that schema's rules, or refused by name where the check
+/// does not know them.
+fn any_schema(value: &Value, path: &str, target: OtioTarget) -> Result<(), Shape> {
+  let members = object(value, path)?;
+  match schema_name(members, path)? {
+    "Timeline.1" => timeline_at(value, path, target),
+    "Stack.1" | "Track.1" | "Gap.1" | "Clip.1" | "Clip.2" => composable(value, path, target, false),
+    "Transition.1" => transition(members, path, target),
+    "Marker.2" => marker(value, path, target),
+    name if MEDIA_REFERENCES.contains(&name) => media_reference(value, path, target),
+    name if EFFECTS.contains(&name) => effect(value, path, target),
+    "RationalTime.1" => rational_time(value, path, target),
+    "TimeRange.1" => time_range(value, path, target),
+    "TimeTransform.1" => time_transform(value, path, target),
+    "V2d.1" => v2d(value, path, target),
+    "Box2d.1" => box2d(value, path, target),
+    "Color.1" => color(value, path, target),
+    _ => Err(shape(
+      &format!("{path}.OTIO_SCHEMA"),
+      "a schema whose rules the check knows",
+    )),
+  }
+}
+
+/// The members a schema's reader leaves unread, given the keys it reads: a
+/// reader keeps them as the object's own, decoded as any others are
+/// ([`contents`]).
+fn others(
+  members: &Members,
+  path: &str,
+  target: OtioTarget,
+  read: &[&[&str]],
+) -> Result<(), Shape> {
+  for (key, value) in members {
+    let key = key.as_str();
+    if key != "OTIO_SCHEMA" && !read.iter().any(|keys| keys.contains(&key)) {
+      contents(value, &format!("{path}.{key}"), target)?;
+    }
+  }
+  Ok(())
+}
+
+fn time_range(value: &Value, path: &str, target: OtioTarget) -> Result<(), Shape> {
   let members = schema(value, path, &["TimeRange.1"], "the schema TimeRange.1")?;
   let (duration, at) = required(members, path, "duration")?;
-  length(duration, &at)?;
+  length(duration, &at, target)?;
   let (start, at) = required(members, path, "start_time")?;
-  rational_time(start, &at)
+  rational_time(start, &at, target)?;
+  others(members, path, target, &[&["duration", "start_time"]])
 }
 
 /// A `RationalTime.1` that measures a length: no shorter than nothing.
-fn length(value: &Value, path: &str) -> Result<(), Shape> {
-  rational_time(value, path)?;
+fn length(value: &Value, path: &str, target: OtioTarget) -> Result<(), Shape> {
+  rational_time(value, path, target)?;
   let members = object(value, path)?;
   match member(members, "value").and_then(Value::as_f64) {
     Some(value) if value >= 0.0 => Ok(()),
@@ -249,7 +451,7 @@ fn length(value: &Value, path: &str) -> Result<(), Shape> {
   }
 }
 
-fn rational_time(value: &Value, path: &str) -> Result<(), Shape> {
+fn rational_time(value: &Value, path: &str, target: OtioTarget) -> Result<(), Shape> {
   let members = schema(
     value,
     path,
@@ -262,20 +464,53 @@ fn rational_time(value: &Value, path: &str) -> Result<(), Shape> {
     _ => return Err(shape(&at, "a positive, finite rate")),
   }
   let (count, at) = required(members, path, "value")?;
-  match count.as_f64() {
-    Some(count) if count.is_finite() => Ok(()),
-    _ => Err(shape(&at, "a finite number")),
-  }
+  number(count, &at)?;
+  others(members, path, target, &[&["rate", "value"]])
 }
 
-/// An array of objects that each name their schema: effects, whose own
-/// fields this check does not read.
-fn schema_objects(value: &Value, path: &str) -> Result<(), Shape> {
-  for (index, entry) in array(value, path)?.iter().enumerate() {
-    let at = format!("{path}[{index}]");
-    schema_name(object(entry, &at)?, &at)?;
+fn time_transform(value: &Value, path: &str, target: OtioTarget) -> Result<(), Shape> {
+  let members = schema(
+    value,
+    path,
+    &["TimeTransform.1"],
+    "the schema TimeTransform.1",
+  )?;
+  let (offset, at) = required(members, path, "offset")?;
+  rational_time(offset, &at, target)?;
+  for key in ["rate", "scale"] {
+    let (value, at) = required(members, path, key)?;
+    number(value, &at)?;
   }
-  Ok(())
+  others(members, path, target, &[&["offset", "rate", "scale"]])
+}
+
+fn v2d(value: &Value, path: &str, target: OtioTarget) -> Result<(), Shape> {
+  let members = schema(value, path, &["V2d.1"], "the schema V2d.1")?;
+  for key in ["x", "y"] {
+    let (value, at) = required(members, path, key)?;
+    number(value, &at)?;
+  }
+  others(members, path, target, &[&["x", "y"]])
+}
+
+fn box2d(value: &Value, path: &str, target: OtioTarget) -> Result<(), Shape> {
+  let members = schema(value, path, &["Box2d.1"], "the schema Box2d.1")?;
+  for key in ["min", "max"] {
+    let (corner, at) = required(members, path, key)?;
+    v2d(corner, &at, target)?;
+  }
+  others(members, path, target, &[&["min", "max"]])
+}
+
+fn color(value: &Value, path: &str, target: OtioTarget) -> Result<(), Shape> {
+  let members = schema(value, path, &["Color.1"], "the schema Color.1")?;
+  let (name, at) = required(members, path, "name")?;
+  string(name, &at)?;
+  for key in ["r", "g", "b", "a"] {
+    let (value, at) = required(members, path, key)?;
+    number(value, &at)?;
+  }
+  others(members, path, target, &[&["name", "r", "g", "b", "a"]])
 }
 
 fn schema<'a>(
@@ -355,6 +590,14 @@ fn string(value: &Value, path: &str) -> Result<(), Shape> {
 
 fn string_value<'a>(value: &'a Value, path: &str) -> Result<&'a str, Shape> {
   value.as_str().ok_or_else(|| shape(path, "a string"))
+}
+
+/// A finite number: what a reader takes for a `double`.
+fn number(value: &Value, path: &str) -> Result<(), Shape> {
+  match value.as_f64() {
+    Some(number) if number.is_finite() => Ok(()),
+    _ => Err(shape(path, "a finite number")),
+  }
 }
 
 fn shape(path: &str, expected: &'static str) -> Shape {

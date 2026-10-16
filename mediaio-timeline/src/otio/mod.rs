@@ -576,6 +576,11 @@ impl fmt::Display for ChildAt {
 /// schema's `read_from`, per target — the types they read for the keys the
 /// export writes, and every transition between two items.
 ///
+/// Every dictionary is walked, metadata included: a reader decodes one
+/// carrying `OTIO_SCHEMA` as an object of that schema wherever it sits, so
+/// the check holds it to that schema's rules, and refuses by name a schema
+/// whose rules it does not know.
+///
 /// This is the structural self-check the export is held to — the shape, not
 /// the meaning: it does not recompute positions.
 pub fn validate_json(json: &str, target: OtioTarget) -> Result<(), Invalid> {

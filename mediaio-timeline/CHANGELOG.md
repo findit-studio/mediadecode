@@ -60,6 +60,13 @@ Its versions are its own: they do not move with `mediadecode`'s.
   whole as `Spot::Marker`.
 - `validate_json` holds every marker to `Marker.2`, with the
   `marked_range` every reader requires.
+- `validate_json` walks every dictionary, metadata included, as
+  OpenTimelineIO's readers decode them: one carrying `OTIO_SCHEMA` —
+  in metadata, under a key no reader reads, or nested in either — is held
+  to that schema's rules, and a schema whose rules the check does not know
+  is refused by name. Metadata itself must be a plain dictionary, every
+  effect one of the four effect schemas with its required keys, and, for
+  `V0_15Plus`, a media reference's image bounds a `Box2d.1`.
 
 ## [0.2.0] - 2026-10-15
 
