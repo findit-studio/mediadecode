@@ -39,6 +39,16 @@ The backend-agnostic core it adapts has its own log at
   libavcodec's defaults. On a temporally scalable HEVC stream
   `Discard::NonReference` also skips pictures a higher sub-layer
   references, which the bitstream's `DISPOSABLE` never marks.
+- **The standalone `VideoDecoder` takes them too**: each of its eight
+  constructors has a `_with_options` sibling, its arguments with
+  `options` appended — `open_with_options`, `open_timed_with_options`,
+  `open_with_frame_limits_with_options`,
+  `open_with_frame_limits_timed_with_options` on the probing road, and
+  `open_with_with_options`, `open_with_timed_with_options`,
+  `open_with_limits_with_options`, `open_with_limits_timed_with_options`
+  on a pinned backend — that writes them into every codec context the
+  decoder opens, a later probe advance's included; `options()` reads
+  them back. The constructors without keep libavcodec's defaults.
 
 ## [0.19.0] - 2026-10-16
 

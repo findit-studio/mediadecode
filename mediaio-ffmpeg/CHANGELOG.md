@@ -21,7 +21,8 @@ The family — `mediadecode`, `mediadecode-ffmpeg`, `mediadecode-webcodecs`,
   `ParseDiscardError` for any other name). The defaults are libavcodec's.
   `DecoderLimits` stays what a decoder may spend; these are decode
   behaviour, and `mediadecode-ffmpeg` writes them into every video
-  `AVCodecContext` a session opens.
+  `AVCodecContext` a decoder opened with them opens — its stream
+  decoder's and its standalone `VideoDecoder`'s.
 
 ## [0.19.0] - 2026-10-16
 

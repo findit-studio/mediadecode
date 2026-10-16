@@ -2218,6 +2218,179 @@ fn every_discard_value_reaches_the_codec_context() {
   }
 }
 
+/// **Every standalone constructor writes the options it names into the
+/// context it opens** — the probing road and the pinned one, untimed and
+/// timed, with the default limits and with named ones — and reports
+/// them; every constructor without `_with_options` leaves libavcodec's
+/// defaults.
+///
+/// On Apple targets, over VideoToolbox — the probe's one backend there,
+/// and one that opens a context with no hardware asked for: its device is
+/// created with nothing to create (`libavutil/hwcontext_videotoolbox.c`
+/// 829–838 in FFmpeg 9.0.1), and the decoder's session waits for the
+/// first picture.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn every_standalone_constructor_writes_its_options_into_the_context() {
+  use std::num::NonZeroI32;
+
+  ffmpeg_next::init().expect("ffmpeg init");
+
+  let parameters = || {
+    let mut parameters = ffmpeg_next::codec::Parameters::new();
+    // SAFETY: `parameters` owns a live, zeroed `AVCodecParameters`;
+    // both fields written are plain scalars.
+    unsafe {
+      let raw = parameters.as_mut_ptr();
+      (*raw).codec_type = ffmpeg_next::ffi::AVMediaType::AVMEDIA_TYPE_VIDEO;
+      (*raw).codec_id = ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_H264;
+    }
+    parameters
+  };
+  let read_back = |decoder: Result<VideoDecoder>| {
+    let decoder = decoder.expect("the decoder opens");
+    // SAFETY: `decoder.state.inner` owns a live, opened `AVCodecContext`
+    // for this borrow; the three are `AVDiscard` fields, read as the
+    // integers they are.
+    let raw = unsafe {
+      let ctx = decoder.state.inner.as_ptr();
+      (
+        ptr::addr_of!((*ctx).skip_frame).cast::<i32>().read(),
+        ptr::addr_of!((*ctx).skip_loop_filter).cast::<i32>().read(),
+        ptr::addr_of!((*ctx).skip_idct).cast::<i32>().read(),
+      )
+    };
+    (raw, decoder.options())
+  };
+
+  // A different value in each, so a setting written into another's field
+  // is seen.
+  let options = crate::DecoderOptions::new()
+    .with_skip_frame(crate::Discard::NonReference)
+    .with_skip_loop_filter(crate::Discard::All)
+    .with_skip_idct(crate::Discard::NonKey);
+  let named = ((8, 48, 32), options);
+  let defaults = ((0, 0, 0), crate::DecoderOptions::new());
+  let limits = crate::limits::DecoderLimits::default;
+  let timebase = mediadecode::Timebase::new(1, NonZeroI32::new(1_000).expect("non-zero"));
+  let pinned = Backend::VideoToolbox;
+
+  // The probing road.
+  assert_eq!(
+    read_back(VideoDecoder::open_with_options(parameters(), options)),
+    named
+  );
+  assert_eq!(
+    read_back(VideoDecoder::open_timed_with_options(
+      parameters(),
+      timebase,
+      options
+    )),
+    named
+  );
+  assert_eq!(
+    read_back(VideoDecoder::open_with_frame_limits_with_options(
+      parameters(),
+      limits(),
+      options
+    )),
+    named
+  );
+  assert_eq!(
+    read_back(VideoDecoder::open_with_frame_limits_timed_with_options(
+      parameters(),
+      limits(),
+      timebase,
+      options
+    )),
+    named
+  );
+  assert_eq!(read_back(VideoDecoder::open(parameters())), defaults);
+  assert_eq!(
+    read_back(VideoDecoder::open_timed(parameters(), timebase)),
+    defaults
+  );
+  assert_eq!(
+    read_back(VideoDecoder::open_with_frame_limits(parameters(), limits())),
+    defaults
+  );
+  assert_eq!(
+    read_back(VideoDecoder::open_with_frame_limits_timed(
+      parameters(),
+      limits(),
+      timebase
+    )),
+    defaults
+  );
+
+  // The pinned road.
+  assert_eq!(
+    read_back(VideoDecoder::open_with_with_options(
+      parameters(),
+      pinned,
+      options
+    )),
+    named
+  );
+  assert_eq!(
+    read_back(VideoDecoder::open_with_timed_with_options(
+      parameters(),
+      pinned,
+      timebase,
+      options
+    )),
+    named
+  );
+  assert_eq!(
+    read_back(VideoDecoder::open_with_limits_with_options(
+      parameters(),
+      pinned,
+      limits(),
+      options
+    )),
+    named
+  );
+  assert_eq!(
+    read_back(VideoDecoder::open_with_limits_timed_with_options(
+      parameters(),
+      pinned,
+      limits(),
+      timebase,
+      options
+    )),
+    named
+  );
+  assert_eq!(
+    read_back(VideoDecoder::open_with(parameters(), pinned)),
+    defaults
+  );
+  assert_eq!(
+    read_back(VideoDecoder::open_with_timed(
+      parameters(),
+      pinned,
+      timebase
+    )),
+    defaults
+  );
+  assert_eq!(
+    read_back(VideoDecoder::open_with_limits(
+      parameters(),
+      pinned,
+      limits()
+    )),
+    defaults
+  );
+  assert_eq!(
+    read_back(VideoDecoder::open_with_limits_timed(
+      parameters(),
+      pinned,
+      limits(),
+      timebase
+    )),
+    defaults
+  );
+}
+
 /// **A context this crate builds decodes on one thread.** Nothing here
 /// sets `thread_count` or `thread_type`, and FFmpeg's own default is one
 /// thread, so the allocator judge and the `get_format` callback run on

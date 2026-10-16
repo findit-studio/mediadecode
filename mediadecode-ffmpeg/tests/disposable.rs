@@ -236,3 +236,89 @@ fn ffmpegs_non_reference_skip_keeps_the_same_eight_pictures() {
   let references = decode(timebase, &parameters, &admitted, DecoderOptions::new());
   assert_eq!(skipping, references);
 }
+
+/// The pts of every picture the standalone decoder `decoder` delivers for
+/// `packets`, in order.
+#[cfg(target_vendor = "apple")]
+fn delivered(mut decoder: mediadecode_ffmpeg::VideoDecoder, packets: &[VideoPacket]) -> Vec<i64> {
+  use mediadecode_ffmpeg::{Frame, VideoDecoder};
+
+  let mut frame = Frame::empty().expect("a frame");
+  let mut pictures = Vec::new();
+  let mut take = |decoder: &mut VideoDecoder, frame: &mut Frame| {
+    while let Received::Produced = decoder.receive_frame(frame).expect("decode cleanly") {
+      pictures.push(frame.pts().expect("a picture's pts"));
+    }
+  };
+  for packet in packets {
+    loop {
+      match decoder.send_packet(packet).expect("decode cleanly") {
+        Sent::Accepted => break,
+        Sent::MustDrain => take(&mut decoder, &mut frame),
+      }
+    }
+    take(&mut decoder, &mut frame);
+  }
+  while let Sent::MustDrain = decoder.send_eof().expect("decode cleanly") {
+    take(&mut decoder, &mut frame);
+  }
+  take(&mut decoder, &mut frame);
+  pictures.sort_unstable();
+  pictures
+}
+
+/// The standalone decoder takes the options too: opened with
+/// `skip_frame` = `noref`, on the probing road and on the pinned one, it
+/// keeps exactly the pictures of the packets the bitstream leaves
+/// unmarked.
+///
+/// The standalone decoder is hardware-only, and FFmpeg asks VideoToolbox
+/// for a hardware H.264 decoder (`libavcodec/videotoolbox.c` 848–854 in
+/// 9.0.1), which on the machines this was written on fails every picture
+/// of the Sony clips. So the clip is `01_pandas_muted.mp4`, Main 4:2:0
+/// with non-reference B pictures, and the target an Apple one.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn the_standalone_decoder_skipping_non_references_keeps_the_admitted_pictures() {
+  use mediadecode_ffmpeg::{Backend, VideoDecoder};
+
+  let Some(path) = fixture("01_pandas_muted.mp4") else {
+    return;
+  };
+  let (timebase, parameters, packets) = video_packets(&path);
+  assert_eq!(packets.len(), 300);
+  let admitted: Vec<i64> = {
+    let mut pts: Vec<i64> = packets
+      .iter()
+      .filter(|packet| !disposable(packet))
+      .map(|packet| packet.pts().expect("a packet's pts").pts())
+      .collect();
+    pts.sort_unstable();
+    pts
+  };
+  assert_eq!(admitted.len(), 155, "145 of the 300 marked");
+
+  // libavcodec's defaults decode every picture: the clip is one the
+  // decoder decodes.
+  let whole = delivered(
+    VideoDecoder::open_timed(parameters.clone(), timebase).expect("open the decoder"),
+    &packets,
+  );
+  assert_eq!(whole.len(), 300);
+
+  let skipping = DecoderOptions::new().with_skip_frame(Discard::NonReference);
+  let probing = VideoDecoder::open_timed_with_options(parameters.clone(), timebase, skipping)
+    .expect("open the probing decoder");
+  assert_eq!(probing.options(), skipping);
+  assert_eq!(delivered(probing, &packets), admitted, "the probing road");
+  let pinned = VideoDecoder::open_with_limits_timed_with_options(
+    parameters,
+    Backend::VideoToolbox,
+    DecoderLimits::default(),
+    timebase,
+    skipping,
+  )
+  .expect("open the pinned decoder");
+  assert_eq!(pinned.options(), skipping);
+  assert_eq!(delivered(pinned, &packets), admitted, "the pinned road");
+}

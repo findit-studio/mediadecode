@@ -129,9 +129,10 @@ impl FromStr for Discard {
   }
 }
 
-/// How a decoder session decodes: libavcodec's three `AVDiscard` settings,
-/// written into every video `AVCodecContext` the session opens — its
-/// hardware probe's, its software decoder's, and a fallback's.
+/// How a decoder decodes: libavcodec's three `AVDiscard` settings. A
+/// decoder opened with them writes them into every video `AVCodecContext`
+/// it opens — each hardware candidate its probe builds, a software
+/// decoder, a fallback's.
 ///
 /// What a decoder may spend is [`DecoderLimits`](crate::limits::DecoderLimits)'s;
 /// this is what it does. The defaults are libavcodec's: [`Discard::Default`]
