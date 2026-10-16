@@ -33,6 +33,15 @@ The family — `mediadecode`, `mediadecode-ffmpeg`, `mediadecode-webcodecs`,
   it: a write the sink failed, which the I/O context keeps and writes
   nothing after, is read there after the last flush and reported
   (`OutputError::SinkWrite`), whatever the sink's own flush answers.
+- A seek the sink fails is kept by the writer guard
+  (`writer_guard::SeekRecord`, the third handle `GuardedWriter::new`
+  answers), which libavformat does not do: a muxer going back to patch
+  its header may ignore the answer and write on. The guard writes and
+  seeks nothing after it, and every `Output` call that reached
+  libavformat — the header, a packet, the trailer, `into_sink` — names
+  it once libavformat returns, whatever libavformat answered
+  (`OutputError::SinkSeek`), after a panic and before libavformat's own
+  error.
 - `CodecId::mime_type` — the descriptor's first MIME type — and the
   `PNG`, `BMP`, `TTF`, `OTF` and `TEXT` ids.
 

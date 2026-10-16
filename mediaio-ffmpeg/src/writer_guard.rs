@@ -29,16 +29,83 @@
 //! without touching the sink again, so nothing more is written into a
 //! file whose writer has already failed in a way it could not report.
 //!
+//! **So is a sink that failed a seek** ([`SeekRecord`]). libavformat keeps
+//! no record of a failed seek, and a muxer patching what it wrote earlier
+//! may write on regardless, into the wrong place; the guard records the
+//! failure, refuses every later write and seek, and the context names it.
+//!
 //! The guard cannot help under `panic = "abort"`, where no unwind exists
 //! to catch; that is a whole-binary choice the caller makes.
 
 use std::{
   io::{self, Seek, SeekFrom, Write},
   panic::{AssertUnwindSafe, catch_unwind},
-  sync::Arc,
+  sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+  },
 };
 
 use crate::reader_guard::{InertError, PanicLatch};
+
+/// Where a sink's failed seek is kept until the muxing context can name
+/// it.
+///
+/// **A failed seek leaves nothing behind in libavformat.** `avio_seek`
+/// answers the sink's error but keeps none — it sets no
+/// `AVIOContext.error` (`aviobuf.c` 236–319 in FFmpeg 9.0.1) — and a
+/// muxer patching a header it wrote earlier may ignore the answer and
+/// write on, into the wrong place. So the guard keeps the first failed
+/// positioning seek here and, from then on, refuses every write and every
+/// seek, so nothing more lands where it does not belong; the context
+/// reports it once libavformat returns.
+///
+/// A positioning seek is an absolute one, `SeekFrom::Start`: the only kind
+/// `avio_seek` asks for, the offset made absolute first (`aviobuf.c`
+/// 303–317 in FFmpeg 9.0.1). The size probe — ffmpeg-next's answer to
+/// `AVSEEK_SIZE`, and `avio_size`'s own fallback (326–347) — asks
+/// `SeekFrom::Current` and `SeekFrom::End`, which libavformat survives
+/// failing: those are not kept. Each moves the sink back with a
+/// `SeekFrom::Start` only once its `SeekFrom::End` succeeded, so a failure
+/// there leaves the sink where the probe moved it — misplaced, and kept
+/// like any other.
+#[derive(Debug, Default)]
+pub struct SeekRecord {
+  failed: AtomicBool,
+  error: Mutex<Option<InertError>>,
+}
+
+impl SeekRecord {
+  /// Keeps `error`; the first failure wins, as the panic latch's does.
+  fn record(&self, error: InertError) {
+    // A poisoned lock holds a plain `Option`, sound to use; refusing to
+    // record would lose the very failure this type carries.
+    let mut slot = self.error.lock().unwrap_or_else(|e| e.into_inner());
+    if slot.is_none() {
+      *slot = Some(error);
+    }
+    drop(slot);
+    self.failed.store(true, Ordering::Release);
+  }
+
+  /// Whether a seek has failed: an `Acquire` load, pairing with the
+  /// `Release` store in [`Self::record`].
+  pub(crate) fn is_set(&self) -> bool {
+    self.failed.load(Ordering::Acquire)
+  }
+
+  /// The failed seek's error, rebuilt owning nothing, or `None`.
+  pub(crate) fn failure(&self) -> Option<io::Error> {
+    if !self.is_set() {
+      return None;
+    }
+    self
+      .error
+      .lock()
+      .unwrap_or_else(|e| e.into_inner())
+      .map(InertError::rebuild)
+  }
+}
 
 /// A caller's byte sink, wrapped so that a panic inside it becomes an
 /// I/O error instead of an abort, and stays one.
@@ -51,19 +118,24 @@ use crate::reader_guard::{InertError, PanicLatch};
 pub struct GuardedWriter<W> {
   inner: W,
   latch: Arc<PanicLatch>,
+  seeks: Arc<SeekRecord>,
 }
 
 impl<W> GuardedWriter<W> {
-  /// Wraps `inner`, returning the guard and a handle on the latch the
-  /// muxer keeps to name a panic after the fact.
-  pub fn new(inner: W) -> (Self, Arc<PanicLatch>) {
+  /// Wraps `inner`, returning the guard and handles on the latch and the
+  /// seek record the muxer keeps to name a panic, or a failed seek, after
+  /// the fact.
+  pub fn new(inner: W) -> (Self, Arc<PanicLatch>, Arc<SeekRecord>) {
     let latch = Arc::new(PanicLatch::default());
+    let seeks = Arc::new(SeekRecord::default());
     (
       Self {
         inner,
         latch: Arc::clone(&latch),
+        seeks: Arc::clone(&seeks),
       },
       latch,
+      seeks,
     )
   }
 
@@ -80,7 +152,7 @@ impl<W> GuardedWriter<W> {
   /// at all, once a panic is latched — an error it returns reduced there
   /// ([`InertError`]).
   fn guard<T>(&mut self, call: impl FnOnce(&mut W) -> io::Result<T>) -> io::Result<T> {
-    let Self { inner, latch } = self;
+    let Self { inner, latch, .. } = self;
     if latch.is_latched() {
       return Err(io::Error::other(
         "the caller's writer panicked earlier, and is not called again",
@@ -110,11 +182,27 @@ impl<W> GuardedWriter<W> {
   }
 }
 
+impl<W> GuardedWriter<W> {
+  /// Refuses a write or a seek once a seek has failed ([`SeekRecord`]).
+  fn positioned(&self) -> io::Result<()> {
+    if self.seeks.is_set() {
+      Err(io::Error::other(
+        "the caller's writer failed a seek earlier, and nothing more is written",
+      ))
+    } else {
+      Ok(())
+    }
+  }
+}
+
 impl<W: Write> Write for GuardedWriter<W> {
   fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+    self.positioned()?;
     self.guard(|inner| inner.write(buf))
   }
 
+  /// A flush writes nothing libavformat placed, so it runs after a failed
+  /// seek too: the sink's own buffers are the caller's.
   fn flush(&mut self) -> io::Result<()> {
     self.guard(|inner| inner.flush())
   }
@@ -122,7 +210,15 @@ impl<W: Write> Write for GuardedWriter<W> {
 
 impl<W: Seek> Seek for GuardedWriter<W> {
   fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-    self.guard(|inner| inner.seek(pos))
+    self.positioned()?;
+    let sought = self.guard(|inner| inner.seek(pos));
+    // A positioning seek that failed is kept; a panic is the latch's.
+    if let (Err(error), SeekFrom::Start(_)) = (&sought, pos)
+      && !self.latch.is_latched()
+    {
+      self.seeks.record(InertError::of(error));
+    }
+    sought
   }
 }
 
@@ -171,7 +267,7 @@ mod tests {
   /// way it could not report is not written into further.
   #[test]
   fn a_panicking_write_latches_and_the_sink_is_not_called_again() {
-    let (mut guarded, latch) = GuardedWriter::new(Panicking::default());
+    let (mut guarded, latch, _) = GuardedWriter::new(Panicking::default());
     assert!(latch.message().is_none(), "nothing has panicked yet");
 
     let err = quietly(|| guarded.write(b"bytes")).expect_err("a panic is an error, not an abort");
@@ -192,12 +288,12 @@ mod tests {
   /// and `stream_position`, the default over `seek`, is guarded with it.
   #[test]
   fn a_panicking_seek_or_flush_latches_its_message() {
-    let (mut guarded, latch) = GuardedWriter::new(Panicking::default());
+    let (mut guarded, latch, _) = GuardedWriter::new(Panicking::default());
     assert!(quietly(|| guarded.seek(SeekFrom::Start(4))).is_err());
     assert_eq!(latch.message().as_deref(), Some("seek exploded"));
     assert!(quietly(|| guarded.stream_position()).is_err());
 
-    let (mut guarded, latch) = GuardedWriter::new(Panicking::default());
+    let (mut guarded, latch, _) = GuardedWriter::new(Panicking::default());
     assert!(quietly(|| guarded.flush()).is_err());
     assert_eq!(latch.message().as_deref(), Some("flush exploded"));
   }
@@ -226,7 +322,7 @@ mod tests {
   /// completing at all is the assertion, as the reader guard's is.
   #[test]
   fn a_payload_that_panics_on_drop_does_not_get_dropped() {
-    let (mut guarded, latch) = GuardedWriter::new(PanicsWithAPayload);
+    let (mut guarded, latch, _) = GuardedWriter::new(PanicsWithAPayload);
     assert!(quietly(|| guarded.write(b"bytes")).is_err());
     assert!(latch.message().is_some());
   }
@@ -288,7 +384,7 @@ mod tests {
   /// the guard's own error.
   #[test]
   fn an_error_whose_payload_panics_on_drop_is_latched_and_named() {
-    let (mut guarded, latch) = GuardedWriter::new(ReturnsAHostileError::default());
+    let (mut guarded, latch, _) = GuardedWriter::new(ReturnsAHostileError::default());
     let err = quietly(|| guarded.write(b"bytes")).expect_err("the write failed");
     let said = err.to_string();
     // Forgotten, not dropped: were the guard to hand the payload out,
@@ -333,7 +429,7 @@ mod tests {
         ))
       }
     }
-    let (mut guarded, latch) = GuardedWriter::new(Failing::default());
+    let (mut guarded, latch, _) = GuardedWriter::new(Failing::default());
     let os = guarded.write(b"bytes").expect_err("the write failed");
     assert_eq!(os.raw_os_error(), Some(28));
     assert!(os.get_ref().is_none(), "no payload leaves the guard");
@@ -345,9 +441,99 @@ mod tests {
     assert_eq!(guarded.into_inner().calls, 3, "the sink is called again");
   }
 
+  /// A buffer that refuses to seek back before where it stands, as a
+  /// pipe or an append-only store does, and counts the calls that reach
+  /// it.
+  #[derive(Default)]
+  struct ForwardOnly {
+    bytes: io::Cursor<Vec<u8>>,
+    calls: u32,
+  }
+
+  impl Write for ForwardOnly {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+      self.calls += 1;
+      self.bytes.write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+      self.calls += 1;
+      Ok(())
+    }
+  }
+
+  impl Seek for ForwardOnly {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+      self.calls += 1;
+      let here = self.bytes.position();
+      let end = self.bytes.get_ref().len() as u64;
+      let target = match pos {
+        SeekFrom::Start(at) => Some(at),
+        SeekFrom::Current(by) => here.checked_add_signed(by),
+        SeekFrom::End(by) => end.checked_add_signed(by),
+      };
+      match target {
+        Some(target) if target >= here => self.bytes.seek(SeekFrom::Start(target)),
+        _ => Err(io::Error::from_raw_os_error(libc::ESPIPE)),
+      }
+    }
+  }
+
+  /// **A positioning seek that fails is kept, and nothing more is
+  /// written or sought.** The seek back fails with the sink's own error,
+  /// which the record keeps — its code, owning nothing — and every later
+  /// write and seek is refused without reaching the sink, so nothing lands
+  /// where it does not belong. A flush still runs: it writes nothing
+  /// libavformat placed. Nothing is latched: a failed seek is no panic.
+  #[test]
+  fn a_failed_positioning_seek_is_kept_and_nothing_more_is_written() {
+    let (mut guarded, latch, seeks) = GuardedWriter::new(ForwardOnly::default());
+    guarded.write_all(b"header").expect("write");
+    assert!(seeks.failure().is_none(), "nothing has failed yet");
+    let refused = guarded.seek(SeekFrom::Start(0)).expect_err("a seek back");
+    assert_eq!(refused.raw_os_error(), Some(libc::ESPIPE));
+    let kept = seeks.failure().expect("the failed seek is kept");
+    assert_eq!(kept.raw_os_error(), Some(libc::ESPIPE));
+    assert!(kept.get_ref().is_none(), "kept owning nothing");
+    assert!(guarded.write(b"patch").is_err(), "no write after it");
+    assert!(guarded.seek(SeekFrom::Start(6)).is_err(), "no seek either");
+    guarded.flush().expect("a flush still runs");
+    assert!(latch.message().is_none(), "a failed seek is not a panic");
+    let sink = guarded.into_inner();
+    assert_eq!(sink.bytes.into_inner(), b"header", "only what came before");
+    // The write, the failed seek and the flush: nothing else reached it.
+    assert_eq!(sink.calls, 3);
+  }
+
+  /// **A size probe that fails is not kept.** ffmpeg-next answers
+  /// libavformat's `AVSEEK_SIZE` with a `SeekFrom::Current` and a
+  /// `SeekFrom::End`, which libavformat survives failing; the sink stays
+  /// writable. The probe of a sink that can measure itself goes there and
+  /// back, as the default `stream_position` does, and keeps nothing.
+  #[test]
+  fn a_size_probe_that_fails_is_not_kept() {
+    let (mut guarded, _, seeks) = GuardedWriter::new(ForwardOnly::default());
+    guarded.write_all(b"abcd").expect("write");
+    assert!(guarded.seek(SeekFrom::Current(-1)).is_err());
+    assert!(guarded.seek(SeekFrom::End(-2)).is_err());
+    assert!(seeks.failure().is_none(), "a probe's failure is not kept");
+    assert_eq!(guarded.stream_position().expect("where it stands"), 4);
+    guarded.write_all(b"e").expect("still writable");
+    assert_eq!(guarded.into_inner().bytes.into_inner(), b"abcde");
+  }
+
+  /// **A seek that panics is the latch's, not the record's**: the panic
+  /// is named as one, and the sink is not called again either way.
+  #[test]
+  fn a_seek_that_panics_is_latched_not_kept() {
+    let (mut guarded, latch, seeks) = GuardedWriter::new(Panicking::default());
+    assert!(quietly(|| guarded.seek(SeekFrom::Start(0))).is_err());
+    assert_eq!(latch.message().as_deref(), Some("seek exploded"));
+    assert!(seeks.failure().is_none(), "a panic is not a failed seek");
+  }
+
   #[test]
   fn an_unremarkable_writer_passes_straight_through() {
-    let (mut guarded, latch) = GuardedWriter::new(io::Cursor::new(Vec::new()));
+    let (mut guarded, latch, _) = GuardedWriter::new(io::Cursor::new(Vec::new()));
     guarded.write_all(b"abcd").expect("write");
     assert_eq!(guarded.seek(SeekFrom::Start(1)).expect("seek"), 1);
     guarded.write_all(b"X").expect("write");

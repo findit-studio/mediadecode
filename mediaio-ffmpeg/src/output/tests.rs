@@ -597,3 +597,97 @@ fn a_failed_write_is_reported_when_the_sink_is_handed_back() {
     other => panic!("expected the failed write reported, got {other:?}"),
   }
 }
+
+/// A buffer that refuses to seek back before where it stands, as a pipe
+/// or an append-only store does; it writes and seeks forward as a buffer
+/// does.
+#[derive(Debug, Default)]
+struct ForwardOnly {
+  bytes: Cursor<Vec<u8>>,
+}
+
+impl Write for ForwardOnly {
+  fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+    self.bytes.write(buf)
+  }
+  fn flush(&mut self) -> io::Result<()> {
+    Ok(())
+  }
+}
+
+impl Seek for ForwardOnly {
+  fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+    let here = self.bytes.position();
+    let end = self.bytes.get_ref().len() as u64;
+    let target = match pos {
+      SeekFrom::Start(at) => Some(at),
+      SeekFrom::Current(by) => here.checked_add_signed(by),
+      SeekFrom::End(by) => end.checked_add_signed(by),
+    };
+    match target {
+      Some(target) if target >= here => self.bytes.seek(SeekFrom::Start(target)),
+      _ => Err(io::Error::from_raw_os_error(libc::ESPIPE)),
+    }
+  }
+}
+
+/// **A seek the sink refuses is named, and the container never ends in
+/// `Ok`.** Forty cues of a kilobyte each — more than the 32 KiB the I/O
+/// context buffers — go into MP4 and into Matroska, each of which goes
+/// back at its trailer to patch what it wrote first (MP4 its `mdat` size,
+/// without checking the seek: `movenc.c` 8997–8999 in FFmpeg 9.0.1;
+/// Matroska its segment's size, 3398–3399), through a sink that refuses
+/// every seek back. The guard keeps the failure and writes nothing after
+/// it; the trailer and `into_sink` both name it.
+///
+/// PLANT: without the record, MP4's trailer answers `Ok` — its muxer
+/// writes on past the failed seek — and Matroska's names libavformat's
+/// error instead.
+#[test]
+fn a_seek_the_sink_refuses_is_named_and_never_ends_in_ok() {
+  ffmpeg_next::init().expect("ffmpeg init");
+  for (container, codec) in [("mp4", CodecId::MOV_TEXT), ("matroska", CodecId::SUBRIP)] {
+    let ticket = ticket(ffmpeg_next::ffi::AVMediaType::AVMEDIA_TYPE_SUBTITLE, codec);
+    let mut output = Output::open(ForwardOnly::default(), container).expect("open");
+    let stream = output
+      .add_stream(&StreamSpec::new(&ticket, millis()))
+      .expect("a stream");
+    output.write_header().expect("the header");
+    assert_eq!(output.stream_time_base(stream).expect("a ruler"), millis());
+    // A 16-bit length, then the text: how mov_text frames a cue, and
+    // bytes SubRip carries as they are.
+    let mut text = 1000u16.to_be_bytes().to_vec();
+    text.extend([b'x'; 1000]);
+    for index in 0..40 {
+      let pts = index * 1000;
+      let cue = SubtitlePacket::new(
+        FfmpegBytes::copy_from_slice(&text),
+        SubtitlePacketExtra::new(0),
+      )
+      .with_pts(Some(ms(pts)))
+      .with_duration(Some(ms(500)));
+      output
+        .write_packet::<crate::Owned>(
+          stream,
+          OutputPacket::Subtitle(&cue),
+          times(pts),
+          PacketLimits::default(),
+        )
+        .unwrap_or_else(|error| panic!("{container}: cue {index}: {error}"));
+    }
+    let trailer = output.write_trailer();
+    assert!(
+      matches!(trailer, Err(OutputError::SinkSeek(_))),
+      "{container}: the trailer names the failed seek: {trailer:?}",
+    );
+    match output.into_sink() {
+      Err(OutputError::SinkSeek(error)) => {
+        assert_eq!(error.raw_os_error(), Some(libc::ESPIPE), "{container}");
+      }
+      other => panic!(
+        "{container}: expected the failed seek named, got {:?}",
+        other.map(|sink| sink.bytes.into_inner().len())
+      ),
+    }
+  }
+}

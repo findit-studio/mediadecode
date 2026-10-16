@@ -147,6 +147,16 @@ impl InertError {
     inert
   }
 
+  /// What `error` says, read from it in place: for an error that owns no
+  /// payload of the caller's — one this guard rebuilt — where reading
+  /// runs no caller's code.
+  pub(crate) fn of(error: &io::Error) -> Self {
+    match error.raw_os_error() {
+      Some(code) => Self::Os(code),
+      None => Self::Kind(error.kind()),
+    }
+  }
+
   /// An error that says the same and owns nothing: the OS code, or the
   /// bare kind.
   pub(crate) fn rebuild(self) -> io::Error {

@@ -36,6 +36,15 @@
 //! nothing after it; [`Output::into_sink`] reads it there and reports it
 //! ([`OutputError::SinkWrite`]), so a sink missing bytes is never handed
 //! back as a whole one.
+//!
+//! A seek the sink fails is kept by the guard, which libavformat does not
+//! do ([`SeekRecord`](crate::writer_guard::SeekRecord)): a muxer going
+//! back to patch a header may ignore the answer and write on, into the
+//! wrong place. The guard writes nothing after it, and every call that
+//! reached libavformat names it once libavformat returns, whatever
+//! libavformat answered ([`OutputError::SinkSeek`]) — so a container
+//! whose patches went missing never ends in `Ok`. A panic is named first,
+//! then a failed seek, then libavformat's own error.
 
 use core::{
   ffi::{c_int, c_uint, c_void},
@@ -85,7 +94,7 @@ use crate::{
   limits::PacketLimits,
   reader_guard::PanicLatch,
   ticket::CodecTicket,
-  writer_guard::GuardedWriter,
+  writer_guard::{GuardedWriter, SeekRecord},
 };
 
 /// `AVMEDIA_TYPE_VIDEO`, as the integer `AVCodecParameters.codec_type`
@@ -214,6 +223,15 @@ pub enum OutputError {
   /// The caller's sink failed its final flush.
   #[error("the sink failed its final flush: {0}")]
   Sink(#[source] io::Error),
+  /// A seek into the caller's sink failed, so what libavformat placed
+  /// after it — a header it went back to patch, an index at the end — is
+  /// not where it belongs. libavformat keeps no record of a failed seek,
+  /// and a muxer may ignore the answer and write on; the writer guard
+  /// keeps the first failure and writes nothing after it, and every call
+  /// that reached libavformat names it
+  /// ([`SeekRecord`](crate::writer_guard::SeekRecord)).
+  #[error("a seek into the sink failed, so what libavformat placed after it is missing: {0}")]
+  SinkSeek(#[source] io::Error),
   /// A write into the caller's sink failed, so bytes meant for it are
   /// not in it — whatever its own flush says. The I/O context keeps the
   /// first failed write's error (`AVIOContext.error`) and writes nothing
@@ -399,6 +417,8 @@ pub struct Output<W> {
   io: ManuallyDrop<StreamIo>,
   /// The writer guard's latch, to name a sink's panic.
   latch: Arc<PanicLatch>,
+  /// The writer guard's record of a failed seek, to name it.
+  seeks: Arc<SeekRecord>,
   phase: OutputPhase,
   /// The sink's type, held by `io` type-erased.
   _sink: PhantomData<fn(W) -> W>,
@@ -496,12 +516,33 @@ impl<W> Output<W> {
   }
 
   /// libavformat's `code`, named — the sink's panic first, if it raised
-  /// one: libavformat reports a panicked sink as the I/O error the guard
-  /// answered, folded into whatever it was doing.
+  /// one, then a seek it failed: libavformat reports either as the I/O
+  /// error the guard answered, folded into whatever it was doing, or not
+  /// at all.
   fn fault(&self, code: c_int) -> OutputError {
-    match self.latch.message() {
-      Some(message) => OutputError::SinkPanic { message },
-      None => OutputError::Ffmpeg(ffmpeg_next::Error::from(code)),
+    self
+      .sink_fault()
+      .unwrap_or_else(|| OutputError::Ffmpeg(ffmpeg_next::Error::from(code)))
+  }
+
+  /// What the sink did that libavformat cannot be trusted to report: a
+  /// panic, else a failed seek.
+  fn sink_fault(&self) -> Option<OutputError> {
+    if let Some(message) = self.latch.message() {
+      return Some(OutputError::SinkPanic { message });
+    }
+    self.seeks.failure().map(OutputError::SinkSeek)
+  }
+
+  /// libavformat's answer `status` to a call that reached the sink, named:
+  /// the sink's own fault first, whatever libavformat answered — a muxer
+  /// may carry on past a seek it failed and answer success — then
+  /// libavformat's error.
+  fn settled(&self, status: c_int) -> Result<(), OutputError> {
+    match self.sink_fault() {
+      Some(fault) => Err(fault),
+      None if status < 0 => Err(OutputError::Ffmpeg(ffmpeg_next::Error::from(status))),
+      None => Ok(()),
     }
   }
 
@@ -546,7 +587,7 @@ impl<W: Write + Seek + Send + 'static> Output<W> {
       });
     }
 
-    let (guarded, latch) = GuardedWriter::new(sink);
+    let (guarded, latch, seeks) = GuardedWriter::new(sink);
     let mut io = StreamIo::from_write_seek(guarded)?;
     let mut ctx: *mut AVFormatContext = ptr::null_mut();
     // SAFETY: `ctx` is a valid out-pointer; `oformat` is the static muxer
@@ -572,6 +613,7 @@ impl<W: Write + Seek + Send + 'static> Output<W> {
       ctx,
       io: ManuallyDrop::new(io),
       latch,
+      seeks,
       phase: OutputPhase::Building,
       _sink: PhantomData,
     })
@@ -779,15 +821,16 @@ impl<W: Write + Seek + Send + 'static> Output<W> {
   /// Writes the header: the end of building, the start of writing.
   ///
   /// A failure leaves the context [`OutputPhase::Failed`]: libavformat
-  /// takes no packet and no trailer after a header it did not write.
+  /// takes no packet and no trailer after a header it did not write — nor
+  /// after one whose sink failed a seek, which nothing more reaches.
   pub fn write_header(&mut self) -> Result<(), OutputError> {
     self.require(OutputCall::WriteHeader, OutputPhase::Building)?;
     // SAFETY: `ctx` is live, its `oformat` and `pb` set and its streams
     // complete; the muxer's options are its defaults (null dictionary).
     let status = unsafe { avformat_write_header(self.ctx.as_ptr(), ptr::null_mut()) };
-    if status < 0 {
+    if let Err(error) = self.settled(status) {
       self.phase = OutputPhase::Failed;
-      return Err(self.fault(status));
+      return Err(error);
     }
     self.phase = OutputPhase::Writing;
     Ok(())
@@ -834,10 +877,7 @@ impl<W: Write + Seek + Send + 'static> Output<W> {
     // blank, which then drops here.
     let status = unsafe { av_interleaved_write_frame(self.ctx.as_ptr(), av_packet.as_mut_ptr()) };
     drop(av_packet);
-    if status < 0 {
-      return Err(self.fault(status));
-    }
-    Ok(())
+    self.settled(status)
   }
 
   /// Writes the trailer: the packets still queued for interleaving, then
@@ -851,10 +891,7 @@ impl<W: Write + Seek + Send + 'static> Output<W> {
     // trailer call the phase allows.
     let status = unsafe { av_write_trailer(self.ctx.as_ptr()) };
     self.phase = OutputPhase::Finished;
-    if status < 0 {
-      return Err(self.fault(status));
-    }
-    Ok(())
+    self.settled(status)
   }
 
   /// Frees the context and hands the sink back, flushed — and only when
@@ -869,12 +906,21 @@ impl<W: Write + Seek + Send + 'static> Output<W> {
   /// ([`OutputError::Sink`]). A panic the sink raised, at any point, is
   /// reported before either ([`OutputError::SinkPanic`]): a sink that
   /// panicked is not called again; whatever state it is in, the error
-  /// says so.
+  /// says so. A seek it failed, at any point, comes next
+  /// ([`OutputError::SinkSeek`]): what libavformat placed after it is
+  /// missing, however the rest went.
   pub fn into_sink(self) -> Result<W, OutputError> {
     let this = ManuallyDrop::new(self);
     // SAFETY: `this` is never dropped, so each field is moved out exactly
     // once here, and none is used through `this` again.
-    let (ctx, io, latch) = unsafe { (this.ctx, ptr::read(&this.io), ptr::read(&this.latch)) };
+    let (ctx, io, latch, seeks) = unsafe {
+      (
+        this.ctx,
+        ptr::read(&this.io),
+        ptr::read(&this.latch),
+        ptr::read(&this.seeks),
+      )
+    };
     // SAFETY: the context is this value's, freed exactly once — before
     // the I/O context its `pb` points at, which `AVFMT_FLAG_CUSTOM_IO`
     // keeps libavformat from touching.
@@ -901,6 +947,9 @@ impl<W: Write + Seek + Send + 'static> Output<W> {
     let flushed = guarded.flush();
     if let Some(message) = latch.message() {
       return Err(OutputError::SinkPanic { message });
+    }
+    if let Some(error) = seeks.failure() {
+      return Err(OutputError::SinkSeek(error));
     }
     if written < 0 {
       return Err(OutputError::SinkWrite(ffmpeg_next::Error::from(written)));
