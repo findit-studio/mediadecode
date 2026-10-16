@@ -8,9 +8,12 @@
 //! model, or models elsewhere, is refused with its name and where it sits
 //! ([`Unreadable::Schema`]); a key, a value or a note of a modelled schema
 //! the timeline has no word for is refused by name too
-//! ([`Unreadable::Feature`]). Nothing is dropped: a key is read only where
-//! it carries nothing — `null`, an empty list, `true` for `enabled` — or
-//! what the timeline keeps.
+//! ([`Unreadable::Feature`]). Nothing is dropped: a member is read only
+//! where the timeline keeps it, or where OpenTimelineIO 0.17.0 holds it as
+//! it holds the member's absence — and the export writes it back so (the
+//! backstop, below). A member OpenTimelineIO keeps and the timeline does not
+//! — a `color` on an item, an `enabled` on a transition, which it keeps as
+//! dynamic fields — is refused by name, `null` and `true` among them.
 //!
 //! A member OpenTimelineIO's schema lets a document leave out reads as
 //! OpenTimelineIO 0.17.0 reads it — its reader builds each object with its
@@ -53,19 +56,25 @@
 //! ([`Feature::StandaloneGap`]).
 //!
 //! Last comes the backstop ([`reproduced`]): the export writes the timeline
-//! read, and every `RationalTime` it writes must be the one the document
-//! states at the same path, strictly — the same value and the same rate —
-//! or the read is refused as inexact there. The checks before it refuse by
-//! name what they know; the backstop closes the class of what is read but
-//! would be written otherwise — a medium's range counted in a ruler the
-//! export would not choose, among them — so the reader accepts exactly the
-//! documents whose times the export reproduces.
+//! read, and every value it writes must be the one the document states at
+//! the same path, as OpenTimelineIO 0.17.0 holds it — a string byte for
+//! byte, a boolean exactly, a `RationalTime`'s numbers as doubles, a
+//! dictionary's as the integers or doubles their text spells — or the read
+//! is refused as inexact there, naming both values. A member the export
+//! writes may be missing from the document only where OpenTimelineIO reads
+//! its absence as that value ([`WRITTEN_DEFAULTS`]), and one the document
+//! states may go unwritten only where OpenTimelineIO holds it as its
+//! absence ([`STATED_DEFAULTS`]). The checks before it refuse by name what
+//! they know; the backstop closes the class of what is read but would be
+//! written otherwise — a medium's range in a ruler the export would not
+//! choose, a marker's color in another case — so the reader accepts exactly
+//! the documents the export reproduces.
 
 use core::str::FromStr;
 use std::{boxed::Box, vec, vec::Vec};
 
 use mediatime::{Duration, Rate, Rounding, TimeRange, Timebase, Timestamp};
-use smol_bytes::{Utf8Bytes, format_utf8bytes};
+use smol_bytes::{Utf8Bytes, Utf8BytesMut, format_utf8bytes};
 
 use super::{
   ChildAt, Feature, Inexact, NotRepresentable, OtioTarget, Shape, Spot, UnmodelledFeature,
@@ -116,10 +125,7 @@ fn feature(at: &At, feature: Feature) -> Unreadable {
 }
 
 fn inexact(at: &At, reason: &'static str) -> Unreadable {
-  Unreadable::Inexact(Inexact {
-    path: at.0.clone(),
-    reason,
-  })
+  Unreadable::Inexact(Inexact::new(at.0.clone(), reason))
 }
 
 fn array<'a>(value: &'a Value, at: &At) -> Result<&'a [Value], Unreadable> {
@@ -238,9 +244,12 @@ impl<'a> Object<'a> {
 
   /// An item's `color`, a newer reader's word the timeline has none for:
   /// absent or `null`.
+  /// No `color` on an item: OpenTimelineIO 0.17.0's items have none, and
+  /// keep one stated — `null` among them — as a dynamic field they write
+  /// back (`serializableObject.cpp` 78–107), which the timeline would drop.
   fn no_color(&self) -> Result<(), Unreadable> {
     match self.get("color") {
-      None | Some(Value::Null) => Ok(()),
+      None => Ok(()),
       Some(_) => Err(feature(&self.at.key("color"), Feature::ItemColor)),
     }
   }
@@ -979,6 +988,9 @@ fn transition(
   edit: Ruler,
   ticks: Timebase,
 ) -> Result<(Child, derive::Child), Unreadable> {
+  // No `enabled`: OpenTimelineIO 0.17.0's transitions have none, and keep
+  // one stated as a dynamic field they write back (`transition.cpp` 31–36;
+  // `serializableObject.cpp` 78–107), which the timeline would drop.
   object.keys(&[
     "OTIO_SCHEMA",
     "metadata",
@@ -986,10 +998,8 @@ fn transition(
     "in_offset",
     "out_offset",
     "transition_type",
-    "enabled",
   ])?;
   object.no_name(&[])?;
-  object.never_disabled()?;
   match object.string("transition_type")? {
     Some("SMPTE_Dissolve") => {}
     Some(other) => {
@@ -1297,135 +1307,336 @@ fn markers(object: &Object<'_>, placed: Placed) -> Result<Vec<Marker>, Unreadabl
     .collect()
 }
 
-/// The reader's backstop: every time the document states is one the
-/// export writes, where and as the export writes it for the timeline read
-/// from it.
+/// The reader's backstop: every value the document states is one the
+/// export writes back, where and as the export writes it for the timeline
+/// read from it.
 ///
-/// The export writes `timeline` again, and each `RationalTime` it writes —
-/// the global start, each gap's and clip's range, each transition's
-/// offsets, each medium's available range, each marker's range — is
-/// compared with the one `root` states at the same path, strictly, as
-/// OpenTimelineIO's `strictly_equal` compares (`rationalTime.h` 101–104 in
-/// 0.17.0): its value and its rate, each the same `f64`. A clip's medium is
-/// compared where the document's own clip schema keeps it. The first time
-/// that differs, that the document does not state, or that it states and
-/// the export does not write, is refused as inexact; a timeline the export
-/// cannot write, at the document's root.
+/// The export writes `timeline` again, for the target the document's clips
+/// are written for — `Legacy` where they are `Clip.1`, else `V0_15Plus` —
+/// and its tree is walked beside the document's, path by path, an object's
+/// keys in any order. Every scalar the export writes must be the one the
+/// document states at the same path, as OpenTimelineIO 0.17.0's reader holds
+/// it ([`same_scalar`]). A member the export writes and the document leaves
+/// out is admitted only where OpenTimelineIO reads its absence as that very
+/// value ([`WRITTEN_DEFAULTS`]); a member the document states and the export
+/// does not write, only where OpenTimelineIO holds it as it holds its absence
+/// ([`STATED_DEFAULTS`]). The first value that differs is refused as inexact
+/// there, naming both; a timeline the export cannot write, at the document's
+/// root.
 ///
-/// The checks before it refuse by name what they know. This closes the
-/// class none of them names — a time read, and counted again, in a form
-/// the export does not write it in, such as a medium's range in a ruler of
-/// the document's choosing — so that the reader accepts exactly the
-/// documents whose times the export reproduces.
+/// The checks before it refuse by name what they know. This closes the class
+/// none of them names — a value read, then written back otherwise: a time in
+/// another ruler, a string in another case — so the reader accepts exactly
+/// the documents the export reproduces, value for value, as OpenTimelineIO
+/// reads them.
 pub(crate) fn reproduced(root: &Value, timeline: &Timeline) -> Result<(), Unreadable> {
-  let written = export::timeline(timeline, &layout_valid(timeline), OtioTarget::V0_15Plus)
-    .map_err(|_| {
-      inexact(
-        &At::root(),
-        "a timeline whose times the export cannot write back",
-      )
-    })?;
-  times_match(&written, Some(root), &At::root())
+  let target = if clip_schema(root) == Some("Clip.1") {
+    OtioTarget::Legacy
+  } else {
+    OtioTarget::V0_15Plus
+  };
+  let written = export::timeline(timeline, &layout_valid(timeline), target)
+    .map_err(|_| inexact(&At::root(), "a timeline the export cannot write back"))?;
+  same(&written, root, &At::root(), Numbers::AsWritten)
 }
 
-/// The `RationalTime` `written` and the one `stated`, held strictly equal;
-/// or, within any other value, each time `written` holds against the one
-/// `stated` holds at the same place, and no time `stated` holds that
-/// `written` does not ([`reproduced`]).
-fn times_match(written: &Value, stated: Option<&Value>, at: &At) -> Result<(), Unreadable> {
-  let differs = || {
-    inexact(
-      at,
-      "a time the export does not write back as stated: another value or rate",
-    )
-  };
-  match written {
-    Value::Object(members) => {
+/// How OpenTimelineIO 0.17.0's reader holds the numbers at a place.
+#[derive(Clone, Copy)]
+enum Numbers {
+  /// A member it fetches as a `double` — a `RationalTime`'s rate and value —
+  /// which takes any number, an integer read as the `double` it is
+  /// (`deserialization.cpp` 376–488 in 0.17.0).
+  Doubles,
+  /// A value it keeps as it parses it — in a dictionary: an integer as an
+  /// `int64_t`, any other number as a `double` (59–73).
+  AsWritten,
+}
+
+/// The tree `written` beside `stated`, both at `at`: each object's members
+/// by key, in any order; each array's items by place; each scalar held as
+/// OpenTimelineIO holds it ([`same_scalar`]), its numbers as `numbers` says
+/// ([`reproduced`]).
+fn same(written: &Value, stated: &Value, at: &At, numbers: Numbers) -> Result<(), Unreadable> {
+  match (written, stated) {
+    (Value::Object(members), Value::Object(stated_members)) => {
       let schema = schema_of(written);
-      if schema == Some("RationalTime.1") {
-        return match stated {
-          Some(stated) if same_time(written, stated) => Ok(()),
-          _ => Err(differs()),
-        };
-      }
-      let stated_members = stated.and_then(Value::as_object).unwrap_or_default();
-      // A `Clip.1` keeps its medium under `media_reference`, where the
-      // export's `Clip.2` keeps it under `media_references`, by its key.
-      let legacy_clip = schema == Some("Clip.2") && stated.and_then(schema_of) == Some("Clip.1");
+      let numbers = if schema == Some("RationalTime.1") {
+        Numbers::Doubles
+      } else {
+        Numbers::AsWritten
+      };
       for (key, value) in members {
-        if legacy_clip && key == "media_references" {
-          let medium = member(value, DEFAULT_MEDIA).unwrap_or(&Value::Null);
-          let at = at.key("media_reference");
-          times_match(medium, find(stated_members, "media_reference"), &at)?;
-        } else {
-          times_match(value, find(stated_members, key), &at.key(key))?;
+        let at = at.key(key);
+        match find(stated_members, key) {
+          Some(stated) => same(value, stated, &at, numbers)?,
+          None if admitted(&WRITTEN_DEFAULTS, schema, key, value) => {}
+          None => return Err(differs(&at, Some(value), None)),
         }
       }
-      // A time the document states where the export writes none.
       for (key, value) in stated_members {
-        let written_there = if legacy_clip && key == "media_reference" {
-          find(members, "media_references")
-        } else {
-          find(members, key)
-        };
-        if written_there.is_none() && carries_time(value) {
-          return Err(inexact(
-            &at.key(key),
-            "a time the export does not write: none is written there",
-          ));
+        if find(members, key).is_none() && !admitted(&STATED_DEFAULTS, schema, key, value) {
+          return Err(differs(&at.key(key), None, Some(value)));
         }
       }
       Ok(())
     }
-    Value::Array(items) => {
-      let stated_items = stated.and_then(Value::as_array).unwrap_or_default();
-      for (index, item) in items.iter().enumerate() {
-        times_match(item, stated_items.get(index), &at.index(index))?;
+    (Value::Array(items), Value::Array(stated_items)) => {
+      for (index, (item, stated)) in items.iter().zip(stated_items).enumerate() {
+        same(item, stated, &at.index(index), numbers)?;
       }
-      match stated_items
-        .iter()
-        .enumerate()
-        .skip(items.len())
-        .find(|(_, item)| carries_time(item))
-      {
-        Some((index, _)) => Err(inexact(
-          &at.index(index),
-          "a time the export does not write: none is written there",
-        )),
-        None => Ok(()),
+      let shorter = items.len().min(stated_items.len());
+      if items.len() == stated_items.len() {
+        Ok(())
+      } else {
+        Err(differs(
+          &at.index(shorter),
+          items.get(shorter),
+          stated_items.get(shorter),
+        ))
       }
     }
-    _ => match stated {
-      Some(stated) if carries_time(stated) => Err(differs()),
-      _ => Ok(()),
-    },
+    _ if same_scalar(written, stated, numbers) => Ok(()),
+    _ => Err(differs(at, Some(written), Some(stated))),
   }
 }
 
-/// Whether two `RationalTime`s are strictly equal: the same `f64` value and
-/// the same `f64` rate, read exactly from their numbers.
-fn same_time(written: &Value, stated: &Value) -> bool {
-  let read = |time: &Value, key: &str| {
-    member(time, key).and_then(|number| match number {
-      Value::Number(text) => json::exact_f64(text.as_str()),
-      _ => None,
-    })
-  };
-  schema_of(stated) == Some("RationalTime.1")
-    && ["value", "rate"]
-      .iter()
-      .all(|key| matches!((read(written, key), read(stated, key)), (Some(a), Some(b)) if a == b))
+/// Whether two scalars are one value as OpenTimelineIO 0.17.0's reader holds
+/// it: two strings byte for byte, two booleans or two nulls alike, and two
+/// numbers as `numbers` reads them ([`held`]) — so `24` and `24.0` are one
+/// `RationalTime` rate, both read as the `double` 24.0, while in a dictionary
+/// `-3` is an `int64_t` and `-3.0` a `double`. A number reads only as its
+/// text spells it exactly ([`json::exact_f64`]), as every number this reader
+/// takes does.
+fn same_scalar(written: &Value, stated: &Value, numbers: Numbers) -> bool {
+  match (written, stated) {
+    (Value::Null, Value::Null) => true,
+    (Value::Bool(written), Value::Bool(stated)) => written == stated,
+    (Value::String(written), Value::String(stated)) => written == stated,
+    (Value::Number(written), Value::Number(stated)) => {
+      held(written, numbers).is_some_and(|written| Some(written) == held(stated, numbers))
+    }
+    _ => false,
+  }
 }
 
-/// Whether `value` holds a `RationalTime` anywhere.
-fn carries_time(value: &Value) -> bool {
-  match value {
-    Value::Object(members) => {
-      schema_of(value) == Some("RationalTime.1")
-        || members.iter().any(|(_, value)| carries_time(value))
+/// A number as OpenTimelineIO 0.17.0's reader holds it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Held {
+  Integer(i64),
+  Double(f64),
+}
+
+/// The number `text` spells, as OpenTimelineIO 0.17.0's reader holds it
+/// where it reads `numbers`: as a `double`, or as its JSON parser takes it —
+/// an integer, with neither fraction nor exponent, as an `int64_t`, one past
+/// `i64` and within `u64` cut to its low 63 bits (`deserialization.cpp`
+/// 63–70), one past `u64` as a `double`; any other as a `double`. `None` for
+/// a number no `double` holds exactly.
+fn held(text: &str, numbers: Numbers) -> Option<Held> {
+  let double = || json::exact_f64(text);
+  if matches!(numbers, Numbers::Doubles) || text.contains(['.', 'e', 'E']) {
+    return double().map(Held::Double);
+  }
+  match text.parse::<i128>() {
+    Ok(value) if i64::try_from(value).is_ok() => i64::try_from(value).ok().map(Held::Integer),
+    Ok(value) if u64::try_from(value).is_ok() => u64::try_from(value)
+      .ok()
+      .map(|value| Held::Integer((value & 0x7FFF_FFFF_FFFF_FFFF) as i64)),
+    _ => double().map(Held::Double),
+  }
+}
+
+/// A value the export writes, or the document states, at `at`, and the other
+/// side's — `None` where one leaves the member out — refused as inexact,
+/// naming both.
+fn differs(at: &At, written: Option<&Value>, stated: Option<&Value>) -> Unreadable {
+  let shown = |value: Option<&Value>| match value {
+    Some(value) => {
+      let mut out = Utf8BytesMut::new();
+      json::write_compact(value, &mut out);
+      out.freeze_shared()
     }
-    Value::Array(items) => items.iter().any(carries_time),
-    _ => false,
+    None => Utf8Bytes::from_static("nothing"),
+  };
+  Unreadable::Inexact(Inexact::with_values(
+    at.0.clone(),
+    "a value the export does not write back as the document states it",
+    shown(written),
+    shown(stated),
+  ))
+}
+
+/// A value OpenTimelineIO 0.17.0 holds a member at, which a defaults table
+/// names.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Plain {
+  Null,
+  True,
+  Text(&'static str),
+  EmptyObject,
+  EmptyArray,
+}
+
+impl Plain {
+  fn is(self, value: &Value) -> bool {
+    match (self, value) {
+      (Self::Null, Value::Null) | (Self::True, Value::Bool(true)) => true,
+      (Self::Text(expected), Value::String(text)) => text == expected,
+      (Self::EmptyObject, Value::Object(members)) => members.is_empty(),
+      (Self::EmptyArray, Value::Array(items)) => items.is_empty(),
+      _ => false,
+    }
+  }
+}
+
+/// One row of a defaults table: the member `key`, at `value`, of an object
+/// of one of `schemas`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Row {
+  schemas: &'static [&'static str],
+  key: &'static str,
+  value: Plain,
+}
+
+/// Whether one of `rows` admits the member `key`, at `value`, of an object
+/// of `schema`.
+fn admitted(rows: &[Row], schema: Option<&str>, key: &str, value: &Value) -> bool {
+  schema.is_some_and(|schema| {
+    rows
+      .iter()
+      .any(|row| row.key == key && row.schemas.contains(&schema) && row.value.is(value))
+  })
+}
+
+/// The schemas whose objects carry a name and metadata
+/// (`SerializableObjectWithMetadata`).
+const WITH_METADATA: &[&str] = &[
+  "Timeline.1",
+  "Stack.1",
+  "Track.1",
+  "Gap.1",
+  "Clip.1",
+  "Clip.2",
+  "Transition.1",
+  "ExternalReference.1",
+  "Marker.2",
+];
+
+/// The schemas whose objects are items (`Item`).
+const ITEMS: &[&str] = &["Stack.1", "Track.1", "Gap.1", "Clip.1", "Clip.2"];
+
+/// **The written defaults**: the members the export writes that a document
+/// may leave out, as OpenTimelineIO 0.17.0 reads each one's absence as the
+/// value written — it builds every object by its default constructor and
+/// reads such a member only if present. Each row cites the export's write
+/// (`export.rs`), the read and the default (`src/opentimelineio/` at
+/// `v0.17.0`). Nothing else the export writes may be missing.
+pub(crate) const WRITTEN_DEFAULTS: [Row; 10] = [
+  // `metadata` `{}`: the stack's, a track's, a gap's, and any object's with
+  // no words (`export.rs` 112, 686, 789, 1191); read only if present
+  // (`serializableObjectWithMetadata.cpp` 21) over `AnyDictionary()`
+  // (`serializableObjectWithMetadata.h` 24, each schema's constructor).
+  Row {
+    schemas: WITH_METADATA,
+    key: "metadata",
+    value: Plain::EmptyObject,
+  },
+  // `name` `""`: a gap's, a transition's, a reference's, and whatever the
+  // timeline names nothing (772, 790, 948; 106, 687, 741, 866); read only
+  // if present (`serializableObjectWithMetadata.cpp` 22) over
+  // `std::string()` (`.h` 23).
+  Row {
+    schemas: WITH_METADATA,
+    key: "name",
+    value: Plain::Text(""),
+  },
+  // `source_range` `null` on the stack and a track (114, 688): read only if
+  // present (`item.cpp` 175) over `std::nullopt` (`stack.h` 26, `track.h`
+  // 38).
+  Row {
+    schemas: &["Stack.1", "Track.1"],
+    key: "source_range",
+    value: Plain::Null,
+  },
+  // `effects` `[]` (115, 689, 743, 798): `item.cpp` 176 over `item.h` 30.
+  Row {
+    schemas: ITEMS,
+    key: "effects",
+    value: Plain::EmptyArray,
+  },
+  // `markers` `[]` where an item has none (116, 690, 744, 799): `item.cpp`
+  // 177 over `item.h` 31.
+  Row {
+    schemas: ITEMS,
+    key: "markers",
+    value: Plain::EmptyArray,
+  },
+  // `enabled` `true` (117, 691, 745, 800): `item.cpp` 178 over `item.h` 32.
+  Row {
+    schemas: ITEMS,
+    key: "enabled",
+    value: Plain::True,
+  },
+  // A reference's `available_range` `null` where it states none (774–777):
+  // `mediaReference.cpp` 30 over `std::nullopt` (`externalReference.h` 24).
+  Row {
+    schemas: &["ExternalReference.1"],
+    key: "available_range",
+    value: Plain::Null,
+  },
+  // A reference's `available_image_bounds` `null`, for `V0_15Plus` (779):
+  // `mediaReference.cpp` 31–33 over `std::nullopt` (`externalReference.h`
+  // 26–27).
+  Row {
+    schemas: &["ExternalReference.1"],
+    key: "available_image_bounds",
+    value: Plain::Null,
+  },
+  // A marker's `color` `GREEN` (867): `marker.cpp` 27 over `Color::green`
+  // (`marker.h` 40), which is `"GREEN"` (20).
+  Row {
+    schemas: &["Marker.2"],
+    key: "color",
+    value: Plain::Text("GREEN"),
+  },
+  // A marker's `comment` `""` (869): `marker.cpp` 29 over `std::string()`
+  // (`marker.h` 41).
+  Row {
+    schemas: &["Marker.2"],
+    key: "comment",
+    value: Plain::Text(""),
+  },
+];
+
+/// **The stated defaults**: the members a document may state that the export
+/// does not write, as OpenTimelineIO 0.17.0 holds each one's stated value as
+/// it holds the member's absence. Nothing else a document states may go
+/// unwritten: OpenTimelineIO keeps every member it reads, and one its schema
+/// does not know as a dynamic field it writes back (`serializableObject.cpp`
+/// 78–107 at `v0.17.0`) — a `color` on an item and an `enabled` on a
+/// transition among them.
+pub(crate) const STATED_DEFAULTS: [Row; 1] = [
+  // A reference's `available_image_bounds` `null`, which the `Legacy` export
+  // does not write (`export.rs` 778–780): read into its optional as
+  // `std::nullopt` (`mediaReference.cpp` 31–33), its value when absent
+  // (`externalReference.h` 26–27).
+  Row {
+    schemas: &["ExternalReference.1"],
+    key: "available_image_bounds",
+    value: Plain::Null,
+  },
+];
+
+/// The schema of the first clip `value` holds, depth first: what target the
+/// document is written for.
+fn clip_schema(value: &Value) -> Option<&str> {
+  match value {
+    Value::Object(members) => match schema_of(value) {
+      Some(schema @ ("Clip.1" | "Clip.2")) => Some(schema),
+      _ => members.iter().find_map(|(_, value)| clip_schema(value)),
+    },
+    Value::Array(items) => items.iter().find_map(clip_schema),
+    _ => None,
   }
 }
 

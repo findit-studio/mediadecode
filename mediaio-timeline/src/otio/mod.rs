@@ -703,9 +703,12 @@ impl core::error::Error for Shape {}
 /// one it models elsewhere is refused with its name and where it sits
 /// ([`Unreadable::Schema`]); a key, value or note of a modelled schema the
 /// timeline has no word for is refused by name too
-/// ([`Unreadable::Feature`]). A key is read only where it carries nothing —
-/// `null`, an empty list, `enabled` as `true` — or what the timeline keeps:
-/// nothing is dropped. A member OpenTimelineIO's schema lets a document
+/// ([`Unreadable::Feature`]). A member is read only where the timeline keeps
+/// it, or where OpenTimelineIO 0.17.0 holds it as it holds its absence:
+/// nothing is dropped — a `color` on an item and an `enabled` on a
+/// transition, which OpenTimelineIO keeps as dynamic fields, are refused by
+/// name, `null` and `true` among them. A marker's color is one of the eleven
+/// names exactly, in capitals. A member OpenTimelineIO's schema lets a document
 /// leave out reads as OpenTimelineIO 0.17.0's reader reads it — a name as
 /// empty, `enabled` as `true`, a marker's color as GREEN — or, where that
 /// is no value and the timeline needs one (the timeline's
@@ -713,16 +716,21 @@ impl core::error::Error for Shape {}
 /// keep (a gap's `source_range`, nothing at rate 1), is refused by name.
 ///
 /// **What it reads, the export writes back.** Last, the export writes the
-/// timeline read, and every `RationalTime` it writes — the global start,
-/// each gap's and clip's range, each transition's offsets, each medium's
-/// available range, each marker's range — must be the one the document
-/// states at the same path, strictly: the same value and the same rate,
-/// as OpenTimelineIO's `strictly_equal` compares them. The first that is
-/// not is refused as [`Unreadable::Inexact`] there. The checks before it
-/// refuse by name what they know; this one closes the rest of the class —
-/// a time read in a form the export would not write it in, such as a
-/// medium's range counted in a ruler of the document's choosing — so the
-/// documents read are exactly those whose times the export reproduces.
+/// timeline read, and every value it writes must be the one the document
+/// states at the same path, as OpenTimelineIO 0.17.0's reader holds it: a
+/// string byte for byte, a boolean exactly, a `RationalTime`'s rate and value
+/// as doubles — `24` and `24.0` alike — and a number in a dictionary as the
+/// integer or the double its text spells. An object's keys may come in any
+/// order. A member the export writes may be missing only where
+/// OpenTimelineIO reads its absence as that very value — an empty name, no
+/// metadata, effects or markers, `enabled`, no ranges, a GREEN marker with
+/// no comment — and one the document states may go unwritten only where
+/// OpenTimelineIO holds it as it holds its absence: a reference's image
+/// bounds of `null` in a document for `Legacy`. The first value that
+/// differs is refused as [`Unreadable::Inexact`] there, naming both. The
+/// checks before it refuse by name what they know; this one closes the
+/// rest of the class — a value read, then written back otherwise — so the
+/// documents read are exactly those the export reproduces.
 ///
 /// # Errors
 ///
@@ -733,7 +741,7 @@ impl core::error::Error for Shape {}
 ///   timeline does not model;
 /// - [`Unreadable::Inexact`] for a number its type holds only rounded, a
 ///   count or rate that does not land exactly where the timeline counts it,
-///   a time OpenTimelineIO's `f64` arithmetic rounds, or a time the export
+///   a time OpenTimelineIO's `f64` arithmetic rounds, or a value the export
 ///   does not write back as the document states it;
 /// - [`Unreadable::Validation`] for a timeline read whole that does not
 ///   [`validate`](fn@validate).
@@ -763,7 +771,7 @@ pub enum Unreadable {
   Feature(UnmodelledFeature),
   /// A count or a rate that does not land exactly where the timeline
   /// counts it, a time OpenTimelineIO derives from the document that its
-  /// `f64` arithmetic rounds, or a time the export would not write back as
+  /// `f64` arithmetic rounds, or a value the export would not write back as
   /// the document states it.
   Inexact(Inexact),
   /// The timeline read does not [`validate`](fn@validate): its refusals.
@@ -898,9 +906,11 @@ pub enum Feature {
   TransitionType(Utf8Bytes),
   /// A trim — a `source_range` — on the stack or a track.
   Trim,
-  /// The stack, a gap or a transition disabled.
+  /// The stack or a gap disabled.
   Disabled,
-  /// A `color` on an item: a newer reader's word.
+  /// A `color` on an item, `null` among them: a newer reader's member,
+  /// which OpenTimelineIO 0.17.0 keeps as a dynamic field and the timeline
+  /// would drop.
   ItemColor,
   /// A marker color outside OpenTimelineIO's eleven.
   MarkerColor(Utf8Bytes),
@@ -985,20 +995,49 @@ impl fmt::Display for Feature {
 }
 
 /// A count or a rate that does not land exactly where the timeline counts
-/// it, a time OpenTimelineIO's `f64` arithmetic rounds, or one the export
-/// would not write back as stated, and where: what [`Unreadable::Inexact`]
-/// carries. A time OpenTimelineIO derives is refused where it is derived
-/// from: a range at the range, a place or a visible range at its child, a
-/// duration or an end at its track, the stack's pick of its longest track
-/// at the stack. A time the export would write otherwise is refused at the
-/// first `RationalTime` that differs.
+/// it, a time OpenTimelineIO's `f64` arithmetic rounds, or a value the
+/// export would not write back as stated, and where: what
+/// [`Unreadable::Inexact`] carries. A time OpenTimelineIO derives is refused
+/// where it is derived from: a range at the range, a place or a visible
+/// range at its child, a duration or an end at its track, the stack's pick
+/// of its longest track at the stack. A value the export would write
+/// otherwise is refused at the first that differs, with both values
+/// ([`Inexact::written`], [`Inexact::stated`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Inexact {
   path: Utf8Bytes,
   reason: &'static str,
+  /// Where the export would write back another value than the document
+  /// states: the value it writes, and the document's.
+  values: Option<Box<(Utf8Bytes, Utf8Bytes)>>,
 }
 
 impl Inexact {
+  /// A value that does not land exactly at `path`, for `reason`.
+  pub(crate) const fn new(path: Utf8Bytes, reason: &'static str) -> Self {
+    Self {
+      path,
+      reason,
+      values: None,
+    }
+  }
+
+  /// A value the export would write back as `written` where the document
+  /// states `stated`, at `path` — each as JSON, or `nothing` for a member
+  /// left out.
+  pub(crate) fn with_values(
+    path: Utf8Bytes,
+    reason: &'static str,
+    written: Utf8Bytes,
+    stated: Utf8Bytes,
+  ) -> Self {
+    Self {
+      path,
+      reason,
+      values: Some(Box::new((written, stated))),
+    }
+  }
+
   /// Where, as a path from the document's root.
   pub fn path(&self) -> &str {
     &self.path
@@ -1008,12 +1047,37 @@ impl Inexact {
   pub const fn reason(&self) -> &'static str {
     self.reason
   }
+
+  /// Where the export would write back another value than the document
+  /// states, the value it writes there, as JSON — `nothing` where it writes
+  /// none.
+  pub fn written(&self) -> Option<&str> {
+    self.values.as_deref().map(|(written, _)| written.as_str())
+  }
+
+  /// Where the export would write back another value than the document
+  /// states, the document's value there, as JSON — `nothing` where it states
+  /// none.
+  pub fn stated(&self) -> Option<&str> {
+    self.values.as_deref().map(|(_, stated)| stated.as_str())
+  }
 }
 
-/// Writes `$.global_start_time.value: a count that is no whole number`.
+/// Writes `$.global_start_time.value: a count that is no whole number`, and
+/// where the export would write another value back, both:
+/// `$.tracks.children[0].markers[0].color: a value the export does not write
+/// back as the document states it: the export writes "GREEN", the document
+/// states "Green"`.
 impl fmt::Display for Inexact {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    write!(f, "{}: {}", self.path, self.reason)
+    write!(f, "{}: {}", self.path, self.reason)?;
+    match self.values.as_deref() {
+      Some((written, stated)) => write!(
+        f,
+        ": the export writes {written}, the document states {stated}"
+      ),
+      None => Ok(()),
+    }
   }
 }
 

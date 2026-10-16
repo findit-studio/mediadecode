@@ -58,6 +58,36 @@ pub(crate) fn write_pretty(value: &Value, out: &mut Utf8BytesMut) {
   write_value(value, 0, out);
 }
 
+/// Writes `value` on one line, `", "` between members and items and `": "`
+/// after a key: a value named in a refusal.
+pub(crate) fn write_compact(value: &Value, out: &mut Utf8BytesMut) {
+  match value {
+    Value::Array(items) => {
+      out.push('[');
+      for (index, item) in items.iter().enumerate() {
+        if index > 0 {
+          out.push_str(", ");
+        }
+        write_compact(item, out);
+      }
+      out.push(']');
+    }
+    Value::Object(members) => {
+      out.push('{');
+      for (index, (key, item)) in members.iter().enumerate() {
+        if index > 0 {
+          out.push_str(", ");
+        }
+        write_string(key, out);
+        out.push_str(": ");
+        write_compact(item, out);
+      }
+      out.push('}');
+    }
+    scalar => write_value(scalar, 0, out),
+  }
+}
+
 fn write_value(value: &Value, depth: usize, out: &mut Utf8BytesMut) {
   match value {
     Value::Null => out.push_str("null"),

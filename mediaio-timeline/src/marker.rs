@@ -185,11 +185,13 @@ impl MarkerColor {
     }
   }
 
-  /// The color OpenTimelineIO's `name` spells, its case ignored, or
-  /// `None` for a name outside the eleven.
+  /// The color whose OpenTimelineIO name is `name`, exactly as
+  /// OpenTimelineIO writes it — capitals — or `None` for any other: its
+  /// reader keeps the string as written (`marker.cpp` 27 in 0.17.0), so
+  /// `Green` is not `GREEN`.
   pub(crate) fn from_otio_name(name: &str) -> Option<Self> {
     Self::ALL
       .into_iter()
-      .find(|color| color.otio_name().eq_ignore_ascii_case(name))
+      .find(|color| color.otio_name() == name)
   }
 }

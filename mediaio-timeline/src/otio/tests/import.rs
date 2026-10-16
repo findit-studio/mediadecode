@@ -175,10 +175,21 @@ fn shape(dotted: &str, expected: &'static str) -> Unreadable {
 }
 
 fn inexact(dotted: &str, reason: &'static str) -> Unreadable {
-  Unreadable::Inexact(Inexact {
-    path: Utf8Bytes::from(path(dotted)),
-    reason,
-  })
+  Unreadable::Inexact(Inexact::new(Utf8Bytes::from(path(dotted)), reason))
+}
+
+/// The reason the backstop gives.
+const NOT_WRITTEN_BACK: &str = "a value the export does not write back as the document states it";
+
+/// The backstop's refusal at the dotted `path`: the export writes `written`
+/// there and the document states `stated`, each as JSON, or `nothing`.
+fn differs(dotted: &str, written: &str, stated: &str) -> Unreadable {
+  Unreadable::Inexact(Inexact::with_values(
+    Utf8Bytes::from(path(dotted)),
+    NOT_WRITTEN_BACK,
+    Utf8Bytes::from(written),
+    Utf8Bytes::from(stated),
+  ))
 }
 
 #[test]
@@ -192,27 +203,109 @@ fn what_the_export_writes_reads_back_exactly() {
 
 #[test]
 fn what_carries_nothing_reads_as_nothing() {
-  // A newer reader's `color` left unset, a transition `enabled`, empty
-  // words, the stack unnamed, and a comment and a color left out: none
-  // carries anything the timeline would lose.
+  // Round 10: a member reads as nothing only where OpenTimelineIO 0.17.0
+  // holds it as it holds the member's absence and the export writes it back
+  // so — left out where the export writes its default (the written
+  // defaults), or a reference's image bounds stated `null` where `Legacy`
+  // writes none (the stated defaults).
   let read = read(|root| {
-    set(root, A, "color", Value::Null);
-    set(root, DISSOLVE, "enabled", Value::Bool(true));
-    set(
-      root,
-      GAP,
-      "metadata",
-      object(vec![("mediaio", object(vec![]))]),
-    );
-    set(root, "tracks", "name", text(""));
-    let marker = &format!("{TRACK}.markers.0");
-    remove(root, marker, "comment");
-    set(root, marker, "color", text("red"));
+    remove(root, &format!("{TRACK}.markers.0"), "comment");
+    remove(root, A_MEDIA, "available_image_bounds");
+    for item in ["tracks", TRACK, GAP, A, B] {
+      remove(root, item, "effects");
+      remove(root, item, "enabled");
+    }
   });
   assert_eq!(read, Ok(sample()));
   // A marker with no color is OpenTimelineIO's default, green.
   let green = self::read(|root| remove(root, &format!("{TRACK}.markers.0"), "color")).unwrap();
   assert_eq!(green.tracks()[0].markers()[0].color(), MarkerColor::Green);
+  let legacy = read_edited(OtioTarget::Legacy, |root| {
+    set(
+      root,
+      &format!("{A}.media_reference"),
+      "available_image_bounds",
+      Value::Null,
+    )
+  });
+  assert_eq!(legacy, Ok(sample()));
+}
+
+#[test]
+fn a_member_opentimelineio_keeps_otherwise_than_the_export_writes_is_refused() {
+  // Round 10. A `color` on an item and an `enabled` on a transition are
+  // members OpenTimelineIO 0.17.0's schemas do not know, which it keeps as
+  // dynamic fields and writes back (`serializableObject.cpp` 78–107):
+  // refused by name, `null` and `true` among them.
+  assert_eq!(
+    read(|root| set(root, A, "color", Value::Null)),
+    Err(feature(Feature::ItemColor, &format!("{A}.color"))),
+  );
+  assert_eq!(
+    read(|root| set(root, DISSOLVE, "enabled", Value::Bool(true))),
+    Err(feature(
+      Feature::Key(Utf8Bytes::from("enabled")),
+      &format!("{DISSOLVE}.enabled")
+    )),
+  );
+  // The backstop refuses the rest, naming both values: the stack named
+  // otherwise than the export names it, or not at all, and words the
+  // timeline keeps none of, which OpenTimelineIO keeps.
+  assert_eq!(
+    read(|root| set(root, "tracks", "name", text(""))),
+    Err(differs("tracks.name", "\"tracks\"", "\"\"")),
+  );
+  assert_eq!(
+    read(|root| remove(root, "tracks", "name")),
+    Err(differs("tracks.name", "\"tracks\"", "nothing")),
+  );
+  assert_eq!(
+    read(|root| set(
+      root,
+      GAP,
+      "metadata",
+      object(vec![("mediaio", object(vec![]))]),
+    )),
+    Err(differs(&format!("{GAP}.metadata.mediaio"), "nothing", "{}")),
+  );
+}
+
+#[test]
+fn the_backstop_alone_refuses_a_string_or_a_boolean_written_back_otherwise() {
+  // Round 10: the backstop by itself, every check before it bypassed — the
+  // document altered after the timeline was read from it. Codex's case
+  // through it: a marker's color `Green`, which the export writes `GREEN`.
+  let mut timeline = sample();
+  timeline.tracks_mut()[0].markers_mut()[0].set_color(MarkerColor::Green);
+  for target in [OtioTarget::V0_15Plus, OtioTarget::Legacy] {
+    let written = || json::parse(&to_otio(&timeline, target).unwrap()).unwrap();
+    let guarded = |edit: &dyn Fn(&mut Value)| {
+      let mut root = written();
+      edit(&mut root);
+      super::super::import::reproduced(&root, &timeline)
+    };
+    assert_eq!(guarded(&|_| {}), Ok(()), "{target:?}: the premise");
+    let marker = format!("{TRACK}.markers.0");
+    assert_eq!(
+      guarded(&|root| set(root, &marker, "color", text("Green"))),
+      Err(differs(
+        &format!("{marker}.color"),
+        "\"GREEN\"",
+        "\"Green\""
+      )),
+      "{target:?}",
+    );
+    assert_eq!(
+      guarded(&|root| set(root, A, "name", text("b"))),
+      Err(differs(&format!("{A}.name"), "\"a\"", "\"b\"")),
+      "{target:?}",
+    );
+    assert_eq!(
+      guarded(&|root| set(root, TRACK, "enabled", Value::Bool(false))),
+      Err(differs(&format!("{TRACK}.enabled"), "true", "false")),
+      "{target:?}",
+    );
+  }
 }
 
 /// Every schema the export writes: an object carrying `OTIO_SCHEMA` is
@@ -1121,12 +1214,12 @@ fn a_timebase_word_off_the_edit_rate_is_refused_by_name() {
 
 #[test]
 fn an_absent_name_reads_as_empty() {
-  // `serializableObjectWithMetadata.cpp` 22: an empty name.
+  // `serializableObjectWithMetadata.cpp` 22: an empty name. The stack's,
+  // which the export writes `tracks`, may not be left out (round 10).
   let (track_marker, clip_marker) = (format!("{TRACK}.markers.0"), format!("{A}.markers.0"));
   let read = read(|root| {
     for path in [
       "",
-      "tracks",
       TRACK,
       GAP,
       FADE_IN,
@@ -1492,8 +1585,12 @@ fn a_feature_the_timeline_has_no_word_for_is_refused_by_name() {
       feature(Feature::Disabled, &format!("{GAP}.enabled")),
     ),
     (
+      // A transition has no `enabled` in OpenTimelineIO 0.17.0 (round 10).
       Box::new(|root| set(root, DISSOLVE, "enabled", Value::Bool(false))),
-      feature(Feature::Disabled, &format!("{DISSOLVE}.enabled")),
+      feature(
+        Feature::Key(Utf8Bytes::from("enabled")),
+        &format!("{DISSOLVE}.enabled"),
+      ),
     ),
     (
       Box::new(|root| set(root, A, "color", text("RED"))),
@@ -1987,10 +2084,6 @@ fn at_48(root: &mut Value, range: &str, words: &str, start: &str, duration: &str
   }
 }
 
-/// The reason the backstop gives.
-const NOT_WRITTEN_BACK: &str =
-  "a time the export does not write back as stated: another value or rate";
-
 #[test]
 fn a_media_range_read_in_a_ruler_the_export_does_not_write_is_refused() {
   // Round 9: the reader counts a media-side range in the ruler its words
@@ -2000,7 +2093,8 @@ fn a_media_range_read_in_a_ruler_the_export_does_not_write_is_refused() {
   // [0, 24) at 1/24, and was written back as 0@24 + 24@24 — its inclusive
   // end moved from 47@48 to 23@24, another instant (`timeRange.h` 48–65 in
   // 0.17.0). The backstop refuses it, and the same in an available range
-  // and in a clip marker's range.
+  // and in a clip marker's range — since round 10 at the first value that
+  // differs, the ruler the range's words name.
   let a = Clip::new(
     ClipId::new("a"),
     "a",
@@ -2037,12 +2131,14 @@ fn a_media_range_read_in_a_ruler_the_export_does_not_write_is_refused() {
       "24.0",
     ),
   ];
+  // Round 10 widened the backstop to every value: the first that differs
+  // is the ruler the range's words name, ahead of its times.
   for (name, range, words, duration) in cases {
     assert_eq!(
       read_text_edited(&written, |root| at_48(
         root, &range, &words, "0.0", duration
       )),
-      Err(inexact(&format!("{range}.duration"), NOT_WRITTEN_BACK)),
+      Err(differs(&format!("{words}.ruler"), "\"24/1\"", "\"48/1\"")),
       "{name}",
     );
   }
@@ -2054,7 +2150,8 @@ fn every_time_the_document_states_is_the_one_the_export_writes_there() {
   // times. The edit side — the global start, a gap, a transition's offsets,
   // a track marker — is counted at the edit rate bit for bit, so its own
   // check refuses it by name; the media side declares its ruler, so the
-  // backstop refuses it at its first time.
+  // backstop refuses it at its first value that differs, the ruler its
+  // words name.
   let off_rate = "a rate other than the f64 of the exact ruler it is counted in";
   // The time at `time`, `value` ticks at 120 a second: five a frame.
   let at_120 = |root: &mut Value, time: &str, value: &str| {
@@ -2109,7 +2206,11 @@ fn every_time_the_document_states_is_the_one_the_export_writes_there() {
           "120.0",
         )
       }),
-      inexact(&format!("{A}.source_range.duration"), NOT_WRITTEN_BACK),
+      differs(
+        &format!("{A}.metadata.mediaio.source.ruler"),
+        "\"24/1\"",
+        "\"120/1\"",
+      ),
     ),
     (
       "an available range",
@@ -2122,9 +2223,10 @@ fn every_time_the_document_states_is_the_one_the_export_writes_there() {
           "500.0",
         )
       }),
-      inexact(
-        &format!("{A_MEDIA}.available_range.duration"),
-        NOT_WRITTEN_BACK,
+      differs(
+        &format!("{A_MEDIA}.metadata.mediaio.available.ruler"),
+        "\"24/1\"",
+        "\"120/1\"",
       ),
     ),
     (
@@ -2141,9 +2243,10 @@ fn every_time_the_document_states_is_the_one_the_export_writes_there() {
           )
         }
       }),
-      inexact(
-        &format!("{a_marker}.marked_range.duration"),
-        NOT_WRITTEN_BACK,
+      differs(
+        &format!("{a_marker}.metadata.mediaio.range.ruler"),
+        "\"24/1\"",
+        "\"120/1\"",
       ),
     ),
   ];
@@ -2335,14 +2438,19 @@ fn every_number_is_read_exactly_or_refused() {
       )
     })
   };
-  // Exactly an f32, and other spellings of the sample's own -3 dB.
+  // Exactly an f32, and other spellings of the sample's own -3 dB, each a
+  // double as the export writes one.
   assert_eq!(
-    gain("16777216").unwrap().tracks()[0].clips()[0].gain(),
+    gain("16777216.0").unwrap().tracks()[0].clips()[0].gain(),
     Gain::from_db(16_777_216.0),
   );
-  for spelled in ["-3", "-3e0", "-0.3E1", "-30e-1"] {
+  for spelled in ["-3e0", "-0.3E1", "-30e-1", "-3.00"] {
     assert_eq!(gain(spelled), Ok(sample()), "{spelled}");
   }
+  // Round 10: an integer, which OpenTimelineIO's dictionary holds as an
+  // `int64_t`, not as the double the export writes (`deserialization.cpp`
+  // 63–73 in 0.17.0).
+  assert_eq!(gain("-3"), Err(differs(&gain_at, "-3.0", "-3")));
   // Rounded to its nearest f32 (2^24 + 1 reads as 2^24), past the largest,
   // and below the smallest.
   for spelled in ["16777217", "-3.0000001", "1e39", "1e-50"] {
@@ -2394,6 +2502,9 @@ fn a_word_missing_or_misshapen_is_refused_by_name() {
     )),
   );
   // One dissolve may say its place, which is the first; no other place.
+  // Since round 10 even the first is refused, by the backstop: the export
+  // says a place only where the track keeps its dissolves out of their
+  // cuts' order, and OpenTimelineIO would keep the word.
   assert_eq!(
     read(|root| set(
       root,
@@ -2401,7 +2512,11 @@ fn a_word_missing_or_misshapen_is_refused_by_name() {
       "mediaio",
       object(vec![("order", number("0"))])
     )),
-    Ok(sample()),
+    Err(differs(
+      &format!("{DISSOLVE}.metadata.mediaio"),
+      "nothing",
+      "{\"order\": 0}"
+    )),
   );
   assert_eq!(
     read(|root| set(
@@ -2470,19 +2585,38 @@ fn reader_refusals_say_what_and_where() {
 }
 
 #[test]
-fn every_marker_color_reads_back_in_any_case() {
-  for color in MarkerColor::ALL {
-    let mut timeline = sample();
-    timeline.tracks_mut()[0].markers_mut()[0].set_color(color);
-    let text = to_otio(&timeline, OtioTarget::V0_15Plus).unwrap();
-    assert_eq!(from_otio(&text).as_ref(), Ok(&timeline), "{color}");
-    let lower = text.as_str().replace(color.otio_name(), &color.to_string());
-    let read = from_otio(&lower).unwrap();
-    assert_eq!(read.tracks()[0].markers()[0].color(), color, "{lower}");
+fn every_marker_color_reads_back_as_its_name_in_capitals() {
+  // Round 10: OpenTimelineIO keeps a marker's color as written (`marker.cpp`
+  // 27 in 0.17.0), so `Green` is not `GREEN`; a name other than one of the
+  // eleven, exactly, is refused by name. Codex's case: `Green` and `green`
+  // read as GREEN, and were written back so.
+  for target in [OtioTarget::V0_15Plus, OtioTarget::Legacy] {
+    for color in MarkerColor::ALL {
+      let mut timeline = sample();
+      timeline.tracks_mut()[0].markers_mut()[0].set_color(color);
+      let text = to_otio(&timeline, target).unwrap();
+      assert_eq!(
+        from_otio(&text).as_ref(),
+        Ok(&timeline),
+        "{color} {target:?}"
+      );
+    }
+    let marker = format!("{TRACK}.markers.0");
+    for spelled in ["Green", "green", "GREEn"] {
+      assert_eq!(
+        read_edited(target, |root| set(root, &marker, "color", text(spelled))),
+        Err(feature(
+          Feature::MarkerColor(Utf8Bytes::from(spelled)),
+          &format!("{marker}.color")
+        )),
+        "{spelled} {target:?}",
+      );
+    }
   }
   assert_eq!(
-    MarkerColor::from_otio_name("Green"),
+    MarkerColor::from_otio_name("GREEN"),
     Some(MarkerColor::Green)
   );
+  assert_eq!(MarkerColor::from_otio_name("Green"), None);
   assert_eq!(MarkerColor::from_otio_name("GRAY"), None);
 }

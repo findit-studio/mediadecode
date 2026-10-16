@@ -62,11 +62,20 @@ Its versions are its own: they do not move with `mediadecode`'s.
   OpenTimelineIO's `TimeRange()`, is nothing at rate 1, a rate the track's
   duration takes and the timeline loses, so a gap states its range at the
   edit rate, as the export writes it. Last, the export writes the timeline
-  read, and every `RationalTime` it writes must be the one the document
-  states at the same path, strictly — the same value and rate — or the
-  read is refused as `Inexact` there: a medium's range counted in a ruler
-  the export would not choose among them. The reader takes exactly the
-  documents whose times the export reproduces.
+  read, and every value it writes must be the one the document states at
+  the same path, as OpenTimelineIO 0.17.0's reader holds it — strings byte
+  for byte, booleans exactly, a `RationalTime`'s numbers as doubles, a
+  dictionary's as the integers or doubles their text spells — or the read
+  is refused as `Inexact` there, naming both values (`Inexact::written`,
+  `Inexact::stated`): a medium's range counted in a ruler the export would
+  not choose, a marker's color in another case, among them. A member may
+  be left out only where OpenTimelineIO reads its absence as the value the
+  export writes, and stated unwritten only where OpenTimelineIO holds it as
+  its absence; each is a row of one of two tables, cited by source. The
+  reader takes exactly the documents the export reproduces. A marker's
+  color is one of the eleven names exactly, in capitals; a `color` on an
+  item and an `enabled` on a transition, which OpenTimelineIO 0.17.0 keeps
+  as dynamic fields, are refused by name, `null` and `true` among them.
 - The export writes markers as `Marker.2`, refusing one no ruler holds
   whole as `Spot::Marker`.
 - `validate_json` holds every marker to `Marker.2`, with the
