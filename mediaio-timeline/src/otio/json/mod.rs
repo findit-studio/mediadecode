@@ -336,7 +336,7 @@ fn exponent(text: &str) -> Option<i128> {
 const MAX_DEPTH: usize = 128;
 
 /// An object's key as the duplicate check orders it: by its text — and,
-/// in the laws, counted each time two are compared.
+/// in the laws with `std`, counted each time two are compared.
 #[derive(PartialEq, Eq)]
 struct Key(Utf8Bytes);
 
@@ -348,7 +348,7 @@ impl PartialOrd for Key {
 
 impl Ord for Key {
   fn cmp(&self, other: &Self) -> Ordering {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "std"))]
     tests::compared();
     self.0.as_str().cmp(other.0.as_str())
   }

@@ -289,10 +289,7 @@ fn a_note_keyed_as_otio_keys_its_objects_is_written_as_a_pair_and_reads_back() {
   let Value::Array(pairs) = pairs else {
     panic!("the notes are an array: {pairs:?}")
   };
-  assert!(pairs.contains(&Value::Array(vec![
-    text("OTIO_SCHEMA"),
-    text("Marker.2")
-  ])));
+  assert!(pairs.contains(&Value::Array(vec![text("OTIO_SCHEMA"), text("Marker.2")])));
 }
 
 #[test]
@@ -306,7 +303,10 @@ fn notes_that_are_not_pairs_of_strings_each_key_once_are_refused_by_name() {
     Err(shape("metadata.mediaio.metadata", "an array")),
   );
   assert_eq!(
-    read(|root| notes(root, Value::Array(vec![Value::Array(vec![text("only a key")])]))),
+    read(|root| notes(
+      root,
+      Value::Array(vec![Value::Array(vec![text("only a key")])])
+    )),
     Err(shape(
       "metadata.mediaio.metadata.0",
       "a note: a key and a value, both strings"
@@ -378,7 +378,11 @@ fn spelling(timebase: Timebase) -> (i32, i32) {
 #[test]
 fn an_edit_side_value_keeps_its_timebases_spelling() {
   let timeline = respelled();
-  assert_eq!(crate::validate(&timeline), Ok(()), "the premise: it validates");
+  assert_eq!(
+    crate::validate(&timeline),
+    Ok(()),
+    "the premise: it validates"
+  );
   for target in [OtioTarget::V0_15Plus, OtioTarget::Legacy] {
     let written = to_otio(&timeline, target).unwrap();
     let read = from_otio(&written).unwrap();
@@ -392,7 +396,11 @@ fn an_edit_side_value_keeps_its_timebases_spelling() {
       (3, 72),
       "a's fade"
     );
-    assert_eq!(spelling(track.clips()[1].record().timebase()), (2, 48), "b's record");
+    assert_eq!(
+      spelling(track.clips()[1].record().timebase()),
+      (2, 48),
+      "b's record"
+    );
     let dissolve = &track.transitions()[0];
     assert_eq!(spelling(dissolve.at().timebase()), (1, 24), "the cut");
     assert_eq!(spelling(dissolve.in_offset().timebase()), (2, 48), "in");
@@ -413,7 +421,10 @@ fn an_edit_side_value_keeps_its_timebases_spelling() {
   // reciprocal's.
   let mut root = json::parse(&to_otio(&timeline, OtioTarget::V0_15Plus).unwrap()).unwrap();
   assert_eq!(at(&mut root, "metadata.mediaio.start"), &text("1/24"));
-  assert_eq!(at(&mut root, &format!("{A}.metadata.mediaio.record")), &text("4/96"));
+  assert_eq!(
+    at(&mut root, &format!("{A}.metadata.mediaio.record")),
+    &text("4/96")
+  );
   assert_eq!(
     at(&mut root, &format!("{FADE_IN}.metadata.mediaio.timebase")),
     &text("3/72")
@@ -423,7 +434,11 @@ fn an_edit_side_value_keeps_its_timebases_spelling() {
     panic!("the dissolve's words: {words:?}")
   };
   let keys: Vec<&str> = words.iter().map(|(key, _)| key.as_str()).collect();
-  assert_eq!(keys, ["at", "out_offset"], "in_offset spells the reciprocal");
+  assert_eq!(
+    keys,
+    ["at", "out_offset"],
+    "in_offset spells the reciprocal"
+  );
   let b_words = at(&mut root, &format!("{B}.metadata.mediaio"));
   let Value::Object(b_words) = b_words else {
     panic!("b's words: {b_words:?}")
@@ -433,7 +448,10 @@ fn an_edit_side_value_keeps_its_timebases_spelling() {
     "b's record spells the reciprocal"
   );
   assert_eq!(
-    at(&mut root, &format!("{TRACK}.markers.0.metadata.mediaio.timebase")),
+    at(
+      &mut root,
+      &format!("{TRACK}.markers.0.metadata.mediaio.timebase")
+    ),
     &text("1/24")
   );
 }
@@ -455,14 +473,34 @@ fn a_timebase_word_off_the_edit_rate_is_refused_by_name() {
     )),
   );
   // An equal timebase spelled otherwise reads, in its own spelling.
-  let read = read(|root| set(root, &format!("{A}.metadata.mediaio"), "record", text("2/48")))
-    .expect("an equal timebase");
-  assert_eq!(spelling(read.tracks()[0].clips()[0].record().timebase()), (2, 48));
+  let equal = read(|root| {
+    set(
+      root,
+      &format!("{A}.metadata.mediaio"),
+      "record",
+      text("2/48"),
+    )
+  })
+  .expect("an equal timebase");
+  assert_eq!(
+    spelling(equal.tracks()[0].clips()[0].record().timebase()),
+    (2, 48)
+  );
   // A word of the other kind of transition.
   assert_eq!(
     read_edited(OtioTarget::V0_15Plus, |root| {
-      set(&mut *root, &format!("{DISSOLVE}.metadata"), "mediaio", object(vec![]));
-      set(root, &format!("{DISSOLVE}.metadata.mediaio"), "timebase", text("1/24"));
+      set(
+        &mut *root,
+        &format!("{DISSOLVE}.metadata"),
+        "mediaio",
+        object(vec![]),
+      );
+      set(
+        root,
+        &format!("{DISSOLVE}.metadata.mediaio"),
+        "timebase",
+        text("1/24"),
+      );
     }),
     Err(feature(
       Feature::Word("timebase".into()),
@@ -470,7 +508,12 @@ fn a_timebase_word_off_the_edit_rate_is_refused_by_name() {
     )),
   );
   assert_eq!(
-    read(|root| set(root, &format!("{FADE_IN}.metadata.mediaio"), "at", text("1/24"))),
+    read(|root| set(
+      root,
+      &format!("{FADE_IN}.metadata.mediaio"),
+      "at",
+      text("1/24")
+    )),
     Err(feature(
       Feature::Word("at".into()),
       &format!("{FADE_IN}.metadata.mediaio.at")

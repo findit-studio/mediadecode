@@ -225,16 +225,21 @@ fn a_float_reads_only_where_its_text_spells_its_canonical_decimal() {
   }
 }
 
+// The count is kept per thread, which needs `std`: without it the crate's
+// `std` is `alloc`, which has no thread-locals.
+#[cfg(feature = "std")]
 std::thread_local! {
   /// How many times this thread's duplicate checks compared two keys.
   static COMPARISONS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
 }
 
 /// Counts one comparison of two keys, for the law below.
+#[cfg(feature = "std")]
 pub(super) fn compared() {
   COMPARISONS.with(|count| count.set(count.get() + 1));
 }
 
+#[cfg(feature = "std")]
 #[test]
 fn a_large_flat_object_is_checked_for_a_twice_named_key_in_n_log_n_comparisons() {
   use core::fmt::Write as _;
@@ -256,7 +261,10 @@ fn a_large_flat_object_is_checked_for_a_twice_named_key_in_n_log_n_comparisons()
   // log2(n) here, against the n(n - 1)/2 = 2·10^8 of a scan of the keys
   // before each.
   let log2 = usize::BITS - n.leading_zeros();
-  assert!(comparisons >= n - 1, "the check compares every key: {comparisons}");
+  assert!(
+    comparisons >= n - 1,
+    "the check compares every key: {comparisons}"
+  );
   assert!(
     comparisons <= 4 * n * log2 as usize,
     "{comparisons} comparisons for {n} keys",

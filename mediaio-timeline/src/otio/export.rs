@@ -667,11 +667,9 @@ fn track(
         self::clip(clip, source, available, markers, ticks, target)
       }
       Planned::Fade(fade, edge) => fade_transition(fade, edge, Edit { edit, ticks }),
-      Planned::Dissolve(index, transition) => dissolve(
-        transition,
-        Edit { edit, ticks },
-        reordered.then_some(index),
-      ),
+      Planned::Dissolve(index, transition) => {
+        dissolve(transition, Edit { edit, ticks }, reordered.then_some(index))
+      }
     })
     .collect();
   let markers = track
