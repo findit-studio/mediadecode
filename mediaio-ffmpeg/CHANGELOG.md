@@ -44,6 +44,19 @@ The family — `mediadecode`, `mediadecode-ffmpeg`, `mediadecode-webcodecs`,
   error.
 - `CodecId::mime_type` — the descriptor's first MIME type — and the
   `PNG`, `BMP`, `TTF`, `OTF` and `TEXT` ids.
+- What libavformat's packet path reads of a stream, for a muxer that
+  keeps each packet from a rule libavformat would apply only after
+  taking it: `Output::stream_codec` answers a stream's `StreamCodec` — its
+  codec, video delay, sample rate, channels, frame size, the samples its
+  codec fixes in each frame, block alignment, initial padding and
+  extradata — once `add_stream` made it; `Output::shifts_early_times`
+  whether libavformat moves every stream's times for an early first one;
+  and `Output::set_automatic_filters` turns its automatic bitstream
+  filters off, so that every packet reaches the muxer as handed over
+  (`OutputCall::AutomaticFilters`).
+- `CodecId::intra_only` — whether libavformat takes every packet of the
+  codec for a key frame — and `CodecId::bits_per_sample`, with the
+  `LCEVC`, `EVC`, `APV`, `WAVPACK`, `TRUEHD` and `TTML` ids.
 
 ## [0.19.0] - 2026-10-16
 

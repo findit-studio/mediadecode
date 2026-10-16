@@ -63,11 +63,11 @@ use ffmpeg_next::{
   Packet,
   ffi::{
     AV_DISPOSITION_ATTACHED_PIC, AV_INPUT_BUFFER_PADDING_SIZE, AVChapter, AVCodecParameters,
-    AVFMT_FLAG_CUSTOM_IO, AVFMT_NOFILE, AVFMT_NOTIMESTAMPS, AVFMT_TS_NONSTRICT, AVFormatContext,
-    AVRational, AVStream, av_dict_free, av_dict_set, av_dynarray_add_nofree, av_free, av_freep,
-    av_guess_format, av_interleaved_write_frame, av_mallocz, av_write_trailer,
-    avcodec_parameters_copy, avformat_alloc_output_context2, avformat_free_context,
-    avformat_new_stream, avformat_write_header, avio_flush,
+    AVFMT_FLAG_AUTO_BSF, AVFMT_FLAG_CUSTOM_IO, AVFMT_NOFILE, AVFMT_NOTIMESTAMPS, AVFMT_TS_NEGATIVE,
+    AVFMT_TS_NONSTRICT, AVFormatContext, AVRational, AVStream, av_dict_free, av_dict_set,
+    av_dynarray_add_nofree, av_free, av_freep, av_guess_format, av_interleaved_write_frame,
+    av_mallocz, av_write_trailer, avcodec_parameters_copy, avformat_alloc_output_context2,
+    avformat_free_context, avformat_new_stream, avformat_write_header, avio_flush,
   },
   format::context::StreamIo,
   packet::Mut,
@@ -134,6 +134,8 @@ pub enum OutputCall {
   WritePacket,
   /// [`Output::write_trailer`].
   WriteTrailer,
+  /// [`Output::set_automatic_filters`].
+  AutomaticFilters,
 }
 
 /// A text handed to libavformat as a C string.
@@ -406,6 +408,79 @@ impl PacketTimes {
   }
 }
 
+/// What libavformat's packet path reads of a stream's codec parameters,
+/// as the stream holds them once [`Output::add_stream`] made it — the
+/// facts a caller needs to keep a packet from a rule libavformat would
+/// apply only after taking it ([`Output::stream_codec`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamCodec {
+  codec: CodecId,
+  video_delay: i32,
+  sample_rate: i32,
+  channels: i32,
+  frame_size: i32,
+  frame_duration: i32,
+  block_align: i32,
+  initial_padding: i32,
+  extradata: Vec<u8>,
+}
+
+impl StreamCodec {
+  /// The stream's codec.
+  pub const fn codec(&self) -> CodecId {
+    self.codec
+  }
+
+  /// How many frames a video stream's decoder holds back before the
+  /// first comes out (`video_delay`): above zero for a stream that
+  /// reorders, whose packets' presentation times libavformat cannot
+  /// make up from their decode times.
+  pub const fn video_delay(&self) -> i32 {
+    self.video_delay
+  }
+
+  /// An audio stream's sample rate, or `0`.
+  pub const fn sample_rate(&self) -> i32 {
+    self.sample_rate
+  }
+
+  /// An audio stream's channel count, or `0`.
+  pub const fn channels(&self) -> i32 {
+    self.channels
+  }
+
+  /// The samples in each of an audio stream's frames where the codec
+  /// fixes them, or `0`.
+  pub const fn frame_size(&self) -> i32 {
+    self.frame_size
+  }
+
+  /// The samples every frame of an audio stream's codec holds, as
+  /// libavcodec tells them from its parameters alone
+  /// (`av_get_audio_frame_duration2` of no bytes), or `0` where the codec
+  /// does not fix them.
+  pub const fn frame_duration(&self) -> i32 {
+    self.frame_duration
+  }
+
+  /// An audio stream's bytes per block, or `0`.
+  pub const fn block_align(&self) -> i32 {
+    self.block_align
+  }
+
+  /// The samples an audio stream's encoder put before its first, or
+  /// `0`.
+  pub const fn initial_padding(&self) -> i32 {
+    self.initial_padding
+  }
+
+  /// The stream's extradata — its codec's configuration — as the stream
+  /// holds it, without the padding.
+  pub fn extradata(&self) -> &[u8] {
+    &self.extradata
+  }
+}
+
 /// libavformat's muxing context over a caller's sink — see [the
 /// module](self).
 pub struct Output<W> {
@@ -503,6 +578,60 @@ impl<W> Output<W> {
   /// The panic the sink raised, if it raised one.
   pub fn sink_panic(&self) -> Option<Utf8Bytes> {
     self.latch.message()
+  }
+
+  /// Whether libavformat moves every stream's times when the first one it
+  /// writes lies below the lowest its stream allows
+  /// (`handle_avoid_negative_ts`, `libavformat/mux.c` 636–717; the mode,
+  /// 411–421, in FFmpeg 9.0.1). A muxer that takes negative times as they
+  /// are (`AVFMT_TS_NEGATIVE`: MP4) or writes none
+  /// (`AVFMT_NOTIMESTAMPS`) is left alone.
+  pub fn shifts_early_times(&self) -> bool {
+    // SAFETY: as [`Self::container`] — a plain integer field of the
+    // static muxer.
+    let flags = unsafe { (*(*self.ctx.as_ptr()).oformat).flags };
+    flags & (AVFMT_TS_NEGATIVE | AVFMT_NOTIMESTAMPS) == 0
+  }
+
+  /// What libavformat's packet path reads of `stream`'s codec parameters,
+  /// as the stream holds them ([`StreamCodec`]).
+  pub fn stream_codec(&self, stream: usize) -> Result<StreamCodec, OutputError> {
+    let st = self.stream(stream)?;
+    // SAFETY: `st` is a live stream of the live context and its
+    // `codecpar` the stream's own; plain integer fields are read, the
+    // codec id and media type as the integers they are stored as, and the
+    // extradata as the `extradata_size` bytes libavutil allocated (null
+    // when there is none). `av_get_audio_frame_duration2` reads the same
+    // parameters' plain fields and writes nothing.
+    unsafe {
+      let par = (*st).codecpar;
+      let extradata = match ((*par).extradata, usize::try_from((*par).extradata_size)) {
+        (data, Ok(len)) if !data.is_null() && len > 0 => {
+          core::slice::from_raw_parts(data, len).to_vec()
+        }
+        _ => Vec::new(),
+      };
+      // libavcodec reads only the parameters' plain fields, and answers
+      // zero for a codec it does not know.
+      let audio = read_unaligned(addr_of!((*par).codec_type).cast::<i32>())
+        == ffmpeg_next::ffi::AVMediaType::AVMEDIA_TYPE_AUDIO as i32;
+      let frame_duration = if audio {
+        ffmpeg_next::ffi::av_get_audio_frame_duration2(par, 0)
+      } else {
+        0
+      };
+      Ok(StreamCodec {
+        codec: CodecId::from_raw(read_unaligned(addr_of!((*par).codec_id).cast::<i32>())),
+        video_delay: (*par).video_delay,
+        sample_rate: (*par).sample_rate,
+        channels: (*par).ch_layout.nb_channels,
+        frame_size: (*par).frame_size,
+        frame_duration,
+        block_align: (*par).block_align,
+        initial_padding: (*par).initial_padding,
+        extradata,
+      })
+    }
   }
 
   /// The stream at `index`, or a refusal naming it.
@@ -617,6 +746,32 @@ impl<W: Write + Seek + Send + 'static> Output<W> {
       phase: OutputPhase::Building,
       _sink: PhantomData,
     })
+  }
+
+  /// Turns libavformat's automatic bitstream filters on or off
+  /// (`AVFMT_FLAG_AUTO_BSF`, on by default: `libavformat/options_table.h`
+  /// 42 in FFmpeg 9.0.1). With them on, a muxer may filter a stream's
+  /// packets before it writes them (`check_bitstream`, `mux.c` 1056–1073)
+  /// — strip AAC's ADTS headers, join VP9 frames into superframes or PGS
+  /// segments into display sets — so what reaches the file is not what
+  /// was handed over; with them off, every packet is written as it was
+  /// handed over, or refused by the muxer.
+  ///
+  /// Only while the context is being built: libavformat decides at the
+  /// first packet.
+  pub fn set_automatic_filters(&mut self, on: bool) -> Result<(), OutputError> {
+    self.require(OutputCall::AutomaticFilters, OutputPhase::Building)?;
+    // SAFETY: a plain integer field of the live context, read by
+    // libavformat only when it writes a packet, after the header.
+    unsafe {
+      let ctx = self.ctx.as_ptr();
+      if on {
+        (*ctx).flags |= AVFMT_FLAG_AUTO_BSF;
+      } else {
+        (*ctx).flags &= !AVFMT_FLAG_AUTO_BSF;
+      }
+    }
+    Ok(())
   }
 
   /// Adds one stream, as `spec` describes it, and answers its index.

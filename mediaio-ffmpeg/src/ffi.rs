@@ -962,6 +962,11 @@ pub(crate) mod c_shims {
       tags: *const *const ffmpeg_next::ffi::AVCodecTag,
       tag: libc::c_uint,
     ) -> c_int;
+
+    /// `AVCodecID` as `c_int`: the bits one sample of the codec takes
+    /// where its samples have a fixed size, else `0` — libavcodec answers
+    /// every integer from a `switch` over the ids it names.
+    pub(crate) fn av_get_bits_per_sample(codec_id: c_int) -> c_int;
   }
 }
 
