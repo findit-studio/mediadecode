@@ -39,8 +39,8 @@ use mediaencode::{
   },
 };
 use mediaencode_ffmpeg::{
-  ContainerName, FfmpegMuxRefusal, FfmpegMuxer, FfmpegOwnedMuxer, MuxOpenError, MuxStage,
-  OutputError, OutputText, PayloadRule, Rewrite, Uncarried,
+  AutomaticFilter, ContainerName, FfmpegMuxRefusal, FfmpegMuxer, FfmpegOwnedMuxer, MuxOpenError,
+  MuxOptions, MuxStage, OutputError, OutputText, PayloadRule, Rewrite, SideDataFate, Uncarried,
 };
 use mediaio_ffmpeg::{
   CodecTicket, FfmpegBytes, PacketLimits,
@@ -1406,6 +1406,29 @@ fn muxer_into(
   .0
 }
 
+/// A muxer for `container` into `target`, over `table`, as `options` say.
+fn muxer_with(
+  target: &Path,
+  container: ContainerName,
+  table: Vec<TrackDescription<Ffmpeg, FfmpegBytes, CodecTicket>>,
+  options: MuxOptions,
+) -> FfmpegOwnedMuxer<File> {
+  FfmpegOwnedMuxer::open_with(
+    File::create(target).expect("create"),
+    container,
+    table,
+    &[],
+    options,
+  )
+  .expect("open")
+  .0
+}
+
+/// The options with the automatic filters `on` or off.
+fn filters(on: bool) -> MuxOptions {
+  MuxOptions::new().with_automatic_filters(on)
+}
+
 /// The container's own refusal and the packet handed back, or a panic
 /// naming what came instead.
 fn by_container<P: core::fmt::Debug>(
@@ -1824,33 +1847,41 @@ fn l17_an_empty_packet_a_container_drops_is_refused() {
   muxer.finish().expect("finished");
 }
 
-/// **L18 — AAC in ADTS headers is refused by name where the container
-/// takes raw AAC**: a transport stream's AAC into MP4, which would refuse
-/// the first such packet after taking it, and an ADTS packet on a raw AAC
-/// track into Matroska, which would write it as it came.
+/// **L18 — AAC in an ADTS header is refused by name on a track whose
+/// configuration is stated**, into MP4, which would refuse the first such
+/// packet after taking it, and into Matroska, which would write it into a
+/// track that declares raw AAC — the automatic filters on or off, as the
+/// filter would convert it only were it the track's first packet, and then
+/// make a configuration beside the track's.
 #[test]
-fn l18_aac_in_adts_headers_is_refused_by_name() {
+fn l18_aac_in_an_adts_header_is_refused_on_a_configured_track() {
   let Some(corpus) = Corpus::new() else { return };
-  let (table, packets) = first_track(&corpus.transport_stream(), TrackKind::Audio, 1);
-  let mut muxer = muxer_into(&output(&corpus, "l18.mp4"), ContainerName::MP4, table);
-  let adts = audio_at(&audio_of(&packets[0]), 0);
-  assert!(
-    adts.packet().data().as_ref().starts_with(&[0xFF]),
-    "the premise: a transport stream's AAC is framed in ADTS"
-  );
-  let (refusal, back) = by_container(muxer.write_audio(adts.clone()));
-  assert_eq!(refusal, payload(PayloadRule::AdtsHeader));
-  untouched!(adts, back);
-
-  let (table, packets) = first_track(&corpus.multi_track_mkv(), TrackKind::Audio, 1);
-  let mut muxer = muxer_into(&output(&corpus, "l18.mkv"), ContainerName::MATROSKA, table);
+  let source = corpus.multi_track_mkv();
+  let (_, packets) = first_track(&source, TrackKind::Audio, 1);
   let raw = audio_of(&packets[0]);
   let mut framed = vec![0xFF, 0xF1, 0x4C, 0x80, 0x00, 0x00, 0xFC];
   framed.extend_from_slice(raw.data().as_ref());
-  let offered = audio_at(&audio_holding(&raw, &framed), 0);
-  let (refusal, back) = by_container(muxer.write_audio(offered.clone()));
-  assert_eq!(refusal, payload(PayloadRule::AdtsHeader));
-  untouched!(offered, back);
+  for (container, name) in [
+    (ContainerName::MP4, "l18.mp4"),
+    (ContainerName::MATROSKA, "l18.mkv"),
+  ] {
+    for on in [true, false] {
+      let mut muxer = muxer_with(
+        &output(&corpus, name),
+        container.clone(),
+        table_of(&source, TrackKind::Audio),
+        filters(on),
+      );
+      let offered = audio_at(&audio_holding(&raw, &framed), 0);
+      let (refusal, back) = by_container(muxer.write_audio(offered.clone()));
+      assert_eq!(
+        refusal,
+        payload(PayloadRule::AdtsHeader),
+        "{name}, the filters on: {on}"
+      );
+      untouched!(offered, back);
+    }
+  }
 }
 
 /// **L19 — MP4 refuses PCM that is not a whole number of frames**, whose
@@ -2108,9 +2139,9 @@ fn l25_mp4_refuses_ac3_it_would_drop_or_refuse() {
 }
 
 /// **L26 — a configuration the container needs and the track does not
-/// carry is refused at open, by name, and nothing is written**: a
-/// transport stream's AAC into Matroska, H.264 without one into MP4, AV1
-/// without one into WebM.
+/// carry is refused at open, by name, and nothing is written**: H.264
+/// without one into MP4, AV1 without one into WebM. AAC's is refused only
+/// with the automatic filters off (L29).
 #[test]
 fn l26_a_missing_configuration_is_refused_at_open() {
   let Some(corpus) = Corpus::new() else { return };
@@ -2130,11 +2161,6 @@ fn l26_a_missing_configuration_is_refused_at_open() {
     );
     result.map(drop)
   };
-  let (aac, _) = first_track(&corpus.transport_stream(), TrackKind::Audio, 1);
-  assert!(matches!(
-    open("l26.mkv", ContainerName::MATROSKA, aac),
-    Err(MuxOpenError::ConfigurationMissing { track, codec }) if track.get() == 0 && codec == CodecId::AAC
-  ));
   let none = || Some(bytes_of(&[]));
   let (h264, _) = first_track(&corpus.multi_track_mkv(), TrackKind::Video, 1);
   let h264 = h264
@@ -2365,5 +2391,557 @@ fn l28_a_rewrite_is_reported_and_reads_back_so() {
     packets(&output(&corpus, "l28-wavpack.mkv"))[0][0].bytes,
     block.data().as_ref(),
     "read back with the header Matroska rebuilds",
+  );
+}
+
+/// The side data of each packet of `path`'s first track, in order: each
+/// entry's kind and bytes.
+fn side_data_of(path: &Path) -> Vec<Vec<(i32, Vec<u8>)>> {
+  let mut demuxer = FfmpegOwnedDemuxer::open(path).expect("open");
+  let mut out = Vec::new();
+  while let Some(packet) = demuxer.next_packet().expect("a packet or the end") {
+    if packet.track().get() != 0 {
+      continue;
+    }
+    let entries = match &packet {
+      DemuxedPacket::Video(p) => p.packet().extra().side_data().to_vec(),
+      DemuxedPacket::Audio(p) => p.packet().extra().side_data().to_vec(),
+      other => panic!("video or audio: {other:?}"),
+    };
+    out.push(
+      entries
+        .iter()
+        .map(|entry| (entry.kind(), entry.data().to_vec()))
+        .collect(),
+    );
+  }
+  out
+}
+
+/// The lines of `report` a kind of loss fills.
+fn lines(
+  report: &mediaencode_ffmpeg::MuxReport,
+  of: impl Fn(&Uncarried) -> bool,
+) -> Vec<Uncarried> {
+  report
+    .uncarried()
+    .iter()
+    .filter(|line| of(line))
+    .cloned()
+    .collect()
+}
+
+/// **L29 — a transport stream's AAC, framed in ADTS, is remuxed into MP4
+/// and Matroska, the conversion reported**: the automatic filter strips
+/// each frame's header and makes the track's configuration from the first,
+/// as `ffmpeg -c copy` does, and the report names it for the track. Each
+/// frame reads back as its raw AAC. With the filters off nothing makes the
+/// configuration, and the track is refused at open by name, nothing
+/// written.
+#[test]
+fn l29_a_transport_streams_adts_aac_is_converted_and_reported() {
+  let Some(corpus) = Corpus::new() else { return };
+  let ts = corpus.transport_stream();
+  let (_, frames) = first_track(&ts, TrackKind::Audio, 3);
+  let track = TrackIndex::new(0);
+  for (container, name) in [
+    (ContainerName::MP4, "l29.mp4"),
+    (ContainerName::MATROSKA, "l29.mkv"),
+  ] {
+    let target = output(&corpus, name);
+    let (mut muxer, report) = FfmpegOwnedMuxer::open(
+      File::create(&target).expect("create"),
+      container.clone(),
+      table_of(&ts, TrackKind::Audio),
+      &[],
+      PacketLimits::default(),
+    )
+    .expect("the filters make the configuration");
+    assert!(
+      report.uncarried().contains(&Uncarried::Filtered {
+        track,
+        filter: AutomaticFilter::AacAdtsToAsc
+      }),
+      "{name}: {report:?}"
+    );
+    let mut offered = Vec::new();
+    for (index, frame) in frames.iter().enumerate() {
+      let frame = audio_of(frame);
+      let bytes = frame.data().as_ref().to_vec();
+      assert_eq!(
+        (bytes[0], bytes[1] & 0xF0),
+        (0xFF, 0xF0),
+        "the premise: an ADTS frame"
+      );
+      muxer
+        .write_audio(audio_at(&frame, 21 * index as i64))
+        .map_err(|error| error.map_packet(drop))
+        .expect("an ADTS frame the filter converts");
+      offered.push(bytes);
+    }
+    muxer.finish().expect("finished");
+    let written = &packets(&target)[0];
+    assert_eq!(written.len(), offered.len(), "{name}");
+    for (seen, bytes) in written.iter().zip(&offered) {
+      // Seven bytes of header, and two more of CRC where it is present.
+      let header = if bytes[1] & 1 == 1 { 7 } else { 9 };
+      assert_eq!(seen.bytes, bytes[header..], "{name}: the raw frame");
+    }
+    let demuxer = FfmpegOwnedDemuxer::open(&target).expect("open");
+    assert!(
+      !demuxer.tracks()[0].extra().ticket().extradata().is_empty(),
+      "{name}: configured from the first frame's header"
+    );
+  }
+  for (container, name) in [
+    (ContainerName::MP4, "l29-off.mp4"),
+    (ContainerName::MATROSKA, "l29-off.mkv"),
+  ] {
+    let target = output(&corpus, name);
+    let refused = FfmpegOwnedMuxer::open_with(
+      File::create(&target).expect("create"),
+      container,
+      table_of(&ts, TrackKind::Audio),
+      &[],
+      filters(false),
+    );
+    assert!(
+      matches!(
+        refused,
+        Err(MuxOpenError::ConfigurationMissing { track, codec })
+          if track.get() == 0 && codec == CodecId::AAC
+      ),
+      "{name}"
+    );
+    assert_eq!(
+      std::fs::metadata(&target).expect("the file").len(),
+      0,
+      "{name}: nothing was written"
+    );
+  }
+  // The filter's own rule: a packet that is not one ADTS frame — here two
+  // in one — is refused by name, untouched.
+  let mut muxer = muxer_into(
+    &output(&corpus, "l29-two.mp4"),
+    ContainerName::MP4,
+    table_of(&ts, TrackKind::Audio),
+  );
+  let first = audio_of(&frames[0]);
+  let mut two = first.data().as_ref().to_vec();
+  two.extend_from_slice(audio_of(&frames[1]).data().as_ref());
+  let offered = audio_at(&audio_holding(&first, &two), 0);
+  let (refusal, back) = by_container(muxer.write_audio(offered.clone()));
+  assert_eq!(refusal, payload(PayloadRule::AdtsFrame));
+  untouched!(offered, back);
+}
+
+/// **L30 — MP4 keeps a duration only as the distance to the next decode
+/// time, and reports a track whose packets do not abut**, once, when the
+/// packet showing it is written. Packets that abut report nothing.
+#[test]
+fn l30_mp4_reports_the_durations_it_does_not_keep() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = corpus.multi_track_mkv();
+  let (_, frames) = first_track(&source, TrackKind::Video, 3);
+  let at = |frame: &DemuxedPacket<Ffmpeg, FfmpegBytes>, at: i64| {
+    video_at(&video_of(frame).with_duration(Some(ms(40))), Some(at), at)
+  };
+  let durations = |muxer: &FfmpegOwnedMuxer<File>| {
+    lines(muxer.report(), |line| {
+      matches!(
+        line,
+        Uncarried::Rewritten {
+          rewrite: Rewrite::Durations,
+          ..
+        }
+      )
+    })
+  };
+  let mut muxer = muxer_into(
+    &output(&corpus, "l30.mp4"),
+    ContainerName::MP4,
+    table_of(&source, TrackKind::Video),
+  );
+  for (index, frame) in frames.iter().enumerate() {
+    muxer
+      .write_video(at(frame, 40 * index as i64))
+      .map_err(|error| error.map_packet(drop))
+      .expect("a packet");
+  }
+  assert_eq!(durations(&muxer), vec![], "packets that abut lose nothing");
+  muxer.finish().expect("finished");
+
+  let mut muxer = muxer_into(
+    &output(&corpus, "l30-gap.mp4"),
+    ContainerName::MP4,
+    table_of(&source, TrackKind::Video),
+  );
+  muxer
+    .write_video(at(&frames[0], 0))
+    .map_err(|error| error.map_packet(drop))
+    .expect("a packet");
+  assert_eq!(durations(&muxer), vec![], "nothing shows it yet");
+  // 80 ms after the first, which offered 40.
+  muxer
+    .write_video(at(&frames[1], 80))
+    .map_err(|error| error.map_packet(drop))
+    .expect("a packet");
+  let reported = vec![Uncarried::Rewritten {
+    track: TrackIndex::new(0),
+    rewrite: Rewrite::Durations,
+  }];
+  assert_eq!(durations(&muxer), reported);
+  muxer
+    .write_video(at(&frames[2], 200))
+    .map_err(|error| error.map_packet(drop))
+    .expect("a packet");
+  assert_eq!(durations(&muxer), reported, "once for the track");
+  muxer.finish().expect("finished");
+}
+
+/// **L31 — packet side data a container has no place for is reported for
+/// its track, by name, once**: MP4 drops closed captions, and may drop
+/// skip samples; Matroska keeps a block addition of id 1, which reads back
+/// as itself, and drops one of another id.
+#[test]
+fn l31_side_data_a_container_drops_is_reported_by_name() {
+  use ffmpeg_next::ffi::AVPacketSideDataType as T;
+  let Some(corpus) = Corpus::new() else { return };
+  let source = corpus.multi_track_mkv();
+  let (_, video) = first_track(&source, TrackKind::Video, 2);
+  let track = TrackIndex::new(0);
+  let with = |packet: &DemuxedPacket<Ffmpeg, FfmpegBytes>, at: i64, entries: Vec<SideDataEntry>| {
+    let mut packet = video_of(packet)
+      .with_pts(Some(ms(at)))
+      .with_dts(Some(ms(at)));
+    packet.extra_mut().set_side_data(entries);
+    VideoTrackPacket::new(TrackIndex::new(0), packet)
+  };
+  let sides = |report: &mediaencode_ffmpeg::MuxReport| {
+    lines(report, |line| matches!(line, Uncarried::SideData { .. }))
+  };
+
+  let mut muxer = muxer_into(
+    &output(&corpus, "l31.mp4"),
+    ContainerName::MP4,
+    table_of(&source, TrackKind::Video),
+  );
+  for (index, packet) in video.iter().enumerate() {
+    muxer
+      .write_video(with(
+        packet,
+        40 * index as i64,
+        vec![side(T::AV_PKT_DATA_A53_CC, &[1, 2, 3])],
+      ))
+      .map_err(|error| error.map_packet(drop))
+      .expect("a packet");
+  }
+  assert_eq!(
+    sides(muxer.report()),
+    vec![Uncarried::SideData {
+      track,
+      kind: T::AV_PKT_DATA_A53_CC as i32,
+      name: Some("A53 Closed Captions"),
+      fate: SideDataFate::Dropped,
+    }],
+    "once, for two packets"
+  );
+  muxer.finish().expect("finished");
+
+  let (_, audio) = first_track(&source, TrackKind::Audio, 1);
+  let mut muxer = muxer_into(
+    &output(&corpus, "l31-audio.mp4"),
+    ContainerName::MP4,
+    table_of(&source, TrackKind::Audio),
+  );
+  let mut skip = 0u32.to_le_bytes().to_vec();
+  skip.extend(100u32.to_le_bytes());
+  skip.extend([0, 0]);
+  let mut skipping = audio_of(&audio[0])
+    .with_pts(Some(ms(0)))
+    .with_dts(Some(ms(0)));
+  skipping
+    .extra_mut()
+    .set_side_data(vec![side(T::AV_PKT_DATA_SKIP_SAMPLES, &skip)]);
+  muxer
+    .write_audio(AudioTrackPacket::new(track, skipping))
+    .map_err(|error| error.map_packet(drop))
+    .expect("a packet");
+  assert_eq!(
+    sides(muxer.report()),
+    vec![Uncarried::SideData {
+      track,
+      kind: T::AV_PKT_DATA_SKIP_SAMPLES as i32,
+      name: Some("Skip Samples"),
+      fate: SideDataFate::PossiblyDropped,
+    }]
+  );
+  muxer.finish().expect("finished");
+
+  let target = output(&corpus, "l31.mkv");
+  let mut muxer = muxer_into(
+    &target,
+    ContainerName::MATROSKA,
+    table_of(&source, TrackKind::Video),
+  );
+  let addition = |id: u64| {
+    let mut bytes = id.to_be_bytes().to_vec();
+    bytes.extend([7, 7]);
+    bytes
+  };
+  muxer
+    .write_video(with(
+      &video[0],
+      0,
+      vec![side(T::AV_PKT_DATA_MATROSKA_BLOCKADDITIONAL, &addition(1))],
+    ))
+    .map_err(|error| error.map_packet(drop))
+    .expect("a packet");
+  assert_eq!(sides(muxer.report()), vec![], "kept");
+  muxer
+    .write_video(with(
+      &video[1],
+      40,
+      vec![side(T::AV_PKT_DATA_MATROSKA_BLOCKADDITIONAL, &addition(2))],
+    ))
+    .map_err(|error| error.map_packet(drop))
+    .expect("a packet");
+  assert_eq!(
+    sides(muxer.report()),
+    vec![Uncarried::SideData {
+      track,
+      kind: T::AV_PKT_DATA_MATROSKA_BLOCKADDITIONAL as i32,
+      name: Some("Matroska BlockAdditional"),
+      fate: SideDataFate::Dropped,
+    }]
+  );
+  muxer.finish().expect("finished");
+  let read = side_data_of(&target);
+  let kind = T::AV_PKT_DATA_MATROSKA_BLOCKADDITIONAL as i32;
+  assert!(
+    read[0].contains(&(kind, addition(1))),
+    "read back as itself: {read:?}"
+  );
+  assert!(
+    read[1].iter().all(|(entry, _)| *entry != kind),
+    "not written: {read:?}"
+  );
+}
+
+/// PCM in Matroska, whose reader states no channel layout.
+#[rustfmt::skip]
+fn pcm_mkv(corpus: &Corpus) -> PathBuf {
+  generated(corpus, "pcm.mkv", &[
+    "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=0.5",
+    "-ac", "2", "-c:a", "pcm_s16le",
+  ])
+}
+
+/// **L32 — MP4 PCM whose channel layout its `chnl` box cannot write is
+/// refused at open, by name, nothing written**: Matroska's PCM reads back
+/// with no layout, whose channels MP4 can place nowhere, and would fail
+/// the trailer. QuickTime's, its layout stated, is written (L16, L19).
+#[test]
+fn l32_mp4_refuses_pcm_whose_layout_it_cannot_write() {
+  let Some(corpus) = Corpus::new() else { return };
+  let table = table_of(&pcm_mkv(&corpus), TrackKind::Audio);
+  assert_eq!(
+    (
+      table[0].side_data().ch_layout().order(),
+      table[0].side_data().ch_layout().channels()
+    ),
+    (
+      ffmpeg_next::ffi::AVChannelOrder::AV_CHANNEL_ORDER_UNSPEC as i32,
+      2
+    ),
+    "the premise: two channels, no layout"
+  );
+  let target = output(&corpus, "l32.mp4");
+  let refused = FfmpegOwnedMuxer::open(
+    File::create(&target).expect("create"),
+    ContainerName::MP4,
+    table,
+    &[],
+    PacketLimits::default(),
+  );
+  assert!(
+    matches!(refused, Err(MuxOpenError::ChannelLayout { track }) if track.get() == 0),
+    "{refused:?}"
+  );
+  assert_eq!(std::fs::metadata(&target).expect("the file").len(), 0);
+  let (_muxer, _) = FfmpegOwnedMuxer::open(
+    File::create(output(&corpus, "l32.mkv")).expect("create"),
+    ContainerName::MATROSKA,
+    table_of(&pcm_mkv(&corpus), TrackKind::Audio),
+    &[],
+    PacketLimits::default(),
+  )
+  .expect("Matroska writes no layout");
+}
+
+/// TrueHD in Matroska, from libavcodec's experimental encoder.
+#[rustfmt::skip]
+fn truehd_mkv(corpus: &Corpus) -> PathBuf {
+  generated(corpus, "truehd.mkv", &[
+    "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=0.5",
+    "-ac", "2", "-c:a", "truehd", "-strict", "-2",
+  ])
+}
+
+/// **L33 — TrueHD into MP4 is refused at open, by name, nothing written**:
+/// MP4 admits it to its query, and refuses its header unless experiments
+/// are allowed.
+#[test]
+fn l33_mp4_refuses_truehd() {
+  let Some(corpus) = Corpus::new() else { return };
+  let target = output(&corpus, "l33.mp4");
+  let refused = FfmpegOwnedMuxer::open(
+    File::create(&target).expect("create"),
+    ContainerName::MP4,
+    table_of(&truehd_mkv(&corpus), TrackKind::Audio),
+    &[],
+    PacketLimits::default(),
+  );
+  assert!(
+    matches!(
+      refused,
+      Err(MuxOpenError::CodecNotCarried { track, codec })
+        if track.get() == 0 && codec == CodecId::TRUEHD
+    ),
+    "{refused:?}"
+  );
+  assert_eq!(std::fs::metadata(&target).expect("the file").len(), 0);
+}
+
+/// RealVideo 1.0 in RealMedia.
+#[rustfmt::skip]
+fn rv10_rm(corpus: &Corpus) -> PathBuf {
+  generated(corpus, "rv10.rm", &[
+    "-f", "lavfi", "-i", "testsrc2=size=64x48:rate=25:duration=0.2",
+    "-c:v", "rv10",
+  ])
+}
+
+/// **L34 — RealVideo into Matroska is refused at open, by name, nothing
+/// written**: Matroska admits it to its query, and refuses its header.
+#[test]
+fn l34_matroska_refuses_realvideo() {
+  let Some(corpus) = Corpus::new() else { return };
+  let target = output(&corpus, "l34.mkv");
+  let refused = FfmpegOwnedMuxer::open(
+    File::create(&target).expect("create"),
+    ContainerName::MATROSKA,
+    table_of(&rv10_rm(&corpus), TrackKind::Video),
+    &[],
+    PacketLimits::default(),
+  );
+  assert!(
+    matches!(
+      refused,
+      Err(MuxOpenError::CodecNotCarried { track, codec })
+        if track.get() == 0 && codec == CodecId::RV10
+    ),
+    "{refused:?}"
+  );
+  assert_eq!(std::fs::metadata(&target).expect("the file").len(), 0);
+}
+
+/// VP9 in WebM, made by libvpx.
+#[rustfmt::skip]
+fn vp9_webm(corpus: &Corpus) -> PathBuf {
+  generated(corpus, "vp9.webm", &[
+    "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=25:duration=0.2",
+    "-c:v", "libvpx-vp9", "-deadline", "realtime", "-cpu-used", "8",
+  ])
+}
+
+/// **L35 — with the automatic filters on, Matroska joins VP9's hidden
+/// frames into the superframe of the next frame shown, the conversion
+/// reported**: two hidden frames and a shown one read back as one
+/// superframe, at the shown frame's time; a seventh hidden frame in a row
+/// is refused by name. With the filters off, each frame is written as it
+/// was handed over.
+#[test]
+fn l35_vp9_hidden_frames_join_a_superframe() {
+  let Some(corpus) = Corpus::new() else { return };
+  let source = vp9_webm(&corpus);
+  let (_, frames) = first_track(&source, TrackKind::Video, 1);
+  let frame = video_of(&frames[0]);
+  // The frame marker and profile 0, then: shown (`0x82`), hidden (`0x80`).
+  let hidden = |tag: u8| [0x80, tag, tag];
+  let shown = [0x82, 9, 9, 9];
+  let track = TrackIndex::new(0);
+  let target = output(&corpus, "l35.mkv");
+  let (mut muxer, report) = FfmpegOwnedMuxer::open(
+    File::create(&target).expect("create"),
+    ContainerName::MATROSKA,
+    table_of(&source, TrackKind::Video),
+    &[],
+    PacketLimits::default(),
+  )
+  .expect("open");
+  assert!(report.uncarried().contains(&Uncarried::Filtered {
+    track,
+    filter: AutomaticFilter::Vp9Superframe
+  }));
+  for (at, bytes) in [(0, &hidden(1)[..]), (40, &hidden(2)[..]), (80, &shown[..])] {
+    muxer
+      .write_video(video_at(&video_holding(&frame, bytes), Some(at), at))
+      .map_err(|error| error.map_packet(drop))
+      .expect("a frame the filter takes");
+  }
+  for index in 0..6 {
+    let at = 120 + 40 * index;
+    muxer
+      .write_video(video_at(&video_holding(&frame, &hidden(3)), Some(at), at))
+      .map_err(|error| error.map_packet(drop))
+      .expect("up to six hidden frames held");
+  }
+  let seventh = video_at(&video_holding(&frame, &hidden(4)), Some(400), 400);
+  let (refusal, back) = by_container(muxer.write_video(seventh.clone()));
+  assert_eq!(refusal, payload(PayloadRule::Superframe));
+  untouched!(seventh, back);
+  muxer
+    .write_video(video_at(&video_holding(&frame, &shown), Some(440), 440))
+    .map_err(|error| error.map_packet(drop))
+    .expect("the six joined");
+  muxer.finish().expect("finished");
+  let written = &packets(&target)[0];
+  let mut first = [hidden(1).as_slice(), &hidden(2), &shown].concat();
+  // The index: its marker — sizes of one byte, three frames — the sizes,
+  // the marker again.
+  first.extend([0xC2, 3, 3, 4, 0xC2]);
+  assert_eq!(written.len(), 2, "two superframes");
+  assert_eq!(written[0].bytes, first, "the first, joined");
+  assert_eq!(
+    written[0]
+      .pts
+      .and_then(|pts| pts.checked_rescale_with(millis(), Rounding::Nearest))
+      .map(|pts| pts.pts()),
+    Some(80),
+    "at the shown frame's time"
+  );
+
+  let off = output(&corpus, "l35-off.mkv");
+  let mut muxer = muxer_with(
+    &off,
+    ContainerName::MATROSKA,
+    table_of(&source, TrackKind::Video),
+    filters(false),
+  );
+  for (at, bytes) in [(0, &hidden(1)[..]), (40, &hidden(2)[..]), (80, &shown[..])] {
+    muxer
+      .write_video(video_at(&video_holding(&frame, bytes), Some(at), at))
+      .map_err(|error| error.map_packet(drop))
+      .expect("a frame");
+  }
+  muxer.finish().expect("finished");
+  assert_eq!(
+    packets(&off)[0]
+      .iter()
+      .map(|seen| seen.bytes.clone())
+      .collect::<Vec<_>>(),
+    vec![hidden(1).to_vec(), hidden(2).to_vec(), shown.to_vec()],
+    "each as handed over"
   );
 }

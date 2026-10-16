@@ -364,16 +364,46 @@ fn a_rescale_rounds_as_av_rescale_q_does() {
 /// reads Annex B by its start code.
 #[test]
 fn a_configuration_is_judged_and_its_rewrite_reported() {
-  let rewrites_of = |family, kind, codec, extradata: &[u8]| {
-    rewrites(family, kind, codec, extradata, true).collect::<Vec<_>>()
+  let rewrites_of = |family, _kind: TrackKind, codec, extradata: &[u8]| {
+    rewrites(family, codec, extradata, true).collect::<Vec<_>>()
   };
-  assert!(configuration_missing(Family::Mp4, CodecId::H264, &[]));
-  assert!(configuration_missing(Family::Mp4, CodecId::HEVC, &[]));
-  assert!(!configuration_missing(Family::Mp4, CodecId::H264, &[1, 2]));
-  assert!(configuration_missing(Family::Matroska, CodecId::AV1, &[]));
-  assert!(configuration_missing(Family::WebM, CodecId::AV1, &[]));
-  assert!(configuration_missing(Family::Matroska, CodecId::AAC, &[]));
-  assert!(!configuration_missing(Family::Other, CodecId::H264, &[]));
+  assert!(configuration_missing(Family::Mp4, CodecId::H264, &[], true));
+  assert!(configuration_missing(Family::Mp4, CodecId::HEVC, &[], true));
+  assert!(!configuration_missing(
+    Family::Mp4,
+    CodecId::H264,
+    &[1, 2],
+    true
+  ));
+  assert!(configuration_missing(
+    Family::Matroska,
+    CodecId::AV1,
+    &[],
+    true
+  ));
+  assert!(configuration_missing(Family::WebM, CodecId::AV1, &[], true));
+  assert!(!configuration_missing(
+    Family::Other,
+    CodecId::H264,
+    &[],
+    true
+  ));
+  // AAC's comes from its first ADTS header with the automatic filters on;
+  // with them off MP4 and Matroska need it stated.
+  for family in [Family::Mp4, Family::Matroska] {
+    assert!(
+      configuration_missing(family, CodecId::AAC, &[], false),
+      "{family:?}"
+    );
+    assert!(
+      !configuration_missing(family, CodecId::AAC, &[], true),
+      "{family:?}"
+    );
+    assert!(
+      !configuration_missing(family, CodecId::AAC, &[0x11, 0x90], false),
+      "{family:?}"
+    );
+  }
   let avcc = [1, 0x64, 0, 0x1F];
   let annex = [0, 0, 0, 1, 0x67];
   assert_eq!(
@@ -421,7 +451,7 @@ fn a_configuration_is_judged_and_its_rewrite_reported() {
       CodecId::TTML,
       b"lavc-ttmlenc"
     ),
-    vec![Rewrite::ParagraphsJoined, Rewrite::Durations]
+    vec![Rewrite::ParagraphsJoined]
   );
   assert_eq!(
     rewrites_of(Family::Mp4, TrackKind::Audio, CodecId::EAC3, &[]),
@@ -438,14 +468,15 @@ fn a_configuration_is_judged_and_its_rewrite_reported() {
   );
 }
 
-/// **The durations a container does not keep are reported**: MP4's of a
-/// subtitle or data track other than `mov_text`, and Matroska's and
-/// WebM's of a video or audio track with no default duration; APV's size
-/// prefix is not, as MP4's reader takes it back off.
+/// **The durations a container does not keep are reported at open**:
+/// Matroska's and WebM's of a video or audio track with no default
+/// duration. MP4's are reported while writing, where the packets do not
+/// abut, so none is at open; APV's size prefix is not, as MP4's reader
+/// takes it back off.
 #[test]
 fn a_duration_the_container_does_not_keep_is_reported() {
-  let rewrites_of = |family, kind, codec, default_duration| {
-    rewrites(family, kind, codec, &[], default_duration).collect::<Vec<_>>()
+  let rewrites_of = |family, _kind: TrackKind, codec, default_duration| {
+    rewrites(family, codec, &[], default_duration).collect::<Vec<_>>()
   };
   for family in [Family::Matroska, Family::WebM] {
     assert_eq!(
@@ -468,8 +499,8 @@ fn a_duration_the_container_does_not_keep_is_reported() {
     rewrites_of(Family::Mp4, TrackKind::Video, CodecId::APV, true),
     vec![]
   );
-  assert!(configuration_missing(Family::Mp4, CodecId::EVC, &[]));
-  assert!(!configuration_missing(Family::Mp4, CodecId::VP9, &[]));
+  assert!(configuration_missing(Family::Mp4, CodecId::EVC, &[], true));
+  assert!(!configuration_missing(Family::Mp4, CodecId::VP9, &[], true));
 }
 
 /// A ProRes frame of `len` bytes, opening on its atom.
@@ -689,4 +720,424 @@ fn mp4s_ac3_handling_is_mirrored() {
     ac3_packet(held, true, &independent),
     Err(PayloadRule::Ac3Blocks)
   );
+}
+
+/// An ADTS frame `len` bytes long: its header — a CRC after it where `crc`,
+/// MPEG-4 AAC LC at the sample rate index `rate`, the channel configuration
+/// `channels`, `blocks` raw data blocks less one — then `payload` to the
+/// frame's end.
+fn adts(len: usize, crc: bool, rate: u8, channels: u8, blocks: u8, payload: u8) -> Vec<u8> {
+  let fields: [(u64, u32); 15] = [
+    (0xFFF, 12),
+    (0, 1),
+    (0, 2),
+    (u64::from(!crc), 1),
+    (1, 2),
+    (u64::from(rate), 4),
+    (0, 1),
+    (u64::from(channels), 3),
+    (0, 1),
+    (0, 1),
+    (0, 1),
+    (0, 1),
+    (len as u64, 13),
+    (0x7FF, 11),
+    (u64::from(blocks), 2),
+  ];
+  let header = fields
+    .iter()
+    .fold(0u64, |bits, &(value, width)| (bits << width) | value);
+  let mut frame = header.to_be_bytes()[1..].to_vec();
+  frame.resize(len, payload);
+  frame
+}
+
+/// **An ADTS frame is one the automatic filter converts whole**: its sync
+/// word, a sample rate the table names, a frame length of the packet's
+/// own, no CRC over several raw data blocks, bytes after the header and
+/// its CRC, and on the track's first frame a channel configuration or a
+/// program config element opening the payload.
+#[test]
+fn an_adts_frame_is_one_the_automatic_filter_converts_whole() {
+  let frame = adts(20, false, 3, 2, 0, 0x21);
+  assert!(adts_frame(&frame, true));
+  assert!(adts_frame(&frame, false));
+  assert!(!adts_frame(&frame[..6], false), "shorter than its header");
+  let mut sync = frame.clone();
+  sync[0] = 0x7F;
+  assert!(!adts_frame(&sync, false), "no sync word");
+  assert!(
+    !adts_frame(&adts(20, false, 13, 2, 0, 0x21), false),
+    "a sample rate the table does not name"
+  );
+  assert!(
+    !adts_frame(&adts(21, false, 3, 2, 0, 0x21)[..20], false),
+    "a frame longer than its packet"
+  );
+  let mut two = frame.clone();
+  two.extend(adts(20, false, 3, 2, 0, 0x21));
+  assert!(
+    !adts_frame(&two, false),
+    "two frames: the filter strips the first header alone"
+  );
+  assert!(
+    !adts_frame(&adts(20, true, 3, 2, 1, 0x21), false),
+    "a CRC over two raw data blocks"
+  );
+  assert!(
+    adts_frame(&adts(20, true, 3, 2, 0, 0x21), false),
+    "a CRC over one"
+  );
+  assert!(
+    !adts_frame(&adts(9, true, 3, 2, 0, 0x21), false),
+    "nothing after the header and its CRC"
+  );
+  assert!(
+    !adts_frame(&adts(7, false, 3, 2, 0, 0x21), false),
+    "nothing after the header"
+  );
+  // A first frame whose channels are its program config element's opens
+  // its payload with one, element id 5; a later frame is not asked.
+  assert!(adts_frame(&adts(20, false, 3, 0, 0, 0b1010_0000), true));
+  assert!(!adts_frame(&adts(20, false, 3, 0, 0, 0x21), true));
+  assert!(adts_frame(&adts(20, false, 3, 0, 0, 0x21), false));
+}
+
+/// **VP9's hidden frames are held and joined as the superframe filter holds
+/// and joins them**: a frame shown passes, or joins those held; a hidden
+/// one is held, its times dropped; a superframe or an empty packet passes
+/// where none is held and is refused where some are; a seventh hidden frame
+/// in a row is refused.
+#[test]
+fn vp9_hidden_frames_are_held_and_joined_as_the_filter_holds_them() {
+  // The frame marker, profile 0, then show-existing, frame type and show
+  // bits: `0x82` is shown, `0x80` hidden, `0x88` shows an existing frame.
+  let (shown, hidden, existing) = ([0x82, 1], [0x80, 1], [0x88, 1]);
+  // Profile 3 reads a reserved bit before the rest.
+  let (hidden_3, shown_3) = ([0xB0, 1], [0xB1, 1]);
+  // Two frames of two bytes, then the index: its marker, two sizes of one
+  // byte, its marker again.
+  let superframe = [0x80, 1, 0x82, 2, 0xC1, 2, 2, 0xC1];
+  assert_eq!(vp9_superframe(0, &shown), Ok((0, true)));
+  assert_eq!(vp9_superframe(0, &existing), Ok((0, true)));
+  assert_eq!(vp9_superframe(0, &hidden), Ok((1, false)));
+  assert_eq!(vp9_superframe(0, &hidden_3), Ok((1, false)));
+  assert_eq!(vp9_superframe(1, &shown_3), Ok((0, true)), "joined");
+  assert_eq!(vp9_superframe(0, &superframe), Ok((0, true)));
+  assert_eq!(vp9_superframe(1, &superframe), Err(PayloadRule::Superframe));
+  assert_eq!(vp9_superframe(0, &[]), Ok((0, true)));
+  assert_eq!(vp9_superframe(2, &[]), Err(PayloadRule::Superframe));
+  assert_eq!(vp9_superframe(5, &hidden), Ok((6, false)));
+  assert_eq!(
+    vp9_superframe(6, &hidden),
+    Err(PayloadRule::Superframe),
+    "a seventh in a row"
+  );
+  assert_eq!(vp9_superframe(6, &shown), Ok((0, true)), "seven joined");
+  // An index whose first marker does not match is no superframe: a frame
+  // shown, of any bytes.
+  assert_eq!(vp9_superframe(1, &[0x82, 1, 2, 0xC1]), Ok((0, true)));
+}
+
+/// One PGS segment of `kind` with `payload` bytes after its header.
+fn segment(kind: u8, payload: usize) -> Vec<u8> {
+  let mut bytes = vec![kind];
+  bytes.extend(u16::try_from(payload).expect("small").to_be_bytes());
+  bytes.extend(vec![0x40; payload]);
+  bytes
+}
+
+/// **PGS segments are joined into display sets as the filter joins them**:
+/// a whole set passes; a set across packets is held to its end, timed by
+/// its presentation segment's packet; a set completed with no presentation
+/// segment, segments that do not parse, and an empty packet are refused.
+#[test]
+fn pgs_segments_are_joined_into_display_sets_as_the_filter_joins_them() {
+  let start = PgsState::default();
+  let (pcs, end, ods) = (segment(0x16, 8), segment(0x80, 0), segment(0x15, 4));
+  let whole = [pcs.clone(), ods.clone(), end.clone()].concat();
+  assert_eq!(pgs_frame_merge(start, &whole), Ok((start, true)));
+  let held = PgsState {
+    holding: true,
+    presentation: true,
+  };
+  assert_eq!(pgs_frame_merge(start, &pcs), Ok((held, true)));
+  assert_eq!(
+    pgs_frame_merge(held, &[ods.clone(), end.clone()].concat()),
+    Ok((start, false)),
+    "the set is timed by its presentation segment's packet"
+  );
+  let unpresented = PgsState {
+    holding: true,
+    presentation: false,
+  };
+  assert_eq!(pgs_frame_merge(start, &ods), Ok((unpresented, false)));
+  assert_eq!(
+    pgs_frame_merge(unpresented, &end),
+    Err(PayloadRule::PgsSegments)
+  );
+  assert_eq!(
+    pgs_frame_merge(start, &[ods.clone(), end.clone()].concat()),
+    Err(PayloadRule::PgsSegments),
+    "a whole set with no presentation segment"
+  );
+  assert_eq!(
+    pgs_frame_merge(start, &pcs[..6]),
+    Err(PayloadRule::PgsSegments),
+    "a segment past the packet"
+  );
+  assert_eq!(
+    pgs_frame_merge(start, &[pcs.clone(), pcs.clone(), end.clone()].concat()),
+    Err(PayloadRule::PgsSegments),
+    "two presentation segments in a set"
+  );
+  assert_eq!(
+    pgs_frame_merge(start, &[segment(0x16, 2), end.clone()].concat()),
+    Err(PayloadRule::PgsSegments),
+    "a presentation segment shorter than 11 bytes"
+  );
+  assert_eq!(
+    pgs_frame_merge(start, &[whole.clone(), whole.clone()].concat()),
+    Ok((start, true)),
+    "two sets in one packet"
+  );
+  assert_eq!(pgs_frame_merge(start, &[]), Err(PayloadRule::Empty));
+}
+
+/// **MP4's PCM takes the channel layouts its `chnl` box writes**: every
+/// channel one ISO/IEC 23001-8 gives a position; an unspecified layout
+/// names none, and a downmix's or an ambisonic layout's channels have none.
+/// One channel writes no `chnl`, and another codec none either.
+#[test]
+fn mp4_pcm_takes_the_layouts_its_chnl_box_writes() {
+  use AVChannelOrder as Order;
+  let native = |mask: u64, channels: i32| LayoutView {
+    order: Order::AV_CHANNEL_ORDER_NATIVE as i32,
+    channels,
+    mask,
+    map: &[],
+  };
+  let unspecified = LayoutView {
+    order: Order::AV_CHANNEL_ORDER_UNSPEC as i32,
+    channels: 2,
+    mask: 0,
+    map: &[],
+  };
+  assert!(mp4_pcm_layout_written(CodecId::PCM_S16LE, native(0b11, 2)));
+  // 5.1 (side): FL FR FC LFE SL SR.
+  assert!(mp4_pcm_layout_written(CodecId::PCM_S24LE, native(0x60F, 6)));
+  assert!(!mp4_pcm_layout_written(CodecId::PCM_S16LE, unspecified));
+  assert!(mp4_pcm_layout_written(
+    CodecId::PCM_S16LE,
+    LayoutView {
+      channels: 1,
+      ..unspecified
+    }
+  ));
+  // The stereo downmix's two channels.
+  assert!(!mp4_pcm_layout_written(
+    CodecId::PCM_F32LE,
+    native((1 << 29) | (1 << 30), 2)
+  ));
+  let custom = |channels: &[AVChannel]| {
+    channels
+      .iter()
+      .map(|&channel| CustomChannel::new(channel as i32, [0; 16]))
+      .collect::<Vec<_>>()
+  };
+  let front = custom(&[
+    AVChannel::AV_CHAN_FRONT_LEFT,
+    AVChannel::AV_CHAN_FRONT_RIGHT,
+  ]);
+  let unknown = custom(&[AVChannel::AV_CHAN_UNKNOWN, AVChannel::AV_CHAN_FRONT_RIGHT]);
+  let of = |map| LayoutView {
+    order: Order::AV_CHANNEL_ORDER_CUSTOM as i32,
+    channels: 2,
+    mask: 0,
+    map,
+  };
+  assert!(mp4_pcm_layout_written(CodecId::PCM_S32LE, of(&front)));
+  assert!(!mp4_pcm_layout_written(CodecId::PCM_S32LE, of(&unknown)));
+  let ambisonic = LayoutView {
+    order: Order::AV_CHANNEL_ORDER_AMBISONIC as i32,
+    channels: 6,
+    mask: 0b11,
+    map: &[],
+  };
+  assert!(!mp4_pcm_layout_written(CodecId::PCM_S16LE, ambisonic));
+  assert!(mp4_pcm_layout_written(CodecId::AAC, unspecified));
+  // As `av_channel_layout_channel_from_index` names each channel.
+  assert_eq!(native(0b1010, 2).channel_at(1), Some(3));
+  assert_eq!(native(0b1010, 2).channel_at(2), None);
+  assert_eq!(unspecified.channel_at(0), None);
+  assert_eq!(
+    ambisonic.channel_at(3),
+    Some(AVChannel::AV_CHAN_AMBISONIC_BASE as i32 + 3)
+  );
+  assert_eq!(ambisonic.channel_at(4), Some(0));
+  assert_eq!(ambisonic.channel_at(5), Some(1));
+}
+
+/// **Each container keeps the packet side data it has a place for**, by
+/// the side-data table: MP4 its new extradata, and its skip samples
+/// possibly; Matroska and WebM an audio block's end skip and its first
+/// start skip, a WebVTT cue's lines, a block addition of id 1, a video
+/// block's T.35 additions; neither anything else; another container
+/// nothing claimed.
+#[test]
+fn each_container_keeps_the_side_data_it_has_a_place_for() {
+  use AVPacketSideDataType as T;
+  use SideDataFate::{Dropped, PossiblyDropped};
+  let entry = |kind: T, data: &[u8]| {
+    SideDataEntry::new(
+      kind as i32,
+      FfmpegBytes::try_copy_from_slice(data).expect("a copy"),
+    )
+  };
+  let rules = |family, kind, codec| SideRules {
+    family,
+    kind,
+    codec,
+    sample_rate: 48_000,
+    frame_size: 1024,
+    initial_padding: 1024,
+    extradata: vec![0x11, 0x90],
+  };
+  let skip = |start: u32, end: u32| {
+    let mut bytes = start.to_le_bytes().to_vec();
+    bytes.extend(end.to_le_bytes());
+    bytes.extend([0, 0]);
+    bytes
+  };
+  let mp4 = rules(Family::Mp4, TrackKind::Audio, CodecId::AAC);
+  let skipping = entry(T::AV_PKT_DATA_SKIP_SAMPLES, &skip(0, 100));
+  assert_eq!(
+    mp4.fate(&entry(T::AV_PKT_DATA_NEW_EXTRADATA, &[0x12, 0x10]), false),
+    None
+  );
+  assert_eq!(mp4.fate(&skipping, false), Some(PossiblyDropped));
+  assert_eq!(
+    mp4.fate(&entry(T::AV_PKT_DATA_SKIP_SAMPLES, &skip(0, 0)), false),
+    None,
+    "it says nothing"
+  );
+  let unframed = SideRules {
+    frame_size: 0,
+    ..mp4.clone()
+  };
+  assert_eq!(unframed.fate(&skipping, false), Some(Dropped));
+  assert_eq!(
+    mp4.fate(&entry(T::AV_PKT_DATA_PRFT, &[1; 24]), false),
+    Some(Dropped)
+  );
+  assert_eq!(
+    mp4.fate(&entry(T::AV_PKT_DATA_A53_CC, &[1]), false),
+    Some(Dropped)
+  );
+
+  let mkv = rules(Family::Matroska, TrackKind::Audio, CodecId::AAC);
+  let start = entry(T::AV_PKT_DATA_SKIP_SAMPLES, &skip(1024, 0));
+  assert_eq!(mkv.fate(&skipping, false), None, "as discard padding");
+  assert_eq!(mkv.fate(&start, true), None, "as the codec delay");
+  assert_eq!(mkv.fate(&start, false), Some(Dropped), "after the first");
+  assert_eq!(
+    mkv.fate(&entry(T::AV_PKT_DATA_SKIP_SAMPLES, &skip(100, 0)), true),
+    Some(Dropped),
+    "another than the stream's padding"
+  );
+  let mut reasons = skip(0, 100);
+  reasons[8] = 1;
+  assert_eq!(
+    mkv.fate(&entry(T::AV_PKT_DATA_SKIP_SAMPLES, &reasons), false),
+    Some(Dropped)
+  );
+  assert_eq!(
+    mkv.fate(&entry(T::AV_PKT_DATA_NEW_EXTRADATA, &[0x12, 0x10]), false),
+    Some(PossiblyDropped)
+  );
+  assert_eq!(
+    mkv.fate(&entry(T::AV_PKT_DATA_NEW_EXTRADATA, &[0x11, 0x90]), false),
+    None,
+    "the track's own"
+  );
+
+  let video = rules(Family::WebM, TrackKind::Video, CodecId::VP9);
+  assert_eq!(
+    video.fate(&entry(T::AV_PKT_DATA_NEW_EXTRADATA, &[1, 2]), false),
+    Some(Dropped)
+  );
+  for kind in [
+    T::AV_PKT_DATA_DYNAMIC_HDR10_PLUS,
+    T::AV_PKT_DATA_DYNAMIC_HDR_SMPTE_2094_APP5,
+    T::AV_PKT_DATA_LCEVC,
+  ] {
+    assert_eq!(video.fate(&entry(kind, &[1]), false), None, "{kind:?}");
+    assert_eq!(
+      mkv.fate(&entry(kind, &[1]), false),
+      Some(Dropped),
+      "{kind:?} on an audio track"
+    );
+  }
+  let addition = |id: u64| {
+    let mut bytes = id.to_be_bytes().to_vec();
+    bytes.push(7);
+    entry(T::AV_PKT_DATA_MATROSKA_BLOCKADDITIONAL, &bytes)
+  };
+  assert_eq!(video.fate(&addition(1), false), None);
+  assert_eq!(video.fate(&addition(2), false), Some(Dropped));
+  let webvtt = rules(Family::Matroska, TrackKind::Subtitle, CodecId::WEBVTT);
+  let identifier = entry(T::AV_PKT_DATA_WEBVTT_IDENTIFIER, b"id");
+  assert_eq!(webvtt.fate(&identifier, false), None);
+  assert_eq!(mkv.fate(&identifier, false), Some(Dropped));
+  assert_eq!(mp4.fate(&identifier, false), Some(Dropped));
+  assert_eq!(
+    SideRules::unclaimed().fate(&entry(T::AV_PKT_DATA_A53_CC, &[1]), false),
+    None,
+    "nothing is claimed of another container"
+  );
+}
+
+/// **The automatic filters are those libavformat inserts**: AAC's in MP4
+/// and Matroska for a track with no configuration, VP9's in MP4, Matroska
+/// and WebM, PGS's in Matroska; none with the filters off, and none
+/// claimed of another container.
+#[test]
+fn the_automatic_filters_are_those_libavformat_inserts() {
+  use AutomaticFilter as A;
+  let named =
+    |family, codec, extradata: &[u8], on| Filter::settle(family, codec, extradata, on).named();
+  for family in [Family::Mp4, Family::Matroska] {
+    assert_eq!(
+      named(family, CodecId::AAC, &[], true),
+      Some(A::AacAdtsToAsc)
+    );
+    assert_eq!(named(family, CodecId::AAC, &[0x11, 0x90], true), None);
+  }
+  for family in [Family::Mp4, Family::Matroska, Family::WebM] {
+    assert_eq!(
+      named(family, CodecId::VP9, &[], true),
+      Some(A::Vp9Superframe)
+    );
+  }
+  assert_eq!(
+    named(Family::Matroska, CodecId::HDMV_PGS_SUBTITLE, &[], true),
+    Some(A::PgsFrameMerge)
+  );
+  assert_eq!(
+    named(Family::Mp4, CodecId::HDMV_PGS_SUBTITLE, &[], true),
+    None
+  );
+  assert_eq!(named(Family::Matroska, CodecId::VP9, &[], false), None);
+  assert_eq!(named(Family::Other, CodecId::VP9, &[], true), None);
+  assert_eq!(A::AacAdtsToAsc.name(), "aac_adtstoasc");
+  assert_eq!(A::Vp9Superframe.to_string(), "vp9_superframe");
+  assert_eq!(A::PgsFrameMerge.name(), "pgs_frame_merge");
+  // The headers that refuse what the query admits.
+  assert!(header_refuses(Family::Mp4, CodecId::TRUEHD));
+  assert!(!header_refuses(Family::Matroska, CodecId::TRUEHD));
+  for codec in [CodecId::COOK, CodecId::RV10, CodecId::RV30, CodecId::ATRAC3] {
+    assert!(header_refuses(Family::Matroska, codec), "{codec:?}");
+    assert!(header_refuses(Family::WebM, codec), "{codec:?}");
+  }
+  assert!(!header_refuses(Family::Other, CodecId::TRUEHD));
 }

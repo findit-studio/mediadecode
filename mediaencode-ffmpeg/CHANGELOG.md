@@ -16,7 +16,10 @@ The family releases in lockstep.
   (`ContainerName`). `open` takes the sink, the container, the track
   table with each track's `CodecTicket`, the chapters and the packet
   limits, refuses by name what the container cannot take
-  (`MuxOpenError`) and reports what it drops (`MuxReport`, `Uncarried`).
+  (`MuxOpenError`) and reports what it drops (`MuxReport`, `Uncarried`);
+  `open_with` takes `MuxOptions` — the packet limits and whether
+  libavformat's automatic bitstream filters run — and the muxer's own
+  `report` grows with what it learns writing.
   Matroska keeps attachments with their filename and MIME type, MP4 keeps
   cover art; the report follows each track's road, naming the flags an
   attachment loses in Matroska and the filename, MIME type, language and
@@ -37,18 +40,43 @@ The family releases in lockstep.
   container writes; an MP4 `mov_text` cue out of order; an unmarked key
   frame of a codec of key frames alone (`FfmpegMuxRefusal`); and a
   packet's bytes or side data the container would refuse or write
-  otherwise — an empty packet it drops, AAC in ADTS headers, partial PCM,
+  otherwise — an empty packet it drops, AAC in an ADTS header on a track
+  whose configuration is stated, partial PCM,
   AV1 OBUs or WavPack blocks that do not parse, MP4 skip-samples below
   nothing, Matroska's new FLAC STREAMINFO of another length, a ProRes
   packet off its atom, a WebVTT cue that would not read back, an AC-3
   frame MP4 would drop or refuse (`FfmpegMuxRefusal::Payload`,
-  `PayloadRule`). A track whose configuration the container needs and
-  the track lacks is refused at open (`MuxOpenError::ConfigurationMissing`).
+  `PayloadRule`). Refused at open: a track whose configuration the
+  container needs and the track lacks (`MuxOpenError::ConfigurationMissing`),
+  AAC's only with the automatic filters off; TrueHD into MP4, and ATRAC3,
+  Cook, RealAudio 2.0, SIPR and RealVideo 1.0, 2.0 and 3.0 into Matroska,
+  whose headers refuse them (`MuxOpenError::CodecNotCarried`); MP4 PCM of
+  a channel layout its `chnl` box cannot write, an unspecified one among
+  them, which would fail the trailer (`MuxOpenError::ChannelLayout`).
   Reported at open (`Uncarried::Rewritten`, `Rewrite`): length prefixes
   for Annex B, filtered OBUs, MP4's joined E-AC-3, `mov_text` cue ends and
-  joined TTML paragraphs, sync from the bitstream, durations the container
-  does not keep, Matroska's stripped WavPack headers. The automatic
-  bitstream filters are off in these containers.
+  joined TTML paragraphs, sync from the bitstream, Matroska's and WebM's
+  durations without a default duration, Matroska's stripped WavPack
+  headers. Reported while writing (`CarrierMuxer::report`): MP4's
+  durations, where a track's packets do not abut.
+- **The automatic filters, on by default, each reported.** libavformat's
+  automatic bitstream filters run as `ffmpeg -c copy` runs them —
+  `aac_adtstoasc` for MP4's and Matroska's AAC framed in ADTS with no
+  configuration, `vp9_superframe` for VP9 in MP4, Matroska and WebM,
+  `pgs_frame_merge` for Matroska's PGS — each named for its track at open
+  (`Uncarried::Filtered`, `AutomaticFilter`). The first packet decides:
+  libavformat inserts a track's filter at its first packet, and the muxer
+  admits there only what the filter converts, refusing by name what it
+  would refuse after taking it (`PayloadRule::AdtsFrame`, `Superframe`,
+  `PgsSegments`). A packet the filter holds meets no rule of its times. A
+  caller turns them off with `MuxOptions::set_automatic_filters`, and the
+  refusals by name apply instead.
+- **Packet side data, by the side-data table.** What each container
+  writes of a packet's side data, from its source: a kind it has no place
+  for, or keeps only in part, is reported for its track by name the first
+  time a packet carrying it is written (`Uncarried::SideData`,
+  `SideDataFate::Dropped`), and a kind whose fate the source does not
+  settle as possibly dropped (`SideDataFate::PossiblyDropped`).
 - **The report table.** What a road keeps of a track's filename, MIME
   type, language and each disposition flag, per container, is one
   table the report and the stream's disposition both read: Matroska's

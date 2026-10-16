@@ -47,7 +47,23 @@ parameters are rebuilt from, an attachment track with its one file.
   (`FfmpegMuxRefusal::Payload`, `PayloadRule`) — or reported at open,
   where the container writes a track's packets in a form of its own
   (`Uncarried::Rewritten`, `Rewrite`), or written and read back as handed
-  over. No automatic bitstream filter rewrites a packet first.
+  over. MP4's durations, which it keeps only as the distances between
+  packets, are reported as they are lost, in the muxer's own `report`.
+- **libavformat's automatic bitstream filters run, each reported.** As
+  `ffmpeg -c copy` runs them: AAC's ADTS headers stripped where the track
+  states no configuration, VP9's hidden frames joined into superframes,
+  PGS segments joined into display sets — each named for its track at
+  open (`Uncarried::Filtered`). libavformat inserts a filter at a track's
+  first packet, so the first packet decides, and the muxer admits only
+  what the filter converts. `MuxOptions::set_automatic_filters(false)`
+  turns them off, and the refusals by name apply instead.
+- **Packet side data a container has no place for is reported**, by
+  name, for its track (`Uncarried::SideData`), from a table of what each
+  container writes; where the source does not settle a kind's fate, it is
+  reported as possibly dropped.
+- **What a header or trailer would refuse is refused at open**: TrueHD
+  into MP4, RealMedia's codecs into Matroska, MP4 PCM of a channel layout
+  it cannot write (`MuxOpenError`).
 - **Packets are copied into libavformat**, never lent, and a sink that
   panics is caught before C sees the unwind, named in the muxer's fault,
   and never called again.
