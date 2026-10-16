@@ -286,11 +286,7 @@ fn media_reference(value: &Value, path: &str, target: OtioTarget) -> Result<(), 
       let (kind, at) = required(members, path, "generator_kind")?;
       string(kind, &at)?;
       let (parameters, at) = required(members, path, "parameters")?;
-      plain(
-        parameters,
-        &at,
-        "no schema: parameters is a dictionary",
-      )?;
+      plain(parameters, &at, "no schema: parameters is a dictionary")?;
       contents(parameters, &at, target)?;
       &["generator_kind", "parameters"]
     }
@@ -693,7 +689,10 @@ fn integer(value: &Value, path: &str) -> Result<(), Shape> {
   if whole {
     Ok(())
   } else {
-    Err(shape(path, "a whole number, without a fraction or an exponent"))
+    Err(shape(
+      path,
+      "a whole number, without a fraction or an exponent",
+    ))
   }
 }
 
