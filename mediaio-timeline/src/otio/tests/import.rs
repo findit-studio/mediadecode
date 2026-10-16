@@ -1180,7 +1180,7 @@ fn absent_metadata_reads_as_no_note_and_a_needed_word_is_refused_by_name() {
 }
 
 #[test]
-fn an_items_absent_source_range_is_no_trim_a_gap_of_no_length_or_refused_for_a_clip() {
+fn an_items_absent_source_range_is_no_trim_on_a_track_or_refused_for_a_gap_or_a_clip() {
   // `item.cpp` 175: none — no trim, on the stack and a track.
   assert_eq!(
     read(|root| {
@@ -1189,8 +1189,15 @@ fn an_items_absent_source_range_is_no_trim_a_gap_of_no_length_or_refused_for_a_c
     }),
     Ok(sample()),
   );
-  // A gap's is its constructor's `TimeRange()` (`gap.h` 23): no length.
-  // The export writes one after a fade-out at the track's end.
+  // A gap's is its constructor's `TimeRange()` (`gap.h` 23 in 0.17.0):
+  // nothing, at rate 1 — a rate the timeline does not keep, which the
+  // track's duration takes. Refused in every position: the sample's leading
+  // gap of some length, and the gap of no length the export writes after a
+  // fade-out at the track's end.
+  assert_eq!(
+    read(|root| remove(root, GAP, "source_range")),
+    Err(shape(&format!("{GAP}.source_range"), "a required key")),
+  );
   let mut faded = sample();
   let b = &mut faded.tracks_mut()[0].clips_mut()[1];
   let fades = b
@@ -1198,10 +1205,19 @@ fn an_items_absent_source_range_is_no_trim_a_gap_of_no_length_or_refused_for_a_c
     .with_out(Some(Fade::new(Duration::new(4, edit()), FadeShape::Linear)));
   b.set_fades(fades);
   let mut root = json::parse(&to_otio(&faded, OtioTarget::V0_15Plus).unwrap()).unwrap();
-  remove(&mut root, &format!("{TRACK}.children.6"), "source_range");
+  let last = format!("{TRACK}.children.6");
+  assert_eq!(
+    at(&mut root, &format!("{last}.OTIO_SCHEMA")),
+    &text("Gap.1"),
+    "the premise: the gap after the fade-out"
+  );
+  remove(&mut root, &last, "source_range");
   let mut out = Utf8BytesMut::new();
   json::write_pretty(&root, &mut out);
-  assert_eq!(from_otio(&out.freeze_shared()), Ok(faded));
+  assert_eq!(
+    from_otio(&out.freeze_shared()),
+    Err(shape(&format!("{last}.source_range"), "a required key")),
+  );
   // A clip's is none, which OpenTimelineIO plays as its medium's whole
   // available range — a range the document's words do not count.
   assert_eq!(
@@ -1664,7 +1680,7 @@ fn a_gap_of_no_length_is_read_only_where_the_export_writes_one() {
   // Round 7: OpenTimelineIO counts a gap of no length all the same — its
   // range is the item's duration (`item.cpp` 43–46 in 0.17.0), and its rate
   // joins the track's sum, which starts at rate 1 and takes the higher of
-  // two (`track.cpp` 111–148; `rationalTime.h` 283–294) — so one the
+  // two (`track.cpp` 111–141; `rationalTime.h` 283–294) — so one the
   // timeline has no place for is refused by name.
   //
   // Codex's input: a timeline at 4/3 starting 2^52 ticks in, one track
@@ -1789,13 +1805,165 @@ fn a_gap_of_no_length_is_read_only_where_the_export_writes_one() {
         unreachable!()
       };
       assert_eq!(items.len(), children, "{fades:?} {target:?}: the premise");
+      let read = from_otio(&written);
+      assert_eq!(read, Ok(timeline.clone()), "{fades:?} {target:?}");
+      // Re-exported, each track lasts strictly as long as the document's
+      // does, its rate — the edit rate — included.
+      let again = to_otio(&read.unwrap(), target).unwrap();
       assert_eq!(
-        from_otio(&written),
-        Ok(timeline.clone()),
+        track_durations(&written),
+        vec![(48.0, 24.0)],
+        "{fades:?} {target:?}: the premise"
+      );
+      assert_eq!(
+        track_durations(&again),
+        track_durations(&written),
         "{fades:?} {target:?}"
       );
     }
   }
+}
+
+/// Each track's duration as OpenTimelineIO 0.17.0 sums it from the document
+/// `text` — `Track::available_range` (`track.cpp` 111–141): from
+/// `RationalTime()`, nothing at rate 1 (`rationalTime.h` 43), each item's
+/// `source_range.duration` — a gap's `TimeRange()` (`gap.h` 23) where it
+/// states none — then a first transition's `in_offset` and a last one's
+/// `out_offset`, each added by `operator+=` (`rationalTime.h` 283–294) —
+/// as `(value, rate)`: what `RationalTime::strictly_equal` compares
+/// (101–104).
+fn track_durations(text: &str) -> Vec<(f64, f64)> {
+  let root = json::parse(text).unwrap();
+  let member = |value: &Value, key: &str| {
+    value
+      .as_object()
+      .and_then(|members| members.iter().find(|(name, _)| name == key))
+      .map(|(_, value)| value.clone())
+  };
+  let time = |value: &Value| {
+    let number = |key| {
+      member(value, key)
+        .and_then(|number| number.as_f64())
+        .unwrap()
+    };
+    (number("value"), number("rate"))
+  };
+  // `value_rescaled_to` (`rationalTime.h` 75–78), then `operator+=`.
+  let rescaled = |(value, rate): (f64, f64), to: f64| {
+    if to == rate {
+      value
+    } else {
+      (value * to) / rate
+    }
+  };
+  let add = |sum: (f64, f64), other: (f64, f64)| {
+    if sum.1 < other.1 {
+      (other.0 + rescaled(sum, other.1), other.1)
+    } else {
+      (sum.0 + rescaled(other, sum.1), sum.1)
+    }
+  };
+  let transition = |child: &Value| {
+    member(child, "OTIO_SCHEMA")
+      .as_ref()
+      .and_then(Value::as_str)
+      == Some("Transition.1")
+  };
+  let tracks = member(&root, "tracks")
+    .and_then(|stack| member(&stack, "children"))
+    .unwrap();
+  tracks
+    .as_array()
+    .unwrap()
+    .iter()
+    .map(|track| {
+      let children = member(track, "children").unwrap();
+      let children = children.as_array().unwrap();
+      let mut sum = (0.0, 1.0);
+      for child in children.iter().filter(|child| !transition(child)) {
+        let duration = member(child, "source_range").map_or((0.0, 1.0), |range| {
+          time(&member(&range, "duration").unwrap())
+        });
+        sum = add(sum, duration);
+      }
+      if let Some(first) = children.first().filter(|first| transition(first)) {
+        sum = add(sum, time(&member(first, "in_offset").unwrap()));
+      }
+      if let Some(last) = children.last().filter(|last| transition(last)) {
+        sum = add(sum, time(&member(last, "out_offset").unwrap()));
+      }
+      sum
+    })
+    .collect()
+}
+
+#[test]
+fn a_fade_side_gap_of_no_length_is_read_only_in_the_form_the_export_writes() {
+  // Round 8: the timeline keeps a gap's length at the edit rate alone, so a
+  // gap of no length is read only as the export writes one, its range stated
+  // at the edit rate exactly; any other form loses its rate, which the
+  // track's duration takes (`track.cpp` 111–141; `rationalTime.h` 283–294).
+  //
+  // Codex's case: one clip at 24 fps with a one-tick fade-in, its medium
+  // counted at 1 fps, so its source range is written at rate 1.
+  let mut a = Clip::new(
+    ClipId::new("a"),
+    "a",
+    MediaRef::new(Utf8Bytes::from_static("file:///a.mov")).with_rate(Some(Rate::hz(1))),
+    TimeRange::new(0, 1, timebase(1, 1)),
+    TimeRange::new(0, 24, edit()),
+  );
+  a.set_fades(Fades::new().with_in(Some(Fade::new(Duration::new(1, edit()), FadeShape::Linear))));
+  let timeline =
+    Timeline::new("codex", Rate::FPS_24).with_track(Track::new(TrackKind::Video, "V").with_clip(a));
+  assert_eq!(crate::validate(&timeline), Ok(()), "the premise");
+  let written = to_otio(&timeline, OtioTarget::V0_15Plus).unwrap();
+  assert_eq!(
+    from_otio(&written),
+    Ok(timeline.clone()),
+    "the premise: the export reads back"
+  );
+  let edited = |edit: &dyn Fn(&mut Value)| {
+    let mut root = json::parse(&written).unwrap();
+    edit(&mut root);
+    let mut out = Utf8BytesMut::new();
+    json::write_pretty(&root, &mut out);
+    out.freeze_shared()
+  };
+  let leading = format!("{TRACK}.children.0");
+
+  // The range left out: OpenTimelineIO reads nothing at rate 1, and the
+  // track lasts 1@1 where the export's lasts 24@24 — the same time, which
+  // `strictly_equal` tells apart.
+  let omitted = edited(&|root| remove(root, &leading, "source_range"));
+  assert_eq!(track_durations(&written), vec![(24.0, 24.0)], "the premise");
+  assert_eq!(track_durations(&omitted), vec![(1.0, 1.0)], "the premise");
+  assert_eq!(
+    from_otio(&omitted),
+    Err(shape(&format!("{leading}.source_range"), "a required key")),
+    "Codex's case",
+  );
+
+  // Stated, at rate 1: lost just the same.
+  let off_rate = edited(&|root| {
+    for key in ["start_time", "duration"] {
+      set(
+        root,
+        &format!("{leading}.source_range.{key}"),
+        "rate",
+        number("1.0"),
+      );
+    }
+  });
+  assert_eq!(track_durations(&off_rate), vec![(1.0, 1.0)], "the premise");
+  assert_eq!(
+    from_otio(&off_rate),
+    Err(inexact(
+      &format!("{leading}.source_range.start_time.rate"),
+      "a rate other than the f64 of the exact ruler it is counted in"
+    )),
+    "a range stated at another rate",
+  );
 }
 
 #[test]

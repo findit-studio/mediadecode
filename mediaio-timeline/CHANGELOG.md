@@ -57,8 +57,11 @@ Its versions are its own: they do not move with `mediadecode`'s.
   the stack's — is held as `to_otio` holds it; each is refused as
   `Inexact` where it rounds. A member OpenTimelineIO lets a document leave
   out reads as OpenTimelineIO 0.17.0's reader reads it — an empty name, a
-  GREEN marker, a gap of no length — or is refused by name where that is
-  no value and the timeline needs one.
+  GREEN marker — or is refused by name where that is no value and the
+  timeline needs one, or a value it does not keep: a gap's absent range,
+  OpenTimelineIO's `TimeRange()`, is nothing at rate 1, a rate the track's
+  duration takes and the timeline loses, so a gap states its range at the
+  edit rate, as the export writes it.
 - The export writes markers as `Marker.2`, refusing one no ruler holds
   whole as `Spot::Marker`.
 - `validate_json` holds every marker to `Marker.2`, with the

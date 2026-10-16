@@ -15,14 +15,14 @@
 //! A member OpenTimelineIO's schema lets a document leave out reads as
 //! OpenTimelineIO 0.17.0 reads it — its reader builds each object with its
 //! default constructor and reads such a member only if present — so an
-//! absent name reads as empty, an item's absent `enabled` as `true`, a
-//! marker's absent color as GREEN and its comment as empty, and a gap's
-//! absent range as a gap of no length — read only where the export writes
-//! one, like any other; a `Clip.1` with no media reference
-//! is a clip with no medium, refused by name as a `null` one is. A member
-//! whose default is no value at all, where the timeline needs one — the
-//! timeline's `global_start_time`, a clip's `source_range` — is refused by
-//! name.
+//! absent name reads as empty, an item's absent `enabled` as `true`, and a
+//! marker's absent color as GREEN and its comment as empty; a `Clip.1` with
+//! no media reference is a clip with no medium, refused by name as a `null`
+//! one is. A member whose default is no value at all, where the timeline
+//! needs one — the timeline's `global_start_time`, a clip's `source_range`
+//! — is refused by name, and so is a gap's absent `source_range`, whose
+//! default, `TimeRange()`, is nothing at rate 1: a rate the timeline does
+//! not keep, which OpenTimelineIO's sum of the track's duration takes.
 //!
 //! Every number is read exactly, or refused as [`Unreadable::Inexact`]: a
 //! count or a place as the whole number its digits spell
@@ -46,9 +46,10 @@
 //! edit rate. A track's time ends with its last clip, so a gap of some
 //! length after it — which OpenTimelineIO counts in the track's duration —
 //! is refused by name ([`Feature::TrailingGap`]). A gap of no length is
-//! read only where the export writes one, on a fade's gap side; anywhere
-//! else OpenTimelineIO still counts it — its range in its duration, its
-//! rate in its track's sum — so it is refused by name too
+//! read only where the export writes one, on a fade's gap side, and as it
+//! writes one, its range stated at the edit rate; anywhere else
+//! OpenTimelineIO still counts it — its range in its duration, its rate in
+//! its track's sum — so it is refused by name too
 //! ([`Feature::StandaloneGap`]).
 
 use core::str::FromStr;
@@ -762,7 +763,8 @@ impl Child {
 /// ends with its last clip: a gap of some length after it is refused by
 /// name, every gap of a track with no clip among them. A gap of no length
 /// is read only where the export writes one — on a fade's gap side, beside
-/// no other gap — and refused by name anywhere else, as OpenTimelineIO
+/// no other gap — and in the form it writes, its range stated at the edit
+/// rate ([`gap`]); it is refused by name anywhere else, as OpenTimelineIO
 /// counts it all the same. Answers the children as OpenTimelineIO's walk
 /// reads them too, each counted as the document writes it.
 fn children(object: &Object<'_>, edit: Ruler, ticks: Timebase) -> Result<Children, Unreadable> {
@@ -774,15 +776,10 @@ fn children(object: &Object<'_>, edit: Ruler, ticks: Timebase) -> Result<Childre
     let child = Object::of(value, at.index(index))?;
     let (read_as, walked) = match child.schema(&["Gap.1", "Clip.1", "Clip.2", "Transition.1"])? {
       "Gap.1" => {
-        // A gap that states no range is OpenTimelineIO's `TimeRange()`:
-        // nothing, at rate 1, as its walk counts it.
-        let (length, ruler) = match gap(&child, edit)? {
-          Some(length) => (length, edit),
-          None => (0, Ruler::new(Rate::hz(1))),
-        };
+        let length = gap(&child, edit)?;
         let walked = derive::Child::Item {
-          start: written(0, ruler),
-          duration: written(length, ruler),
+          start: written(0, edit),
+          duration: written(length, edit),
         };
         (Child::Gap(length), walked)
       }
@@ -932,10 +929,16 @@ fn ordered(dissolves: Vec<(Transition, Option<usize>, At)>) -> Result<Vec<Transi
 
 /// A `Gap.1`'s length at the edit rate: a gap carries nothing else.
 ///
-/// `None` for a gap with no `source_range`, which OpenTimelineIO reads as
-/// its constructor's `TimeRange()` (`gap.h` 23 in 0.17.0; `item.cpp` 175
-/// reads the range only if present): a gap of no length, at rate 1.
-fn gap(object: &Object<'_>, edit: Ruler) -> Result<Option<u64>, Unreadable> {
+/// Its `source_range` is required, as a clip's is, and counted at the edit
+/// rate exactly — the form the export writes — as every range is
+/// ([`counts`]). Without one OpenTimelineIO reads a gap as its
+/// constructor's `TimeRange()` (`gap.h` 23 in 0.17.0; `item.cpp` 175 reads
+/// the range only if present): nothing, at rate 1. The timeline keeps a
+/// gap's length at the edit rate alone, so that rate would be lost, and it
+/// joins the track's sum, which carries the higher of two rates
+/// (`track.cpp` 111–141; `rationalTime.h` 283–294): a re-export, writing
+/// the gap at the edit rate, could change the track's duration strictly.
+fn gap(object: &Object<'_>, edit: Ruler) -> Result<u64, Unreadable> {
   object.keys(&[
     "OTIO_SCHEMA",
     "metadata",
@@ -953,14 +956,11 @@ fn gap(object: &Object<'_>, edit: Ruler) -> Result<Option<u64>, Unreadable> {
   object.never_disabled()?;
   object.no_color()?;
   let at = object.at.key("source_range");
-  let Some(range) = object.get("source_range") else {
-    return Ok(None);
-  };
-  let (start, length) = counts(range, &at, edit)?;
+  let (start, length) = counts(object.required("source_range")?, &at, edit)?;
   if start != 0 {
     return Err(feature(&at.key("start_time"), Feature::GapStart));
   }
-  Ok(Some(length))
+  Ok(length)
 }
 
 /// A `Transition.1`: a fade, by this crate's words, or a dissolve — and

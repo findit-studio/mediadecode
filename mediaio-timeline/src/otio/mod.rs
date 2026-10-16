@@ -692,7 +692,8 @@ impl core::error::Error for Shape {}
 /// OpenTimelineIO counts in the track's duration, is refused
 /// ([`Feature::TrailingGap`]), and so is a gap of no length anywhere but
 /// where the export writes one, on a fade's gap side
-/// ([`Feature::StandaloneGap`]). Both clip schemas are read: `Clip.2` and
+/// ([`Feature::StandaloneGap`]). A gap states its range, at the edit rate,
+/// as the export writes it. Both clip schemas are read: `Clip.2` and
 /// `Clip.1`.
 ///
 /// A document from another writer is read where it uses only what the
@@ -909,7 +910,7 @@ pub enum Feature {
   /// OpenTimelineIO counts it all the same: its range is the item's
   /// duration (`item.cpp` 43–46 in 0.17.0), and its rate joins the track's
   /// sum, which starts at rate 1 and takes the higher of two rates
-  /// (`track.cpp` 111–148; `rationalTime.h` 283–294), while the timeline
+  /// (`track.cpp` 111–141; `rationalTime.h` 283–294), while the timeline
   /// has nothing there.
   StandaloneGap,
   /// A fade not between a gap and the clip it fades, or playing anything

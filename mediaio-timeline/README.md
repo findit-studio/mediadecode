@@ -337,10 +337,10 @@ after a track's last clip, …), and a count or rate that does not land
 exactly, or a time OpenTimelineIO would read rounded
 (`Unreadable::Inexact`). A member OpenTimelineIO lets a document leave out
 reads as OpenTimelineIO's own reader reads it — an empty name, `enabled`,
-a GREEN marker, a gap of no length, read only on a fade's gap side as
-any gap of no length is — or, where that is no value and the
-timeline needs one (`global_start_time`, a clip's `source_range`), is
-refused by name. A key is read only
+a GREEN marker — or, where that is no value and the timeline needs one
+(`global_start_time`, a clip's `source_range`), or a value the timeline
+does not keep (a gap's `source_range`, whose default is nothing at rate 1,
+a rate its track's duration would take), is refused by name. A key is read only
 where it carries nothing — `null`, an empty list, `enabled` as `true` — or
 what the timeline keeps.
 
