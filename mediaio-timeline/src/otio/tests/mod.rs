@@ -527,8 +527,16 @@ fn every_number_an_accepted_export_writes_reads_back_exactly_in_either_build() {
       .iter()
       .all(|reading| reading.is_ok_and(|number| number.double().to_bits() == meant.to_bits()))
   };
+  // Fewer under Miri, which interprets slowly: the first eight seeds, which
+  // between them draw every kind of rate and of gap, written, misread and
+  // refused.
+  let (seeds, many) = if cfg!(miri) {
+    (8, (0, 0))
+  } else {
+    (256, (64, 16))
+  };
   let (mut written, mut misread) = (0, 0);
-  for seed in 0..256 {
+  for seed in 0..seeds {
     let mut draw = Seeded(seed);
     let (num, den) = match draw.within(0, 2) {
       0 => COMMON[draw.within(0, COMMON.len() as u64 - 1) as usize],
@@ -586,9 +594,9 @@ fn every_number_an_accepted_export_writes_reads_back_exactly_in_either_build() {
       Err(other) => panic!("seed {seed}: {other}"),
     }
   }
-  // Both sides drawn, many times.
+  // Both sides drawn, many times; under Miri, at least once.
   assert!(
-    written > 64 && misread > 16,
+    written > many.0 && misread > many.1,
     "{written} written, {misread} misread"
   );
 }

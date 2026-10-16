@@ -1,5 +1,13 @@
 //! The reader: what the export writes reads back exactly, and what the
 //! timeline does not model is refused by name, with where it sits.
+//!
+//! Under Miri the laws run lighter, every branch they reach still reached:
+//! Miri interprets every step, and on a 32-bit target the whole suite
+//! shares one 4 GiB address space, no frame's addresses ever given back.
+//! A law whose cases read alike for both targets reads one ([`TARGETS`]), a
+//! table of spellings of one kind runs its first row ([`alike`]), and a
+//! heavy law whose every branch the others reach does not run. Natively
+//! every case runs.
 
 use std::{string::String, vec, vec::Vec};
 
@@ -123,9 +131,44 @@ fn object(members: Vec<(&str, Value)>) -> Value {
   )
 }
 
+/// The sample as the export writes it for `target`, parsed: with `std`,
+/// written and parsed once, for every law that edits a copy of it.
+fn written(target: OtioTarget) -> Value {
+  let write = || json::parse(&to_otio(&sample(), target).unwrap()).unwrap();
+  #[cfg(feature = "std")]
+  {
+    static WRITTEN: [std::sync::OnceLock<Value>; 2] = [const { std::sync::OnceLock::new() }; 2];
+    let slot = match target {
+      OtioTarget::V0_15Plus => &WRITTEN[0],
+      OtioTarget::Legacy => &WRITTEN[1],
+    };
+    slot.get_or_init(write).clone()
+  }
+  #[cfg(not(feature = "std"))]
+  write()
+}
+
+/// The targets a law reads where its cases read alike for both: both, or
+/// under Miri one (the module's note); `Legacy`'s own members are read by
+/// the laws that name it.
+const TARGETS: &[OtioTarget] = if cfg!(miri) {
+  &[OtioTarget::V0_15Plus]
+} else {
+  &[OtioTarget::V0_15Plus, OtioTarget::Legacy]
+};
+
+/// The rows of a table whose rows reach the same branches, each spelling a
+/// value of one kind: every one, or under Miri the first (the module's
+/// note).
+fn alike<T>(rows: impl IntoIterator<Item = T>) -> impl Iterator<Item = T> {
+  rows
+    .into_iter()
+    .take(if cfg!(miri) { 1 } else { usize::MAX })
+}
+
 /// The sample written for `target`, edited, written out again and read.
 fn read_edited(target: OtioTarget, edit: impl FnOnce(&mut Value)) -> Result<Timeline, Unreadable> {
-  let mut root = json::parse(&to_otio(&sample(), target).unwrap()).unwrap();
+  let mut root = written(target);
   edit(&mut root);
   let mut out = Utf8BytesMut::new();
   json::write_pretty(&root, &mut out);
@@ -202,6 +245,10 @@ fn what_the_export_writes_reads_back_exactly() {
 }
 
 #[test]
+#[cfg_attr(
+  miri,
+  ignore = "too heavy for Miri on a 32-bit target; the laws Miri runs reach its every branch"
+)]
 fn what_carries_nothing_reads_as_nothing() {
   // Round 10: a member reads as nothing only where OpenTimelineIO 0.17.0
   // holds it as it holds the member's absence and the export writes it back
@@ -277,10 +324,10 @@ fn the_backstop_alone_refuses_a_string_or_a_boolean_written_back_otherwise() {
   // through it: a marker's color `Green`, which the export writes `GREEN`.
   let mut timeline = sample();
   timeline.tracks_mut()[0].markers_mut()[0].set_color(MarkerColor::Green);
-  for target in [OtioTarget::V0_15Plus, OtioTarget::Legacy] {
-    let written = || json::parse(&to_otio(&timeline, target).unwrap()).unwrap();
+  for &target in TARGETS {
+    let written = json::parse(&to_otio(&timeline, target).unwrap()).unwrap();
     let guarded = |edit: &dyn Fn(&mut Value)| {
-      let mut root = written();
+      let mut root = written.clone();
       edit(&mut root);
       super::super::import::reproduced(&root, &timeline)
     };
@@ -352,6 +399,10 @@ fn plain_where_it_should_be(value: &Value, in_metadata: bool) -> bool {
 }
 
 #[test]
+#[cfg_attr(
+  miri,
+  ignore = "too heavy for Miri on a 32-bit target; the laws Miri runs reach its every branch"
+)]
 fn a_note_keyed_as_otio_keys_its_objects_is_written_as_a_pair_and_reads_back() {
   // The keys OpenTimelineIO's reader looks for (`deserialization.cpp`
   // 561–573, 627–629 in 0.17.0), the crate's own word names, and an empty
@@ -391,7 +442,7 @@ fn checked_edited(
   target: OtioTarget,
   edit: impl FnOnce(&mut Value),
 ) -> Result<(), (String, &'static str)> {
-  let mut root = json::parse(&to_otio(&sample(), target).unwrap()).unwrap();
+  let mut root = written(target);
   edit(&mut root);
   let mut out = Utf8BytesMut::new();
   json::write_pretty(&root, &mut out);
@@ -419,7 +470,7 @@ fn the_self_check_decodes_every_dictionary_as_a_reader_does() {
   };
   let studio = |value: Value| move |root: &mut Value| set(root, "metadata", "studio", value);
   let clip = "$.tracks.children[0].children[2]";
-  for target in [OtioTarget::V0_15Plus, OtioTarget::Legacy] {
+  for &target in TARGETS {
     // Round 4's plant N1: the notes written as an object. One keyed
     // `OTIO_SCHEMA: Marker.2` is a marker to every reader, which refuses it
     // for the range it lacks.
@@ -600,6 +651,19 @@ fn the_self_check_decodes_every_dictionary_as_a_reader_does() {
       "{target:?}",
     );
   }
+  // Under Miri, where the cases above read for one target, `Legacy` reads
+  // one of them: its `Clip.1` holds an item's effects as `Clip.2` does.
+  if cfg!(miri) {
+    assert_eq!(
+      checked_edited(OtioTarget::Legacy, |root| set(
+        root,
+        A,
+        "effects",
+        Value::Array(vec![schema("Effect.1", vec![])])
+      )),
+      refused(&format!("{clip}.effects[0].effect_name"), "a required key"),
+    );
+  }
   // From 0.15 a reader reads a media reference's image bounds as a
   // `Box2d`; before, as a key it does not know.
   let bounds =
@@ -678,7 +742,7 @@ fn a_dictionary_of_media_references_carrying_otio_schema_is_refused_by_name() {
 fn a_generator_reference_is_held_to_its_readers_members() {
   // `generatorReference.cpp` 26–27 in 0.17.0: `generator_kind`, a string,
   // and `parameters`, a dictionary, both required.
-  for target in [OtioTarget::V0_15Plus, OtioTarget::Legacy] {
+  for &target in TARGETS {
     let media = a_media(target);
     let at = |key: &str| checked_path(&format!("{media}.{key}"));
     let generator = |members: Vec<(&str, Value)>| {
@@ -776,7 +840,7 @@ fn an_image_sequence_reference_is_held_to_its_readers_members() {
       ("missing_frame_policy", text("hold")),
     ]
   };
-  for target in [OtioTarget::V0_15Plus, OtioTarget::Legacy] {
+  for &target in TARGETS {
     let media = a_media(target);
     let at = |key: &str| checked_path(&format!("{media}.{key}"));
     let checked = |members: Vec<(&str, Value)>| {
@@ -787,7 +851,7 @@ fn an_image_sequence_reference_is_held_to_its_readers_members() {
     };
     assert_eq!(checked(sequence()), Ok(()), "{target:?}");
     // Each required member, left out.
-    for (index, (key, _)) in sequence().into_iter().enumerate().skip(1) {
+    for (index, (key, _)) in alike(sequence().into_iter().enumerate().skip(1)) {
       let mut members = sequence();
       members.remove(index);
       assert_eq!(
@@ -808,7 +872,9 @@ fn an_image_sequence_reference_is_held_to_its_readers_members() {
     };
     let whole = "a whole number, without a fraction or an exponent";
     // An integer, as RapidJSON reads one: `-0` among them, and every one up
-    // to 2^64 - 1, which the handler keeps cut to its low 63 bits.
+    // to 2^64 - 1, which the handler keeps cut to its low 63 bits — between
+    // them each of its four integer callbacks, so every row runs under Miri
+    // too.
     for spelling in [
       "-0",
       "0",
@@ -824,15 +890,15 @@ fn an_image_sequence_reference_is_held_to_its_readers_members() {
       );
     }
     // A double, which the reader refuses there: a fraction, an exponent,
-    // and an integer past 64 bits.
-    for spelling in [
+    // and an integer past 64 bits — each the one double callback.
+    for spelling in alike([
       "1001.0",
       "1.001e3",
       "-0.0",
       "18446744073709551616",
       "-9223372036854775809",
       "NaN",
-    ] {
+    ]) {
       assert_eq!(
         with("start_frame", number(spelling)),
         Err((at("start_frame"), whole)),
@@ -860,7 +926,7 @@ fn an_image_sequence_reference_is_held_to_its_readers_members() {
       Err((at("name_prefix"), "a string")),
       "{target:?}",
     );
-    for policy in ["error", "black", "hold"] {
+    for policy in alike(["error", "black", "hold"]) {
       assert_eq!(
         with("missing_frame_policy", text(policy)),
         Ok(()),
@@ -909,7 +975,7 @@ fn an_objects_reference_id_is_a_string_no_other_object_carries() {
   // (`deserialization.cpp` 624–642, 669–672 in 0.17.0); it makes the
   // stack before the timeline that holds it.
   let id = |root: &mut Value, path: &str, value: Value| set(root, path, "OTIO_REF_ID", value);
-  for target in [OtioTarget::V0_15Plus, OtioTarget::Legacy] {
+  for &target in TARGETS {
     assert_eq!(
       checked_edited(target, |root| id(root, "", number("7"))),
       Err((String::from("$.OTIO_REF_ID"), "a string")),
@@ -1094,7 +1160,7 @@ fn an_edit_side_value_keeps_its_timebases_spelling() {
     Ok(()),
     "the premise: it validates"
   );
-  for target in [OtioTarget::V0_15Plus, OtioTarget::Legacy] {
+  for &target in TARGETS {
     let written = to_otio(&timeline, target).unwrap();
     let read = from_otio(&written).unwrap();
     assert_eq!(read, timeline, "{target:?}");
@@ -1755,7 +1821,7 @@ fn a_gap_of_some_length_after_the_last_clip_is_refused() {
     FadeShape::EqualPower,
   )));
   b.set_fades(fades);
-  for target in [OtioTarget::V0_15Plus, OtioTarget::Legacy] {
+  for &target in TARGETS {
     let written = to_otio(&faded, target).unwrap();
     let mut root = json::parse(&written).unwrap();
     // `[gap, fade in, a, dissolve, b, fade out, gap]`.
@@ -1798,6 +1864,10 @@ fn abutting(fades: [bool; 4]) -> Timeline {
 }
 
 #[test]
+#[cfg_attr(
+  miri,
+  ignore = "too heavy for Miri on a 32-bit target; the laws Miri runs reach its every branch"
+)]
 fn a_gap_of_no_length_is_read_only_where_the_export_writes_one() {
   // Round 7: OpenTimelineIO counts a gap of no length all the same — its
   // range is the item's duration (`item.cpp` 43–46 in 0.17.0), and its rate
@@ -2020,6 +2090,10 @@ fn track_durations(text: &str) -> Vec<(f64, f64)> {
 }
 
 #[test]
+#[cfg_attr(
+  miri,
+  ignore = "too heavy for Miri on a 32-bit target; the laws Miri runs reach its every branch"
+)]
 fn a_fade_side_gap_of_no_length_is_read_only_in_the_form_the_export_writes() {
   // Round 8: the timeline keeps a gap's length at the edit rate alone, so a
   // gap of no length is read only as the export writes one, its range stated
@@ -2110,6 +2184,10 @@ fn at_48(root: &mut Value, range: &str, words: &str, start: &str, duration: &str
 }
 
 #[test]
+#[cfg_attr(
+  miri,
+  ignore = "too heavy for Miri on a 32-bit target; the laws Miri runs reach its every branch"
+)]
 fn a_media_range_read_in_a_ruler_the_export_does_not_write_is_refused() {
   // Round 9: the reader counts a media-side range in the ruler its words
   // declare and then in the model's timebase, which keeps no ruler; the
@@ -2482,7 +2560,7 @@ fn every_number_is_read_as_opentimelineio_reads_it_or_refused() {
     gain("16777216.0").unwrap().tracks()[0].clips()[0].gain(),
     Gain::from_db(16_777_216.0),
   );
-  for spelled in ["-3e0", "-0.3E1", "-30e-1", "-3.00"] {
+  for spelled in alike(["-3e0", "-0.3E1", "-30e-1", "-3.00"]) {
     assert_eq!(gain(spelled), Ok(sample()), "{spelled}");
   }
   // A gain of -0.0 is one of its own: written back as -0.0.
@@ -2498,11 +2576,11 @@ fn every_number_is_read_as_opentimelineio_reads_it_or_refused() {
   assert_eq!(gain("-3"), Err(differs(&gain_at, "-3.0", "-3")));
   // Rounded to its nearest f32 (2^24 + 1 reads as 2^24), past the largest,
   // and below the smallest.
-  for spelled in ["16777217", "-3.0000001", "1e39", "1e-50"] {
+  for spelled in alike(["16777217", "-3.0000001", "1e39", "1e-50"]) {
     assert_eq!(gain(spelled), Err(inexact(&gain_at, GAIN)), "{spelled}");
   }
   // NaN and the infinities, which OpenTimelineIO reads, by name.
-  for spelled in ["NaN", "-Infinity"] {
+  for spelled in alike(["NaN", "-Infinity"]) {
     assert_eq!(
       gain(spelled),
       Err(inexact(
@@ -2520,17 +2598,17 @@ fn every_number_is_read_as_opentimelineio_reads_it_or_refused() {
   let rate = |spelled: &'static str| {
     read(move |root| set(root, "global_start_time", "rate", number(spelled)))
   };
-  for spelled in ["24", "2.4e1", "2400E-2", "24.000", "24.0000000000000001"] {
+  for spelled in alike(["24", "2.4e1", "2400E-2", "24.000", "24.0000000000000001"]) {
     assert_eq!(rate(spelled), Ok(sample()), "{spelled}");
   }
-  for spelled in ["24.000000000000004", "1e-400", "-0"] {
+  for spelled in alike(["24.000000000000004", "1e-400", "-0"]) {
     assert_eq!(
       rate(spelled),
       Err(inexact("global_start_time.rate", RATE)),
       "{spelled}"
     );
   }
-  for spelled in ["NaN", "Infinity", "-Inf"] {
+  for spelled in alike(["NaN", "Infinity", "-Inf"]) {
     assert_eq!(
       rate(spelled),
       Err(inexact(
@@ -2555,10 +2633,10 @@ fn every_number_is_read_as_opentimelineio_reads_it_or_refused() {
   let start = |spelled: &'static str| {
     read(move |root| set(root, "global_start_time", "value", number(spelled)))
   };
-  for spelled in ["0", "-0", "0e-400", "1e-400", "0.0E+5"] {
+  for spelled in alike(["0", "-0", "0e-400", "1e-400", "0.0E+5"]) {
     assert_eq!(start(spelled), Ok(sample()), "{spelled}");
   }
-  for spelled in ["-0.0", "-0e0", "-1e-400"] {
+  for spelled in alike(["-0.0", "-0e0", "-1e-400"]) {
     assert_eq!(
       start(spelled),
       Err(inexact(
@@ -2568,7 +2646,7 @@ fn every_number_is_read_as_opentimelineio_reads_it_or_refused() {
       "{spelled}"
     );
   }
-  for spelled in ["NaN", "-Infinity"] {
+  for spelled in alike(["NaN", "-Infinity"]) {
     assert_eq!(
       start(spelled),
       Err(inexact(
@@ -2581,6 +2659,10 @@ fn every_number_is_read_as_opentimelineio_reads_it_or_refused() {
 }
 
 #[test]
+#[cfg_attr(
+  miri,
+  ignore = "too heavy for Miri on a 32-bit target; the laws Miri runs reach its every branch"
+)]
 fn the_backstop_holds_doubles_bit_for_bit_so_a_negative_zero_is_not_zero() {
   // Round 11: the backstop by itself, the document altered after the
   // timeline was read from it. A gain of 0 dB, written `0.0`, beside a
@@ -2625,7 +2707,7 @@ fn the_backstop_holds_doubles_bit_for_bit_so_a_negative_zero_is_not_zero() {
 /// double and the check holds finite.
 #[test]
 fn every_row_of_the_number_table_reads_in_a_document_as_opentimelineio_reads_it() {
-  #[derive(Debug)]
+  #[derive(Debug, PartialEq)]
   enum Row {
     /// Read in both.
     Read,
@@ -2661,14 +2743,20 @@ fn every_row_of_the_number_table_reads_in_a_document_as_opentimelineio_reads_it(
     ("-Infinity", Row::NotFinite),
   ];
   let checked = |edit: &dyn Fn(&mut Value)| {
-    let mut root = json::parse(&to_otio(&sample(), OtioTarget::V0_15Plus).unwrap()).unwrap();
+    let mut root = written(OtioTarget::V0_15Plus);
     edit(&mut root);
     let mut out = Utf8BytesMut::new();
     json::write_pretty(&root, &mut out);
     validate_json(&out.freeze_shared(), OtioTarget::V0_15Plus)
   };
   let mut wrong = Vec::new();
+  let mut kinds: Vec<&Row> = Vec::new();
   for (text, row) in &rows {
+    // Under Miri, the first row of each kind (the module's note).
+    if cfg!(miri) && kinds.contains(&row) {
+      continue;
+    }
+    kinds.push(row);
     let in_metadata = checked(&|root| set(root, "metadata", "n", number(text)));
     let as_value = checked(&|root| set(root, "global_start_time", "value", number(text)));
     let refused = |result: &Result<(), Invalid>, reason: &str| matches!(result, Err(Invalid::Syntax(syntax)) if syntax.reason() == reason);
@@ -2804,6 +2892,10 @@ fn reader_refusals_say_what_and_where() {
 }
 
 #[test]
+#[cfg_attr(
+  miri,
+  ignore = "too heavy for Miri on a 32-bit target; the laws Miri runs reach its every branch"
+)]
 fn every_marker_color_reads_back_as_its_name_in_capitals() {
   // Round 10: OpenTimelineIO keeps a marker's color as written (`marker.cpp`
   // 27 in 0.17.0), so `Green` is not `GREEN`; a name other than one of the

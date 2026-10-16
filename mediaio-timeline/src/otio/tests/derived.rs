@@ -359,6 +359,10 @@ fn a_mixed_rate_track_whose_derived_places_are_whole_is_written_and_read_back_ex
 }
 
 #[test]
+#[cfg_attr(
+  miri,
+  ignore = "too heavy for Miri on a 32-bit target; the laws Miri runs reach its every branch"
+)]
 fn the_goldens_read_back_put_every_clip_on_its_record() {
   // The law timeline, mixed 23.976 fps frames and 48 kHz samples: read back
   // as OpenTimelineIO reads it, `b` starts at frame 96 and `a-sound` at

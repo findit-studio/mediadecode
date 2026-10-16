@@ -455,7 +455,9 @@ pub(super) fn compared() {
 #[test]
 fn a_large_flat_object_is_checked_for_a_twice_named_key_in_n_log_n_comparisons() {
   use core::fmt::Write as _;
-  let n: usize = 20_000;
+  // Fewer keys under Miri, which interprets slowly: at a thousand, a scan's
+  // n(n - 1)/2 = 499,500 comparisons is still over six times the bound.
+  let n: usize = if cfg!(miri) { 1_000 } else { 20_000 };
   let mut text = std::string::String::from("{");
   for index in 0..n {
     if index > 0 {
