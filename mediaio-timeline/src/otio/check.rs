@@ -197,9 +197,8 @@ fn composable(value: &Value, path: &str, target: OtioTarget, in_track: bool) -> 
 
 fn clip1(members: &Members, path: &str, target: OtioTarget) -> Result<(), Shape> {
   item(members, path, target)?;
-  let reference = |value: &Value, at: &str| {
-    nullable(value, at, |value, at| media_reference(value, at, target))
-  };
+  let reference =
+    |value: &Value, at: &str| nullable(value, at, |value, at| media_reference(value, at, target));
   match target {
     OtioTarget::V0_15Plus => optional(members, path, "media_reference", reference)?,
     OtioTarget::Legacy => {

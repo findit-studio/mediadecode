@@ -14,8 +14,8 @@ use crate::{
   MediaRef, Metadata, Rate, Refusal, TimeRange, Timebase, Timeline, Timestamp, Track, TrackKind,
   Transition,
   otio::{
-    Feature, Inexact, Invalid, OtioTarget, Shape, UnmodelledFeature, UnmodelledSchema,
-    Unreadable, from_otio, to_otio, validate_json,
+    Feature, Inexact, Invalid, OtioTarget, Shape, UnmodelledFeature, UnmodelledSchema, Unreadable,
+    from_otio, to_otio, validate_json,
   },
 };
 
@@ -395,7 +395,10 @@ fn the_self_check_decodes_every_dictionary_as_a_reader_does() {
         "OTIO_SCHEMA",
         text("Marker.2")
       )),
-      refused("$.metadata.OTIO_SCHEMA", "no schema: metadata is a dictionary"),
+      refused(
+        "$.metadata.OTIO_SCHEMA",
+        "no schema: metadata is a dictionary"
+      ),
       "{target:?}",
     );
     // In a clip's metadata, inside an array; and under a key no reader
@@ -407,17 +410,26 @@ fn the_self_check_decodes_every_dictionary_as_a_reader_does() {
         "studio",
         Value::Array(vec![schema("TimeRange.1", vec![])])
       )),
-      refused(&format!("{clip}.metadata.studio[0].duration"), "a required key"),
+      refused(
+        &format!("{clip}.metadata.studio[0].duration"),
+        "a required key"
+      ),
       "{target:?}",
     );
     assert_eq!(
-      checked_edited(target, |root| set(root, A, "studio", schema("Marker.2", vec![]))),
+      checked_edited(target, |root| set(
+        root,
+        A,
+        "studio",
+        schema("Marker.2", vec![])
+      )),
       refused(&format!("{clip}.studio.marked_range"), "a required key"),
       "{target:?}",
     );
     // An item holds its effects as `Effect`s, each with the keys its reader
     // requires.
-    let effects = |entry: Value| move |root: &mut Value| set(root, A, "effects", Value::Array(vec![entry]));
+    let effects =
+      |entry: Value| move |root: &mut Value| set(root, A, "effects", Value::Array(vec![entry]));
     assert_eq!(
       checked_edited(target, effects(schema("Effect.1", vec![]))),
       refused(&format!("{clip}.effects[0].effect_name"), "a required key"),
@@ -433,7 +445,10 @@ fn the_self_check_decodes_every_dictionary_as_a_reader_does() {
     );
     assert_eq!(
       checked_edited(target, effects(schema("Marker.2", vec![]))),
-      refused(&format!("{clip}.effects[0].OTIO_SCHEMA"), "an effect schema"),
+      refused(
+        &format!("{clip}.effects[0].OTIO_SCHEMA"),
+        "an effect schema"
+      ),
       "{target:?}",
     );
     let frozen = schema(
@@ -444,7 +459,11 @@ fn the_self_check_decodes_every_dictionary_as_a_reader_does() {
         ("metadata", object(vec![("at", rational())])),
       ],
     );
-    assert_eq!(checked_edited(target, effects(frozen)), Ok(()), "{target:?}");
+    assert_eq!(
+      checked_edited(target, effects(frozen)),
+      Ok(()),
+      "{target:?}"
+    );
     // The value schemas a reader decodes, each with every key it fetches.
     let red = || {
       schema(
@@ -490,9 +509,8 @@ fn the_self_check_decodes_every_dictionary_as_a_reader_does() {
   }
   // From 0.15 a reader reads a media reference's image bounds as a
   // `Box2d`; before, as a key it does not know.
-  let bounds = |value: Value| {
-    move |root: &mut Value| set(root, A_MEDIA, "available_image_bounds", value)
-  };
+  let bounds =
+    |value: Value| move |root: &mut Value| set(root, A_MEDIA, "available_image_bounds", value);
   assert_eq!(
     checked_edited(OtioTarget::V0_15Plus, bounds(object(vec![]))),
     refused(
