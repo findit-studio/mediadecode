@@ -12,6 +12,17 @@
 //! it carries nothing — `null`, an empty list, `true` for `enabled` — or
 //! what the timeline keeps.
 //!
+//! A member OpenTimelineIO's schema lets a document leave out reads as
+//! OpenTimelineIO 0.17.0 reads it — its reader builds each object with its
+//! default constructor and reads such a member only if present — so an
+//! absent name reads as empty, an item's absent `enabled` as `true`, a
+//! marker's absent color as GREEN and its comment as empty, and a gap's
+//! absent range as a gap of no length; a `Clip.1` with no media reference
+//! is a clip with no medium, refused by name as a `null` one is. A member
+//! whose default is no value at all, where the timeline needs one — the
+//! timeline's `global_start_time`, a clip's `source_range` — is refused by
+//! name.
+//!
 //! Every number is read exactly, or refused as [`Unreadable::Inexact`]: a
 //! count or a place as the whole number its digits spell
 //! ([`json::whole`]), a float as the one whose canonical decimal its text
@@ -726,10 +737,15 @@ fn children(object: &Object<'_>, edit: Ruler, ticks: Timebase) -> Result<Childre
     let child = Object::of(value, at.index(index))?;
     let (read_as, walked) = match child.schema(&["Gap.1", "Clip.1", "Clip.2", "Transition.1"])? {
       "Gap.1" => {
-        let length = gap(&child, edit)?;
+        // A gap that states no range is OpenTimelineIO's `TimeRange()`:
+        // nothing, at rate 1, as its walk counts it.
+        let (length, ruler) = match gap(&child, edit)? {
+          Some(length) => (length, edit),
+          None => (0, Ruler::new(Rate::hz(1))),
+        };
         let walked = derive::Child::Item {
-          start: written(0, edit),
-          duration: written(length, edit),
+          start: written(0, ruler),
+          duration: written(length, ruler),
         };
         (Child::Gap(length), walked)
       }
@@ -855,7 +871,11 @@ fn ordered(dissolves: Vec<(Transition, Option<usize>, At)>) -> Result<Vec<Transi
 }
 
 /// A `Gap.1`'s length at the edit rate: a gap carries nothing else.
-fn gap(object: &Object<'_>, edit: Ruler) -> Result<u64, Unreadable> {
+///
+/// `None` for a gap with no `source_range`, which OpenTimelineIO reads as
+/// its constructor's `TimeRange()` (`gap.h` 23 in 0.17.0; `item.cpp` 175
+/// reads the range only if present): a gap of no length, at rate 1.
+fn gap(object: &Object<'_>, edit: Ruler) -> Result<Option<u64>, Unreadable> {
   object.keys(&[
     "OTIO_SCHEMA",
     "metadata",
@@ -873,11 +893,14 @@ fn gap(object: &Object<'_>, edit: Ruler) -> Result<u64, Unreadable> {
   object.never_disabled()?;
   object.no_color()?;
   let at = object.at.key("source_range");
-  let (start, length) = counts(object.required("source_range")?, &at, edit)?;
+  let Some(range) = object.get("source_range") else {
+    return Ok(None);
+  };
+  let (start, length) = counts(range, &at, edit)?;
   if start != 0 {
     return Err(feature(&at.key("start_time"), Feature::GapStart));
   }
-  Ok(length)
+  Ok(Some(length))
 }
 
 /// A `Transition.1`: a fade, by this crate's words, or a dissolve — and
@@ -1038,10 +1061,13 @@ fn clip(
 /// reference of a `Clip.2`, under `DEFAULT_MEDIA` and active.
 fn media(object: &Object<'_>, schema: &str) -> Result<MediaRef, Unreadable> {
   if schema != "Clip.2" {
+    // OpenTimelineIO upgrades a `Clip.1` to a `Clip.2`, and one whose
+    // `media_reference` is absent or `null` to a `MissingReference`
+    // (`typeRegistry.cpp` 99–117 in 0.17.0): a clip with no medium.
     let at = object.at.key("media_reference");
-    return match object.required("media_reference")? {
-      Value::Null => Err(feature(&at, Feature::NoMedia)),
-      value => reference(value, at),
+    return match object.get("media_reference") {
+      None | Some(Value::Null) => Err(feature(&at, Feature::NoMedia)),
+      Some(value) => reference(value, at),
     };
   }
   let at = object.at.key("media_references");

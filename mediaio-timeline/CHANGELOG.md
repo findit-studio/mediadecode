@@ -45,7 +45,10 @@ Its versions are its own: they do not move with `mediadecode`'s.
   decimal — and what OpenTimelineIO derives from the document in its own
   `f64` arithmetic — both ends of every range, and each track's walk and
   the stack's — is held as `to_otio` holds it; each is refused as
-  `Inexact` where it rounds.
+  `Inexact` where it rounds. A member OpenTimelineIO lets a document leave
+  out reads as OpenTimelineIO 0.17.0's reader reads it — an empty name, a
+  GREEN marker, a gap of no length — or is refused by name where that is
+  no value and the timeline needs one.
 - The export writes markers as `Marker.2`, refusing one no ruler holds
   whole as `Spot::Marker`.
 - `validate_json` holds every marker to `Marker.2`, with the

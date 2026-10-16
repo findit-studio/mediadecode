@@ -697,7 +697,12 @@ impl core::error::Error for Shape {}
 /// timeline has no word for is refused by name too
 /// ([`Unreadable::Feature`]). A key is read only where it carries nothing —
 /// `null`, an empty list, `enabled` as `true` — or what the timeline keeps:
-/// nothing is dropped.
+/// nothing is dropped. A member OpenTimelineIO's schema lets a document
+/// leave out reads as OpenTimelineIO 0.17.0's reader reads it — a name as
+/// empty, `enabled` as `true`, a marker's color as GREEN, a gap's range as
+/// no length — or, where that is no value and the timeline needs one (the
+/// timeline's `global_start_time`, a clip's `source_range`), is refused by
+/// name.
 ///
 /// # Errors
 ///

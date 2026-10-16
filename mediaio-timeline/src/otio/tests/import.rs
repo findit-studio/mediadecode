@@ -214,6 +214,234 @@ fn what_carries_nothing_reads_as_nothing() {
   assert_eq!(green.tracks()[0].markers()[0].color(), MarkerColor::Green);
 }
 
+// Members OpenTimelineIO 0.17.0's schema lets a document leave out read as
+// its reader reads them: it builds each object with its default
+// constructor (`typeRegistry.h` 57–65) and reads such a member only if
+// present. One law per member.
+
+#[test]
+fn an_absent_name_reads_as_empty() {
+  // `serializableObjectWithMetadata.cpp` 22: an empty name.
+  let (track_marker, clip_marker) = (format!("{TRACK}.markers.0"), format!("{A}.markers.0"));
+  let read = read(|root| {
+    for path in [
+      "",
+      "tracks",
+      TRACK,
+      GAP,
+      FADE_IN,
+      A,
+      DISSOLVE,
+      B,
+      A_MEDIA,
+      track_marker.as_str(),
+      clip_marker.as_str(),
+    ] {
+      remove(root, path, "name");
+    }
+  });
+  let mut nameless = sample();
+  nameless.set_name("");
+  let track = &mut nameless.tracks_mut()[0];
+  track.set_name("");
+  track.markers_mut()[0].set_name("");
+  for clip in track.clips_mut() {
+    clip.set_name("");
+  }
+  track.clips_mut()[0].markers_mut()[0].set_name("");
+  assert_eq!(read, Ok(nameless));
+}
+
+#[test]
+fn absent_metadata_reads_as_no_note_and_a_needed_word_is_refused_by_name() {
+  // `serializableObjectWithMetadata.cpp` 21: an empty dictionary — where
+  // the timeline needs none of its words, nothing.
+  let track_marker = format!("{TRACK}.markers.0");
+  assert_eq!(
+    read(|root| {
+      for path in ["tracks", TRACK, GAP, DISSOLVE, track_marker.as_str()] {
+        remove(root, path, "metadata");
+      }
+    }),
+    Ok(sample()),
+  );
+  // Where it needs one, the word is refused by name.
+  assert_eq!(
+    read(|root| remove(root, "", "metadata")),
+    Err(shape("metadata.mediaio.rate", "a required word")),
+  );
+  assert_eq!(
+    read(|root| remove(root, A, "metadata")),
+    Err(shape(&format!("{A}.metadata.mediaio.id"), "a required word")),
+  );
+}
+
+#[test]
+fn an_items_absent_source_range_is_no_trim_a_gap_of_no_length_or_refused_for_a_clip() {
+  // `item.cpp` 175: none — no trim, on the stack and a track.
+  assert_eq!(
+    read(|root| {
+      remove(root, "tracks", "source_range");
+      remove(root, TRACK, "source_range");
+    }),
+    Ok(sample()),
+  );
+  // A gap's is its constructor's `TimeRange()` (`gap.h` 23): no length.
+  // The export writes one after a fade-out at the track's end.
+  let mut faded = sample();
+  let b = &mut faded.tracks_mut()[0].clips_mut()[1];
+  let fades = b.fades().with_out(Some(Fade::new(
+    Duration::new(4, edit()),
+    FadeShape::Linear,
+  )));
+  b.set_fades(fades);
+  let mut root = json::parse(&to_otio(&faded, OtioTarget::V0_15Plus).unwrap()).unwrap();
+  remove(&mut root, &format!("{TRACK}.children.6"), "source_range");
+  let mut out = Utf8BytesMut::new();
+  json::write_pretty(&root, &mut out);
+  assert_eq!(from_otio(&out.freeze_shared()), Ok(faded));
+  // A clip's is none, which OpenTimelineIO plays as its medium's whole
+  // available range — a range the document's words do not count.
+  assert_eq!(
+    read(|root| remove(root, A, "source_range")),
+    Err(shape(&format!("{A}.source_range"), "a required key")),
+  );
+}
+
+#[test]
+fn absent_effects_and_markers_read_as_none() {
+  // `item.cpp` 176–177: none.
+  assert_eq!(
+    read(|root| {
+      for path in ["tracks", TRACK, GAP, A, B] {
+        remove(root, path, "effects");
+      }
+      for path in ["tracks", GAP, B] {
+        remove(root, path, "markers");
+      }
+    }),
+    Ok(sample()),
+  );
+}
+
+#[test]
+fn an_items_absent_enabled_reads_as_enabled() {
+  // `item.cpp` 178; `item.h` 33: `true`.
+  assert_eq!(
+    read(|root| {
+      for path in ["tracks", TRACK, GAP, A, B] {
+        remove(root, path, "enabled");
+      }
+    }),
+    Ok(sample()),
+  );
+}
+
+#[test]
+fn a_markers_absent_color_reads_and_writes_back_as_green() {
+  // `marker.cpp` 27 reads the color only if present, over the default
+  // constructor's `Color::green` (`marker.h` 37–42). Python's binding
+  // defaults its own constructor to RED, which no reader runs.
+  let read = read(|root| {
+    remove(root, &format!("{TRACK}.markers.0"), "color");
+    remove(root, &format!("{A}.markers.0"), "color");
+  })
+  .unwrap();
+  let track = &read.tracks()[0];
+  assert_eq!(track.markers()[0].color(), MarkerColor::Green);
+  assert_eq!(track.clips()[0].markers()[0].color(), MarkerColor::Green);
+  let mut root = json::parse(&to_otio(&read, OtioTarget::V0_15Plus).unwrap()).unwrap();
+  assert_eq!(
+    at(&mut root, &format!("{TRACK}.markers.0.color")),
+    &text("GREEN"),
+  );
+}
+
+#[test]
+fn a_markers_absent_comment_reads_as_empty() {
+  // `marker.cpp` 29; `marker.h` 42: empty.
+  let mut commented = sample();
+  commented.tracks_mut()[0].markers_mut()[0].set_comment("a note");
+  let mut root = json::parse(&to_otio(&commented, OtioTarget::V0_15Plus).unwrap()).unwrap();
+  remove(&mut root, &format!("{TRACK}.markers.0"), "comment");
+  let mut out = Utf8BytesMut::new();
+  json::write_pretty(&root, &mut out);
+  assert_eq!(from_otio(&out.freeze_shared()), Ok(sample()));
+}
+
+#[test]
+fn a_references_absent_ranges_read_as_none() {
+  // `mediaReference.cpp` 30–33: none — the available range, its word
+  // with it, and the image bounds.
+  let read = read(|root| {
+    remove(root, A_MEDIA, "available_range");
+    remove(root, &format!("{A_MEDIA}.metadata.mediaio"), "available");
+    remove(root, A_MEDIA, "available_image_bounds");
+  })
+  .unwrap();
+  let media = read.tracks()[0].clips()[0].media();
+  assert_eq!(media.available_range(), None);
+  let mut expected = sample();
+  let a = &mut expected.tracks_mut()[0].clips_mut()[0];
+  let medium = a.media().clone().with_available_range(None);
+  a.set_media(medium);
+  assert_eq!(read, expected);
+}
+
+#[test]
+fn an_absent_global_start_time_is_refused_by_name() {
+  // `timeline.cpp` 31; `timeline.h` 28: none — no time, where the
+  // timeline always starts somewhere.
+  assert_eq!(
+    read(|root| remove(root, "", "global_start_time")),
+    Err(shape("global_start_time", "a required key")),
+  );
+}
+
+#[test]
+fn a_clip_1_without_a_media_reference_is_a_clip_with_no_medium() {
+  // OpenTimelineIO upgrades it to a `Clip.2` holding a `MissingReference`
+  // (`typeRegistry.cpp` 99–117), as it does a `null` one.
+  assert_eq!(
+    read_edited(OtioTarget::Legacy, |root| remove(root, A, "media_reference")),
+    Err(feature(Feature::NoMedia, &format!("{A}.media_reference"))),
+  );
+}
+
+#[test]
+fn a_member_opentimelineio_requires_is_refused_by_name() {
+  // What 0.17.0 reads with `reader.read` and so refuses a document
+  // without: a track's kind (`track.cpp` 34), a transition's offsets and
+  // type (`transition.cpp` 33–35), a marker's range (`marker.cpp` 28), a
+  // stack's and a track's children (`composition.cpp` 191), a reference's
+  // URL (`externalReference.cpp` 23), a `Clip.2`'s references
+  // (`clip.cpp` 141–144), a time's rate and value and a range's start
+  // and duration (`deserialization.cpp` 578, 585–586).
+  let cases: Vec<(String, &str)> = vec![
+    (TRACK.into(), "kind"),
+    (DISSOLVE.into(), "in_offset"),
+    (DISSOLVE.into(), "out_offset"),
+    (DISSOLVE.into(), "transition_type"),
+    (format!("{TRACK}.markers.0"), "marked_range"),
+    ("tracks".into(), "children"),
+    (TRACK.into(), "children"),
+    (A_MEDIA.into(), "target_url"),
+    (A.into(), "media_references"),
+    (A.into(), "active_media_reference_key"),
+    (format!("{GAP}.source_range.duration"), "rate"),
+    (format!("{GAP}.source_range.duration"), "value"),
+    (format!("{GAP}.source_range"), "start_time"),
+    (format!("{GAP}.source_range"), "duration"),
+  ];
+  for (path, key) in cases {
+    assert_eq!(
+      read(|root| remove(root, &path, key)),
+      Err(shape(&format!("{path}.{key}"), "a required key")),
+      "{path}.{key}",
+    );
+  }
+}
+
 #[test]
 fn a_schema_the_timeline_does_not_model_is_refused_with_where_it_sits() {
   let effect = |name: &str| object(vec![("OTIO_SCHEMA", text(name))]);

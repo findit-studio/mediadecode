@@ -324,7 +324,11 @@ writer's metadata, a track kind or transition type it does not know, a
 trim on a track, a marker color outside the eleven, a gap of some length
 after a track's last clip, …), and a count or rate that does not land
 exactly, or a time OpenTimelineIO would read rounded
-(`Unreadable::Inexact`). A key is read only
+(`Unreadable::Inexact`). A member OpenTimelineIO lets a document leave out
+reads as OpenTimelineIO's own reader reads it — an empty name, `enabled`,
+a GREEN marker, a gap of no length — or, where that is no value and the
+timeline needs one (`global_start_time`, a clip's `source_range`), is
+refused by name. A key is read only
 where it carries nothing — `null`, an empty list, `enabled` as `true` — or
 what the timeline keeps.
 
