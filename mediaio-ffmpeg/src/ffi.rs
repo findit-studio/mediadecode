@@ -967,6 +967,13 @@ pub(crate) mod c_shims {
     /// where its samples have a fixed size, else `0` — libavcodec answers
     /// every integer from a `switch` over the ids it names.
     pub(crate) fn av_get_bits_per_sample(codec_id: c_int) -> c_int;
+
+    /// `AVPacketSideDataType` as `c_int`: libavcodec's name for a packet
+    /// side-data type, or null for a type it does not name — answered for
+    /// every integer from a `switch` over the types it names
+    /// (`libavcodec/packet.c` 269–317 in FFmpeg 9.0.1). Each name is a
+    /// string literal of libavcodec's, live and unwritten for the process.
+    pub(crate) fn av_packet_side_data_name(kind: c_int) -> *const libc::c_char;
   }
 }
 

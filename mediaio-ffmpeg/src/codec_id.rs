@@ -265,6 +265,12 @@ impl CodecId {
   pub const EVC: Self = Self(AVCodecID::AV_CODEC_ID_EVC as i32);
   /// APV (Advanced Professional Video).
   pub const APV: Self = Self(AVCodecID::AV_CODEC_ID_APV as i32);
+  /// RealVideo 1.0.
+  pub const RV10: Self = Self(AVCodecID::AV_CODEC_ID_RV10 as i32);
+  /// RealVideo 2.0.
+  pub const RV20: Self = Self(AVCodecID::AV_CODEC_ID_RV20 as i32);
+  /// RealVideo 3.0.
+  pub const RV30: Self = Self(AVCodecID::AV_CODEC_ID_RV30 as i32);
 
   // --- Audio codecs ----------------------------------------------------
 
@@ -292,16 +298,32 @@ impl CodecId {
   pub const PCM_S16BE: Self = Self(AVCodecID::AV_CODEC_ID_PCM_S16BE as i32);
   /// PCM signed 24-bit little-endian.
   pub const PCM_S24LE: Self = Self(AVCodecID::AV_CODEC_ID_PCM_S24LE as i32);
+  /// PCM signed 24-bit big-endian.
+  pub const PCM_S24BE: Self = Self(AVCodecID::AV_CODEC_ID_PCM_S24BE as i32);
   /// PCM signed 32-bit little-endian.
   pub const PCM_S32LE: Self = Self(AVCodecID::AV_CODEC_ID_PCM_S32LE as i32);
+  /// PCM signed 32-bit big-endian.
+  pub const PCM_S32BE: Self = Self(AVCodecID::AV_CODEC_ID_PCM_S32BE as i32);
   /// PCM 32-bit float little-endian.
   pub const PCM_F32LE: Self = Self(AVCodecID::AV_CODEC_ID_PCM_F32LE as i32);
+  /// PCM 32-bit float big-endian.
+  pub const PCM_F32BE: Self = Self(AVCodecID::AV_CODEC_ID_PCM_F32BE as i32);
   /// PCM 64-bit float little-endian.
   pub const PCM_F64LE: Self = Self(AVCodecID::AV_CODEC_ID_PCM_F64LE as i32);
+  /// PCM 64-bit float big-endian.
+  pub const PCM_F64BE: Self = Self(AVCodecID::AV_CODEC_ID_PCM_F64BE as i32);
   /// WavPack.
   pub const WAVPACK: Self = Self(AVCodecID::AV_CODEC_ID_WAVPACK as i32);
   /// Dolby TrueHD.
   pub const TRUEHD: Self = Self(AVCodecID::AV_CODEC_ID_TRUEHD as i32);
+  /// Sony ATRAC3.
+  pub const ATRAC3: Self = Self(AVCodecID::AV_CODEC_ID_ATRAC3 as i32);
+  /// RealAudio Cook.
+  pub const COOK: Self = Self(AVCodecID::AV_CODEC_ID_COOK as i32);
+  /// RealAudio 2.0 (28.8 kbit/s).
+  pub const RA_288: Self = Self(AVCodecID::AV_CODEC_ID_RA_288 as i32);
+  /// RealAudio SIPR.
+  pub const SIPR: Self = Self(AVCodecID::AV_CODEC_ID_SIPR as i32);
 
   // --- Still-image and attachment codecs -------------------------------
 
@@ -357,6 +379,9 @@ impl fmt::Debug for CodecId {
       Self::LCEVC => "LCEVC",
       Self::EVC => "EVC",
       Self::APV => "APV",
+      Self::RV10 => "RV10",
+      Self::RV20 => "RV20",
+      Self::RV30 => "RV30",
       Self::AAC => "AAC",
       Self::MP3 => "MP3",
       Self::OPUS => "OPUS",
@@ -369,11 +394,19 @@ impl fmt::Debug for CodecId {
       Self::PCM_S16LE => "PCM_S16LE",
       Self::PCM_S16BE => "PCM_S16BE",
       Self::PCM_S24LE => "PCM_S24LE",
+      Self::PCM_S24BE => "PCM_S24BE",
       Self::PCM_S32LE => "PCM_S32LE",
+      Self::PCM_S32BE => "PCM_S32BE",
       Self::PCM_F32LE => "PCM_F32LE",
+      Self::PCM_F32BE => "PCM_F32BE",
       Self::PCM_F64LE => "PCM_F64LE",
+      Self::PCM_F64BE => "PCM_F64BE",
       Self::WAVPACK => "WAVPACK",
       Self::TRUEHD => "TRUEHD",
+      Self::ATRAC3 => "ATRAC3",
+      Self::COOK => "COOK",
+      Self::RA_288 => "RA_288",
+      Self::SIPR => "SIPR",
       Self::SUBRIP => "SUBRIP",
       Self::ASS => "ASS",
       Self::WEBVTT => "WEBVTT",

@@ -52,11 +52,17 @@ The family — `mediadecode`, `mediadecode-ffmpeg`, `mediadecode-webcodecs`,
   extradata — once `add_stream` made it; `Output::shifts_early_times`
   whether libavformat moves every stream's times for an early first one;
   and `Output::set_automatic_filters` turns its automatic bitstream
-  filters off, so that every packet reaches the muxer as handed over
-  (`OutputCall::AutomaticFilters`).
+  filters on or off — on by default, as libavformat's own — so that a
+  caller who wants every packet to reach the muxer as handed over can
+  have it (`OutputCall::AutomaticFilters`).
 - `CodecId::intra_only` — whether libavformat takes every packet of the
   codec for a key frame — and `CodecId::bits_per_sample`, with the
-  `LCEVC`, `EVC`, `APV`, `WAVPACK`, `TRUEHD` and `TTML` ids.
+  `LCEVC`, `EVC`, `APV`, `WAVPACK`, `TRUEHD` and `TTML` ids; the
+  big-endian `PCM_S24BE`, `PCM_S32BE`, `PCM_F32BE` and `PCM_F64BE`, and
+  `ATRAC3`, `COOK`, `RA_288`, `SIPR`, `RV10`, `RV20` and `RV30`.
+- `extras::packet_side_data_name`: libavcodec's name for a packet
+  side-data type, asked as the integer it is on the wire, or `None`
+  where this build names no such type.
 
 ## [0.19.0] - 2026-10-16
 
