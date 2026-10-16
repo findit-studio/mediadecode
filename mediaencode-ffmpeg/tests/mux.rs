@@ -2156,6 +2156,122 @@ fn l26_a_missing_configuration_is_refused_at_open() {
   ));
 }
 
+/// **L27 — the report names exactly what each container drops of a timed
+/// track's language and flags, and the file agrees**, case by case:
+/// Matroska keeps a language but an empty one and `und`, the default and
+/// forced flags, commentary, the impairments and original or dub — one of
+/// them — and no other; WebM the default and forced flags; MP4 a packed
+/// code that unpacks to itself, the enabled flag and its kind boxes. Read
+/// back, the report names exactly each declared field the file does not
+/// hold.
+#[test]
+fn l27_the_report_names_what_each_timed_road_drops() {
+  use TrackDisposition as D;
+  let Some(corpus) = Corpus::new() else { return };
+  let h264_source = corpus.multi_track_mkv();
+  let av1_source = av1_mkv(&corpus);
+  let h264 = first_track(&h264_source, TrackKind::Video, 2).1;
+  let av1 = first_track(&av1_source, TrackKind::Video, 2).1;
+  let cases = [
+    (
+      ContainerName::MATROSKA,
+      "mkv",
+      Some("eng"),
+      D::DEFAULT | D::FORCED | D::COMMENT | D::HEARING_IMPAIRED | D::VISUAL_IMPAIRED | D::ORIGINAL,
+    ),
+    (ContainerName::MATROSKA, "mkv", Some("en-US"), D::DUB),
+    (
+      ContainerName::MATROSKA,
+      "mkv",
+      Some(""),
+      D::ORIGINAL | D::DUB,
+    ),
+    (
+      ContainerName::MATROSKA,
+      "mkv",
+      Some("und"),
+      D::KARAOKE
+        | D::LYRICS
+        | D::CLEAN_EFFECTS
+        | D::CAPTIONS
+        | D::DESCRIPTIONS
+        | D::METADATA
+        | D::NON_DIEGETIC,
+    ),
+    (
+      ContainerName::WEBM,
+      "webm",
+      Some("eng"),
+      D::DEFAULT | D::FORCED,
+    ),
+    (
+      ContainerName::WEBM,
+      "webm",
+      Some(""),
+      D::COMMENT | D::HEARING_IMPAIRED,
+    ),
+    (
+      ContainerName::MP4,
+      "mp4",
+      Some("eng"),
+      D::DEFAULT | D::HEARING_IMPAIRED | D::COMMENT | D::DUB | D::FORCED,
+    ),
+    (
+      ContainerName::MP4,
+      "mp4",
+      Some("en"),
+      D::VISUAL_IMPAIRED | D::DESCRIPTIONS | D::CAPTIONS,
+    ),
+    (
+      ContainerName::MP4,
+      "mp4",
+      Some("ENG"),
+      D::KARAOKE | D::ORIGINAL,
+    ),
+    (ContainerName::MP4, "mp4", Some("`ab"), D::empty()),
+  ];
+  for (index, (container, extension, language, flags)) in cases.into_iter().enumerate() {
+    let (source, packets) = if container == ContainerName::WEBM {
+      (&av1_source, &av1)
+    } else {
+      (&h264_source, &h264)
+    };
+    let mut table = table_of(source, TrackKind::Video);
+    table[0].set_language(language.map(Into::into));
+    table[0].set_disposition(flags);
+    let offered: Vec<Row> = table.iter().map(offered).collect();
+    let target = output(&corpus, &format!("l27-{index}.{extension}"));
+    let (mut muxer, report) = FfmpegOwnedMuxer::open(
+      File::create(&target).expect("create"),
+      container,
+      table,
+      &[],
+      PacketLimits::default(),
+    )
+    .expect("open");
+    for (at, packet) in packets.iter().enumerate() {
+      let at = 40 * at as i64;
+      muxer
+        .write_video(video_at(&video_of(packet), Some(at), at))
+        .map_err(|error| error.map_packet(drop))
+        .expect("a packet");
+    }
+    muxer.finish().expect("the container is finished");
+    let written = rows(&target);
+    let fields: Vec<Uncarried> = report
+      .uncarried()
+      .iter()
+      .filter(|lost| !matches!(lost, Uncarried::Rewritten { .. }))
+      .cloned()
+      .collect();
+    assert_eq!(
+      fields,
+      lost(0, &offered[0], &written[0]),
+      "case {index}: the report names exactly what the file lost",
+    );
+  }
+}
+
 /// **L28 — a packet the container writes in its own form is reported at
 /// open, and reads back so**: MP4 marks each `mov_text` cue's end with an
 /// empty sample of its own; MP4 writes a transport stream's Annex B H.264

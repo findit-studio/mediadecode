@@ -49,6 +49,14 @@ The family releases in lockstep.
   joined TTML paragraphs, sync from the bitstream, durations the container
   does not keep, Matroska's stripped WavPack headers. The automatic
   bitstream filters are off in these containers.
+- **The report table.** What a road keeps of a track's filename, MIME
+  type, language and each disposition flag, per container, is one
+  table the report and the stream's disposition both read: Matroska's
+  text descriptions on a subtitle track alone; a language Matroska or
+  WebM writes as `und` or reads back as none, and an MP4 language whose
+  packed code does not unpack to itself, reported; no flag the report
+  names as dropped handed to libavformat, so MP4 makes no cover of a
+  timed track.
 - The encoders arrive in the following releases.
 
 ## [0.19.0] - 2026-10-16

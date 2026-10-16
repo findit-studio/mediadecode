@@ -190,11 +190,15 @@ pub enum Uncarried {
     /// The MIME type the attachment declared.
     mime_type: Utf8Bytes,
   },
-  /// A language the container cannot spell, or keeps no field for on the
-  /// track's road. MP4 stores exactly three letters in `a`–`z` and its
-  /// neighbours (`movenc.c` 8455–8458, `isom.c` 233–258 in FFmpeg
-  /// 9.0.1); anything else is written as undetermined, or cut to three
-  /// letters. MP4's cover, which no track carries, keeps none.
+  /// A language the track's road does not write so that it reads back as
+  /// itself — the report table's language rule. Matroska and WebM write
+  /// an empty tag as `und` (`matroskaenc.c` 1967–1969 in FFmpeg 9.0.1) and
+  /// read `und` back as none (`matroskadec.c` 3280–3281). MP4 keeps only a
+  /// code that packs and unpacks to itself: exactly three bytes in
+  /// `0x60..=0x7F`, the first not `0x60`, which packs below `0x400` and
+  /// unpacks through the Macintosh table, and not all three `0x7F`, which
+  /// packs to "unspecified" (`isom.c` 233–280; `movenc.c` 8455–8458).
+  /// MP4's cover, which no track carries, keeps none.
   Language {
     /// The track.
     track: TrackIndex,
@@ -1359,7 +1363,7 @@ where
       let stream = match road {
         Road::NotWritten => None,
         road => {
-          let spec = stream_spec(description, *road);
+          let spec = stream_spec(family, description, *road);
           let stream = output
             .add_stream(&spec)
             .map_err(|error| MuxFault::new(MuxStage::Stream { track }, error))?;
@@ -2062,19 +2066,9 @@ fn rewrites(
 }
 
 /// What `road` drops of `description` in `family`, in the report's
-/// order: the whole attachment where it is not written; else an
-/// attachment's filename and MIME type, the language and the disposition
-/// flags the road keeps no field for.
-///
-/// The roads keep different fields. A timed stream keeps the language
-/// and the flags its container has fields for. An attachment Matroska
-/// writes keeps its file, filename and MIME type (`mkv_write_attachments`,
-/// `matroskaenc.c` 2513–2561 in FFmpeg 9.0.1) and its language, among the
-/// tags written for it (`mkv_write_tags`, 2377–2390), but no flag: it has
-/// no track entry (1957–1958). MP4's cover keeps its picture and the type
-/// of its image (`mov_write_covr`, `movenc.c` 4815–4839), and reads back
-/// as an attached picture: its filename, MIME type, language and every
-/// other flag are dropped.
+/// order: the whole attachment where it is not written; else, by the
+/// report table ([`kept`]), an attachment's filename and MIME type, the
+/// language and the disposition flags the road keeps no field for.
 fn losses<D>(
   family: Family,
   road: Road,
@@ -2084,51 +2078,210 @@ fn losses<D>(
   if road == Road::NotWritten {
     return vec![Uncarried::Attachment { track }];
   }
+  let kept = kept(
+    family,
+    road,
+    description.kind(),
+    description.codec(),
+    description.disposition(),
+  );
   let mut lost = Vec::new();
-  if road == Road::Cover
-    && let Some(file) = description.file()
-  {
-    if let Some(filename) = file.filename() {
+  if let Some(file) = description.file() {
+    if let Some(filename) = file.filename()
+      && !kept.filename
+    {
       lost.push(Uncarried::Filename {
         track,
         filename: filename.clone(),
       });
     }
-    if let Some(mime_type) = file.mime_type() {
+    if let Some(mime_type) = file.mime_type()
+      && !kept.mime_type
+    {
       lost.push(Uncarried::MimeType {
         track,
         mime_type: mime_type.clone(),
       });
     }
   }
-  let language_kept = |tag: &str| match road {
-    Road::Timed => language_carried(family, tag),
-    Road::Attachment => true,
-    Road::Cover | Road::NotWritten => false,
-  };
   if let Some(tag) = description.language()
-    && !language_kept(tag.as_str())
+    && !kept.language.keeps(tag.as_str())
   {
     lost.push(Uncarried::Language {
       track,
       tag: tag.clone(),
     });
   }
-  let flags = disposition_dropped(family, road, description.codec(), description.disposition());
+  let flags = description.disposition().difference(kept.flags);
   if !flags.is_empty() {
     lost.push(Uncarried::Disposition { track, flags });
   }
   lost
 }
 
-/// The stream a track becomes, on its road.
+/// What a road keeps of a track's own fields in a container: one row of
+/// the report table (see [the module](self)), which the report and the
+/// stream's disposition both read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Kept {
+  filename: bool,
+  mime_type: bool,
+  language: LanguageRule,
+  flags: TrackDisposition,
+}
+
+/// Which languages a road writes so that they read back as themselves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LanguageRule {
+  /// Any, as given.
+  AsGiven,
+  /// A Matroska or WebM track entry's: as given, but an empty tag is
+  /// written as `und` (`matroskaenc.c` 1967–1969) and `und` reads back as
+  /// none (`matroskadec.c` 3280–3281).
+  Determined,
+  /// MP4's packed code: exactly three bytes in `0x60..=0x7F` that pack
+  /// and unpack to themselves — not a first byte of `0x60`, which packs
+  /// below `0x400` and unpacks through the Macintosh table, and not
+  /// `0x7F7F7F`, which packs to "unspecified" (`isom.c` 233–280;
+  /// `movenc.c` 8455–8458). An empty tag is written as `und`.
+  Packed,
+  /// None.
+  Dropped,
+}
+
+impl LanguageRule {
+  /// Whether the road writes `tag` so that it reads back as `tag`.
+  fn keeps(self, tag: &str) -> bool {
+    match self {
+      Self::AsGiven => true,
+      Self::Determined => !tag.is_empty() && tag != "und",
+      Self::Packed => {
+        let bytes = tag.as_bytes();
+        bytes.len() == 3
+          && bytes.iter().all(|byte| (0x60..=0x7F).contains(byte))
+          && bytes[0] != 0x60
+          && bytes != [0x7F; 3]
+      }
+      Self::Dropped => false,
+    }
+  }
+}
+
+/// The report table: what `road` keeps in `family` of a track of `kind`
+/// and `codec` declaring `flags` — from each muxer's source in FFmpeg
+/// 9.0.1, and its demuxer's for what reads back. A container this release
+/// does not know keeps everything, as far as anything is claimed.
+fn kept(
+  family: Family,
+  road: Road,
+  kind: TrackKind,
+  codec: CodecId,
+  flags: TrackDisposition,
+) -> Kept {
+  use TrackDisposition as D;
+  // Every bit, an unnamed one among them.
+  let everything = Kept {
+    filename: true,
+    mime_type: true,
+    language: LanguageRule::AsGiven,
+    flags: D::from_bits_retain(u32::MAX),
+  };
+  match (family, road) {
+    (Family::Other, _) | (_, Road::NotWritten) => everything,
+    // An attachment Matroska writes keeps its file, filename and MIME
+    // type (`mkv_write_attachments`, `matroskaenc.c` 2513–2561) and its
+    // language, among the tags written for it (`mkv_write_tags`,
+    // 2377–2390), but no flag: it has no track entry (1957–1958).
+    (_, Road::Attachment) => Kept {
+      flags: D::empty(),
+      ..everything
+    },
+    // MP4's cover keeps its picture and the type of its image
+    // (`mov_write_covr`, `movenc.c` 4815–4839), and reads back as an
+    // attached picture and nothing more.
+    (_, Road::Cover) => Kept {
+      filename: false,
+      mime_type: false,
+      language: LanguageRule::Dropped,
+      flags: D::ATTACHED_PIC,
+    },
+    // `matroskaenc.c` 1967–2003, 2149–2150: the default and forced flags,
+    // the commentary and impairment flags, original or dub — one of them;
+    // both at once write neither — and text descriptions on a subtitle
+    // track alone.
+    (Family::Matroska, Road::Timed) => {
+      let mut kept = D::DEFAULT | D::FORCED | D::COMMENT | D::HEARING_IMPAIRED | D::VISUAL_IMPAIRED;
+      if !flags.contains(D::ORIGINAL | D::DUB) {
+        kept |= D::ORIGINAL | D::DUB;
+      }
+      if kind == TrackKind::Subtitle {
+        kept |= D::DESCRIPTIONS;
+      }
+      Kept {
+        language: LanguageRule::Determined,
+        flags: kept,
+        ..everything
+      }
+    }
+    // WebM: the default and forced flags, and a WebVTT track's kind
+    // through its codec id — the first of captions, descriptions or
+    // metadata it declares (`matroskaenc.c` 1974–2002).
+    (Family::WebM, Road::Timed) => {
+      let mut kept = D::DEFAULT | D::FORCED;
+      if codec == CodecId::WEBVTT
+        && let Some(first) = [D::CAPTIONS, D::DESCRIPTIONS, D::METADATA]
+          .into_iter()
+          .find(|kind| flags.contains(*kind))
+      {
+        kept |= first;
+      }
+      Kept {
+        language: LanguageRule::Determined,
+        flags: kept,
+        ..everything
+      }
+    }
+    // The track's enabled flag (`enable_tracks`, `movenc.c` 7883–7923)
+    // and the DASH role `kind` boxes (4338–4356, `isom.c` 450–462).
+    (Family::Mp4, Road::Timed) => Kept {
+      language: LanguageRule::Packed,
+      flags: D::DEFAULT
+        | D::HEARING_IMPAIRED
+        | D::CAPTIONS
+        | D::COMMENT
+        | D::VISUAL_IMPAIRED
+        | D::DESCRIPTIONS
+        | D::DUB
+        | D::FORCED,
+      ..everything
+    },
+  }
+}
+
+/// The stream a track becomes, on its road. The disposition handed to
+/// libavformat is what the report table keeps of it ([`kept`]), so that no
+/// flag the report names as dropped acts on the stream — MP4 would make a
+/// timed video stream marked as an attached picture into a cover
+/// (`is_cover_image`, `movenc.c` 7606–7620).
 fn stream_spec<'a, D: AsRef<[u8]>>(
+  family: Family,
   description: &'a TrackDescription<Ffmpeg, D, CodecTicket>,
   road: Road,
 ) -> StreamSpec<'a> {
   let ticket = description.side_data();
+  let declared = description.disposition();
+  let written = declared.intersection(
+    kept(
+      family,
+      road,
+      description.kind(),
+      description.codec(),
+      declared,
+    )
+    .flags,
+  );
   let spec = StreamSpec::new(ticket, description.timebase())
-    .with_disposition(description.disposition().bits() as i32)
+    .with_disposition(written.bits() as i32)
     .with_language(description.language().map(Utf8Bytes::as_str))
     .with_extradata(description.extradata().map(|bytes| bytes.as_ref()));
   let spec = match description.params() {
@@ -2168,83 +2321,6 @@ fn matroska_mime_type(codec: CodecId) -> Option<&'static str> {
 /// in FFmpeg 9.0.1).
 fn is_cover_codec(codec: CodecId) -> bool {
   codec == CodecId::MJPEG || codec == CodecId::PNG || codec == CodecId::BMP
-}
-
-/// Whether `family` writes the language `tag` as it is.
-fn language_carried(family: Family, tag: &str) -> bool {
-  match family {
-    // MP4 packs three five-bit letters: exactly three bytes, each in
-    // 0x60..=0x7F (`ff_mov_iso639_to_lang`, `isom.c` 233–258). Anything
-    // else is written as undetermined, or cut to its first three.
-    Family::Mp4 => {
-      let bytes = tag.as_bytes();
-      bytes.len() == 3 && bytes.iter().all(|byte| (0x60..=0x7F).contains(byte))
-    }
-    // Matroska and WebM write the tag as given (`matroskaenc.c`
-    // 1967–1969); for any other container nothing is claimed.
-    Family::Matroska | Family::WebM | Family::Other => true,
-  }
-}
-
-/// The disposition flags `road` has no field for in `family`.
-fn disposition_dropped(
-  family: Family,
-  road: Road,
-  codec: CodecId,
-  flags: TrackDisposition,
-) -> TrackDisposition {
-  use TrackDisposition as D;
-  let kept = match (road, family) {
-    // No track entry, so no flag (`matroskaenc.c` 1957–1958); a track
-    // not written is reported whole.
-    (Road::Attachment | Road::NotWritten, _) => D::empty(),
-    // The cover reads back as an attached picture, and nothing more
-    // (`movenc.c` 4815–4839).
-    (Road::Cover, _) => D::ATTACHED_PIC,
-    // `matroskaenc.c` 1971–2023, 2157: the default and forced flags, the
-    // commentary, impairment and text-description flags, and original or
-    // dub — one of them; both at once write neither.
-    (Road::Timed, Family::Matroska) => {
-      let mut kept = D::DEFAULT
-        | D::FORCED
-        | D::COMMENT
-        | D::HEARING_IMPAIRED
-        | D::VISUAL_IMPAIRED
-        | D::DESCRIPTIONS;
-      if !flags.contains(D::ORIGINAL | D::DUB) {
-        kept |= D::ORIGINAL | D::DUB;
-      }
-      kept
-    }
-    // WebM writes the default and forced flags, and a WebVTT track's
-    // kind through its codec id — the first of captions, descriptions or
-    // metadata it declares (`matroskaenc.c` 1979–2002).
-    (Road::Timed, Family::WebM) => {
-      let mut kept = D::DEFAULT | D::FORCED;
-      if codec == CodecId::WEBVTT
-        && let Some(kind) = [D::CAPTIONS, D::DESCRIPTIONS, D::METADATA]
-          .into_iter()
-          .find(|kind| flags.contains(*kind))
-      {
-        kept |= kind;
-      }
-      kept
-    }
-    // The track's enabled flag and the DASH role `kind` boxes
-    // (`movenc.c` 4338–4385, `isom.c` 450–462).
-    (Road::Timed, Family::Mp4) => {
-      D::DEFAULT
-        | D::HEARING_IMPAIRED
-        | D::CAPTIONS
-        | D::COMMENT
-        | D::VISUAL_IMPAIRED
-        | D::DESCRIPTIONS
-        | D::DUB
-        | D::FORCED
-    }
-    (Road::Timed, Family::Other) => return D::empty(),
-  };
-  flags.difference(kept)
 }
 
 /// A chapter's span in its own time base, or a refusal naming it.
