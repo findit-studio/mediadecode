@@ -272,7 +272,10 @@ fn absent_metadata_reads_as_no_note_and_a_needed_word_is_refused_by_name() {
   );
   assert_eq!(
     read(|root| remove(root, A, "metadata")),
-    Err(shape(&format!("{A}.metadata.mediaio.id"), "a required word")),
+    Err(shape(
+      &format!("{A}.metadata.mediaio.id"),
+      "a required word"
+    )),
   );
 }
 
@@ -290,10 +293,9 @@ fn an_items_absent_source_range_is_no_trim_a_gap_of_no_length_or_refused_for_a_c
   // The export writes one after a fade-out at the track's end.
   let mut faded = sample();
   let b = &mut faded.tracks_mut()[0].clips_mut()[1];
-  let fades = b.fades().with_out(Some(Fade::new(
-    Duration::new(4, edit()),
-    FadeShape::Linear,
-  )));
+  let fades = b
+    .fades()
+    .with_out(Some(Fade::new(Duration::new(4, edit()), FadeShape::Linear)));
   b.set_fades(fades);
   let mut root = json::parse(&to_otio(&faded, OtioTarget::V0_15Plus).unwrap()).unwrap();
   remove(&mut root, &format!("{TRACK}.children.6"), "source_range");
@@ -403,7 +405,11 @@ fn a_clip_1_without_a_media_reference_is_a_clip_with_no_medium() {
   // OpenTimelineIO upgrades it to a `Clip.2` holding a `MissingReference`
   // (`typeRegistry.cpp` 99–117), as it does a `null` one.
   assert_eq!(
-    read_edited(OtioTarget::Legacy, |root| remove(root, A, "media_reference")),
+    read_edited(OtioTarget::Legacy, |root| remove(
+      root,
+      A,
+      "media_reference"
+    )),
     Err(feature(Feature::NoMedia, &format!("{A}.media_reference"))),
   );
 }
