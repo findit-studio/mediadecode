@@ -2135,8 +2135,13 @@ fn the_packet_timebase_reaches_the_codec_context() {
   };
   let limits = crate::limits::DecoderLimits::default();
   let read_back = |declared: Option<mediadecode::Timebase>| {
-    let (ctx, _state) =
-      build_codec_context(&parameters(), limits, declared).expect("a context is allocated");
+    let (ctx, _state) = build_codec_context(
+      &parameters(),
+      limits,
+      crate::DecoderOptions::new(),
+      declared,
+    )
+    .expect("a context is allocated");
     // SAFETY: `ctx` owns a live `AVCodecContext` for this borrow, and
     // `pkt_timebase` is a public `AVRational` field.
     let raw = unsafe { (*ctx.as_ptr()).pkt_timebase };
@@ -2162,6 +2167,311 @@ fn the_packet_timebase_reaches_the_codec_context() {
   assert_eq!(read_back(Some(unset)), (0, 1));
 }
 
+/// **The decoder's options reach the codec context.** Each of the three
+/// `AVDiscard` settings is written as the value it names, every value of
+/// each; and the defaults leave libavcodec's own, `AVDISCARD_DEFAULT`.
+#[test]
+fn every_discard_value_reaches_the_codec_context() {
+  ffmpeg_next::init().expect("ffmpeg init");
+
+  let mut parameters = ffmpeg_next::codec::Parameters::new();
+  // SAFETY: `parameters` owns a live, zeroed `AVCodecParameters`; both
+  // fields written are plain scalars.
+  unsafe {
+    let raw = parameters.as_mut_ptr();
+    (*raw).codec_type = ffmpeg_next::ffi::AVMediaType::AVMEDIA_TYPE_VIDEO;
+    (*raw).codec_id = ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_H264;
+  }
+  let read_back = |options: crate::DecoderOptions| {
+    let (ctx, state) = build_codec_context(
+      &parameters,
+      crate::limits::DecoderLimits::default(),
+      options,
+      None,
+    )
+    .expect("a context is allocated");
+    // SAFETY: `ctx` owns a live `AVCodecContext` for this borrow; the
+    // three are `AVDiscard` fields, read as the integers they are.
+    let raw = unsafe {
+      let ctx = ctx.as_ptr();
+      (
+        ptr::addr_of!((*ctx).skip_frame).cast::<i32>().read(),
+        ptr::addr_of!((*ctx).skip_loop_filter).cast::<i32>().read(),
+        ptr::addr_of!((*ctx).skip_idct).cast::<i32>().read(),
+      )
+    };
+    drop(ctx);
+    drop(state);
+    raw
+  };
+  assert_eq!(read_back(crate::DecoderOptions::new()), (0, 0, 0));
+  for value in crate::Discard::ALL {
+    let av = value.as_av() as i32;
+    let one = crate::DecoderOptions::new();
+    assert_eq!(read_back(one.with_skip_frame(value)), (av, 0, 0), "{value}");
+    assert_eq!(
+      read_back(one.with_skip_loop_filter(value)),
+      (0, av, 0),
+      "{value}"
+    );
+    assert_eq!(read_back(one.with_skip_idct(value)), (0, 0, av), "{value}");
+  }
+}
+
+/// **The open request starts at [`VideoDecoder::open`]'s and sets each
+/// optional**, consuming and in place alike, and back to the probe and an
+/// untimed decoder.
+#[test]
+fn the_open_request_starts_at_opens_and_sets_each_optional() {
+  use std::num::NonZeroI32;
+
+  let request = VideoDecoderOpen::new();
+  assert_eq!(request, VideoDecoderOpen::default());
+  assert_eq!(
+    (
+      request.backend(),
+      request.limits(),
+      request.timebase(),
+      request.options()
+    ),
+    (
+      None,
+      crate::limits::DecoderLimits::new(),
+      None,
+      crate::DecoderOptions::new()
+    )
+  );
+
+  let limits = crate::limits::DecoderLimits::new().with_max_packet_bytes(12_345);
+  let timebase = mediadecode::Timebase::new(1, NonZeroI32::new(1_000).expect("non-zero"));
+  let options = crate::DecoderOptions::new().with_skip_frame(crate::Discard::NonReference);
+  let built = request
+    .with_backend(Some(Backend::VideoToolbox))
+    .with_limits(limits)
+    .with_timebase(Some(timebase))
+    .with_options(options);
+  assert_eq!(
+    (
+      built.backend(),
+      built.limits(),
+      built.timebase(),
+      built.options()
+    ),
+    (Some(Backend::VideoToolbox), limits, Some(timebase), options)
+  );
+  let mut set = VideoDecoderOpen::new();
+  set
+    .set_backend(Some(Backend::VideoToolbox))
+    .set_limits(limits)
+    .set_timebase(Some(timebase))
+    .set_options(options);
+  assert_eq!(set, built);
+  set.set_backend(None).set_timebase(None);
+  assert_eq!(
+    set,
+    VideoDecoderOpen::new()
+      .with_limits(limits)
+      .with_options(options)
+  );
+}
+
+/// Codec parameters naming H.264 video and nothing more: enough for a
+/// context to open.
+#[cfg(target_vendor = "apple")]
+fn h264_parameters() -> codec::Parameters {
+  let mut parameters = codec::Parameters::new();
+  // SAFETY: `parameters` owns a live, zeroed `AVCodecParameters`; both
+  // fields written are plain scalars.
+  unsafe {
+    let raw = parameters.as_mut_ptr();
+    (*raw).codec_type = ffmpeg_next::ffi::AVMediaType::AVMEDIA_TYPE_VIDEO;
+    (*raw).codec_id = ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_H264;
+  }
+  parameters
+}
+
+/// What a decoder opened as, read the way the two laws below read it:
+/// whether it probes, its backend and its limits; the packet timebase and
+/// the three skips its context holds, as raw integers; and the options it
+/// reports.
+#[cfg(target_vendor = "apple")]
+type Opened = (
+  bool,
+  Backend,
+  crate::limits::DecoderLimits,
+  (i32, i32),
+  (i32, i32, i32),
+  crate::DecoderOptions,
+);
+
+#[cfg(target_vendor = "apple")]
+fn opened(decoder: Result<VideoDecoder>) -> Opened {
+  let decoder = decoder.expect("the decoder opens");
+  // SAFETY: `decoder.state.inner` owns a live, opened `AVCodecContext` for
+  // this borrow; `pkt_timebase` is a public `AVRational` field, and the
+  // three skips are `AVDiscard` fields, read as the integers they are.
+  let (timebase, skips) = unsafe {
+    let ctx = decoder.state.inner.as_ptr();
+    (
+      ((*ctx).pkt_timebase.num, (*ctx).pkt_timebase.den),
+      (
+        ptr::addr_of!((*ctx).skip_frame).cast::<i32>().read(),
+        ptr::addr_of!((*ctx).skip_loop_filter).cast::<i32>().read(),
+        ptr::addr_of!((*ctx).skip_idct).cast::<i32>().read(),
+      ),
+    )
+  };
+  (
+    decoder.probe.is_some(),
+    decoder.backend(),
+    decoder.frame_limits,
+    timebase,
+    skips,
+    decoder.options(),
+  )
+}
+
+/// **What the open request names reaches the decoder it opens**, on the
+/// probe and on a pinned backend, untimed and timed:
+///
+/// - the options and the packet timebase are written into the context;
+/// - the limits are held;
+/// - the probe is present exactly when no backend is pinned;
+/// - the options are reported.
+///
+/// On Apple targets, over VideoToolbox. It is the probe's one backend
+/// there, and it opens a context without asking for hardware: its device
+/// is created with nothing to create (`libavutil/hwcontext_videotoolbox.c`
+/// 829–838 in FFmpeg 9.0.1), and the decoder's session waits for the
+/// first picture.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn the_open_request_reaches_the_decoder_on_both_roads() {
+  use std::num::NonZeroI32;
+
+  ffmpeg_next::init().expect("ffmpeg init");
+
+  // A different value in each skip, so a setting written into another's
+  // field is seen.
+  let options = crate::DecoderOptions::new()
+    .with_skip_frame(crate::Discard::NonReference)
+    .with_skip_loop_filter(crate::Discard::All)
+    .with_skip_idct(crate::Discard::NonKey);
+  let limits = crate::limits::DecoderLimits::new().with_max_packet_bytes(12_345);
+  let milliseconds = mediadecode::Timebase::new(1, NonZeroI32::new(1_000).expect("non-zero"));
+  for pinned in [None, Some(Backend::VideoToolbox)] {
+    for (timebase, written) in [(None, (0, 1)), (Some(milliseconds), (1, 1_000))] {
+      let request = VideoDecoderOpen::new()
+        .with_backend(pinned)
+        .with_limits(limits)
+        .with_timebase(timebase)
+        .with_options(options);
+      assert_eq!(
+        opened(VideoDecoder::open_from(request, h264_parameters())),
+        (
+          pinned.is_none(),
+          Backend::VideoToolbox,
+          limits,
+          written,
+          (8, 48, 32),
+          options
+        ),
+        "{request:?}"
+      );
+    }
+  }
+}
+
+/// **Each of the eight `open*` constructors opens the request its
+/// arguments spell**: the probe or the pinned backend, the limits and the
+/// packet timebase it names, and libavcodec's options.
+///
+/// On Apple targets, over VideoToolbox, for the reason the law above
+/// gives.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn each_open_constructor_opens_the_request_it_spells() {
+  use std::num::NonZeroI32;
+
+  ffmpeg_next::init().expect("ffmpeg init");
+
+  let parameters = h264_parameters;
+  let default = crate::limits::DecoderLimits::default();
+  let limits = crate::limits::DecoderLimits::new().with_max_packet_bytes(12_345);
+  let milliseconds = mediadecode::Timebase::new(1, NonZeroI32::new(1_000).expect("non-zero"));
+  let (untimed, timed) = ((0, 1), (1, 1_000));
+  let pinned = Backend::VideoToolbox;
+  let cases = [
+    (
+      "open",
+      opened(VideoDecoder::open(parameters())),
+      (true, default, untimed),
+    ),
+    (
+      "open_timed",
+      opened(VideoDecoder::open_timed(parameters(), milliseconds)),
+      (true, default, timed),
+    ),
+    (
+      "open_with_frame_limits",
+      opened(VideoDecoder::open_with_frame_limits(parameters(), limits)),
+      (true, limits, untimed),
+    ),
+    (
+      "open_with_frame_limits_timed",
+      opened(VideoDecoder::open_with_frame_limits_timed(
+        parameters(),
+        limits,
+        milliseconds,
+      )),
+      (true, limits, timed),
+    ),
+    (
+      "open_with",
+      opened(VideoDecoder::open_with(parameters(), pinned)),
+      (false, default, untimed),
+    ),
+    (
+      "open_with_timed",
+      opened(VideoDecoder::open_with_timed(
+        parameters(),
+        pinned,
+        milliseconds,
+      )),
+      (false, default, timed),
+    ),
+    (
+      "open_with_limits",
+      opened(VideoDecoder::open_with_limits(parameters(), pinned, limits)),
+      (false, limits, untimed),
+    ),
+    (
+      "open_with_limits_timed",
+      opened(VideoDecoder::open_with_limits_timed(
+        parameters(),
+        pinned,
+        limits,
+        milliseconds,
+      )),
+      (false, limits, timed),
+    ),
+  ];
+  for (name, opened, (probing, limits, timebase)) in cases {
+    assert_eq!(
+      opened,
+      (
+        probing,
+        pinned,
+        limits,
+        timebase,
+        (0, 0, 0),
+        crate::DecoderOptions::new()
+      ),
+      "{name}"
+    );
+  }
+}
+
 /// **A context this crate builds decodes on one thread.** Nothing here
 /// sets `thread_count` or `thread_type`, and FFmpeg's own default is one
 /// thread, so the allocator judge and the `get_format` callback run on
@@ -2180,9 +2490,13 @@ fn a_context_this_crate_builds_decodes_on_one_thread() {
     (*raw).codec_type = ffmpeg_next::ffi::AVMediaType::AVMEDIA_TYPE_VIDEO;
     (*raw).codec_id = ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_H264;
   }
-  let (ctx, state) =
-    build_codec_context(&parameters, crate::limits::DecoderLimits::default(), None)
-      .expect("a context is allocated");
+  let (ctx, state) = build_codec_context(
+    &parameters,
+    crate::limits::DecoderLimits::default(),
+    crate::DecoderOptions::new(),
+    None,
+  )
+  .expect("a context is allocated");
   // SAFETY: `ctx` owns a live `AVCodecContext` for this borrow, and
   // `thread_count` is a plain integer field.
   let threads = unsafe { (*ctx.as_ptr()).thread_count };

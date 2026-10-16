@@ -112,6 +112,8 @@ use mediadecode::{
     Demuxer, DurationSource, MeasuredEnd, SubtitleTrackPacket, SubtitleTrackParams, TrackIndex,
     TrackInfo, TrackKind, TrackParams, UnknownTrackParams, VideoTrackPacket, VideoTrackParams,
   },
+  nal::{NalCodec, NalStream},
+  packet::PacketFlags,
 };
 use smol_bytes::Utf8Bytes;
 
@@ -279,6 +281,14 @@ pub struct CarrierDemuxer<C: crate::FfmpegCarrier> {
   /// [`Measured`]. Fed by [`Self::next_packet_impl`] as packets are
   /// read; it reads nothing itself.
   measured: Measured,
+  /// Each track's reading of its H.264 or HEVC bitstream, by track
+  /// index — `None` for every other track — through which
+  /// [`Self::next_packet_impl`] marks a video packet
+  /// [`DISPOSABLE`](mediadecode::packet::PacketFlags::DISPOSABLE) where
+  /// its NAL units prove that nothing references its picture
+  /// ([`mediadecode::nal`]), in any container. Built at open from each
+  /// stream's codec and extradata ([`bitstreams`]).
+  bitstreams: Vec<Option<NalStream>>,
   /// Reads that answer in place of libavformat's next ones. Test only:
   /// see [`Self::read_into`].
   #[cfg(test)]
@@ -561,6 +571,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
     // `max_streams`.
     let measured =
       Measured::new(count).map_err(|_| DemuxError::TrackTableAlloc(TrackTableAlloc::new(count)))?;
+    let bitstreams = bitstreams(&input)?;
     Ok(Self {
       input,
       tracks,
@@ -568,6 +579,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
       format,
       duration,
       measured,
+      bitstreams,
       #[cfg(test)]
       injected_reads: VecDeque::new(),
       pending,
@@ -1181,7 +1193,12 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierDemuxer<C> {
             provenance,
           )
         }
-        .map(|built| built.map(|p| DemuxedPacket::Video(VideoTrackPacket::new(track, p)))),
+        .map(|built| {
+          built.map(|p| {
+            let p = marked_from_bitstream(self.bitstreams.get_mut(index), p);
+            DemuxedPacket::Video(VideoTrackPacket::new(track, p))
+          })
+        }),
         TrackKind::Audio => unsafe {
           boundary::audio_packet_from_borrowed::<C>(
             &packet,
@@ -3022,6 +3039,94 @@ unsafe fn packet_is_parked_picture(stream: *const AVStream, packet: &Packet) -> 
 /// `TIMED_THUMBNAILS` constant at all — its `from_bits_truncate` drops
 /// every bit this build of the wrapper has no name for, which is how
 /// the distinction went missing in the first place.
+/// Each stream's reading of its H.264 or HEVC bitstream, by stream
+/// index: a [`NalStream`] for a video stream of either codec, built from
+/// its extradata, and `None` for every other stream, whose packets carry
+/// the container's mark alone.
+///
+/// The codec and the medium are read as the raw integers they are, as
+/// [`build_tracks`] reads them; the extradata is borrowed, not copied —
+/// the reading keeps only its framing and the sub-layers its parameter
+/// sets declare.
+fn bitstreams(input: &Input) -> Result<Vec<Option<NalStream>>, DemuxError> {
+  let count = input.streams().len();
+  let mut out = Vec::new();
+  out
+    .try_reserve_exact(count)
+    .map_err(|_| DemuxError::TrackTableAlloc(TrackTableAlloc::new(count)))?;
+  for stream in input.streams() {
+    let parameters = stream.parameters();
+    // SAFETY: the stream's parameters are live for this iteration.
+    let par = unsafe { parameters.as_ptr() };
+    // SAFETY: `codec_id` is a public field of the live parameters, read
+    // as the integer it is rather than as its bindgen enum.
+    let codec =
+      CodecId::from_raw(unsafe { read_unaligned(addr_of!((*par).codec_id).cast::<i32>()) });
+    let nal = match codec {
+      CodecId::H264 => Some(NalCodec::H264),
+      CodecId::HEVC => Some(NalCodec::Hevc),
+      _ => None,
+    }
+    .filter(|_| boundary::media_kind_of(&parameters).is_video())
+    .map(|codec| {
+      // SAFETY: `extradata` and `extradata_size` are public fields of the
+      // stream's live parameters; libavformat keeps `extradata` readable
+      // for `extradata_size` bytes while the stream exists, and the slice
+      // is read before this iteration ends.
+      let extradata = unsafe {
+        let ptr = (*par).extradata;
+        let len = (*par).extradata_size.max(0) as usize;
+        if ptr.is_null() || len == 0 {
+          &[][..]
+        } else {
+          core::slice::from_raw_parts(ptr, len)
+        }
+      };
+      NalStream::new(codec, extradata)
+    });
+    out.push(nal);
+  }
+  Ok(out)
+}
+
+/// `packet`, marked [`PacketFlags::DISPOSABLE`] where its track's
+/// bitstream proves that nothing references its picture
+/// ([`NalStream::read`]) — and, where the packet carries
+/// `AV_PKT_DATA_NEW_EXTRADATA`, read in the configuration it brings, as a
+/// decoder would take it (the first such entry, as
+/// `av_packet_get_side_data` answers).
+///
+/// A packet known to be corrupt is neither read nor marked: its NAL units
+/// say nothing the reading may learn from. A track without a reading — a
+/// codec other than H.264 and HEVC — passes its packets through.
+fn marked_from_bitstream<D: AsRef<[u8]>>(
+  bitstream: Option<&mut Option<NalStream>>,
+  packet: mediadecode::packet::VideoPacket<crate::extras::VideoPacketExtra, D>,
+) -> mediadecode::packet::VideoPacket<crate::extras::VideoPacketExtra, D> {
+  let Some(Some(bitstream)) = bitstream else {
+    return packet;
+  };
+  const NEW_EXTRADATA: i32 =
+    ffmpeg_next::ffi::AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA as i32;
+  if let Some(entry) = packet
+    .extra()
+    .side_data()
+    .iter()
+    .find(|entry| entry.kind() == NEW_EXTRADATA)
+  {
+    bitstream.reconfigure(entry.data());
+  }
+  if packet.flags().contains(PacketFlags::CORRUPT) {
+    return packet;
+  }
+  if bitstream.read(packet.data().as_ref()).is_disposable() {
+    let flags = packet.flags() | PacketFlags::DISPOSABLE;
+    packet.with_flags(flags)
+  } else {
+    packet
+  }
+}
+
 const fn is_attachment_disposition(disposition: c_int) -> bool {
   disposition & AV_DISPOSITION_ATTACHED_PIC != 0
     && disposition & AV_DISPOSITION_TIMED_THUMBNAILS == 0
@@ -4920,5 +5025,93 @@ mod tests {
     assert_eq!((tb.num(), tb.den().get()), (1, 1_000_000));
     let target = Timestamp::new(1_500, Timebase::new(1, NonZeroI32::new(1000).expect("ms")));
     assert_eq!(target.rescale_to(tb).pts(), 1_500_000);
+  }
+
+  /// An H.264 packet of length-framed NAL units: an access unit
+  /// delimiter, then a slice of `nal_ref_idc` `reference`.
+  fn avc_packet(reference: u8) -> Vec<u8> {
+    vec![
+      0,
+      0,
+      0,
+      2,
+      0x09,
+      0xF0,
+      0,
+      0,
+      0,
+      4,
+      (reference << 5) | 1,
+      0x88,
+      0x84,
+      0x21,
+    ]
+  }
+
+  /// A minimal `avcC` of four-byte lengths.
+  fn avcc() -> Vec<u8> {
+    vec![
+      1, 0x64, 0x00, 0x28, 0xFF, 0xE1, 0, 4, 0x67, 0x64, 0x00, 0x28, 1, 0, 4, 0x68, 0xEE, 0x3C,
+      0x80,
+    ]
+  }
+
+  fn video_packet(
+    data: Vec<u8>,
+    side_data: Vec<crate::extras::SideDataEntry>,
+  ) -> mediadecode::packet::VideoPacket<crate::extras::VideoPacketExtra, Vec<u8>> {
+    mediadecode::packet::VideoPacket::new(
+      data,
+      crate::extras::VideoPacketExtra::new(0).with_side_data(side_data),
+    )
+  }
+
+  #[test]
+  fn a_non_reference_h264_packet_is_marked_and_a_reference_one_is_not() {
+    let mut bitstream = Some(NalStream::new(NalCodec::H264, &avcc()));
+    let marked = marked_from_bitstream(Some(&mut bitstream), video_packet(avc_packet(0), vec![]));
+    assert!(marked.flags().contains(PacketFlags::DISPOSABLE));
+    let kept = marked_from_bitstream(Some(&mut bitstream), video_packet(avc_packet(2), vec![]));
+    assert!(!kept.flags().contains(PacketFlags::DISPOSABLE));
+    // The marks the packet already carries stay.
+    let keyed = video_packet(avc_packet(0), vec![]).with_flags(PacketFlags::KEY);
+    let keyed = marked_from_bitstream(Some(&mut bitstream), keyed);
+    assert_eq!(keyed.flags(), PacketFlags::KEY | PacketFlags::DISPOSABLE);
+  }
+
+  #[test]
+  fn a_corrupt_packet_and_a_track_without_a_reading_pass_through_unmarked() {
+    let mut bitstream = Some(NalStream::new(NalCodec::H264, &avcc()));
+    let corrupt = video_packet(avc_packet(0), vec![]).with_flags(PacketFlags::CORRUPT);
+    let corrupt = marked_from_bitstream(Some(&mut bitstream), corrupt);
+    assert_eq!(corrupt.flags(), PacketFlags::CORRUPT);
+    let mut unread: Option<NalStream> = None;
+    let passed = marked_from_bitstream(Some(&mut unread), video_packet(avc_packet(0), vec![]));
+    assert_eq!(passed.flags(), PacketFlags::empty());
+    let passed = marked_from_bitstream(None, video_packet(avc_packet(0), vec![]));
+    assert_eq!(passed.flags(), PacketFlags::empty());
+  }
+
+  #[test]
+  fn new_extradata_on_a_packet_reframes_its_track_before_it_is_read() {
+    // The track opened as Annex B; the packet brings an `avcC` of
+    // four-byte lengths, and is read in it.
+    let mut bitstream = Some(NalStream::new(NalCodec::H264, &[]));
+    let new = ffmpeg_next::ffi::AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA as i32;
+    let entry = crate::extras::SideDataEntry::new(
+      new,
+      crate::FfmpegBytes::try_copy_from_slice(&avcc()).expect("the record's bytes"),
+    );
+    let marked = marked_from_bitstream(
+      Some(&mut bitstream),
+      video_packet(avc_packet(0), vec![entry]),
+    );
+    assert!(marked.flags().contains(PacketFlags::DISPOSABLE));
+    assert_eq!(
+      bitstream.as_ref().and_then(NalStream::framing),
+      Some(mediadecode::nal::Framing::Length(
+        mediadecode::nal::LengthSize::Four
+      ))
+    );
   }
 }

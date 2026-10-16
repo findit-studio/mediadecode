@@ -7,6 +7,41 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Its versions are its own: they do not move with the rest of the family's.
 
+## [0.1.1] - unreleased
+
+### Added
+
+- **`nal`: what an H.264 or HEVC packet's NAL units say about its
+  picture.** `NalStream`, built from a track's configuration record —
+  FFmpeg's own test for an `avcC` or `hvcC` and its length size, else
+  Annex B — reads each packet's NAL unit headers (`read`) and answers
+  `Verdict::Disposable` only where the bitstream proves that nothing
+  references the packet's picture and nothing beside it is needed later:
+  - H.264: at least one slice, every slice of `nal_ref_idc` 0, none an
+    IDR, and nothing beside them but SEI, access unit delimiters and
+    filler data;
+  - HEVC: every slice a sub-layer non-reference type of layer 0 at the
+    highest temporal sub-layer any parameter set has declared, learned
+    from every SPS and VPS and the record's `numTemporalLayers`, and
+    nothing beside them but delimiters, filler data and SEI. Unlike
+    FFmpeg's own `AVDISCARD_NONREF`, which skips sub-layer non-reference
+    pictures at every sub-layer, it never marks one a higher sub-layer
+    may reference.
+
+  Anything else keeps the packet, with the reason (`KeptReason`): a
+  reference or random-access picture, a parameter set or an end, an
+  extension's NAL unit, a picture below the highest sub-layer or before
+  any SPS, and a packet that does not parse. `NalCodec` names the two
+  codecs read; every other codec is unclassified.
+
+### Changed
+
+- **`PacketFlags::DISPOSABLE` is the container's mark or the
+  bitstream's**: nothing references this picture. Its contract is
+  unchanged — absent means unknown — and a demuxer that reads the
+  bitstream sets it on more H.264 and HEVC packets than the container
+  marks.
+
 ## [0.1.0] - 2026-10-16
 
 ### Added
