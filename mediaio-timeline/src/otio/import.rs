@@ -833,8 +833,8 @@ fn children(object: &Object<'_>, edit: Ruler, ticks: Timebase) -> Result<Childre
         // it, while the timeline has nothing there.
         if length == 0 {
           let fade = |at: Option<usize>| at.and_then(|at| fades.get(at).copied().flatten());
-          let fade_side =
-            fade(Some(index + 1)) == Some(Edge::In) || fade(index.checked_sub(1)) == Some(Edge::Out);
+          let fade_side = fade(Some(index + 1)) == Some(Edge::In)
+            || fade(index.checked_sub(1)) == Some(Edge::Out);
           if !fade_side || before == Some(Kind::Gap) || after == Some(Kind::Gap) {
             return Err(feature(&here, Feature::StandaloneGap));
           }

@@ -1698,7 +1698,12 @@ fn a_gap_of_no_length_is_read_only_where_the_export_writes_one() {
       ]),
     ),
   ]);
-  set(&mut root, "tracks.children.0", "children", Value::Array(vec![gap]));
+  set(
+    &mut root,
+    "tracks.children.0",
+    "children",
+    Value::Array(vec![gap]),
+  );
   let mut out = Utf8BytesMut::new();
   json::write_pretty(&root, &mut out);
   assert_eq!(
