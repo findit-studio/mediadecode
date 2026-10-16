@@ -1,11 +1,16 @@
-//! A small JSON value: written pretty for the export, read strictly for the
-//! self-check.
+//! A small JSON value: written pretty for the export, and read as
+//! OpenTimelineIO 0.17.0's parser reads it — its numbers by RapidJSON's
+//! verdict ([`number`]).
 
 use core::{cmp::Ordering, fmt::Write as _};
 use smol_bytes::{Utf8Bytes, Utf8BytesMut};
 use std::{collections::BTreeSet, vec::Vec};
 
 use super::Syntax;
+
+mod number;
+
+pub(crate) use number::{Held, Number, number, readings};
 
 /// A JSON value. A number is kept as the text that spells it, so the writer
 /// puts down exactly the digits it was handed and the reader keeps exactly
@@ -42,10 +47,11 @@ impl Value {
     }
   }
 
-  /// The number's value, read through `f64`.
+  /// The number's value as a member read as a `double` takes it
+  /// ([`double`]).
   pub(crate) fn as_f64(&self) -> Option<f64> {
     match self {
-      Self::Number(text) => text.parse().ok(),
+      Self::Number(text) => double(text),
       _ => None,
     }
   }
@@ -155,160 +161,72 @@ fn write_string(text: &str, out: &mut Utf8BytesMut) {
   out.push('"');
 }
 
-/// A JSON number's text as the exact decimal it spells: its sign, its
-/// significant digits — none for a zero — and the power of ten the last of
-/// them counts.
-struct Decimal<'a> {
-  negative: bool,
-  integer: &'a str,
-  fraction: &'a str,
-  /// The leading zeros of the digits, which say nothing.
-  lead: usize,
-  /// How many digits are significant, after the leading zeros.
-  significant: usize,
-  /// The power of ten the last significant digit counts.
-  scale: i128,
+/// The `double` OpenTimelineIO 0.17.0 reads `text` as where it fetches a
+/// member as one — a `RationalTime`'s rate and value among them: the
+/// number RapidJSON reads ([`number`]), an integer cast to the nearest
+/// double ([`Number::double`]) — or `None` where it reads no number, or its
+/// builds read different ones.
+pub(crate) fn double(text: &str) -> Option<f64> {
+  number(text).ok().map(Number::double)
 }
 
-impl Decimal<'_> {
-  /// The significant digits, the integer part's and the fraction's as one.
-  fn digits(&self) -> impl Iterator<Item = u8> + '_ {
-    self
-      .integer
-      .bytes()
-      .chain(self.fraction.bytes())
-      .skip(self.lead)
-      .take(self.significant)
-  }
-
-  const fn is_zero(&self) -> bool {
-    self.significant == 0
-  }
-
-  /// Whether the two spell the same number: any two zeros, else the same
-  /// sign, digits and scale.
-  fn same_value(&self, other: &Decimal<'_>) -> bool {
-    if self.is_zero() || other.is_zero() {
-      return self.is_zero() && other.is_zero();
-    }
-    self.negative == other.negative
-      && self.scale == other.scale
-      && self.significant == other.significant
-      && self.digits().eq(other.digits())
-  }
+/// The number `text` spells as OpenTimelineIO 0.17.0's handler keeps it,
+/// in a dictionary: an `int64_t` or a `double` ([`Number::held`]) — or
+/// `None` where RapidJSON reads no number, or its builds read different
+/// ones.
+pub(crate) fn held(text: &str) -> Option<Held> {
+  number(text).ok().map(Number::held)
 }
 
-/// `text` — a number as the JSON grammar spells it — read as the exact
-/// decimal it spells, or `None` for an exponent that is not one.
-///
-/// A mantissa of zeros alone is zero at any exponent, however long, and its
-/// exponent is not read at all; for any other number an exponent of any
-/// length is read ([`exponent`]).
-fn decimal(text: &str) -> Option<Decimal<'_>> {
-  let (negative, unsigned) = match text.strip_prefix('-') {
-    Some(unsigned) => (true, unsigned),
-    None => (false, text),
-  };
-  let (mantissa, power) = unsigned.split_once(['e', 'E']).unwrap_or((unsigned, "0"));
-  let (integer, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
-  let digits = || integer.bytes().chain(fraction.bytes());
-  let all = integer.len() + fraction.len();
-  // The trailing zeros each scale the digits before them by ten.
-  let zeros = digits().rev().take_while(|&digit| digit == b'0').count();
-  if zeros == all {
-    return Some(Decimal {
-      negative,
-      integer,
-      fraction,
-      lead: all,
-      significant: 0,
-      scale: 0,
-    });
-  }
-  let lead = digits().take_while(|&digit| digit == b'0').count();
-  // Within ±2^100 and the two lengths within ±2^64: no overflow.
-  let scale =
-    exponent(power)? - i128::try_from(fraction.len()).ok()? + i128::try_from(zeros).ok()?;
-  Some(Decimal {
-    negative,
-    integer,
-    fraction,
-    lead,
-    significant: all - zeros - lead,
-    scale,
-  })
-}
-
-/// The whole number a JSON number's text spells, exactly — `86400.0`,
-/// `86400`, `8.64e4` — or `None` for one with a fraction, or past what an
-/// `i128` holds.
-///
-/// Read from the digits, not through an `f64`: past 2^53 an `f64` holds
-/// only some whole numbers, and one between two of them would read as its
-/// nearest. A zero is zero at any exponent, however long; for any other
-/// number an exponent of any length is read ([`exponent`]), so one past a
-/// machine integer makes a fraction or a number past an `i128`, by its
-/// sign.
+/// The whole number OpenTimelineIO 0.17.0 keeps for `text` in a dictionary
+/// ([`held`]): its integer, or its double where that is a whole number
+/// within ±2^127 — `None` for a fraction, NaN or an infinity, and for a
+/// number RapidJSON refuses.
 pub(crate) fn whole(text: &str) -> Option<i128> {
-  let decimal = decimal(text)?;
-  if decimal.is_zero() {
-    return Some(0);
+  match held(text)? {
+    Held::Integer(value) => Some(i128::from(value)),
+    Held::Double(value) => whole_double(value),
   }
-  // A significant digit below the units is a fraction.
-  if decimal.scale < 0 {
+}
+
+/// `value` as a whole number, where it is one within ±2^127: `-0.0` as
+/// zero, a fraction, NaN and an infinity `None`.
+pub(crate) fn whole_double(value: f64) -> Option<i128> {
+  /// 2^127.
+  const LIMIT: f64 = 170_141_183_460_469_231_731_687_303_715_884_105_728.0;
+  // NaN is within neither bound.
+  if !(value > -LIMIT && value < LIMIT) {
     return None;
   }
-  let mut value: i128 = 0;
-  for digit in decimal.digits() {
-    value = value
-      .checked_mul(10)?
-      .checked_add(i128::from(digit - b'0'))?;
+  let whole = value as i128;
+  // Exact both ways for a whole number; a fraction truncated is another.
+  (whole as f64 == value).then_some(whole)
+}
+
+/// The `f32` the export writes back as `text` reads: the `f32` nearest the
+/// double OpenTimelineIO 0.17.0 reads `text` as ([`double`]), where it is
+/// finite and its shortest spelling — `{:?}`, as the export writes every
+/// `f32` — reads as that very double; else `None`. So `-3.0` and `-3e0`
+/// read as -3.0, `16777217`, which no `f32` holds, is `None`, and so is
+/// `0.10000000149011612`, the `f32` 0.1's own value, whose spelling `0.1`
+/// reads as another double.
+pub(crate) fn float(text: &str) -> Option<f32> {
+  let read = double(text)?;
+  let nearest = read as f32;
+  if !nearest.is_finite() {
+    return None;
   }
-  // `value` is at least 1, so past 38 places the product leaves an `i128`
-  // and the loop ends.
-  for _ in 0..decimal.scale {
-    value = value.checked_mul(10)?;
-  }
-  Some(if decimal.negative { -value } else { value })
-}
-
-/// The `f64` a JSON number's text spells **exactly**, or `None`.
-///
-/// Exactly: the text's own decimal value is that of the `f64`'s canonical
-/// decimal — the shortest that reads back as it, the one `{:?}` writes and
-/// the export writes every `f64` in. So any spelling of that value reads —
-/// `24`, `24.0`, `2.4e1` — and nothing else: a number that reads as its
-/// nearest `f64` only rounded (`24.0000000000000001`), one past the largest
-/// (which reads as an infinity) and one between zero and the smallest
-/// (which reads as zero) are each `None`.
-pub(crate) fn exact_f64(text: &str) -> Option<f64> {
-  let value = text.parse::<f64>().ok().filter(|value| value.is_finite())?;
-  spells(text, format_args!("{value:?}")).then_some(value)
-}
-
-/// The `f32` a JSON number's text spells **exactly**, or `None`: as
-/// [`exact_f64`], against the `f32`'s canonical decimal — so `16777217`,
-/// which reads as the `f32` 16777216, is `None`.
-pub(crate) fn exact_f32(text: &str) -> Option<f32> {
-  let value = text.parse::<f32>().ok().filter(|value| value.is_finite())?;
-  spells(text, format_args!("{value:?}")).then_some(value)
-}
-
-/// Whether `text` spells the same decimal as `canonical`, written out.
-fn spells(text: &str, canonical: core::fmt::Arguments<'_>) -> bool {
   let mut written = Spelled::default();
-  if core::fmt::write(&mut written, canonical).is_err() {
-    return false;
-  }
-  match (decimal(text), decimal(written.as_str())) {
-    (Some(text), Some(canonical)) => text.same_value(&canonical),
-    _ => false,
-  }
+  core::fmt::write(&mut written, format_args!("{nearest:?}")).ok()?;
+  double(written.as_str())
+    .filter(|back| back.to_bits() == read.to_bits())
+    .map(|_| nearest)
 }
 
-/// A float's canonical decimal, written on the stack: the longest an `f64`
-/// writes is 24 bytes (`-2.2250738585072014e-308`). Longer text is refused
-/// as an error, which no float writes.
+/// A float's shortest spelling, written on the stack: an `f32`'s is at
+/// most a minus, nine significant digits, a point and an exponent such as
+/// `e-38`, 15 bytes. Longer text is refused as an error, which no float
+/// writes.
 #[derive(Default)]
 struct Spelled {
   bytes: [u8; 32],
@@ -330,34 +248,6 @@ impl core::fmt::Write for Spelled {
     self.len = end;
     Ok(())
   }
-}
-
-/// A JSON exponent's value — a sign, if any, and its digits — however many
-/// digits it has, saturated at ±2^100; `None` for text that is no exponent.
-///
-/// Saturating loses nothing [`whole`] reads: a number's text is shorter
-/// than 2^64 bytes, so the places its digits have below the units, or its
-/// trailing zeros above them, are fewer — and an exponent past ±2^100
-/// leaves any digit but zero below the units, a fraction, or more than 38
-/// places above them, past an `i128`, whichever its sign. Nor anything
-/// [`exact_f64`] and [`exact_f32`] read: such a number reads as an infinity
-/// or as zero, and a finite float's canonical decimal has an exponent within
-/// ±400.
-fn exponent(text: &str) -> Option<i128> {
-  const SATURATED: i128 = 1 << 100;
-  let (negative, digits) = match text.as_bytes().first() {
-    Some(b'-') => (true, &text[1..]),
-    Some(b'+') => (false, &text[1..]),
-    _ => (false, text),
-  };
-  if digits.is_empty() || !digits.bytes().all(|digit| digit.is_ascii_digit()) {
-    return None;
-  }
-  // Below 2^100, ten times the value and a digit stay within an `i128`.
-  let magnitude = digits.bytes().fold(0, |value: i128, digit| {
-    (value * 10 + i128::from(digit - b'0')).min(SATURATED)
-  });
-  Some(if negative { -magnitude } else { magnitude })
 }
 
 /// How deep arrays and objects may nest before the reader refuses: deep
@@ -384,8 +274,11 @@ impl Ord for Key {
   }
 }
 
-/// Reads `text` as one JSON value (RFC 8259), refusing what the grammar
-/// does not admit, an object naming a key twice, and nesting past
+/// Reads `text` as one JSON value (RFC 8259) — and, as OpenTimelineIO
+/// 0.17.0's parser does under `kParseNanAndInfFlag`, `NaN`, `Inf` and
+/// `Infinity` as numbers — refusing what the grammar does not admit, a
+/// number RapidJSON refuses or OpenTimelineIO's builds read as different
+/// values ([`number::scan`]), an object naming a key twice, and nesting past
 /// [`MAX_DEPTH`].
 pub(crate) fn parse(text: &str) -> Result<Value, Syntax> {
   let mut reader = Reader {
@@ -445,7 +338,7 @@ impl Reader<'_> {
       Some(b't') => self.literal("true", Value::Bool(true)),
       Some(b'f') => self.literal("false", Value::Bool(false)),
       Some(b'n') => self.literal("null", Value::Null),
-      Some(b'-' | b'0'..=b'9') => self.number(),
+      Some(b'-' | b'0'..=b'9' | b'N' | b'I') => self.number(),
       _ => Err(self.refuse("expected a value")),
     }
   }
@@ -534,42 +427,27 @@ impl Reader<'_> {
     }
   }
 
-  fn digits(&mut self) -> usize {
-    let start = self.at;
-    while let Some(b'0'..=b'9') = self.peek() {
-      self.at += 1;
-    }
-    self.at - start
-  }
-
+  /// A number, as far as RapidJSON reads one, kept as its text — or
+  /// RapidJSON's refusal where it stopped, at the number's first byte for
+  /// one too big or one the builds read differently ([`number::scan`]).
   fn number(&mut self) -> Result<Value, Syntax> {
     let start = self.at;
-    if self.peek() == Some(b'-') {
-      self.at += 1;
-    }
-    match self.peek() {
-      Some(b'0') => self.at += 1,
-      Some(b'1'..=b'9') => {
-        self.digits();
+    let scanned = number::scan(&self.bytes[start..]);
+    match scanned.settled() {
+      Ok(_) => {
+        self.at = start + scanned.end;
+        // A number's bytes are ASCII, so its ends are a character's.
+        Ok(Value::Number(Utf8Bytes::from(&self.text[start..self.at])))
       }
-      _ => return Err(self.refuse("expected a digit")),
+      Err(error) => Err(Syntax {
+        offset: if error.at_start() {
+          start
+        } else {
+          start + scanned.end
+        },
+        reason: error.reason(),
+      }),
     }
-    if self.peek() == Some(b'.') {
-      self.at += 1;
-      if self.digits() == 0 {
-        return Err(self.refuse("expected a digit after `.`"));
-      }
-    }
-    if let Some(b'e' | b'E') = self.peek() {
-      self.at += 1;
-      if let Some(b'+' | b'-') = self.peek() {
-        self.at += 1;
-      }
-      if self.digits() == 0 {
-        return Err(self.refuse("expected a digit in the exponent"));
-      }
-    }
-    Ok(Value::Number(Utf8Bytes::from(&self.text[start..self.at])))
   }
 
   fn string(&mut self) -> Result<Utf8Bytes, Syntax> {

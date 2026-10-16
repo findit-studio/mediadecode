@@ -29,10 +29,10 @@
 //! rounded — a clip placed early, a different stretch of media played. And
 //! OpenTimelineIO derives a document's positions in that arithmetic: a sum
 //! of two times is carried in the higher of their rates, the other rescaled
-//! into it, two rounded operations. So the export holds two things:
+//! into it, two rounded operations. So the export holds three things:
 //!
 //! - every count it writes lies within ±2^53, and a rate is written as the
-//!   `f64` nearest it, spelled so it reads back as that very `f64`; a
+//!   `f64` nearest it, in its shortest spelling; a
 //!   media-side range whose counts are past 2^53 in both rulers above is
 //!   written in the coarsest ruler of a whole number of ticks a second that
 //!   holds its start and its length exactly, when its counts there are
@@ -49,6 +49,19 @@
 //!   rate, as every whole rate that lands on a range is a multiple of the
 //!   coarsest, which counts it in the smallest counts; and a range none of
 //!   them writes — or, an available range, ends within ±2^53 — is refused;
+//! - every number it writes reads back, in OpenTimelineIO 0.17.0's reader,
+//!   as the value meant. That reader is RapidJSON in its normal precision,
+//!   which does not always round to the nearest double: it reads a count
+//!   written `<digits>.0` exactly up to 1 801 439 850 948 198, ⌊2^54 / 10⌋,
+//!   but past it may read another — `1801439850948199.0` as
+//!   1801439850948199.25, `9007199254740991.0` as 9007199254740990 — and it
+//!   reads the shortest spelling of the `f64` of every common rate exactly —
+//!   24, 25, 30, 48, 50 and 60, the NTSC rates over 1001, the audio rates,
+//!   90 kHz — but of some others a neighbouring `f64`, 96000/1001's among
+//!   them. So the export reads every count and every rate it writes as that
+//!   reader does, in a build that rounds its multiply-adds twice and in one
+//!   that fuses them, and refuses one either reads as another value
+//!   ([`NotRepresentable::misread`]);
 //! - every count OpenTimelineIO derives from the document — the end of each
 //!   clip's source range, its start plus its length; each child's place on
 //!   its track, from zero in the child's own rate with every item before it
@@ -169,7 +182,9 @@ pub enum OtioTarget {
 ///   or derive rounded in every plan of rulers the export's bounded search
 ///   tries ([`RulerSearch`]): one past 2^53, where its `f64` no longer holds
 ///   every whole number, or one its arithmetic would land half a tick off
-///   or more (see [the module's docs](self)).
+///   or more (see [the module's docs](self)); and for a count or a rate
+///   whose spelling OpenTimelineIO 0.17's reader reads as another value
+///   ([`NotRepresentable::misread`]).
 pub fn to_otio(timeline: &Timeline, target: OtioTarget) -> Result<Utf8Bytes, Refused> {
   validate(timeline).map_err(Refused::Validation)?;
   let tree = export::timeline(timeline, &layout_valid(timeline), target)
@@ -195,7 +210,9 @@ pub enum Refused {
   /// by its arithmetic: the count the last plan tried could not hold, and,
   /// for a count OpenTimelineIO derives, a source range no ruler of the
   /// search's bands writes or an available range none holds whole, what the
-  /// search tried ([`NotRepresentable::searched`]).
+  /// search tried ([`NotRepresentable::searched`]); or a count or a rate the
+  /// export would write whose spelling OpenTimelineIO 0.17's reader reads as
+  /// another value ([`NotRepresentable::misread`]).
   NotRepresentable(NotRepresentable),
 }
 
@@ -248,12 +265,28 @@ impl core::error::Error for Refused {}
 /// counts. Those refusals say what the search tried too: its bands, and no
 /// walk. A track's marker is counted at the edit rate, as a count the
 /// export writes there, and refused with no search.
+///
+/// Last, a number the export would write — a count, or a ruler's rate —
+/// that OpenTimelineIO 0.17 reads as another value is refused, with no
+/// search ([`misread`](Self::misread)). OpenTimelineIO 0.17.0 reads numbers
+/// with RapidJSON in its normal precision, which does not always round to
+/// the nearest double: a count written `<digits>.0` past
+/// 1 801 439 850 948 198, ⌊2^54 / 10⌋, can read as another —
+/// `1801439850948199.0` as 1801439850948199.25, `9007199254740991.0` as
+/// 9007199254740990, a whole number — and the shortest spelling of the
+/// `f64` of some rates as a neighbouring `f64`, 96000/1001's among them,
+/// while every common rate reads exactly. A build that fuses one of
+/// RapidJSON's multiply-adds may also read a long number otherwise than one
+/// that does not. The export reads every count and every rate it writes as
+/// both kinds of build read it, and refuses the first, in the order the
+/// document writes them, that either reads as another value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NotRepresentable {
   at: Spot,
   value: i128,
   rate: Rate,
   searched: Option<RulerSearch>,
+  misread: Option<Misread>,
 }
 
 impl NotRepresentable {
@@ -287,11 +320,98 @@ impl NotRepresentable {
   /// range's end among them, the plans it walked; for a source range no
   /// ruler of the bands writes, or an available range none of them holds
   /// whole, none ([`RulerSearch::walks`] 0), the range refused as the
-  /// timeline holds it. `None` only for a count the export writes at the
-  /// edit rate, refused before any walk: the search tries no ruler for it.
+  /// timeline holds it. `None` for a count the export writes at the edit
+  /// rate, refused before any walk — the search tries no ruler for it — and
+  /// for a number OpenTimelineIO 0.17 reads as another value
+  /// ([`misread`](Self::misread)).
   pub const fn searched(&self) -> Option<RulerSearch> {
     self.searched
   }
+
+  /// The number OpenTimelineIO 0.17 reads as another value where the
+  /// export would write it: the count, written `<digits>.0`, or the rate
+  /// of [`rate`](Self::rate)'s ruler, and what it reads. `None` for a count
+  /// past 2^53, or one OpenTimelineIO derives rounded.
+  pub const fn misread(&self) -> Option<Misread> {
+    self.misread
+  }
+}
+
+/// A number the export would write that OpenTimelineIO 0.17 reads as
+/// another value: what [`NotRepresentable::misread`] carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Misread {
+  number: MisreadNumber,
+  meant: u64,
+  read: [u64; 2],
+}
+
+impl Misread {
+  pub(crate) const fn new(number: MisreadNumber, meant: f64, read: [f64; 2]) -> Self {
+    Self {
+      number,
+      meant: meant.to_bits(),
+      read: [read[0].to_bits(), read[1].to_bits()],
+    }
+  }
+
+  /// Which of the `RationalTime`'s numbers it is.
+  pub const fn number(&self) -> MisreadNumber {
+    self.number
+  }
+
+  /// The value meant: the count, or the `f64` nearest the exact rate.
+  pub const fn meant(&self) -> f64 {
+    f64::from_bits(self.meant)
+  }
+
+  /// What OpenTimelineIO 0.17 reads the spelling as: in a build that
+  /// rounds RapidJSON's `d * 10 + digit` twice, then in one that fuses it —
+  /// one value twice where the two agree.
+  pub const fn read(&self) -> [f64; 2] {
+    [f64::from_bits(self.read[0]), f64::from_bits(self.read[1])]
+  }
+}
+
+/// Writes `written 1801439850948199.0: OpenTimelineIO 0.17 reads this
+/// spelling as another value, 1801439850948199.3` — the read value in its
+/// shortest spelling, 1801439850948199.25's — or for a rate `its rate
+/// written 95.90409590409591: …`, both readings where two builds differ.
+impl fmt::Display for Misread {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    let meant = self.meant();
+    match self.number {
+      // A count the export writes lies within ±2^53, where its `f64` is
+      // whole and exact.
+      MisreadNumber::Count => write!(f, "written {}.0", meant as i128)?,
+      MisreadNumber::Rate => write!(f, "its rate written {meant:?}")?,
+    }
+    f.write_str(": OpenTimelineIO 0.17 reads this spelling as another value, ")?;
+    let [twice, fused] = self.read();
+    if twice.to_bits() == fused.to_bits() {
+      write!(f, "{twice:?}")
+    } else {
+      write!(
+        f,
+        "{twice:?} in a build that rounds its multiply-add twice and {fused:?} in one that \
+         fuses it"
+      )
+    }
+  }
+}
+
+/// Which number of a `RationalTime` OpenTimelineIO 0.17 would read as
+/// another value ([`Misread::number`]).
+///
+/// Marked `#[non_exhaustive]`: a later number joins as a variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum MisreadNumber {
+  /// Its count, `value`, written as its digits and `.0`.
+  Count,
+  /// Its rate, written as the shortest spelling of the `f64` nearest the
+  /// exact rate.
+  Rate,
 }
 
 /// Writes `the gap before track 0, clip 0 counts 9007199254740993 ticks of
@@ -300,12 +420,20 @@ impl NotRepresentable {
 /// `…, in the last of 3 plans the bounded search walked, …` — or, for a
 /// source range no ruler of the bands writes or an available range none
 /// holds whole, `…, in any of the range's own rulers or of the bounded
-/// search's bands, so the search walked no plan`.
+/// search's bands, so the search walked no plan`. For a number
+/// OpenTimelineIO 0.17 reads as another value, the spelling and what it
+/// reads instead ([`Misread`]): `the gap before track 0, clip 0 counts
+/// 1801439850948199 ticks of 1/1 s, written 1801439850948199.0:
+/// OpenTimelineIO 0.17 reads this spelling as another value,
+/// 1801439850948199.3`.
 impl fmt::Display for NotRepresentable {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     write!(f, "{} counts {} ticks", self.at, self.value)?;
     if let Some(tick) = self.rate.checked_to_timebase() {
       write!(f, " of {tick} s")?;
+    }
+    if let Some(misread) = self.misread {
+      return write!(f, ", {misread}");
     }
     f.write_str(", which OpenTimelineIO's f64 does not hold exactly")?;
     if let Some(searched) = self.searched {
@@ -676,10 +804,17 @@ impl core::error::Error for Shape {}
 /// from the words the export writes under `metadata.mediaio`, and holds
 /// every `RationalTime` to them: its rate the `f64` of its exact ruler, bit
 /// for bit, and its value a whole count within ±2^53. Every number is read
-/// exactly: a count or a place as the whole number its digits spell, and a
-/// float — a rate, a gain — only where its text spells the float's
-/// canonical decimal, in any spelling (`2.4e1` reads as `24.0` does); a
-/// number its float holds only rounded, or not at all, is refused. What OpenTimelineIO
+/// as OpenTimelineIO 0.17.0's parser reads it — RapidJSON at the commit the
+/// release pins, in its normal precision, which does not always round to
+/// the nearest double: a count as the whole number the `double` it reads
+/// is, a rate as that `double`, a gain as the `f32` whose shortest spelling
+/// reads as the same `double` — so `2.4e1` reads as `24.0` does, and so does
+/// `24.0000000000000001`, whose digits past the 17th RapidJSON drops. A
+/// number RapidJSON refuses (`0e309`, `2e308`) is refused as syntax, and so
+/// is one OpenTimelineIO's builds read as different values, as a build that
+/// fuses one of RapidJSON's multiply-adds reads some long numbers; NaN and
+/// an infinity, which it reads, are refused by name in a time or a rate, and
+/// so is a count of `-0.0`, whose sign no whole count keeps. What OpenTimelineIO
 /// derives from those counts in its own `f64` arithmetic is held as
 /// [`to_otio`] holds it before writing: both ends of every range — its end
 /// and its last tick — and every place, visible range and duration of the
@@ -720,8 +855,8 @@ impl core::error::Error for Shape {}
 /// states at the same path, as OpenTimelineIO 0.17.0's reader holds it: a
 /// string byte for byte, a boolean exactly, a `RationalTime`'s rate and value
 /// as doubles — `24` and `24.0` alike — and a number in a dictionary as the
-/// integer or the double its text spells. An object's keys may come in any
-/// order. A member the export writes may be missing only where
+/// integer or the double RapidJSON reads it as; two doubles bit for bit, so
+/// `-0.0` is not `0.0`. An object's keys may come in any order. A member the export writes may be missing only where
 /// OpenTimelineIO reads its absence as that very value — an empty name, no
 /// metadata, effects or markers, `enabled`, no ranges, a GREEN marker with
 /// no comment — and one the document states may go unwritten only where
@@ -734,15 +869,18 @@ impl core::error::Error for Shape {}
 ///
 /// # Errors
 ///
-/// - [`Unreadable::Syntax`] for text that is not JSON;
+/// - [`Unreadable::Syntax`] for text that is not JSON as OpenTimelineIO
+///   0.17.0's parser reads it — a number it refuses among it — or a number
+///   its builds read as different values;
 /// - [`Unreadable::Shape`] for a value missing or not of the type read
 ///   there, a word of the crate's among them;
 /// - [`Unreadable::Schema`] and [`Unreadable::Feature`] for what the
 ///   timeline does not model;
-/// - [`Unreadable::Inexact`] for a number its type holds only rounded, a
-///   count or rate that does not land exactly where the timeline counts it,
-///   a time OpenTimelineIO's `f64` arithmetic rounds, or a value the export
-///   does not write back as the document states it;
+/// - [`Unreadable::Inexact`] for a number the model holds only rounded, or
+///   not at all — NaN, an infinity, a count of `-0.0` — a count or rate that
+///   does not land exactly where the timeline counts it, a time
+///   OpenTimelineIO's `f64` arithmetic rounds, or a value the export does
+///   not write back as the document states it;
 /// - [`Unreadable::Validation`] for a timeline read whole that does not
 ///   [`validate`](fn@validate).
 pub fn from_otio(json: &str) -> Result<Timeline, Unreadable> {

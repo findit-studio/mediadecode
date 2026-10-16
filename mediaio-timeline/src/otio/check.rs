@@ -7,10 +7,17 @@
 //! document must carry and of which type: `reader.read` fails on a missing
 //! key and `reader.read_if_present` does not, and each takes exactly the
 //! type of the member it fills (`deserialization.cpp:376–415` in 0.17.0) —
-//! a `double` any number (418–455), an `int64_t` a whole number written
-//! without a fraction or an exponent, which is how the parser tells the
-//! two apart (457–488), a string or an optional value `null` as well, read
-//! as empty or as none. The table is OpenTimelineIO 0.17.0's, with each
+//! a `double` any number (418–454), an `int64_t` an integer (457–487), a
+//! string or an optional value `null` as well, read as empty or as none.
+//! A number is held as OpenTimelineIO's parser reads it — RapidJSON at the
+//! commit 0.17.0 pins, whose verdict on each number's text the crate's
+//! reader gives ([`json::number`]): an integer written without a fraction
+//! or an exponent, `-0` among them and every one up to 2^64 − 1, which the
+//! handler keeps cut to its low 63 bits (`deserialization.cpp:62–73`), and
+//! any other number a `double`, `NaN` and the infinities among them. A
+//! number RapidJSON refuses — `0e309`, `2e308` — refuses the document as
+//! syntax, and so does one OpenTimelineIO's builds read as different
+//! values. The table is OpenTimelineIO 0.17.0's, with each
 //! reader's lines under `src/opentimelineio/` at `v0.17.0`; the check holds
 //! every schema it accepts to its row, and in places to more (`*`, see
 //! below). A schema not in the table is refused by name.
@@ -116,7 +123,10 @@ use std::{collections::BTreeSet, format};
 
 use smol_bytes::{Utf8Bytes, format_utf8bytes};
 
-use super::{OtioTarget, Shape, json::Value};
+use super::{
+  OtioTarget, Shape,
+  json::{self, Held, Value},
+};
 
 type Members = [(Utf8Bytes, Value)];
 
@@ -613,7 +623,10 @@ fn rational_time(value: &Value, path: &str, target: OtioTarget) -> Result<(), Sh
     _ => return Err(shape(&at, "a positive, finite rate")),
   }
   let (count, at) = required(members, path, "value")?;
-  number(count, &at)?;
+  match count.as_f64() {
+    Some(count) if count.is_finite() => {}
+    _ => return Err(shape(&at, "a finite number")),
+  }
   others(members, path, target, &[&["rate", "value"]])
 }
 
@@ -741,17 +754,14 @@ fn string_value<'a>(value: &'a Value, path: &str) -> Result<&'a str, Shape> {
   value.as_str().ok_or_else(|| shape(path, "a string"))
 }
 
-/// A whole number, what a reader takes for an `int64_t`: written without a
-/// fraction or an exponent — a reader decodes any other number as a
-/// `double`, which it refuses there (`deserialization.cpp:457–488` in
-/// 0.17.0) — and within an `i64`, as the parser keeps one. A negative zero
-/// is refused too, as the parser may keep it as a `double`.
+/// A whole number, what a reader takes for an `int64_t`: one RapidJSON
+/// reads as an integer — written without a fraction or an exponent, `-0`
+/// among them, and up to 2^64 − 1, which the handler keeps cut to its low 63
+/// bits (`deserialization.cpp:62–73` in 0.17.0) — not one it reads as a
+/// `double`, which the reader refuses there (`:457–487`).
 fn integer(value: &Value, path: &str) -> Result<(), Shape> {
   let whole = match value {
-    Value::Number(text) => {
-      let text = text.as_str();
-      !text.contains(['.', 'e', 'E']) && text != "-0" && text.parse::<i64>().is_ok()
-    }
+    Value::Number(text) => matches!(json::held(text), Some(Held::Integer(_))),
     _ => false,
   };
   if whole {
@@ -764,11 +774,12 @@ fn integer(value: &Value, path: &str) -> Result<(), Shape> {
   }
 }
 
-/// A finite number: what a reader takes for a `double`.
+/// A number: what a reader takes for a `double` — any RapidJSON reads,
+/// `NaN` and the infinities among them.
 fn number(value: &Value, path: &str) -> Result<(), Shape> {
   match value.as_f64() {
-    Some(number) if number.is_finite() => Ok(()),
-    _ => Err(shape(path, "a finite number")),
+    Some(_) => Ok(()),
+    None => Err(shape(path, "a number")),
   }
 }
 

@@ -807,7 +807,32 @@ fn an_image_sequence_reference_is_held_to_its_readers_members() {
       checked(members)
     };
     let whole = "a whole number, without a fraction or an exponent";
-    for spelling in ["1001.0", "1.001e3", "-0"] {
+    // An integer, as RapidJSON reads one: `-0` among them, and every one up
+    // to 2^64 - 1, which the handler keeps cut to its low 63 bits.
+    for spelling in [
+      "-0",
+      "0",
+      "-9223372036854775808",
+      "9223372036854775807",
+      "9223372036854775808",
+      "18446744073709551615",
+    ] {
+      assert_eq!(
+        with("start_frame", number(spelling)),
+        Ok(()),
+        "{target:?} {spelling}",
+      );
+    }
+    // A double, which the reader refuses there: a fraction, an exponent,
+    // and an integer past 64 bits.
+    for spelling in [
+      "1001.0",
+      "1.001e3",
+      "-0.0",
+      "18446744073709551616",
+      "-9223372036854775809",
+      "NaN",
+    ] {
       assert_eq!(
         with("start_frame", number(spelling)),
         Err((at("start_frame"), whole)),
@@ -827,7 +852,7 @@ fn an_image_sequence_reference_is_held_to_its_readers_members() {
     assert_eq!(with("rate", number("23.976")), Ok(()), "{target:?}");
     assert_eq!(
       with("rate", text("24")),
-      Err((at("rate"), "a finite number")),
+      Err((at("rate"), "a number")),
       "{target:?}",
     );
     assert_eq!(
@@ -2332,17 +2357,30 @@ fn set_range(root: &mut Value, range: &str, start: i64, duration: i64) {
 #[test]
 fn a_range_whose_end_opentimelineio_rounds_is_refused() {
   const ROUNDS: &str = "a range whose end, or last tick, OpenTimelineIO's f64 arithmetic rounds";
-  // A track's marker, at the edit rate: one tick ending at 2^53 reads; one
-  // tick on, OpenTimelineIO's sum rounds 2^53 + 1 back to 2^53.
-  let marker = |start: i64| {
-    read(move |root| set_range(root, &format!("{TRACK}.markers.0.marked_range"), start, 1))
+  // A track's marker, at the edit rate: two ticks ending at 2^53 read; one
+  // tick from 2^53, OpenTimelineIO's sum rounds 2^53 + 1 back to 2^53. A
+  // start of 2^53 - 1, OpenTimelineIO 0.17's reader reads as 2^53 - 2, and
+  // so does this one.
+  let marker = |start: i64, length: i64| {
+    read(move |root| {
+      set_range(
+        root,
+        &format!("{TRACK}.markers.0.marked_range"),
+        start,
+        length,
+      )
+    })
   };
   assert_eq!(
-    marker(LIMIT - 1).unwrap().tracks()[0].markers()[0].range(),
-    TimeRange::new(LIMIT - 1, LIMIT, edit()),
+    marker(LIMIT - 2, 2).unwrap().tracks()[0].markers()[0].range(),
+    TimeRange::new(LIMIT - 2, LIMIT, edit()),
   );
   assert_eq!(
-    marker(LIMIT),
+    marker(LIMIT - 1, 1).unwrap().tracks()[0].markers()[0].range(),
+    TimeRange::new(LIMIT - 2, LIMIT - 1, edit()),
+  );
+  assert_eq!(
+    marker(LIMIT, 1),
     Err(inexact(&format!("{TRACK}.markers.0.marked_range"), ROUNDS)),
   );
   // A clip's marker, in the ruler its word names.
@@ -2354,7 +2392,7 @@ fn a_range_whose_end_opentimelineio_rounds_is_refused() {
     TimeRange::new(LIMIT - 2, LIMIT, edit()),
   );
   assert_eq!(
-    clip_marker(LIMIT - 1),
+    clip_marker(LIMIT),
     Err(inexact(&format!("{A}.markers.0.marked_range"), ROUNDS)),
   );
   // `b`'s source range, its medium's available range left unknown so the
@@ -2372,7 +2410,7 @@ fn a_range_whose_end_opentimelineio_rounds_is_refused() {
     TimeRange::new(LIMIT - 24, LIMIT, edit()),
   );
   assert_eq!(
-    source(LIMIT - 23),
+    source(LIMIT - 22),
     Err(inexact(&format!("{B}.source_range"), ROUNDS)),
   );
   // An available range.
@@ -2392,10 +2430,11 @@ fn what_opentimelineio_derives_from_a_track_is_held_as_the_export_holds_it() {
     gap(LIMIT - 48).unwrap().tracks()[0].clips()[1].record(),
     TimeRange::new(LIMIT - 24, LIMIT, edit()),
   );
-  // One frame longer, `b` ends at 2^53 + 1 on its track, which
-  // OpenTimelineIO's sum rounds.
+  // Two frames longer, `b` ends at 2^53 + 2 on its track, past what the
+  // walk holds. (One frame longer, 2^53 - 47, OpenTimelineIO 0.17's reader
+  // reads as 2^53 - 46.)
   assert_eq!(
-    gap(LIMIT - 47),
+    gap(LIMIT - 46),
     Err(inexact(
       B,
       "a place on its track that OpenTimelineIO's f64 arithmetic rounds"
@@ -2406,7 +2445,7 @@ fn what_opentimelineio_derives_from_a_track_is_held_as_the_export_holds_it() {
   assert_eq!(
     read(|root| {
       let start = format!("{A}.source_range.start_time");
-      set(root, &start, "value", count(LIMIT - 25));
+      set(root, &start, "value", count(LIMIT - 24));
     }),
     Err(inexact(
       A,
@@ -2424,9 +2463,8 @@ fn what_opentimelineio_derives_from_a_track_is_held_as_the_export_holds_it() {
 }
 
 #[test]
-fn every_number_is_read_exactly_or_refused() {
+fn every_number_is_read_as_opentimelineio_reads_it_or_refused() {
   const GAIN: &str = "a gain that is not exactly the f32 it reads as";
-  const RATE: &str = "a rate that is not exactly the f64 it reads as";
   let gain_at = format!("{A}.metadata.mediaio.gain_db");
   let gain = |spelled: &'static str| {
     read(move |root| {
@@ -2447,31 +2485,212 @@ fn every_number_is_read_exactly_or_refused() {
   for spelled in ["-3e0", "-0.3E1", "-30e-1", "-3.00"] {
     assert_eq!(gain(spelled), Ok(sample()), "{spelled}");
   }
+  // A gain of -0.0 is one of its own: written back as -0.0.
+  assert_eq!(
+    gain("-0.0").unwrap().tracks()[0].clips()[0]
+      .gain()
+      .map(|gain| gain.db().to_bits()),
+    Some((-0.0_f32).to_bits()),
+  );
   // Round 10: an integer, which OpenTimelineIO's dictionary holds as an
   // `int64_t`, not as the double the export writes (`deserialization.cpp`
-  // 63–73 in 0.17.0).
+  // 62–73 in 0.17.0).
   assert_eq!(gain("-3"), Err(differs(&gain_at, "-3.0", "-3")));
   // Rounded to its nearest f32 (2^24 + 1 reads as 2^24), past the largest,
   // and below the smallest.
   for spelled in ["16777217", "-3.0000001", "1e39", "1e-50"] {
     assert_eq!(gain(spelled), Err(inexact(&gain_at, GAIN)), "{spelled}");
   }
+  // NaN and the infinities, which OpenTimelineIO reads, by name.
+  for spelled in ["NaN", "-Infinity"] {
+    assert_eq!(
+      gain(spelled),
+      Err(inexact(
+        &gain_at,
+        "a gain of NaN or an infinity, which no gain holds"
+      )),
+      "{spelled}"
+    );
+  }
 
-  // A RationalTime's rate, the same way: any spelling of the f64 the
-  // export writes, and no other number.
+  // A RationalTime's rate, as OpenTimelineIO reads it, as a double: any
+  // spelling of the f64 the export writes — `24.0000000000000001` among
+  // them, whose digits past the 17th RapidJSON drops — and no other number.
+  const RATE: &str = "a rate other than the f64 of the exact ruler it is counted in";
   let rate = |spelled: &'static str| {
     read(move |root| set(root, "global_start_time", "rate", number(spelled)))
   };
-  for spelled in ["24", "2.4e1", "2400E-2", "24.000"] {
+  for spelled in ["24", "2.4e1", "2400E-2", "24.000", "24.0000000000000001"] {
     assert_eq!(rate(spelled), Ok(sample()), "{spelled}");
   }
-  for spelled in ["24.0000000000000001", "1e309", "1e-400"] {
+  for spelled in ["24.000000000000004", "1e-400", "-0"] {
     assert_eq!(
       rate(spelled),
       Err(inexact("global_start_time.rate", RATE)),
       "{spelled}"
     );
   }
+  for spelled in ["NaN", "Infinity", "-Inf"] {
+    assert_eq!(
+      rate(spelled),
+      Err(inexact(
+        "global_start_time.rate",
+        "a rate of NaN or an infinity, which no ruler holds"
+      )),
+      "{spelled}"
+    );
+  }
+  // A number RapidJSON refuses refuses the document, as syntax.
+  let syntax = |result: Result<Timeline, Unreadable>| match result {
+    Err(Unreadable::Syntax(syntax)) => syntax.reason(),
+    other => panic!("{other:?}"),
+  };
+  assert_eq!(syntax(rate("1e309")), "a number too big for a double");
+  assert_eq!(syntax(rate("0e309")), "a number too big for a double");
+
+  // A RationalTime's value, as a double: the sample's start, zero, in any
+  // spelling OpenTimelineIO reads as zero — `-0`, an integer, among them —
+  // but not `-0.0`, a double of negative zero, whose sign no whole count
+  // keeps; nor NaN or an infinity. Each by name.
+  let start = |spelled: &'static str| {
+    read(move |root| set(root, "global_start_time", "value", number(spelled)))
+  };
+  for spelled in ["0", "-0", "0e-400", "1e-400", "0.0E+5"] {
+    assert_eq!(start(spelled), Ok(sample()), "{spelled}");
+  }
+  for spelled in ["-0.0", "-0e0", "-1e-400"] {
+    assert_eq!(
+      start(spelled),
+      Err(inexact(
+        "global_start_time.value",
+        "a count of negative zero, whose sign no whole count keeps"
+      )),
+      "{spelled}"
+    );
+  }
+  for spelled in ["NaN", "-Infinity"] {
+    assert_eq!(
+      start(spelled),
+      Err(inexact(
+        "global_start_time.value",
+        "a count of NaN or an infinity, which no whole count holds"
+      )),
+      "{spelled}"
+    );
+  }
+}
+
+#[test]
+fn the_backstop_holds_doubles_bit_for_bit_so_a_negative_zero_is_not_zero() {
+  // Round 11: the backstop by itself, the document altered after the
+  // timeline was read from it. A gain of 0 dB, written `0.0`, beside a
+  // document's `-0.0`, in a dictionary; the global start, zero, beside
+  // `-0.0`, a RationalTime's value read as a double. `-0`, the integer
+  // zero, is the double `0.0` there, and the `int64_t` 0 in a dictionary.
+  let mut timeline = sample();
+  timeline.tracks_mut()[0].clips_mut()[0].set_gain(Some(Gain::UNITY));
+  let written = || json::parse(&to_otio(&timeline, OtioTarget::V0_15Plus).unwrap()).unwrap();
+  let guarded = |edit: &dyn Fn(&mut Value)| {
+    let mut root = written();
+    edit(&mut root);
+    super::super::import::reproduced(&root, &timeline)
+  };
+  assert_eq!(guarded(&|_| {}), Ok(()), "the premise");
+  let words = format!("{A}.metadata.mediaio");
+  let gain_at = format!("{words}.gain_db");
+  assert_eq!(
+    guarded(&|root| set(root, &words, "gain_db", number("-0.0"))),
+    Err(differs(&gain_at, "0.0", "-0.0")),
+  );
+  assert_eq!(
+    guarded(&|root| set(root, &words, "gain_db", number("-0"))),
+    Err(differs(&gain_at, "0.0", "-0")),
+  );
+  assert_eq!(
+    guarded(&|root| set(root, "global_start_time", "value", number("-0.0"))),
+    Err(differs("global_start_time.value", "0.0", "-0.0")),
+  );
+  for spelled in ["-0", "0", "0e-400"] {
+    assert_eq!(
+      guarded(&|root| set(root, "global_start_time", "value", number(spelled))),
+      Ok(()),
+      "{spelled}"
+    );
+  }
+}
+
+/// The rows of the number table (`json::number`'s), each in a document: in
+/// a dictionary — the timeline's metadata, which every reader keeps as it
+/// parses it — and as a `RationalTime`'s value, which a reader fetches as a
+/// double and the check holds finite.
+#[test]
+fn every_row_of_the_number_table_reads_in_a_document_as_opentimelineio_reads_it() {
+  #[derive(Debug)]
+  enum Row {
+    /// Read in both.
+    Read,
+    /// Read in a dictionary; not finite, so refused as a time's value.
+    NotFinite,
+    /// Refused as syntax, at the number, in both.
+    Refused(&'static str),
+  }
+  const TOO_BIG: &str = "a number too big for a double";
+  let integer_of_400 = "7".repeat(400);
+  let rows = [
+    ("0e309", Row::Refused(TOO_BIG)),
+    ("0e-400", Row::Read),
+    ("0.1e309", Row::Read),
+    ("1e308", Row::Read),
+    ("2e308", Row::Refused(TOO_BIG)),
+    ("-0", Row::Read),
+    ("-0.0", Row::Read),
+    ("9223372036854775807", Row::Read),
+    ("9223372036854775808", Row::Read),
+    ("18446744073709551615", Row::Read),
+    ("18446744073709551616", Row::Read),
+    ("9007199254740992", Row::Read),
+    ("9007199254740993", Row::Read),
+    (integer_of_400.as_str(), Row::Refused(TOO_BIG)),
+    ("9007199254740991.0", Row::Read),
+    ("24.0000000000000001", Row::Read),
+    (
+      "0.90071992547409945",
+      Row::Refused("a number OpenTimelineIO's builds read as different values"),
+    ),
+    ("NaN", Row::NotFinite),
+    ("-Infinity", Row::NotFinite),
+  ];
+  let checked = |edit: &dyn Fn(&mut Value)| {
+    let mut root = json::parse(&to_otio(&sample(), OtioTarget::V0_15Plus).unwrap()).unwrap();
+    edit(&mut root);
+    let mut out = Utf8BytesMut::new();
+    json::write_pretty(&root, &mut out);
+    validate_json(&out.freeze_shared(), OtioTarget::V0_15Plus)
+  };
+  let mut wrong = Vec::new();
+  for (text, row) in &rows {
+    let in_metadata = checked(&|root| set(root, "metadata", "n", number(text)));
+    let as_value = checked(&|root| set(root, "global_start_time", "value", number(text)));
+    let refused = |result: &Result<(), Invalid>, reason: &str| matches!(result, Err(Invalid::Syntax(syntax)) if syntax.reason() == reason);
+    let held = match row {
+      Row::Read => in_metadata.is_ok() && as_value.is_ok(),
+      Row::NotFinite => {
+        in_metadata.is_ok()
+          && as_value
+            == Err(Invalid::Shape(Shape {
+              path: Utf8Bytes::from("$.global_start_time.value"),
+              expected: "a finite number",
+            }))
+      }
+      Row::Refused(reason) => refused(&in_metadata, reason) && refused(&as_value, reason),
+    };
+    if !held {
+      wrong.push(format!(
+        "{text}: {row:?}, read {in_metadata:?} and {as_value:?}"
+      ));
+    }
+  }
+  assert!(wrong.is_empty(), "rows read otherwise: {wrong:?}");
 }
 
 #[test]

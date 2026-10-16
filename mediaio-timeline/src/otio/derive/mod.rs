@@ -337,6 +337,7 @@ impl Time {
       value,
       rate: self.ruler.exact,
       searched: None,
+      misread: None,
     }
   }
 }

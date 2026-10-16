@@ -166,7 +166,7 @@ of their two rates, the other rescaled into it — two rounded operations. The
 export holds both:
 
 - **what it writes.** Every count lies within ±2^53, and a rate is the `f64`
-  nearest it, spelled so it reads back as that very `f64`. A media-side
+  nearest it, in its shortest spelling. A media-side
   range its own rulers count past 2^53 — a medium stamped in nanoseconds
   since 1970 — is written in the coarsest ruler of a whole number of ticks a
   second that holds its start and its length, whole seconds or
@@ -185,6 +185,17 @@ export holds both:
   a multiple of the coarsest, which counts it in the smallest counts; a
   range none of those rulers writes — or, an available range, ends — is
   refused.
+- **how it reads back.** OpenTimelineIO 0.17.0 reads numbers with RapidJSON
+  in its normal precision, which does not always round to the nearest
+  double: it reads every count written `<digits>.0` up to
+  1 801 439 850 948 198 (⌊2^54 / 10⌋) exactly, but past it not every one —
+  `9007199254740991.0` as 9007199254740990 — and the shortest spelling of
+  every common rate exactly (24, 25, 30, 48, 50, 60, the NTSC rates over
+  1001, the audio rates, 90 kHz), but of some others a neighbouring `f64`
+  (96000/1001's). The export reads every count and rate it writes as that
+  reader does, in a build that fuses one of its multiply-adds and in one
+  that does not, and refuses by name one either reads as another value
+  (`NotRepresentable::misread`).
 - **what OpenTimelineIO derives from it**, computed operation for operation
   and branch for branch as OpenTimelineIO computes it, beside its exact
   value: the end of each clip's source range; each child's place on its
@@ -292,7 +303,10 @@ container's timecode, so its available range does not yet carry the
 camera's.
 
 `otio::validate_json(&str, OtioTarget)` is the structural self-check the
-export is held to: the crate's own strict JSON reader, then OpenTimelineIO's
+export is held to: the crate's own JSON reader — which reads every number as
+OpenTimelineIO 0.17.0's parser does, `NaN` and the infinities among them,
+and refuses as syntax one it refuses (`0e309`, `2e308`) or one
+OpenTimelineIO's builds read as different values — then OpenTimelineIO's
 schema shape — exactly the keys the target's readers require (audited
 against each schema's `read_from`, per target: `Track.1` needs its `kind`,
 a `Marker.2` its `marked_range`, and a reader before 0.15 a `Clip.1`'s
@@ -312,10 +326,16 @@ inverse of `to_otio`: for every timeline `to_otio` writes, for either
 target, it reads that very timeline back — every count, timebase and rate
 as the model held it. It holds each `RationalTime` to the exact words: its
 rate the `f64` of its exact ruler, bit for bit, and its value a whole count
-within ±2^53, read from its digits. Every number is read exactly: a float —
-a rate, a clip's gain — only where its text spells the float's canonical
-decimal, in any spelling, so a gain of `16777217` dB, which an `f32` holds
-only as 16777216, is refused. What OpenTimelineIO derives from those
+within ±2^53. Every number is read as OpenTimelineIO 0.17.0's parser reads
+it — RapidJSON at the commit the release pins, in its normal precision, the
+readings of a build that fuses one of its multiply-adds and of one that
+does not alike, or refused — and held to the model exactly: a count as the
+whole number its double is, a rate as that double, a clip's gain as the
+`f32` whose shortest spelling reads back as the same double. So
+`24.0000000000000001` reads as 24, as OpenTimelineIO reads it; a gain of
+`16777217` dB, which no `f32` holds, is refused; and so, by name, is a
+count of NaN, of an infinity or of `-0.0`, whose sign no whole count
+keeps. What OpenTimelineIO derives from those
 counts in its own `f64` arithmetic is held as the export holds it: both
 ends of every range — a marker one tick long at 2^53, whose end
 OpenTimelineIO's sum rounds back to 2^53, is refused — and every place,
@@ -350,8 +370,8 @@ color, `null` where unset — so a document 0.18 writes is refused by name
 until the item color is modelled. Last, the export writes the timeline read, and every value it
 writes must be the one the document states at the same path, as
 OpenTimelineIO holds it — a string byte for byte, a time's numbers as
-doubles — or the read is refused as inexact there, naming both: the reader
-takes exactly the documents the export reproduces.
+doubles, two doubles bit for bit — or the read is refused as inexact there,
+naming both: the reader takes exactly the documents the export reproduces.
 
 ## The stored document
 

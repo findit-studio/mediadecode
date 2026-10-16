@@ -21,6 +21,18 @@
 //! tries holds is refused, with the last walk's refusal and what the search
 //! tried.
 //!
+//! Last, every number the document would carry is read as OpenTimelineIO
+//! 0.17.0's reader reads it ([`spellings`]). That reader, RapidJSON in its
+//! normal precision, reads a count written `<digits>.0` exactly up to
+//! 1 801 439 850 948 198, ⌊2^54 / 10⌋, and past it not always — the
+//! fraction's `0` joins the significand, which converts to a double rounded
+//! past 2^53 before it is divided by ten — and the shortest spelling of the
+//! `f64` of most rates exactly, but not of every one: 96000/1001's it reads
+//! as a neighbouring `f64`, while every common rate reads exactly. A count
+//! or a rate that a build rounding its multiply-adds twice, or one fusing
+//! them, would read as another value is refused there, with no search
+//! ([`read_back`]).
+//!
 //! OpenTimelineIO keeps a rate as an `f64`, which names many rationals, and
 //! a range as two counts in one ruler, which says nothing of the timebase
 //! the model counts it in. So beside what OpenTimelineIO reads, the export
@@ -41,9 +53,9 @@ use mediatime::{Duration, Rate, Rounding, TimeRange, Timebase};
 use smol_bytes::{Utf8Bytes, format_utf8bytes};
 
 use super::{
-  NotRepresentable, OtioTarget, RulerSearch, Spot,
+  Misread, MisreadNumber, NotRepresentable, OtioTarget, RulerSearch, Spot,
   derive::{self, Child, Ruler, Time},
-  json::Value,
+  json::{self, Number, Value},
 };
 use crate::{
   Clip, ClipAt, Edge, EdgeAt, Fade, FadeShape, Item, Layout, Marker, MarkerAt, MediaRef, Metadata,
@@ -83,6 +95,7 @@ pub(crate) fn timeline(
     .map(|(index, laid)| markers_planned(index, laid.track(), edit, &operands))
     .collect::<Result<Vec<_>, _>>()?;
   let settled = settle(planned, edit, &operands, Time::written(start, edit))?;
+  spellings(start, edit, &settled, &marked)?;
   // A valid timeline states its rate, and the reciprocal of a rate above
   // zero is a timebase.
   let ticks = timeline.rate().checked_to_timebase().unwrap_or_default();
@@ -1149,6 +1162,7 @@ impl Counted {
         value,
         rate: self.ruler.exact(),
         searched,
+        misread: None,
       }),
     }
   }
@@ -1158,6 +1172,14 @@ impl Counted {
       rational_time(self.ruler, self.length),
       rational_time(self.ruler, self.start),
     )
+  }
+
+  /// Refuses the range at `at` where OpenTimelineIO 0.17 reads a number
+  /// [`time_range`](Self::time_range) writes as another value, in its
+  /// order: the duration's, then the start's ([`read_back`]).
+  fn read_back(self, at: Spot) -> Result<(), NotRepresentable> {
+    read_back(self.length, self.ruler, at)?;
+    read_back(self.start, self.ruler, at)
   }
 }
 
@@ -1194,18 +1216,123 @@ fn metadata(mut words: Vec<(&'static str, Value)>, notes: &Metadata) -> Value {
   }
 }
 
-/// `count` ticks of `ruler`: its rate written as the `f64` nearest it, in
-/// the shortest spelling that reads back as that `f64`, and the count as
-/// [`number`] writes one.
+/// `count` ticks of `ruler`: its rate as [`rate`] writes one, and the count
+/// as [`number`] does.
 fn rational_time(ruler: Ruler, count: i128) -> Value {
   object(vec![
     ("OTIO_SCHEMA", text("RationalTime.1")),
-    (
-      "rate",
-      Value::Number(format_utf8bytes!("{:?}", ruler.otio())),
-    ),
+    ("rate", rate(ruler)),
     ("value", number(count)),
   ])
+}
+
+/// A ruler's rate, written as the `f64` nearest it in its shortest spelling
+/// — the one `{:?}` writes, which reads back as that `f64` where a reader
+/// rounds to nearest, as OpenTimelineIO 0.17's does not always
+/// ([`read_back`]).
+fn rate(ruler: Ruler) -> Value {
+  Value::Number(format_utf8bytes!("{:?}", ruler.otio()))
+}
+
+/// Refuses the first number the document would carry — a count or a
+/// ruler's rate, in the order it writes them — that OpenTimelineIO 0.17's
+/// reader reads as another value ([`read_back`]): the global start; then
+/// per track its markers, then its children — a gap's length, a clip's
+/// source range, its markers and its medium's available range, a fade's
+/// length, a dissolve's two offsets. Every count among them the plan holds
+/// within ±2^53 already; this holds each to its spelling. A gap's start
+/// and a fade's offset of zero are zeros, which read exactly, and every
+/// rate written beside them is the edit rate's, read with the start's.
+fn spellings(
+  start: i128,
+  edit: Ruler,
+  tracks: &[Vec<Planned<'_>>],
+  marked: &[Marked],
+) -> Result<(), NotRepresentable> {
+  read_back(start, edit, Spot::Start)?;
+  for (track, (children, marked)) in tracks.iter().zip(marked).enumerate() {
+    for (marker, range) in marked.track.iter().enumerate() {
+      range.read_back(Spot::Marker(MarkerAt::Track { track, marker }))?;
+    }
+    // The clip the walk reaches next: a gap is named by the clip it leads
+    // to, as the plan names it, and a fade by the clip it fades.
+    let mut next = 0;
+    for child in children {
+      match *child {
+        Planned::Gap(length) => read_back(
+          i128::from(length),
+          edit,
+          Spot::Record(ClipAt::new(track, next)),
+        )?,
+        Planned::Clip {
+          source, available, ..
+        } => {
+          let at = ClipAt::new(track, next);
+          source.read_back(Spot::Source(at))?;
+          let markers = marked.clips.get(next).map_or(&[][..], Vec::as_slice);
+          for (marker, range) in markers.iter().enumerate() {
+            range.read_back(Spot::Marker(MarkerAt::Clip { clip: at, marker }))?;
+          }
+          if let Some(available) = available {
+            available.read_back(Spot::Available(at))?;
+          }
+          next += 1;
+        }
+        Planned::Fade(fade, edge) => {
+          // A fade-in is written before its clip, a fade-out after it.
+          let clip = match edge {
+            Edge::In => next,
+            Edge::Out => next.saturating_sub(1),
+          };
+          read_back(
+            i128::from(fade.duration().ticks()),
+            edit,
+            Spot::Fade(EdgeAt::new(ClipAt::new(track, clip), edge)),
+          )?;
+        }
+        Planned::Dissolve(which, transition) => {
+          let at = Spot::Transition(TransitionAt::new(track, which));
+          read_back(i128::from(transition.in_offset().ticks()), edit, at)?;
+          read_back(i128::from(transition.out_offset().ticks()), edit, at)?;
+        }
+      }
+    }
+  }
+  Ok(())
+}
+
+/// Refuses `count` ticks of `ruler`, at `at`, where OpenTimelineIO 0.17's
+/// reader reads a number the export writes there — the ruler's rate
+/// ([`rate`]), then the count ([`number`]) — as another value: in a build
+/// that rounds RapidJSON's multiply-adds twice, or in one that fuses them
+/// ([`json::readings`]). Named as [`NotRepresentable::misread`] with the
+/// value meant and what each reads.
+fn read_back(count: i128, ruler: Ruler, at: Spot) -> Result<(), NotRepresentable> {
+  let misread = |number: MisreadNumber, written: Value, meant: f64| -> Option<Misread> {
+    let Value::Number(text) = written else {
+      return None;
+    };
+    // A refused reading is no value at all: NaN, which is no number meant.
+    let read = json::readings(&text).map(|reading| reading.map_or(f64::NAN, Number::double));
+    read
+      .iter()
+      .any(|read| read.to_bits() != meant.to_bits())
+      .then(|| Misread::new(number, meant, read))
+  };
+  // Within ±2^53, which the plan holds every written count to, a count's
+  // `f64` is exact.
+  let found = misread(MisreadNumber::Rate, rate(ruler), ruler.otio())
+    .or_else(|| misread(MisreadNumber::Count, number(count), count as f64));
+  match found {
+    None => Ok(()),
+    Some(misread) => Err(NotRepresentable {
+      at,
+      value: count,
+      rate: ruler.exact(),
+      searched: None,
+      misread: Some(misread),
+    }),
+  }
 }
 
 fn time_range(duration: Value, start_time: Value) -> Value {
@@ -1232,6 +1359,7 @@ fn held(value: i128, ruler: Ruler, at: Spot) -> Result<(), NotRepresentable> {
       value,
       rate: ruler.exact(),
       searched: None,
+      misread: None,
     })
   }
 }

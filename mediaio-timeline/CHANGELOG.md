@@ -27,6 +27,26 @@ Its versions are its own: they do not move with `mediadecode`'s.
   anything, and OpenTimelineIO 0.17 reads an object carrying `OTIO_SCHEMA`
   as an object of that schema, so a note keyed so made the export a
   document it refuses.
+- **BREAKING: `to_otio` refuses a count or a rate OpenTimelineIO 0.17's
+  reader would read as another value.** OpenTimelineIO 0.17.0 reads
+  numbers with RapidJSON in its normal precision, which does not always
+  round to the nearest double: a count written `<digits>.0` past
+  1 801 439 850 948 198 (⌊2^54 / 10⌋) can read as another —
+  `9007199254740991.0` as 9007199254740990 — and so can the shortest
+  spelling of some rates' `f64`s — 96000/1001's — while every common rate
+  reads exactly. The export reads every count and rate it writes as both
+  kinds of build read it — one that fuses a multiply-add of RapidJSON's
+  and one that does not — and refuses one either misreads, naming the
+  place and both values (`NotRepresentable::misread`). 0.2.0 wrote them.
+- **BREAKING: `validate_json` reads every number as OpenTimelineIO 0.17's
+  parser does** — RapidJSON at the commit the release pins, step for step:
+  `NaN`, `Inf` and `Infinity` are numbers, read where a reader reads a
+  number; `0e309`, `2e308` and an integer of 400 digits, which RapidJSON
+  refuses, refuse the document as syntax, and so does a number
+  OpenTimelineIO's builds read as different values; an `int64_t` member
+  takes every integer RapidJSON reads as one — `-0`, and up to 2^64 − 1,
+  which OpenTimelineIO keeps cut to its low 63 bits — and nothing written
+  with a fraction or an exponent.
 
 ### Added
 
@@ -51,8 +71,11 @@ Its versions are its own: they do not move with `mediadecode`'s.
   length anywhere but where the export writes one, on a fade's gap side,
   which OpenTimelineIO counts all the same (`Feature::StandaloneGap`).
   Every number is
-  read exactly — a float only where its text spells the float's canonical
-  decimal — and what OpenTimelineIO derives from the document in its own
+  read as OpenTimelineIO 0.17.0's parser reads it — RapidJSON in its
+  normal precision, the readings of a build that fuses one of its
+  multiply-adds and of one that does not alike, or refused — and held to
+  the model exactly: a count of NaN, of an infinity or of `-0.0` is
+  refused by name. What OpenTimelineIO derives from the document in its own
   `f64` arithmetic — both ends of every range, and each track's walk and
   the stack's — is held as `to_otio` holds it; each is refused as
   `Inexact` where it rounds. A member OpenTimelineIO lets a document leave
@@ -65,7 +88,8 @@ Its versions are its own: they do not move with `mediadecode`'s.
   read, and every value it writes must be the one the document states at
   the same path, as OpenTimelineIO 0.17.0's reader holds it — strings byte
   for byte, booleans exactly, a `RationalTime`'s numbers as doubles, a
-  dictionary's as the integers or doubles their text spells — or the read
+  dictionary's as the integers or doubles RapidJSON reads them as, two
+  doubles bit for bit, so `-0.0` is not `0.0` — or the read
   is refused as `Inexact` there, naming both values (`Inexact::written`,
   `Inexact::stated`): a medium's range counted in a ruler the export would
   not choose, a marker's color in another case, among them. A member may
@@ -79,6 +103,10 @@ Its versions are its own: they do not move with `mediadecode`'s.
   item `color` is OpenTimelineIO 0.18's item color, which 0.18 writes on
   every item: a document 0.18 writes is refused by name until it is
   modelled.
+- `otio::NotRepresentable::misread`, with `otio::Misread` and
+  `otio::MisreadNumber`: the count or rate OpenTimelineIO 0.17's reader
+  would read as another value, what was meant and what each kind of build
+  reads.
 - The export writes markers as `Marker.2`, refusing one no ruler holds
   whole as `Spot::Marker`.
 - `validate_json` holds every marker to `Marker.2`, with the

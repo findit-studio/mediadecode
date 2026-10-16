@@ -27,12 +27,19 @@
 //! default, `TimeRange()`, is nothing at rate 1: a rate the timeline does
 //! not keep, which OpenTimelineIO's sum of the track's duration takes.
 //!
-//! Every number is read exactly, or refused as [`Unreadable::Inexact`]: a
-//! count or a place as the whole number its digits spell
-//! ([`json::whole`]), a float as the one whose canonical decimal its text
-//! spells ([`json::exact_f64`], [`json::exact_f32`]) — so `2.4e1` reads as
-//! `24.0` does, and `16777217` does not read as the `f32` 16777216. Counts
-//! are read where the export writes them, and held to the exact words it
+//! Every number is read as OpenTimelineIO 0.17.0's parser reads it —
+//! RapidJSON at the commit the release pins, whose verdict on a number's
+//! text [`json::number`] gives, a number its builds read differently
+//! refused — and held to the model exactly, or refused as
+//! [`Unreadable::Inexact`]: a count as the whole number the `double` it
+//! reads as is ([`json::double`]), a dissolve's place as the whole number a
+//! dictionary keeps ([`json::whole`]), a gain as the `f32` whose shortest
+//! spelling reads as the same `double` ([`json::float`]). So `2.4e1` reads
+//! as `24.0` does, and `24.0000000000000001` too — RapidJSON keeps 17
+//! significant digits — while `16777217` reads as no `f32`, and a count of
+//! NaN, an infinity or `-0.0`, whose sign no whole count keeps, is refused
+//! by name, as is a rate of NaN or an infinity. Counts are read where the
+//! export writes them, and held to the exact words it
 //! writes beside them ([`export`](super::export)): each `RationalTime`'s
 //! rate must be the `f64` of the exact ruler its word names, bit for bit,
 //! and its value a whole count within ±2^53, which an `f64` holds exactly;
@@ -59,7 +66,8 @@
 //! read, and every value it writes must be the one the document states at
 //! the same path, as OpenTimelineIO 0.17.0 holds it — a string byte for
 //! byte, a boolean exactly, a `RationalTime`'s numbers as doubles, a
-//! dictionary's as the integers or doubles their text spells — or the read
+//! dictionary's as the integers or doubles RapidJSON reads them as, two
+//! doubles bit for bit — or the read
 //! is refused as inexact there, naming both values. A member the export
 //! writes may be missing from the document only where OpenTimelineIO reads
 //! its absence as that value ([`WRITTEN_DEFAULTS`]), and one the document
@@ -81,7 +89,7 @@ use super::{
   UnmodelledSchema, Unreadable,
   derive::{self, Ruler, Time},
   export::{self, DEFAULT_MEDIA, OURS},
-  json::{self, Value},
+  json::{self, Held, Value},
 };
 use crate::{
   Clip, ClipId, Edge, Fade, FadeShape, Gain, Marker, MarkerColor, MediaRef, Metadata, Timeline,
@@ -367,14 +375,22 @@ impl<'a> Words<'a> {
       .transpose()
   }
 
-  /// A gain in decibels: the `f32` its number spells exactly
-  /// ([`json::exact_f32`]), finite so.
+  /// A gain in decibels: the `f32` whose shortest spelling reads back as
+  /// the `double` its number reads as ([`json::float`]), finite so; NaN and
+  /// an infinity refused by name.
   fn gain(&self, word: &str) -> Result<Option<Gain>, Unreadable> {
     let Some(value) = self.get(word) else {
       return Ok(None);
     };
     let at = self.at.key(word);
-    json::exact_f32(number(value, &at)?)
+    let text = number(value, &at)?;
+    if json::double(text).is_some_and(|read| !read.is_finite()) {
+      return Err(inexact(
+        &at,
+        "a gain of NaN or an infinity, which no gain holds",
+      ));
+    }
+    json::float(text)
       .and_then(Gain::from_db)
       .map(Some)
       .ok_or_else(|| inexact(&at, "a gain that is not exactly the f32 it reads as"))
@@ -474,16 +490,25 @@ struct Exact {
   timebase: Timebase,
 }
 
-/// A `RationalTime.1` counted in `ruler`: its rate the `f64` its number
-/// spells exactly ([`json::exact_f64`]) and that `f64` the exact ruler's,
-/// bit for bit; its value a whole count within ±2^53.
+/// A `RationalTime.1` counted in `ruler`, its two numbers read as
+/// OpenTimelineIO 0.17.0 reads them, as `double`s ([`json::double`]): its
+/// rate the `f64` of the exact ruler, bit for bit; its value a whole count
+/// within ±2^53. NaN and an infinity are refused by name, in either, and a
+/// count of `-0.0`, whose sign no whole count keeps.
 fn count(value: &Value, at: &At, ruler: Ruler) -> Result<i64, Unreadable> {
+  /// 2^53.
+  const EXACT: f64 = 9_007_199_254_740_992.0;
   let object = Object::of(value, at.clone())?;
   object.schema(&["RationalTime.1"])?;
   object.keys(&["OTIO_SCHEMA", "rate", "value"])?;
   let rate_at = at.key("rate");
-  let rate = json::exact_f64(number(object.required("rate")?, &rate_at)?)
-    .ok_or_else(|| inexact(&rate_at, "a rate that is not exactly the f64 it reads as"))?;
+  let rate = double(object.required("rate")?, &rate_at)?;
+  if !rate.is_finite() {
+    return Err(inexact(
+      &rate_at,
+      "a rate of NaN or an infinity, which no ruler holds",
+    ));
+  }
   if rate.to_bits() != ruler.otio().to_bits() {
     return Err(inexact(
       &rate_at,
@@ -491,16 +516,36 @@ fn count(value: &Value, at: &At, ruler: Ruler) -> Result<i64, Unreadable> {
     ));
   }
   let value_at = at.key("value");
-  let whole = json::whole(number(object.required("value")?, &value_at)?)
-    .ok_or_else(|| inexact(&value_at, "a count that is no whole number"))?;
-  if whole.unsigned_abs() > 1 << 53 {
+  let count = double(object.required("value")?, &value_at)?;
+  if !count.is_finite() {
+    return Err(inexact(
+      &value_at,
+      "a count of NaN or an infinity, which no whole count holds",
+    ));
+  }
+  if count.to_bits() == (-0.0_f64).to_bits() {
+    return Err(inexact(
+      &value_at,
+      "a count of negative zero, whose sign no whole count keeps",
+    ));
+  }
+  if !(-EXACT..=EXACT).contains(&count) {
     return Err(inexact(
       &value_at,
       "a count past 2^53, which an f64 does not hold exactly",
     ));
   }
+  let whole = json::whole_double(count)
+    .ok_or_else(|| inexact(&value_at, "a count that is no whole number"))?;
   // Within ±2^53, so within `i64`.
   Ok(whole as i64)
+}
+
+/// The `double` OpenTimelineIO 0.17.0 reads a number as where it reads a
+/// member as one ([`json::double`]).
+fn double(value: &Value, at: &At) -> Result<f64, Unreadable> {
+  json::double(number(value, at)?)
+    .ok_or_else(|| inexact(at, "a number OpenTimelineIO 0.17.0 does not read"))
 }
 
 /// A count that measures a length: zero or more.
@@ -1344,11 +1389,12 @@ pub(crate) fn reproduced(root: &Value, timeline: &Timeline) -> Result<(), Unread
 #[derive(Clone, Copy)]
 enum Numbers {
   /// A member it fetches as a `double` — a `RationalTime`'s rate and value —
-  /// which takes any number, an integer read as the `double` it is
-  /// (`deserialization.cpp` 376–488 in 0.17.0).
+  /// which takes any number, an integer cast to the nearest `double`
+  /// (`deserialization.cpp` 418–454 in 0.17.0).
   Doubles,
   /// A value it keeps as it parses it — in a dictionary: an integer as an
-  /// `int64_t`, any other number as a `double` (59–73).
+  /// `int64_t`, a `Uint64` cut to its low 63 bits, any other number as a
+  /// `double` (62–73).
   AsWritten,
 }
 
@@ -1402,11 +1448,10 @@ fn same(written: &Value, stated: &Value, at: &At, numbers: Numbers) -> Result<()
 
 /// Whether two scalars are one value as OpenTimelineIO 0.17.0's reader holds
 /// it: two strings byte for byte, two booleans or two nulls alike, and two
-/// numbers as `numbers` reads them ([`held`]) — so `24` and `24.0` are one
-/// `RationalTime` rate, both read as the `double` 24.0, while in a dictionary
-/// `-3` is an `int64_t` and `-3.0` a `double`. A number reads only as its
-/// text spells it exactly ([`json::exact_f64`]), as every number this reader
-/// takes does.
+/// numbers as `numbers` reads them ([`held`]), two doubles bit for bit — so
+/// `24` and `24.0` are one `RationalTime` rate, both read as the `double`
+/// 24.0, while in a dictionary `-3` is an `int64_t` and `-3.0` a `double`,
+/// and `-0.0` is not `0.0` anywhere.
 fn same_scalar(written: &Value, stated: &Value, numbers: Numbers) -> bool {
   match (written, stated) {
     (Value::Null, Value::Null) => true,
@@ -1419,30 +1464,16 @@ fn same_scalar(written: &Value, stated: &Value, numbers: Numbers) -> bool {
   }
 }
 
-/// A number as OpenTimelineIO 0.17.0's reader holds it.
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Held {
-  Integer(i64),
-  Double(f64),
-}
-
 /// The number `text` spells, as OpenTimelineIO 0.17.0's reader holds it
-/// where it reads `numbers`: as a `double`, or as its JSON parser takes it —
-/// an integer, with neither fraction nor exponent, as an `int64_t`, one past
-/// `i64` and within `u64` cut to its low 63 bits (`deserialization.cpp`
-/// 63–70), one past `u64` as a `double`; any other as a `double`. `None` for
-/// a number no `double` holds exactly.
+/// where it reads `numbers` — RapidJSON's verdict ([`json::number`]): as a
+/// `double` ([`json::double`]), or as its handler keeps it, an integer as an
+/// `int64_t`, a `Uint64` cut to its low 63 bits, any other number as a
+/// `double` ([`json::held`]). `None` for a number RapidJSON refuses, or one
+/// OpenTimelineIO's builds read as different values.
 fn held(text: &str, numbers: Numbers) -> Option<Held> {
-  let double = || json::exact_f64(text);
-  if matches!(numbers, Numbers::Doubles) || text.contains(['.', 'e', 'E']) {
-    return double().map(Held::Double);
-  }
-  match text.parse::<i128>() {
-    Ok(value) if i64::try_from(value).is_ok() => i64::try_from(value).ok().map(Held::Integer),
-    Ok(value) if u64::try_from(value).is_ok() => u64::try_from(value)
-      .ok()
-      .map(|value| Held::Integer((value & 0x7FFF_FFFF_FFFF_FFFF) as i64)),
-    _ => double().map(Held::Double),
+  match numbers {
+    Numbers::Doubles => json::double(text).map(Held::Double),
+    Numbers::AsWritten => json::held(text),
   }
 }
 

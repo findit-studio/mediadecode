@@ -382,10 +382,214 @@ fn a_count_past_2_53_is_refused_rather_than_read_rounded() {
   // The start, at the edit rate.
   let early = at_one_fps(0, 1).with_start(Timestamp::new(-TWO_53 - 1, tb(1, 1)));
   assert_eq!(not_representable(&early), (Spot::Start, -past));
-  // Up to 2^53 itself is written, and reads back whole.
+  // Within 2^53 a count OpenTimelineIO 0.17's reader reads back exactly is
+  // written, and reads back whole: 2^53 - 2. (2^53 - 1 it misreads, below.)
   assert_eq!(
-    children(&at_one_fps(TWO_53 - 1, TWO_53)),
-    ["Gap(9007199254740991)", "a"]
+    children(&at_one_fps(TWO_53 - 2, TWO_53 - 1)),
+    ["Gap(9007199254740990)", "a"]
+  );
+}
+
+/// Where `to_otio` refuses `timeline` because OpenTimelineIO 0.17's reader
+/// reads a number it would write as another value, and the refusal.
+fn misread(timeline: &Timeline) -> (NotRepresentable, Misread) {
+  match to_otio(timeline, OtioTarget::V0_15Plus) {
+    Err(Refused::NotRepresentable(refusal)) => match refusal.misread() {
+      Some(misread) => (refusal, misread),
+      None => panic!("{refusal}"),
+    },
+    other => panic!("{other:?}"),
+  }
+}
+
+#[test]
+fn a_count_opentimelineio_0_17_reads_as_another_is_refused_by_name() {
+  // OpenTimelineIO 0.17's reader takes `<digits>.0`'s zero into the
+  // significand, which converts to a double rounded past 2^53 before it is
+  // divided by ten: every count up to 1 801 439 850 948 198, ⌊2^54 / 10⌋,
+  // reads back exactly — the last the export writes before the first it
+  // refuses.
+  const LAST: i64 = 1_801_439_850_948_198;
+  assert_eq!(
+    children(&at_one_fps(LAST, LAST + 1)),
+    ["Gap(1801439850948198)", "a"]
+  );
+  // The next it reads as 1 801 439 850 948 199.25: refused by name, with no
+  // search, the place and both values named.
+  let (refusal, read) = misread(&at_one_fps(LAST + 1, LAST + 2));
+  assert_eq!(
+    (refusal.at(), refusal.value(), refusal.searched()),
+    (Spot::Record(ClipAt::new(0, 0)), i128::from(LAST + 1), None)
+  );
+  assert_eq!(read.number(), MisreadNumber::Count);
+  assert_eq!(read.meant(), (LAST + 1) as f64);
+  // A quarter more: the doubles there are a quarter apart.
+  assert_eq!(read.read(), [(LAST + 1) as f64 + 0.25; 2]);
+  assert_eq!(
+    std::string::ToString::to_string(&refusal),
+    "the gap before track 0, clip 0 counts 1801439850948199 ticks of 1/1 s, written \
+     1801439850948199.0: OpenTimelineIO 0.17 reads this spelling as another value, \
+     1801439850948199.3"
+  );
+  // 2^53 - 1 it reads as 2^53 - 2, a whole number: a reader would place the
+  // clip a second early, and say nothing.
+  let (refusal, read) = misread(&at_one_fps(TWO_53 - 1, TWO_53));
+  assert_eq!(refusal.value(), i128::from(TWO_53 - 1));
+  assert_eq!(read.read(), [(TWO_53 - 2) as f64; 2]);
+  // At the start, at the edit rate, as much.
+  let start = at_one_fps(0, 1).with_start(Timestamp::new(TWO_53 - 1, tb(1, 1)));
+  assert_eq!(misread(&start).0.at(), Spot::Start);
+}
+
+#[test]
+fn a_rate_opentimelineio_0_17_reads_as_another_is_refused_by_name() {
+  let at = |num: i32| {
+    let rate = Rate::fps(num, core::num::NonZeroI32::new(1001).unwrap());
+    let frame = rate.checked_to_timebase().unwrap();
+    one_track_at(
+      rate,
+      Clip::new(
+        ClipId::new("a"),
+        "a",
+        MediaRef::new("file:///a.mov"),
+        TimeRange::new(0, 24, frame),
+        TimeRange::new(0, 24, frame),
+      ),
+    )
+  };
+  // 96000/1001's f64 is written 95.90409590409591, which OpenTimelineIO
+  // 0.17's reader reads as the next f64 up: refused where it is first
+  // written, at the start.
+  let (refusal, read) = misread(&at(96_000));
+  assert_eq!((refusal.at(), refusal.value()), (Spot::Start, 0));
+  assert_eq!(read.number(), MisreadNumber::Rate);
+  assert_eq!(read.meant(), 96_000.0 / 1001.0);
+  assert_eq!(
+    read.read().map(f64::to_bits),
+    [0x4057_F9DC_B511_2288; 2],
+    "the next f64 up from {:#x}",
+    (96_000.0_f64 / 1001.0).to_bits()
+  );
+  assert_eq!(
+    std::string::ToString::to_string(&refusal),
+    "the start counts 0 ticks of 1001/96000 s, its rate written 95.90409590409591: \
+     OpenTimelineIO 0.17 reads this spelling as another value, 95.90409590409593"
+  );
+  // 24000/1001's, written 23.976023976023978, reads back exactly: written,
+  // and read back as the very timeline.
+  let ntsc = at(24_000);
+  let text = to_otio(&ntsc, OtioTarget::V0_15Plus).unwrap();
+  assert_eq!(from_otio(&text), Ok(ntsc));
+}
+
+/// SplitMix64: a fixed seed gives a fixed sequence, on every platform.
+struct Seeded(u64);
+
+impl Seeded {
+  fn next(&mut self) -> u64 {
+    self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = self.0;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+  }
+
+  /// A number in `low..=high`.
+  fn within(&mut self, low: u64, high: u64) -> u64 {
+    low + self.next() % (high - low + 1)
+  }
+}
+
+#[test]
+fn every_number_an_accepted_export_writes_reads_back_exactly_in_either_build() {
+  // Rates common and exotic, and gaps from a few frames to 2^53, from fixed
+  // seeds. Whatever `to_otio` writes, OpenTimelineIO 0.17's reader reads
+  // back as the value meant — each count as its whole number, each rate as
+  // the f64 its shortest spelling names — in a build that rounds RapidJSON's
+  // multiply-adds twice and in one that fuses them; whatever it refuses as
+  // misread, either build does read otherwise.
+  const COMMON: [(i32, i32); 12] = [
+    (24, 1),
+    (25, 1),
+    (30, 1),
+    (48, 1),
+    (50, 1),
+    (60, 1),
+    (24_000, 1001),
+    (30_000, 1001),
+    (48_000, 1001),
+    (60_000, 1001),
+    (96_000, 1001),
+    (25, 2),
+  ];
+  let reads_back = |text: &str, meant: f64| {
+    json::readings(text)
+      .iter()
+      .all(|reading| reading.is_ok_and(|number| number.double().to_bits() == meant.to_bits()))
+  };
+  let (mut written, mut misread) = (0, 0);
+  for seed in 0..256 {
+    let mut draw = Seeded(seed);
+    let (num, den) = match draw.within(0, 2) {
+      0 => COMMON[draw.within(0, COMMON.len() as u64 - 1) as usize],
+      1 => (draw.within(1, 240_000) as i32, 1001),
+      _ => (draw.within(1, 240_000) as i32, draw.within(1, 1001) as i32),
+    };
+    let rate = Rate::fps(num, core::num::NonZeroI32::new(den).unwrap());
+    let Some(frame) = rate.checked_to_timebase() else {
+      continue;
+    };
+    let gap = match draw.within(0, 3) {
+      0 => draw.within(0, 1000),
+      1 => 1 << draw.within(0, 53),
+      2 => draw.within(1_801_439_850_948_190, 1_801_439_850_948_210),
+      _ => draw.within((1 << 53) - 30, 1 << 53),
+    } as i64;
+    let length = draw.within(1, 48) as i64;
+    let timeline = one_track_at(
+      rate,
+      Clip::new(
+        ClipId::new("a"),
+        "a",
+        MediaRef::new("file:///a.mov"),
+        TimeRange::new(0, length, frame),
+        TimeRange::new(gap, gap + length, frame),
+      ),
+    );
+    match to_otio(&timeline, OtioTarget::V0_15Plus) {
+      Ok(text) => {
+        written += 1;
+        let root = json::parse(&text).unwrap();
+        let mut times = Vec::new();
+        named(&root, "RationalTime.1", &mut times);
+        for time in times {
+          let value = spelled(time, "value");
+          let count: i128 = value.strip_suffix(".0").unwrap().parse().unwrap();
+          assert!(reads_back(value, count as f64), "seed {seed}: {value}");
+          let rate = spelled(time, "rate");
+          assert!(
+            reads_back(rate, rate.parse().unwrap()),
+            "seed {seed}: {rate}"
+          );
+        }
+      }
+      Err(Refused::NotRepresentable(refusal)) => {
+        if let Some(read) = refusal.misread() {
+          misread += 1;
+          let meant = read.meant().to_bits();
+          assert!(
+            read.read().iter().any(|read| read.to_bits() != meant),
+            "seed {seed}: {refusal}"
+          );
+        }
+      }
+      Err(other) => panic!("seed {seed}: {other}"),
+    }
+  }
+  // Both sides drawn, many times.
+  assert!(
+    written > 64 && misread > 16,
+    "{written} written, {misread} misread"
   );
 }
 
@@ -570,18 +774,25 @@ fn every_count_in_the_goldens_is_one_an_f64_holds_exactly() {
     assert_eq!(times.len(), 1 + 3 * 4 + 2 * 2 + 3 * 2 + 2 * 2);
     for time in &times {
       // A whole count within ±2^53, written as `<digits>.0`, which an f64
-      // reads back as exactly that count.
+      // reads back as exactly that count — and OpenTimelineIO 0.17's reader
+      // too, in either build.
       let value = spelled(time, "value");
       let digits = value.strip_suffix(".0").unwrap();
       let count: i128 = digits.parse().unwrap();
       assert!(count.unsigned_abs() <= 1 << 53, "{value}");
       assert_eq!(value.parse::<f64>().unwrap() as i128, count, "{value}");
+      let both = |text: &str, meant: f64| {
+        json::readings(text).map(|reading| reading.map(|number| number.double().to_bits()))
+          == [Ok(meant.to_bits()); 2]
+      };
+      assert!(both(value, count as f64), "{value}");
       // The rate spelled as the shortest text of one f64, which reads back as
-      // that very f64.
+      // that very f64, in either build of OpenTimelineIO 0.17's reader too.
       let rate = spelled(time, "rate");
       let read = rate.parse::<f64>().unwrap();
       assert!(read.is_finite() && read > 0.0, "{rate}");
       assert_eq!(format!("{read:?}"), rate);
+      assert!(both(rate, read), "{rate}");
     }
     let mut ranges = Vec::new();
     named(&root, "TimeRange.1", &mut ranges);
@@ -617,6 +828,7 @@ fn a_refusal_to_export_says_why() {
       value: 9_007_199_254_740_993,
       rate: Rate::hz(1),
       searched: None,
+      misread: None,
     })),
     "the gap before track 0, clip 0 counts 9007199254740993 ticks of 1/1 s, which \
      OpenTimelineIO's f64 does not hold exactly"
@@ -629,6 +841,7 @@ fn a_refusal_to_export_says_why() {
       value: 27_021_597_764_222_973,
       rate: Rate::hz(3),
       searched: Some(RulerSearch { walks: 3 }),
+      misread: None,
     })),
     "the place of track 0, child 1 counts 27021597764222973 ticks of 1/3 s, which \
      OpenTimelineIO's f64 does not hold exactly, in the last of 3 plans the bounded search \
@@ -651,6 +864,7 @@ fn a_refusal_to_export_says_why() {
       value: 9_007_199_254_740_994,
       rate: Rate::hz(1),
       searched: Some(RulerSearch { walks: 0 }),
+      misread: None,
     })),
     "the source range of track 0, clip 0 counts 9007199254740994 ticks of 1/1 s, which \
      OpenTimelineIO's f64 does not hold exactly, in any of the range's own rulers or of the \
@@ -662,6 +876,7 @@ fn a_refusal_to_export_says_why() {
       value: 9_007_199_254_740_993,
       rate: Rate::hz(1),
       searched: Some(RulerSearch { walks: 0 }),
+      misread: None,
     })),
     "the available range of track 0, clip 0 counts 9007199254740993 ticks of 1/1 s, which \
      OpenTimelineIO's f64 does not hold exactly, in any of the range's own rulers or of the \
