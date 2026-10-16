@@ -8,6 +8,62 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 The family — `mediadecode`, `mediadecode-ffmpeg`, `mediadecode-webcodecs`,
 `mediaencode`, `mediaencode-ffmpeg` and `mediaio` — releases in lockstep.
 
+## [Unreleased]
+
+### Added
+
+- **The write crossing**: `output::Output`, libavformat's muxing
+  context owned in Rust over a caller's `Write + Seek`, for
+  `mediaencode-ffmpeg`'s muxer. It takes no pointer from a caller, so
+  nothing in it is `unsafe`; `contracts` gains "Writing a container" and
+  "`AVOutputFormat`" for what it keeps with libavformat: the context
+  freed before its I/O context, the call order kept at run time
+  (`OutputError::OutOfOrder`), packets copied in on the copy road,
+  parameters rebuilt from a `CodecTicket`, ids crossing as integers.
+- **`writer_guard::GuardedWriter`**: a caller's sink behind the reader
+  guard's panic latch. A panic inside it becomes a latched I/O error,
+  named by the context (`OutputError::SinkPanic`), and a sink that
+  panicked is never called again.
+- Both guards reduce an error the stream returns to its OS code or its
+  kind inside their `catch_unwind`, dropping its payload there:
+  ffmpeg-next drops a returned error inside its `extern "C"` callback,
+  where a payload whose `Drop` panics aborted the process. That panic is
+  now latched and named like any other.
+- `Output::into_sink` hands the sink back only when every byte reached
+  it: a write the sink failed, which the I/O context keeps and writes
+  nothing after, is read there after the last flush and reported
+  (`OutputError::SinkWrite`), whatever the sink's own flush answers.
+- A seek the sink fails is kept by the writer guard
+  (`writer_guard::SeekRecord`, the third handle `GuardedWriter::new`
+  answers), which libavformat does not do: a muxer going back to patch
+  its header may ignore the answer and write on. The guard writes and
+  seeks nothing after it, and every `Output` call that reached
+  libavformat — the header, a packet, the trailer, `into_sink` — names
+  it once libavformat returns, whatever libavformat answered
+  (`OutputError::SinkSeek`), after a panic and before libavformat's own
+  error.
+- `CodecId::mime_type` — the descriptor's first MIME type — and the
+  `PNG`, `BMP`, `TTF`, `OTF` and `TEXT` ids.
+- What libavformat's packet path reads of a stream, for a muxer that
+  keeps each packet from a rule libavformat would apply only after
+  taking it: `Output::stream_codec` answers a stream's `StreamCodec` — its
+  codec, video delay, sample rate, channels, frame size, the samples its
+  codec fixes in each frame, block alignment, initial padding and
+  extradata — once `add_stream` made it; `Output::shifts_early_times`
+  whether libavformat moves every stream's times for an early first one;
+  and `Output::set_automatic_filters` turns its automatic bitstream
+  filters on or off — on by default, as libavformat's own — so that a
+  caller who wants every packet to reach the muxer as handed over can
+  have it (`OutputCall::AutomaticFilters`).
+- `CodecId::intra_only` — whether libavformat takes every packet of the
+  codec for a key frame — and `CodecId::bits_per_sample`, with the
+  `LCEVC`, `EVC`, `APV`, `WAVPACK`, `TRUEHD` and `TTML` ids; the
+  big-endian `PCM_S24BE`, `PCM_S32BE`, `PCM_F32BE` and `PCM_F64BE`, and
+  `ATRAC3`, `COOK`, `RA_288`, `SIPR`, `RV10`, `RV20` and `RV30`.
+- `extras::packet_side_data_name`: libavcodec's name for a packet
+  side-data type, asked as the integer it is on the wire, or `None`
+  where this build names no such type.
+
 ## [0.19.0] - 2026-10-16
 
 ### Added

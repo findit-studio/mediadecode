@@ -7,6 +7,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The family releases in lockstep.
 
+## [Unreleased]
+
+### Added
+
+- **A packet is presented no earlier than it is decoded**:
+  `MuxRefusal::PtsBeforeDts` and `check_presentation_order`, the rule
+  every container keeps over the times as it stores them — libavformat
+  compares the counts it is handed, and refuses only after taking the
+  packet. A backend applies it to its stored representation, not to the
+  instants offered, names it first and hands the packet back.
+
 ## [0.19.0] - 2026-10-16
 
 ### Added

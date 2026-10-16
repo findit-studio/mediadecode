@@ -5,8 +5,16 @@
 #![forbid(unsafe_code)]
 
 pub mod catalogue;
+pub mod mux;
 
 pub use catalogue::{Admitted, CATALOGUE, EncoderRefusal, Entry, License, encoder_by_name, lookup};
+pub use mux::{
+  AutomaticFilter, CarrierMuxer, ContainerName, FfmpegMuxRefusal, FfmpegMuxer, FfmpegOwnedMuxer,
+  MuxFault, MuxOpenError, MuxOptions, MuxReport, MuxStage, PayloadRule, Rewrite, SideDataFate,
+  Uncarried,
+};
+// What a fault and a refusal name, from the base's muxing context.
+pub use mediaio_ffmpeg::output::{OutputCall, OutputError, OutputPhase, OutputText};
 
 // The faces this adapter implements, and the vocabulary they speak.
 pub use mediaencode;
