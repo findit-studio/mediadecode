@@ -47,7 +47,10 @@ Its versions are its own: they do not move with `mediadecode`'s.
   `UnmodelledSchema`, `UnmodelledFeature` and its `Feature`, `Inexact`, and
   the self-check's `Shape` and `Syntax` — never dropped: a gap of some
   length after a track's last clip, which OpenTimelineIO counts in the
-  track's duration, among them (`Feature::TrailingGap`). Every number is
+  track's duration, among them (`Feature::TrailingGap`), and a gap of no
+  length anywhere but where the export writes one, on a fade's gap side,
+  which OpenTimelineIO counts all the same (`Feature::StandaloneGap`).
+  Every number is
   read exactly — a float only where its text spells the float's canonical
   decimal — and what OpenTimelineIO derives from the document in its own
   `f64` arithmetic — both ends of every range, and each track's walk and

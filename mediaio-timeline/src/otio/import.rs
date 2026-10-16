@@ -17,7 +17,8 @@
 //! default constructor and reads such a member only if present — so an
 //! absent name reads as empty, an item's absent `enabled` as `true`, a
 //! marker's absent color as GREEN and its comment as empty, and a gap's
-//! absent range as a gap of no length; a `Clip.1` with no media reference
+//! absent range as a gap of no length — read only where the export writes
+//! one, like any other; a `Clip.1` with no media reference
 //! is a clip with no medium, refused by name as a `null` one is. A member
 //! whose default is no value at all, where the timeline needs one — the
 //! timeline's `global_start_time`, a clip's `source_range` — is refused by
@@ -44,7 +45,11 @@
 //! items end to end from zero, each clip as long as its source range at the
 //! edit rate. A track's time ends with its last clip, so a gap of some
 //! length after it — which OpenTimelineIO counts in the track's duration —
-//! is refused by name ([`Feature::TrailingGap`]).
+//! is refused by name ([`Feature::TrailingGap`]). A gap of no length is
+//! read only where the export writes one, on a fade's gap side; anywhere
+//! else OpenTimelineIO still counts it — its range in its duration, its
+//! rate in its track's sum — so it is refused by name too
+//! ([`Feature::StandaloneGap`]).
 
 use core::str::FromStr;
 use std::{boxed::Box, vec, vec::Vec};
@@ -753,12 +758,13 @@ impl Child {
 
 /// A track's clips, each at its record, and its transitions: its items
 /// laid end to end from zero, as OpenTimelineIO places them, each fade on
-/// the clip beside it and each dissolve on the cut it straddles. A gap
-/// after the last clip is read only where it has no length — the gap the
-/// export writes after a fade-out at the track's end — as the track ends
-/// with that clip: one of some length is refused by name, every gap of a
-/// track with no clip among them. Answers the children as OpenTimelineIO's
-/// walk reads them too, each counted as the document writes it.
+/// the clip beside it and each dissolve on the cut it straddles. The track
+/// ends with its last clip: a gap of some length after it is refused by
+/// name, every gap of a track with no clip among them. A gap of no length
+/// is read only where the export writes one — on a fade's gap side, beside
+/// no other gap — and refused by name anywhere else, as OpenTimelineIO
+/// counts it all the same. Answers the children as OpenTimelineIO's walk
+/// reads them too, each counted as the document writes it.
 fn children(object: &Object<'_>, edit: Ruler, ticks: Timebase) -> Result<Children, Unreadable> {
   let at = object.at.key("children");
   let values = array(object.required("children")?, &at)?;
@@ -791,6 +797,13 @@ fn children(object: &Object<'_>, edit: Ruler, ticks: Timebase) -> Result<Childre
   }
 
   let kinds: Vec<Kind> = read.iter().map(Child::kind).collect();
+  let fades: Vec<Option<Edge>> = read
+    .iter()
+    .map(|child| match child {
+      Child::Fade(edge, _) => Some(*edge),
+      _ => None,
+    })
+    .collect();
   let last_clip = kinds.iter().rposition(|&kind| kind == Kind::Clip);
   let mut cursor: i64 = 0;
   let mut clips: Vec<Clip> = Vec::new();
@@ -813,6 +826,18 @@ fn children(object: &Object<'_>, edit: Ruler, ticks: Timebase) -> Result<Childre
       Child::Gap(length) => {
         if length > 0 && last_clip.is_none_or(|last| index > last) {
           return Err(feature(&here, Feature::TrailingGap));
+        }
+        // A gap of no length is read only where the export writes one: on
+        // a fade's gap side — before a fade-in, after a fade-out — and
+        // beside no other gap. Anywhere else OpenTimelineIO still counts
+        // it, while the timeline has nothing there.
+        if length == 0 {
+          let fade = |at: Option<usize>| at.and_then(|at| fades.get(at).copied().flatten());
+          let fade_side =
+            fade(Some(index + 1)) == Some(Edge::In) || fade(index.checked_sub(1)) == Some(Edge::Out);
+          if !fade_side || before == Some(Kind::Gap) || after == Some(Kind::Gap) {
+            return Err(feature(&here, Feature::StandaloneGap));
+          }
         }
         cursor = advance(cursor, length, &here)?;
       }

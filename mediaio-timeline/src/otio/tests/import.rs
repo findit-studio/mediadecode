@@ -1597,13 +1597,16 @@ fn a_gap_of_some_length_after_the_last_clip_is_refused() {
       "tracks.children.1.children.0"
     )),
   );
-  // A gap of no length there carries nothing.
+  // A gap of no length there is no fade's: OpenTimelineIO still counts it.
   assert_eq!(
     read(|root| {
       let empty = gap(root, "0.0");
       push(root, &format!("{TRACK}.children"), empty);
     }),
-    Ok(sample()),
+    Err(feature(
+      Feature::StandaloneGap,
+      &format!("{TRACK}.children.5")
+    )),
   );
   // The export writes one after a fade-out at a track's end, and reads it
   // back.
@@ -1630,6 +1633,163 @@ fn a_gap_of_some_length_after_the_last_clip_is_refused() {
       "{target:?}"
     );
     assert_eq!(from_otio(&written), Ok(faded.clone()), "{target:?}");
+  }
+}
+
+/// Two clips end to end from zero on one track, `a` at [0, 24) and `b` at
+/// [24, 48), each fading as `fades` says: `a`'s in and out, then `b`'s.
+fn abutting(fades: [bool; 4]) -> Timeline {
+  let fade = |on: bool| on.then(|| Fade::new(Duration::new(6, edit()), FadeShape::Linear));
+  let clip = |name: &str, start: i64, fade_in: bool, fade_out: bool| {
+    Clip::new(
+      ClipId::new(name),
+      name,
+      MediaRef::new(smol_bytes::format_utf8bytes!("file:///{name}.mov"))
+        .with_available_range(Some(TimeRange::new(0, 100, edit())))
+        .with_rate(Some(Rate::FPS_24)),
+      TimeRange::new(10, 34, edit()),
+      TimeRange::new(start, start + 24, edit()),
+    )
+    .with_fades(Fades::new().with_in(fade(fade_in)).with_out(fade(fade_out)))
+  };
+  Timeline::new("abutting", Rate::FPS_24).with_track(
+    Track::new(TrackKind::Video, "V")
+      .with_clip(clip("a", 0, fades[0], fades[1]))
+      .with_clip(clip("b", 24, fades[2], fades[3])),
+  )
+}
+
+#[test]
+fn a_gap_of_no_length_is_read_only_where_the_export_writes_one() {
+  // Round 7: OpenTimelineIO counts a gap of no length all the same — its
+  // range is the item's duration (`item.cpp` 43–46 in 0.17.0), and its rate
+  // joins the track's sum, which starts at rate 1 and takes the higher of
+  // two (`track.cpp` 111–148; `rationalTime.h` 283–294) — so one the
+  // timeline has no place for is refused by name.
+  //
+  // Codex's input: a timeline at 4/3 starting 2^52 ticks in, one track
+  // holding one such gap alone. Read, it would leave the track empty, which
+  // the export derives at rate 1 and could not write back.
+  let rate = Rate::fps(4, core::num::NonZeroI32::new(3).expect("non-zero"));
+  let lone = Timeline::new("lone", rate).with_track(Track::new(TrackKind::Video, "V"));
+  let mut root = json::parse(&to_otio(&lone, OtioTarget::V0_15Plus).unwrap()).unwrap();
+  set(
+    &mut root,
+    "global_start_time",
+    "value",
+    number("4503599627370496.0"),
+  );
+  let edit_rate = at(&mut root, "global_start_time.rate").clone();
+  let zero = || {
+    object(vec![
+      ("OTIO_SCHEMA", text("RationalTime.1")),
+      ("rate", edit_rate.clone()),
+      ("value", number("0.0")),
+    ])
+  };
+  let gap = object(vec![
+    ("OTIO_SCHEMA", text("Gap.1")),
+    (
+      "source_range",
+      object(vec![
+        ("OTIO_SCHEMA", text("TimeRange.1")),
+        ("duration", zero()),
+        ("start_time", zero()),
+      ]),
+    ),
+  ]);
+  set(&mut root, "tracks.children.0", "children", Value::Array(vec![gap]));
+  let mut out = Utf8BytesMut::new();
+  json::write_pretty(&root, &mut out);
+  assert_eq!(
+    from_otio(&out.freeze_shared()),
+    Err(feature(
+      Feature::StandaloneGap,
+      "tracks.children.0.children.0"
+    )),
+    "Codex's input",
+  );
+
+  // The sample's leading gap, of no length.
+  let empty = |root: &mut Value| {
+    let mut gap = at(root, GAP).clone();
+    set(&mut gap, "source_range.duration", "value", number("0.0"));
+    gap
+  };
+  // Alone, on a track with no clip.
+  assert_eq!(
+    read(|root| {
+      let mut track = at(root, TRACK).clone();
+      let only = empty(root);
+      set(&mut track, "", "children", Value::Array(vec![only]));
+      set(&mut track, "", "markers", Value::Array(vec![]));
+      let Value::Array(tracks) = at(root, "tracks.children") else {
+        unreachable!()
+      };
+      tracks.push(track);
+    }),
+    Err(feature(
+      Feature::StandaloneGap,
+      "tracks.children.1.children.0"
+    )),
+    "alone on a track",
+  );
+  // Mid-track, between `a` and `b`, where the dissolve was.
+  assert_eq!(
+    read(|root| {
+      let gap = empty(root);
+      let Value::Array(children) = at(root, &format!("{TRACK}.children")) else {
+        unreachable!()
+      };
+      children[3] = gap;
+    }),
+    Err(feature(
+      Feature::StandaloneGap,
+      &format!("{TRACK}.children.3")
+    )),
+    "mid-track",
+  );
+  // On a fade's gap side, but beside another gap: the export writes no gap
+  // of no length after one of some length.
+  assert_eq!(
+    read(|root| {
+      let gap = empty(root);
+      let Value::Array(children) = at(root, &format!("{TRACK}.children")) else {
+        unreachable!()
+      };
+      children.insert(1, gap);
+    }),
+    Err(feature(
+      Feature::StandaloneGap,
+      &format!("{TRACK}.children.1")
+    )),
+    "beside another gap",
+  );
+
+  // The fade encoding reads back: a gap of no length before a fade-in at a
+  // track's start, after a fade-out at its end, between a fade-out and a
+  // fade-in, and before a fade-in after a clip that does not fade out.
+  for (fades, children) in [
+    ([true, false, false, false], 4),
+    ([false, false, false, true], 4),
+    ([false, true, true, false], 5),
+    ([false, false, true, false], 4),
+  ] {
+    let timeline = abutting(fades);
+    assert_eq!(crate::validate(&timeline), Ok(()), "{fades:?}: the premise");
+    for target in [OtioTarget::V0_15Plus, OtioTarget::Legacy] {
+      let written = to_otio(&timeline, target).unwrap();
+      let mut root = json::parse(&written).unwrap();
+      let Value::Array(items) = at(&mut root, &format!("{TRACK}.children")) else {
+        unreachable!()
+      };
+      assert_eq!(items.len(), children, "{fades:?} {target:?}: the premise");
+      assert_eq!(
+        from_otio(&written),
+        Ok(timeline.clone()),
+        "{fades:?} {target:?}"
+      );
+    }
   }
 }
 

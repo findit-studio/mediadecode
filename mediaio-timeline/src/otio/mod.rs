@@ -690,7 +690,9 @@ impl core::error::Error for Shape {}
 /// clip beside its gap and each dissolve on the cut it straddles. A track
 /// ends with its last clip: a gap of some length after it, which
 /// OpenTimelineIO counts in the track's duration, is refused
-/// ([`Feature::TrailingGap`]). Both clip schemas are read: `Clip.2` and
+/// ([`Feature::TrailingGap`]), and so is a gap of no length anywhere but
+/// where the export writes one, on a fade's gap side
+/// ([`Feature::StandaloneGap`]). Both clip schemas are read: `Clip.2` and
 /// `Clip.1`.
 ///
 /// A document from another writer is read where it uses only what the
@@ -705,7 +707,8 @@ impl core::error::Error for Shape {}
 /// nothing is dropped. A member OpenTimelineIO's schema lets a document
 /// leave out reads as OpenTimelineIO 0.17.0's reader reads it — a name as
 /// empty, `enabled` as `true`, a marker's color as GREEN, a gap's range as
-/// no length — or, where that is no value and the timeline needs one (the
+/// no length, read only on a fade's gap side as any gap of no length is —
+/// or, where that is no value and the timeline needs one (the
 /// timeline's `global_start_time`, a clip's `source_range`), is refused by
 /// name.
 ///
@@ -898,9 +901,17 @@ pub enum Feature {
   /// A gap of some length after a track's last clip — any gap of a track
   /// with no clip among them. OpenTimelineIO counts it in the track's
   /// duration, and so in the timeline's, while the timeline's track ends
-  /// with its last clip. A gap of no length there carries nothing and is
-  /// read: the export writes one after a fade-out at a track's end.
+  /// with its last clip.
   TrailingGap,
+  /// A gap of no length anywhere but where the export writes one — on a
+  /// fade's gap side, before a fade-in or after a fade-out, beside no other
+  /// gap — a gap of a track with no clip among them included.
+  /// OpenTimelineIO counts it all the same: its range is the item's
+  /// duration (`item.cpp` 43–46 in 0.17.0), and its rate joins the track's
+  /// sum, which starts at rate 1 and takes the higher of two rates
+  /// (`track.cpp` 111–148; `rationalTime.h` 283–294), while the timeline
+  /// has nothing there.
+  StandaloneGap,
   /// A fade not between a gap and the clip it fades, or playing anything
   /// of the gap's side.
   Fade,
@@ -945,6 +956,9 @@ impl fmt::Display for Feature {
       Self::TrailingGap => {
         f.write_str("a gap of some length after the track's last clip, where its track has ended")
       }
+      Self::StandaloneGap => f.write_str(
+        "a gap of no length where no fade stands beside it, which OpenTimelineIO still counts",
+      ),
       Self::Fade => {
         f.write_str("a fade not between a gap and the clip it fades, or playing the gap's side")
       }
