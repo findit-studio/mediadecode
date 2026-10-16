@@ -32,6 +32,10 @@ use crate::{
   frame::Frame,
 };
 
+mod open;
+
+pub use open::VideoDecoderOpen;
+
 /// Hardware-accelerated video decoder.
 ///
 /// Hardware-only — there is no software fallback inside this crate. If
@@ -123,15 +127,15 @@ pub struct VideoDecoder {
   /// `AVCodecContext` this decoder opens — including the ones a probe
   /// advance opens later, which is why it is held rather than passed.
   ///
-  /// `None` for a standalone decoder: [`Self::open`] and its siblings
-  /// are handed codec parameters and no stream, so there is no ruler
-  /// to declare. The stream decoder one tier up has one.
+  /// `None` where the opener declares none: an untimed request
+  /// ([`VideoDecoderOpen::timebase`]). The stream decoder one tier up
+  /// always declares one.
   pkt_timebase: Option<mediadecode::Timebase>,
   /// How the decoder decodes ([`crate::DecoderOptions`]), written into
   /// every `AVCodecContext` this decoder opens — including the ones a
-  /// probe advance opens later, which is why it is held. What a
-  /// `*_with_options` constructor names — the stream decoder one tier up
-  /// passes its own — and libavcodec's defaults for every other.
+  /// probe advance opens later, which is why it is held. The request's
+  /// ([`VideoDecoderOpen::options`]), or the stream decoder's one tier
+  /// up.
   options: crate::DecoderOptions,
   /// `true` once [`Self::send_eof`] has been accepted, until
   /// [`Self::flush`].
@@ -486,34 +490,43 @@ impl VideoDecoder {
   /// been sent yet, so the caller can retry or fall back to software
   /// with the original `parameters` directly.
   pub fn open(parameters: codec::Parameters) -> Result<Self> {
-    Self::open_with_frame_limits(parameters, crate::limits::DecoderLimits::default())
+    Self::open_from(VideoDecoderOpen::new(), parameters)
   }
 
-  /// [`Self::open`], with how the decoder decodes named: the
-  /// [`DecoderOptions`](crate::DecoderOptions) — libavcodec's
-  /// `skip_frame`, `skip_loop_filter` and `skip_idct` — written into
-  /// every `AVCodecContext` this decoder opens, including the ones a
-  /// later hardware probe advance opens.
+  /// Opens the decoder `request` names over `parameters`. This is the one
+  /// road the eight `open*` constructors take.
   ///
-  /// Every constructor here has such a sibling, its name and arguments
-  /// the constructor's with `_with_options` and `options` appended; the
-  /// ones without take libavcodec's defaults.
+  /// With no backend pinned it probes the platform's backends in order,
+  /// as [`Self::open`] describes. With one pinned it opens that one alone,
+  /// as [`Self::open_with`] describes. The request's limits, packet
+  /// timebase and [`DecoderOptions`](crate::DecoderOptions) are written
+  /// into every `AVCodecContext` the decoder opens, including the ones a
+  /// later probe advance opens.
   ///
-  /// **Not the road for a picture cadence**: a packet the demuxer marks
+  /// **The options are not the road for a picture cadence.** A packet the
+  /// demuxer marks
   /// [`DISPOSABLE`](mediadecode::packet::PacketFlags::DISPOSABLE) is
-  /// dropped before it is sent. On a temporally scalable HEVC stream
+  /// dropped before it is sent. On a temporally scalable HEVC stream,
   /// [`Discard::NonReference`](crate::Discard::NonReference) also skips
-  /// pictures a higher sub-layer references, which the mark never does —
-  /// see [`crate::options`].
-  pub fn open_with_options(
-    parameters: codec::Parameters,
-    options: crate::DecoderOptions,
-  ) -> Result<Self> {
-    Self::open_with_frame_limits_with_options(
-      parameters,
-      crate::limits::DecoderLimits::default(),
-      options,
-    )
+  /// pictures a higher sub-layer references, which the mark never does.
+  /// See [`crate::options`].
+  pub fn open_from(request: VideoDecoderOpen, parameters: codec::Parameters) -> Result<Self> {
+    match request.backend() {
+      None => Self::open_probing(
+        parameters,
+        request.limits(),
+        request.options(),
+        request.timebase(),
+        backend::probe_order(),
+      ),
+      Some(backend) => Self::open_with_limits_timed_in(
+        parameters,
+        backend,
+        request.limits(),
+        request.options(),
+        request.timebase(),
+      ),
+    }
   }
 
   /// [`Self::open`], with the stream's packet timebase declared.
@@ -530,25 +543,9 @@ impl VideoDecoder {
     parameters: codec::Parameters,
     timebase: mediadecode::Timebase,
   ) -> Result<Self> {
-    Self::open_with_frame_limits_timed(
+    Self::open_from(
+      VideoDecoderOpen::new().with_timebase(Some(timebase)),
       parameters,
-      crate::limits::DecoderLimits::default(),
-      timebase,
-    )
-  }
-
-  /// [`Self::open_timed`], with the decoder's options named — see
-  /// [`Self::open_with_options`].
-  pub fn open_timed_with_options(
-    parameters: codec::Parameters,
-    timebase: mediadecode::Timebase,
-    options: crate::DecoderOptions,
-  ) -> Result<Self> {
-    Self::open_with_frame_limits_timed_with_options(
-      parameters,
-      crate::limits::DecoderLimits::default(),
-      timebase,
-      options,
     )
   }
 
@@ -569,18 +566,7 @@ impl VideoDecoder {
     // cue's PTS, a packet-duration fallback — is unavailable. Reach
     // for [`Self::open_with_frame_limits_timed`] when the stream's
     // ruler is known, which is nearly always.
-    Self::open_with_frame_limits_timed_in(parameters, limits, crate::DecoderOptions::new(), None)
-  }
-
-  /// [`Self::open_with_frame_limits`], with the decoder's options named
-  /// — see [`Self::open_with_options`].
-  pub fn open_with_frame_limits_with_options(
-    parameters: codec::Parameters,
-    limits: crate::limits::DecoderLimits,
-    options: crate::DecoderOptions,
-  ) -> Result<Self> {
-    // Explicitly untimed — see [`Self::open_with_frame_limits`].
-    Self::open_with_frame_limits_timed_in(parameters, limits, options, None)
+    Self::open_from(VideoDecoderOpen::new().with_limits(limits), parameters)
   }
 
   /// [`Self::open_with_frame_limits`], with the stream's packet
@@ -590,42 +576,16 @@ impl VideoDecoder {
     limits: crate::limits::DecoderLimits,
     timebase: mediadecode::Timebase,
   ) -> Result<Self> {
-    Self::open_with_frame_limits_timed_in(
+    Self::open_from(
+      VideoDecoderOpen::new()
+        .with_limits(limits)
+        .with_timebase(Some(timebase)),
       parameters,
-      limits,
-      crate::DecoderOptions::new(),
-      Some(timebase),
     )
   }
 
-  /// [`Self::open_with_frame_limits_timed`], with the decoder's options
-  /// named — see [`Self::open_with_options`].
-  pub fn open_with_frame_limits_timed_with_options(
-    parameters: codec::Parameters,
-    limits: crate::limits::DecoderLimits,
-    timebase: mediadecode::Timebase,
-    options: crate::DecoderOptions,
-  ) -> Result<Self> {
-    Self::open_with_frame_limits_timed_in(parameters, limits, options, Some(timebase))
-  }
-
-  fn open_with_frame_limits_timed_in(
-    parameters: codec::Parameters,
-    limits: crate::limits::DecoderLimits,
-    options: crate::DecoderOptions,
-    pkt_timebase: Option<mediadecode::Timebase>,
-  ) -> Result<Self> {
-    Self::open_probing(
-      parameters,
-      limits,
-      options,
-      pkt_timebase,
-      backend::probe_order(),
-    )
-  }
-
-  /// The probe itself, across `order` — [`backend::probe_order`] for every
-  /// public constructor.
+  /// The probe itself, across `order` — [`backend::probe_order`] for
+  /// [`Self::open_from`] and the stream decoder.
   ///
   /// Taken as an argument so a lane can stand on a platform with no
   /// hardware backend at all, which no machine that runs the suite is: an
@@ -754,22 +714,9 @@ impl VideoDecoder {
   /// for retrying with another hardware backend or falling back to a
   /// software decoder of their choice (e.g. `ffmpeg::decoder::Video`).
   pub fn open_with(parameters: codec::Parameters, backend: Backend) -> Result<Self> {
-    Self::open_with_limits(parameters, backend, crate::limits::DecoderLimits::default())
-  }
-
-  /// [`Self::open_with`], with the decoder's options named: written into
-  /// the `AVCodecContext` this call opens — see
-  /// [`Self::open_with_options`].
-  pub fn open_with_with_options(
-    parameters: codec::Parameters,
-    backend: Backend,
-    options: crate::DecoderOptions,
-  ) -> Result<Self> {
-    Self::open_with_limits_with_options(
+    Self::open_from(
+      VideoDecoderOpen::new().with_backend(Some(backend)),
       parameters,
-      backend,
-      crate::limits::DecoderLimits::default(),
-      options,
     )
   }
 
@@ -780,28 +727,11 @@ impl VideoDecoder {
     backend: Backend,
     timebase: mediadecode::Timebase,
   ) -> Result<Self> {
-    Self::open_with_limits_timed(
+    Self::open_from(
+      VideoDecoderOpen::new()
+        .with_backend(Some(backend))
+        .with_timebase(Some(timebase)),
       parameters,
-      backend,
-      crate::limits::DecoderLimits::default(),
-      timebase,
-    )
-  }
-
-  /// [`Self::open_with_timed`], with the decoder's options named — see
-  /// [`Self::open_with_options`].
-  pub fn open_with_timed_with_options(
-    parameters: codec::Parameters,
-    backend: Backend,
-    timebase: mediadecode::Timebase,
-    options: crate::DecoderOptions,
-  ) -> Result<Self> {
-    Self::open_with_limits_timed_with_options(
-      parameters,
-      backend,
-      crate::limits::DecoderLimits::default(),
-      timebase,
-      options,
     )
   }
 
@@ -819,25 +749,12 @@ impl VideoDecoder {
     limits: crate::limits::DecoderLimits,
   ) -> Result<Self> {
     // Explicitly untimed — see [`Self::open_with_frame_limits`].
-    Self::open_with_limits_timed_in(
+    Self::open_from(
+      VideoDecoderOpen::new()
+        .with_backend(Some(backend))
+        .with_limits(limits),
       parameters,
-      backend,
-      limits,
-      crate::DecoderOptions::new(),
-      None,
     )
-  }
-
-  /// [`Self::open_with_limits`], with the decoder's options named — see
-  /// [`Self::open_with_options`].
-  pub fn open_with_limits_with_options(
-    parameters: codec::Parameters,
-    backend: Backend,
-    limits: crate::limits::DecoderLimits,
-    options: crate::DecoderOptions,
-  ) -> Result<Self> {
-    // Explicitly untimed — see [`Self::open_with_frame_limits`].
-    Self::open_with_limits_timed_in(parameters, backend, limits, options, None)
   }
 
   /// [`Self::open_with_limits`], with the stream's packet timebase
@@ -848,29 +765,17 @@ impl VideoDecoder {
     limits: crate::limits::DecoderLimits,
     timebase: mediadecode::Timebase,
   ) -> Result<Self> {
-    Self::open_with_limits_timed_in(
+    Self::open_from(
+      VideoDecoderOpen::new()
+        .with_backend(Some(backend))
+        .with_limits(limits)
+        .with_timebase(Some(timebase)),
       parameters,
-      backend,
-      limits,
-      crate::DecoderOptions::new(),
-      Some(timebase),
     )
   }
 
-  /// [`Self::open_with_limits_timed`], with the decoder's options named
-  /// — see [`Self::open_with_options`].
-  pub fn open_with_limits_timed_with_options(
-    parameters: codec::Parameters,
-    backend: Backend,
-    limits: crate::limits::DecoderLimits,
-    timebase: mediadecode::Timebase,
-    options: crate::DecoderOptions,
-  ) -> Result<Self> {
-    Self::open_with_limits_timed_in(parameters, backend, limits, options, Some(timebase))
-  }
-
-  /// The road onto one pinned backend: every `open_with*` constructor's,
-  /// and the stream decoder's.
+  /// The road onto one pinned backend: [`Self::open_from`]'s with a
+  /// backend pinned, and the stream decoder's.
   pub(crate) fn open_with_limits_timed_in(
     parameters: codec::Parameters,
     backend: Backend,
@@ -1016,9 +921,10 @@ impl VideoDecoder {
     self.state.backend
   }
 
-  /// How this decoder decodes: the options it was opened with, written
-  /// into every `AVCodecContext` it opens — libavcodec's defaults for a
-  /// constructor without `_with_options`.
+  /// How this decoder decodes: the options it was opened with
+  /// ([`VideoDecoderOpen::options`]), written into every `AVCodecContext`
+  /// it opens. They are libavcodec's defaults for the eight `open*`
+  /// constructors.
   pub const fn options(&self) -> crate::DecoderOptions {
     self.options
   }

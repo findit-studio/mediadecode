@@ -267,20 +267,20 @@ fn delivered(mut decoder: mediadecode_ffmpeg::VideoDecoder, packets: &[VideoPack
   pictures
 }
 
-/// The standalone decoder takes the options too: opened with
-/// `skip_frame` = `noref`, on the probing road and on the pinned one, it
-/// keeps exactly the pictures of the packets the bitstream leaves
-/// unmarked.
+/// The standalone decoder takes the options too. Opened with
+/// `skip_frame` = `noref` through its open request, on the probe and on a
+/// pinned backend, it keeps exactly the pictures of the packets the
+/// bitstream leaves unmarked.
 ///
 /// The standalone decoder is hardware-only, and FFmpeg asks VideoToolbox
 /// for a hardware H.264 decoder (`libavcodec/videotoolbox.c` 848–854 in
-/// 9.0.1), which on the machines this was written on fails every picture
-/// of the Sony clips. So the clip is `01_pandas_muted.mp4`, Main 4:2:0
-/// with non-reference B pictures, and the target an Apple one.
+/// 9.0.1). On the machines this was written on, that decoder fails every
+/// picture of the Sony clips. So the clip is `01_pandas_muted.mp4`, Main
+/// 4:2:0 with non-reference B pictures, and the target is an Apple one.
 #[cfg(target_vendor = "apple")]
 #[test]
 fn the_standalone_decoder_skipping_non_references_keeps_the_admitted_pictures() {
-  use mediadecode_ffmpeg::{Backend, VideoDecoder};
+  use mediadecode_ffmpeg::{Backend, VideoDecoder, VideoDecoderOpen};
 
   let Some(path) = fixture("01_pandas_muted.mp4") else {
     return;
@@ -298,27 +298,26 @@ fn the_standalone_decoder_skipping_non_references_keeps_the_admitted_pictures() 
   };
   assert_eq!(admitted.len(), 155, "145 of the 300 marked");
 
-  // libavcodec's defaults decode every picture: the clip is one the
-  // decoder decodes.
+  // libavcodec's defaults decode every picture: the decoder can decode
+  // this clip.
   let whole = delivered(
     VideoDecoder::open_timed(parameters.clone(), timebase).expect("open the decoder"),
     &packets,
   );
   assert_eq!(whole.len(), 300);
 
-  let skipping = DecoderOptions::new().with_skip_frame(Discard::NonReference);
-  let probing = VideoDecoder::open_timed_with_options(parameters.clone(), timebase, skipping)
-    .expect("open the probing decoder");
-  assert_eq!(probing.options(), skipping);
-  assert_eq!(delivered(probing, &packets), admitted, "the probing road");
-  let pinned = VideoDecoder::open_with_limits_timed_with_options(
+  let skipping = VideoDecoderOpen::new()
+    .with_timebase(Some(timebase))
+    .with_options(DecoderOptions::new().with_skip_frame(Discard::NonReference));
+  let probing =
+    VideoDecoder::open_from(skipping, parameters.clone()).expect("open the probing decoder");
+  assert_eq!(probing.options(), skipping.options());
+  assert_eq!(delivered(probing, &packets), admitted, "the probe");
+  let pinned = VideoDecoder::open_from(
+    skipping.with_backend(Some(Backend::VideoToolbox)),
     parameters,
-    Backend::VideoToolbox,
-    DecoderLimits::default(),
-    timebase,
-    skipping,
   )
   .expect("open the pinned decoder");
-  assert_eq!(pinned.options(), skipping);
-  assert_eq!(delivered(pinned, &packets), admitted, "the pinned road");
+  assert_eq!(pinned.options(), skipping.options());
+  assert_eq!(delivered(pinned, &packets), admitted, "the pinned backend");
 }

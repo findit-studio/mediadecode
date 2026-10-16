@@ -347,13 +347,14 @@ for end-to-end demuxer-driven runs that cover all three streams.
   `FfmpegVideoStreamDecoder::open_with_options` / `open_as_with_options`
   — libavcodec's `skip_frame`, `skip_loop_filter` and `skip_idct`, each
   a `Discard` (FFmpeg's `AVDiscard`: `none` … `all`), written into every
-  video codec context the session opens; the standalone `VideoDecoder`
-  takes them through a `_with_options` sibling of each constructor
-  (`open_with_options`, `open_with_limits_timed_with_options`, …). They
-  are decode behaviour, not limits: `DecoderLimits` stays what a decoder
-  may spend. `skip_frame` is not the road for a picture cadence — see the
-  demuxer's `DISPOSABLE` mark below — and on a temporally scalable HEVC
-  stream `noref` also skips pictures a higher sub-layer references.
+  video codec context the session opens. The standalone `VideoDecoder`
+  takes them through `VideoDecoder::open_from` and its request,
+  `VideoDecoderOpen`, which also names the probe or a pinned backend, the
+  limits and the packet timebase. They are decode behaviour, not limits:
+  `DecoderLimits` stays what a decoder may spend. `skip_frame` is not the
+  road for a picture cadence — see the demuxer's `DISPOSABLE` mark below
+  — and on a temporally scalable HEVC stream `noref` also skips pictures
+  a higher sub-layer references.
 - **Demuxer**: `FfmpegDemuxer` — `mediadecode`'s `Demuxer` over
   `libavformat`, opened from a path (`open`) or from any
   `Read + Seek` byte source through a custom `AVIOContext`

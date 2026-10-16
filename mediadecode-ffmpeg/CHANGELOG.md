@@ -39,16 +39,19 @@ The backend-agnostic core it adapts has its own log at
   libavcodec's defaults. On a temporally scalable HEVC stream
   `Discard::NonReference` also skips pictures a higher sub-layer
   references, which the bitstream's `DISPOSABLE` never marks.
-- **The standalone `VideoDecoder` takes them too**: each of its eight
-  constructors has a `_with_options` sibling, its arguments with
-  `options` appended — `open_with_options`, `open_timed_with_options`,
-  `open_with_frame_limits_with_options`,
-  `open_with_frame_limits_timed_with_options` on the probing road, and
-  `open_with_with_options`, `open_with_timed_with_options`,
-  `open_with_limits_with_options`, `open_with_limits_timed_with_options`
-  on a pinned backend — that writes them into every codec context the
-  decoder opens, a later probe advance's included; `options()` reads
-  them back. The constructors without keep libavcodec's defaults.
+- **`VideoDecoderOpen` and `VideoDecoder::open_from`: one road for the
+  standalone decoder.** The request holds every optional of the
+  decoder's construction: the probe or one pinned backend, the limits,
+  the packet timebase, and the `DecoderOptions`. Each has a getter, a
+  consuming `with_*` and an in-place `set_*`; the request is
+  `#[non_exhaustive]`.
+  - `open_from(request, parameters)` opens it, writing the options into
+    every codec context the decoder opens, a later probe advance's
+    included. `VideoDecoder::options()` reads them back.
+  - The eight `open*` constructors keep their signatures and behaviour.
+    Each now opens the request its arguments spell, with libavcodec's
+    options.
+  - A later optional joins the request, not the constructor list.
 
 ## [0.19.0] - 2026-10-16
 

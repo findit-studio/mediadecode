@@ -118,7 +118,7 @@ pub type FfmpegVideoStreamDecoder = video::CarrierVideoStreamDecoder<View>;
 pub type FfmpegOwnedVideoStreamDecoder = video::CarrierVideoStreamDecoder<Owned>;
 pub use audio::{AudioDecodeError, CarrierAudioStreamDecoder};
 pub use backend::Backend;
-pub use decoder::VideoDecoder;
+pub use decoder::{VideoDecoder, VideoDecoderOpen};
 pub use demuxer::{
   CarrierDemuxer, ChapterAlloc, ChapterTimebaseInvalid, ChapterTitleAlloc,
   ChapterTitleBudgetExhausted, ChapterTitleTooLong, DemuxError, ProbeBudgetExhausted,
