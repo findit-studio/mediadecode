@@ -3978,5 +3978,34 @@ fn _assert_send() {
   check::<VideoDecoder>();
 }
 
+/// The three skips `ctx` holds — `skip_frame`, `skip_loop_filter` and
+/// `skip_idct` — as the raw integers they are, for the laws that prove a
+/// decoder's options reached its context.
+///
+/// # Safety
+///
+/// `ctx` is a live `AVCodecContext` for the call.
+#[cfg(test)]
+pub(crate) unsafe fn skips_of(ctx: *const ffmpeg_next::ffi::AVCodecContext) -> (i32, i32, i32) {
+  // SAFETY: the caller's contract; the three are `AVDiscard` fields, read
+  // as integers so no enum is formed from FFmpeg memory.
+  unsafe {
+    (
+      ptr::addr_of!((*ctx).skip_frame).cast::<i32>().read(),
+      ptr::addr_of!((*ctx).skip_loop_filter).cast::<i32>().read(),
+      ptr::addr_of!((*ctx).skip_idct).cast::<i32>().read(),
+    )
+  }
+}
+
+#[cfg(test)]
+impl VideoDecoder {
+  /// [`skips_of`] this decoder's active context.
+  pub(crate) fn skips_for_test(&self) -> (i32, i32, i32) {
+    // SAFETY: `state.inner` owns a live, opened context for this borrow.
+    unsafe { skips_of(self.state.inner.as_ptr()) }
+  }
+}
+
 #[cfg(test)]
 mod tests;

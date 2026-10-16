@@ -22,7 +22,7 @@ use mediadecode::{
 use mediadecode_ffmpeg::{
   DecodePath, DecoderLimits, DecoderOptions, Discard, FfmpegOwnedDemuxer as FfmpegDemuxer,
   FfmpegOwnedVideoStreamDecoder as FfmpegVideoStreamDecoder, OwnedVideoFrame as VideoFrame,
-  OwnedVideoPacket as VideoPacket, empty_owned_video_frame,
+  OwnedVideoPacket as VideoPacket, VideoStreamDecoderOpen, empty_owned_video_frame,
 };
 
 const FIXTURES_ENV: &str = "VIDEO_FIXTURES";
@@ -137,30 +137,30 @@ fn picture_hash(frame: &VideoFrame) -> u64 {
   hasher.finish()
 }
 
-/// Every picture a software decoder delivers for `packets`, by pts, each
-/// as its [`picture_hash`] — the decoder opened with `options`.
-fn decode(
+/// Every picture the session opened by `request` delivers for `packets`,
+/// by pts, each as `read` makes of it.
+fn session_pictures<T>(
+  request: VideoStreamDecoderOpen,
   timebase: Timebase,
   parameters: &ffmpeg_next::codec::Parameters,
   packets: &[&VideoPacket],
-  options: DecoderOptions,
-) -> BTreeMap<i64, u64> {
-  let mut decoder = FfmpegVideoStreamDecoder::open_as_with_options(
+  mut read: impl FnMut(&VideoFrame) -> T,
+) -> BTreeMap<i64, T> {
+  let mut decoder = FfmpegVideoStreamDecoder::open_from(
+    request,
     parameters.clone(),
     timebase,
     DecoderLimits::default(),
-    DecodePath::Software,
-    options,
   )
-  .expect("open a software decoder");
-  assert_eq!(decoder.options(), options);
+  .expect("open the session");
+  assert_eq!(decoder.options(), request.options());
   let mut frame = empty_owned_video_frame();
   let mut pictures = BTreeMap::new();
   let mut take = |decoder: &mut FfmpegVideoStreamDecoder, frame: &mut VideoFrame| {
     while let Received::Produced = decoder.receive_frame(frame).expect("decode cleanly") {
       let pts = frame.pts().expect("a picture's pts").pts();
       assert!(
-        pictures.insert(pts, picture_hash(frame)).is_none(),
+        pictures.insert(pts, read(frame)).is_none(),
         "two pictures at {pts}"
       );
     }
@@ -179,6 +179,25 @@ fn decode(
   }
   take(&mut decoder, &mut frame);
   pictures
+}
+
+/// Every picture a software session delivers for `packets`, by pts, each
+/// as its [`picture_hash`]: the session opened with `options`.
+fn decode(
+  timebase: Timebase,
+  parameters: &ffmpeg_next::codec::Parameters,
+  packets: &[&VideoPacket],
+  options: DecoderOptions,
+) -> BTreeMap<i64, u64> {
+  session_pictures(
+    VideoStreamDecoderOpen::new()
+      .with_path(DecodePath::Software)
+      .with_options(options),
+    timebase,
+    parameters,
+    packets,
+    picture_hash,
+  )
 }
 
 #[test]
@@ -320,4 +339,55 @@ fn the_standalone_decoder_skipping_non_references_keeps_the_admitted_pictures() 
   .expect("open the pinned decoder");
   assert_eq!(pinned.options(), skipping.options());
   assert_eq!(delivered(pinned, &packets), admitted, "the pinned backend");
+}
+
+/// The stream decoder takes the options on every path. Opened through
+/// its request with `skip_frame` = `noref`, it keeps exactly the pictures
+/// of the packets the bitstream leaves unmarked, on `Auto`, `AnyHardware`,
+/// the VideoToolbox pin, and software.
+///
+/// The target is an Apple one, on `01_pandas_muted.mp4`, for the reason
+/// the standalone law above gives.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn the_session_skipping_non_references_keeps_the_admitted_pictures_on_every_path() {
+  use mediadecode_ffmpeg::Backend;
+
+  let Some(path) = fixture("01_pandas_muted.mp4") else {
+    return;
+  };
+  let (timebase, parameters, packets) = video_packets(&path);
+  let every: Vec<&VideoPacket> = packets.iter().collect();
+  let admitted: Vec<i64> = {
+    let mut pts: Vec<i64> = packets
+      .iter()
+      .filter(|packet| !disposable(packet))
+      .map(|packet| packet.pts().expect("a packet's pts").pts())
+      .collect();
+    pts.sort_unstable();
+    pts
+  };
+  assert_eq!(admitted.len(), 155, "145 of the 300 marked");
+  let skipping = DecoderOptions::new().with_skip_frame(Discard::NonReference);
+  for path in [
+    DecodePath::Auto,
+    DecodePath::AnyHardware,
+    DecodePath::Hardware(Backend::VideoToolbox),
+    DecodePath::Software,
+  ] {
+    let pictures = session_pictures(
+      VideoStreamDecoderOpen::new()
+        .with_path(path)
+        .with_options(skipping),
+      timebase,
+      &parameters,
+      &every,
+      |_| (),
+    );
+    assert_eq!(
+      pictures.keys().copied().collect::<Vec<_>>(),
+      admitted,
+      "{path:?}"
+    );
+  }
 }

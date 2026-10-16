@@ -83,6 +83,10 @@ use crate::{
   frame::alloc_av_video_frame,
 };
 
+mod open;
+
+pub use open::VideoStreamDecoderOpen;
+
 /// Which decode path a video session takes — the choice
 /// [`CarrierVideoStreamDecoder::open_as`] is given.
 ///
@@ -471,7 +475,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     time_base: Timebase,
     limits: DecoderLimits,
   ) -> Result<Self, Error> {
-    Self::open_as_impl(parameters, time_base, limits, DecodePath::Auto)
+    Self::open_from_impl(VideoStreamDecoderOpen::new(), parameters, time_base, limits)
   }
 
   /// [`Self::open_impl`], with the decode path chosen rather than
@@ -482,44 +486,42 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     limits: DecoderLimits,
     path: DecodePath,
   ) -> Result<Self, Error> {
-    Self::open_as_with_options_impl(
+    Self::open_from_impl(
+      VideoStreamDecoderOpen::new().with_path(path),
       parameters,
       time_base,
       limits,
-      path,
-      crate::DecoderOptions::new(),
     )
   }
 
-  /// [`Self::open_as_impl`], with how the session decodes named.
-  pub(crate) fn open_as_with_options_impl(
+  /// The session `request` names: the one road `open` and `open_as`
+  /// take.
+  pub(crate) fn open_from_impl(
+    request: VideoStreamDecoderOpen,
     parameters: Parameters,
     time_base: Timebase,
     limits: DecoderLimits,
-    path: DecodePath,
-    options: crate::DecoderOptions,
   ) -> Result<Self, Error> {
-    Self::open_as_in(
+    Self::open_from_in(
+      request,
       parameters,
       time_base,
       limits,
-      path,
-      options,
       crate::backend::probe_order(),
     )
   }
 
-  /// [`Self::open_as_impl`] with the probe order named — the platform's
-  /// own for every public constructor, and an empty one for the lane
-  /// that stands on a platform with no hardware backend at all.
-  pub(crate) fn open_as_in(
+  /// [`Self::open_from_impl`] with the probe order named — the
+  /// platform's own for every public constructor, and an empty one for
+  /// the lane that stands on a platform with no hardware backend at all.
+  pub(crate) fn open_from_in(
+    request: VideoStreamDecoderOpen,
     parameters: Parameters,
     time_base: Timebase,
     limits: DecoderLimits,
-    path: DecodePath,
-    options: crate::DecoderOptions,
     order: &[Backend],
   ) -> Result<Self, Error> {
+    let (path, options) = (request.path(), request.options());
     // ffmpeg-next's `Parameters` carries an optional `owner: Rc<dyn Any>`
     // (when constructed from `stream.parameters()` it points back at
     // the demuxer's `AVStream`). Upstream marks the type `Send`
@@ -1111,11 +1113,28 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
     time_base: Timebase,
     path: DecodePath,
   ) -> Result<Self, Error> {
+    Self::from_hw_inner_for_test_from(
+      hw,
+      VideoStreamDecoderOpen::new().with_path(path),
+      parameters,
+      time_base,
+    )
+  }
+
+  /// [`Self::from_hw_inner_for_test_as`], with the session's whole open
+  /// request named: the seam through which a probe-era fallback's
+  /// options are proved.
+  pub(crate) fn from_hw_inner_for_test_from(
+    hw: Box<dyn HwInner>,
+    request: VideoStreamDecoderOpen,
+    parameters: Parameters,
+    time_base: Timebase,
+  ) -> Result<Self, Error> {
     let limits = DecoderLimits::default();
     let owned_parameters = try_clone_parameters(&parameters, limits.max_codec_parameter_bytes())?;
     Ok(Self {
       state: DecodeState::Hw(hw),
-      path,
+      path: request.path(),
       parameters: owned_parameters,
       hw_scratch: Frame::empty()?,
       sw_scratch: alloc_av_video_frame()?,
@@ -1123,7 +1142,7 @@ impl<C: crate::FfmpegCarrier + crate::CarrierOps> CarrierVideoStreamDecoder<C> {
       eof_sent: false,
       time_base,
       limits,
-      options: crate::DecoderOptions::new(),
+      options: request.options(),
       scratch_pending: false,
       _carrier: core::marker::PhantomData,
     })
@@ -1612,49 +1631,41 @@ macro_rules! video_lane_face {
         Self::open_as_impl(parameters, time_base, limits, path)
       }
 
-      /// [`open`](Self::open), with how the session decodes named: the
-      /// [`DecoderOptions`](crate::DecoderOptions) — libavcodec's
-      /// `skip_frame`, `skip_loop_filter` and `skip_idct` — written into
-      /// every video `AVCodecContext` the session opens: each hardware
-      /// candidate the probe builds, the software decoder, and a fallback's.
+      /// Opens the session `request` names for `parameters`. This is the
+      /// one road [`open`](Self::open) and [`open_as`](Self::open_as)
+      /// take.
       ///
-      /// [`open_as_with_options`](Self::open_as_with_options)`(..,
-      /// DecodePath::Auto, options)`.
+      /// The request's [`DecodePath`] chooses the decoder, as
+      /// [`open_as`](Self::open_as) describes. Its
+      /// [`DecoderOptions`](crate::DecoderOptions) (libavcodec's
+      /// `skip_frame`, `skip_loop_filter` and `skip_idct`) are written
+      /// into every video `AVCodecContext` the session opens: each
+      /// hardware candidate the probe builds, the software decoder, and a
+      /// fallback's.
       ///
-      /// **Not the road for a picture cadence**: a packet the demuxer
-      /// marks [`DISPOSABLE`](mediadecode::packet::PacketFlags::DISPOSABLE)
-      /// is dropped before it is sent. On a temporally scalable HEVC
-      /// stream [`Discard::NonReference`](crate::Discard::NonReference)
-      /// also skips pictures a higher sub-layer references, which the mark
-      /// never does — see [`crate::options`].
-      pub fn open_with_options(
-        parameters: Parameters,
-        time_base: Timebase,
-        limits: DecoderLimits,
-        options: crate::DecoderOptions,
-      ) -> Result<Self, Error> {
-        Self::open_as_with_options_impl(parameters, time_base, limits, DecodePath::Auto, options)
-      }
-
-      /// [`open_as`](Self::open_as), with how the session decodes named —
-      /// see [`open_with_options`](Self::open_with_options).
+      /// **The options are not the road for a picture cadence.** A packet
+      /// the demuxer marks
+      /// [`DISPOSABLE`](mediadecode::packet::PacketFlags::DISPOSABLE) is
+      /// dropped before it is sent. On a temporally scalable HEVC stream,
+      /// [`Discard::NonReference`](crate::Discard::NonReference) also
+      /// skips pictures a higher sub-layer references, which the mark
+      /// never does. See [`crate::options`].
       ///
       /// # Errors
       ///
-      /// As [`open_as`](Self::open_as).
-      pub fn open_as_with_options(
+      /// As [`open_as`](Self::open_as), on the request's path.
+      pub fn open_from(
+        request: VideoStreamDecoderOpen,
         parameters: Parameters,
         time_base: Timebase,
         limits: DecoderLimits,
-        path: DecodePath,
-        options: crate::DecoderOptions,
       ) -> Result<Self, Error> {
-        Self::open_as_with_options_impl(parameters, time_base, limits, path, options)
+        Self::open_from_impl(request, parameters, time_base, limits)
       }
 
-      /// How this session decodes: the options it was opened with,
-      /// libavcodec's defaults for [`open`](Self::open) and
-      /// [`open_as`](Self::open_as).
+      /// How this session decodes: the options it was opened with
+      /// ([`VideoStreamDecoderOpen::options`]), libavcodec's defaults for
+      /// [`open`](Self::open) and [`open_as`](Self::open_as).
       pub const fn options(&self) -> crate::DecoderOptions {
         self.options
       }

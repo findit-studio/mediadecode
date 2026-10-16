@@ -29,29 +29,30 @@ The backend-agnostic core it adapts has its own log at
 
 ### Added
 
-- **`DecoderOptions`, how a video session decodes**: libavcodec's
+- **`DecoderOptions`, how a video decoder decodes**: libavcodec's
   `skip_frame`, `skip_loop_filter` and `skip_idct`, each a `Discard`
   (both re-exported from `mediaio-ffmpeg` 0.19.1, with
-  `ParseDiscardError`), taken by `FfmpegVideoStreamDecoder::open_with_options`
-  and `open_as_with_options` and written into every video codec context
-  the session opens — each hardware candidate, the software decoder and a
-  fallback's — and read back by `options()`. `open` and `open_as` keep
-  libavcodec's defaults. On a temporally scalable HEVC stream
-  `Discard::NonReference` also skips pictures a higher sub-layer
-  references, which the bitstream's `DISPOSABLE` never marks.
-- **`VideoDecoderOpen` and `VideoDecoder::open_from`: one road for the
-  standalone decoder.** The request holds every optional of the
-  decoder's construction: the probe or one pinned backend, the limits,
-  the packet timebase, and the `DecoderOptions`. Each has a getter, a
-  consuming `with_*` and an in-place `set_*`; the request is
-  `#[non_exhaustive]`.
-  - `open_from(request, parameters)` opens it, writing the options into
-    every codec context the decoder opens, a later probe advance's
-    included. `VideoDecoder::options()` reads them back.
-  - The eight `open*` constructors keep their signatures and behaviour.
-    Each now opens the request its arguments spell, with libavcodec's
-    options.
-  - A later optional joins the request, not the constructor list.
+  `ParseDiscardError`). They are written into every video codec context
+  a decoder opens — each hardware candidate, a probe advance, the
+  software decoder and a fallback's — and read back by `options()`. On a
+  temporally scalable HEVC stream `Discard::NonReference` also skips
+  pictures a higher sub-layer references, which the bitstream's
+  `DISPOSABLE` never marks.
+- **One open road per video decoder, through an open request.** Each
+  request holds every optional of its decoder's construction, with a
+  getter, a consuming `with_*` and an in-place `set_*`, and is
+  `#[non_exhaustive]`: a later optional joins the request, not the
+  constructor list.
+  - The stream decoder: `VideoStreamDecoderOpen` (the `DecodePath`, and
+    the `DecoderOptions`) and
+    `FfmpegVideoStreamDecoder::open_from(request, parameters, time_base,
+    limits)`. `open` and `open_as` keep their signatures and behaviour,
+    each opening the request its arguments spell.
+  - The standalone decoder: `VideoDecoderOpen` (the probe or one pinned
+    backend, the limits, the packet timebase, and the `DecoderOptions`)
+    and `VideoDecoder::open_from(request, parameters)`. The eight `open*`
+    constructors keep their signatures and behaviour, each opening the
+    request its arguments spell.
 
 ## [0.19.0] - 2026-10-16
 

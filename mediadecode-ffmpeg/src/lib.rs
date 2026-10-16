@@ -130,7 +130,7 @@ pub use error::{
 };
 pub use image::{CarrierImageDecoder, Corrupt, CorruptSource, ImageDecodeError, InputTooLarge};
 pub use subtitle::{CarrierSubtitleStreamDecoder, SubtitleDecodeError};
-pub use video::{CarrierVideoStreamDecoder, DecodePath, VideoDecodeError};
+pub use video::{CarrierVideoStreamDecoder, DecodePath, VideoDecodeError, VideoStreamDecoderOpen};
 
 /// Asserts a submission was taken, and answers nothing.
 ///
