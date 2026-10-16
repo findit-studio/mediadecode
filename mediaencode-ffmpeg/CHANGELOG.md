@@ -27,6 +27,28 @@ The family releases in lockstep.
   them — by the muxer's own name (`FfmpegMuxRefusal`, through
   `MuxError::Backend`), handing the packet back; faults name their stage
   (`MuxFault`), a sink's panic included.
+- **The packet-rule table.** Every rule libavformat applies on the
+  packet path in Matroska, WebM and MP4, at FFmpeg 9.0.1, is refused by
+  name before libavformat is handed the packet, reported at open, or
+  passed through. Refused, the packet handed back untouched: a negative
+  duration; MP4's duration, decode gap and composition offset past
+  `i32::MAX` ticks, the gap judged in `i128`; a reordering stream's
+  packet without a presentation time; a time before the earliest the
+  container writes; an MP4 `mov_text` cue out of order; an unmarked key
+  frame of a codec of key frames alone (`FfmpegMuxRefusal`); and a
+  packet's bytes or side data the container would refuse or write
+  otherwise — an empty packet it drops, AAC in ADTS headers, partial PCM,
+  AV1 OBUs or WavPack blocks that do not parse, MP4 skip-samples below
+  nothing, Matroska's new FLAC STREAMINFO of another length, a ProRes
+  packet off its atom, a WebVTT cue that would not read back, an AC-3
+  frame MP4 would drop or refuse (`FfmpegMuxRefusal::Payload`,
+  `PayloadRule`). A track whose configuration the container needs and
+  the track lacks is refused at open (`MuxOpenError::ConfigurationMissing`).
+  Reported at open (`Uncarried::Rewritten`, `Rewrite`): length prefixes
+  for Annex B, filtered OBUs, MP4's joined E-AC-3, `mov_text` cue ends and
+  joined TTML paragraphs, sync from the bitstream, durations the container
+  does not keep, Matroska's stripped WavPack headers. The automatic
+  bitstream filters are off in these containers.
 - The encoders arrive in the following releases.
 
 ## [0.19.0] - 2026-10-16

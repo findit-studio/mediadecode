@@ -38,6 +38,16 @@ parameters are rebuilt from, an attachment track with its one file.
   and an equal decode time on a strict container's video or audio
   stream — MP4 — (`FfmpegMuxRefusal::RepeatedDts`) are refused by the
   muxer's own. Every refusal hands the packet back untouched.
+- **Every rule libavformat applies to a packet is accounted for** in
+  Matroska, WebM and MP4, at FFmpeg 9.0.1: libavformat interleaves
+  packets before its muxer sees them, so a muxer's own refusal comes
+  after taking the packet, often while writing another. Each rule is
+  refused by name first — the container's timing rules
+  (`FfmpegMuxRefusal`) and its rules over a packet's bytes and side data
+  (`FfmpegMuxRefusal::Payload`, `PayloadRule`) — or reported at open,
+  where the container writes a track's packets in a form of its own
+  (`Uncarried::Rewritten`, `Rewrite`), or written and read back as handed
+  over. No automatic bitstream filter rewrites a packet first.
 - **Packets are copied into libavformat**, never lent, and a sink that
   panics is caught before C sees the unwind, named in the muxer's fault,
   and never called again.
