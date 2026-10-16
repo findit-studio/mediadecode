@@ -8,6 +8,21 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 The family — `mediadecode`, `mediadecode-ffmpeg`, `mediadecode-webcodecs`,
 `mediaencode`, `mediaencode-ffmpeg` and `mediaio` — releases in lockstep.
 
+## [0.19.1] - unreleased
+
+### Added
+
+- **`options`: how a decoder decodes, beside what it may spend.**
+  `DecoderOptions` carries libavcodec's three `AVDiscard` settings —
+  `skip_frame`, `skip_loop_filter` and `skip_idct` — each a `Discard`,
+  FFmpeg's seven values (`Nothing`, `Default`, `NonReference`,
+  `Bidirectional`, `NonIntra`, `NonKey`, `All`), written and read as
+  FFmpeg's option constants (`none` … `all`, any case on reading;
+  `ParseDiscardError` for any other name). The defaults are libavcodec's.
+  `DecoderLimits` stays what a decoder may spend; these are decode
+  behaviour, and `mediadecode-ffmpeg` writes them into every video
+  `AVCodecContext` a session opens.
+
 ## [0.19.0] - 2026-10-16
 
 ### Added

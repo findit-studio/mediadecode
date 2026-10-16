@@ -2135,8 +2135,13 @@ fn the_packet_timebase_reaches_the_codec_context() {
   };
   let limits = crate::limits::DecoderLimits::default();
   let read_back = |declared: Option<mediadecode::Timebase>| {
-    let (ctx, _state) =
-      build_codec_context(&parameters(), limits, declared).expect("a context is allocated");
+    let (ctx, _state) = build_codec_context(
+      &parameters(),
+      limits,
+      crate::DecoderOptions::new(),
+      declared,
+    )
+    .expect("a context is allocated");
     // SAFETY: `ctx` owns a live `AVCodecContext` for this borrow, and
     // `pkt_timebase` is a public `AVRational` field.
     let raw = unsafe { (*ctx.as_ptr()).pkt_timebase };
@@ -2162,6 +2167,57 @@ fn the_packet_timebase_reaches_the_codec_context() {
   assert_eq!(read_back(Some(unset)), (0, 1));
 }
 
+/// **The decoder's options reach the codec context.** Each of the three
+/// `AVDiscard` settings is written as the value it names, every value of
+/// each; and the defaults leave libavcodec's own, `AVDISCARD_DEFAULT`.
+#[test]
+fn every_discard_value_reaches_the_codec_context() {
+  ffmpeg_next::init().expect("ffmpeg init");
+
+  let mut parameters = ffmpeg_next::codec::Parameters::new();
+  // SAFETY: `parameters` owns a live, zeroed `AVCodecParameters`; both
+  // fields written are plain scalars.
+  unsafe {
+    let raw = parameters.as_mut_ptr();
+    (*raw).codec_type = ffmpeg_next::ffi::AVMediaType::AVMEDIA_TYPE_VIDEO;
+    (*raw).codec_id = ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_H264;
+  }
+  let read_back = |options: crate::DecoderOptions| {
+    let (ctx, state) = build_codec_context(
+      &parameters,
+      crate::limits::DecoderLimits::default(),
+      options,
+      None,
+    )
+    .expect("a context is allocated");
+    // SAFETY: `ctx` owns a live `AVCodecContext` for this borrow; the
+    // three are `AVDiscard` fields, read as the integers they are.
+    let raw = unsafe {
+      let ctx = ctx.as_ptr();
+      (
+        ptr::addr_of!((*ctx).skip_frame).cast::<i32>().read(),
+        ptr::addr_of!((*ctx).skip_loop_filter).cast::<i32>().read(),
+        ptr::addr_of!((*ctx).skip_idct).cast::<i32>().read(),
+      )
+    };
+    drop(ctx);
+    drop(state);
+    raw
+  };
+  assert_eq!(read_back(crate::DecoderOptions::new()), (0, 0, 0));
+  for value in crate::Discard::ALL {
+    let av = value.as_av() as i32;
+    let one = crate::DecoderOptions::new();
+    assert_eq!(read_back(one.with_skip_frame(value)), (av, 0, 0), "{value}");
+    assert_eq!(
+      read_back(one.with_skip_loop_filter(value)),
+      (0, av, 0),
+      "{value}"
+    );
+    assert_eq!(read_back(one.with_skip_idct(value)), (0, 0, av), "{value}");
+  }
+}
+
 /// **A context this crate builds decodes on one thread.** Nothing here
 /// sets `thread_count` or `thread_type`, and FFmpeg's own default is one
 /// thread, so the allocator judge and the `get_format` callback run on
@@ -2180,9 +2236,13 @@ fn a_context_this_crate_builds_decodes_on_one_thread() {
     (*raw).codec_type = ffmpeg_next::ffi::AVMediaType::AVMEDIA_TYPE_VIDEO;
     (*raw).codec_id = ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_H264;
   }
-  let (ctx, state) =
-    build_codec_context(&parameters, crate::limits::DecoderLimits::default(), None)
-      .expect("a context is allocated");
+  let (ctx, state) = build_codec_context(
+    &parameters,
+    crate::limits::DecoderLimits::default(),
+    crate::DecoderOptions::new(),
+    None,
+  )
+  .expect("a context is allocated");
   // SAFETY: `ctx` owns a live `AVCodecContext` for this borrow, and
   // `thread_count` is a plain integer field.
   let threads = unsafe { (*ctx.as_ptr()).thread_count };

@@ -127,6 +127,12 @@ pub struct VideoDecoder {
   /// are handed codec parameters and no stream, so there is no ruler
   /// to declare. The stream decoder one tier up has one.
   pkt_timebase: Option<mediadecode::Timebase>,
+  /// How the decoder decodes ([`crate::DecoderOptions`]), written into
+  /// every `AVCodecContext` this decoder opens — including the ones a
+  /// probe advance opens later, which is why it is held. libavcodec's
+  /// defaults for every public constructor here; the stream decoder one
+  /// tier up passes its own.
+  options: crate::DecoderOptions,
   /// `true` once [`Self::send_eof`] has been accepted, until
   /// [`Self::flush`].
   ///
@@ -367,6 +373,7 @@ type BuildCandidate = fn(
   Codec,
   Backend,
   crate::limits::DecoderLimits,
+  crate::DecoderOptions,
   Option<mediadecode::Timebase>,
 ) -> Result<DecoderState>;
 
@@ -538,7 +545,13 @@ impl VideoDecoder {
     limits: crate::limits::DecoderLimits,
     pkt_timebase: Option<mediadecode::Timebase>,
   ) -> Result<Self> {
-    Self::open_probing(parameters, limits, pkt_timebase, backend::probe_order())
+    Self::open_probing(
+      parameters,
+      limits,
+      crate::DecoderOptions::new(),
+      pkt_timebase,
+      backend::probe_order(),
+    )
   }
 
   /// The probe itself, across `order` — [`backend::probe_order`] for every
@@ -551,6 +564,7 @@ impl VideoDecoder {
   pub(crate) fn open_probing(
     parameters: codec::Parameters,
     limits: crate::limits::DecoderLimits,
+    options: crate::DecoderOptions,
     pkt_timebase: Option<mediadecode::Timebase>,
     order: &[Backend],
   ) -> Result<Self> {
@@ -571,7 +585,14 @@ impl VideoDecoder {
             continue;
           }
         };
-      match Self::build_state(cloned_for_build, codec, backend, limits, pkt_timebase) {
+      match Self::build_state(
+        cloned_for_build,
+        codec,
+        backend,
+        limits,
+        options,
+        pkt_timebase,
+      ) {
         Ok(state) => {
           tracing::info!(?backend, "hwdecode: opened video decoder (probing)");
           let remaining = order[(i + 1)..].to_vec();
@@ -637,6 +658,7 @@ impl VideoDecoder {
             max_probe_pending_bytes: DEFAULT_MAX_PROBE_PENDING_BYTES,
             frame_limits: limits,
             pkt_timebase,
+            options,
             eof_sent: false,
             scaled_output: crate::vtscale::ScaledOutput::new(),
           });
@@ -694,7 +716,13 @@ impl VideoDecoder {
     limits: crate::limits::DecoderLimits,
   ) -> Result<Self> {
     // Explicitly untimed — see [`Self::open_with_frame_limits`].
-    Self::open_with_limits_timed_in(parameters, backend, limits, None)
+    Self::open_with_limits_timed_in(
+      parameters,
+      backend,
+      limits,
+      crate::DecoderOptions::new(),
+      None,
+    )
   }
 
   /// [`Self::open_with_limits`], with the stream's packet timebase
@@ -705,17 +733,26 @@ impl VideoDecoder {
     limits: crate::limits::DecoderLimits,
     timebase: mediadecode::Timebase,
   ) -> Result<Self> {
-    Self::open_with_limits_timed_in(parameters, backend, limits, Some(timebase))
+    Self::open_with_limits_timed_in(
+      parameters,
+      backend,
+      limits,
+      crate::DecoderOptions::new(),
+      Some(timebase),
+    )
   }
 
-  fn open_with_limits_timed_in(
+  /// [`Self::open_with_limits`] with the decoder's options named — the
+  /// stream decoder's road onto one pinned backend.
+  pub(crate) fn open_with_limits_timed_in(
     parameters: codec::Parameters,
     backend: Backend,
     limits: crate::limits::DecoderLimits,
+    options: crate::DecoderOptions,
     pkt_timebase: Option<mediadecode::Timebase>,
   ) -> Result<Self> {
     let codec = find_decoder(&parameters)?;
-    let state = Self::build_state(parameters, codec, backend, limits, pkt_timebase)?;
+    let state = Self::build_state(parameters, codec, backend, limits, options, pkt_timebase)?;
     Ok(Self {
       state,
       hw_frame: alloc_av_frame().map_err(Error::Ffmpeg)?,
@@ -724,6 +761,7 @@ impl VideoDecoder {
       max_probe_pending_bytes: DEFAULT_MAX_PROBE_PENDING_BYTES,
       frame_limits: limits,
       pkt_timebase,
+      options,
       eof_sent: false,
       scaled_output: crate::vtscale::ScaledOutput::new(),
     })
@@ -775,7 +813,14 @@ impl VideoDecoder {
       .first()
       .copied()
       .unwrap_or(Backend::VideoToolbox);
-    let state = Self::software_state_for_test(parameters, codec, backend, limits, None)?;
+    let state = Self::software_state_for_test(
+      parameters,
+      codec,
+      backend,
+      limits,
+      crate::DecoderOptions::new(),
+      None,
+    )?;
     Ok(Self {
       state,
       hw_frame: alloc_av_frame().map_err(Error::Ffmpeg)?,
@@ -784,6 +829,7 @@ impl VideoDecoder {
       max_probe_pending_bytes: DEFAULT_MAX_PROBE_PENDING_BYTES,
       frame_limits: limits,
       pkt_timebase: None,
+      options: crate::DecoderOptions::new(),
       eof_sent: false,
       scaled_output: crate::vtscale::ScaledOutput::new(),
     })
@@ -800,9 +846,10 @@ impl VideoDecoder {
     codec: Codec,
     backend: Backend,
     limits: crate::limits::DecoderLimits,
+    options: crate::DecoderOptions,
     pkt_timebase: Option<mediadecode::Timebase>,
   ) -> Result<DecoderState> {
-    let (ctx, callback_state) = build_codec_context(&parameters, limits, pkt_timebase)?;
+    let (ctx, callback_state) = build_codec_context(&parameters, limits, options, pkt_timebase)?;
     let opened = ctx.decoder().open_as(codec).map_err(Error::Ffmpeg)?;
     ensure_video_codec_type(&opened)?;
     Ok(DecoderState {
@@ -1847,6 +1894,7 @@ impl VideoDecoder {
         codec,
         next_backend,
         self.frame_limits,
+        self.options,
         self.pkt_timebase,
       ) {
         Ok(s) => s,
@@ -2037,12 +2085,13 @@ impl VideoDecoder {
     codec: Codec,
     backend: Backend,
     limits: crate::limits::DecoderLimits,
+    options: crate::DecoderOptions,
     pkt_timebase: Option<mediadecode::Timebase>,
   ) -> Result<DecoderState> {
     // Use our checked allocator instead of Context::from_parameters, which
     // does not null-check avcodec_alloc_context3 and would feed a null
     // AVCodecContext into FFmpeg under OOM.
-    let (mut ctx, state) = build_codec_context(&parameters, limits, pkt_timebase)?;
+    let (mut ctx, state) = build_codec_context(&parameters, limits, options, pkt_timebase)?;
     let av_type = backend.av_hwdevice_type();
 
     // Verify the codec advertises this hwaccel **with the exact HW pix_fmt
@@ -2840,6 +2889,7 @@ impl Drop for InstalledCallbackState {
 pub(crate) fn build_codec_context(
   parameters: &codec::Parameters,
   limits: crate::limits::DecoderLimits,
+  options: crate::DecoderOptions,
   pkt_timebase: Option<mediadecode::Timebase>,
 ) -> Result<(Context, InstalledCallbackState)> {
   ensure_parameters_non_null(parameters)?;
@@ -2999,6 +3049,22 @@ pub(crate) fn build_codec_context(
       (*ctx_ptr).pkt_timebase =
         ffmpeg_next::Rational::new(timebase.num(), timebase.den().get()).into();
     }
+  }
+
+  // **How the decoder decodes** ([`crate::DecoderOptions`]): the three
+  // `AVDiscard` settings, "decoding: Set by user" (`libavcodec/avcodec.h`
+  // 1653–1667 in 9.0.1), written into every context this function builds.
+  // A road that takes no options passes the defaults, which are the very
+  // values `avcodec_alloc_context3` has just written, so its context is
+  // unchanged.
+  //
+  // SAFETY: `ctx_ptr` is the non-null context allocated above; the three
+  // are public fields of type `AVDiscard`, and each value written is one
+  // of its named discriminants.
+  unsafe {
+    (*ctx_ptr).skip_frame = options.skip_frame().as_av();
+    (*ctx_ptr).skip_loop_filter = options.skip_loop_filter().as_av();
+    (*ctx_ptr).skip_idct = options.skip_idct().as_av();
   }
 
   // **`max_samples` is deliberately left alone.**

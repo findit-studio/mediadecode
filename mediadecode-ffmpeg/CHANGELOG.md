@@ -9,6 +9,37 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 The backend-agnostic core it adapts has its own log at
 [`mediadecode/CHANGELOG.md`](../mediadecode/CHANGELOG.md).
 
+## [0.19.1] - unreleased
+
+### Changed
+
+- **The demuxer marks `PacketFlags::DISPOSABLE` from the bitstream.**
+  Beside the container's own mark (MP4's `sdtp`), a video packet of an
+  H.264 or HEVC track is marked where its NAL units prove that nothing
+  references its picture (`mediadecode::nal`): a non-reference H.264
+  picture, or an HEVC sub-layer non-reference picture at the highest
+  temporal sub-layer, with nothing beside it but SEI, access unit
+  delimiters and filler data — in any container, and read in the
+  configuration an `AV_PKT_DATA_NEW_EXTRADATA` entry brings. A packet
+  known to be corrupt is not marked. **More packets are marked
+  DISPOSABLE on H.264 and HEVC, so a consumer that drops them decodes
+  fewer pictures**: two in three of a Sony XAVC original, which carries
+  no `sdtp` and was marked nowhere before. The flag's contract is
+  unchanged — absent means unknown.
+
+### Added
+
+- **`DecoderOptions`, how a video session decodes**: libavcodec's
+  `skip_frame`, `skip_loop_filter` and `skip_idct`, each a `Discard`
+  (both re-exported from `mediaio-ffmpeg` 0.19.1, with
+  `ParseDiscardError`), taken by `FfmpegVideoStreamDecoder::open_with_options`
+  and `open_as_with_options` and written into every video codec context
+  the session opens — each hardware candidate, the software decoder and a
+  fallback's — and read back by `options()`. `open` and `open_as` keep
+  libavcodec's defaults. On a temporally scalable HEVC stream
+  `Discard::NonReference` also skips pictures a higher sub-layer
+  references, which the bitstream's `DISPOSABLE` never marks.
+
 ## [0.19.0] - 2026-10-16
 
 The FFmpeg crossings move to the new base crate,

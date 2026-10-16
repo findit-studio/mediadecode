@@ -16,9 +16,10 @@ bitflags! {
   ///   `AV_PKT_FLAG_CORRUPT`).
   /// - `DISCARD = 0b100` — packet should be skipped during reconstruction
   ///   (FFmpeg `AV_PKT_FLAG_DISCARD`).
-  /// - `DISPOSABLE = 0b1_0000` — the demuxer states that nothing
-  ///   references this packet (FFmpeg `AV_PKT_FLAG_DISPOSABLE`). Absent
-  ///   means unknown, never "referenced".
+  /// - `DISPOSABLE = 0b1_0000` — nothing references this picture: the
+  ///   container's mark or the bitstream's (FFmpeg
+  ///   `AV_PKT_FLAG_DISPOSABLE`, and [`nal`](crate::nal)). Absent means
+  ///   unknown, never "referenced".
   ///
   /// # Text form
   ///
@@ -40,16 +41,27 @@ bitflags! {
     const CORRUPT = 0b010;
     /// Demuxer hint: skip this packet.
     const DISCARD = 0b100;
-    /// Demuxer hint: nothing references this packet, so dropping it
-    /// loses its own picture and no other (FFmpeg
-    /// `AV_PKT_FLAG_DISPOSABLE`). In libavformat 9.0.1 one demuxer sets
+    /// Nothing references this picture: the container's mark or the
+    /// bitstream's. Dropping the packet loses its own picture and no
+    /// other (FFmpeg `AV_PKT_FLAG_DISPOSABLE`).
+    ///
+    /// **The container's mark.** In libavformat 9.0.1 one demuxer sets
     /// it: MP4/MOV, from `sdtp`, for a sample nothing depends on
-    /// (`libavformat/mov.c` 11719–11723). Matroska's own discardable bit
+    /// (`libavformat/mov.c` 11720–11723). Matroska's own discardable bit
     /// is NOT mapped (`libavformat/matroskadec.c` reads the block's
-    /// keyframe bit alone, 4319–4320), so a Matroska packet reads absent.
+    /// keyframe bit alone, 4319–4320).
+    ///
+    /// **The bitstream's.** For H.264 and HEVC, a demuxer also marks
+    /// every packet whose NAL units prove it — a non-reference picture,
+    /// or an HEVC sub-layer non-reference picture at the highest temporal
+    /// sub-layer, with nothing beside it a later picture needs
+    /// ([`nal::NalStream`](crate::nal::NalStream)) — in any container. No
+    /// other codec's bitstream is read.
+    ///
     /// The bit's ABSENCE means unknown, never "referenced": that is the
-    /// rule a consumer must honour, because most containers never mark
-    /// it, and a packet without it may be disposable all the same.
+    /// rule a consumer must honour, because a container may never mark
+    /// it, a codec's bitstream may not be read, and a packet without it
+    /// may be disposable all the same.
     const DISPOSABLE = 0b1_0000;
   }
 }

@@ -343,13 +343,30 @@ for end-to-end demuxer-driven runs that cover all three streams.
   picture's own error; when to stop trusting a hardware session is the
   caller's policy. `is_hardware()` / `is_software()` stay the live
   reading of where a session is.
+- **Decoder options**: `DecoderOptions` and
+  `FfmpegVideoStreamDecoder::open_with_options` / `open_as_with_options`
+  — libavcodec's `skip_frame`, `skip_loop_filter` and `skip_idct`, each
+  a `Discard` (FFmpeg's `AVDiscard`: `none` … `all`), written into every
+  video codec context the session opens. They are decode behaviour, not
+  limits: `DecoderLimits` stays what a decoder may spend. `skip_frame` is
+  not the road for a picture cadence — see the demuxer's `DISPOSABLE`
+  mark below — and on a temporally scalable HEVC stream `noref` also
+  skips pictures a higher sub-layer references.
 - **Demuxer**: `FfmpegDemuxer` — `mediadecode`'s `Demuxer` over
   `libavformat`, opened from a path (`open`) or from any
   `Read + Seek` byte source through a custom `AVIOContext`
   (`open_reader`). Plus `DemuxError`, and `format()` → `ContainerFormat`
   — libavformat's own identification of the bytes (`"matroska,webm"`,
   `"mov,mp4,m4a,3gp,3g2,mj2"`), read from the container rather than
-  guessed from a path.
+  guessed from a path. A video packet is marked
+  `PacketFlags::DISPOSABLE` where the container says nothing
+  references it (MP4's `sdtp`) **or** where its H.264 or HEVC NAL units
+  prove it (`mediadecode::nal`) — a non-reference picture, or an HEVC
+  sub-layer non-reference picture at the highest temporal sub-layer,
+  with nothing beside it a later picture needs — in any container. A
+  Sony XAVC original, which carries no `sdtp`, has two pictures in three
+  marked; a consumer that keeps only reference pictures drops them
+  before they are decoded.
 - **Codec identity**: `CodecId` — the number FFmpeg keys on, with
   `name()` / `long_name()` reading libavcodec's own descriptor table
   for the word beside it (`"h264"`, `"aac"`), so a stored track row can

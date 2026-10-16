@@ -2474,8 +2474,13 @@ struct ScriptedHw {
 impl ScriptedHw {
   fn new(parameters: &Parameters) -> Self {
     Self {
-      sw: super::open_sw_decoder(parameters, DecoderLimits::default(), None)
-        .expect("FFmpeg's own decoder for the stream"),
+      sw: super::open_sw_decoder(
+        parameters,
+        DecoderLimits::default(),
+        crate::DecoderOptions::new(),
+        None,
+      )
+      .expect("FFmpeg's own decoder for the stream"),
       failing_sends: Vec::new(),
       failing_pictures: Vec::new(),
       failing_eof: None,
@@ -2969,6 +2974,7 @@ fn any_hardware_refuses_at_open_on_a_platform_with_no_hardware_backend() {
     tb,
     DecoderLimits::default(),
     DecodePath::AnyHardware,
+    crate::DecoderOptions::new(),
     &[],
   ) {
     Ok(dec) => panic!(
@@ -2999,6 +3005,7 @@ fn any_hardware_refuses_at_open_on_a_platform_with_no_hardware_backend() {
     tb,
     DecoderLimits::default(),
     DecodePath::Auto,
+    crate::DecoderOptions::new(),
     &[],
   )
   .expect("Auto opens software where no hardware backend exists");
