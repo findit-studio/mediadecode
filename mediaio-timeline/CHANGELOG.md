@@ -75,7 +75,10 @@ Its versions are its own: they do not move with `mediadecode`'s.
   reader takes exactly the documents the export reproduces. A marker's
   color is one of the eleven names exactly, in capitals; a `color` on an
   item and an `enabled` on a transition, which OpenTimelineIO 0.17.0 keeps
-  as dynamic fields, are refused by name, `null` and `true` among them.
+  as dynamic fields, are refused by name, `null` and `true` among them. The
+  item `color` is OpenTimelineIO 0.18's item color, which 0.18 writes on
+  every item: a document 0.18 writes is refused by name until it is
+  modelled.
 - The export writes markers as `Marker.2`, refusing one no ruler holds
   whole as `Spot::Marker`.
 - `validate_json` holds every marker to `Marker.2`, with the

@@ -345,7 +345,9 @@ read only where the timeline keeps it, or where OpenTimelineIO holds it as
 it holds its absence: a `color` on an item and an `enabled` on a
 transition, which OpenTimelineIO 0.17.0 keeps as fields of their own, are
 refused by name, and a marker's color is one of the eleven names exactly,
-in capitals. Last, the export writes the timeline read, and every value it
+in capitals. OpenTimelineIO 0.18 writes a `color` on every item — its item
+color, `null` where unset — so a document 0.18 writes is refused by name
+until the item color is modelled. Last, the export writes the timeline read, and every value it
 writes must be the one the document states at the same path, as
 OpenTimelineIO holds it — a string byte for byte, a time's numbers as
 doubles — or the read is refused as inexact there, naming both: the reader

@@ -908,9 +908,11 @@ pub enum Feature {
   Trim,
   /// The stack or a gap disabled.
   Disabled,
-  /// A `color` on an item, `null` among them: a newer reader's member,
-  /// which OpenTimelineIO 0.17.0 keeps as a dynamic field and the timeline
-  /// would drop.
+  /// A `color` on an item, `null` among them: OpenTimelineIO 0.18's item
+  /// color (`item.cpp` 181 in 0.18.1), not modelled yet. OpenTimelineIO
+  /// 0.17.0 keeps it as a dynamic field, which the timeline would drop, and
+  /// 0.18 writes one on every item, so a document 0.18 writes is refused
+  /// here until the item color is modelled.
   ItemColor,
   /// A marker color outside OpenTimelineIO's eleven.
   MarkerColor(Utf8Bytes),
@@ -967,7 +969,9 @@ impl fmt::Display for Feature {
       ),
       Self::Trim => f.write_str("a trim, which the timeline keeps on clips alone"),
       Self::Disabled => f.write_str("disabled, which the timeline keeps on tracks and clips alone"),
-      Self::ItemColor => f.write_str("a color on an item, which the timeline does not keep"),
+      Self::ItemColor => f.write_str(
+        "a color on an item, null among them: OpenTimelineIO 0.18's item color, not modelled yet",
+      ),
       Self::MarkerColor(color) => write!(
         f,
         "the marker color {color}, outside OpenTimelineIO's eleven"
