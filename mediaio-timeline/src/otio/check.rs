@@ -40,6 +40,7 @@
 //! | `V2d.1` | `x`, `y`: numbers | — | `deserialization.cpp:609–615` | as read |
 //! | `Box2d.1` | `min`, `max`: `V2d.1` | — | `deserialization.cpp:616–623` | as read |
 //! | `Color.1` | `name`: a string; `r`, `g`, `b`, `a`: numbers | — | 0.18.1 `deserialization.cpp:591–598`; 0.17.0 keeps it as an unknown schema | as 0.18.1 reads it |
+//! | every object a reader registers | — | `OTIO_REF_ID`: a string, nonempty ones unique in the document | `deserialization.cpp:624–642`, `669–672` | as read (below) |
 //!
 //! The check requires exactly the keys of every reader of its target —
 //! releases 0.15 to 0.18.1 and `main` (`00c22fa`) for
@@ -79,6 +80,18 @@
 //! references, a generator's parameters — is never a schema's object: a
 //! member named `OTIO_SCHEMA` there is refused by name.
 //!
+//! A reader registers each object it makes by its `OTIO_REF_ID`: it fetches
+//! the key, where present, as a string, and refuses a nonempty one an
+//! object it made before carries (`deserialization.cpp:624–642`, `669–672`
+//! in 0.17.0). It makes an object of every dictionary carrying
+//! `OTIO_SCHEMA` but the value schemas it decodes before (`:575–623`), whose
+//! `OTIO_REF_ID` it neither reads nor registers: `RationalTime.1`,
+//! `TimeRange.1`, `TimeTransform.1` and `SerializableObjectRef.1` for every
+//! reader, `V2d.1` and `Box2d.1` from 0.15, `Color.1` from 0.18. The check
+//! holds every other schema's id so, in the order a reader makes them — each
+//! dictionary's contents before itself — and, for a schema a reader of the
+//! target decodes as a value and another as an object, as the latter does.
+//!
 //! A schema whose rules the check does not know is refused by name, at its
 //! `OTIO_SCHEMA`. In one case that is stricter than a reader: a name no
 //! reader registers becomes an `UnknownSchema` (`typeRegistry.cpp:260–290`
@@ -99,7 +112,7 @@
 //! typed: a newer reader's `color` on an item or `enabled` on a transition
 //! or an effect.
 
-use std::format;
+use std::{collections::BTreeSet, format};
 
 use smol_bytes::{Utf8Bytes, format_utf8bytes};
 
@@ -128,7 +141,62 @@ const EFFECTS: &[&str] = &[
 ];
 
 pub(crate) fn timeline(root: &Value, target: OtioTarget) -> Result<(), Shape> {
-  timeline_at(root, "$", target)
+  timeline_at(root, "$", target)?;
+  reference_ids(root, "$", target, &mut BTreeSet::new())
+}
+
+/// Whether every reader of `target` decodes `name` as a value schema, whose
+/// `OTIO_REF_ID` it neither reads nor registers: the branches of
+/// `SerializableObject::Reader::_decode` before its last
+/// (`deserialization.cpp:575–623` in 0.17.0; 0.12's and 0.14.1's are the
+/// first four, and `Color.1` is one only from 0.18, after the oldest reader
+/// of either target).
+fn value_schema(name: &str, target: OtioTarget) -> bool {
+  match name {
+    "RationalTime.1" | "TimeRange.1" | "TimeTransform.1" | "SerializableObjectRef.1" => true,
+    "V2d.1" | "Box2d.1" => target == OtioTarget::V0_15Plus,
+    _ => false,
+  }
+}
+
+/// Every object a reader registers carries its `OTIO_REF_ID`, where it has
+/// one, as a string, and no nonempty one an object registered before it
+/// carries (`deserialization.cpp:624–642`, `669–672` in 0.17.0). A reader
+/// makes an object of each dictionary carrying `OTIO_SCHEMA` of no value
+/// schema ([`value_schema`]), wherever it sits, as its parser closes the
+/// dictionary — after everything the dictionary holds — so the walk takes
+/// each dictionary's contents before the dictionary, and names the id a
+/// reader would refuse.
+fn reference_ids<'a>(
+  value: &'a Value,
+  path: &str,
+  target: OtioTarget,
+  seen: &mut BTreeSet<&'a str>,
+) -> Result<(), Shape> {
+  match value {
+    Value::Array(entries) => {
+      for (index, entry) in entries.iter().enumerate() {
+        reference_ids(entry, &format!("{path}[{index}]"), target, seen)?;
+      }
+    }
+    Value::Object(members) => {
+      for (key, entry) in members {
+        reference_ids(entry, &format!("{path}.{key}"), target, seen)?;
+      }
+      let registered = member(members, "OTIO_SCHEMA")
+        .and_then(Value::as_str)
+        .is_some_and(|name| !value_schema(name, target));
+      if registered && let Some(id) = member(members, "OTIO_REF_ID") {
+        let at = format!("{path}.OTIO_REF_ID");
+        let id = string_value(id, &at)?;
+        if !id.is_empty() && !seen.insert(id) {
+          return Err(shape(&at, "an id no other object carries"));
+        }
+      }
+    }
+    _ => {}
+  }
+  Ok(())
 }
 
 fn timeline_at(value: &Value, path: &str, target: OtioTarget) -> Result<(), Shape> {

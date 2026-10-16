@@ -785,6 +785,107 @@ fn a_missing_reference_reads_a_references_members_alone() {
 }
 
 #[test]
+fn an_objects_reference_id_is_a_string_no_other_object_carries() {
+  // Round 6: a reader fetches an object's `OTIO_REF_ID` as a string and
+  // refuses a nonempty one an object it made before carries
+  // (`deserialization.cpp` 624–642, 669–672 in 0.17.0); it makes the
+  // stack before the timeline that holds it.
+  let id = |root: &mut Value, path: &str, value: Value| set(root, path, "OTIO_REF_ID", value);
+  for target in [OtioTarget::V0_15Plus, OtioTarget::Legacy] {
+    assert_eq!(
+      checked_edited(target, |root| id(root, "", number("7"))),
+      Err((String::from("$.OTIO_REF_ID"), "a string")),
+      "{target:?}: an integer id",
+    );
+    assert_eq!(
+      checked_edited(target, |root| id(root, A, Value::Null)),
+      Err((checked_path(&format!("{A}.OTIO_REF_ID")), "a string")),
+      "{target:?}: a null id",
+    );
+    assert_eq!(
+      checked_edited(target, |root| {
+        id(&mut *root, "", text("one"));
+        id(root, "tracks", text("one"));
+      }),
+      Err((
+        String::from("$.OTIO_REF_ID"),
+        "an id no other object carries"
+      )),
+      "{target:?}: the timeline's id, the stack's before it",
+    );
+    assert_eq!(
+      checked_edited(target, |root| {
+        for path in ["", "tracks", TRACK, A] {
+          id(&mut *root, path, text(""));
+        }
+      }),
+      Ok(()),
+      "{target:?}: empty ids, none registered",
+    );
+    assert_eq!(
+      checked_edited(target, |root| {
+        for (path, name) in [("", "t"), ("tracks", "s"), (TRACK, "k"), (A, "a"), (B, "b")] {
+          id(&mut *root, path, text(name));
+        }
+      }),
+      Ok(()),
+      "{target:?}: unique ids",
+    );
+    // A value schema's id is neither read nor registered.
+    assert_eq!(
+      checked_edited(target, |root| {
+        id(&mut *root, "global_start_time", number("7"));
+        id(&mut *root, &format!("{A}.source_range"), text("one"));
+        id(root, "", text("one"));
+      }),
+      Ok(()),
+      "{target:?}: ids on a RationalTime.1 and a TimeRange.1",
+    );
+  }
+  // A schema a reader of the target decodes as a value and another as an
+  // object is held as the object: `Color.1` before 0.18, `V2d.1` before
+  // 0.15.
+  let colored = |root: &mut Value| {
+    set(
+      root,
+      "metadata",
+      "studio",
+      object(vec![
+        ("OTIO_SCHEMA", text("Color.1")),
+        ("name", text("red")),
+        ("r", number("1")),
+        ("g", number("0")),
+        ("b", number("0")),
+        ("a", number("1")),
+        ("OTIO_REF_ID", number("7")),
+      ]),
+    )
+  };
+  assert_eq!(
+    checked_edited(OtioTarget::V0_15Plus, colored),
+    Err((String::from("$.metadata.studio.OTIO_REF_ID"), "a string")),
+  );
+  let point = |root: &mut Value| {
+    set(
+      root,
+      "metadata",
+      "studio",
+      object(vec![
+        ("OTIO_SCHEMA", text("V2d.1")),
+        ("x", number("0")),
+        ("y", number("0")),
+        ("OTIO_REF_ID", number("7")),
+      ]),
+    )
+  };
+  assert_eq!(checked_edited(OtioTarget::V0_15Plus, point), Ok(()));
+  assert_eq!(
+    checked_edited(OtioTarget::Legacy, point),
+    Err((String::from("$.metadata.studio.OTIO_REF_ID"), "a string")),
+  );
+}
+
+#[test]
 fn notes_that_are_not_pairs_of_strings_each_key_once_are_refused_by_name() {
   let notes = |root: &mut Value, value: Value| {
     set(root, "metadata.mediaio", "metadata", value);

@@ -296,12 +296,13 @@ export is held to: the crate's own strict JSON reader, then OpenTimelineIO's
 schema shape — exactly the keys the target's readers require (audited
 against each schema's `read_from`, per target: `Track.1` needs its `kind`,
 a `Marker.2` its `marked_range`, and a reader before 0.15 a `Clip.1`'s
-`media_reference`), the types of the keys the export writes, media
+`media_reference`), the type each reader reads every member as, media
 references, the target's clip schema, every marker a `Marker.2`, every
 transition between two items. It walks every dictionary, metadata
 included: OpenTimelineIO decodes one carrying `OTIO_SCHEMA` as an object
 of that schema wherever it sits, so the check holds it to that schema's
-rules, and refuses by name a schema whose rules it does not know. No
+rules, and refuses by name a schema whose rules it does not know; an
+object's `OTIO_REF_ID` must be a string no other object carries. No
 Python and no OpenTimelineIO install; CI runs it on the goldens.
 
 ### Reading back

@@ -64,9 +64,14 @@ Its versions are its own: they do not move with `mediadecode`'s.
   OpenTimelineIO's readers decode them: one carrying `OTIO_SCHEMA` —
   in metadata, under a key no reader reads, or nested in either — is held
   to that schema's rules, and a schema whose rules the check does not know
-  is refused by name. Metadata itself must be a plain dictionary, every
-  effect one of the four effect schemas with its required keys, and, for
-  `V0_15Plus`, a media reference's image bounds a `Box2d.1`.
+  is refused by name. Every schema it accepts is held to its 0.17.0
+  reader's required and optional members and their types — a generator's
+  kind and parameters, an image sequence's eight members, an effect's
+  name and a time warp's scalar among them. Metadata, a clip's media
+  references and a generator's parameters must each be a plain
+  dictionary; every effect one of the four effect schemas; every object's
+  `OTIO_REF_ID` a string, and a nonempty one unique in the document; and,
+  for `V0_15Plus`, a media reference's image bounds a `Box2d.1`.
 
 ## [0.2.0] - 2026-10-15
 
