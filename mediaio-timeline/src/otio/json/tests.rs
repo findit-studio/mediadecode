@@ -224,3 +224,41 @@ fn a_float_reads_only_where_its_text_spells_its_canonical_decimal() {
     );
   }
 }
+
+std::thread_local! {
+  /// How many times this thread's duplicate checks compared two keys.
+  static COMPARISONS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+/// Counts one comparison of two keys, for the law below.
+pub(super) fn compared() {
+  COMPARISONS.with(|count| count.set(count.get() + 1));
+}
+
+#[test]
+fn a_large_flat_object_is_checked_for_a_twice_named_key_in_n_log_n_comparisons() {
+  use core::fmt::Write as _;
+  let n: usize = 20_000;
+  let mut text = std::string::String::from("{");
+  for index in 0..n {
+    if index > 0 {
+      text.push(',');
+    }
+    write!(text, "\"key{index:05}\":{index}").expect("a string takes it");
+  }
+  text.push('}');
+  COMPARISONS.with(|count| count.set(0));
+  let value = parse(&text).expect("a flat object");
+  let comparisons = COMPARISONS.with(core::cell::Cell::get);
+  assert_eq!(value.as_object().map(<[_]>::len), Some(n));
+  // Each key is compared on its way into the set — at least once — and a
+  // balanced tree compares it a few times log2(n) at most: under 4 n
+  // log2(n) here, against the n(n - 1)/2 = 2·10^8 of a scan of the keys
+  // before each.
+  let log2 = usize::BITS - n.leading_zeros();
+  assert!(comparisons >= n - 1, "the check compares every key: {comparisons}");
+  assert!(
+    comparisons <= 4 * n * log2 as usize,
+    "{comparisons} comparisons for {n} keys",
+  );
+}

@@ -1,9 +1,9 @@
 //! A small JSON value: written pretty for the export, read strictly for the
 //! self-check.
 
-use core::fmt::Write as _;
+use core::{cmp::Ordering, fmt::Write as _};
 use smol_bytes::{Utf8Bytes, Utf8BytesMut};
-use std::vec::Vec;
+use std::{collections::BTreeSet, vec::Vec};
 
 use super::Syntax;
 
@@ -335,6 +335,25 @@ fn exponent(text: &str) -> Option<i128> {
 /// document cannot exhaust the stack.
 const MAX_DEPTH: usize = 128;
 
+/// An object's key as the duplicate check orders it: by its text — and,
+/// in the laws, counted each time two are compared.
+#[derive(PartialEq, Eq)]
+struct Key(Utf8Bytes);
+
+impl PartialOrd for Key {
+  fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+    Some(self.cmp(other))
+  }
+}
+
+impl Ord for Key {
+  fn cmp(&self, other: &Self) -> Ordering {
+    #[cfg(test)]
+    tests::compared();
+    self.0.as_str().cmp(other.0.as_str())
+  }
+}
+
 /// Reads `text` as one JSON value (RFC 8259), refusing what the grammar
 /// does not admit, an object naming a key twice, and nesting past
 /// [`MAX_DEPTH`].
@@ -414,6 +433,10 @@ impl Reader<'_> {
   fn object(&mut self) -> Result<Value, Syntax> {
     self.at += 1;
     let mut members: Vec<(Utf8Bytes, Value)> = Vec::new();
+    // The keys read so far, for the check that none is named twice: in a
+    // set, so an object of n keys costs O(n log n) comparisons — a scan of
+    // the members before each key would cost n²/2.
+    let mut keys: BTreeSet<Key> = BTreeSet::new();
     self.skip_space();
     if self.peek() == Some(b'}') {
       self.at += 1;
@@ -426,7 +449,7 @@ impl Reader<'_> {
       }
       let key_at = self.at;
       let key = self.string()?;
-      if members.iter().any(|(seen, _)| *seen == key) {
+      if !keys.insert(Key(key.clone())) {
         return Err(Syntax {
           offset: key_at,
           reason: "a key named twice in one object",
