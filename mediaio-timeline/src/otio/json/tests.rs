@@ -257,16 +257,18 @@ fn a_large_flat_object_is_checked_for_a_twice_named_key_in_n_log_n_comparisons()
   let comparisons = COMPARISONS.with(core::cell::Cell::get);
   assert_eq!(value.as_object().map(<[_]>::len), Some(n));
   // Each key is compared on its way into the set — at least once — and a
-  // balanced tree compares it a few times log2(n) at most: under 4 n
-  // log2(n) here, against the n(n - 1)/2 = 2·10^8 of a scan of the keys
-  // before each.
+  // search tree compares it a bounded number of times on each of O(log n)
+  // levels: the standard library's B-tree scans at most eleven keys a
+  // node, on at most 1 + log6(n) levels, so at most 66 times a key here,
+  // within the 8 log2(n) = 120 the law allows. A scan of the keys before
+  // each would cost n(n - 1)/2 = 2·10^8, over 80 times the bound.
   let log2 = usize::BITS - n.leading_zeros();
   assert!(
     comparisons >= n - 1,
     "the check compares every key: {comparisons}"
   );
   assert!(
-    comparisons <= 4 * n * log2 as usize,
+    comparisons <= 8 * n * log2 as usize,
     "{comparisons} comparisons for {n} keys",
   );
 }
