@@ -1,63 +1,83 @@
 //! OpenTimelineIO's schema shape, checked over a value the crate's own
 //! reader produced.
 //!
-//! # Which keys are required
+//! # Every schema the check accepts
 //!
-//! Each schema's `read_from` in OpenTimelineIO's C++ core decides which keys
-//! a document must carry: `reader.read` fails on a missing key, and
-//! `reader.read_if_present` does not. The check requires exactly the keys
-//! the `reader.read` calls take, for every reader of its target — releases
-//! 0.15 to 0.18.1 and `main` (`00c22fa`) for [`OtioTarget::V0_15Plus`]; for
-//! [`OtioTarget::Legacy`], the C++ readers of 0.12 to 0.14.1 (the Python
-//! ones before them require less). Lines are `main`'s under
-//! `src/opentimelineio/` unless a release is named:
+//! Each schema's `read_from` in OpenTimelineIO's C++ core decides what a
+//! document must carry and of which type: `reader.read` fails on a missing
+//! key and `reader.read_if_present` does not, and each takes exactly the
+//! type of the member it fills (`deserialization.cpp:376–415` in 0.17.0) —
+//! a `double` any number (418–455), an `int64_t` a whole number written
+//! without a fraction or an exponent, which is how the parser tells the
+//! two apart (457–488), a string or an optional value `null` as well, read
+//! as empty or as none. The table is OpenTimelineIO 0.17.0's, with each
+//! reader's lines under `src/opentimelineio/` at `v0.17.0`; the check holds
+//! every schema it accepts to its row, and in places to more (`*`, see
+//! below). A schema not in the table is refused by name.
 //!
-//! | schema | required | where |
-//! |---|---|---|
-//! | `Timeline.1` | `tracks` | `timeline.cpp:30` |
-//! | `Stack.1` | `children` | `composition.cpp:199` |
-//! | `Track.1` | `kind`, `children` | `track.cpp:41` (0.14.1: `:31`), `composition.cpp:199` |
-//! | `Clip.2` | `media_references`, `active_media_reference_key` | `clip.cpp:145–148` |
-//! | `Clip.1` | `media_reference` under `Legacy`; nothing under `V0_15Plus` | 0.14.1 `clip.cpp:34`, 0.12 `clip.cpp:28`; a later reader upgrades a `Clip.1`, reading a reference left out as missing (`typeRegistry.cpp:159–177`) |
-//! | `Gap.1` | — | an item's keys only |
-//! | `Transition.1` | `in_offset`, `out_offset`, `transition_type` | `transition.cpp:35–37` |
-//! | `ExternalReference.1` | `target_url` | `externalReference.cpp:23` |
-//! | `Marker.2` | `marked_range` | `marker.cpp:28` (0.15: `:26`, 0.14.1: `:23`, 0.12: `:20`) |
-//! | `Effect.1`, `TimeEffect.1` | `effect_name` | `effect.cpp:25` (0.15: `:23`, 0.14.1: `:20`, 0.12: `:17`) |
-//! | `LinearTimeWarp.1`, `FreezeFrame.1` | `time_scalar`, then an effect's | `linearTimeWarp.cpp:23` (0.14.1: `:20`, 0.12: `:17`) |
-//! | `RationalTime.1` | `rate`, `value` | `deserialization.cpp:578–583` |
-//! | `TimeRange.1` | `start_time`, `duration` | `deserialization.cpp:585–591` |
-//! | `TimeTransform.1` | `offset`, `rate`, `scale` | `deserialization.cpp:602–610` |
-//! | `V2d.1` | `x`, `y` | `deserialization.cpp:621–627`, from 0.15 |
-//! | `Box2d.1` | `min`, `max` | `deserialization.cpp:628–635`, from 0.15 |
-//! | `Color.1` | `name`, `r`, `g`, `b`, `a` | `deserialization.cpp:593–600`, from 0.18 |
+//! | schema | required | optional | reader | the check |
+//! |---|---|---|---|---|
+//! | every schema with metadata | — | `metadata`: a dictionary; `name`: a string | `serializableObjectWithMetadata.cpp:21–22` | metadata a plain dictionary, walked |
+//! | `Timeline.1` | `tracks`: a `Stack.1` | `global_start_time`: a `RationalTime.1`, or null | `timeline.cpp:30–31` | as read |
+//! | every item | — | `source_range`: a `TimeRange.1`, or null; `effects`: effects; `markers`: markers; `enabled`: a boolean | `item.cpp:175–178` | each marker a `Marker.2`* |
+//! | `Stack.1` | `children`: composables | an item's | `stack.cpp:32`, `composition.cpp:191` | children tracks, stacks, clips and gaps* |
+//! | `Track.1` | `kind`: a string; `children`: composables | an item's | `track.cpp:34`, `composition.cpp:191` | each transition between two items* |
+//! | `Clip.2` | `media_references`: a dictionary of media references; `active_media_reference_key`: a string | an item's | `clip.cpp:141–144` | the references a plain dictionary, the active key one of them* |
+//! | `Clip.1` | — | `media_reference` | upgraded to a `Clip.2`, anything but a media reference read as missing (`typeRegistry.cpp:99–117`) | the reference null or a media reference* |
+//! | `Gap.1` | — | an item's | `gap.cpp:43` | as read |
+//! | `Transition.1` | `in_offset`, `out_offset`: `RationalTime.1`; `transition_type`: a string | metadata and name | `transition.cpp:33–35` | offsets of zero or more* |
+//! | `Marker.2` | `marked_range`: a `TimeRange.1` | `color`, `comment`: strings | `marker.cpp:27–29` | as read |
+//! | every media reference | — | `available_range`: a `TimeRange.1`, or null; `available_image_bounds`: a `Box2d.1`, or null | `mediaReference.cpp:30–33` | as read |
+//! | `ExternalReference.1` | `target_url`: a string | a reference's | `externalReference.cpp:23` | as read |
+//! | `MissingReference.1` | — | a reference's | `missingReference.cpp:28` | as read |
+//! | `GeneratorReference.1` | `generator_kind`: a string; `parameters`: a dictionary | a reference's | `generatorReference.cpp:26–27` | the parameters a plain dictionary, walked |
+//! | `ImageSequenceReference.1` | `target_url_base`, `name_prefix`, `name_suffix`: strings; `start_frame`, `frame_step`, `frame_zero_padding`: whole numbers; `rate`: a number; `missing_frame_policy`: `error`, `black` or `hold` | a reference's | `imageSequenceReference.cpp:195–233` | as read |
+//! | `Effect.1`, `TimeEffect.1` | `effect_name`: a string | metadata and name | `effect.cpp:23` | as read |
+//! | `LinearTimeWarp.1`, `FreezeFrame.1` | `time_scalar`: a number; an effect's | an effect's | `linearTimeWarp.cpp:23` | as read |
+//! | `RationalTime.1` | `rate`, `value`: numbers | — | `deserialization.cpp:575–581` | a positive, finite rate; a finite value* |
+//! | `TimeRange.1` | `start_time`, `duration`: `RationalTime.1` | — | `deserialization.cpp:582–589` | a duration of zero or more* |
+//! | `TimeTransform.1` | `offset`: a `RationalTime.1`; `rate`, `scale`: numbers | — | `deserialization.cpp:590–598` | as read |
+//! | `V2d.1` | `x`, `y`: numbers | — | `deserialization.cpp:609–615` | as read |
+//! | `Box2d.1` | `min`, `max`: `V2d.1` | — | `deserialization.cpp:616–623` | as read |
+//! | `Color.1` | `name`: a string; `r`, `g`, `b`, `a`: numbers | — | 0.18.1 `deserialization.cpp:591–598`; 0.17.0 keeps it as an unknown schema | as 0.18.1 reads it |
 //!
-//! A reader that does not decode a value schema — one before 0.15 a `V2d.1`
-//! or a `Box2d.1`, one before 0.18 a `Color.1` — keeps the dictionary as an
-//! object of a schema it does not know (below); the check holds it to the
-//! newer readers' rules for every target.
+//! The check requires exactly the keys of every reader of its target —
+//! releases 0.15 to 0.18.1 and `main` (`00c22fa`) for
+//! [`OtioTarget::V0_15Plus`]; for [`OtioTarget::Legacy`], the C++ readers of
+//! 0.12 to 0.14.1 (the Python ones before them require less). Where another
+//! reader differs from 0.17.0's, the check follows the stricter:
 //!
-//! Everything else these schemas read is read only if present: `metadata`
-//! and `name` on each (`serializableObjectWithMetadata.cpp:21–22`), an
-//! item's `source_range`, `effects`, `markers` and `enabled`
-//! (`item.cpp:185–188`), a timeline's `global_start_time`
-//! (`timeline.cpp:31`), a media reference's `available_range` and
-//! `available_image_bounds` (`mediaReference.cpp:30–33`), a marker's
-//! `color` and, from 0.16, its `comment` (`marker.cpp:29`; readers
-//! before 0.16 keep a `comment` as a field they do not know, and write it
-//! back).
+//! - A `Clip.1` must carry its `media_reference` under `Legacy` (0.14.1
+//!   `clip.cpp:34`, 0.12 `clip.cpp:28`); `Clip.2` is unknown there, and
+//!   refused.
+//! - `kind` is `track.cpp:31` in 0.14.1; `marked_range` is `marker.cpp:26`
+//!   in 0.15, `:23` in 0.14.1 and `:20` in 0.12; `effect_name` is
+//!   `effect.cpp:25` at `main`, `:20` in 0.14.1 and `:17` in 0.12;
+//!   `time_scalar` is `linearTimeWarp.cpp:20` in 0.14.1 and `:17` in 0.12.
+//! - A reader before 0.15 does not decode a `V2d.1` or a `Box2d.1`, nor one
+//!   before 0.18 a `Color.1`: it keeps the dictionary as an object of a
+//!   schema it does not know (below). The check holds it to the newer
+//!   readers' rules for every target. A media reference's image bounds, which
+//!   no reader before 0.15 reads, must be an object under `Legacy`, walked
+//!   as any other.
+//! - A marker's `comment` is read from 0.16 (readers before keep it as a
+//!   field they do not know, and write it back); an item's `color`, and an
+//!   effect's `enabled`, from 0.18 (0.18.1 `item.cpp:181`; `effect.cpp:26`
+//!   at `main`).
 //!
 //! # Every dictionary
 //!
 //! A reader converts each dictionary as its parser closes it, wherever it
-//! sits (`deserialization.cpp:156–190`): one without `OTIO_SCHEMA` stays a
-//! dictionary, and one carrying it becomes an object of the schema it names
-//! (`:564–568`), which that schema's own `read_from` then reads
+//! sits (`deserialization.cpp:156–190` at `main`): one without `OTIO_SCHEMA`
+//! stays a dictionary, and one carrying it becomes an object of the schema
+//! it names (`:564–568`), which that schema's own `read_from` then reads
 //! (`serializableObject.h:222–235`). So a dictionary in metadata, under a
 //! key no reader reads, or nested inside either, refuses the document when
 //! its schema's reader would. The check walks every dictionary alike and
 //! holds each one carrying `OTIO_SCHEMA` to that schema's rules, wherever it
-//! sits. Metadata itself is a dictionary, never a schema's object.
+//! sits. A dictionary a reader reads as one — metadata, a clip's media
+//! references, a generator's parameters — is never a schema's object: a
+//! member named `OTIO_SCHEMA` there is refused by name.
 //!
 //! A schema whose rules the check does not know is refused by name, at its
 //! `OTIO_SCHEMA`. In one case that is stricter than a reader: a name no
@@ -68,16 +88,16 @@
 //!
 //! # What a value is held to
 //!
-//! A value present is held to the type the reader takes, and in places to
-//! more — a string where a reader would take `null` as empty, a positive,
-//! finite rate, a length of zero or more, an active media key among the
-//! references, every transition between two items, every marker a
-//! `Marker.2` — the one marker schema the readers 0.12 to 0.18.1 know —
-//! every effect one of the four effect schemas, and, for readers from
-//! 0.15, a media reference's image bounds a `Box2d.1`. Keys this crate
-//! never writes and no reader of the target requires are walked but not
+//! A value present is held to the type its reader takes, and where the
+//! table marks it (`*`) to more: a string where a reader would take `null`
+//! as empty, a positive, finite rate, a length of zero or more, an active
+//! media key among the references, every transition between two items,
+//! every marker a `Marker.2` — the one marker schema the readers 0.12 to
+//! 0.18.1 know — and a `Clip.1`'s reference a media reference or null,
+//! where a reader from 0.15 reads anything else as missing. Keys no reader
+//! of the target requires and this crate never writes are walked but not
 //! typed: a newer reader's `color` on an item or `enabled` on a transition
-//! or an effect, a generator's parameters.
+//! or an effect.
 
 use std::format;
 
@@ -212,7 +232,11 @@ fn clip1(members: &Members, path: &str, target: OtioTarget) -> Result<(), Shape>
 fn clip2(members: &Members, path: &str, target: OtioTarget) -> Result<(), Shape> {
   item(members, path, target)?;
   let (references, at) = required(members, path, "media_references")?;
-  let references = object(references, &at)?;
+  let references = plain(
+    references,
+    &at,
+    "no schema: media_references is a dictionary",
+  )?;
   for (key, reference) in references {
     media_reference(reference, &format!("{at}.{key}"), target)?;
   }
@@ -250,18 +274,71 @@ fn media_reference(value: &Value, path: &str, target: OtioTarget) -> Result<(), 
       }
     })
   })?;
-  let external = schema_name(members, path)? == "ExternalReference.1";
-  if external {
-    let (url, at) = required(members, path, "target_url")?;
-    string(url, &at)?;
-  }
-  let url: &[&str] = if external { &["target_url"] } else { &[] };
+  // Each reference's own members, as its reader reads them; a
+  // `MissingReference.1` reads none.
+  let own: &[&str] = match schema_name(members, path)? {
+    "ExternalReference.1" => {
+      let (url, at) = required(members, path, "target_url")?;
+      string(url, &at)?;
+      &["target_url"]
+    }
+    "GeneratorReference.1" => {
+      let (kind, at) = required(members, path, "generator_kind")?;
+      string(kind, &at)?;
+      let (parameters, at) = required(members, path, "parameters")?;
+      plain(
+        parameters,
+        &at,
+        "no schema: parameters is a dictionary",
+      )?;
+      contents(parameters, &at, target)?;
+      &["generator_kind", "parameters"]
+    }
+    "ImageSequenceReference.1" => {
+      image_sequence(members, path)?;
+      IMAGE_SEQUENCE
+    }
+    _ => &[],
+  };
   others(
     members,
     path,
     target,
-    &[NAMED, &["available_range", "available_image_bounds"], url],
+    &[NAMED, &["available_range", "available_image_bounds"], own],
   )
+}
+
+/// The members an `ImageSequenceReference.1`'s reader requires, in its
+/// order (`imageSequenceReference.cpp:195–233` in 0.17.0).
+const IMAGE_SEQUENCE: &[&str] = &[
+  "target_url_base",
+  "name_prefix",
+  "name_suffix",
+  "start_frame",
+  "frame_step",
+  "rate",
+  "frame_zero_padding",
+  "missing_frame_policy",
+];
+
+/// An `ImageSequenceReference.1`'s own members: the URL's base, the name's
+/// prefix and suffix as strings, the first frame, the step and the zero
+/// padding as whole numbers, the rate as a number, and a missing frame's
+/// policy, one of the three the reader knows (`:214–233`).
+fn image_sequence(members: &Members, path: &str) -> Result<(), Shape> {
+  for key in IMAGE_SEQUENCE {
+    let (value, at) = required(members, path, key)?;
+    match *key {
+      "start_frame" | "frame_step" | "frame_zero_padding" => integer(value, &at)?,
+      "rate" => number(value, &at)?,
+      "missing_frame_policy" => match string_value(value, &at)? {
+        "error" | "black" | "hold" => {}
+        _ => return Err(shape(&at, "error, black or hold")),
+      },
+      _ => string(value, &at)?,
+    }
+  }
+  Ok(())
 }
 
 fn transition(members: &Members, path: &str, target: OtioTarget) -> Result<(), Shape> {
@@ -350,16 +427,25 @@ fn named(members: &Members, path: &str, target: OtioTarget) -> Result<(), Shape>
 }
 
 /// Metadata: a dictionary every reader takes as one, never a schema's
-/// object. Its values are walked as any others are ([`contents`]).
+/// object ([`plain`]). Its values are walked as any others are
+/// ([`contents`]).
 fn dictionary(value: &Value, path: &str, target: OtioTarget) -> Result<(), Shape> {
+  plain(value, path, "no schema: metadata is a dictionary")?;
+  contents(value, path, target)
+}
+
+/// A dictionary a reader reads as one — metadata, a clip's media
+/// references, a generator's parameters — and so never a schema's object:
+/// one carrying `OTIO_SCHEMA` is decoded as an object, its `OTIO_SCHEMA`
+/// fetched as a string (`deserialization.cpp:561–573` in 0.17.0), and the
+/// reader refuses it where it reads a dictionary. Refused here at that
+/// member, as `expected` names it.
+fn plain<'a>(value: &'a Value, path: &str, expected: &'static str) -> Result<&'a Members, Shape> {
   let members = object(value, path)?;
   if member(members, "OTIO_SCHEMA").is_some() {
-    return Err(shape(
-      &format!("{path}.OTIO_SCHEMA"),
-      "no schema: metadata is a dictionary",
-    ));
+    return Err(shape(&format!("{path}.OTIO_SCHEMA"), expected));
   }
-  contents(value, path, target)
+  Ok(members)
 }
 
 /// A value where the document leaves the type open — metadata, a key no
@@ -589,6 +675,26 @@ fn string(value: &Value, path: &str) -> Result<(), Shape> {
 
 fn string_value<'a>(value: &'a Value, path: &str) -> Result<&'a str, Shape> {
   value.as_str().ok_or_else(|| shape(path, "a string"))
+}
+
+/// A whole number, what a reader takes for an `int64_t`: written without a
+/// fraction or an exponent — a reader decodes any other number as a
+/// `double`, which it refuses there (`deserialization.cpp:457–488` in
+/// 0.17.0) — and within an `i64`, as the parser keeps one. A negative zero
+/// is refused too, as the parser may keep it as a `double`.
+fn integer(value: &Value, path: &str) -> Result<(), Shape> {
+  let whole = match value {
+    Value::Number(text) => {
+      let text = text.as_str();
+      !text.contains(['.', 'e', 'E']) && text != "-0" && text.parse::<i64>().is_ok()
+    }
+    _ => false,
+  };
+  if whole {
+    Ok(())
+  } else {
+    Err(shape(path, "a whole number, without a fraction or an exponent"))
+  }
 }
 
 /// A finite number: what a reader takes for a `double`.

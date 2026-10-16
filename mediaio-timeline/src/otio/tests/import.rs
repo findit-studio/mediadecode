@@ -535,6 +535,255 @@ fn the_self_check_decodes_every_dictionary_as_a_reader_does() {
   );
 }
 
+/// Where the sample's clip `a` keeps its medium, for `target`.
+fn a_media(target: OtioTarget) -> String {
+  match target {
+    OtioTarget::V0_15Plus => String::from(A_MEDIA),
+    OtioTarget::Legacy => format!("{A}.media_reference"),
+  }
+}
+
+/// The checker's path for the dotted `path`: `$.`, and each index in
+/// brackets.
+fn checked_path(path: &str) -> String {
+  let mut out = String::from("$");
+  for step in path.split('.').filter(|step| !step.is_empty()) {
+    if step.bytes().all(|byte| byte.is_ascii_digit()) {
+      out.push_str(&format!("[{step}]"));
+    } else {
+      out.push('.');
+      out.push_str(step);
+    }
+  }
+  out
+}
+
+#[test]
+fn a_dictionary_of_media_references_carrying_otio_schema_is_refused_by_name() {
+  // Round 5: a reader decodes `media_references` as it closes it, and a
+  // member named `OTIO_SCHEMA` makes it an object of a schema, its
+  // `OTIO_SCHEMA` fetched as a string — here an object, which it refuses.
+  let external = object(vec![
+    ("OTIO_SCHEMA", text("ExternalReference.1")),
+    ("target_url", text("file:///other.mov")),
+  ]);
+  assert_eq!(
+    checked_edited(OtioTarget::V0_15Plus, |root| set(
+      root,
+      &format!("{A}.media_references"),
+      "OTIO_SCHEMA",
+      external
+    )),
+    Err((
+      checked_path(&format!("{A}.media_references.OTIO_SCHEMA")),
+      "no schema: media_references is a dictionary"
+    )),
+  );
+}
+
+#[test]
+fn a_generator_reference_is_held_to_its_readers_members() {
+  // `generatorReference.cpp` 26–27 in 0.17.0: `generator_kind`, a string,
+  // and `parameters`, a dictionary, both required.
+  for target in [OtioTarget::V0_15Plus, OtioTarget::Legacy] {
+    let media = a_media(target);
+    let at = |key: &str| checked_path(&format!("{media}.{key}"));
+    let generator = |members: Vec<(&str, Value)>| {
+      let mut members = members;
+      members.insert(0, ("OTIO_SCHEMA", text("GeneratorReference.1")));
+      object(members)
+    };
+    let refused = |reference: Value| {
+      checked_edited(target, |root| {
+        let (parent, key) = media.rsplit_once('.').expect("a dotted path");
+        set(root, parent, key, reference);
+      })
+    };
+    // Round 5's counterexample: a generator on a reference's members alone.
+    assert_eq!(
+      refused(generator(vec![])),
+      Err((at("generator_kind"), "a required key")),
+      "{target:?}",
+    );
+    assert_eq!(
+      refused(generator(vec![("generator_kind", text("solid"))])),
+      Err((at("parameters"), "a required key")),
+      "{target:?}",
+    );
+    assert_eq!(
+      refused(generator(vec![
+        ("generator_kind", number("1")),
+        ("parameters", object(vec![])),
+      ])),
+      Err((at("generator_kind"), "a string")),
+      "{target:?}",
+    );
+    assert_eq!(
+      refused(generator(vec![
+        ("generator_kind", text("solid")),
+        ("parameters", text("red")),
+      ])),
+      Err((at("parameters"), "an object")),
+      "{target:?}",
+    );
+    assert_eq!(
+      refused(generator(vec![
+        ("generator_kind", text("solid")),
+        (
+          "parameters",
+          object(vec![("OTIO_SCHEMA", text("Marker.2"))]),
+        ),
+      ])),
+      Err((
+        at("parameters.OTIO_SCHEMA"),
+        "no schema: parameters is a dictionary"
+      )),
+      "{target:?}",
+    );
+    // Its parameters are walked as any dictionary is.
+    assert_eq!(
+      refused(generator(vec![
+        ("generator_kind", text("solid")),
+        (
+          "parameters",
+          object(vec![(
+            "fill",
+            object(vec![("OTIO_SCHEMA", text("Marker.2"))]),
+          )]),
+        ),
+      ])),
+      Err((at("parameters.fill.marked_range"), "a required key")),
+      "{target:?}",
+    );
+    assert_eq!(
+      refused(generator(vec![
+        ("generator_kind", text("solid")),
+        ("parameters", object(vec![("color", text("red"))])),
+      ])),
+      Ok(()),
+      "{target:?}",
+    );
+  }
+}
+
+#[test]
+fn an_image_sequence_reference_is_held_to_its_readers_members() {
+  // `imageSequenceReference.cpp` 195–233 in 0.17.0: three strings, three
+  // `int64_t`s, a `double` and a policy of three, each required.
+  let sequence = || {
+    vec![
+      ("OTIO_SCHEMA", text("ImageSequenceReference.1")),
+      ("target_url_base", text("file:///frames/")),
+      ("name_prefix", text("a.")),
+      ("name_suffix", text(".exr")),
+      ("start_frame", number("1001")),
+      ("frame_step", number("1")),
+      ("rate", number("24")),
+      ("frame_zero_padding", number("4")),
+      ("missing_frame_policy", text("hold")),
+    ]
+  };
+  for target in [OtioTarget::V0_15Plus, OtioTarget::Legacy] {
+    let media = a_media(target);
+    let at = |key: &str| checked_path(&format!("{media}.{key}"));
+    let checked = |members: Vec<(&str, Value)>| {
+      checked_edited(target, |root| {
+        let (parent, key) = media.rsplit_once('.').expect("a dotted path");
+        set(root, parent, key, object(members));
+      })
+    };
+    assert_eq!(checked(sequence()), Ok(()), "{target:?}");
+    // Each required member, left out.
+    for (index, (key, _)) in sequence().into_iter().enumerate().skip(1) {
+      let mut members = sequence();
+      members.remove(index);
+      assert_eq!(
+        checked(members),
+        Err((at(key), "a required key")),
+        "{target:?} {key}",
+      );
+    }
+    // Each held to its type.
+    let with = |key: &str, value: Value| {
+      let mut members = sequence();
+      for member in &mut members {
+        if member.0 == key {
+          member.1 = value.clone();
+        }
+      }
+      checked(members)
+    };
+    let whole = "a whole number, without a fraction or an exponent";
+    for spelling in ["1001.0", "1.001e3", "-0"] {
+      assert_eq!(
+        with("start_frame", number(spelling)),
+        Err((at("start_frame"), whole)),
+        "{target:?} {spelling}",
+      );
+    }
+    assert_eq!(
+      with("frame_step", text("1")),
+      Err((at("frame_step"), whole)),
+      "{target:?}",
+    );
+    assert_eq!(
+      with("frame_zero_padding", number("4.5")),
+      Err((at("frame_zero_padding"), whole)),
+      "{target:?}",
+    );
+    assert_eq!(with("rate", number("23.976")), Ok(()), "{target:?}");
+    assert_eq!(
+      with("rate", text("24")),
+      Err((at("rate"), "a finite number")),
+      "{target:?}",
+    );
+    assert_eq!(
+      with("name_prefix", number("5")),
+      Err((at("name_prefix"), "a string")),
+      "{target:?}",
+    );
+    for policy in ["error", "black", "hold"] {
+      assert_eq!(
+        with("missing_frame_policy", text(policy)),
+        Ok(()),
+        "{target:?} {policy}"
+      );
+    }
+    assert_eq!(
+      with("missing_frame_policy", text("skip")),
+      Err((at("missing_frame_policy"), "error, black or hold")),
+      "{target:?}",
+    );
+  }
+}
+
+#[test]
+fn a_missing_reference_reads_a_references_members_alone() {
+  // `missingReference.cpp` 28 in 0.17.0: nothing of its own.
+  for target in [OtioTarget::V0_15Plus, OtioTarget::Legacy] {
+    let media = a_media(target);
+    let checked = |members: Vec<(&str, Value)>| {
+      checked_edited(target, |root| {
+        let (parent, key) = media.rsplit_once('.').expect("a dotted path");
+        set(root, parent, key, object(members));
+      })
+    };
+    assert_eq!(
+      checked(vec![("OTIO_SCHEMA", text("MissingReference.1"))]),
+      Ok(()),
+      "{target:?}",
+    );
+    assert_eq!(
+      checked(vec![
+        ("OTIO_SCHEMA", text("MissingReference.1")),
+        ("name", number("5")),
+      ]),
+      Err((checked_path(&format!("{media}.name")), "a string")),
+      "{target:?}",
+    );
+  }
+}
+
 #[test]
 fn notes_that_are_not_pairs_of_strings_each_key_once_are_refused_by_name() {
   let notes = |root: &mut Value, value: Value| {
