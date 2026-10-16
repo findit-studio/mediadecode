@@ -707,11 +707,22 @@ impl core::error::Error for Shape {}
 /// `null`, an empty list, `enabled` as `true` — or what the timeline keeps:
 /// nothing is dropped. A member OpenTimelineIO's schema lets a document
 /// leave out reads as OpenTimelineIO 0.17.0's reader reads it — a name as
-/// empty, `enabled` as `true`, a marker's color as GREEN, a gap's range as
-/// no length, read only on a fade's gap side as any gap of no length is —
-/// or, where that is no value and the timeline needs one (the
-/// timeline's `global_start_time`, a clip's `source_range`), is refused by
-/// name.
+/// empty, `enabled` as `true`, a marker's color as GREEN — or, where that
+/// is no value and the timeline needs one (the timeline's
+/// `global_start_time`, a clip's `source_range`), or a value it does not
+/// keep (a gap's `source_range`, nothing at rate 1), is refused by name.
+///
+/// **What it reads, the export writes back.** Last, the export writes the
+/// timeline read, and every `RationalTime` it writes — the global start,
+/// each gap's and clip's range, each transition's offsets, each medium's
+/// available range, each marker's range — must be the one the document
+/// states at the same path, strictly: the same value and the same rate,
+/// as OpenTimelineIO's `strictly_equal` compares them. The first that is
+/// not is refused as [`Unreadable::Inexact`] there. The checks before it
+/// refuse by name what they know; this one closes the rest of the class —
+/// a time read in a form the export would not write it in, such as a
+/// medium's range counted in a ruler of the document's choosing — so the
+/// documents read are exactly those whose times the export reproduces.
 ///
 /// # Errors
 ///
@@ -722,13 +733,15 @@ impl core::error::Error for Shape {}
 ///   timeline does not model;
 /// - [`Unreadable::Inexact`] for a number its type holds only rounded, a
 ///   count or rate that does not land exactly where the timeline counts it,
-///   or a time OpenTimelineIO's `f64` arithmetic rounds;
+///   a time OpenTimelineIO's `f64` arithmetic rounds, or a time the export
+///   does not write back as the document states it;
 /// - [`Unreadable::Validation`] for a timeline read whole that does not
 ///   [`validate`](fn@validate).
 pub fn from_otio(json: &str) -> Result<Timeline, Unreadable> {
   let root = json::parse(json).map_err(Unreadable::Syntax)?;
   let timeline = import::timeline(&root)?;
   validate(&timeline).map_err(Unreadable::Validation)?;
+  import::reproduced(&root, &timeline)?;
   Ok(timeline)
 }
 
@@ -749,8 +762,9 @@ pub enum Unreadable {
   /// word for.
   Feature(UnmodelledFeature),
   /// A count or a rate that does not land exactly where the timeline
-  /// counts it, or a time OpenTimelineIO derives from the document that its
-  /// `f64` arithmetic rounds.
+  /// counts it, a time OpenTimelineIO derives from the document that its
+  /// `f64` arithmetic rounds, or a time the export would not write back as
+  /// the document states it.
   Inexact(Inexact),
   /// The timeline read does not [`validate`](fn@validate): its refusals.
   Validation(Vec<Refusal>),
@@ -971,11 +985,13 @@ impl fmt::Display for Feature {
 }
 
 /// A count or a rate that does not land exactly where the timeline counts
-/// it, or a time OpenTimelineIO's `f64` arithmetic rounds, and where: what
-/// [`Unreadable::Inexact`] carries. A time OpenTimelineIO derives is
-/// refused where it is derived from: a range at the range, a place or a
-/// visible range at its child, a duration or an end at its track, the
-/// stack's pick of its longest track at the stack.
+/// it, a time OpenTimelineIO's `f64` arithmetic rounds, or one the export
+/// would not write back as stated, and where: what [`Unreadable::Inexact`]
+/// carries. A time OpenTimelineIO derives is refused where it is derived
+/// from: a range at the range, a place or a visible range at its child, a
+/// duration or an end at its track, the stack's pick of its longest track
+/// at the stack. A time the export would write otherwise is refused at the
+/// first `RationalTime` that differs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Inexact {
   path: Utf8Bytes,

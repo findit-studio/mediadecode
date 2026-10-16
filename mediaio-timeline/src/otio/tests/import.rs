@@ -1966,6 +1966,192 @@ fn a_fade_side_gap_of_no_length_is_read_only_in_the_form_the_export_writes() {
   );
 }
 
+/// `text`, edited by `edit`, read back.
+fn read_text_edited(text: &str, edit: impl FnOnce(&mut Value)) -> Result<Timeline, Unreadable> {
+  let mut root = json::parse(text).unwrap();
+  edit(&mut root);
+  let mut out = Utf8BytesMut::new();
+  json::write_pretty(&root, &mut out);
+  from_otio(&out.freeze_shared())
+}
+
+/// Recounts the range at `range` at 48 ticks a second — `start` and
+/// `duration` its counts there — and names that ruler in its words at
+/// `words`.
+fn at_48(root: &mut Value, range: &str, words: &str, start: &str, duration: &str) {
+  set(root, words, "ruler", text("48/1"));
+  for (key, value) in [("start_time", start), ("duration", duration)] {
+    let time = format!("{range}.{key}");
+    set(root, &time, "rate", number("48.0"));
+    set(root, &time, "value", number(value));
+  }
+}
+
+/// The reason the backstop gives.
+const NOT_WRITTEN_BACK: &str =
+  "a time the export does not write back as stated: another value or rate";
+
+#[test]
+fn a_media_range_read_in_a_ruler_the_export_does_not_write_is_refused() {
+  // Round 9: the reader counts a media-side range in the ruler its words
+  // declare and then in the model's timebase, which keeps no ruler; the
+  // export plans its own, and writes another range. Codex's case: a 24 fps
+  // clip whose source range is 0@48 + 48@48 under the ruler 48/1 read as
+  // [0, 24) at 1/24, and was written back as 0@24 + 24@24 — its inclusive
+  // end moved from 47@48 to 23@24, another instant (`timeRange.h` 48–65 in
+  // 0.17.0). The backstop refuses it, and the same in an available range
+  // and in a clip marker's range.
+  let a = Clip::new(
+    ClipId::new("a"),
+    "a",
+    MediaRef::new(Utf8Bytes::from_static("file:///a.mov"))
+      .with_available_range(Some(TimeRange::new(0, 24, edit())))
+      .with_rate(Some(Rate::FPS_24)),
+    TimeRange::new(0, 24, edit()),
+    TimeRange::new(0, 24, edit()),
+  )
+  .with_marker(Marker::new("half", TimeRange::new(0, 12, edit())));
+  let timeline =
+    Timeline::new("one", Rate::FPS_24).with_track(Track::new(TrackKind::Video, "V").with_clip(a));
+  let written = to_otio(&timeline, OtioTarget::V0_15Plus).unwrap();
+  assert_eq!(from_otio(&written), Ok(timeline.clone()), "the premise");
+  let clip = "tracks.children.0.children.0";
+  let media = format!("{clip}.media_references.DEFAULT_MEDIA");
+  let cases: [(&str, String, String, &str); 3] = [
+    (
+      "the source range",
+      format!("{clip}.source_range"),
+      format!("{clip}.metadata.mediaio.source"),
+      "48.0",
+    ),
+    (
+      "the available range",
+      format!("{media}.available_range"),
+      format!("{media}.metadata.mediaio.available"),
+      "48.0",
+    ),
+    (
+      "the clip marker's range",
+      format!("{clip}.markers.0.marked_range"),
+      format!("{clip}.markers.0.metadata.mediaio.range"),
+      "24.0",
+    ),
+  ];
+  for (name, range, words, duration) in cases {
+    assert_eq!(
+      read_text_edited(&written, |root| at_48(
+        root, &range, &words, "0.0", duration
+      )),
+      Err(inexact(&format!("{range}.duration"), NOT_WRITTEN_BACK)),
+      "{name}",
+    );
+  }
+}
+
+#[test]
+fn every_time_the_document_states_is_the_one_the_export_writes_there() {
+  // Round 9: a ruler the export would not write, injected in each family of
+  // times. The edit side — the global start, a gap, a transition's offsets,
+  // a track marker — is counted at the edit rate bit for bit, so its own
+  // check refuses it by name; the media side declares its ruler, so the
+  // backstop refuses it at its first time.
+  let off_rate = "a rate other than the f64 of the exact ruler it is counted in";
+  // The time at `time`, `value` ticks at 120 a second: five a frame.
+  let at_120 = |root: &mut Value, time: &str, value: &str| {
+    set(root, time, "rate", number("120.0"));
+    set(root, time, "value", number(value));
+  };
+  // The range at `range` at 120 a second, its words at `words` naming it.
+  let range_at_120 = move |root: &mut Value, range: &str, words: &str, start: &str, end: &str| {
+    set(root, words, "ruler", text("120/1"));
+    at_120(root, &format!("{range}.start_time"), start);
+    at_120(root, &format!("{range}.duration"), end);
+  };
+  let a_marker = format!("{A}.markers.0");
+  let cases: Vec<(&str, Edit, Unreadable)> = vec![
+    (
+      "the global start",
+      Box::new(move |root| at_120(root, "global_start_time", "0.0")),
+      inexact("global_start_time.rate", off_rate),
+    ),
+    (
+      "a gap",
+      Box::new(move |root| at_120(root, &format!("{GAP}.source_range.duration"), "60.0")),
+      inexact(&format!("{GAP}.source_range.duration.rate"), off_rate),
+    ),
+    (
+      "a transition's offset",
+      Box::new(move |root| at_120(root, &format!("{DISSOLVE}.in_offset"), "10.0")),
+      inexact(&format!("{DISSOLVE}.in_offset.rate"), off_rate),
+    ),
+    (
+      "a track marker",
+      Box::new(move |root| {
+        at_120(
+          root,
+          &format!("{TRACK}.markers.0.marked_range.duration"),
+          "120.0",
+        )
+      }),
+      inexact(
+        &format!("{TRACK}.markers.0.marked_range.duration.rate"),
+        off_rate,
+      ),
+    ),
+    (
+      "a source range",
+      Box::new(move |root| {
+        range_at_120(
+          root,
+          &format!("{A}.source_range"),
+          &format!("{A}.metadata.mediaio.source"),
+          "50.0",
+          "120.0",
+        )
+      }),
+      inexact(&format!("{A}.source_range.duration"), NOT_WRITTEN_BACK),
+    ),
+    (
+      "an available range",
+      Box::new(move |root| {
+        range_at_120(
+          root,
+          &format!("{A_MEDIA}.available_range"),
+          &format!("{A_MEDIA}.metadata.mediaio.available"),
+          "0.0",
+          "500.0",
+        )
+      }),
+      inexact(
+        &format!("{A_MEDIA}.available_range.duration"),
+        NOT_WRITTEN_BACK,
+      ),
+    ),
+    (
+      "a clip marker",
+      Box::new({
+        let marker = a_marker.clone();
+        move |root| {
+          range_at_120(
+            root,
+            &format!("{marker}.marked_range"),
+            &format!("{marker}.metadata.mediaio.range"),
+            "50.0",
+            "10.0",
+          )
+        }
+      }),
+      inexact(
+        &format!("{a_marker}.marked_range.duration"),
+        NOT_WRITTEN_BACK,
+      ),
+    ),
+  ];
+  for (name, edit, refused) in cases {
+    assert_eq!(read(edit), Err(refused), "{name}");
+  }
+}
+
 #[test]
 fn a_count_or_rate_that_does_not_land_exactly_is_refused() {
   assert_eq!(

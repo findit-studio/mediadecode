@@ -342,7 +342,11 @@ a GREEN marker — or, where that is no value and the timeline needs one
 does not keep (a gap's `source_range`, whose default is nothing at rate 1,
 a rate its track's duration would take), is refused by name. A key is read only
 where it carries nothing — `null`, an empty list, `enabled` as `true` — or
-what the timeline keeps.
+what the timeline keeps. Last, the export writes the timeline read, and
+every time it writes must be the one the document states at the same
+path, the same value at the same rate, or the read is refused as inexact
+there: the reader takes exactly the documents whose times the export
+reproduces.
 
 ## The stored document
 

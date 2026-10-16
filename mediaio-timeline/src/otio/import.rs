@@ -51,6 +51,15 @@
 //! OpenTimelineIO still counts it — its range in its duration, its rate in
 //! its track's sum — so it is refused by name too
 //! ([`Feature::StandaloneGap`]).
+//!
+//! Last comes the backstop ([`reproduced`]): the export writes the timeline
+//! read, and every `RationalTime` it writes must be the one the document
+//! states at the same path, strictly — the same value and the same rate —
+//! or the read is refused as inexact there. The checks before it refuse by
+//! name what they know; the backstop closes the class of what is read but
+//! would be written otherwise — a medium's range counted in a ruler the
+//! export would not choose, among them — so the reader accepts exactly the
+//! documents whose times the export reproduces.
 
 use core::str::FromStr;
 use std::{boxed::Box, vec, vec::Vec};
@@ -59,15 +68,15 @@ use mediatime::{Duration, Rate, Rounding, TimeRange, Timebase, Timestamp};
 use smol_bytes::{Utf8Bytes, format_utf8bytes};
 
 use super::{
-  ChildAt, Feature, Inexact, NotRepresentable, Shape, Spot, UnmodelledFeature, UnmodelledSchema,
-  Unreadable,
+  ChildAt, Feature, Inexact, NotRepresentable, OtioTarget, Shape, Spot, UnmodelledFeature,
+  UnmodelledSchema, Unreadable,
   derive::{self, Ruler, Time},
-  export::{DEFAULT_MEDIA, OURS},
+  export::{self, DEFAULT_MEDIA, OURS},
   json::{self, Value},
 };
 use crate::{
   Clip, ClipId, Edge, Fade, FadeShape, Gain, Marker, MarkerColor, MediaRef, Metadata, Timeline,
-  Track, TrackKind, Transition,
+  Track, TrackKind, Transition, layout::layout_valid,
 };
 
 type Members = [(Utf8Bytes, Value)];
@@ -1286,4 +1295,154 @@ fn markers(object: &Object<'_>, placed: Placed) -> Result<Vec<Marker>, Unreadabl
       )
     })
     .collect()
+}
+
+/// The reader's backstop: every time the document states is one the
+/// export writes, where and as the export writes it for the timeline read
+/// from it.
+///
+/// The export writes `timeline` again, and each `RationalTime` it writes —
+/// the global start, each gap's and clip's range, each transition's
+/// offsets, each medium's available range, each marker's range — is
+/// compared with the one `root` states at the same path, strictly, as
+/// OpenTimelineIO's `strictly_equal` compares (`rationalTime.h` 101–104 in
+/// 0.17.0): its value and its rate, each the same `f64`. A clip's medium is
+/// compared where the document's own clip schema keeps it. The first time
+/// that differs, that the document does not state, or that it states and
+/// the export does not write, is refused as inexact; a timeline the export
+/// cannot write, at the document's root.
+///
+/// The checks before it refuse by name what they know. This closes the
+/// class none of them names — a time read, and counted again, in a form
+/// the export does not write it in, such as a medium's range in a ruler of
+/// the document's choosing — so that the reader accepts exactly the
+/// documents whose times the export reproduces.
+pub(crate) fn reproduced(root: &Value, timeline: &Timeline) -> Result<(), Unreadable> {
+  let written = export::timeline(timeline, &layout_valid(timeline), OtioTarget::V0_15Plus)
+    .map_err(|_| {
+      inexact(
+        &At::root(),
+        "a timeline whose times the export cannot write back",
+      )
+    })?;
+  times_match(&written, Some(root), &At::root())
+}
+
+/// The `RationalTime` `written` and the one `stated`, held strictly equal;
+/// or, within any other value, each time `written` holds against the one
+/// `stated` holds at the same place, and no time `stated` holds that
+/// `written` does not ([`reproduced`]).
+fn times_match(written: &Value, stated: Option<&Value>, at: &At) -> Result<(), Unreadable> {
+  let differs = || {
+    inexact(
+      at,
+      "a time the export does not write back as stated: another value or rate",
+    )
+  };
+  match written {
+    Value::Object(members) => {
+      let schema = schema_of(written);
+      if schema == Some("RationalTime.1") {
+        return match stated {
+          Some(stated) if same_time(written, stated) => Ok(()),
+          _ => Err(differs()),
+        };
+      }
+      let stated_members = stated.and_then(Value::as_object).unwrap_or_default();
+      // A `Clip.1` keeps its medium under `media_reference`, where the
+      // export's `Clip.2` keeps it under `media_references`, by its key.
+      let legacy_clip = schema == Some("Clip.2") && stated.and_then(schema_of) == Some("Clip.1");
+      for (key, value) in members {
+        if legacy_clip && key == "media_references" {
+          let medium = member(value, DEFAULT_MEDIA).unwrap_or(&Value::Null);
+          let at = at.key("media_reference");
+          times_match(medium, find(stated_members, "media_reference"), &at)?;
+        } else {
+          times_match(value, find(stated_members, key), &at.key(key))?;
+        }
+      }
+      // A time the document states where the export writes none.
+      for (key, value) in stated_members {
+        let written_there = if legacy_clip && key == "media_reference" {
+          find(members, "media_references")
+        } else {
+          find(members, key)
+        };
+        if written_there.is_none() && carries_time(value) {
+          return Err(inexact(
+            &at.key(key),
+            "a time the export does not write: none is written there",
+          ));
+        }
+      }
+      Ok(())
+    }
+    Value::Array(items) => {
+      let stated_items = stated.and_then(Value::as_array).unwrap_or_default();
+      for (index, item) in items.iter().enumerate() {
+        times_match(item, stated_items.get(index), &at.index(index))?;
+      }
+      match stated_items
+        .iter()
+        .enumerate()
+        .skip(items.len())
+        .find(|(_, item)| carries_time(item))
+      {
+        Some((index, _)) => Err(inexact(
+          &at.index(index),
+          "a time the export does not write: none is written there",
+        )),
+        None => Ok(()),
+      }
+    }
+    _ => match stated {
+      Some(stated) if carries_time(stated) => Err(differs()),
+      _ => Ok(()),
+    },
+  }
+}
+
+/// Whether two `RationalTime`s are strictly equal: the same `f64` value and
+/// the same `f64` rate, read exactly from their numbers.
+fn same_time(written: &Value, stated: &Value) -> bool {
+  let read = |time: &Value, key: &str| {
+    member(time, key).and_then(|number| match number {
+      Value::Number(text) => json::exact_f64(text.as_str()),
+      _ => None,
+    })
+  };
+  schema_of(stated) == Some("RationalTime.1")
+    && ["value", "rate"]
+      .iter()
+      .all(|key| matches!((read(written, key), read(stated, key)), (Some(a), Some(b)) if a == b))
+}
+
+/// Whether `value` holds a `RationalTime` anywhere.
+fn carries_time(value: &Value) -> bool {
+  match value {
+    Value::Object(members) => {
+      schema_of(value) == Some("RationalTime.1")
+        || members.iter().any(|(_, value)| carries_time(value))
+    }
+    Value::Array(items) => items.iter().any(carries_time),
+    _ => false,
+  }
+}
+
+/// The schema an object names, if it is one that names one.
+fn schema_of(value: &Value) -> Option<&str> {
+  member(value, "OTIO_SCHEMA").and_then(Value::as_str)
+}
+
+/// The member `key` of `value`, if it is an object that has one.
+fn member<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
+  value.as_object().and_then(|members| find(members, key))
+}
+
+/// The member `key` among `members`.
+fn find<'a>(members: &'a Members, key: &str) -> Option<&'a Value> {
+  members
+    .iter()
+    .find(|(name, _)| name == key)
+    .map(|(_, value)| value)
 }
