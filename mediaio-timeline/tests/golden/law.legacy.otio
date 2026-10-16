@@ -3,9 +3,12 @@
     "metadata": {
         "mediaio": {
             "rate": "24000/1001",
-            "metadata": {
-                "project": "law"
-            }
+            "metadata": [
+                [
+                    "project",
+                    "law"
+                ]
+            ]
         }
     },
     "name": "law",

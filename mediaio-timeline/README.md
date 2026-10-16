@@ -277,9 +277,15 @@ that names many rationals and a range as two counts that say nothing of the
 model's timebase: the edit rate (`rate`, as `num/den`); for each media-side
 range — a source range, an available range, a clip's marker — the exact
 ruler its counts are written in and the timebase the model counts it in
-(`source`, `available`, `range`); and for a track that keeps its
+(`source`, `available`, `range`); for a track that keeps its
 transitions out of their cuts' order, each dissolve's place among them
-(`order`). Available ranges and the start are written as the timeline holds
+(`order`); and where an edit-side value spells its timebase otherwise than
+the edit rate's reciprocal — `1/24` beside a rate of `48/2` — that
+spelling (`start`, `record`, `timebase`, `at`, `in_offset`,
+`out_offset`), so every value reads back as it was written. The model's
+notes ride beside the clip's words as an array of `[key, value]` pairs,
+never as an object: a note's key is anything, and OpenTimelineIO reads an
+object carrying `OTIO_SCHEMA` as an object of that schema. Available ranges and the start are written as the timeline holds
 them: a medium read through `mediadecode` starts at zero until the read side
 exposes the container's timecode, so its available range does not yet carry
 the camera's.

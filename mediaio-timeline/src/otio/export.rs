@@ -83,17 +83,23 @@ pub(crate) fn timeline(
     .map(|(index, laid)| markers_planned(index, laid.track(), edit, &operands))
     .collect::<Result<Vec<_>, _>>()?;
   let settled = settle(planned, edit, &operands, Time::written(start, edit))?;
+  // A valid timeline states its rate, and the reciprocal of a rate above
+  // zero is a timebase.
+  let ticks = timeline.rate().checked_to_timebase().unwrap_or_default();
   let tracks = laid
     .tracks()
     .iter()
     .zip(&settled)
     .zip(&marked)
-    .map(|((laid, children), marked)| track(laid.track(), children, marked, edit, target))
+    .map(|((laid, children), marked)| {
+      track(laid.track(), children, marked, Edit { edit, ticks }, target)
+    })
     .collect();
-  let rate = vec![(
+  let mut rate = vec![(
     "rate",
     Value::String(format_utf8bytes!("{}", timeline.rate())),
   )];
+  rate.extend(spelled(timeline.start().timebase(), ticks).map(|start| ("start", start)));
   Ok(object(vec![
     ("OTIO_SCHEMA", text("Timeline.1")),
     ("metadata", metadata(rate, timeline.metadata())),
@@ -618,11 +624,30 @@ fn fade_offsets(fade: Fade, edge: Edge) -> (u64, u64) {
   }
 }
 
+/// The edit rate's ruler, and the timebase its reciprocal spells — the one
+/// a reader counts an edit-side value in where no word spells another.
+#[derive(Clone, Copy)]
+struct Edit {
+  edit: Ruler,
+  ticks: Timebase,
+}
+
+/// The word an edit-side value's `timebase` is written with: its own
+/// spelling, `num/den`, where it spells the edit rate's reciprocal `ticks`
+/// otherwise — `1/24` beside a rate of `48/2` — and none where it does not,
+/// so a document stays as compact as the timeline's spellings allow.
+/// Validation holds every edit-side value to the edit rate by value, so
+/// the counts are the same in either spelling.
+fn spelled(timebase: Timebase, ticks: Timebase) -> Option<Value> {
+  (timebase.num() != ticks.num() || timebase.den() != ticks.den())
+    .then(|| Value::String(format_utf8bytes!("{timebase}")))
+}
+
 fn track(
   track: &Track,
   children: &[Planned<'_>],
   marked: &Marked,
-  edit: Ruler,
+  Edit { edit, ticks }: Edit,
   target: OtioTarget,
 ) -> Value {
   // Dissolves are written in their cuts' order; where the track keeps its
@@ -639,19 +664,24 @@ fn track(
         available,
       } => {
         let markers = clips.next().map_or(&[][..], Vec::as_slice);
-        self::clip(clip, source, available, markers, target)
+        self::clip(clip, source, available, markers, ticks, target)
       }
-      Planned::Fade(fade, edge) => fade_transition(fade, edge, edit),
-      Planned::Dissolve(index, transition) => {
-        dissolve(transition, edit, reordered.then_some(index))
-      }
+      Planned::Fade(fade, edge) => fade_transition(fade, edge, Edit { edit, ticks }),
+      Planned::Dissolve(index, transition) => dissolve(
+        transition,
+        Edit { edit, ticks },
+        reordered.then_some(index),
+      ),
     })
     .collect();
   let markers = track
     .markers()
     .iter()
     .zip(&marked.track)
-    .map(|(marker, &range)| self::marker(marker, range, None))
+    .map(|(marker, &range)| {
+      let word = spelled(marker.range().timebase(), ticks).map(|timebase| ("timebase", timebase));
+      self::marker(marker, range, word)
+    })
     .collect();
   object(vec![
     ("OTIO_SCHEMA", text("Track.1")),
@@ -677,9 +707,11 @@ fn clip(
   source: Counted,
   available: Option<Counted>,
   markers: &[Counted],
+  ticks: Timebase,
   target: OtioTarget,
 ) -> Value {
   let mut words = vec![("id", text(clip.id().as_str()))];
+  words.extend(spelled(clip.record().timebase(), ticks).map(|record| ("record", record)));
   if let Some(gain) = clip.gain() {
     words.push((
       "gain_db",
@@ -696,7 +728,7 @@ fn clip(
     .zip(markers)
     .map(|(marker, &range)| {
       let exact = exact_ruler(range.ruler, marker.range().timebase());
-      self::marker(marker, range, Some(exact))
+      self::marker(marker, range, Some(("range", exact)))
     })
     .collect();
   let mut members = vec![
@@ -771,8 +803,9 @@ fn gap(length: u64, edit: Ruler) -> Value {
   ])
 }
 
-/// A fade as a dissolve against its gap.
-fn fade_transition(fade: Fade, edge: Edge, edit: Ruler) -> Value {
+/// A fade as a dissolve against its gap, its duration's timebase spelled
+/// where it is spelled otherwise than the edit rate's reciprocal.
+fn fade_transition(fade: Fade, edge: Edge, Edit { edit, ticks }: Edit) -> Value {
   let (in_offset, out_offset) = fade_offsets(fade, edge);
   let word = match edge {
     Edge::In => "in",
@@ -782,22 +815,30 @@ fn fade_transition(fade: Fade, edge: Edge, edit: Ruler) -> Value {
     FadeShape::Linear => "linear",
     FadeShape::EqualPower => "equal_power",
   };
+  let mut words = vec![("fade", text(word)), ("shape", text(shape))];
+  words.extend(spelled(fade.duration().timebase(), ticks).map(|timebase| ("timebase", timebase)));
   transition(
-    metadata(
-      vec![("fade", text(word)), ("shape", text(shape))],
-      &Metadata::new(),
-    ),
+    metadata(words, &Metadata::new()),
     rational_time(edit, i128::from(in_offset)),
     rational_time(edit, i128::from(out_offset)),
   )
 }
 
 /// A transition as a dissolve, with its index among its track's
-/// transitions where the track keeps them out of their cuts' order.
-fn dissolve(transition: &Transition, edit: Ruler, order: Option<usize>) -> Value {
-  let words = order.map_or_else(Vec::new, |index| {
+/// transitions where the track keeps them out of their cuts' order, and
+/// the timebases of its cut and its offsets spelled where each is spelled
+/// otherwise than the edit rate's reciprocal.
+fn dissolve(transition: &Transition, Edit { edit, ticks }: Edit, order: Option<usize>) -> Value {
+  let mut words = order.map_or_else(Vec::new, |index| {
     vec![("order", Value::Number(format_utf8bytes!("{index}")))]
   });
+  for (word, timebase) in [
+    ("at", transition.at().timebase()),
+    ("in_offset", transition.in_offset().timebase()),
+    ("out_offset", transition.out_offset().timebase()),
+  ] {
+    words.extend(spelled(timebase, ticks).map(|spelled| (word, spelled)));
+  }
   self::transition(
     metadata(words, &Metadata::new()),
     rational_time(edit, i128::from(transition.in_offset().ticks())),
@@ -816,10 +857,11 @@ fn reordered(track: &Track) -> bool {
 }
 
 /// A marker as `Marker.2`: its `range` counted in one ruler — the edit
-/// rate's, for a track's marker; for a clip's, the ruler its plan chose,
-/// with `exact` naming it and the marker's own timebase.
-fn marker(marker: &Marker, range: Counted, exact: Option<Value>) -> Value {
-  let words = exact.map_or_else(Vec::new, |exact| vec![("range", exact)]);
+/// rate's, for a track's marker, with its timebase spelled where it is
+/// spelled otherwise than the edit rate's reciprocal (`timebase`); for a
+/// clip's, the ruler its plan chose, with its exact words (`range`).
+fn marker(marker: &Marker, range: Counted, word: Option<(&'static str, Value)>) -> Value {
+  let words = word.into_iter().collect();
   object(vec![
     ("OTIO_SCHEMA", text("Marker.2")),
     ("metadata", metadata(words, &Metadata::new())),
@@ -1132,13 +1174,20 @@ fn recount(range: TimeRange, length: Duration, rate: Rate) -> Option<Counted> {
 
 /// The metadata object: this crate's own `words` and the model's `notes`
 /// under [`OURS`], or nothing when there are neither.
+///
+/// The notes are an array of `[key, value]` pairs, never an object: a
+/// note's key is anything the model was given, and OpenTimelineIO reads a
+/// dictionary carrying `OTIO_SCHEMA` as an object of that schema
+/// (`deserialization.cpp` 561–573 in 0.17.0) — a note keyed so would make
+/// the export a document OpenTimelineIO refuses. As strings in an array,
+/// keys are values, which no reader takes for a schema.
 fn metadata(mut words: Vec<(&'static str, Value)>, notes: &Metadata) -> Value {
   if !notes.is_empty() {
     let notes = notes
       .iter()
-      .map(|(key, value)| (Utf8Bytes::from(key), text(value)))
+      .map(|(key, value)| Value::Array(vec![text(key), text(value)]))
       .collect();
-    words.push(("metadata", Value::Object(notes)));
+    words.push(("metadata", Value::Array(notes)));
   }
   if words.is_empty() {
     Value::Object(Vec::new())

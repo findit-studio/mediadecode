@@ -15,11 +15,18 @@ Its versions are its own: they do not move with `mediadecode`'s.
   metadata.** Beside OpenTimelineIO's fields, every document `to_otio`
   writes carries under `metadata.mediaio` the words `from_otio` reads the
   timeline back by: the edit rate (`rate`), each media-side range's exact
-  ruler and timebase (`source`, `available`, `range`), and a dissolve's
-  place among its track's transitions where the track keeps them out of
-  their cuts' order (`order`). They are always written, as the read-back
-  needs them: no document is 0.2.0's byte for byte, with markers or
-  without. OpenTimelineIO's readers keep them as metadata.
+  ruler and timebase (`source`, `available`, `range`), a dissolve's place
+  among its track's transitions where the track keeps them out of their
+  cuts' order (`order`), and the timebase of an edit-side value spelled
+  otherwise than the edit rate's reciprocal (`start`, `record`,
+  `timebase`, `at`, `in_offset`, `out_offset`). They are always written,
+  as the read-back needs them: no document is 0.2.0's byte for byte, with
+  markers or without. OpenTimelineIO's readers keep them as metadata.
+- **BREAKING: the model's notes are an array of `[key, value]` pairs**
+  under `metadata.mediaio.metadata`, never an object: a note's key is
+  anything, and OpenTimelineIO 0.17 reads an object carrying `OTIO_SCHEMA`
+  as an object of that schema, so a note keyed so made the export a
+  document it refuses.
 
 ### Added
 

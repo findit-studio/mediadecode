@@ -11,10 +11,11 @@ use super::{
 };
 use crate::{
   Clip, ClipAt, ClipId, Duration, Fade, FadeShape, Fades, Gain, IdClash, Marker, MarkerColor,
-  MediaRef, Rate, Refusal, TimeRange, Timeline, Timestamp, Track, TrackKind, Transition,
+  MediaRef, Metadata, Rate, Refusal, TimeRange, Timebase, Timeline, Timestamp, Track, TrackKind,
+  Transition,
   otio::{
     Feature, Inexact, OtioTarget, Shape, UnmodelledFeature, UnmodelledSchema, Unreadable,
-    from_otio, to_otio,
+    from_otio, to_otio, validate_json,
   },
 };
 
@@ -212,6 +213,269 @@ fn what_carries_nothing_reads_as_nothing() {
   // A marker with no color is OpenTimelineIO's default, green.
   let green = self::read(|root| remove(root, &format!("{TRACK}.markers.0"), "color")).unwrap();
   assert_eq!(green.tracks()[0].markers()[0].color(), MarkerColor::Green);
+}
+
+/// Every schema the export writes: an object carrying `OTIO_SCHEMA` is
+/// one of these, or a reader would take a plain dictionary for an object.
+const SCHEMAS: [&str; 11] = [
+  "Timeline.1",
+  "Stack.1",
+  "Track.1",
+  "Clip.1",
+  "Clip.2",
+  "Gap.1",
+  "Transition.1",
+  "ExternalReference.1",
+  "Marker.2",
+  "RationalTime.1",
+  "TimeRange.1",
+];
+
+/// Whether every dictionary in `value` OpenTimelineIO reads as a plain one
+/// is one: no object below a `metadata` member carries `OTIO_SCHEMA`, and
+/// every object that does names a schema the export writes.
+fn plain_where_it_should_be(value: &Value, in_metadata: bool) -> bool {
+  match value {
+    Value::Object(members) => {
+      let schema = members
+        .iter()
+        .find(|(key, _)| key == "OTIO_SCHEMA")
+        .map(|(_, schema)| schema);
+      let schema_ok = match schema {
+        None => true,
+        Some(Value::String(name)) => !in_metadata && SCHEMAS.contains(&name.as_str()),
+        Some(_) => false,
+      };
+      schema_ok
+        && members
+          .iter()
+          .all(|(key, member)| plain_where_it_should_be(member, in_metadata || key == "metadata"))
+    }
+    Value::Array(items) => items
+      .iter()
+      .all(|item| plain_where_it_should_be(item, in_metadata)),
+    _ => true,
+  }
+}
+
+#[test]
+fn a_note_keyed_as_otio_keys_its_objects_is_written_as_a_pair_and_reads_back() {
+  // The keys OpenTimelineIO's reader looks for (`deserialization.cpp`
+  // 561–573, 627–629 in 0.17.0), the crate's own word names, and an empty
+  // key: none may become a member of an object.
+  let notes = || {
+    Metadata::new()
+      .with("OTIO_SCHEMA", "Marker.2")
+      .with("OTIO_REF_ID", "a reference")
+      .with("metadata", "a note")
+      .with("mediaio", "another")
+      .with("", "an empty key")
+  };
+  let mut timeline = sample().with_metadata(notes());
+  *timeline.tracks_mut()[0].clips_mut()[0].metadata_mut() = notes();
+  for target in [OtioTarget::V0_15Plus, OtioTarget::Legacy] {
+    let written = to_otio(&timeline, target).unwrap();
+    assert_eq!(validate_json(&written, target), Ok(()), "{target:?}");
+    let root = json::parse(&written).unwrap();
+    assert!(
+      plain_where_it_should_be(&root, false),
+      "{target:?}: a note keyed as a schema is an object: {written}"
+    );
+    assert_eq!(from_otio(&written), Ok(timeline.clone()), "{target:?}");
+  }
+  // The pairs, as written.
+  let mut root = json::parse(&to_otio(&timeline, OtioTarget::V0_15Plus).unwrap()).unwrap();
+  let pairs = at(&mut root, "metadata.mediaio.metadata");
+  let Value::Array(pairs) = pairs else {
+    panic!("the notes are an array: {pairs:?}")
+  };
+  assert!(pairs.contains(&Value::Array(vec![
+    text("OTIO_SCHEMA"),
+    text("Marker.2")
+  ])));
+}
+
+#[test]
+fn notes_that_are_not_pairs_of_strings_each_key_once_are_refused_by_name() {
+  let notes = |root: &mut Value, value: Value| {
+    set(root, "metadata.mediaio", "metadata", value);
+  };
+  let pair = |key: &str, value: &str| Value::Array(vec![text(key), text(value)]);
+  assert_eq!(
+    read(|root| notes(root, object(vec![("project", text("law"))]))),
+    Err(shape("metadata.mediaio.metadata", "an array")),
+  );
+  assert_eq!(
+    read(|root| notes(root, Value::Array(vec![Value::Array(vec![text("only a key")])]))),
+    Err(shape(
+      "metadata.mediaio.metadata.0",
+      "a note: a key and a value, both strings"
+    )),
+  );
+  assert_eq!(
+    read(|root| {
+      notes(
+        root,
+        Value::Array(vec![Value::Array(vec![text("key"), number("1")])]),
+      )
+    }),
+    Err(shape(
+      "metadata.mediaio.metadata.0",
+      "a note: a key and a value, both strings"
+    )),
+  );
+  assert_eq!(
+    read(|root| notes(root, Value::Array(vec![pair("key", "a"), pair("key", "b")]))),
+    Err(shape(
+      "metadata.mediaio.metadata.1.0",
+      "a key no earlier note names"
+    )),
+  );
+  assert_eq!(
+    read(|root| notes(root, Value::Array(vec![pair("key", "a")]))),
+    Ok(sample().with_metadata(Metadata::new().with("key", "a"))),
+  );
+}
+
+/// `num/den`, as a test spells a timebase.
+fn timebase(num: i32, den: i32) -> Timebase {
+  Timebase::new(num, core::num::NonZeroI32::new(den).expect("non-zero"))
+}
+
+/// The sample at a rate of `48/2` — 24 a second, spelled unreduced — whose
+/// edit-side values spell its reciprocal `2/48` otherwise: the start in
+/// `1/24`, `a`'s record in `4/96` and its fade in `3/72`, the dissolve's cut
+/// in `1/24`, its offsets in `2/48` (the reciprocal's own spelling) and
+/// `5/120`, and the track's marker in `1/24`.
+fn respelled() -> Timeline {
+  let rate = Rate::fps(48, core::num::NonZeroI32::new(2).expect("non-zero"));
+  let mut timeline = sample();
+  timeline.set_rate(rate);
+  timeline.set_start(Timestamp::new(0, timebase(1, 24)));
+  let track = &mut timeline.tracks_mut()[0];
+  let a = &mut track.clips_mut()[0];
+  a.set_record(TimeRange::new(12, 36, timebase(4, 96)));
+  let fades = a.fades().with_in(Some(Fade::new(
+    Duration::new(6, timebase(3, 72)),
+    FadeShape::Linear,
+  )));
+  a.set_fades(fades);
+  track.clips_mut()[1].set_record(TimeRange::new(36, 60, timebase(2, 48)));
+  *track.transitions_mut() = vec![Transition::dissolve(
+    Timestamp::new(36, timebase(1, 24)),
+    Duration::new(2, timebase(2, 48)),
+    Duration::new(2, timebase(5, 120)),
+  )];
+  track.markers_mut()[0].set_range(TimeRange::new(0, 24, timebase(1, 24)));
+  timeline
+}
+
+/// A timebase's spelling, as `(num, den)`.
+fn spelling(timebase: Timebase) -> (i32, i32) {
+  (timebase.num(), timebase.den().get())
+}
+
+#[test]
+fn an_edit_side_value_keeps_its_timebases_spelling() {
+  let timeline = respelled();
+  assert_eq!(crate::validate(&timeline), Ok(()), "the premise: it validates");
+  for target in [OtioTarget::V0_15Plus, OtioTarget::Legacy] {
+    let written = to_otio(&timeline, target).unwrap();
+    let read = from_otio(&written).unwrap();
+    assert_eq!(read, timeline, "{target:?}");
+    assert_eq!(spelling(read.start().timebase()), (1, 24), "the start");
+    let track = &read.tracks()[0];
+    let a = &track.clips()[0];
+    assert_eq!(spelling(a.record().timebase()), (4, 96), "a's record");
+    assert_eq!(
+      spelling(a.fades().in_().expect("a's fade").duration().timebase()),
+      (3, 72),
+      "a's fade"
+    );
+    assert_eq!(spelling(track.clips()[1].record().timebase()), (2, 48), "b's record");
+    let dissolve = &track.transitions()[0];
+    assert_eq!(spelling(dissolve.at().timebase()), (1, 24), "the cut");
+    assert_eq!(spelling(dissolve.in_offset().timebase()), (2, 48), "in");
+    assert_eq!(spelling(dissolve.out_offset().timebase()), (5, 120), "out");
+    assert_eq!(
+      spelling(track.markers()[0].range().timebase()),
+      (1, 24),
+      "the marker"
+    );
+    #[cfg(feature = "serde")]
+    assert_eq!(
+      serde_json::to_string(&read).unwrap(),
+      serde_json::to_string(&timeline).unwrap(),
+      "{target:?}: the stored document, byte for byte",
+    );
+  }
+  // The words are written only where a spelling differs from the
+  // reciprocal's.
+  let mut root = json::parse(&to_otio(&timeline, OtioTarget::V0_15Plus).unwrap()).unwrap();
+  assert_eq!(at(&mut root, "metadata.mediaio.start"), &text("1/24"));
+  assert_eq!(at(&mut root, &format!("{A}.metadata.mediaio.record")), &text("4/96"));
+  assert_eq!(
+    at(&mut root, &format!("{FADE_IN}.metadata.mediaio.timebase")),
+    &text("3/72")
+  );
+  let words = at(&mut root, &format!("{DISSOLVE}.metadata.mediaio"));
+  let Value::Object(words) = words else {
+    panic!("the dissolve's words: {words:?}")
+  };
+  let keys: Vec<&str> = words.iter().map(|(key, _)| key.as_str()).collect();
+  assert_eq!(keys, ["at", "out_offset"], "in_offset spells the reciprocal");
+  let b_words = at(&mut root, &format!("{B}.metadata.mediaio"));
+  let Value::Object(b_words) = b_words else {
+    panic!("b's words: {b_words:?}")
+  };
+  assert!(
+    b_words.iter().all(|(key, _)| key != "record"),
+    "b's record spells the reciprocal"
+  );
+  assert_eq!(
+    at(&mut root, &format!("{TRACK}.markers.0.metadata.mediaio.timebase")),
+    &text("1/24")
+  );
+}
+
+#[test]
+fn a_timebase_word_off_the_edit_rate_is_refused_by_name() {
+  assert_eq!(
+    read(|root| set(root, "metadata.mediaio", "start", text("1/25"))),
+    Err(shape(
+      "metadata.mediaio.start",
+      "the edit rate's timebase, written num/den"
+    )),
+  );
+  assert_eq!(
+    read(|root| set(root, &format!("{A}.metadata.mediaio"), "record", text("x"))),
+    Err(shape(
+      &format!("{A}.metadata.mediaio.record"),
+      "the edit rate's timebase, written num/den"
+    )),
+  );
+  // An equal timebase spelled otherwise reads, in its own spelling.
+  let read = read(|root| set(root, &format!("{A}.metadata.mediaio"), "record", text("2/48")))
+    .expect("an equal timebase");
+  assert_eq!(spelling(read.tracks()[0].clips()[0].record().timebase()), (2, 48));
+  // A word of the other kind of transition.
+  assert_eq!(
+    read_edited(OtioTarget::V0_15Plus, |root| {
+      set(&mut *root, &format!("{DISSOLVE}.metadata"), "mediaio", object(vec![]));
+      set(root, &format!("{DISSOLVE}.metadata.mediaio"), "timebase", text("1/24"));
+    }),
+    Err(feature(
+      Feature::Word("timebase".into()),
+      &format!("{DISSOLVE}.metadata.mediaio.timebase")
+    )),
+  );
+  assert_eq!(
+    read(|root| set(root, &format!("{FADE_IN}.metadata.mediaio"), "at", text("1/24"))),
+    Err(feature(
+      Feature::Word("at".into()),
+      &format!("{FADE_IN}.metadata.mediaio.at")
+    )),
+  );
 }
 
 // Members OpenTimelineIO 0.17.0's schema lets a document leave out read as

@@ -33,7 +33,9 @@
 //! rate must be the `f64` of the exact ruler its word names, bit for bit,
 //! and its value a whole count within ±2^53, which an `f64` holds exactly;
 //! a media-side range is counted again in the timebase the model counts it
-//! in, exactly.
+//! in, exactly. An edit-side value is counted in the timebase its word
+//! spells, which must be the edit rate's reciprocal by value, and without a
+//! word in that reciprocal; the model's notes are pairs, each key once.
 //! What OpenTimelineIO derives from the document is held as the export
 //! holds it ([`derive`](super::derive)), and refused as
 //! [`Unreadable::Inexact`] where its `f64` arithmetic rounds: both ends of
@@ -391,21 +393,44 @@ impl<'a> Words<'a> {
       .ok_or_else(|| shape(&self.at.key(word), "a required word"))
   }
 
-  /// The model's notes: an object of strings, under `metadata`.
+  /// The model's notes, under `metadata`: an array of `[key, value]`
+  /// pairs of strings, each key once — never an object, whose keys a
+  /// reader would take for schema words (see the export).
   fn notes(&self) -> Result<Metadata, Unreadable> {
     let Some(value) = self.get("metadata") else {
       return Ok(Metadata::new());
     };
     let at = self.at.key("metadata");
-    let notes = Object::of(value, at.clone())?;
-    notes
-      .members
-      .iter()
-      .map(|(key, note)| match note {
-        Value::String(text) => Ok((key.clone(), text.clone())),
-        _ => Err(shape(&at.key(key), "a string")),
+    let mut notes = Metadata::new();
+    for (index, pair) in array(value, &at)?.iter().enumerate() {
+      let at = at.index(index);
+      let Some([Value::String(key), Value::String(note)]) = pair.as_array() else {
+        return Err(shape(&at, "a note: a key and a value, both strings"));
+      };
+      if notes.insert(key.clone(), note.clone()).is_some() {
+        return Err(shape(&at.index(0), "a key no earlier note names"));
+      }
+    }
+    Ok(notes)
+  }
+
+  /// The timebase an edit-side value is counted in: the one its word
+  /// spells — the edit rate's reciprocal by value, spelled otherwise, as
+  /// the export writes it — or, with no word, the reciprocal `ticks`
+  /// itself. Either counts the same ticks.
+  fn timebase(&self, word: &str, ticks: Timebase) -> Result<Timebase, Unreadable> {
+    let Some(text) = self.text(word)? else {
+      return Ok(ticks);
+    };
+    Timebase::from_str(text)
+      .ok()
+      .filter(|timebase| *timebase == ticks)
+      .ok_or_else(|| {
+        shape(
+          &self.at.key(word),
+          "the edit rate's timebase, written num/den",
+        )
       })
-      .collect()
   }
 }
 
@@ -568,12 +593,13 @@ pub(crate) fn timeline(root: &Value) -> Result<Timeline, Unreadable> {
     "global_start_time",
     "tracks",
   ])?;
-  let words = Words::of(&object, &["rate", "metadata"])?;
+  let words = Words::of(&object, &["rate", "start", "metadata"])?;
   let rate = words
     .rate("rate")?
     .ok_or_else(|| shape(&words.at.key("rate"), "a required word"))?;
   let edit = Ruler::new(rate);
   let ticks = rate.checked_to_timebase().unwrap_or_default();
+  let start_timebase = words.timebase("start", ticks)?;
   let start = count(
     object.required("global_start_time")?,
     &object.at.key("global_start_time"),
@@ -583,7 +609,7 @@ pub(crate) fn timeline(root: &Value) -> Result<Timeline, Unreadable> {
   let tracks = self::stack(&stack, edit, ticks, written(start, edit))?;
   Ok(
     Timeline::new(object.name()?, rate)
-      .with_start(Timestamp::new(start, ticks))
+      .with_start(Timestamp::new(start, start_timebase))
       .with_metadata(words.notes()?)
       .with_tracks(tracks),
   )
@@ -696,9 +722,14 @@ enum Child {
   Clip(Box<Clip>, u64),
   /// A fade at one edge of the clip beside it.
   Fade(Edge, Fade),
-  /// A dissolve, its offsets at the edit rate, and its index among its
-  /// track's transitions where the document says it.
-  Dissolve(u64, u64, Option<usize>),
+  /// A dissolve: its offsets, the timebase of its cut, and its index
+  /// among its track's transitions where the document says it.
+  Dissolve {
+    in_offset: Duration,
+    out_offset: Duration,
+    at: Timebase,
+    order: Option<usize>,
+  },
 }
 
 /// What kind of child sits at a place of a track: what a transition's
@@ -715,7 +746,7 @@ impl Child {
     match self {
       Self::Gap(_) => Kind::Gap,
       Self::Clip(..) => Kind::Clip,
-      Self::Fade(..) | Self::Dissolve(..) => Kind::Transition,
+      Self::Fade(..) | Self::Dissolve { .. } => Kind::Transition,
     }
   }
 }
@@ -787,7 +818,10 @@ fn children(object: &Object<'_>, edit: Ruler, ticks: Timebase) -> Result<Childre
       }
       Child::Clip(mut clip, length) => {
         let end = advance(cursor, length, &here)?;
-        clip.set_record(TimeRange::new(cursor, end, ticks));
+        // The record's timebase is the one `clip` set: its word's, or the
+        // edit rate's reciprocal.
+        let timebase = clip.record().timebase();
+        clip.set_record(TimeRange::new(cursor, end, timebase));
         if let Some(fade) = fade_in.take() {
           let fades = clip.fades().with_in(Some(fade));
           clip.set_fades(fades);
@@ -815,15 +849,16 @@ fn children(object: &Object<'_>, edit: Ruler, ticks: Timebase) -> Result<Childre
           }
         }
       }
-      Child::Dissolve(in_offset, out_offset, order) => {
+      Child::Dissolve {
+        in_offset,
+        out_offset,
+        at,
+        order,
+      } => {
         if before != Some(Kind::Clip) || after != Some(Kind::Clip) {
           return Err(feature(&here, Feature::DissolveBesideGap));
         }
-        let transition = Transition::dissolve(
-          Timestamp::new(cursor, ticks),
-          Duration::new(in_offset, ticks),
-          Duration::new(out_offset, ticks),
-        );
+        let transition = Transition::dissolve(Timestamp::new(cursor, at), in_offset, out_offset);
         dissolves.push((transition, order, here));
       }
     }
@@ -945,14 +980,31 @@ fn transition(
     in_offset: written(in_offset, edit),
     out_offset: written(out_offset, edit),
   };
-  let words = Words::of(object, &["fade", "shape", "order"])?;
-  let Some(fade) = words.text("fade")? else {
-    if words.get("shape").is_some() {
-      return Err(feature(
-        &words.at.key("shape"),
-        Feature::Word(Utf8Bytes::from_static("shape")),
-      ));
+  let words = Words::of(
+    object,
+    &[
+      "fade",
+      "shape",
+      "timebase",
+      "order",
+      "at",
+      "in_offset",
+      "out_offset",
+    ],
+  )?;
+  // A word of the other kind of transition is one this reader does not
+  // know there.
+  let foreign = |names: &[&'static str]| -> Result<(), Unreadable> {
+    match names.iter().find(|name| words.get(name).is_some()) {
+      Some(name) => Err(feature(
+        &words.at.key(name),
+        Feature::Word(Utf8Bytes::from_static(name)),
+      )),
+      None => Ok(()),
     }
+  };
+  let Some(fade) = words.text("fade")? else {
+    foreign(&["shape", "timebase"])?;
     let order = words
       .get("order")
       .map(|value| {
@@ -962,14 +1014,15 @@ fn transition(
           .ok_or_else(|| shape(&at, "a place among the track's transitions"))
       })
       .transpose()?;
-    return Ok((Child::Dissolve(in_offset, out_offset, order), walked));
+    let dissolve = Child::Dissolve {
+      in_offset: Duration::new(in_offset, words.timebase("in_offset", ticks)?),
+      out_offset: Duration::new(out_offset, words.timebase("out_offset", ticks)?),
+      at: words.timebase("at", ticks)?,
+      order,
+    };
+    return Ok((dissolve, walked));
   };
-  if words.get("order").is_some() {
-    return Err(feature(
-      &words.at.key("order"),
-      Feature::Word(Utf8Bytes::from_static("order")),
-    ));
-  }
+  foreign(&["order", "at", "in_offset", "out_offset"])?;
   let edge = match fade {
     "in" => Edge::In,
     "out" => Edge::Out,
@@ -989,8 +1042,9 @@ fn transition(
   if gap_side != 0 {
     return Err(feature(&object.at, Feature::Fade));
   }
+  let timebase = words.timebase("timebase", ticks)?;
   Ok((
-    Child::Fade(edge, Fade::new(Duration::new(inside, ticks), curve)),
+    Child::Fade(edge, Fade::new(Duration::new(inside, timebase), curve)),
     walked,
   ))
 }
@@ -1019,8 +1073,9 @@ fn clip(
   ];
   known.extend_from_slice(references);
   object.keys(&known)?;
-  let words = Words::of(object, &["id", "gain_db", "source", "metadata"])?;
+  let words = Words::of(object, &["id", "gain_db", "source", "record", "metadata"])?;
   let id = words.required_text("id")?;
+  let record = words.timebase("record", ticks)?;
   let exact = words.required_exact("source")?;
   object.no_effects()?;
   object.no_color()?;
@@ -1048,7 +1103,8 @@ fn clip(
     object.name()?,
     media(object, schema)?,
     source,
-    TimeRange::new(0, 0, ticks),
+    // The track places the record; its timebase is the clip's own.
+    TimeRange::new(0, 0, record),
   )
   .with_enabled(object.enabled()?)
   .with_gain(words.gain("gain_db")?)
@@ -1172,7 +1228,7 @@ fn markers(object: &Object<'_>, placed: Placed) -> Result<Vec<Marker>, Unreadabl
       let words = Words::of(
         &marker,
         match placed {
-          Placed::Edit(..) => &[],
+          Placed::Edit(..) => &["timebase"],
           Placed::Exact => &["range"],
         },
       )?;
@@ -1190,7 +1246,7 @@ fn markers(object: &Object<'_>, placed: Placed) -> Result<Vec<Marker>, Unreadabl
       let range = match placed {
         Placed::Edit(edit, ticks) => {
           let (start, length) = counts(range, &range_at, edit)?;
-          edit_range(start, length, ticks)
+          edit_range(start, length, words.timebase("timebase", ticks)?)
         }
         Placed::Exact => {
           let exact = words.required_exact("range")?;
