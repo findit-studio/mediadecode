@@ -989,7 +989,7 @@ fn transition(
   ticks: Timebase,
 ) -> Result<(Child, derive::Child), Unreadable> {
   // No `enabled`: OpenTimelineIO 0.17.0's transitions have none, and keep
-  // one stated as a dynamic field they write back (`transition.cpp` 31–36;
+  // one stated as a dynamic field they write back (`transition.cpp` 33–35;
   // `serializableObject.cpp` 78–107), which the timeline would drop.
   object.keys(&[
     "OTIO_SCHEMA",
@@ -1558,20 +1558,20 @@ pub(crate) const WRITTEN_DEFAULTS: [Row; 10] = [
     key: "source_range",
     value: Plain::Null,
   },
-  // `effects` `[]` (115, 689, 743, 798): `item.cpp` 176 over `item.h` 30.
+  // `effects` `[]` (115, 689, 743, 798): `item.cpp` 176 over `item.h` 31.
   Row {
     schemas: ITEMS,
     key: "effects",
     value: Plain::EmptyArray,
   },
   // `markers` `[]` where an item has none (116, 690, 744, 799): `item.cpp`
-  // 177 over `item.h` 31.
+  // 177 over `item.h` 32.
   Row {
     schemas: ITEMS,
     key: "markers",
     value: Plain::EmptyArray,
   },
-  // `enabled` `true` (117, 691, 745, 800): `item.cpp` 178 over `item.h` 32.
+  // `enabled` `true` (117, 691, 745, 800): `item.cpp` 178 over `item.h` 33.
   Row {
     schemas: ITEMS,
     key: "enabled",
@@ -1600,7 +1600,7 @@ pub(crate) const WRITTEN_DEFAULTS: [Row; 10] = [
     value: Plain::Text("GREEN"),
   },
   // A marker's `comment` `""` (869): `marker.cpp` 29 over `std::string()`
-  // (`marker.h` 41).
+  // (`marker.h` 42).
   Row {
     schemas: &["Marker.2"],
     key: "comment",
